@@ -47,6 +47,9 @@ extern totp_secs_left:proc
 extern vault_tpm_remember:proc
 extern vault_tpm_forget:proc
 extern vault_tpm_has:proc
+extern reg_load_vault:proc
+extern reg_save_vault:proc
+extern cfg_default_vault:proc
 
 externdef g_use_tpm:dword
 externdef g_cfg_in:qword
@@ -200,6 +203,7 @@ WSTR s_createfail,  <Could not create the vault (I/O or out of memory).>
 WSTR s_notitle,     <An entry needs a title.>
 WSTR s_full,        <Vault is full.>
 WSTR s_resealfail,  <Saved in memory but writing to disk failed.>
+WSTR s_firstrun,    <No vault yet - set a master password to create your default vault.>
 WSTR s_tpmnone,     <No Windows Hello / TPM unlock saved for this vault on this PC.>
 WSTR s_tpmfail,     <Windows Hello / TPM unlock failed - use your master password.>
 WSTR s_tpmsaved,    <This device can now unlock the vault with Windows Hello / TPM.>
@@ -226,6 +230,7 @@ align 8
 g_hinst     dq ?
 g_vpath_set dd ?
 g_create    dd ?
+g_is_default dd ?                     ; 1 = auto-created default vault (register it)
 g_revealed  dd ?
 g_clip_seq  dd ?                      ; clipboard sequence number at last copy
 g_e_edit    dd ?
@@ -397,7 +402,15 @@ gu_pwok:
     je      gu_open
     call    do_init
     test    eax, eax
-    jz      gu_open
+    jnz     gu_createfail
+    mov     dword ptr [g_create], 0          ; created -> open mode from now on
+    cmp     dword ptr [g_is_default], 0
+    je      gu_open
+    lea     rcx, [g_vpath]                   ; persist the default path to HKCU
+    call    reg_save_vault
+    mov     dword ptr [g_is_default], 0
+    jmp     gu_open
+gu_createfail:
     call    gui_wipepw
     mov     rcx, qword ptr [rbp-24]
     lea     rdx, [s_createfail]
@@ -498,8 +511,20 @@ unlock_proc proc
     xor     eax, eax
     jmp     up_ret
 up_init:
-    mov     dword ptr [g_vpath_set], 0
-    mov     dword ptr [g_create], 0
+    sub     rsp, 32
+    cmp     dword ptr [g_vpath_set], 0
+    je      up_init_x
+    mov     rcx, qword ptr [rbp-8]           ; show the resolved vault path
+    mov     edx, IDC_U_PATH
+    lea     r8, [g_vpath]
+    call    SetDlgItemTextW
+    cmp     dword ptr [g_create], 0
+    je      up_init_x
+    mov     rcx, qword ptr [rbp-8]           ; first-run hint
+    lea     rdx, [s_firstrun]
+    call    gui_status
+up_init_x:
+    add     rsp, 32
     mov     eax, 1
     jmp     up_ret
 up_cmd:
@@ -1270,14 +1295,77 @@ gui_clrwbuf endp
 ; gui_main - GUI front-end: unlock dialog, then the vault dialog, looping back
 ;   to the unlock screen when the vault is locked.
 ; =============================================================================
+; gui_resolve_vault() - pick the vault path from the registry (HKLM>HKCU), or
+;   fall back to a default Documents\vault.vordr that the first unlock creates.
+;   Sets g_vpath / g_vpath_set / g_create / g_is_default.
+gui_resolve_vault proc frame
+    FRAME_PROLOG 32
+    mov     dword ptr [g_is_default], 0
+    lea     rcx, [g_vpath]
+    mov     edx, 1024
+    call    reg_load_vault
+    test    eax, eax
+    jz      grv_default
+    mov     dword ptr [g_vpath_set], 1
+    mov     dword ptr [g_create], 0
+    FRAME_EPILOG
+    ret
+grv_default:
+    lea     rcx, [g_vpath]
+    call    cfg_default_vault
+    test    eax, eax
+    jz      grv_none
+    mov     dword ptr [g_vpath_set], 1
+    mov     dword ptr [g_create], 1
+    mov     dword ptr [g_is_default], 1
+    FRAME_EPILOG
+    ret
+grv_none:
+    mov     dword ptr [g_vpath_set], 0
+    mov     dword ptr [g_create], 0
+    FRAME_EPILOG
+    ret
+gui_resolve_vault endp
+
+; gui_try_tpm_auto() -> eax = 1 if the registered vault was unlocked via TPM.
+gui_try_tpm_auto proc frame
+    FRAME_PROLOG 32
+    lea     rax, [g_vpath]
+    mov     qword ptr [g_cfg_in], rax
+    call    vault_tpm_has
+    test    eax, eax
+    jz      gta_no
+    mov     dword ptr [g_use_tpm], 1
+    call    vault_unlock
+    mov     dword ptr [g_use_tpm], 0
+    test    eax, eax
+    jnz     gta_no
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gta_no:
+    mov     dword ptr [g_use_tpm], 0
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gui_try_tpm_auto endp
+
 gui_main proc frame
     FRAME_PROLOG 32
     WINCALL GetModuleHandleW, 0
     mov     qword ptr [g_hinst], rax
+    call    gui_resolve_vault               ; registry path, or default to create
+    ; startup shortcut: an existing vault with a TPM sidecar unlocks silently
+    cmp     dword ptr [g_create], 0
+    jne     gm_loop
+    call    gui_try_tpm_auto
+    test    eax, eax
+    jnz     gm_vault
 gm_loop:
     WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_UNLOCK, 0, addr unlock_proc, 0
     cmp     rax, 1
     jne     gm_done                         ; cancelled -> exit
+gm_vault:
     WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_VAULT, 0, addr vault_proc, 0
     call    vault_lock                      ; wipe body + key on close
     jmp     gm_loop
