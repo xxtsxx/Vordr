@@ -45,7 +45,7 @@ goto :argloop
 :doneargs
 
 set ASMFLAGS=/c /nologo /W3 /Zi %ASMEXTRA%
-set SOURCES=main console hardening random loadcfg sha256 aesgcm blake2b argon2 fileio secmem vault pwgen otp log selftest redteam gui
+set SOURCES=main console hardening random loadcfg sha256 aesgcm blake2b argon2 fileio secmem vault pad pwgen otp log selftest redteam gui
 
 echo === assembling ===
 for %%f in (%SOURCES%) do (
@@ -69,7 +69,7 @@ link /nologo /subsystem:windows /entry:wstart /nodefaultlib /incremental:no ^
      %GUARDFLAGS% /debug /pdb:bin\vordr.pdb ^
      /manifest:embed /manifestinput:vordr.manifest /manifestuac:no ^
      /libpath:"%SDKLIB%" ^
-     /out:bin\vordr.exe obj\main.obj obj\console.obj obj\hardening.obj obj\random.obj obj\loadcfg.obj obj\sha256.obj obj\aesgcm.obj obj\blake2b.obj obj\argon2.obj obj\fileio.obj obj\secmem.obj obj\vault.obj obj\pwgen.obj obj\otp.obj obj\log.obj obj\selftest.obj obj\redteam.obj obj\gui.obj obj\vordr.res ^
+     /out:bin\vordr.exe obj\main.obj obj\console.obj obj\hardening.obj obj\random.obj obj\loadcfg.obj obj\sha256.obj obj\aesgcm.obj obj\blake2b.obj obj\argon2.obj obj\fileio.obj obj\secmem.obj obj\vault.obj obj\pad.obj obj\pwgen.obj obj\otp.obj obj\log.obj obj\selftest.obj obj\redteam.obj obj\gui.obj obj\vordr.res ^
      kernel32.lib bcrypt.lib user32.lib advapi32.lib
 if errorlevel 1 goto :failed
 
