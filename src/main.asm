@@ -45,6 +45,9 @@ extern do_padnew:proc                   ; OTP pad/share commands (pad.asm)
 extern do_padimport:proc
 extern do_share:proc
 extern do_open:proc
+extern do_edit:proc                     ; vault edit/remove (vault.asm)
+extern do_remove:proc
+extern do_bench:proc                    ; benchmark (bench.asm)
 ifdef DBG_TRACE
 extern cmd_redteam:proc                 ; fault-injection self-test (redteam.asm)
 endif
@@ -122,8 +125,8 @@ msg_usage label byte
     db "                       [--url U] [--notes N]     add an entry",13,10
     db "    vordr list   VAULT -p PW                     list entry titles",13,10
     db "    vordr get    VAULT -p PW --title T           reveal an entry",13,10
-    db "    vordr edit   VAULT -p PW   (not yet implemented)",13,10
-    db "    vordr remove VAULT -p PW   (not yet implemented)",13,10
+    db "    vordr edit   VAULT -p PW --title T [field overrides]   edit an entry",13,10
+    db "    vordr remove VAULT -p PW --title T         delete an entry",13,10
     db "  password generator:",13,10
     db "    vordr gen [--len N] [--count N] [--no-symbols]",13,10
     db "  one-time-pad sharing  (PAD = .vpad file; pad shared out-of-band):",13,10
@@ -133,7 +136,7 @@ msg_usage label byte
     db "    vordr open      PAD -p PW --share SHARE [-o OUT] decrypt a share",13,10
     db "  diagnostics:",13,10
     db "    vordr selftest             run all known-answer self-tests",13,10
-    db "    vordr bench   (not yet implemented)",13,10
+    db "    vordr bench [-m MIB] [-t N] benchmark the crypto core",13,10
     db 13,10
     db "  Every launch runs the self-test gate first and fails closed on mismatch.",13,10
 msg_usage_len equ $ - msg_usage
@@ -1133,38 +1136,12 @@ password_to_utf8 endp
 ; =============================================================================
 ; Command handlers.  Each is a DLPV landing-pad target reached through the
 ; CALL_GUARDED dispatch.  In this scaffold build every vault/share/gen verb is
-; a fail-closed stub that prints a placeholder and returns EXIT_OK; `selftest`
-; is fully live.  Real implementations land on top of this in the next step.
+; thin landing-pad wrappers over the implementation modules.
 ; =============================================================================
 .const
-CSTR m_stub_init,      "init: not yet implemented (scaffold build)",13,10
-CSTR m_stub_add,       "add: not yet implemented (scaffold build)",13,10
-CSTR m_stub_get,       "get: not yet implemented (scaffold build)",13,10
-CSTR m_stub_list,      "list: not yet implemented (scaffold build)",13,10
-CSTR m_stub_edit,      "edit: not yet implemented (scaffold build)",13,10
-CSTR m_stub_remove,    "remove: not yet implemented (scaffold build)",13,10
-CSTR m_stub_bench,     "bench: not yet implemented (scaffold build)",13,10
 CSTR c_nl,             13,10
 CSTR m_gen_fail,       "gen: invalid options (length 1..256, at least one character class)",13,10
 .code
-
-; STUB_HANDLER name, msg - emit a landing-pad stub that prints msg and returns OK
-STUB_HANDLER macro hname, msg
-LANDING_PAD
-hname proc frame
-    FRAME_PROLOG 32
-    lea     rcx, [msg]
-    mov     edx, msg&_len
-    call    print_a
-    mov     eax, EXIT_OK
-    FRAME_EPILOG
-    ret
-hname endp
-endm
-
-    STUB_HANDLER cmd_edit,      m_stub_edit
-    STUB_HANDLER cmd_remove,    m_stub_remove
-    STUB_HANDLER cmd_bench,     m_stub_bench
 
 ; --- vault command handlers (thin landing-pad wrappers over vault.asm) ------
 LANDING_PAD
@@ -1198,6 +1175,30 @@ cmd_get proc frame
     FRAME_EPILOG
     ret
 cmd_get endp
+
+LANDING_PAD
+cmd_edit proc frame
+    FRAME_PROLOG 32
+    call    do_edit
+    FRAME_EPILOG
+    ret
+cmd_edit endp
+
+LANDING_PAD
+cmd_remove proc frame
+    FRAME_PROLOG 32
+    call    do_remove
+    FRAME_EPILOG
+    ret
+cmd_remove endp
+
+LANDING_PAD
+cmd_bench proc frame
+    FRAME_PROLOG 32
+    call    do_bench
+    FRAME_EPILOG
+    ret
+cmd_bench endp
 
 LANDING_PAD
 cmd_padnew proc frame

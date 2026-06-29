@@ -115,6 +115,8 @@ CSTR e_noopt,   "error: 'get' needs --title NAME",13,10
 CSTR e_notfound,"no entry with that title",13,10
 CSTR m_added,   "entry added.",13,10
 CSTR m_created, "vault created.",13,10
+CSTR m_removed, "entry removed.",13,10
+CSTR m_updated, "entry updated.",13,10
 CSTR m_empty,   "(vault is empty)",13,10
 
 .data?
@@ -140,6 +142,7 @@ g_ts        dq ?                ; GetSystemTimeAsFileTime scratch
 vst_ct      db 16 dup (?)
 vst_dec     db 16 dup (?)
 vst_tag     db 16 dup (?)
+g_editbuf   db MAX_ENTRY_BYTES dup (?)     ; scratch copy of an entry for `edit`
 
 .code
 
@@ -1022,6 +1025,493 @@ pl_out:
     FRAME_EPILOG
     ret
 print_label endp
+
+; ===========================================================================
+; vault_entry_len(rcx = entry ptr) -> rax = total entry length in bytes.  Leaf.
+; (id16 + created8 + modified8 + fcount4 + sum over fields of 6+len)
+; ===========================================================================
+vault_entry_len proc
+    lea     r10, [rcx+32]                   ; -> field_count
+    mov     r8d, dword ptr [r10]
+    add     r10, 4
+vel_loop:
+    test    r8d, r8d
+    jz      vel_done
+    mov     r9d, dword ptr [r10+2]          ; field len
+    add     r10, 6
+    add     r10, r9
+    dec     r8d
+    jmp     vel_loop
+vel_done:
+    sub     r10, rcx
+    mov     rax, r10
+    ret
+vault_entry_len endp
+
+; ===========================================================================
+; find_field_in(rcx = entry ptr, edx = field type) -> rax = value ptr (0 if
+;   absent), rdx = value len.  Leaf.
+; ===========================================================================
+find_field_in proc
+    lea     r10, [rcx+32]
+    mov     r8d, dword ptr [r10]
+    add     r10, 4
+ffi_loop:
+    test    r8d, r8d
+    jz      ffi_none
+    movzx   eax, word ptr [r10]
+    mov     r9d, dword ptr [r10+2]
+    cmp     eax, edx
+    jne     ffi_skip
+    lea     rax, [r10+6]
+    mov     rdx, r9
+    ret
+ffi_skip:
+    add     r10, 6
+    add     r10, r9
+    dec     r8d
+    jmp     ffi_loop
+ffi_none:
+    xor     eax, eax
+    xor     edx, edx
+    ret
+find_field_in endp
+
+; ===========================================================================
+; vault_find(rcx = match utf8 ptr, rdx = match len) -> rax = entry start ptr
+;   (0 if not found), rdx = entry length.  Matches on the TITLE field.
+; ===========================================================================
+vault_find proc frame
+    FRAME_PROLOG 96
+    ; [rbp-24]=match [rbp-32]=matchlen [rbp-40]=entry cursor [rbp-48]=entries
+    ; [rbp-56]=field cursor [rbp-64]=fields left
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], rdx
+    mov     r10, qword ptr [g_body_ptr]
+    mov     eax, dword ptr [r10]
+    mov     qword ptr [rbp-48], rax
+    lea     r10, [r10+4]
+    mov     qword ptr [rbp-40], r10
+vfn_entry:
+    cmp     qword ptr [rbp-48], 0
+    je      vfn_none
+    mov     r10, qword ptr [rbp-40]
+    add     r10, 32
+    mov     eax, dword ptr [r10]
+    mov     qword ptr [rbp-64], rax
+    add     r10, 4
+    mov     qword ptr [rbp-56], r10
+vfn_fl:
+    cmp     qword ptr [rbp-64], 0
+    je      vfn_nextentry
+    mov     r10, qword ptr [rbp-56]
+    movzx   eax, word ptr [r10]
+    mov     r8d, dword ptr [r10+2]
+    cmp     eax, VF_TITLE
+    jne     vfn_skip
+    mov     rax, qword ptr [rbp-32]
+    cmp     rax, r8
+    jne     vfn_skip
+    lea     rcx, [r10+6]
+    mov     rdx, qword ptr [rbp-24]
+    call    vault_memeq                     ; r8 = len
+    test    eax, eax
+    jnz     vfn_found
+vfn_skip:
+    mov     r10, qword ptr [rbp-56]
+    mov     r8d, dword ptr [r10+2]
+    add     r10, 6
+    add     r10, r8
+    mov     qword ptr [rbp-56], r10
+    dec     qword ptr [rbp-64]
+    jmp     vfn_fl
+vfn_nextentry:
+    mov     rcx, qword ptr [rbp-40]
+    call    vault_entry_len
+    add     qword ptr [rbp-40], rax
+    dec     qword ptr [rbp-48]
+    jmp     vfn_entry
+vfn_found:
+    mov     rcx, qword ptr [rbp-40]
+    call    vault_entry_len
+    mov     rdx, rax
+    mov     rax, qword ptr [rbp-40]
+    FRAME_EPILOG
+    ret
+vfn_none:
+    xor     eax, eax
+    xor     edx, edx
+    FRAME_EPILOG
+    ret
+vault_find endp
+
+; ===========================================================================
+; va_field_raw(rcx = type, rdx = src bytes, r8 = len) - append a TLV field with
+;   raw utf8 bytes at g_body[g_body_len].  Fastfails on overflow.  -> eax = 1.
+; ===========================================================================
+va_field_raw proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx         ; type
+    mov     qword ptr [rbp-32], rdx         ; src
+    mov     qword ptr [rbp-40], r8          ; len
+    mov     r10, qword ptr [g_body_len]
+    add     r10, 6
+    add     r10, r8
+    cmp     r10, VAULT_BODY_MAX
+    ja      vfr_of
+    mov     r11, qword ptr [g_body_ptr]
+    add     r11, qword ptr [g_body_len]
+    mov     rax, qword ptr [rbp-24]
+    mov     word ptr [r11], ax
+    mov     rax, qword ptr [rbp-40]
+    mov     dword ptr [r11+2], eax
+    add     r11, 6
+    mov     r9, qword ptr [rbp-32]
+    xor     r8, r8
+vfr_cp:
+    cmp     r8, qword ptr [rbp-40]
+    jae     vfr_done
+    mov     al, byte ptr [r9+r8]
+    mov     byte ptr [r11+r8], al
+    inc     r8
+    jmp     vfr_cp
+vfr_done:
+    mov     rax, qword ptr [g_body_len]
+    add     rax, 6
+    add     rax, qword ptr [rbp-40]
+    mov     qword ptr [g_body_len], rax
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+vfr_of:
+    FASTFAIL FF_BOUNDS
+va_field_raw endp
+
+; ===========================================================================
+; edit_field(rcx = type, rdx = override wide ptr) -> eax = field-count delta.
+;   If an override is supplied, append it (via va_field, wide->utf8); else keep
+;   the existing value from g_editbuf (via va_field_raw).
+; ===========================================================================
+edit_field proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx         ; type
+    mov     qword ptr [rbp-32], rdx         ; override
+    test    rdx, rdx
+    jz      ef_keep
+    mov     rcx, qword ptr [rbp-24]
+    mov     rdx, qword ptr [rbp-32]
+    call    va_field                        ; eax = 0/1
+    FRAME_EPILOG
+    ret
+ef_keep:
+    lea     rcx, [g_editbuf]
+    mov     edx, dword ptr [rbp-24]
+    call    find_field_in                   ; rax=ptr, rdx=len
+    test    rax, rax
+    jz      ef_none
+    mov     r8, rdx
+    mov     rdx, rax
+    mov     rcx, qword ptr [rbp-24]
+    call    va_field_raw
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+ef_none:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+edit_field endp
+
+; ===========================================================================
+; do_remove - unlock, delete the entry whose title matches --title, reseal.
+; ===========================================================================
+public do_remove
+do_remove proc frame
+    FRAME_PROLOG 80
+    ; [rbp-24]=result [rbp-32]=entry start [rbp-40]=entry len
+    cmp     qword ptr [g_cfg_title], 0
+    je      dr_noopt
+    mov     rcx, qword ptr [g_cfg_title]
+    lea     rdx, [g_match]
+    mov     r8d, CONV_CAP
+    call    conv_w2u
+    mov     qword ptr [g_matchlen], rax
+    call    vault_unlock
+    test    eax, eax
+    jnz     dr_err
+    lea     rcx, [g_match]
+    mov     rdx, qword ptr [g_matchlen]
+    call    vault_find
+    test    rax, rax
+    jz      dr_notfound
+    mov     qword ptr [rbp-32], rax
+    mov     qword ptr [rbp-40], rdx
+    ; memmove the tail over [start, start+len)
+    mov     r10, qword ptr [g_body_ptr]
+    add     r10, qword ptr [g_body_len]     ; body end
+    mov     r11, qword ptr [rbp-32]
+    add     r11, qword ptr [rbp-40]         ; src = start+len
+    sub     r10, r11                        ; n = bytes to move
+    mov     rcx, qword ptr [rbp-32]         ; dst = start
+    xor     r8, r8
+dr_mv:
+    cmp     r8, r10
+    jae     dr_mvdone
+    mov     al, byte ptr [r11+r8]
+    mov     byte ptr [rcx+r8], al
+    inc     r8
+    jmp     dr_mv
+dr_mvdone:
+    mov     rax, qword ptr [g_body_len]
+    sub     rax, qword ptr [rbp-40]
+    mov     qword ptr [g_body_len], rax
+    mov     r11, qword ptr [g_body_ptr]
+    dec     dword ptr [r11]                 ; entry_count--
+    lea     rcx, [g_hdr+VH_NONCE]
+    mov     edx, 12
+    call    rng_fill
+    test    eax, eax
+    jz      dr_oom
+    call    vault_seal_write
+    mov     dword ptr [rbp-24], eax
+    call    vault_lock
+    mov     eax, dword ptr [rbp-24]
+    test    eax, eax
+    jnz     dr_io
+    lea     rcx, [m_removed]
+    mov     edx, m_removed_len
+    call    print_a
+    mov     eax, EXIT_OK
+    FRAME_EPILOG
+    ret
+dr_notfound:
+    call    vault_lock
+    lea     rcx, [e_notfound]
+    mov     edx, e_notfound_len
+    call    print_a
+    mov     eax, EXIT_OK
+    FRAME_EPILOG
+    ret
+dr_noopt:
+    lea     rcx, [e_noopt]
+    mov     edx, e_noopt_len
+    call    print_err
+    mov     eax, EXIT_USAGE
+    FRAME_EPILOG
+    ret
+dr_io:
+    lea     rcx, [e_io]
+    mov     edx, e_io_len
+    call    print_err
+    mov     eax, EXIT_IO
+    FRAME_EPILOG
+    ret
+dr_oom:
+    call    vault_lock
+    lea     rcx, [e_oom]
+    mov     edx, e_oom_len
+    call    print_err
+    mov     eax, EXIT_OOM
+    FRAME_EPILOG
+    ret
+dr_err:
+    mov     dword ptr [rbp-24], eax
+    mov     ecx, eax
+    call    vault_print_err
+    mov     eax, dword ptr [rbp-24]
+    FRAME_EPILOG
+    ret
+do_remove endp
+
+; ===========================================================================
+; do_edit - unlock, replace the matching entry's fields (provided overrides
+; win; unspecified fields keep their existing value), reseal.  Title selects
+; the entry and is preserved; id/created carry over, modified is refreshed.
+; ===========================================================================
+public do_edit
+do_edit proc frame
+    FRAME_PROLOG 128
+    ; [rbp-24]=result [rbp-32]=old start [rbp-40]=old len
+    ; [rbp-48]=new entry start [rbp-56]=field count
+    cmp     qword ptr [g_cfg_title], 0
+    je      de_noopt
+    mov     rcx, qword ptr [g_cfg_title]
+    lea     rdx, [g_match]
+    mov     r8d, CONV_CAP
+    call    conv_w2u
+    mov     qword ptr [g_matchlen], rax
+    call    vault_unlock
+    test    eax, eax
+    jnz     de_err
+    lea     rcx, [g_match]
+    mov     rdx, qword ptr [g_matchlen]
+    call    vault_find
+    test    rax, rax
+    jz      de_notfound
+    mov     qword ptr [rbp-32], rax
+    mov     qword ptr [rbp-40], rdx
+    cmp     rdx, MAX_ENTRY_BYTES
+    ja      de_corrupt
+    ; copy old entry -> g_editbuf
+    mov     r9, rax
+    lea     r11, [g_editbuf]
+    xor     r8, r8
+de_cp:
+    cmp     r8, qword ptr [rbp-40]
+    jae     de_cpdone
+    mov     al, byte ptr [r9+r8]
+    mov     byte ptr [r11+r8], al
+    inc     r8
+    jmp     de_cp
+de_cpdone:
+    ; remove old entry from the body (memmove tail down)
+    mov     r10, qword ptr [g_body_ptr]
+    add     r10, qword ptr [g_body_len]
+    mov     r11, qword ptr [rbp-32]
+    add     r11, qword ptr [rbp-40]
+    sub     r10, r11
+    mov     rcx, qword ptr [rbp-32]
+    xor     r8, r8
+de_mv:
+    cmp     r8, r10
+    jae     de_mvdone
+    mov     al, byte ptr [r11+r8]
+    mov     byte ptr [rcx+r8], al
+    inc     r8
+    jmp     de_mv
+de_mvdone:
+    mov     rax, qword ptr [g_body_len]
+    sub     rax, qword ptr [rbp-40]
+    mov     qword ptr [g_body_len], rax
+    mov     r11, qword ptr [g_body_ptr]
+    dec     dword ptr [r11]
+    ; --- append the rebuilt entry at the new end ---
+    mov     r11, qword ptr [g_body_ptr]
+    add     r11, qword ptr [g_body_len]
+    mov     qword ptr [rbp-48], r11
+    mov     rax, qword ptr [g_body_len]
+    add     rax, 36
+    cmp     rax, VAULT_BODY_MAX
+    ja      de_full
+    ; id (16) + created (8) carried over from g_editbuf
+    lea     r10, [g_editbuf]
+    xor     r8, r8
+de_idcpy:
+    mov     al, byte ptr [r10+r8]
+    mov     byte ptr [r11+r8], al
+    inc     r8
+    cmp     r8, 16
+    jb      de_idcpy
+    mov     rax, qword ptr [r10+16]
+    mov     qword ptr [r11+16], rax         ; created
+    ; modified = now
+    lea     rcx, [g_ts]
+    call    GetSystemTimeAsFileTime
+    mov     r11, qword ptr [rbp-48]
+    mov     rax, qword ptr [g_ts]
+    mov     qword ptr [r11+24], rax
+    mov     dword ptr [r11+32], 0           ; field_count placeholder
+    mov     rax, qword ptr [g_body_len]
+    add     rax, 36
+    mov     qword ptr [g_body_len], rax
+    ; merge fields (title kept; others: override else existing)
+    mov     dword ptr [rbp-56], 0
+    mov     ecx, VF_TITLE
+    xor     edx, edx
+    call    edit_field
+    add     dword ptr [rbp-56], eax
+    mov     ecx, VF_USERNAME
+    mov     rdx, qword ptr [g_cfg_user]
+    call    edit_field
+    add     dword ptr [rbp-56], eax
+    mov     ecx, VF_SECRET
+    mov     rdx, qword ptr [g_cfg_secret]
+    call    edit_field
+    add     dword ptr [rbp-56], eax
+    mov     ecx, VF_URL
+    mov     rdx, qword ptr [g_cfg_url]
+    call    edit_field
+    add     dword ptr [rbp-56], eax
+    mov     ecx, VF_NOTES
+    mov     rdx, qword ptr [g_cfg_notes]
+    call    edit_field
+    add     dword ptr [rbp-56], eax
+    ; patch field_count and bump entry_count
+    mov     r11, qword ptr [rbp-48]
+    mov     eax, dword ptr [rbp-56]
+    mov     dword ptr [r11+32], eax
+    mov     r11, qword ptr [g_body_ptr]
+    inc     dword ptr [r11]
+    lea     rcx, [g_hdr+VH_NONCE]
+    mov     edx, 12
+    call    rng_fill
+    test    eax, eax
+    jz      de_oom
+    call    vault_seal_write
+    mov     dword ptr [rbp-24], eax
+    call    vault_lock
+    mov     eax, dword ptr [rbp-24]
+    test    eax, eax
+    jnz     de_io
+    lea     rcx, [m_updated]
+    mov     edx, m_updated_len
+    call    print_a
+    mov     eax, EXIT_OK
+    FRAME_EPILOG
+    ret
+de_notfound:
+    call    vault_lock
+    lea     rcx, [e_notfound]
+    mov     edx, e_notfound_len
+    call    print_a
+    mov     eax, EXIT_OK
+    FRAME_EPILOG
+    ret
+de_noopt:
+    lea     rcx, [e_noopt]
+    mov     edx, e_noopt_len
+    call    print_err
+    mov     eax, EXIT_USAGE
+    FRAME_EPILOG
+    ret
+de_full:
+    call    vault_lock
+    lea     rcx, [e_full]
+    mov     edx, e_full_len
+    call    print_err
+    mov     eax, EXIT_NOSPACE
+    FRAME_EPILOG
+    ret
+de_corrupt:
+    call    vault_lock
+    mov     ecx, EXIT_CORRUPT
+    call    vault_print_err
+    mov     eax, EXIT_CORRUPT
+    FRAME_EPILOG
+    ret
+de_io:
+    lea     rcx, [e_io]
+    mov     edx, e_io_len
+    call    print_err
+    mov     eax, EXIT_IO
+    FRAME_EPILOG
+    ret
+de_oom:
+    call    vault_lock
+    lea     rcx, [e_oom]
+    mov     edx, e_oom_len
+    call    print_err
+    mov     eax, EXIT_OOM
+    FRAME_EPILOG
+    ret
+de_err:
+    mov     dword ptr [rbp-24], eax
+    mov     ecx, eax
+    call    vault_print_err
+    mov     eax, dword ptr [rbp-24]
+    FRAME_EPILOG
+    ret
+do_edit endp
 
 ; ===========================================================================
 ; vault_selftest() -> eax = 0 on success, 1 on failure.
