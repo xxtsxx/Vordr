@@ -13,14 +13,16 @@
 
 include macros.inc
 
-extern RegGetValueW:proc
+extern RegOpenKeyExW:proc
+extern RegQueryValueExW:proc
 extern RegCreateKeyExW:proc
 extern RegSetValueExW:proc
 extern RegCloseKey:proc
 extern SHGetFolderPathW:proc
 
-RRF_RT_REG_SZ   equ 2
 REG_SZ          equ 1
+REG_DWORD       equ 4
+KEY_READ        equ 20019h
 KEY_WRITE       equ 20006h
 CSIDL_PERSONAL  equ 5
 
@@ -39,39 +41,172 @@ g_hkcu  dq 080000001h            ; HKEY_CURRENT_USER
 
 .data?
 g_cfg_cb    dd ?                 ; RegGetValue/Set byte count
+g_cfg_dw    dd ?                 ; REG_DWORD value scratch
 g_cfg_khan  dq ?                 ; open key handle
 
 .code
+
+; ===========================================================================
+; reg_query_sz(rcx=hkey, rdx=value name, r8=dst, r9d=cap bytes) -> eax = 1 if
+;   the SOFTWARE\Vordr value was read into dst, else 0.  Opens + queries +
+;   closes the key (RegOpenKeyExW fails cleanly when the key is absent).
+; ===========================================================================
+reg_query_sz proc frame
+    FRAME_PROLOG 80
+    mov     qword ptr [rbp-16], rcx          ; hkey
+    mov     qword ptr [rbp-24], rdx          ; value name
+    mov     qword ptr [rbp-32], r8           ; dst
+    mov     dword ptr [rbp-40], r9d          ; cap bytes
+    WINCALL RegOpenKeyExW, qword ptr [rbp-16], addr cfg_subkey, 0, KEY_READ, addr g_cfg_khan
+    test    eax, eax
+    jnz     qsz_no
+    mov     eax, dword ptr [rbp-40]
+    mov     dword ptr [g_cfg_cb], eax
+    WINCALL RegQueryValueExW, qword ptr [g_cfg_khan], qword ptr [rbp-24], 0, 0, \
+            qword ptr [rbp-32], addr g_cfg_cb
+    mov     dword ptr [rbp-48], eax
+    WINCALL RegCloseKey, qword ptr [g_cfg_khan]
+    cmp     dword ptr [rbp-48], 0
+    jne     qsz_no
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+qsz_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+reg_query_sz endp
+
+; ===========================================================================
+; reg_query_dw(rcx=hkey, rdx=value name, r8=*out dword) -> eax = 1 if read.
+; ===========================================================================
+reg_query_dw proc frame
+    FRAME_PROLOG 80
+    mov     qword ptr [rbp-16], rcx          ; hkey
+    mov     qword ptr [rbp-24], rdx          ; value name
+    mov     qword ptr [rbp-32], r8           ; *out
+    WINCALL RegOpenKeyExW, qword ptr [rbp-16], addr cfg_subkey, 0, KEY_READ, addr g_cfg_khan
+    test    eax, eax
+    jnz     qdw_no
+    mov     dword ptr [g_cfg_cb], 4
+    WINCALL RegQueryValueExW, qword ptr [g_cfg_khan], qword ptr [rbp-24], 0, 0, \
+            addr g_cfg_dw, addr g_cfg_cb
+    mov     dword ptr [rbp-40], eax
+    WINCALL RegCloseKey, qword ptr [g_cfg_khan]
+    cmp     dword ptr [rbp-40], 0
+    jne     qdw_no
+    mov     rax, qword ptr [rbp-32]
+    mov     ecx, dword ptr [g_cfg_dw]
+    mov     dword ptr [rax], ecx
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+qdw_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+reg_query_dw endp
+
+; ===========================================================================
+; cfg_get_dword(rcx=value name, edx=default, r8=*locked) -> eax = value.
+;   HKLM wins (and sets *locked=1, since it is admin policy); else HKCU
+;   (*locked=0); else the supplied default (*locked=0).  *locked may be 0/NULL.
+; ===========================================================================
+public cfg_get_dword
+cfg_get_dword proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx          ; value name
+    mov     dword ptr [rbp-32], edx          ; default
+    mov     qword ptr [rbp-40], r8           ; *locked
+    ; --- HKLM (policy) ---
+    mov     rcx, qword ptr [g_hklm]
+    mov     rdx, qword ptr [rbp-24]
+    lea     r8, [g_cfg_dw]
+    call    reg_query_dw
+    test    eax, eax
+    jz      cgd_hkcu
+    mov     rax, qword ptr [rbp-40]
+    test    rax, rax
+    jz      cgd_hklm_val
+    mov     dword ptr [rax], 1               ; locked = 1
+cgd_hklm_val:
+    mov     eax, dword ptr [g_cfg_dw]
+    FRAME_EPILOG
+    ret
+cgd_hkcu:
+    mov     rax, qword ptr [rbp-40]
+    test    rax, rax
+    jz      cgd_hkcu_q
+    mov     dword ptr [rax], 0               ; not locked
+cgd_hkcu_q:
+    mov     rcx, qword ptr [g_hkcu]
+    mov     rdx, qword ptr [rbp-24]
+    lea     r8, [g_cfg_dw]
+    call    reg_query_dw
+    test    eax, eax
+    jz      cgd_def
+    mov     eax, dword ptr [g_cfg_dw]
+    FRAME_EPILOG
+    ret
+cgd_def:
+    mov     eax, dword ptr [rbp-32]
+    FRAME_EPILOG
+    ret
+cfg_get_dword endp
+
+; ===========================================================================
+; cfg_set_dword_hkcu(rcx=value name, edx=value) -> eax = 1/0.
+; ===========================================================================
+public cfg_set_dword_hkcu
+cfg_set_dword_hkcu proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx
+    mov     eax, edx
+    mov     dword ptr [g_cfg_dw], eax
+    WINCALL RegCreateKeyExW, qword ptr [g_hkcu], addr cfg_subkey, 0, 0, 0, \
+            KEY_WRITE, 0, addr g_cfg_khan, 0
+    test    eax, eax
+    jnz     csd_fail
+    WINCALL RegSetValueExW, qword ptr [g_cfg_khan], qword ptr [rbp-24], 0, \
+            REG_DWORD, addr g_cfg_dw, 4
+    mov     dword ptr [rbp-32], eax
+    WINCALL RegCloseKey, qword ptr [g_cfg_khan]
+    cmp     dword ptr [rbp-32], 0
+    jne     csd_fail
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+csd_fail:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+cfg_set_dword_hkcu endp
 
 ; ===========================================================================
 ; reg_load_vault(rcx=dst wide, edx=cap chars) -> eax = 1 if found (HKLM>HKCU).
 ; ===========================================================================
 public reg_load_vault
 reg_load_vault proc frame
-    FRAME_PROLOG 96
+    FRAME_PROLOG 48
     mov     qword ptr [rbp-24], rcx          ; dst
     mov     dword ptr [rbp-32], edx          ; cap (chars)
     ; --- HKLM ---
-    mov     eax, dword ptr [rbp-32]
-    shl     eax, 1                           ; bytes
-    mov     dword ptr [g_cfg_cb], eax
-    WINCALL RegGetValueW, qword ptr [g_hklm], addr cfg_subkey, addr cfg_value, \
-            RRF_RT_REG_SZ, 0, qword ptr [rbp-24], addr g_cfg_cb
+    mov     rcx, qword ptr [g_hklm]
+    lea     rdx, [cfg_value]
+    mov     r8, qword ptr [rbp-24]
+    mov     r9d, dword ptr [rbp-32]
+    shl     r9d, 1
+    call    reg_query_sz
     test    eax, eax
-    jz      rlv_yes
+    jnz     rlv_done
     ; --- HKCU ---
-    mov     eax, dword ptr [rbp-32]
-    shl     eax, 1
-    mov     dword ptr [g_cfg_cb], eax
-    WINCALL RegGetValueW, qword ptr [g_hkcu], addr cfg_subkey, addr cfg_value, \
-            RRF_RT_REG_SZ, 0, qword ptr [rbp-24], addr g_cfg_cb
-    test    eax, eax
-    jz      rlv_yes
-    xor     eax, eax
-    FRAME_EPILOG
-    ret
-rlv_yes:
-    mov     eax, 1
+    mov     rcx, qword ptr [g_hkcu]
+    lea     rdx, [cfg_value]
+    mov     r8, qword ptr [rbp-24]
+    mov     r9d, dword ptr [rbp-32]
+    shl     r9d, 1
+    call    reg_query_sz
+rlv_done:
     FRAME_EPILOG
     ret
 reg_load_vault endp

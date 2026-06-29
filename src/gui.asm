@@ -50,8 +50,13 @@ extern vault_tpm_has:proc
 extern reg_load_vault:proc
 extern reg_save_vault:proc
 extern cfg_default_vault:proc
+extern cfg_get_dword:proc
+extern cfg_set_dword_hkcu:proc
+extern check_password_policy:proc
 
 externdef g_use_tpm:dword
+externdef g_cfg_pwminlen:dword
+externdef g_cfg_pwminclasses:dword
 externdef g_cfg_in:qword
 externdef g_cfg_pass:byte
 externdef g_cfg_title:qword
@@ -84,6 +89,10 @@ extern SetTimer:proc
 extern KillTimer:proc
 extern MultiByteToWideChar:proc
 extern IsDlgButtonChecked:proc
+extern EnableWindow:proc
+extern GetDlgItem:proc
+extern SetDlgItemInt:proc
+extern GetDlgItemInt:proc
 
 ; ---- constants ---------------------------------------------------------------
 MB_OK               equ 0
@@ -146,6 +155,13 @@ IDC_E_SECRET equ 303
 IDC_E_URL    equ 304
 IDC_E_NOTES  equ 305
 IDC_E_TOTP   equ 306
+DLG_CREATE   equ 400
+IDC_C_PATH   equ 401
+IDC_C_PW     equ 402
+IDC_C_PW2    equ 403
+IDC_C_LEN    equ 404
+IDC_C_CLS    equ 405
+IDC_C_STATUS equ 406
 
 OFN_OVERWRITEPROMPT equ 2
 OFN_HIDEREADONLY    equ 4
@@ -204,6 +220,12 @@ WSTR s_notitle,     <An entry needs a title.>
 WSTR s_full,        <Vault is full.>
 WSTR s_resealfail,  <Saved in memory but writing to disk failed.>
 WSTR s_firstrun,    <No vault yet - set a master password to create your default vault.>
+WSTR s_pwmismatch,  <The passwords do not match.>
+WSTR s_pwshort,     <Password is too short for the current policy.>
+WSTR s_pwclasses,   <Password needs more character types (lowercase / uppercase / number / symbol).>
+WSTR s_pollocked,   <Password policy is set by your administrator and cannot be changed here.>
+WSTR wv_pwlen,      <PwMinLen>
+WSTR wv_pwcls,      <PwMinClasses>
 WSTR s_tpmnone,     <No Windows Hello / TPM unlock saved for this vault on this PC.>
 WSTR s_tpmfail,     <Windows Hello / TPM unlock failed - use your master password.>
 WSTR s_tpmsaved,    <This device can now unlock the vault with Windows Hello / TPM.>
@@ -231,6 +253,8 @@ g_hinst     dq ?
 g_vpath_set dd ?
 g_create    dd ?
 g_is_default dd ?                     ; 1 = auto-created default vault (register it)
+g_pol_len_lock dd ?                   ; 1 = min-length set by HKLM policy (locked)
+g_pol_cls_lock dd ?                   ; 1 = min-classes set by HKLM policy (locked)
 g_revealed  dd ?
 g_clip_seq  dd ?                      ; clipboard sequence number at last copy
 g_e_edit    dd ?
@@ -238,6 +262,7 @@ g_e_idx     dd ?
 align 2
 g_vpath     dw 1024 dup (?)        ; chosen vault path (wide, NUL-terminated)
 g_pwbuf     dw 1024 dup (?)        ; password field (wide; wiped after use)
+g_pw2buf    dw 1024 dup (?)        ; confirm-password field (wide; wiped)
 g_conv_w    dw EBUF*2 dup (?)      ; utf8 -> wide display scratch
 g_secret_w  dw EBUF*2 dup (?)      ; current selected secret (wide) for reveal/copy
 g_e_title   dw 1024 dup (?)
@@ -397,25 +422,6 @@ gu_havepw:
 gu_pwok:
     lea     rax, [g_vpath]
     mov     qword ptr [g_cfg_in], rax
-    ; create mode: build a fresh empty vault first
-    cmp     dword ptr [g_create], 0
-    je      gu_open
-    call    do_init
-    test    eax, eax
-    jnz     gu_createfail
-    mov     dword ptr [g_create], 0          ; created -> open mode from now on
-    cmp     dword ptr [g_is_default], 0
-    je      gu_open
-    lea     rcx, [g_vpath]                   ; persist the default path to HKCU
-    call    reg_save_vault
-    mov     dword ptr [g_is_default], 0
-    jmp     gu_open
-gu_createfail:
-    call    gui_wipepw
-    mov     rcx, qword ptr [rbp-24]
-    lea     rdx, [s_createfail]
-    call    gui_status
-    jmp     gu_done
 gu_open:
     call    vault_unlock                    ; eax = 0 / EXIT_*
     mov     dword ptr [rbp-32], eax
@@ -551,6 +557,14 @@ up_new:
     mov     rcx, qword ptr [rbp-8]
     mov     edx, 1
     call    gui_browse
+    cmp     dword ptr [g_create], 0          ; a path was picked -> go to create
+    je      up_new_stay
+    sub     rsp, 32
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, 2                           ; signal gui_main: show create dialog
+    call    EndDialog
+    add     rsp, 32
+up_new_stay:
     mov     eax, 1
     jmp     up_ret
 up_unlock:
@@ -1295,6 +1309,279 @@ gui_clrwbuf endp
 ; gui_main - GUI front-end: unlock dialog, then the vault dialog, looping back
 ;   to the unlock screen when the vault is locked.
 ; =============================================================================
+; gui_load_policy() - load the password policy into g_cfg_pwminlen /
+;   g_cfg_pwminclasses (HKLM policy wins, then HKCU, then 12 / 3) and record
+;   whether each came from HKLM (locked).
+gui_load_policy proc frame
+    FRAME_PROLOG 32
+    lea     rcx, [wv_pwlen]
+    mov     edx, 12
+    lea     r8, [g_pol_len_lock]
+    call    cfg_get_dword
+    cmp     eax, 1
+    jae     @F
+    mov     eax, 12
+@@: cmp     eax, 256
+    jbe     @F
+    mov     eax, 256
+@@: mov     dword ptr [g_cfg_pwminlen], eax
+    lea     rcx, [wv_pwcls]
+    mov     edx, 3
+    lea     r8, [g_pol_cls_lock]
+    call    cfg_get_dword
+    cmp     eax, 1
+    jae     @F
+    mov     eax, 3
+@@: cmp     eax, 4
+    jbe     @F
+    mov     eax, 4
+@@: mov     dword ptr [g_cfg_pwminclasses], eax
+    FRAME_EPILOG
+    ret
+gui_load_policy endp
+
+; gui_pw_match() -> eax = 1 if g_pwbuf == g_pw2buf (wide, NUL-terminated).
+gui_pw_match proc
+    lea     r10, [g_pwbuf]
+    lea     r11, [g_pw2buf]
+    xor     ecx, ecx
+pm_loop:
+    movzx   eax, word ptr [r10+rcx*2]
+    movzx   edx, word ptr [r11+rcx*2]
+    cmp     eax, edx
+    jne     pm_no
+    test    eax, eax
+    jz      pm_yes
+    inc     ecx
+    jmp     pm_loop
+pm_no:
+    xor     eax, eax
+    ret
+pm_yes:
+    mov     eax, 1
+    ret
+gui_pw_match endp
+
+; gui_wipepw_create() - scrub both wide password buffers.
+gui_wipepw_create proc frame
+    FRAME_PROLOG 32
+    lea     rcx, [g_pwbuf]
+    mov     edx, 1024*2
+    call    secure_zero
+    lea     rcx, [g_pw2buf]
+    mov     edx, 1024*2
+    call    secure_zero
+    FRAME_EPILOG
+    ret
+gui_wipepw_create endp
+
+; gui_create_do(rcx = hdlg) -> eax = 1 if the vault was created + unlocked
+;   (close the dialog), else 0 (an error message was shown, stay open).
+gui_create_do proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx          ; hdlg
+    ; read password + confirm
+    WINCALL GetDlgItemTextW, qword ptr [rbp-24], IDC_C_PW, addr g_pwbuf, 1024
+    test    eax, eax
+    jnz     cd_havepw
+    lea     rax, [s_nopw]
+    mov     qword ptr [rbp-56], rax
+    jmp     cd_status
+cd_havepw:
+    WINCALL GetDlgItemTextW, qword ptr [rbp-24], IDC_C_PW2, addr g_pw2buf, 1024
+    call    gui_pw_match
+    test    eax, eax
+    jnz     cd_match
+    lea     rax, [s_pwmismatch]
+    mov     qword ptr [rbp-56], rax
+    jmp     cd_status
+cd_match:
+    ; adopt any user-edited policy values (editable fields only)
+    cmp     dword ptr [g_pol_len_lock], 0
+    jne     cd_len_done
+    WINCALL GetDlgItemInt, qword ptr [rbp-24], IDC_C_LEN, 0, 0
+    test    eax, eax
+    jz      cd_len_done
+    cmp     eax, 256
+    jbe     @F
+    mov     eax, 256
+@@: mov     dword ptr [g_cfg_pwminlen], eax
+cd_len_done:
+    cmp     dword ptr [g_pol_cls_lock], 0
+    jne     cd_cls_done
+    WINCALL GetDlgItemInt, qword ptr [rbp-24], IDC_C_CLS, 0, 0
+    test    eax, eax
+    jz      cd_cls_done
+    cmp     eax, 4
+    jbe     @F
+    mov     eax, 4
+@@: mov     dword ptr [g_cfg_pwminclasses], eax
+cd_cls_done:
+    ; password -> utf8, then enforce the policy
+    lea     rcx, [g_pwbuf]
+    call    password_to_utf8
+    test    eax, eax
+    jnz     cd_pwok
+    lea     rax, [s_badpw]
+    mov     qword ptr [rbp-56], rax
+    jmp     cd_status
+cd_pwok:
+    call    check_password_policy           ; 0 ok / 1 short / 2 few classes
+    cmp     eax, 0
+    je      cd_polok
+    cmp     eax, 1
+    jne     @F
+    lea     rax, [s_pwshort]
+    mov     qword ptr [rbp-56], rax
+    jmp     cd_status
+@@: lea     rax, [s_pwclasses]
+    mov     qword ptr [rbp-56], rax
+    jmp     cd_status
+cd_polok:
+    lea     rax, [g_vpath]
+    mov     qword ptr [g_cfg_in], rax
+    call    do_init
+    test    eax, eax
+    jz      cd_created
+    lea     rax, [s_createfail]
+    mov     qword ptr [rbp-56], rax
+    jmp     cd_status
+cd_created:
+    ; persist the default vault path, and any editable policy values, to HKCU
+    cmp     dword ptr [g_is_default], 0
+    je      cd_savepol
+    lea     rcx, [g_vpath]
+    call    reg_save_vault
+    mov     dword ptr [g_is_default], 0
+cd_savepol:
+    cmp     dword ptr [g_pol_len_lock], 0
+    jne     cd_savecls
+    lea     rcx, [wv_pwlen]
+    mov     edx, dword ptr [g_cfg_pwminlen]
+    call    cfg_set_dword_hkcu
+cd_savecls:
+    cmp     dword ptr [g_pol_cls_lock], 0
+    jne     cd_open
+    lea     rcx, [wv_pwcls]
+    mov     edx, dword ptr [g_cfg_pwminclasses]
+    call    cfg_set_dword_hkcu
+cd_open:
+    ; unlock the freshly created vault for the vault window
+    mov     dword ptr [g_use_tpm], 0
+    call    vault_unlock
+    test    eax, eax
+    jz      cd_done
+    lea     rax, [s_createfail]
+    mov     qword ptr [rbp-56], rax
+    jmp     cd_status
+cd_done:
+    mov     dword ptr [g_create], 0
+    call    gui_wipepw
+    call    gui_wipepw_create
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cd_status:
+    call    gui_wipepw_create
+    mov     r8, qword ptr [rbp-56]
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_C_STATUS, r8
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gui_create_do endp
+
+; =============================================================================
+; create_proc - DLG_CREATE dialog procedure (raw frame; OS callback).
+;   rcx=hdlg rdx=msg r8=wParam r9=lParam -> rax = BOOL handled
+; =============================================================================
+create_proc proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 64
+    mov     qword ptr [rbp-8], rcx
+    cmp     rdx, WM_INITDIALOG
+    je      cp_init
+    cmp     rdx, WM_COMMAND
+    je      cp_cmd
+    xor     eax, eax
+    jmp     cp_ret
+cp_init:
+    sub     rsp, 32
+    mov     rcx, qword ptr [rbp-8]           ; show the path being created
+    mov     edx, IDC_C_PATH
+    lea     r8, [g_vpath]
+    call    SetDlgItemTextW
+    mov     rcx, qword ptr [rbp-8]           ; prefill policy fields
+    mov     edx, IDC_C_LEN
+    mov     r8d, dword ptr [g_cfg_pwminlen]
+    xor     r9d, r9d
+    call    SetDlgItemInt
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_C_CLS
+    mov     r8d, dword ptr [g_cfg_pwminclasses]
+    xor     r9d, r9d
+    call    SetDlgItemInt
+    ; disable policy fields that are locked by HKLM
+    cmp     dword ptr [g_pol_len_lock], 0
+    je      cp_len_ok
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_C_LEN
+    call    GetDlgItem
+    mov     rcx, rax
+    xor     edx, edx
+    call    EnableWindow
+cp_len_ok:
+    cmp     dword ptr [g_pol_cls_lock], 0
+    je      cp_cls_ok
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_C_CLS
+    call    GetDlgItem
+    mov     rcx, rax
+    xor     edx, edx
+    call    EnableWindow
+cp_cls_ok:
+    add     rsp, 32
+    mov     eax, dword ptr [g_pol_len_lock]
+    or      eax, dword ptr [g_pol_cls_lock]
+    jz      cp_init_done
+    WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_C_STATUS, addr s_pollocked
+cp_init_done:
+    mov     eax, 1
+    jmp     cp_ret
+cp_cmd:
+    movzx   eax, r8w
+    cmp     eax, IDOK
+    je      cp_ok
+    cmp     eax, IDCANCEL
+    je      cp_cancel
+    xor     eax, eax
+    jmp     cp_ret
+cp_ok:
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_create_do
+    test    eax, eax
+    jz      cp_handled                      ; error shown, stay open
+    sub     rsp, 32
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, 1
+    call    EndDialog
+    add     rsp, 32
+cp_handled:
+    mov     eax, 1
+    jmp     cp_ret
+cp_cancel:
+    sub     rsp, 32
+    mov     rcx, qword ptr [rbp-8]
+    xor     edx, edx
+    call    EndDialog
+    add     rsp, 32
+    mov     eax, 1
+cp_ret:
+    mov     rsp, rbp
+    pop     rbp
+    ret
+create_proc endp
+
 ; gui_resolve_vault() - pick the vault path from the registry (HKLM>HKCU), or
 ;   fall back to a default Documents\vault.vordr that the first unlock creates.
 ;   Sets g_vpath / g_vpath_set / g_create / g_is_default.
@@ -1354,6 +1641,7 @@ gui_main proc frame
     FRAME_PROLOG 32
     WINCALL GetModuleHandleW, 0
     mov     qword ptr [g_hinst], rax
+    call    gui_load_policy                 ; min length / classes (HKLM>HKCU>def)
     call    gui_resolve_vault               ; registry path, or default to create
     ; startup shortcut: an existing vault with a TPM sidecar unlocks silently
     cmp     dword ptr [g_create], 0
@@ -1362,9 +1650,20 @@ gui_main proc frame
     test    eax, eax
     jnz     gm_vault
 gm_loop:
-    WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_UNLOCK, 0, addr unlock_proc, 0
+    cmp     dword ptr [g_create], 0
+    je      gm_unlock
+    ; create mode (first run or "Create new...")
+    WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_CREATE, 0, addr create_proc, 0
     cmp     rax, 1
     jne     gm_done                         ; cancelled -> exit
+    jmp     gm_vault
+gm_unlock:
+    WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_UNLOCK, 0, addr unlock_proc, 0
+    cmp     rax, 1
+    je      gm_vault
+    cmp     rax, 2                          ; "Create new..." -> switch to create
+    je      gm_loop
+    jmp     gm_done                         ; cancelled -> exit
 gm_vault:
     WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_VAULT, 0, addr vault_proc, 0
     call    vault_lock                      ; wipe body + key on close
