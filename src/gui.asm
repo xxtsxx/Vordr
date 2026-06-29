@@ -45,7 +45,7 @@ CSTR c_stfail,  "SELFTEST FAILURE - refusing to run",13,10
 ; (WSTR text may not contain commas; keep these comma-free single lines.)
 WSTR t_vordr,   <Vordr>
 WSTR t_err,     <Vordr - error>
-WSTR m_about,   <Vordr - hardened password manager (scaffold build). Run vordr selftest in a terminal.>
+WSTR m_about,   <Vordr - hardened password manager. The vault and password generator are reached only here in the GUI (in progress) - never on the command line. CLI is diagnostics only: vordr selftest / vordr bench.>
 WSTR m_nocpu,   <This CPU lacks required features (AES-NI / PCLMULQDQ / SSE4.1) - cannot run.>
 WSTR m_stfail,  <Self-test FAILED - refusing to run. The binary may be corrupt.>
 

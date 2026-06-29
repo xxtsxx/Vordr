@@ -12,12 +12,16 @@ the OS-inbox DLLs `kernel32`, `bcrypt`, and `user32`. Every cryptographic
 primitive is validated against an official RFC/NIST test vector on **every
 launch**, and the program **fails closed** on any violation.
 
-> **Status: v0.1 — all commands functional.** The vault
-> (`init`/`add`/`list`/`get`/`edit`/`remove`, single-file, atomic writes), the
-> `gen` password generator, `bench`, and the per-launch self-test gate (10
-> known-answer tests). See [docs/formats.md](docs/formats.md) for the on-disk
-> format and the security model. Not yet hardened for production: no external
-> review, no GUI vault panes, single-process file locking only.
+> **Status: v0.1 — GUI-first; CLI is diagnostics only.** By design, **no master
+> password or secret is ever passed on the command line** (where it would leak
+> into shell history and process listings) — the vault and the password
+> generator are reached only through the GUI. The vault crypto and operations
+> (create / add / list / get / edit / remove, single-file, atomic writes), the
+> generator, and the per-launch self-test gate (10 known-answer tests) are all
+> implemented and self-tested; the command line exposes only `selftest` and
+> `bench`. **Caveat:** the GUI vault front-end is still in progress (today the
+> window is an About box), so there is not yet an interactive way to drive the
+> vault. No external review; single-process file locking only.
 
 ## Design goals
 
@@ -53,28 +57,20 @@ SDK lib path is set near the top of `build.cmd`.
 
 ## Usage
 
-`vordr.exe` is one executable that runs as a **CLI** when the first argument is
-a known verb (or begins with `-`), and otherwise opens the **GUI**.
+`vordr.exe` opens the **GUI** when launched with no arguments. The vault and the
+password generator are reached **only** through that window — so that a master
+password or a secret is never placed in `argv`, where it would persist in shell
+history and be visible to any process that can read the process list.
+
+The **command line is deliberately limited to non-sensitive diagnostics**:
 
 ```
-  vault:   vordr init | add | get | list | edit | remove
-  pwgen:   vordr gen
-  diag:    vordr selftest | bench
+  vordr selftest             run all known-answer self-tests
+  vordr bench [-m MIB] [-t N] benchmark the crypto core
 ```
 
-Each vault command takes the vault path and the master password:
-
-```
-  vordr init   vault.vordr -p MASTER [-m MIB]
-  vordr add    vault.vordr -p MASTER --title gmail --user me --secret s3cr3t
-  vordr list   vault.vordr -p MASTER
-  vordr get    vault.vordr -p MASTER --title gmail
-  vordr edit   vault.vordr -p MASTER --title gmail --secret newpass
-  vordr remove vault.vordr -p MASTER --title gmail
-  vordr gen    [--len N] [--count N] [--no-symbols]
-```
-
-Every launch runs the self-test gate first and aborts (`EXIT_SELFTEST`) if any
+It accepts no vault path, no master password, and no secret. Every launch (GUI
+or CLI) runs the self-test gate first and aborts (`EXIT_SELFTEST`) if any
 known-answer test mismatches.
 
 ## Module map
