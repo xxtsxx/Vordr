@@ -36,13 +36,6 @@ extern iat_lockdown:proc
 extern secure_zero:proc
 extern run_selftest:proc
 extern log_result:proc
-extern pwgen:proc                       ; password generator (pwgen.asm)
-extern do_init:proc                     ; vault commands (vault.asm)
-extern do_add:proc
-extern do_list:proc
-extern do_get:proc
-extern do_edit:proc                     ; vault edit/remove (vault.asm)
-extern do_remove:proc
 extern do_bench:proc                    ; benchmark (bench.asm)
 ifdef DBG_TRACE
 extern cmd_redteam:proc                 ; fault-injection self-test (redteam.asm)
@@ -73,22 +66,12 @@ g_cfg_t         dd ARGON2_DEF_T
 g_cfg_m         dd ARGON2_DEF_M_KIB
 g_cfg_pwminlen      dd 12           ; password policy: min length (code points)
 g_cfg_pwminclasses  dd 3            ; password policy: min distinct char classes
-public g_cfg_compress, g_cfg_compress_set
-g_cfg_compress      dd 0            ; pack: 0 = store, 1 = XPRESS compress
-g_cfg_compress_set  dd 0            ; 0 = use the size-based default; 1 = explicit
-public g_cfg_json
-g_cfg_json          dd 0            ; hash: 1 = emit JSON instead of text
 public g_cfg_loglevel
 g_cfg_loglevel      dd 0            ; log verbosity (0 = none/off by default; see log.asm)
 public g_cfg_logfile
 g_cfg_logfile       dq 0            ; --log-file PATH override (0 = default path)
 
-; --- password generator (`gen`) options ----------------------------------
-public g_cfg_genlen, g_cfg_gencount, g_cfg_genclasses
-g_cfg_genlen        dd 20               ; --len   N   (1..256)
-g_cfg_gencount      dd 1                ; --count N   (1..100)
-g_cfg_genclasses    dd 15               ; class mask (1=U 2=L 4=D 8=S); --no-symbols clears bit 8
-; --- vault entry fields (wide pointers into g_argbuf; 0 = not supplied) ---
+; --- vault entry fields (populated by the GUI; the CLI never accepts secrets) --
 public g_cfg_title, g_cfg_user, g_cfg_secret, g_cfg_url, g_cfg_notes
 g_cfg_title         dq 0
 g_cfg_user          dq 0
@@ -103,68 +86,38 @@ g_argbuf        dw ARGBUF_CHARS dup (?)
 g_cfg_pass      db MAX_PASSWORD_BYTES+1 dup (?)
 g_positionals   dq MAX_ARGS dup (?)  ; -> UTF-16 positional argument strings
 g_poscount      dq ?                 ; number of positionals
-g_genbuf        db 257 dup (?)       ; password-generator output (max 256 + slack)
 
 ; -----------------------------------------------------------------------------
 .const
 msg_usage label byte
     db "Vordr - hardened password manager (AES-256-GCM vault, Argon2id KDF)",13,10
     db 13,10
-    db "  vault  (VAULT = path to the .vordr file; -p = master password):",13,10
-    db "    vordr init   VAULT -p PW [-m MIB]            create a new vault",13,10
-    db "    vordr add    VAULT -p PW --title T [--user U] [--secret S]",13,10
-    db "                       [--url U] [--notes N]     add an entry",13,10
-    db "    vordr list   VAULT -p PW                     list entry titles",13,10
-    db "    vordr get    VAULT -p PW --title T           reveal an entry",13,10
-    db "    vordr edit   VAULT -p PW --title T [field overrides]   edit an entry",13,10
-    db "    vordr remove VAULT -p PW --title T         delete an entry",13,10
-    db "  password generator:",13,10
-    db "    vordr gen [--len N] [--count N] [--no-symbols]",13,10
-    db "  diagnostics:",13,10
+    db "  Vordr is a GUI application.  The vault, entry secrets, and the password",13,10
+    db "  generator are reached only through the windowed interface, so no master",13,10
+    db "  password or secret is ever passed on the command line (where it would",13,10
+    db "  leak into shell history and process listings).  Launch vordr with no",13,10
+    db "  arguments to open it.",13,10
+    db 13,10
+    db "  The command line exposes only non-sensitive diagnostics:",13,10
     db "    vordr selftest             run all known-answer self-tests",13,10
     db "    vordr bench [-m MIB] [-t N] benchmark the crypto core",13,10
     db 13,10
     db "  Every launch runs the self-test gate first and fails closed on mismatch.",13,10
 msg_usage_len equ $ - msg_usage
 CSTR msg_nocpu,    "error: CPU lacks required features (AES-NI, PCLMULQDQ, SSE4.1)",13,10
-CSTR msg_badpass,  "error: password must be 1..1024 UTF-8 bytes (valid UTF-16 input)",13,10
 CSTR msg_badnum,   "error: numeric argument out of range",13,10
 CSTR msg_st_ok,    "all self-tests passed",13,10
 CSTR msg_st_fail,  "SELFTEST FAILURE",13,10
 
-WSTR w_init,     <init>
-WSTR w_add,      <add>
-WSTR w_get,      <get>
-WSTR w_list,     <list>
-WSTR w_edit,     <edit>
-WSTR w_remove,   <remove>
-WSTR w_gen,      <gen>
 WSTR w_selftest, <selftest>
 WSTR w_bench,    <bench>
 ifdef DBG_TRACE
 WSTR w_redteam,  <redteam>
 endif
-WSTR w_opt_p,    <-p>
-WSTR w_opt_o,    <-o>
-WSTR w_opt_out,  <--out>
 WSTR w_opt_m,    <-m>
 WSTR w_opt_t,    <-t>
-WSTR w_opt_minlen,     <--min-len>
-WSTR w_opt_minclasses, <--min-classes>
-WSTR w_opt_nopolicy,   <--no-policy>
-WSTR w_opt_compress,   <--compress>
-WSTR w_opt_store,      <--store>
-WSTR w_opt_json,       <--json>
 WSTR w_opt_log,        <--log>
 WSTR w_opt_logfile,    <--log-file>
-WSTR w_opt_len,        <--len>
-WSTR w_opt_count,      <--count>
-WSTR w_opt_nosym,      <--no-symbols>
-WSTR w_opt_title,      <--title>
-WSTR w_opt_user,       <--user>
-WSTR w_opt_secret,     <--secret>
-WSTR w_opt_url,        <--url>
-WSTR w_opt_notes,      <--notes>
 WSTR w_lvl_none,       <none>
 WSTR w_lvl_error,      <error>
 WSTR w_lvl_warning,    <warning>
@@ -179,23 +132,16 @@ CMDENT struct
     needs_pass  dd ?                ; 1 if -p is mandatory
 CMDENT ends
 
-; Vault verbs take one positional (the .vordr path) and a mandatory -p master
-; password; gen/selftest/bench take neither.
+; The CLI exposes only non-sensitive diagnostics: no positionals, no secrets.
+; All vault / secret / generator operations live in the GUI.
 cmd_table label CMDENT
-    CMDENT { w_init,      cmd_init,      1, 1 }   ; VAULT path, -p master
-    CMDENT { w_add,       cmd_add,       1, 1 }   ; VAULT path, -p, --title ...
-    CMDENT { w_get,       cmd_get,       1, 1 }   ; VAULT path, -p, --title NAME
-    CMDENT { w_list,      cmd_list,      1, 1 }   ; VAULT path, -p
-    CMDENT { w_edit,      cmd_edit,      1, 1 }
-    CMDENT { w_remove,    cmd_remove,    1, 1 }
-    CMDENT { w_gen,       cmd_gen,       0, 0 }
     CMDENT { w_selftest,  cmd_selftest,  0, 0 }
     CMDENT { w_bench,     cmd_bench,     0, 0 }
 ifdef DBG_TRACE
-    CMDENT { w_redteam,   cmd_redteam,   1, 0 }   ; fault-injection self-test
-CMD_COUNT equ 10
+    CMDENT { w_redteam,   cmd_redteam,   1, 0 }   ; fault-injection self-test (dbg)
+CMD_COUNT equ 3
 else
-CMD_COUNT equ 9
+CMD_COUNT equ 2
 endif
 
 .data?
@@ -643,165 +589,34 @@ endm
 ; =============================================================================
 ; collect_options - walk g_argv[2..] for the active command.
 ;   rcx -> CMDENT for the command
-; Fills g_cfg_in / g_cfg_out / g_cfg_pass / g_cfg_m / g_cfg_t / gen + field opts.
+; Only -m/-t (Argon2 cost for bench) and --log/--log-file are accepted.
 ; Returns eax = exit code (EXIT_OK if all good).
 ; =============================================================================
 collect_options proc frame
-    FRAME_PROLOG 96
-    ; locals:
-    ;   [rbp-24]  CMDENT ptr
-    ;   [rbp-32]  arg index
-    ;   [rbp-40]  positional count seen
-    ;   [rbp-48]  wide password ptr (0 if none)
-
+    FRAME_PROLOG 64
+    ; locals: [rbp-24] CMDENT ptr, [rbp-32] arg index, [rbp-40] positional count
     mov     qword ptr [rbp-24], rcx
     mov     qword ptr [rbp-32], 2       ; argv[0]=exe, argv[1]=command
     mov     qword ptr [rbp-40], 0
-    mov     qword ptr [rbp-48], 0
-    mov     qword ptr [g_cfg_in], 0
-    mov     qword ptr [g_cfg_out], 0
-
 co_loop:
     mov     rax, qword ptr [rbp-32]
     mov     r10d, dword ptr [g_argc]
     cmp     rax, r10
     jae     co_check
-
-    lea     r11, [g_argv]
-    mov     rcx, qword ptr [r11+rax*8]  ; current arg
-
-    ; ---- "-p <password>" ----------------------------------------------------
-    lea     rdx, [w_opt_p]
-    call    wstr_eq
-    test    eax, eax
-    jnz     co_take_p
-    ; ---- "-o <output>" / "--out <output>" -----------------------------------
+    OPTMATCH w_opt_m,       co_take_m
+    OPTMATCH w_opt_t,       co_take_t
+    OPTMATCH w_opt_log,     co_take_log
+    OPTMATCH w_opt_logfile, co_take_logfile
+    ; any other token is a positional (only the dbg `redteam` case name uses one)
     mov     rax, qword ptr [rbp-32]
     lea     r11, [g_argv]
     mov     rcx, qword ptr [r11+rax*8]
-    lea     rdx, [w_opt_o]
-    call    wstr_eq
-    test    eax, eax
-    jnz     co_take_o
-    mov     rax, qword ptr [rbp-32]
-    lea     r11, [g_argv]
-    mov     rcx, qword ptr [r11+rax*8]
-    lea     rdx, [w_opt_out]
-    call    wstr_eq
-    test    eax, eax
-    jnz     co_take_o
-    ; ---- "-m <MiB>" ---------------------------------------------------------
-    mov     rax, qword ptr [rbp-32]
-    lea     r11, [g_argv]
-    mov     rcx, qword ptr [r11+rax*8]
-    lea     rdx, [w_opt_m]
-    call    wstr_eq
-    test    eax, eax
-    jnz     co_take_m
-    ; ---- "-t <passes>" ------------------------------------------------------
-    mov     rax, qword ptr [rbp-32]
-    lea     r11, [g_argv]
-    mov     rcx, qword ptr [r11+rax*8]
-    lea     rdx, [w_opt_t]
-    call    wstr_eq
-    test    eax, eax
-    jnz     co_take_t
-    ; ---- "--min-len <N>" ----------------------------------------------------
-    mov     rax, qword ptr [rbp-32]
-    lea     r11, [g_argv]
-    mov     rcx, qword ptr [r11+rax*8]
-    lea     rdx, [w_opt_minlen]
-    call    wstr_eq
-    test    eax, eax
-    jnz     co_take_minlen
-    ; ---- "--min-classes <K>" ------------------------------------------------
-    mov     rax, qword ptr [rbp-32]
-    lea     r11, [g_argv]
-    mov     rcx, qword ptr [r11+rax*8]
-    lea     rdx, [w_opt_minclasses]
-    call    wstr_eq
-    test    eax, eax
-    jnz     co_take_minclasses
-    ; ---- "--no-policy" (flag) -----------------------------------------------
-    mov     rax, qword ptr [rbp-32]
-    lea     r11, [g_argv]
-    mov     rcx, qword ptr [r11+rax*8]
-    lea     rdx, [w_opt_nopolicy]
-    call    wstr_eq
-    test    eax, eax
-    jnz     co_take_nopolicy
-    ; ---- "--compress" / "--store" (flags) -----------------------------------
-    mov     rax, qword ptr [rbp-32]
-    lea     r11, [g_argv]
-    mov     rcx, qword ptr [r11+rax*8]
-    lea     rdx, [w_opt_compress]
-    call    wstr_eq
-    test    eax, eax
-    jnz     co_take_compress
-    mov     rax, qword ptr [rbp-32]
-    lea     r11, [g_argv]
-    mov     rcx, qword ptr [r11+rax*8]
-    lea     rdx, [w_opt_store]
-    call    wstr_eq
-    test    eax, eax
-    jnz     co_take_store
-    ; ---- "--json" (flag) ----------------------------------------------------
-    mov     rax, qword ptr [rbp-32]
-    lea     r11, [g_argv]
-    mov     rcx, qword ptr [r11+rax*8]
-    lea     rdx, [w_opt_json]
-    call    wstr_eq
-    test    eax, eax
-    jnz     co_take_json
-    ; ---- "--log LEVEL" ------------------------------------------------------
-    mov     rax, qword ptr [rbp-32]
-    lea     r11, [g_argv]
-    mov     rcx, qword ptr [r11+rax*8]
-    lea     rdx, [w_opt_log]
-    call    wstr_eq
-    test    eax, eax
-    jnz     co_take_log
-    ; ---- "--log-file PATH" --------------------------------------------------
-    mov     rax, qword ptr [rbp-32]
-    lea     r11, [g_argv]
-    mov     rcx, qword ptr [r11+rax*8]
-    lea     rdx, [w_opt_logfile]
-    call    wstr_eq
-    test    eax, eax
-    jnz     co_take_logfile
-    ; ---- gen + vault-field options ------------------------------------------
-    OPTMATCH w_opt_len,    co_take_len
-    OPTMATCH w_opt_count,  co_take_count
-    OPTMATCH w_opt_nosym,  co_take_nosym
-    OPTMATCH w_opt_title,  co_take_title
-    OPTMATCH w_opt_user,   co_take_user
-    OPTMATCH w_opt_secret, co_take_secret
-    OPTMATCH w_opt_url,    co_take_url
-    OPTMATCH w_opt_notes,  co_take_notes
-
-    ; ---- positional: store into g_positionals[poscount] ---------------------
-    mov     rax, qword ptr [rbp-32]
-    lea     r11, [g_argv]
-    mov     rcx, qword ptr [r11+rax*8]
-    mov     rdx, qword ptr [rbp-40]     ; poscount
+    mov     rdx, qword ptr [rbp-40]
     BOUND_CHECK rdx, MAX_ARGS
     lea     r11, [g_positionals]
     mov     qword ptr [r11+rdx*8], rcx
     inc     qword ptr [rbp-40]
     inc     qword ptr [rbp-32]
-    jmp     co_loop
-
-co_take_p:
-    call    co_next_arg                 ; rax -> value or 0
-    test    rax, rax
-    jz      co_usage
-    mov     qword ptr [rbp-48], rax
-    jmp     co_loop
-co_take_o:
-    call    co_next_arg                 ; rax -> wide output path or 0
-    test    rax, rax
-    jz      co_usage
-    mov     qword ptr [g_cfg_out], rax
     jmp     co_loop
 co_take_m:
     call    co_next_arg
@@ -811,12 +626,11 @@ co_take_m:
     call    wstr_to_u32
     test    edx, edx
     jz      co_badnum
-    ; -m is in MiB on the command line; store KiB.  Range check both ways.
     cmp     eax, 8
     jb      co_badnum
     cmp     eax, 4096
     ja      co_badnum
-    shl     eax, 10                     ; MiB -> KiB (max 4096<<10, no overflow)
+    shl     eax, 10                     ; MiB -> KiB
     mov     dword ptr [g_cfg_m], eax
     jmp     co_loop
 co_take_t:
@@ -833,53 +647,8 @@ co_take_t:
     ja      co_badnum
     mov     dword ptr [g_cfg_t], eax
     jmp     co_loop
-co_take_minlen:
-    call    co_next_arg
-    test    rax, rax
-    jz      co_usage
-    mov     rcx, rax
-    call    wstr_to_u32
-    test    edx, edx
-    jz      co_badnum
-    cmp     eax, 1
-    jb      co_badnum
-    cmp     eax, MAX_PASSWORD_BYTES
-    ja      co_badnum
-    mov     dword ptr [g_cfg_pwminlen], eax
-    jmp     co_loop
-co_take_minclasses:
-    call    co_next_arg
-    test    rax, rax
-    jz      co_usage
-    mov     rcx, rax
-    call    wstr_to_u32
-    test    edx, edx
-    jz      co_badnum
-    cmp     eax, 4
-    ja      co_badnum                   ; 0..4
-    mov     dword ptr [g_cfg_pwminclasses], eax
-    jmp     co_loop
-co_take_nopolicy:
-    mov     dword ptr [g_cfg_pwminlen], 1
-    mov     dword ptr [g_cfg_pwminclasses], 0
-    inc     qword ptr [rbp-32]          ; flag: consume just this arg
-    jmp     co_loop
-co_take_compress:
-    mov     dword ptr [g_cfg_compress], 1
-    mov     dword ptr [g_cfg_compress_set], 1
-    inc     qword ptr [rbp-32]
-    jmp     co_loop
-co_take_store:
-    mov     dword ptr [g_cfg_compress], 0
-    mov     dword ptr [g_cfg_compress_set], 1
-    inc     qword ptr [rbp-32]
-    jmp     co_loop
-co_take_json:
-    mov     dword ptr [g_cfg_json], 1
-    inc     qword ptr [rbp-32]          ; flag: consume just this arg
-    jmp     co_loop
 co_take_log:
-    call    co_next_arg                 ; rax -> LEVEL value or 0
+    call    co_next_arg
     test    rax, rax
     jz      co_usage
     mov     rcx, rax
@@ -889,110 +658,23 @@ co_take_log:
     mov     dword ptr [g_cfg_loglevel], eax
     jmp     co_loop
 co_take_logfile:
-    call    co_next_arg                 ; rax -> wide log path or 0
+    call    co_next_arg
     test    rax, rax
     jz      co_usage
     mov     qword ptr [g_cfg_logfile], rax
     jmp     co_loop
-co_take_len:
-    call    co_next_arg
-    test    rax, rax
-    jz      co_usage
-    mov     rcx, rax
-    call    wstr_to_u32
-    test    edx, edx
-    jz      co_badnum
-    cmp     eax, 1
-    jb      co_badnum
-    cmp     eax, 256
-    ja      co_badnum
-    mov     dword ptr [g_cfg_genlen], eax
-    jmp     co_loop
-co_take_count:
-    call    co_next_arg
-    test    rax, rax
-    jz      co_usage
-    mov     rcx, rax
-    call    wstr_to_u32
-    test    edx, edx
-    jz      co_badnum
-    cmp     eax, 1
-    jb      co_badnum
-    cmp     eax, 100
-    ja      co_badnum
-    mov     dword ptr [g_cfg_gencount], eax
-    jmp     co_loop
-co_take_nosym:
-    and     dword ptr [g_cfg_genclasses], NOT 8     ; clear the symbol class bit
-    inc     qword ptr [rbp-32]          ; flag: consume just this arg
-    jmp     co_loop
-co_take_title:
-    call    co_next_arg
-    test    rax, rax
-    jz      co_usage
-    mov     qword ptr [g_cfg_title], rax
-    jmp     co_loop
-co_take_user:
-    call    co_next_arg
-    test    rax, rax
-    jz      co_usage
-    mov     qword ptr [g_cfg_user], rax
-    jmp     co_loop
-co_take_secret:
-    call    co_next_arg
-    test    rax, rax
-    jz      co_usage
-    mov     qword ptr [g_cfg_secret], rax
-    jmp     co_loop
-co_take_url:
-    call    co_next_arg
-    test    rax, rax
-    jz      co_usage
-    mov     qword ptr [g_cfg_url], rax
-    jmp     co_loop
-co_take_notes:
-    call    co_next_arg
-    test    rax, rax
-    jz      co_usage
-    mov     qword ptr [g_cfg_notes], rax
-    jmp     co_loop
-
 co_check:
-    ; ---- store positional count globally (all positionals are inputs) -------
     mov     rax, qword ptr [rbp-40]
     mov     qword ptr [g_poscount], rax
     mov     r10, qword ptr [rbp-24]
     mov     eax, dword ptr [r10].CMDENT.pos_args
-    cmp     eax, ENC_VAR
-    je      co_var_pos
-    ; ---- fixed positional count must match ----------------------------------
-    cmp     qword ptr [rbp-40], rax
+    cmp     qword ptr [rbp-40], rax     ; exact positional count must match
     jne     co_usage
-    jmp     co_setin
-co_var_pos:
-    cmp     qword ptr [rbp-40], 1       ; encrypt: at least one input
-    jb      co_usage
-co_setin:
-    ; g_cfg_in = first positional (if any); the output is set only by -o
     cmp     qword ptr [rbp-40], 0
-    je      co_pwcheck
+    je      co_ok
     lea     r11, [g_positionals]
     mov     rcx, qword ptr [r11+0]
     mov     qword ptr [g_cfg_in], rcx
-co_pwcheck:
-    ; ---- password: convert any provided -p; error only if it's mandatory -----
-    mov     rcx, qword ptr [rbp-48]     ; -p value (0 if none was given)
-    test    rcx, rcx
-    jnz     co_haspw
-    ; none supplied: fail only when this command requires a password
-    mov     eax, dword ptr [r10].CMDENT.needs_pass
-    test    eax, eax
-    jnz     co_usage
-    jmp     co_ok
-co_haspw:
-    call    password_to_utf8            ; eax = 1 ok
-    test    eax, eax
-    jz      co_badpass
 co_ok:
     mov     eax, EXIT_OK
     jmp     co_done
@@ -1007,18 +689,11 @@ co_badnum:
     mov     edx, msg_badnum_len
     call    print_err
     mov     eax, EXIT_USAGE
-    jmp     co_done
-co_badpass:
-    lea     rcx, [msg_badpass]
-    mov     edx, msg_badpass_len
-    call    print_err
-    mov     eax, EXIT_USAGE
 co_done:
     FRAME_EPILOG
     ret
 
 ; -- helper: advance to next arg, return its ptr in rax (0 if none) ----------
-; (shares the parent frame; only touches rax/r10/r11)
 co_next_arg:
     inc     qword ptr [rbp-32]          ; skip the option itself
     mov     rax, qword ptr [rbp-32]
@@ -1085,60 +760,7 @@ password_to_utf8 endp
 ; Command handlers.  Each is a DLPV landing-pad target reached through the
 ; CALL_GUARDED dispatch - thin wrappers over the implementation modules.
 ; =============================================================================
-.const
-CSTR c_nl,             13,10
-CSTR m_gen_fail,       "gen: invalid options (length 1..256, at least one character class)",13,10
-.code
-
-; --- vault command handlers (thin landing-pad wrappers over vault.asm) ------
-LANDING_PAD
-cmd_init proc frame
-    FRAME_PROLOG 32
-    call    do_init
-    FRAME_EPILOG
-    ret
-cmd_init endp
-
-LANDING_PAD
-cmd_add proc frame
-    FRAME_PROLOG 32
-    call    do_add
-    FRAME_EPILOG
-    ret
-cmd_add endp
-
-LANDING_PAD
-cmd_list proc frame
-    FRAME_PROLOG 32
-    call    do_list
-    FRAME_EPILOG
-    ret
-cmd_list endp
-
-LANDING_PAD
-cmd_get proc frame
-    FRAME_PROLOG 32
-    call    do_get
-    FRAME_EPILOG
-    ret
-cmd_get endp
-
-LANDING_PAD
-cmd_edit proc frame
-    FRAME_PROLOG 32
-    call    do_edit
-    FRAME_EPILOG
-    ret
-cmd_edit endp
-
-LANDING_PAD
-cmd_remove proc frame
-    FRAME_PROLOG 32
-    call    do_remove
-    FRAME_EPILOG
-    ret
-cmd_remove endp
-
+; --- diagnostics command handlers (DLPV landing-pad targets) ----------------
 LANDING_PAD
 cmd_bench proc frame
     FRAME_PROLOG 32
@@ -1147,50 +769,6 @@ cmd_bench proc frame
     ret
 cmd_bench endp
 
-; cmd_gen - generate g_cfg_gencount passwords of g_cfg_genlen chars over the
-; selected character classes, printing each on its own line.  Secret material is
-; secure_zero'd before returning.
-LANDING_PAD
-cmd_gen proc frame
-    FRAME_PROLOG 48
-    ; [rbp-24] = remaining count
-    mov     eax, dword ptr [g_cfg_gencount]
-    mov     dword ptr [rbp-24], eax
-cg_loop:
-    cmp     dword ptr [rbp-24], 0
-    jbe     cg_done
-    lea     rcx, [g_genbuf]
-    mov     edx, dword ptr [g_cfg_genlen]
-    mov     r8d, dword ptr [g_cfg_genclasses]
-    call    pwgen
-    test    eax, eax
-    jz      cg_fail
-    lea     rcx, [g_genbuf]
-    mov     edx, dword ptr [g_cfg_genlen]
-    call    print_a
-    lea     rcx, [c_nl]
-    mov     edx, c_nl_len
-    call    print_a
-    dec     dword ptr [rbp-24]
-    jmp     cg_loop
-cg_done:
-    lea     rcx, [g_genbuf]
-    mov     edx, 257
-    call    secure_zero
-    mov     eax, EXIT_OK
-    FRAME_EPILOG
-    ret
-cg_fail:
-    lea     rcx, [g_genbuf]
-    mov     edx, 257
-    call    secure_zero
-    lea     rcx, [m_gen_fail]
-    mov     edx, m_gen_fail_len
-    call    print_err
-    mov     eax, EXIT_USAGE
-    FRAME_EPILOG
-    ret
-cmd_gen endp
 
 LANDING_PAD
 cmd_selftest proc frame
