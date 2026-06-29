@@ -47,6 +47,7 @@ externdef g_cfg_user:qword
 externdef g_cfg_secret:qword
 externdef g_cfg_url:qword
 externdef g_cfg_notes:qword
+externdef g_cfg_totp:qword
 
 CP_UTF8         equ 65001
 
@@ -1772,6 +1773,10 @@ vault_add_entry proc frame
     add     dword ptr [rbp-40], eax
     mov     ecx, VF_NOTES
     mov     rdx, qword ptr [g_cfg_notes]
+    call    va_field
+    add     dword ptr [rbp-40], eax
+    mov     ecx, VF_TOTP
+    mov     rdx, qword ptr [g_cfg_totp]
     call    va_field
     add     dword ptr [rbp-40], eax
     mov     r11, qword ptr [rbp-32]
