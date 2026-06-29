@@ -11,11 +11,11 @@ beyond OS-inbox DLLs (`kernel32`, `bcrypt`, `user32`). Every cryptographic
 primitive is validated against an official RFC/NIST vector on **every launch**,
 and the program **fails closed** on any violation.
 
-> **Status: early (v0.1).** Working today: `init`, `add`, `list`, `get`
-> (single-file encrypted vault, atomic writes), the `gen` password generator,
-> the Poly1305 one-time MAC + OTP share core, and the per-launch self-test gate
-> (13 known-answer tests). Still stubbed: `edit`, `remove`, `bench`, and the
-> file-backed OTP pad/share commands (`padnew`/`padimport`/`share`/`open`). See
+> **Status: early (v0.1).** Working today: the vault (`init`/`add`/`list`/`get`,
+> single-file, atomic writes), the `gen` password generator, and **one-time-pad
+> sharing** end-to-end (`padnew`/`padimport`/`share`/`open` with Poly1305
+> one-time MAC and never-reuse offset tracking), plus the per-launch self-test
+> gate (13 known-answer tests). Still stubbed: `edit`, `remove`, `bench`. See
 > [docs/formats.md](docs/formats.md) for the on-disk formats and security model.
 
 ## Design goals
