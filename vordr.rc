@@ -35,6 +35,13 @@
 #define IDC_E_URL    304
 #define IDC_E_NOTES  305
 #define IDC_E_TOTP   306
+#define DLG_CREATE   400
+#define IDC_C_PATH   401
+#define IDC_C_PW     402
+#define IDC_C_PW2    403
+#define IDC_C_LEN    404
+#define IDC_C_CLS    405
+#define IDC_C_STATUS 406
 
 /* application / window icon (lowest ID -> the shell's file icon) */
 1 ICON "vordr.ico"
@@ -105,6 +112,28 @@ BEGIN
     LTEXT           "(base32 secret, e.g. JBSWY3DPEHPK3PXP)", -1, 64, 170, 224, 9
     DEFPUSHBUTTON   "Save", IDOK, 178, 194, 54, 18
     PUSHBUTTON      "Cancel", IDCANCEL, 236, 194, 54, 18
+END
+
+DLG_CREATE DIALOGEX 0, 0, 320, 196
+STYLE DS_CENTER | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Vordr - Create vault"
+FONT 9, "Segoe UI"
+BEGIN
+    LTEXT           "New vault:", -1, 12, 12, 48, 10
+    LTEXT           "", IDC_C_PATH, 64, 12, 244, 10
+    LTEXT           "Master password:", -1, 12, 32, 100, 10
+    EDITTEXT        IDC_C_PW, 120, 30, 188, 14, ES_PASSWORD | ES_AUTOHSCROLL
+    LTEXT           "Confirm password:", -1, 12, 50, 100, 10
+    EDITTEXT        IDC_C_PW2, 120, 48, 188, 14, ES_PASSWORD | ES_AUTOHSCROLL
+    GROUPBOX        "Password policy", -1, 12, 70, 296, 48
+    LTEXT           "Minimum length:", -1, 24, 86, 110, 10
+    EDITTEXT        IDC_C_LEN, 138, 84, 32, 13, ES_NUMBER | ES_AUTOHSCROLL
+    LTEXT           "Minimum character types (1-4):", -1, 24, 102, 110, 10
+    EDITTEXT        IDC_C_CLS, 138, 100, 32, 13, ES_NUMBER | ES_AUTOHSCROLL
+    LTEXT           "Types counted: lowercase, uppercase, number, symbol.", -1, 180, 92, 124, 18
+    DEFPUSHBUTTON   "Create", IDOK, 196, 124, 54, 18
+    PUSHBUTTON      "Cancel", IDCANCEL, 254, 124, 54, 18
+    LTEXT           "", IDC_C_STATUS, 12, 150, 296, 40
 END
 
 1 VERSIONINFO
