@@ -11,12 +11,14 @@ beyond OS-inbox DLLs (`kernel32`, `bcrypt`, `user32`). Every cryptographic
 primitive is validated against an official RFC/NIST vector on **every launch**,
 and the program **fails closed** on any violation.
 
-> **Status: early (v0.1).** Working today: the vault (`init`/`add`/`list`/`get`,
-> single-file, atomic writes), the `gen` password generator, and **one-time-pad
-> sharing** end-to-end (`padnew`/`padimport`/`share`/`open` with Poly1305
-> one-time MAC and never-reuse offset tracking), plus the per-launch self-test
-> gate (13 known-answer tests). Still stubbed: `edit`, `remove`, `bench`. See
-> [docs/formats.md](docs/formats.md) for the on-disk formats and security model.
+> **Status: v0.1 — all commands functional.** The vault
+> (`init`/`add`/`list`/`get`/`edit`/`remove`, single-file, atomic writes), the
+> `gen` password generator, **one-time-pad sharing** end-to-end
+> (`padnew`/`padimport`/`share`/`open` with Poly1305 one-time MAC and never-reuse
+> offset tracking), `bench`, and the per-launch self-test gate (13 known-answer
+> tests). See [docs/formats.md](docs/formats.md) for on-disk formats and the
+> security model. Not yet hardened for production: no external review, no GUI
+> vault panes, single-process file locking only.
 
 ## Design goals
 
