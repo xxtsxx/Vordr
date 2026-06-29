@@ -311,6 +311,8 @@ gb_check:
     test    eax, eax
     jz      gb_done                         ; cancelled
     mov     dword ptr [g_vpath_set], 1
+    mov     eax, dword ptr [rbp-32]         ; save mode == create-new mode
+    mov     dword ptr [g_create], eax
     WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_U_PATH, addr g_vpath
 gb_done:
     FRAME_EPILOG
