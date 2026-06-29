@@ -10,14 +10,14 @@
 ; and asserts the child died with the expected fastfail / access-violation code,
 ; proving the control both fires and fails closed.
 ;
-;   myrkr redteam canary     -> FF_STACK_COOKIE (2)
-;   myrkr redteam shadow     -> FF_SHADOW_STACK (0xF001)
-;   myrkr redteam dlpv       -> FF_GUARD_ICALL  (10)
-;   myrkr redteam overflow   -> FF_OVERFLOW     (0xF005)
-;   myrkr redteam bounds     -> FF_BOUNDS       (0xF004)
-;   myrkr redteam typemagic  -> FF_TYPE_MAGIC   (0xF003)
-;   myrkr redteam heaptag    -> FF_HEAP_TAG     (0xF002)
-;   myrkr redteam iat        -> access violation (0xC0000005)
+;   vordr redteam canary     -> FF_STACK_COOKIE (2)
+;   vordr redteam shadow     -> FF_SHADOW_STACK (0xF001)
+;   vordr redteam dlpv       -> FF_GUARD_ICALL  (10)
+;   vordr redteam overflow   -> FF_OVERFLOW     (0xF005)
+;   vordr redteam bounds     -> FF_BOUNDS       (0xF004)
+;   vordr redteam typemagic  -> FF_TYPE_MAGIC   (0xF003)
+;   vordr redteam heaptag    -> FF_HEAP_TAG     (0xF002)
+;   vordr redteam iat        -> access violation (0xC0000005)
 ;
 ; If a case RETURNS (the control failed to fire), cmd_redteam exits non-zero so
 ; the harness records a FAIL.  Compiled only into the instrumented build

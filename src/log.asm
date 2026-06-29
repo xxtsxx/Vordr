@@ -3,12 +3,11 @@
 ; -----------------------------------------------------------------------------
 ; Every command's outcome is appended as one UTF-8 text line to a log file:
 ;
-;   2026-06-16 14:23:01  INFO   hash: completed successfully
-;   2026-06-16 14:23:05  WARN   decrypt: authentication failed (wrong password or tampered data)
-;   2026-06-16 14:23:09  ERROR  hash: I/O error
-;   2026-06-16 14:24:00  INFO   encrypt: completed successfully [in=C:\a\b.txt out=C:\a\b.mrk]
+;   2026-06-29 14:23:01  INFO   add: completed successfully
+;   2026-06-29 14:23:05  WARN   get: authentication failed (wrong password or tampered data)
+;   2026-06-29 14:23:09  ERROR  list: I/O error
 ;
-; Default path is %LOCALAPPDATA%\Myrkr\myrkr.log (per-user, always writable);
+; Default path is %LOCALAPPDATA%\Vordr\vordr.log (per-user, always writable);
 ; override with `--log-file PATH`.  Logging is OFF by default; opt in (and pick
 ; verbosity) with `--log LEVEL`:
 ;
@@ -53,8 +52,8 @@ LINELEN              equ 16384        ; one log line, UTF-8 bytes
 
 .const
 WSTR w_localappdata, <LOCALAPPDATA>
-WSTR w_subdir,       <\Myrkr>
-WSTR w_logname,      <\myrkr.log>
+WSTR w_subdir,       <\Vordr>
+WSTR w_logname,      <\vordr.log>
 
 CSTR rm_ok,      "completed successfully"
 CSTR rm_auth,    "authentication failed (wrong password or tampered data)"
@@ -171,8 +170,8 @@ log_putw endp
 
 ; -----------------------------------------------------------------------------
 ; log_open() -> rax = file handle (append mode) or INVALID.
-; Uses g_cfg_logfile if set, else %LOCALAPPDATA%\Myrkr\myrkr.log (creating the
-; Myrkr directory if needed).
+; Uses g_cfg_logfile if set, else %LOCALAPPDATA%\Vordr\vordr.log (creating the
+; Vordr directory if needed).
 ; -----------------------------------------------------------------------------
 log_open proc frame
     FRAME_PROLOG 128
@@ -191,13 +190,13 @@ lo_default:
     lea     rdx, [rdx + rcx*2]          ; cursor at the NUL
     mov     rcx, rdx
     lea     rdx, [w_subdir]
-    call    log_wapp                    ; append "\Myrkr"
+    call    log_wapp                    ; append "\Vordr"
     mov     word ptr [rax], 0
     mov     qword ptr [rbp-24], rax
     WINCALL CreateDirectoryW, addr g_logpath, 0     ; ignore result (may exist)
     mov     rcx, qword ptr [rbp-24]
     lea     rdx, [w_logname]
-    call    log_wapp                    ; append "\myrkr.log"
+    call    log_wapp                    ; append "\vordr.log"
     mov     word ptr [rax], 0
     lea     rax, [g_logpath]
     mov     qword ptr [rbp-32], rax
