@@ -712,8 +712,9 @@ collect_options endp
 ; =============================================================================
 ; password_to_utf8(rcx = wide password ptr) -> eax = 1 ok / 0 invalid
 ; Strict conversion (rejects invalid UTF-16), enforces 1..1024 bytes,
-; then wipes the wide original inside g_argbuf.
+; then wipes the wide original at the source (also used by the GUI password box).
 ; =============================================================================
+public password_to_utf8
 password_to_utf8 proc frame
     FRAME_PROLOG 32 + 32 + 16
     ; locals: [rbp-24] = wide ptr

@@ -1,9 +1,96 @@
-/* vordr.rc - VERSIONINFO resource for bin\vordr.exe (compiled by rc.exe in
-   build.cmd, then linked in).  Self-contained: numeric FILEOS/FILETYPE values
-   so no SDK headers are required. */
+/* vordr.rc - app icon, VERSIONINFO, and the GUI dialog templates for
+   bin\vordr.exe (compiled by rc.exe in build.cmd, then linked in). */
+#include <windows.h>
+
+/* control IDs - MUST match the equ values in src/gui.asm */
+#define DLG_UNLOCK   100
+#define IDC_U_PATH   101
+#define IDC_U_OPEN   102
+#define IDC_U_NEW    103
+#define IDC_U_PW     104
+#define IDC_U_UNLOCK 105
+#define IDC_U_STATUS 106
+#define DLG_VAULT    200
+#define IDC_V_LIST   201
+#define IDC_V_TITLE  202
+#define IDC_V_USER   203
+#define IDC_V_SECRET 204
+#define IDC_V_URL    205
+#define IDC_V_NOTES  206
+#define IDC_V_REVEAL 207
+#define IDC_V_COPY   208
+#define IDC_V_ADD    209
+#define IDC_V_EDIT   210
+#define IDC_V_REMOVE 211
+#define IDC_V_LOCK   212
+#define DLG_ENTRY    300
+#define IDC_E_TITLE  301
+#define IDC_E_USER   302
+#define IDC_E_SECRET 303
+#define IDC_E_URL    304
+#define IDC_E_NOTES  305
 
 /* application / window icon (lowest ID -> the shell's file icon) */
 1 ICON "vordr.ico"
+
+DLG_UNLOCK DIALOGEX 0, 0, 320, 138
+STYLE DS_CENTER | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Vordr - Unlock vault"
+FONT 9, "Segoe UI"
+BEGIN
+    LTEXT           "Vault file:", -1, 12, 12, 50, 10
+    LTEXT           "(no vault selected)", IDC_U_PATH, 66, 12, 242, 10
+    PUSHBUTTON      "Open existing...", IDC_U_OPEN, 12, 28, 70, 16
+    PUSHBUTTON      "Create new...", IDC_U_NEW, 88, 28, 70, 16
+    LTEXT           "Master password:", -1, 12, 58, 90, 10
+    EDITTEXT        IDC_U_PW, 12, 70, 296, 14, ES_PASSWORD | ES_AUTOHSCROLL
+    DEFPUSHBUTTON   "Unlock", IDC_U_UNLOCK, 196, 96, 54, 18
+    PUSHBUTTON      "Cancel", IDCANCEL, 254, 96, 54, 18
+    LTEXT           "", IDC_U_STATUS, 12, 120, 296, 10
+END
+
+DLG_VAULT DIALOGEX 0, 0, 426, 286
+STYLE DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Vordr - Vault"
+FONT 9, "Segoe UI"
+BEGIN
+    LISTBOX         IDC_V_LIST, 10, 10, 134, 240, LBS_NOTIFY | WS_VSCROLL | WS_BORDER | WS_TABSTOP
+    PUSHBUTTON      "Add...", IDC_V_ADD, 10, 256, 42, 18
+    PUSHBUTTON      "Edit...", IDC_V_EDIT, 56, 256, 42, 18
+    PUSHBUTTON      "Remove", IDC_V_REMOVE, 102, 256, 42, 18
+    LTEXT           "Title", -1, 158, 14, 40, 10
+    EDITTEXT        IDC_V_TITLE, 206, 12, 210, 13, ES_READONLY | ES_AUTOHSCROLL | WS_TABSTOP
+    LTEXT           "Username", -1, 158, 34, 40, 10
+    EDITTEXT        IDC_V_USER, 206, 32, 210, 13, ES_READONLY | ES_AUTOHSCROLL | WS_TABSTOP
+    LTEXT           "Secret", -1, 158, 54, 40, 10
+    EDITTEXT        IDC_V_SECRET, 206, 52, 150, 13, ES_READONLY | ES_AUTOHSCROLL
+    PUSHBUTTON      "Reveal", IDC_V_REVEAL, 358, 52, 28, 13
+    PUSHBUTTON      "Copy", IDC_V_COPY, 388, 52, 28, 13
+    LTEXT           "URL", -1, 158, 74, 40, 10
+    EDITTEXT        IDC_V_URL, 206, 72, 210, 13, ES_READONLY | ES_AUTOHSCROLL | WS_TABSTOP
+    LTEXT           "Notes", -1, 158, 94, 40, 10
+    EDITTEXT        IDC_V_NOTES, 206, 92, 210, 70, ES_READONLY | ES_MULTILINE | WS_VSCROLL | WS_TABSTOP
+    DEFPUSHBUTTON   "Lock", IDC_V_LOCK, 362, 256, 54, 18
+END
+
+DLG_ENTRY DIALOGEX 0, 0, 300, 196
+STYLE DS_CENTER | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Vordr - Entry"
+FONT 9, "Segoe UI"
+BEGIN
+    LTEXT           "Title", -1, 12, 14, 50, 10
+    EDITTEXT        IDC_E_TITLE, 64, 12, 224, 13, ES_AUTOHSCROLL
+    LTEXT           "Username", -1, 12, 34, 50, 10
+    EDITTEXT        IDC_E_USER, 64, 32, 224, 13, ES_AUTOHSCROLL
+    LTEXT           "Secret", -1, 12, 54, 50, 10
+    EDITTEXT        IDC_E_SECRET, 64, 52, 224, 13, ES_AUTOHSCROLL
+    LTEXT           "URL", -1, 12, 74, 50, 10
+    EDITTEXT        IDC_E_URL, 64, 72, 224, 13, ES_AUTOHSCROLL
+    LTEXT           "Notes", -1, 12, 94, 50, 10
+    EDITTEXT        IDC_E_NOTES, 64, 92, 224, 64, ES_MULTILINE | WS_VSCROLL | ES_AUTOVSCROLL | ES_WANTRETURN
+    DEFPUSHBUTTON   "Save", IDOK, 178, 168, 54, 18
+    PUSHBUTTON      "Cancel", IDCANCEL, 236, 168, 54, 18
+END
 
 1 VERSIONINFO
  FILEVERSION    0,1,0,0

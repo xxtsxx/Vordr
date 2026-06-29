@@ -324,6 +324,7 @@ vault_seal_write endp
 ;   On success: g_body_ptr (secmem, VAULT_BODY_MAX), g_body_len set.  g_hdr holds
 ;   the 80-byte header (so a reseal reuses salt/t/m).  -> eax = 0 / EXIT_*.
 ; ===========================================================================
+public vault_unlock
 vault_unlock proc frame
     FRAME_PROLOG 48
     ; [rbp-24] = ciphertext length
@@ -453,6 +454,7 @@ vu_ret:
 vault_unlock endp
 
 ; vault_lock() - wipe + free the secmem body and wipe the master key.
+public vault_lock
 vault_lock proc frame
     FRAME_PROLOG 32
     mov     rcx, qword ptr [g_body_ptr]
@@ -1595,5 +1597,241 @@ vst_fail:
     FRAME_EPILOG
     ret
 vault_selftest endp
+
+; ===========================================================================
+; GUI session API.  The GUI unlocks the vault ONCE (key in g_vkey, body in
+; secmem), then reads entries and mutates the in-memory body, re-sealing to
+; disk without re-deriving the master key.  All of these assume the vault is
+; already unlocked (vault_unlock succeeded) unless noted.
+; ===========================================================================
+
+; vault_reseal() - persist the current in-memory body to disk under a fresh
+;   GCM nonce (key/salt unchanged).  -> eax = 0 / EXIT_IO / EXIT_OOM.
+public vault_reseal
+vault_reseal proc frame
+    FRAME_PROLOG 32
+    lea     rcx, [g_hdr+VH_NONCE]
+    mov     edx, 12
+    call    rng_fill
+    test    eax, eax
+    jz      vrs_oom
+    call    vault_seal_write
+    FRAME_EPILOG
+    ret
+vrs_oom:
+    mov     eax, EXIT_OOM
+    FRAME_EPILOG
+    ret
+vault_reseal endp
+
+; vault_count() -> eax = number of entries (0 if locked).  Leaf.
+public vault_count
+vault_count proc
+    mov     rax, qword ptr [g_body_ptr]
+    test    rax, rax
+    jz      vc_zero
+    mov     eax, dword ptr [rax]
+    ret
+vc_zero:
+    xor     eax, eax
+    ret
+vault_count endp
+
+; vault_entry_ptr(rcx = index) -> rax = pointer to that entry (0 if out of range)
+public vault_entry_ptr
+vault_entry_ptr proc frame
+    FRAME_PROLOG 48
+    ; [rbp-24] = remaining index, [rbp-32] = cursor
+    mov     r10, qword ptr [g_body_ptr]
+    test    r10, r10
+    jz      vep_none
+    mov     eax, dword ptr [r10]
+    cmp     rcx, rax
+    jae     vep_none
+    mov     qword ptr [rbp-24], rcx
+    lea     r10, [r10+4]
+    mov     qword ptr [rbp-32], r10
+vep_loop:
+    cmp     qword ptr [rbp-24], 0
+    je      vep_done
+    mov     rcx, qword ptr [rbp-32]
+    call    vault_entry_len
+    mov     r10, qword ptr [rbp-32]
+    add     r10, rax
+    mov     qword ptr [rbp-32], r10
+    dec     qword ptr [rbp-24]
+    jmp     vep_loop
+vep_done:
+    mov     rax, qword ptr [rbp-32]
+    FRAME_EPILOG
+    ret
+vep_none:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+vault_entry_ptr endp
+
+; vault_title_at(rcx = index, rdx = *outlen) -> rax = title bytes ptr (0 if none)
+public vault_title_at
+vault_title_at proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rdx     ; outlen ptr
+    call    vault_entry_ptr             ; rcx = index
+    test    rax, rax
+    jz      vta_none
+    mov     rcx, rax
+    mov     edx, VF_TITLE
+    call    find_field_in               ; rax=ptr, rdx=len
+    test    rax, rax
+    jz      vta_none
+    mov     r10, qword ptr [rbp-24]
+    mov     qword ptr [r10], rdx
+    FRAME_EPILOG
+    ret
+vta_none:
+    mov     r10, qword ptr [rbp-24]
+    mov     qword ptr [r10], 0
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+vault_title_at endp
+
+; vault_field_at(rcx = index, edx = field type, r8 = *outlen) -> rax = ptr (0 none)
+public vault_field_at
+vault_field_at proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], r8      ; outlen ptr
+    mov     dword ptr [rbp-32], edx     ; type
+    call    vault_entry_ptr             ; rcx = index
+    test    rax, rax
+    jz      vfa_none
+    mov     rcx, rax
+    mov     edx, dword ptr [rbp-32]
+    call    find_field_in
+    test    rax, rax
+    jz      vfa_none
+    mov     r10, qword ptr [rbp-24]
+    mov     qword ptr [r10], rdx
+    FRAME_EPILOG
+    ret
+vfa_none:
+    mov     r10, qword ptr [rbp-24]
+    mov     qword ptr [r10], 0
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+vault_field_at endp
+
+; vault_add_entry() - append one entry to the in-memory body from the
+;   g_cfg_title/user/secret/url/notes wide pointers (set by the GUI).  Does NOT
+;   reseal.  -> eax = 0 ok / EXIT_NOSPACE if full / EXIT_USAGE if no title.
+public vault_add_entry
+vault_add_entry proc frame
+    FRAME_PROLOG 64
+    ; [rbp-32] = entry start, [rbp-40] = field count
+    cmp     qword ptr [g_cfg_title], 0
+    je      vae_fail
+    mov     rax, qword ptr [g_body_len]
+    add     rax, 36
+    cmp     rax, VAULT_BODY_MAX
+    ja      vae_full
+    mov     r11, qword ptr [g_body_ptr]
+    add     r11, qword ptr [g_body_len]
+    mov     qword ptr [rbp-32], r11
+    mov     rcx, r11
+    mov     edx, 16
+    call    rng_fill                    ; id = 16 random bytes
+    test    eax, eax
+    jz      vae_fail
+    lea     rcx, [g_ts]
+    call    GetSystemTimeAsFileTime
+    mov     r11, qword ptr [rbp-32]
+    mov     rax, qword ptr [g_ts]
+    mov     qword ptr [r11+16], rax     ; created
+    mov     qword ptr [r11+24], rax     ; modified
+    mov     dword ptr [r11+32], 0       ; field_count placeholder
+    mov     rax, qword ptr [g_body_len]
+    add     rax, 36
+    mov     qword ptr [g_body_len], rax
+    mov     dword ptr [rbp-40], 0
+    mov     ecx, VF_TITLE
+    mov     rdx, qword ptr [g_cfg_title]
+    call    va_field
+    add     dword ptr [rbp-40], eax
+    mov     ecx, VF_USERNAME
+    mov     rdx, qword ptr [g_cfg_user]
+    call    va_field
+    add     dword ptr [rbp-40], eax
+    mov     ecx, VF_SECRET
+    mov     rdx, qword ptr [g_cfg_secret]
+    call    va_field
+    add     dword ptr [rbp-40], eax
+    mov     ecx, VF_URL
+    mov     rdx, qword ptr [g_cfg_url]
+    call    va_field
+    add     dword ptr [rbp-40], eax
+    mov     ecx, VF_NOTES
+    mov     rdx, qword ptr [g_cfg_notes]
+    call    va_field
+    add     dword ptr [rbp-40], eax
+    mov     r11, qword ptr [rbp-32]
+    mov     eax, dword ptr [rbp-40]
+    mov     dword ptr [r11+32], eax
+    mov     r11, qword ptr [g_body_ptr]
+    inc     dword ptr [r11]             ; entry_count++
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+vae_full:
+    mov     eax, EXIT_NOSPACE
+    FRAME_EPILOG
+    ret
+vae_fail:
+    mov     eax, EXIT_USAGE
+    FRAME_EPILOG
+    ret
+vault_add_entry endp
+
+; vault_remove_at(rcx = index) - delete entry `index` from the in-memory body
+;   (memmove the tail down, entry_count--).  Does NOT reseal.  -> eax = 0 / 1.
+public vault_remove_at
+vault_remove_at proc frame
+    FRAME_PROLOG 48
+    ; [rbp-24] = entry start, [rbp-32] = entry len
+    call    vault_entry_ptr
+    test    rax, rax
+    jz      vra_none
+    mov     qword ptr [rbp-24], rax
+    mov     rcx, rax
+    call    vault_entry_len
+    mov     qword ptr [rbp-32], rax
+    mov     r10, qword ptr [g_body_ptr]
+    add     r10, qword ptr [g_body_len]     ; body end
+    mov     r11, qword ptr [rbp-24]
+    add     r11, qword ptr [rbp-32]         ; src = start + len
+    sub     r10, r11                        ; n
+    mov     rcx, qword ptr [rbp-24]         ; dst = start
+    xor     r8, r8
+vra_mv:
+    cmp     r8, r10
+    jae     vra_done
+    mov     al, byte ptr [r11+r8]
+    mov     byte ptr [rcx+r8], al
+    inc     r8
+    jmp     vra_mv
+vra_done:
+    mov     rax, qword ptr [g_body_len]
+    sub     rax, qword ptr [rbp-32]
+    mov     qword ptr [g_body_len], rax
+    mov     r11, qword ptr [g_body_ptr]
+    dec     dword ptr [r11]
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+vra_none:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+vault_remove_at endp
 
 end
