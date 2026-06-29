@@ -39,6 +39,7 @@ extern log_result:proc
 extern do_bench:proc                    ; benchmark (bench.asm)
 ifdef DBG_TRACE
 extern cmd_redteam:proc                 ; fault-injection self-test (redteam.asm)
+extern cmd_tpmtest:proc                 ; TPM seal/unseal round-trip (tpm.asm)
 endif
 
 ENC_VAR              equ 0FFFFFFFEh  ; CMDENT.pos_args sentinel: variable (>=1)
@@ -115,6 +116,7 @@ WSTR w_selftest, <selftest>
 WSTR w_bench,    <bench>
 ifdef DBG_TRACE
 WSTR w_redteam,  <redteam>
+WSTR w_tpmtest,  <tpmtest>
 endif
 WSTR w_opt_m,    <-m>
 WSTR w_opt_t,    <-t>
@@ -141,7 +143,8 @@ cmd_table label CMDENT
     CMDENT { w_bench,     cmd_bench,     0, 0 }
 ifdef DBG_TRACE
     CMDENT { w_redteam,   cmd_redteam,   1, 0 }   ; fault-injection self-test (dbg)
-CMD_COUNT equ 3
+    CMDENT { w_tpmtest,   cmd_tpmtest,   0, 0 }   ; TPM round-trip probe (dbg)
+CMD_COUNT equ 4
 else
 CMD_COUNT equ 2
 endif

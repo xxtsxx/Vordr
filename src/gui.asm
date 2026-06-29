@@ -44,7 +44,11 @@ extern vault_title_at:proc
 extern vault_field_at:proc
 extern totp_from_b32:proc
 extern totp_secs_left:proc
+extern vault_tpm_remember:proc
+extern vault_tpm_forget:proc
+extern vault_tpm_has:proc
 
+externdef g_use_tpm:dword
 externdef g_cfg_in:qword
 externdef g_cfg_pass:byte
 externdef g_cfg_title:qword
@@ -76,6 +80,7 @@ extern GetClipboardSequenceNumber:proc
 extern SetTimer:proc
 extern KillTimer:proc
 extern MultiByteToWideChar:proc
+extern IsDlgButtonChecked:proc
 
 ; ---- constants ---------------------------------------------------------------
 MB_OK               equ 0
@@ -113,6 +118,8 @@ IDC_U_NEW    equ 103
 IDC_U_PW     equ 104
 IDC_U_UNLOCK equ 105
 IDC_U_STATUS equ 106
+IDC_U_TPM    equ 107
+IDC_U_REMEMBER equ 108
 DLG_VAULT    equ 200
 IDC_V_LIST   equ 201
 IDC_V_TITLE  equ 202
@@ -128,6 +135,7 @@ IDC_V_REMOVE equ 211
 IDC_V_LOCK   equ 212
 IDC_V_TOTP   equ 213
 IDC_V_COPYTOTP equ 214
+IDC_V_FORGET equ 215
 DLG_ENTRY    equ 300
 IDC_E_TITLE  equ 301
 IDC_E_USER   equ 302
@@ -192,6 +200,14 @@ WSTR s_createfail,  <Could not create the vault (I/O or out of memory).>
 WSTR s_notitle,     <An entry needs a title.>
 WSTR s_full,        <Vault is full.>
 WSTR s_resealfail,  <Saved in memory but writing to disk failed.>
+WSTR s_tpmnone,     <No Windows Hello / TPM unlock saved for this vault on this PC.>
+WSTR s_tpmfail,     <Windows Hello / TPM unlock failed - use your master password.>
+WSTR s_tpmsaved,    <This device can now unlock the vault with Windows Hello / TPM.>
+WSTR s_tpmsavefail, <Could not register this device with the TPM.>
+WSTR t_tpm,         <Windows Hello / TPM>
+WSTR m_forgotten,   <Windows Hello / TPM quick-unlock was removed for this device.>
+WSTR m_forget_q,    <Remove Windows Hello / TPM quick-unlock for this vault on this PC? The master password will still work.>
+WSTR t_forget,      <Forget this device>
 ; OPENFILENAMEW filter: "Vordr vault\0*.vordr\0All files\0*.*\0\0"
 align 2
 g_filter label word
@@ -348,6 +364,7 @@ gui_browse endp
 gui_unlock proc frame
     FRAME_PROLOG 48
     mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [g_use_tpm], 0        ; password path (not the TPM shortcut)
     cmp     dword ptr [g_vpath_set], 0
     jne     gu_havepath
     mov     rcx, qword ptr [rbp-24]
@@ -392,7 +409,12 @@ gu_open:
     call    gui_wipepw
     cmp     dword ptr [rbp-32], 0
     jne     gu_fail
-    ; success
+    ; optionally register this device for Windows Hello / TPM quick-unlock
+    WINCALL IsDlgButtonChecked, qword ptr [rbp-24], IDC_U_REMEMBER
+    cmp     eax, 1
+    jne     gu_success
+    call    vault_tpm_remember
+gu_success:
     WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_U_PW, 0
     WINCALL EndDialog, qword ptr [rbp-24], 1
     jmp     gu_done
@@ -411,6 +433,44 @@ gu_done:
     FRAME_EPILOG
     ret
 gui_unlock endp
+
+; =============================================================================
+; gui_unlock_tpm(rcx = hdlg) - unlock via the TPM sidecar (no password typed).
+;   Falls back to a status message if there is no saved device or it fails.
+; =============================================================================
+gui_unlock_tpm proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    cmp     dword ptr [g_vpath_set], 0
+    jne     gut_havepath
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [s_pickvault]
+    call    gui_status
+    jmp     gut_done
+gut_havepath:
+    lea     rax, [g_vpath]
+    mov     qword ptr [g_cfg_in], rax
+    mov     dword ptr [g_use_tpm], 1
+    call    vault_unlock
+    mov     dword ptr [rbp-32], eax
+    mov     dword ptr [g_use_tpm], 0
+    cmp     dword ptr [rbp-32], 0
+    jne     gut_fail
+    WINCALL EndDialog, qword ptr [rbp-24], 1
+    jmp     gut_done
+gut_fail:
+    ; EXIT_LOCKED here means "no/!matching TPM data" or a TPM error
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [s_tpmfail]
+    cmp     dword ptr [rbp-32], EXIT_LOCKED
+    jne     @F
+    lea     rdx, [s_tpmnone]
+@@: mov     rcx, qword ptr [rbp-24]
+    call    gui_status
+gut_done:
+    FRAME_EPILOG
+    ret
+gui_unlock_tpm endp
 
 ; gui_wipepw() - scrub the UTF-8 master password buffer.
 gui_wipepw proc frame
@@ -450,6 +510,8 @@ up_cmd:
     je      up_new
     cmp     eax, IDC_U_UNLOCK
     je      up_unlock
+    cmp     eax, IDC_U_TPM
+    je      up_tpm
     cmp     eax, IDCANCEL
     je      up_cancel
     xor     eax, eax
@@ -469,6 +531,11 @@ up_new:
 up_unlock:
     mov     rcx, qword ptr [rbp-8]
     call    gui_unlock
+    mov     eax, 1
+    jmp     up_ret
+up_tpm:
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_unlock_tpm
     mov     eax, 1
     jmp     up_ret
 up_cancel:
@@ -1052,6 +1119,8 @@ vp_cmd:
     je      vp_remove
     cmp     eax, IDC_V_LOCK
     je      vp_lock
+    cmp     eax, IDC_V_FORGET
+    je      vp_forget
     cmp     eax, IDCANCEL
     je      vp_lock
     xor     eax, eax
@@ -1145,6 +1214,13 @@ vp_remove:
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_SECRET, 0
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_URL, 0
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_NOTES, 0
+    jmp     vp_handled
+vp_forget:
+    WINCALL MessageBoxW, qword ptr [rbp-8], addr m_forget_q, addr t_forget, <MB_YESNO or MB_ICONQUESTION>
+    cmp     eax, IDYES
+    jne     vp_handled
+    call    vault_tpm_forget
+    WINCALL MessageBoxW, qword ptr [rbp-8], addr m_forgotten, addr t_forget, <MB_OK or MB_ICONINFORMATION>
     jmp     vp_handled
 vp_lock:
 vp_close:
