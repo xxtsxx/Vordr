@@ -9,7 +9,7 @@
 ;       of range, or the CSPRNG fails.
 ;
 ;   check_password_policy() -> eax = 0 ok / 1 too short / 2 too few classes
-;       (re-homed from Myrkr's cmd.asm; reads g_cfg_pass/g_cfg_passlen and the
+;       (reads g_cfg_pass/g_cfg_passlen and the
 ;       g_cfg_pwminlen / g_cfg_pwminclasses policy globals.)
 ;
 ; TODO (next step): guarantee at least one character from each requested class
@@ -161,7 +161,7 @@ pwgen endp
 
 ; =============================================================================
 ; check_password_policy() -> eax = 0 ok / 1 too short / 2 too few classes
-; (re-homed verbatim from Myrkr cmd.asm; counts UTF-8 code points and distinct
+; (counts UTF-8 code points and distinct
 ; character classes in g_cfg_pass[0..g_cfg_passlen).)
 ; =============================================================================
 public check_password_policy

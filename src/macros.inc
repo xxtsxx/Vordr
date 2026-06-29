@@ -57,7 +57,6 @@ MAX_ARGS            equ 256        ; argv[0] + up to 255 file inputs
 MAX_PATH_CHARS      equ 8000h      ; 32768 UTF-16 units (Windows extended-length max)
 MAX_PASSWORD_BYTES  equ 1024       ; UTF-8 bytes after conversion
 MIN_PASSWORD_BYTES  equ 1
-MAX_PLAINTEXT_SIZE  equ 0FFFFFFFFFh ; 64 GiB - 1 (GCM bound, see manifest.md)
 
 ARGON2_MIN_T        equ 1
 ARGON2_MAX_T        equ 16
@@ -66,49 +65,19 @@ ARGON2_MAX_M_KIB    equ 4194304    ; 4 GiB
 ARGON2_DEF_T        equ 3
 ARGON2_DEF_M_KIB    equ 524288     ; 512 MiB (tuned for ~600-700ms with AVX2)
 
-; ---------------------------------------------------------------------------
-; Container header (80 bytes, used verbatim as GCM AAD) - manifest.md section 4
-; The first 64 bytes are the parameter block; bytes 64..79 are a key-check
-; value = SHA-256(key)[0..15], allowing a wrong password to be rejected right
-; after key derivation (before any data is processed) and making the scheme
-; key-committing.  Version 2 introduced the KCV; v1 containers are rejected.
-; ---------------------------------------------------------------------------
-HDR_MAGIC           equ 4B52594Dh  ; "MYRK" little-endian
-HDR_VERSION         equ 2
-
-; Auto-compression threshold: when neither --compress nor --store is given, the
-; default is to compress inputs whose total size is below this, and store above.
-COMPRESS_AUTO_MAX   equ 03200000h  ; 50 MiB
-
-CONTAINER_HDR struct
-    magic       dd ?               ; "MYRK"
-    version     dd ?               ; 2
-    t_cost      dd ?               ; Argon2id passes
-    m_cost_kib  dd ?               ; Argon2id memory (KiB)
-    lanes       dd ?               ; Argon2id parallelism (always 1)
-    salt        db 32 dup (?)      ; CSPRNG salt
-    nonce       db 12 dup (?)      ; GCM nonce
-CONTAINER_HDR ends
-
 KCV_LEN             equ 16         ; key-check value bytes (SHA-256(key) prefix)
-KCV_OFFSET          equ (sizeof CONTAINER_HDR)            ; 64
-HDR_BYTES           equ (sizeof CONTAINER_HDR) + KCV_LEN  ; 80 (full header = AAD)
-GCM_TAG_LEN         equ 16
-CONTAINER_MIN_SIZE  equ HDR_BYTES + GCM_TAG_LEN           ; 96
 
 ; ===========================================================================
-; Vordr vault file format (see docs/formats.md).  Reuses the proven container
-; discipline: a fixed header used verbatim as GCM AAD, a key-check value
-; (SHA-256(key)[0..15]) so a wrong master password is rejected right after the
-; KDF (and the scheme is key-committing), fresh CSPRNG salt/nonce, atomic write
-; via temp-file + MoveFileExW.
+; Vordr vault file format (see docs/formats.md).  A fixed 80-byte header (the
+; 64-byte parameter block plus a 16-byte key-check value) is used verbatim as
+; the GCM AAD.  The KCV = SHA-256(key)[0..15] lets a wrong master password be
+; rejected right after the KDF (and makes the scheme key-committing).  Each
+; write uses a fresh CSPRNG salt/nonce and is committed atomically via a temp
+; file + MoveFileExW.
 ; ---------------------------------------------------------------------------
 VAULT_MAGIC         equ 52445256h  ; "VRDR" little-endian  - the single vault file
 VAULT_VERSION       equ 1
 
-; The vault header is byte-compatible with CONTAINER_HDR (same 64-byte param
-; block + 16-byte KCV) so it can reuse the exact GCM AAD / KCV machinery; only
-; the magic differs ("VRDR" instead of "MYRK").
 VAULT_HDR struct
     magic       dd ?               ; "VRDR"
     version     dd ?               ; 1

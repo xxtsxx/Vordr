@@ -8,7 +8,7 @@ rem known verb (init/add/get/list/edit/remove/gen/selftest/bench).  Otherwise it
 rem opens the windowed front-end.  Every launch runs the self-test gate first and
 rem fails closed.  See src\gui.asm:wstart.
 rem
-rem Reuses the proven Myrkr crypto + hardening core verbatim.  Run from a
+rem Run from a
 rem "x64 Native Tools Command Prompt for VS" (ml64/link on PATH).
 rem ===========================================================================
 setlocal

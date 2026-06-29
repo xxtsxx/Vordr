@@ -84,7 +84,7 @@ con_init endp
 ; Crucially, it first captures the shell-provided stdout/stderr handles and
 ; notes whether each is a real redirection (a disk file or a pipe).  AttachConsole
 ; replaces the process's standard handles with the console's, which would
-; otherwise discard a `myrkr ... > file` / `| tool` redirection and send output
+; otherwise discard a `vordr ... > file` / `| tool` redirection and send output
 ; to the terminal instead.  con_init then restores the captured handle for any
 ; stream that was redirected, so redirection and piping work as expected.
 ; =============================================================================

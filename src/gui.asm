@@ -8,7 +8,7 @@
 ; SCAFFOLD: the GUI is reduced to an About message box.  The full vault UI
 ; (entry list, reveal/copy panes, generator) lands in a later
 ; step.  What is preserved here and must not regress:
-;   * the exact CLI-vs-GUI startup order from Myrkr, and
+;   * the exact CLI-vs-GUI startup order, and
 ;   * the per-run SELF-TEST GATE: every launch runs the KATs first and fails
 ;     closed (EXIT_SELFTEST) before doing any work (brief requirement).
 ; =============================================================================
@@ -65,7 +65,7 @@ gui_main endp
 ; =============================================================================
 ; wstart - process entry point (linker /entry:wstart).
 ; Raw frame (runs before the hardening machinery is live for cpu_gate/
-; hardening_init, exactly as in Myrkr).
+; hardening_init).
 ; =============================================================================
 public wstart
 wstart proc

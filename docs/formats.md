@@ -3,7 +3,7 @@
 This document specifies the on-disk vault format and states the security
 guarantees (and their limits) honestly. Constants live in `src/macros.inc`.
 
-The format reuses Myrkr's proven container discipline:
+The format follows a strict container discipline:
 
 - a fixed header used **verbatim as the GCM AAD**, so header tampering breaks
   authentication;
