@@ -42,6 +42,8 @@ extern vault_remove_at:proc
 extern vault_count:proc
 extern vault_title_at:proc
 extern vault_field_at:proc
+extern totp_from_b32:proc
+extern totp_secs_left:proc
 
 externdef g_cfg_in:qword
 externdef g_cfg_pass:byte
@@ -50,6 +52,7 @@ externdef g_cfg_user:qword
 externdef g_cfg_secret:qword
 externdef g_cfg_url:qword
 externdef g_cfg_notes:qword
+externdef g_cfg_totp:qword
 
 ; ---- Win32 -------------------------------------------------------------------
 extern GetModuleHandleW:proc
@@ -90,6 +93,8 @@ WM_INITDIALOG       equ 110h
 WM_COMMAND          equ 111h
 CLIP_TIMER          equ 1                  ; timer id for clipboard auto-clear
 CLIP_MS             equ 20000              ; clear a copied secret after 20 s
+TOTP_TIMER          equ 2                  ; timer id for live auth-code refresh
+TOTP_MS             equ 1000               ; recompute the code once a second
 LBN_SELCHANGE       equ 1
 LB_ADDSTRING        equ 180h
 LB_RESETCONTENT     equ 184h
@@ -121,12 +126,15 @@ IDC_V_ADD    equ 209
 IDC_V_EDIT   equ 210
 IDC_V_REMOVE equ 211
 IDC_V_LOCK   equ 212
+IDC_V_TOTP   equ 213
+IDC_V_COPYTOTP equ 214
 DLG_ENTRY    equ 300
 IDC_E_TITLE  equ 301
 IDC_E_USER   equ 302
 IDC_E_SECRET equ 303
 IDC_E_URL    equ 304
 IDC_E_NOTES  equ 305
+IDC_E_TOTP   equ 306
 
 OFN_OVERWRITEPROMPT equ 2
 OFN_HIDEREADONLY    equ 4
@@ -216,6 +224,13 @@ g_e_user    dw 1024 dup (?)
 g_e_secret  dw EBUF dup (?)
 g_e_url     dw 1024 dup (?)
 g_e_notes   dw EBUF dup (?)
+g_e_totp    dw 256 dup (?)            ; entry-form base32 TOTP key (wide)
+g_totp_on   dd ?                      ; 1 if the selected entry has a TOTP key
+g_totp_b32len dd ?
+g_totp_b32  db 256 dup (?)            ; selected entry's base32 key (utf8)
+g_totp_code6 db 8 dup (?)            ; computed 6-digit code (ascii)
+g_totp_code_w dw 16 dup (?)          ; code as wide (for clipboard)
+g_disp_a    db 32 dup (?)            ; "287082  (17s)" display, ascii
 align 8
 g_ofn       OPENFILENAMEW <>
 
@@ -556,9 +571,119 @@ gui_showdetail proc frame
     mov     r9d, EBUF*2-1
     call    gui_towide
     WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_SECRET, addr g_mask
+    ; TOTP: if the entry has a base32 key, store it and arm the live refresh
+    mov     rcx, qword ptr [rbp-32]
+    mov     edx, VF_TOTP
+    lea     r8, [rbp-48]
+    call    vault_field_at
+    test    rax, rax
+    jz      gsd_nototp
+    mov     ecx, dword ptr [rbp-48]
+    cmp     ecx, 256
+    ja      gsd_nototp
+    mov     dword ptr [g_totp_b32len], ecx
+    mov     r11, rax                        ; src
+    lea     r10, [g_totp_b32]               ; dst
+    xor     r8d, r8d
+gsd_b32cp:
+    cmp     r8d, dword ptr [g_totp_b32len]
+    jae     gsd_b32d
+    mov     al, byte ptr [r11+r8]
+    mov     byte ptr [r10+r8], al
+    inc     r8d
+    jmp     gsd_b32cp
+gsd_b32d:
+    mov     dword ptr [g_totp_on], 1
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_totp_refresh
+    WINCALL SetTimer, qword ptr [rbp-24], TOTP_TIMER, TOTP_MS, 0
+    FRAME_EPILOG
+    ret
+gsd_nototp:
+    mov     dword ptr [g_totp_on], 0
+    sub     rsp, 32
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, TOTP_TIMER
+    call    KillTimer
+    add     rsp, 32
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_TOTP, 0
     FRAME_EPILOG
     ret
 gui_showdetail endp
+
+; gui_totp_refresh(rcx = hdlg) - recompute the live code + countdown and show it.
+gui_totp_refresh proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    cmp     dword ptr [g_totp_on], 0
+    je      gtr_done
+    lea     rcx, [g_totp_b32]
+    mov     edx, dword ptr [g_totp_b32len]
+    lea     r8, [g_totp_code6]
+    call    totp_from_b32
+    test    eax, eax
+    jz      gtr_bad
+    ; code as wide (for the clipboard copy button)
+    lea     rcx, [g_totp_code6]
+    mov     edx, 6
+    lea     r8, [g_totp_code_w]
+    mov     r9d, 15
+    call    gui_towide
+    ; build "287082  (NNs)" in g_disp_a
+    lea     r11, [g_disp_a]
+    lea     r10, [g_totp_code6]
+    xor     r8d, r8d
+gtr_cp:
+    cmp     r8d, 6
+    jae     gtr_cpd
+    mov     al, byte ptr [r10+r8]
+    mov     byte ptr [r11+r8], al
+    inc     r8d
+    jmp     gtr_cp
+gtr_cpd:
+    mov     byte ptr [r11+6], ' '
+    mov     byte ptr [r11+7], ' '
+    mov     byte ptr [r11+8], '('
+    call    totp_secs_left                  ; eax = seconds left (1..30)
+    lea     r11, [g_disp_a]
+    add     r11, 9
+    cmp     eax, 10
+    jb      gtr_one
+    mov     ecx, eax
+    mov     eax, ecx
+    mov     r9d, 10
+    xor     edx, edx
+    div     r9d
+    add     al, '0'
+    mov     byte ptr [r11], al
+    add     dl, '0'
+    mov     byte ptr [r11+1], dl
+    add     r11, 2
+    jmp     gtr_tail
+gtr_one:
+    add     al, '0'
+    mov     byte ptr [r11], al
+    add     r11, 1
+gtr_tail:
+    mov     byte ptr [r11], 's'
+    mov     byte ptr [r11+1], ')'
+    lea     r10, [g_disp_a]
+    sub     r11, r10
+    add     r11, 2                           ; total ascii length
+    lea     rcx, [g_disp_a]
+    mov     edx, r11d
+    lea     r8, [g_conv_w]
+    mov     r9d, EBUF*2-1
+    call    gui_towide
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_TOTP, addr g_conv_w
+    FRAME_EPILOG
+    ret
+gtr_bad:
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_TOTP, 0
+gtr_done:
+    FRAME_EPILOG
+    ret
+gui_totp_refresh endp
 
 ; gui_reveal(rcx = hdlg) - toggle the secret field between masked and revealed.
 gui_reveal proc frame
@@ -577,13 +702,14 @@ gr_done:
     ret
 gui_reveal endp
 
-; gui_copy(rcx = hdlg) - copy g_secret_w (NUL-terminated wide) to the clipboard
+; gui_copy(rcx = hdlg, rdx = wide NUL-terminated source) - copy to the clipboard
 ;   and arm a timer to auto-clear it after CLIP_MS (only if still ours).
 gui_copy proc frame
     FRAME_PROLOG 64
     mov     qword ptr [rbp-40], rcx         ; hdlg (for SetTimer)
+    mov     qword ptr [rbp-48], rdx         ; source wide ptr
     ; wide length (chars) incl NUL
-    lea     r10, [g_secret_w]
+    mov     r10, rdx
     xor     ecx, ecx
 gc_len:
     cmp     word ptr [r10+rcx*2], 0
@@ -604,9 +730,9 @@ gc_lend:
     WINCALL GlobalLock, rax
     test    rax, rax
     jz      gc_done
-    ; copy g_secret_w (chars) into the locked block
+    ; copy the source (chars) into the locked block
     mov     r11, rax                        ; dst
-    lea     r10, [g_secret_w]               ; src
+    mov     r10, qword ptr [rbp-48]         ; src
     xor     r8d, r8d
 gc_cp:
     cmp     r8d, dword ptr [rbp-32]
@@ -691,6 +817,11 @@ gui_setcfg proc frame
     jne     @F
     xor     eax, eax
 @@: mov     qword ptr [g_cfg_notes], rax
+    lea     rax, [g_e_totp]
+    cmp     word ptr [g_e_totp], 0
+    jne     @F
+    xor     eax, eax
+@@: mov     qword ptr [g_cfg_totp], rax
     FRAME_EPILOG
     ret
 gui_setcfg endp
@@ -703,8 +834,12 @@ gui_clearcfg proc frame
     mov     qword ptr [g_cfg_secret], 0
     mov     qword ptr [g_cfg_url], 0
     mov     qword ptr [g_cfg_notes], 0
+    mov     qword ptr [g_cfg_totp], 0
     lea     rcx, [g_e_secret]
     mov     edx, EBUF*2
+    call    secure_zero
+    lea     rcx, [g_e_totp]
+    mov     edx, 512
     call    secure_zero
     FRAME_EPILOG
     ret
@@ -761,6 +896,7 @@ gui_loadentry proc frame
     LOADF VF_SECRET,   g_e_secret
     LOADF VF_URL,      g_e_url
     LOADF VF_NOTES,    g_e_notes
+    LOADF VF_TOTP,     g_e_totp
     FRAME_EPILOG
     ret
 gui_loadentry endp
@@ -803,6 +939,10 @@ ep_init:
     mov     edx, IDC_E_NOTES
     lea     r8, [g_e_notes]
     call    SetDlgItemTextW
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_E_TOTP
+    lea     r8, [g_e_totp]
+    call    SetDlgItemTextW
     add     rsp, 32
     mov     eax, 1
     jmp     ep_ret
@@ -830,6 +970,7 @@ ep_ok:
     GETF IDC_E_SECRET, g_e_secret, EBUF
     GETF IDC_E_URL,    g_e_url,    1024
     GETF IDC_E_NOTES,  g_e_notes,  EBUF
+    GETF IDC_E_TOTP,   g_e_totp,   256
     sub     rsp, 32
     mov     rcx, qword ptr [rbp-8]
     mov     edx, IDOK
@@ -870,13 +1011,21 @@ vault_proc proc
     jmp     vp_ret
 vp_timer:
     cmp     r8d, CLIP_TIMER
-    jne     vp_unhandled
+    je      vp_t_clip
+    cmp     r8d, TOTP_TIMER
+    je      vp_t_totp
+    jmp     vp_unhandled
+vp_t_clip:
     sub     rsp, 32
     mov     rcx, qword ptr [rbp-8]
     mov     edx, CLIP_TIMER
     call    KillTimer
     add     rsp, 32
     call    gui_clipclear
+    jmp     vp_handled
+vp_t_totp:
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_totp_refresh
     jmp     vp_handled
 vp_init:
     mov     rcx, qword ptr [rbp-8]
@@ -893,6 +1042,8 @@ vp_cmd:
     je      vp_reveal
     cmp     eax, IDC_V_COPY
     je      vp_copy
+    cmp     eax, IDC_V_COPYTOTP
+    je      vp_copytotp
     cmp     eax, IDC_V_ADD
     je      vp_add
     cmp     eax, IDC_V_EDIT
@@ -922,6 +1073,12 @@ vp_reveal:
     jmp     vp_handled
 vp_copy:
     mov     rcx, qword ptr [rbp-8]
+    lea     rdx, [g_secret_w]
+    call    gui_copy
+    jmp     vp_handled
+vp_copytotp:
+    mov     rcx, qword ptr [rbp-8]
+    lea     rdx, [g_totp_code_w]
     call    gui_copy
     jmp     vp_handled
 vp_add:
@@ -939,6 +1096,9 @@ vp_add:
     call    gui_clrwbuf
     lea     rcx, [g_e_notes]
     mov     edx, EBUF
+    call    gui_clrwbuf
+    lea     rcx, [g_e_totp]
+    mov     edx, 256
     call    gui_clrwbuf
     mov     dword ptr [g_e_edit], 0
     WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_ENTRY, qword ptr [rbp-8], addr entry_proc, 0
@@ -992,10 +1152,20 @@ vp_close:
     mov     rcx, qword ptr [rbp-8]
     mov     edx, CLIP_TIMER
     call    KillTimer
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, TOTP_TIMER
+    call    KillTimer
     add     rsp, 32
+    mov     dword ptr [g_totp_on], 0
     call    gui_clipclear                   ; clear the clipboard if it is still ours
-    lea     rcx, [g_secret_w]               ; wipe the in-memory revealed secret
+    lea     rcx, [g_secret_w]               ; wipe revealed secret + TOTP material
     mov     edx, EBUF*4
+    call    secure_zero
+    lea     rcx, [g_totp_b32]
+    mov     edx, 256
+    call    secure_zero
+    lea     rcx, [g_e_totp]
+    mov     edx, 512
     call    secure_zero
     WINCALL EndDialog, qword ptr [rbp-8], 0
 vp_handled:

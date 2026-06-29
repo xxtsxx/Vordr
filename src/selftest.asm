@@ -24,6 +24,9 @@ extern argon2id_hash:proc
 extern check_password_policy:proc
 extern pwgen:proc
 extern vault_selftest:proc
+extern hmac_sha1:proc
+extern base32_decode:proc
+extern hotp:proc
 externdef g_cfg_pass:byte
 externdef g_cfg_passlen:dword
 externdef g_cfg_pwminlen:dword
@@ -85,6 +88,38 @@ CSTR st_pass_gen,  "  [PASS] pwgen  (alphabet + length, no bias tail)",13,10
 CSTR st_fail_gen,  "  [FAIL] pwgen",13,10
 CSTR st_pass_vlt,  "  [PASS] vault seal/open  (Argon2id KDF -> KCV -> GCM round-trip)",13,10
 CSTR st_fail_vlt,  "  [FAIL] vault seal/open",13,10
+CSTR st_pass_mac,  "  [PASS] hmac-sha1  (RFC 2202 test case 1)",13,10
+CSTR st_fail_mac,  "  [FAIL] hmac-sha1",13,10
+CSTR st_pass_b32,  "  [PASS] base32 decode  (RFC 4648)",13,10
+CSTR st_fail_b32,  "  [FAIL] base32 decode",13,10
+CSTR st_pass_otp,  "  [PASS] totp/hotp  (RFC 4226 vector)",13,10
+CSTR st_fail_otp,  "  [FAIL] totp/hotp",13,10
+CSTR st_pass_o16,  "  [PASS] base32->hotp path  (16-char key, high bytes)",13,10
+CSTR st_fail_o16,  "  [FAIL] base32->hotp path",13,10
+CSTR st_pass_mac2, "  [PASS] hmac-sha1 short key  (RFC 2202 case 2)",13,10
+CSTR st_fail_mac2, "  [FAIL] hmac-sha1 short key",13,10
+
+; RFC 2202 HMAC-SHA1 test case 1: key = 0x0b x20, data = "Hi There"
+hm_key      db 020 dup (0bh)             ; (only first 20 used)
+hm_msg      db "Hi There"
+hm_exp      db 0b6h,017h,031h,086h,055h,005h,072h,064h,0e2h,08bh,0c0h,0b6h
+            db 0fbh,037h,08ch,08eh,0f1h,046h,0beh,000h
+; base32("Hello") = "JBSWY3DP" -> 48 65 6C 6C 6F
+b32_src     db "JBSWY3DP"
+b32_exp     db "Hello"
+; RFC 4226 HOTP: secret "12345678901234567890", counter 1 -> "287082"
+otp_key     db "12345678901234567890"
+otp_exp     db "287082"
+; full base32->hotp path: base32("JBSWY3DPEHPK3PXP") = "Hello!"+deadbeef (10 bytes);
+; HOTP at counter 1 = 996554 (exercises a short key with high bytes end-to-end)
+otp16_b32   db "JBSWY3DPEHPK3PXP"
+otp16_dec   db 048h,065h,06ch,06ch,06fh,021h,0deh,0adh,0beh,0efh
+otp16_exp   db "996554"
+; RFC 2202 HMAC-SHA1 case 2: key="Jefe" (4 bytes), msg="what do ya want for nothing?"
+hm2_key     db "Jefe"
+hm2_msg     db "what do ya want for nothing?"
+hm2_exp     db 0efh,0fch,0dfh,06ah,0e5h,0ebh,02fh,0a2h,0d2h,074h
+            db 016h,0d5h,0f1h,084h,0dfh,09ch,025h,09ah,07ch,079h
 
 ; policy test passwords
 pw_short    db "Abc12"                       ; 5 chars (too short)
@@ -139,6 +174,9 @@ gcm_dec         db 16 dup (?)
 align 8
 greq            GCMREQ <>
 pw_out          db 64 dup (?)
+hmac_out        db 20 dup (?)
+b32_out         db 16 dup (?)
+otp_out         db 8 dup (?)
 g_st_verbose    dd ?
 
 .code
@@ -508,6 +546,93 @@ st_vlt_fail:
     STPRINT st_fail_vlt, st_fail_vlt_len
     inc     qword ptr [rbp-24]
 st_after_vlt:
+
+    ; ---- HMAC-SHA1 (RFC 2202 test case 1) -----------------------------------
+    WINCALL hmac_sha1, addr hm_key, 20, addr hm_msg, 8, addr hmac_out
+    lea     rcx, [hmac_out]
+    lea     rdx, [hm_exp]
+    mov     r8, 20
+    call    ct_memcmp
+    test    eax, eax
+    jnz     st_mac_fail
+    STPRINT st_pass_mac, st_pass_mac_len
+    jmp     st_after_mac
+st_mac_fail:
+    STPRINT st_fail_mac, st_fail_mac_len
+    inc     qword ptr [rbp-24]
+st_after_mac:
+
+    ; ---- base32 decode ("JBSWY3DP" -> "Hello") ------------------------------
+    WINCALL base32_decode, addr b32_src, 8, addr b32_out, 16
+    cmp     eax, 5
+    jne     st_b32_fail
+    lea     rcx, [b32_out]
+    lea     rdx, [b32_exp]
+    mov     r8, 5
+    call    ct_memcmp
+    test    eax, eax
+    jnz     st_b32_fail
+    STPRINT st_pass_b32, st_pass_b32_len
+    jmp     st_after_b32
+st_b32_fail:
+    STPRINT st_fail_b32, st_fail_b32_len
+    inc     qword ptr [rbp-24]
+st_after_b32:
+
+    ; ---- HOTP (RFC 4226: secret, counter 1 -> "287082") ---------------------
+    WINCALL hotp, addr otp_key, 20, 1, addr otp_out
+    lea     rcx, [otp_out]
+    lea     rdx, [otp_exp]
+    mov     r8, 6
+    call    ct_memcmp
+    test    eax, eax
+    jnz     st_otp_fail
+    STPRINT st_pass_otp, st_pass_otp_len
+    jmp     st_after_otp
+st_otp_fail:
+    STPRINT st_fail_otp, st_fail_otp_len
+    inc     qword ptr [rbp-24]
+st_after_otp:
+
+    ; ---- HMAC-SHA1 short key (RFC 2202 case 2, "Jefe" = 4 bytes) -------------
+    WINCALL hmac_sha1, addr hm2_key, 4, addr hm2_msg, 28, addr hmac_out
+    lea     rcx, [hmac_out]
+    lea     rdx, [hm2_exp]
+    mov     r8, 20
+    call    ct_memcmp
+    test    eax, eax
+    jnz     st_mac2_fail
+    STPRINT st_pass_mac2, st_pass_mac2_len
+    jmp     st_after_mac2
+st_mac2_fail:
+    STPRINT st_fail_mac2, st_fail_mac2_len
+    inc     qword ptr [rbp-24]
+st_after_mac2:
+
+    ; ---- full base32 -> hotp path (16-char base32 -> 10-byte key w/ high bytes,
+    ;      fixed counter 1 -> 996554): exercises decode + short-key HMAC end-to-end
+    WINCALL base32_decode, addr otp16_b32, 16, addr b32_out, 16
+    cmp     eax, 10
+    jne     st_o16_fail
+    lea     rcx, [b32_out]
+    lea     rdx, [otp16_dec]
+    mov     r8, 10
+    call    ct_memcmp
+    test    eax, eax
+    jnz     st_o16_fail
+    WINCALL hotp, addr b32_out, 10, 1, addr otp_out
+    lea     rcx, [otp_out]
+    lea     rdx, [otp16_exp]
+    mov     r8, 6
+    call    ct_memcmp
+    test    eax, eax
+    jnz     st_o16_fail
+    STPRINT st_pass_o16, st_pass_o16_len
+    jmp     st_after_o16
+st_o16_fail:
+    STPRINT st_fail_o16, st_fail_o16_len
+    inc     qword ptr [rbp-24]
+st_after_o16:
 
     mov     rax, qword ptr [rbp-24]
     FRAME_EPILOG

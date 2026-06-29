@@ -97,6 +97,7 @@ VF_SECRET           equ 3
 VF_URL              equ 4
 VF_NOTES            equ 5
 VF_TAGS             equ 6
+VF_TOTP             equ 7          ; base32 TOTP secret (RFC 6238)
 VAULT_ID_LEN        equ 16         ; per-entry random id
 MAX_ENTRY_BYTES     equ 65536      ; bound on a single serialized entry
 MAX_FIELD_BYTES     equ 16384      ; bound on a single TLV field

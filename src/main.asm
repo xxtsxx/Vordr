@@ -73,11 +73,13 @@ g_cfg_logfile       dq 0            ; --log-file PATH override (0 = default path
 
 ; --- vault entry fields (populated by the GUI; the CLI never accepts secrets) --
 public g_cfg_title, g_cfg_user, g_cfg_secret, g_cfg_url, g_cfg_notes
+public g_cfg_totp
 g_cfg_title         dq 0
 g_cfg_user          dq 0
 g_cfg_secret        dq 0
 g_cfg_url           dq 0
 g_cfg_notes         dq 0
+g_cfg_totp          dq 0                ; --> wide base32 TOTP secret (GUI)
 
 .data?
 public g_cfg_pass, g_positionals, g_poscount
