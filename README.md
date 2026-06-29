@@ -18,10 +18,11 @@ launch**, and the program **fails closed** on any violation.
 > the GUI. Launch `vordr.exe` with no arguments to get the **Unlock** dialog
 > (open an existing `.vordr` or create a new one + master password), then a
 > **Vault** window: an entry list with a detail pane (username / secret with
-> reveal + copy-to-clipboard / url / notes) and Add / Edit / Remove. The command
-> line exposes only `selftest` and `bench`. Still rough: standard (light) Win32
-> theme, single-process file locking, no clipboard auto-clear, no external
-> review.
+> reveal + copy / url / notes) and Add / Edit / Remove. A copied secret is
+> **auto-cleared from the clipboard after 20 s** (and on Lock), but only if you
+> haven't copied something else since. The command line exposes only `selftest`
+> and `bench`. Still rough: standard (light) Win32 theme, single-process file
+> locking, no external review.
 
 ## Design goals
 
