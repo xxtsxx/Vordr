@@ -10,6 +10,8 @@
 #define IDC_U_PW     104
 #define IDC_U_UNLOCK 105
 #define IDC_U_STATUS 106
+#define IDC_U_TPM    107
+#define IDC_U_REMEMBER 108
 #define DLG_VAULT    200
 #define IDC_V_LIST   201
 #define IDC_V_TITLE  202
@@ -25,6 +27,7 @@
 #define IDC_V_LOCK   212
 #define IDC_V_TOTP   213
 #define IDC_V_COPYTOTP 214
+#define IDC_V_FORGET 215
 #define DLG_ENTRY    300
 #define IDC_E_TITLE  301
 #define IDC_E_USER   302
@@ -36,7 +39,7 @@
 /* application / window icon (lowest ID -> the shell's file icon) */
 1 ICON "vordr.ico"
 
-DLG_UNLOCK DIALOGEX 0, 0, 320, 138
+DLG_UNLOCK DIALOGEX 0, 0, 320, 168
 STYLE DS_CENTER | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Vordr - Unlock vault"
 FONT 9, "Segoe UI"
@@ -47,9 +50,11 @@ BEGIN
     PUSHBUTTON      "Create new...", IDC_U_NEW, 88, 28, 70, 16
     LTEXT           "Master password:", -1, 12, 58, 90, 10
     EDITTEXT        IDC_U_PW, 12, 70, 296, 14, ES_PASSWORD | ES_AUTOHSCROLL
-    DEFPUSHBUTTON   "Unlock", IDC_U_UNLOCK, 196, 96, 54, 18
-    PUSHBUTTON      "Cancel", IDCANCEL, 254, 96, 54, 18
-    LTEXT           "", IDC_U_STATUS, 12, 120, 296, 10
+    AUTOCHECKBOX    "Remember this device (fast unlock via Windows Hello / TPM)", IDC_U_REMEMBER, 12, 90, 296, 10
+    DEFPUSHBUTTON   "Unlock", IDC_U_UNLOCK, 196, 106, 54, 18
+    PUSHBUTTON      "Cancel", IDCANCEL, 254, 106, 54, 18
+    PUSHBUTTON      "Unlock with Windows Hello / TPM", IDC_U_TPM, 12, 106, 170, 18
+    LTEXT           "", IDC_U_STATUS, 12, 134, 296, 24
 END
 
 DLG_VAULT DIALOGEX 0, 0, 426, 286
@@ -76,6 +81,7 @@ BEGIN
     LTEXT           "Auth code", -1, 158, 164, 44, 10
     EDITTEXT        IDC_V_TOTP, 206, 162, 110, 13, ES_READONLY | ES_AUTOHSCROLL
     PUSHBUTTON      "Copy code", IDC_V_COPYTOTP, 320, 162, 56, 13
+    PUSHBUTTON      "Forget this device", IDC_V_FORGET, 288, 256, 68, 18
     DEFPUSHBUTTON   "Lock", IDC_V_LOCK, 362, 256, 54, 18
 END
 

@@ -36,6 +36,11 @@ extern print_a:proc
 extern print_err:proc
 extern WideCharToMultiByte:proc
 extern GetSystemTimeAsFileTime:proc
+extern tpm_seal:proc
+extern tpm_unseal:proc
+extern tpm_delete:proc
+extern DeleteFileW:proc
+extern GetFileAttributesW:proc
 
 externdef g_cfg_in:qword
 externdef g_cfg_pass:byte
@@ -144,6 +149,20 @@ vst_ct      db 16 dup (?)
 vst_dec     db 16 dup (?)
 vst_tag     db 16 dup (?)
 g_editbuf   db MAX_ENTRY_BYTES dup (?)     ; scratch copy of an entry for `edit`
+align 4
+public g_use_tpm
+g_use_tpm   dd ?                    ; GUI sets 1 to unlock via TPM, else password
+align 2
+g_tpm_kn    dw 64 dup (?)           ; TPM key name (wide): "Vordr-" + KCV[0..7] hex
+g_tpm_sc    dw MAX_PATH_CHARS dup (?)   ; sidecar path (wide): "<vault>.tpm"
+align 8
+g_tpm_blob  db 512 dup (?)          ; sealed 32-byte master key (RSA-OAEP blob)
+g_tpm_wbuf  db 600 dup (?)          ; assembled sidecar (VTPM hdr + blob) to write
+g_tpm_scptr dq ?                    ; read_file-allocated sidecar buffer
+g_tpm_scsz  dq ?                    ; sidecar size (read_file out param)
+
+VTPM_MAGIC  equ 04D505456h          ; "VTPM" little-endian
+VTPM_HDR    equ 12                  ; magic(4) + version(4) + bloblen(4)
 
 .code
 
@@ -208,6 +227,215 @@ vd_ok:
     FRAME_EPILOG
     ret
 vk_derive endp
+
+; ===========================================================================
+; tpm_kn_build() - g_tpm_kn = L"Vordr-" + 16 lowercase hex of g_hdr KCV[0..7].
+;   A per-vault, per-machine TPM key name (the KCV ties it to this exact key).
+; ===========================================================================
+tpm_kn_build proc frame
+    FRAME_PROLOG 32
+    lea     r10, [g_tpm_kn]
+    mov     word ptr [r10+0],  'V'
+    mov     word ptr [r10+2],  'o'
+    mov     word ptr [r10+4],  'r'
+    mov     word ptr [r10+6],  'd'
+    mov     word ptr [r10+8],  'r'
+    mov     word ptr [r10+10], '-'
+    add     r10, 12
+    lea     r11, [g_hdr+VH_KCV]
+    xor     r8d, r8d
+kn_loop:
+    movzx   eax, byte ptr [r11+r8]
+    mov     ecx, eax
+    shr     ecx, 4
+    and     ecx, 0Fh
+    cmp     ecx, 10
+    jb      kn_hi_d
+    add     ecx, 'a'-10
+    jmp     kn_hi_s
+kn_hi_d:
+    add     ecx, '0'
+kn_hi_s:
+    mov     word ptr [r10], cx
+    add     r10, 2
+    mov     ecx, eax
+    and     ecx, 0Fh
+    cmp     ecx, 10
+    jb      kn_lo_d
+    add     ecx, 'a'-10
+    jmp     kn_lo_s
+kn_lo_d:
+    add     ecx, '0'
+kn_lo_s:
+    mov     word ptr [r10], cx
+    add     r10, 2
+    inc     r8d
+    cmp     r8d, 8
+    jb      kn_loop
+    mov     word ptr [r10], 0
+    FRAME_EPILOG
+    ret
+tpm_kn_build endp
+
+; ===========================================================================
+; tpm_sc_build() - g_tpm_sc = [g_cfg_in] (wide vault path) + L".tpm".
+; ===========================================================================
+tpm_sc_build proc frame
+    FRAME_PROLOG 32
+    mov     r11, qword ptr [g_cfg_in]
+    lea     r10, [g_tpm_sc]
+    xor     r8d, r8d
+sc_cpy:
+    movzx   eax, word ptr [r11+r8*2]
+    test    eax, eax
+    jz      sc_end
+    mov     word ptr [r10+r8*2], ax
+    inc     r8d
+    cmp     r8d, MAX_PATH_CHARS - 8
+    jb      sc_cpy
+sc_end:
+    lea     r10, [r10+r8*2]
+    mov     word ptr [r10+0], '.'
+    mov     word ptr [r10+2], 't'
+    mov     word ptr [r10+4], 'p'
+    mov     word ptr [r10+6], 'm'
+    mov     word ptr [r10+8], 0
+    FRAME_EPILOG
+    ret
+tpm_sc_build endp
+
+; ===========================================================================
+; vk_derive_tpm() - read the sidecar, TPM-unseal it into g_vkey.
+;   Precondition: g_hdr holds the vault header (KCV).  -> eax = 0 / EXIT_LOCKED.
+; ===========================================================================
+vk_derive_tpm proc frame
+    FRAME_PROLOG 48
+    call    tpm_kn_build
+    call    tpm_sc_build
+    lea     rcx, [g_tpm_sc]
+    lea     rdx, [g_tpm_scptr]
+    lea     r8, [g_tpm_scsz]
+    call    read_file
+    test    eax, eax
+    jnz     vdt_no
+    mov     r10, qword ptr [g_tpm_scptr]
+    cmp     dword ptr [r10], VTPM_MAGIC
+    jne     vdt_free
+    mov     eax, dword ptr [r10+8]          ; bloblen
+    cmp     eax, 512
+    ja      vdt_free
+    mov     dword ptr [rbp-32], eax
+    lea     rcx, [g_tpm_kn]
+    lea     rdx, [r10+VTPM_HDR]
+    mov     r8d, dword ptr [rbp-32]
+    lea     r9, [g_vkey]
+    call    tpm_unseal
+    mov     dword ptr [rbp-40], eax         ; unseal result
+    ; free the sidecar buffer (allocated by read_file)
+    mov     rcx, qword ptr [g_tpm_scptr]
+    mov     rdx, qword ptr [g_tpm_scsz]
+    call    mem_free
+    mov     qword ptr [g_tpm_scptr], 0
+    cmp     dword ptr [rbp-40], 0
+    je      vdt_no
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+vdt_free:
+    mov     rcx, qword ptr [g_tpm_scptr]
+    mov     rdx, qword ptr [g_tpm_scsz]
+    call    mem_free
+    mov     qword ptr [g_tpm_scptr], 0
+vdt_no:
+    mov     eax, EXIT_LOCKED
+    FRAME_EPILOG
+    ret
+vk_derive_tpm endp
+
+; ===========================================================================
+; vault_tpm_remember() -> eax = 1/0.  Seal the current master key (g_vkey) to
+;   the TPM and write the per-vault sidecar, enabling fast unlock on this PC.
+;   Precondition: vault just unlocked (g_vkey + g_hdr valid, g_cfg_in = path).
+; ===========================================================================
+public vault_tpm_remember
+vault_tpm_remember proc frame
+    FRAME_PROLOG 48
+    call    tpm_kn_build
+    lea     rcx, [g_tpm_kn]
+    lea     rdx, [g_vkey]
+    lea     r8, [g_tpm_blob]
+    mov     r9d, 512
+    call    tpm_seal
+    test    eax, eax
+    jz      vtr_fail
+    mov     dword ptr [rbp-32], eax         ; blob length
+    lea     r10, [g_tpm_wbuf]
+    mov     dword ptr [r10], VTPM_MAGIC
+    mov     dword ptr [r10+4], 1
+    mov     eax, dword ptr [rbp-32]
+    mov     dword ptr [r10+8], eax
+    lea     r11, [g_tpm_blob]
+    xor     r8d, r8d
+vtr_cp:
+    cmp     r8d, dword ptr [rbp-32]
+    jae     vtr_cpd
+    mov     al, byte ptr [r11+r8]
+    mov     byte ptr [r10+VTPM_HDR+r8], al
+    inc     r8d
+    jmp     vtr_cp
+vtr_cpd:
+    call    tpm_sc_build
+    lea     rcx, [g_tpm_sc]
+    lea     rdx, [g_tpm_wbuf]
+    mov     r8d, dword ptr [rbp-32]
+    add     r8d, VTPM_HDR
+    call    write_file
+    test    eax, eax
+    jnz     vtr_fail
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+vtr_fail:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+vault_tpm_remember endp
+
+; ===========================================================================
+; vault_tpm_forget() -> eax = 1.  Delete the TPM key + sidecar for this vault.
+;   Precondition: g_hdr holds the vault header (so the key name resolves).
+; ===========================================================================
+public vault_tpm_forget
+vault_tpm_forget proc frame
+    FRAME_PROLOG 32
+    call    tpm_kn_build
+    lea     rcx, [g_tpm_kn]
+    call    tpm_delete
+    call    tpm_sc_build
+    WINCALL DeleteFileW, addr g_tpm_sc
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+vault_tpm_forget endp
+
+; ===========================================================================
+; vault_tpm_has() -> eax = 1 if a TPM sidecar exists for g_cfg_in, else 0.
+; ===========================================================================
+public vault_tpm_has
+vault_tpm_has proc frame
+    FRAME_PROLOG 32
+    call    tpm_sc_build
+    WINCALL GetFileAttributesW, addr g_tpm_sc
+    cmp     eax, -1                         ; INVALID_FILE_ATTRIBUTES
+    je      vth_no
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+vth_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+vault_tpm_has endp
 
 ; vk_kcv() - g_sha32 = SHA-256(g_vkey); leaves the 32-byte digest in g_sha32.
 vk_kcv proc frame
@@ -356,10 +584,18 @@ vu_hcpy:
     inc     r8
     cmp     r8, VH_TOTAL
     jb      vu_hcpy
-    ; derive key + KCV check
+    ; derive key (TPM sidecar or master password) + KCV check
+    cmp     dword ptr [g_use_tpm], 0
+    je      vu_pwderive
+    call    vk_derive_tpm
+    test    eax, eax
+    jnz     vu_locked                   ; no/failed TPM -> GUI falls back to pw
+    jmp     vu_havekey
+vu_pwderive:
     call    vk_derive
     test    eax, eax
     jnz     vu_oom
+vu_havekey:
     call    vk_kcv
     lea     rcx, [g_sha32]
     mov     r10, qword ptr [g_filebuf]
