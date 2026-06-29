@@ -41,10 +41,6 @@ extern do_init:proc                     ; vault commands (vault.asm)
 extern do_add:proc
 extern do_list:proc
 extern do_get:proc
-extern do_padnew:proc                   ; OTP pad/share commands (pad.asm)
-extern do_padimport:proc
-extern do_share:proc
-extern do_open:proc
 extern do_edit:proc                     ; vault edit/remove (vault.asm)
 extern do_remove:proc
 extern do_bench:proc                    ; benchmark (bench.asm)
@@ -99,11 +95,6 @@ g_cfg_user          dq 0
 g_cfg_secret        dq 0
 g_cfg_url           dq 0
 g_cfg_notes         dq 0
-; --- one-time-pad / share options ----------------------------------------
-public g_cfg_size, g_cfg_from, g_cfg_share
-g_cfg_size          dd 0                ; --size  N    (pad size in bytes)
-g_cfg_from          dq 0                ; --from  PATH (raw TRNG file for padimport)
-g_cfg_share         dq 0                ; --share PATH (.vshare file for open)
 
 .data?
 public g_cfg_pass, g_positionals, g_poscount
@@ -129,11 +120,6 @@ msg_usage label byte
     db "    vordr remove VAULT -p PW --title T         delete an entry",13,10
     db "  password generator:",13,10
     db "    vordr gen [--len N] [--count N] [--no-symbols]",13,10
-    db "  one-time-pad sharing  (PAD = .vpad file; pad shared out-of-band):",13,10
-    db "    vordr padnew    PAD -p PW --size N        create a CSPRNG pad",13,10
-    db "    vordr padimport PAD -p PW --from RAW      import external TRNG bytes",13,10
-    db "    vordr share     PAD -p PW --secret S -o SHARE   OTP-encrypt a secret",13,10
-    db "    vordr open      PAD -p PW --share SHARE [-o OUT] decrypt a share",13,10
     db "  diagnostics:",13,10
     db "    vordr selftest             run all known-answer self-tests",13,10
     db "    vordr bench [-m MIB] [-t N] benchmark the crypto core",13,10
@@ -153,10 +139,6 @@ WSTR w_list,     <list>
 WSTR w_edit,     <edit>
 WSTR w_remove,   <remove>
 WSTR w_gen,      <gen>
-WSTR w_padnew,   <padnew>
-WSTR w_padimport,<padimport>
-WSTR w_share,    <share>
-WSTR w_open,     <open>
 WSTR w_selftest, <selftest>
 WSTR w_bench,    <bench>
 ifdef DBG_TRACE
@@ -183,9 +165,6 @@ WSTR w_opt_user,       <--user>
 WSTR w_opt_secret,     <--secret>
 WSTR w_opt_url,        <--url>
 WSTR w_opt_notes,      <--notes>
-WSTR w_opt_size,       <--size>
-WSTR w_opt_from,       <--from>
-WSTR w_opt_share,      <--share>
 WSTR w_lvl_none,       <none>
 WSTR w_lvl_error,      <error>
 WSTR w_lvl_warning,    <warning>
@@ -200,10 +179,8 @@ CMDENT struct
     needs_pass  dd ?                ; 1 if -p is mandatory
 CMDENT ends
 
-; NOTE (scaffold): all vault/share verbs take 0 positionals and no mandatory
-; password for now, so each stub runs bare and prints its placeholder.  Real
-; argument specs (entry name, vault path, -p master password, gen options)
-; arrive when the handlers are implemented.
+; Vault verbs take one positional (the .vordr path) and a mandatory -p master
+; password; gen/selftest/bench take neither.
 cmd_table label CMDENT
     CMDENT { w_init,      cmd_init,      1, 1 }   ; VAULT path, -p master
     CMDENT { w_add,       cmd_add,       1, 1 }   ; VAULT path, -p, --title ...
@@ -212,17 +189,13 @@ cmd_table label CMDENT
     CMDENT { w_edit,      cmd_edit,      1, 1 }
     CMDENT { w_remove,    cmd_remove,    1, 1 }
     CMDENT { w_gen,       cmd_gen,       0, 0 }
-    CMDENT { w_padnew,    cmd_padnew,    1, 1 }   ; PAD path, -p, --size N
-    CMDENT { w_padimport, cmd_padimport, 1, 1 }   ; PAD path, -p, --from RAW
-    CMDENT { w_share,     cmd_share,     1, 1 }   ; PAD path, -p, --secret S, -o SHARE
-    CMDENT { w_open,      cmd_open,      1, 1 }   ; PAD path, -p, --share SHARE [-o OUT]
     CMDENT { w_selftest,  cmd_selftest,  0, 0 }
     CMDENT { w_bench,     cmd_bench,     0, 0 }
 ifdef DBG_TRACE
     CMDENT { w_redteam,   cmd_redteam,   1, 0 }   ; fault-injection self-test
-CMD_COUNT equ 14
+CMD_COUNT equ 10
 else
-CMD_COUNT equ 13
+CMD_COUNT equ 9
 endif
 
 .data?
@@ -805,9 +778,6 @@ co_loop:
     OPTMATCH w_opt_secret, co_take_secret
     OPTMATCH w_opt_url,    co_take_url
     OPTMATCH w_opt_notes,  co_take_notes
-    OPTMATCH w_opt_size,   co_take_size
-    OPTMATCH w_opt_from,   co_take_from
-    OPTMATCH w_opt_share,  co_take_share
 
     ; ---- positional: store into g_positionals[poscount] ---------------------
     mov     rax, qword ptr [rbp-32]
@@ -986,28 +956,6 @@ co_take_notes:
     jz      co_usage
     mov     qword ptr [g_cfg_notes], rax
     jmp     co_loop
-co_take_size:
-    call    co_next_arg
-    test    rax, rax
-    jz      co_usage
-    mov     rcx, rax
-    call    wstr_to_u32
-    test    edx, edx
-    jz      co_badnum
-    mov     dword ptr [g_cfg_size], eax
-    jmp     co_loop
-co_take_from:
-    call    co_next_arg
-    test    rax, rax
-    jz      co_usage
-    mov     qword ptr [g_cfg_from], rax
-    jmp     co_loop
-co_take_share:
-    call    co_next_arg
-    test    rax, rax
-    jz      co_usage
-    mov     qword ptr [g_cfg_share], rax
-    jmp     co_loop
 
 co_check:
     ; ---- store positional count globally (all positionals are inputs) -------
@@ -1135,8 +1083,7 @@ password_to_utf8 endp
 
 ; =============================================================================
 ; Command handlers.  Each is a DLPV landing-pad target reached through the
-; CALL_GUARDED dispatch.  In this scaffold build every vault/share/gen verb is
-; thin landing-pad wrappers over the implementation modules.
+; CALL_GUARDED dispatch - thin wrappers over the implementation modules.
 ; =============================================================================
 .const
 CSTR c_nl,             13,10
@@ -1199,38 +1146,6 @@ cmd_bench proc frame
     FRAME_EPILOG
     ret
 cmd_bench endp
-
-LANDING_PAD
-cmd_padnew proc frame
-    FRAME_PROLOG 32
-    call    do_padnew
-    FRAME_EPILOG
-    ret
-cmd_padnew endp
-
-LANDING_PAD
-cmd_padimport proc frame
-    FRAME_PROLOG 32
-    call    do_padimport
-    FRAME_EPILOG
-    ret
-cmd_padimport endp
-
-LANDING_PAD
-cmd_share proc frame
-    FRAME_PROLOG 32
-    call    do_share
-    FRAME_EPILOG
-    ret
-cmd_share endp
-
-LANDING_PAD
-cmd_open proc frame
-    FRAME_PROLOG 32
-    call    do_open
-    FRAME_EPILOG
-    ret
-cmd_open endp
 
 ; cmd_gen - generate g_cfg_gencount passwords of g_cfg_genlen chars over the
 ; selected character classes, printing each on its own line.  Secret material is

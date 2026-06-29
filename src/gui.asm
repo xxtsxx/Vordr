@@ -6,7 +6,7 @@
 ; is_cli_command / dispatch); otherwise it opens the windowed front-end.
 ;
 ; SCAFFOLD: the GUI is reduced to an About message box.  The full vault UI
-; (entry list, reveal/copy panes, generator, share dialog) lands in a later
+; (entry list, reveal/copy panes, generator) lands in a later
 ; step.  What is preserved here and must not regress:
 ;   * the exact CLI-vs-GUI startup order from Myrkr, and
 ;   * the per-run SELF-TEST GATE: every launch runs the KATs first and fails

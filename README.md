@@ -13,12 +13,10 @@ and the program **fails closed** on any violation.
 
 > **Status: v0.1 — all commands functional.** The vault
 > (`init`/`add`/`list`/`get`/`edit`/`remove`, single-file, atomic writes), the
-> `gen` password generator, **one-time-pad sharing** end-to-end
-> (`padnew`/`padimport`/`share`/`open` with Poly1305 one-time MAC and never-reuse
-> offset tracking), `bench`, and the per-launch self-test gate (13 known-answer
-> tests). See [docs/formats.md](docs/formats.md) for on-disk formats and the
-> security model. Not yet hardened for production: no external review, no GUI
-> vault panes, single-process file locking only.
+> `gen` password generator, `bench`, and the per-launch self-test gate (10
+> known-answer tests). See [docs/formats.md](docs/formats.md) for the on-disk
+> format and the security model. Not yet hardened for production: no external
+> review, no GUI vault panes, single-process file locking only.
 
 ## Design goals
 
@@ -30,11 +28,8 @@ and the program **fails closed** on any violation.
   RDSEED**; fails closed if the OS RNG fails.
 - **Self-test on every run** (FIPS 180-4, NIST SP 800-38D, RFC 7693, RFC 9106).
 - **Quantum-hardened by construction.** At rest, AES-256 keeps ~128-bit
-  strength under Grover and memory-hard Argon2id is unaffected by Shor. For
-  **sharing**, Vordr uses a **one-time pad** (information-theoretic
-  confidentiality) plus a **one-time MAC** (information-theoretic integrity) —
-  there is no classical public-key crypto anywhere, so there is nothing for
-  Shor to break.
+  strength under Grover and memory-hard Argon2id is unaffected by Shor. There is
+  no public-key crypto anywhere, so nothing is exposed to Shor's algorithm.
 - **Hostile-OS resistance** — decrypted secrets live in **VirtualLock**ed memory
   (no pagefile leak), imports are locked read-only (RELRO-equivalent), W^X,
   ASLR/DEP/NX, CET + software shadow stack, stack canaries, DLPV, tagged heap,
@@ -63,24 +58,23 @@ a known verb (or begins with `-`), and otherwise opens the **GUI**.
 ```
   vault:   vordr init | add | get | list | edit | remove
   pwgen:   vordr gen
-  share:   vordr padnew | padimport | share | open
   diag:    vordr selftest | bench
 ```
 
 Every launch runs the self-test gate first and aborts (`EXIT_SELFTEST`) if any
 known-answer test mismatches.
 
-## Module map (this scaffold)
+## Module map
 
 | Source | Role |
 |---|---|
 | `macros.inc`, `hardening.asm`, `loadcfg.asm` | Hardening macros + runtime (copied from Myrkr) |
 | `random.asm`, `sha256.asm`, `aesgcm.asm`, `blake2b.asm`, `argon2.asm` | Crypto core (copied verbatim) |
 | `fileio.asm`, `console.asm`, `log.asm` | I/O, console, audit log (copied) |
-| `secmem.asm` | **New** — VirtualLock'd secret memory |
-| `vault.asm` | **New** — single-file vault lifecycle (stubs) |
-| `pwgen.asm` | **New** — password generator + policy (live) |
-| `otp.asm` | **New** — one-time-pad sharing; `otp_xor` live, rest stubbed |
+| `secmem.asm` | VirtualLock'd secret memory |
+| `vault.asm` | Single-file vault lifecycle + commands (init/add/list/get/edit/remove) |
+| `pwgen.asm` | Password generator + policy |
+| `bench.asm` | Crypto-core micro-benchmark |
 | `selftest.asm` | KAT driver, with a verbose flag for the per-run gate |
 | `main.asm`, `gui.asm` | CLI dispatch + hybrid entry (`wstart`) and About shell |
 

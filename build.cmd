@@ -4,9 +4,9 @@ rem build.cmd - assemble and link the single hybrid vordr.exe (password mgr).
 rem
 rem ONE executable serves both roles: it is linked /subsystem:windows with the
 rem GUI entry point (wstart), but wstart runs the full CLI when argv[1] is a
-rem known verb (init/add/get/list/edit/remove/gen/padnew/padimport/share/open/
-rem selftest/bench).  Otherwise it opens the windowed front-end.  Every launch
-rem runs the self-test gate first and fails closed.  See src\gui.asm:wstart.
+rem known verb (init/add/get/list/edit/remove/gen/selftest/bench).  Otherwise it
+rem opens the windowed front-end.  Every launch runs the self-test gate first and
+rem fails closed.  See src\gui.asm:wstart.
 rem
 rem Reuses the proven Myrkr crypto + hardening core verbatim.  Run from a
 rem "x64 Native Tools Command Prompt for VS" (ml64/link on PATH).
@@ -45,7 +45,7 @@ goto :argloop
 :doneargs
 
 set ASMFLAGS=/c /nologo /W3 /Zi %ASMEXTRA%
-set SOURCES=main console hardening random loadcfg sha256 aesgcm blake2b argon2 fileio secmem vault pad pwgen otp bench log selftest redteam gui
+set SOURCES=main console hardening random loadcfg sha256 aesgcm blake2b argon2 fileio secmem vault pwgen bench log selftest redteam gui
 
 echo === assembling ===
 for %%f in (%SOURCES%) do (
@@ -69,7 +69,7 @@ link /nologo /subsystem:windows /entry:wstart /nodefaultlib /incremental:no ^
      %GUARDFLAGS% /debug /pdb:bin\vordr.pdb ^
      /manifest:embed /manifestinput:vordr.manifest /manifestuac:no ^
      /libpath:"%SDKLIB%" ^
-     /out:bin\vordr.exe obj\main.obj obj\console.obj obj\hardening.obj obj\random.obj obj\loadcfg.obj obj\sha256.obj obj\aesgcm.obj obj\blake2b.obj obj\argon2.obj obj\fileio.obj obj\secmem.obj obj\vault.obj obj\pad.obj obj\pwgen.obj obj\otp.obj obj\bench.obj obj\log.obj obj\selftest.obj obj\redteam.obj obj\gui.obj obj\vordr.res ^
+     /out:bin\vordr.exe obj\main.obj obj\console.obj obj\hardening.obj obj\random.obj obj\loadcfg.obj obj\sha256.obj obj\aesgcm.obj obj\blake2b.obj obj\argon2.obj obj\fileio.obj obj\secmem.obj obj\vault.obj obj\pwgen.obj obj\bench.obj obj\log.obj obj\selftest.obj obj\redteam.obj obj\gui.obj obj\vordr.res ^
      kernel32.lib bcrypt.lib user32.lib advapi32.lib
 if errorlevel 1 goto :failed
 
