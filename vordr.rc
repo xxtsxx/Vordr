@@ -27,7 +27,16 @@
 #define IDC_V_LOCK   212
 #define IDC_V_TOTP   213
 #define IDC_V_COPYTOTP 214
-#define IDC_V_FORGET 215
+#define IDC_V_MENU   216
+#define IDC_V_MBACK  217
+#define IDC_V_MTITLE 218
+#define IDC_V_MPOLL  219
+#define IDC_V_MLENL  220
+#define IDC_V_MLEN   221
+#define IDC_V_MCLSL  222
+#define IDC_V_MCLS   223
+#define IDC_V_MTPM   224
+#define IDC_V_MSAVE  225
 #define DLG_ENTRY    300
 #define IDC_E_TITLE  301
 #define IDC_E_USER   302
@@ -69,10 +78,11 @@ STYLE DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Vordr - Vault"
 FONT 9, "Segoe UI"
 BEGIN
-    LISTBOX         IDC_V_LIST, 10, 10, 134, 240, LBS_NOTIFY | WS_VSCROLL | WS_BORDER | WS_TABSTOP
-    PUSHBUTTON      "Add...", IDC_V_ADD, 10, 256, 42, 18
-    PUSHBUTTON      "Edit...", IDC_V_EDIT, 56, 256, 42, 18
-    PUSHBUTTON      "Remove", IDC_V_REMOVE, 102, 256, 42, 18
+    /* ---- vault content (left margin: list starts at x=30) ---------------- */
+    LISTBOX         IDC_V_LIST, 30, 10, 116, 240, LBS_NOTIFY | WS_VSCROLL | WS_BORDER | WS_TABSTOP
+    PUSHBUTTON      "Add...", IDC_V_ADD, 30, 256, 36, 18
+    PUSHBUTTON      "Edit...", IDC_V_EDIT, 69, 256, 36, 18
+    PUSHBUTTON      "Remove", IDC_V_REMOVE, 108, 256, 38, 18
     LTEXT           "Title", -1, 158, 14, 40, 10
     EDITTEXT        IDC_V_TITLE, 206, 12, 210, 13, ES_READONLY | ES_AUTOHSCROLL | WS_TABSTOP
     LTEXT           "Username", -1, 158, 34, 40, 10
@@ -88,8 +98,21 @@ BEGIN
     LTEXT           "Auth code", -1, 158, 164, 44, 10
     EDITTEXT        IDC_V_TOTP, 206, 162, 110, 13, ES_READONLY | ES_AUTOHSCROLL
     PUSHBUTTON      "Copy code", IDC_V_COPYTOTP, 320, 162, 56, 13
-    PUSHBUTTON      "Forget this device", IDC_V_FORGET, 288, 256, 68, 18
     DEFPUSHBUTTON   "Lock", IDC_V_LOCK, 362, 256, 54, 18
+
+    /* ---- settings overlay (hidden until the burger is clicked) ----------- */
+    CONTROL         "", IDC_V_MBACK, "Static", SS_WHITERECT | WS_CHILD | WS_VISIBLE, 0, 0, 426, 286
+    LTEXT           "Settings", IDC_V_MTITLE, 30, 16, 200, 14
+    GROUPBOX        "Password policy", IDC_V_MPOLL, 30, 40, 360, 56
+    LTEXT           "Minimum length:", IDC_V_MLENL, 44, 58, 120, 10
+    EDITTEXT        IDC_V_MLEN, 170, 56, 36, 13, ES_NUMBER | ES_AUTOHSCROLL
+    LTEXT           "Minimum character types (1-4):", IDC_V_MCLSL, 44, 76, 120, 10
+    EDITTEXT        IDC_V_MCLS, 170, 74, 36, 13, ES_NUMBER | ES_AUTOHSCROLL
+    AUTOCHECKBOX    "Unlock this vault with Windows Hello / TPM on this device", IDC_V_MTPM, 30, 112, 360, 12
+    PUSHBUTTON      "Save settings", IDC_V_MSAVE, 30, 138, 70, 18
+
+    /* ---- burger button (top-left, always on top) ------------------------ */
+    PUSHBUTTON      "=", IDC_V_MENU, 6, 6, 18, 16
 END
 
 DLG_ENTRY DIALOGEX 0, 0, 300, 222

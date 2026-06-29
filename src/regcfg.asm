@@ -183,14 +183,17 @@ csd_fail:
 cfg_set_dword_hkcu endp
 
 ; ===========================================================================
-; reg_load_vault(rcx=dst wide, edx=cap chars) -> eax = 1 if found (HKLM>HKCU).
+; reg_load_vault(rcx=dst wide, edx=cap chars, r8=*locked) -> eax = 1 if found
+;   (HKLM>HKCU).  *locked = 1 when the path came from HKLM (admin policy), else
+;   0.  *locked may be 0/NULL.
 ; ===========================================================================
 public reg_load_vault
 reg_load_vault proc frame
-    FRAME_PROLOG 48
+    FRAME_PROLOG 64
     mov     qword ptr [rbp-24], rcx          ; dst
     mov     dword ptr [rbp-32], edx          ; cap (chars)
-    ; --- HKLM ---
+    mov     qword ptr [rbp-40], r8           ; *locked
+    ; --- HKLM (policy) ---
     mov     rcx, qword ptr [g_hklm]
     lea     rdx, [cfg_value]
     mov     r8, qword ptr [rbp-24]
@@ -198,15 +201,27 @@ reg_load_vault proc frame
     shl     r9d, 1
     call    reg_query_sz
     test    eax, eax
-    jnz     rlv_done
-    ; --- HKCU ---
+    jz      rlv_hkcu
+    mov     rax, qword ptr [rbp-40]
+    test    rax, rax
+    jz      rlv_yes
+    mov     dword ptr [rax], 1               ; HKLM -> locked
+rlv_yes:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+rlv_hkcu:
+    mov     rax, qword ptr [rbp-40]
+    test    rax, rax
+    jz      rlv_hkcu_q
+    mov     dword ptr [rax], 0               ; not locked
+rlv_hkcu_q:
     mov     rcx, qword ptr [g_hkcu]
     lea     rdx, [cfg_value]
     mov     r8, qword ptr [rbp-24]
     mov     r9d, dword ptr [rbp-32]
     shl     r9d, 1
     call    reg_query_sz
-rlv_done:
     FRAME_EPILOG
     ret
 reg_load_vault endp

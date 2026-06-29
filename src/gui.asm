@@ -93,13 +93,18 @@ extern EnableWindow:proc
 extern GetDlgItem:proc
 extern SetDlgItemInt:proc
 extern GetDlgItemInt:proc
+extern GetFileAttributesW:proc
+extern ShowWindow:proc
+extern CheckDlgButton:proc
 
 ; ---- constants ---------------------------------------------------------------
 MB_OK               equ 0
 MB_ICONERROR        equ 10h
 MB_ICONINFORMATION  equ 40h
+MB_ICONWARNING      equ 30h
 MB_YESNO            equ 4
 MB_ICONQUESTION     equ 20h
+MB_DEFBUTTON2       equ 100h
 IDYES               equ 6
 IDOK                equ 1
 IDCANCEL            equ 2
@@ -147,7 +152,18 @@ IDC_V_REMOVE equ 211
 IDC_V_LOCK   equ 212
 IDC_V_TOTP   equ 213
 IDC_V_COPYTOTP equ 214
-IDC_V_FORGET equ 215
+IDC_V_MENU   equ 216
+IDC_V_MBACK  equ 217
+IDC_V_MTITLE equ 218
+IDC_V_MPOLL  equ 219
+IDC_V_MLENL  equ 220
+IDC_V_MLEN   equ 221
+IDC_V_MCLSL  equ 222
+IDC_V_MCLS   equ 223
+IDC_V_MTPM   equ 224
+IDC_V_MSAVE  equ 225
+SW_HIDE      equ 0
+SW_SHOW      equ 5
 DLG_ENTRY    equ 300
 IDC_E_TITLE  equ 301
 IDC_E_USER   equ 302
@@ -220,6 +236,9 @@ WSTR s_notitle,     <An entry needs a title.>
 WSTR s_full,        <Vault is full.>
 WSTR s_resealfail,  <Saved in memory but writing to disk failed.>
 WSTR s_firstrun,    <No vault yet - set a master password to create your default vault.>
+WSTR t_overwrite,   <Vordr - vault already exists>
+WSTR m_overwrite,   <A vault file already exists at this location. Creating a new vault will PERMANENTLY destroy it and every entry it holds. Overwrite it?>
+WSTR s_kept,        <Existing vault kept. Cancel, or use "Create new..." to choose a different file.>
 WSTR s_pwmismatch,  <The passwords do not match.>
 WSTR s_pwshort,     <Password is too short for the current policy.>
 WSTR s_pwclasses,   <Password needs more character types (lowercase / uppercase / number / symbol).>
@@ -246,6 +265,22 @@ g_defext label word
     dw 'v','o','r','d','r',0
 g_mask label word
     dw 2022h,2022h,2022h,2022h,2022h,2022h,2022h,2022h,0    ; eight bullets
+; burger / close glyphs for the settings button (wide)
+wb_menu label word
+    dw 2630h, 0                                  ; trigram for heaven (hamburger)
+wb_close label word
+    dw 2715h, 0                                  ; multiplication X
+; control-id groups toggled when the settings overlay opens/closes
+align 4
+g_vault_ids label dword
+    dd IDC_V_LIST, IDC_V_ADD, IDC_V_EDIT, IDC_V_REMOVE, IDC_V_TITLE
+    dd IDC_V_USER, IDC_V_SECRET, IDC_V_REVEAL, IDC_V_COPY, IDC_V_URL
+    dd IDC_V_NOTES, IDC_V_TOTP, IDC_V_COPYTOTP, IDC_V_LOCK
+VAULT_ID_COUNT equ 14
+g_menu_ids label dword
+    dd IDC_V_MBACK, IDC_V_MTITLE, IDC_V_MPOLL, IDC_V_MLENL, IDC_V_MLEN
+    dd IDC_V_MCLSL, IDC_V_MCLS, IDC_V_MTPM, IDC_V_MSAVE
+MENU_ID_COUNT equ 9
 
 .data?
 align 8
@@ -255,6 +290,8 @@ g_create    dd ?
 g_is_default dd ?                     ; 1 = auto-created default vault (register it)
 g_pol_len_lock dd ?                   ; 1 = min-length set by HKLM policy (locked)
 g_pol_cls_lock dd ?                   ; 1 = min-classes set by HKLM policy (locked)
+g_vault_lock dd ?                     ; 1 = vault path set by HKLM (locked)
+g_menu_open  dd ?                     ; 1 = settings overlay is showing
 g_revealed  dd ?
 g_clip_seq  dd ?                      ; clipboard sequence number at last copy
 g_e_edit    dd ?
@@ -428,6 +465,13 @@ gu_open:
     call    gui_wipepw
     cmp     dword ptr [rbp-32], 0
     jne     gu_fail
+    ; first opened the auto-default vault -> record its path in HKCU
+    cmp     dword ptr [g_is_default], 0
+    je      gu_remember
+    lea     rcx, [g_vpath]
+    call    reg_save_vault
+    mov     dword ptr [g_is_default], 0
+gu_remember:
     ; optionally register this device for Windows Hello / TPM quick-unlock
     WINCALL IsDlgButtonChecked, qword ptr [rbp-24], IDC_U_REMEMBER
     cmp     eax, 1
@@ -524,6 +568,22 @@ up_init:
     mov     edx, IDC_U_PATH
     lea     r8, [g_vpath]
     call    SetDlgItemTextW
+    ; if HKLM mandates the vault path, lock the "Open"/"Create new" pickers
+    cmp     dword ptr [g_vault_lock], 0
+    je      up_init_hint
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_U_OPEN
+    call    GetDlgItem
+    mov     rcx, rax
+    xor     edx, edx
+    call    EnableWindow
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_U_NEW
+    call    GetDlgItem
+    mov     rcx, rax
+    xor     edx, edx
+    call    EnableWindow
+up_init_hint:
     cmp     dword ptr [g_create], 0
     je      up_init_x
     mov     rcx, qword ptr [rbp-8]           ; first-run hint
@@ -1098,6 +1158,178 @@ ep_ret:
 entry_proc endp
 
 ; =============================================================================
+; Settings overlay (burger menu) helpers for DLG_VAULT.
+; =============================================================================
+
+; gui_show_ids(rcx=hdlg, rdx=*id array, r8d=count, r9d=SW_* cmd) - ShowWindow
+;   each listed control.
+gui_show_ids proc frame
+    FRAME_PROLOG 80
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], rdx
+    mov     dword ptr [rbp-40], r8d
+    mov     dword ptr [rbp-44], r9d
+    mov     dword ptr [rbp-48], 0           ; index
+gsi_loop:
+    mov     eax, dword ptr [rbp-48]
+    cmp     eax, dword ptr [rbp-40]
+    jae     gsi_done
+    mov     r11, qword ptr [rbp-32]
+    mov     eax, dword ptr [r11+rax*4]      ; ids[i]
+    mov     dword ptr [rbp-52], eax
+    WINCALL GetDlgItem, qword ptr [rbp-24], dword ptr [rbp-52]
+    WINCALL ShowWindow, rax, dword ptr [rbp-44]
+    inc     dword ptr [rbp-48]
+    jmp     gsi_loop
+gsi_done:
+    FRAME_EPILOG
+    ret
+gui_show_ids endp
+
+; gui_menu_open(rcx=hdlg) - hide the vault content, reveal the settings overlay.
+gui_menu_open proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [g_vault_ids]
+    mov     r8d, VAULT_ID_COUNT
+    mov     r9d, SW_HIDE
+    call    gui_show_ids
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [g_menu_ids]
+    mov     r8d, MENU_ID_COUNT
+    mov     r9d, SW_SHOW
+    call    gui_show_ids
+    ; prefill the policy fields
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_V_MLEN
+    mov     r8d, dword ptr [g_cfg_pwminlen]
+    xor     r9d, r9d
+    call    SetDlgItemInt
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_V_MCLS
+    mov     r8d, dword ptr [g_cfg_pwminclasses]
+    xor     r9d, r9d
+    call    SetDlgItemInt
+    ; disable policy fields locked by HKLM
+    cmp     dword ptr [g_pol_len_lock], 0
+    je      mo_len_ok
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_V_MLEN
+    call    GetDlgItem
+    mov     rcx, rax
+    xor     edx, edx
+    call    EnableWindow
+mo_len_ok:
+    cmp     dword ptr [g_pol_cls_lock], 0
+    je      mo_cls_ok
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_V_MCLS
+    call    GetDlgItem
+    mov     rcx, rax
+    xor     edx, edx
+    call    EnableWindow
+mo_cls_ok:
+    ; reflect the current TPM enrolment in the toggle
+    call    vault_tpm_has
+    mov     r8d, eax
+    WINCALL CheckDlgButton, qword ptr [rbp-24], IDC_V_MTPM, r8d
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_MENU, addr wb_close
+    mov     dword ptr [g_menu_open], 1
+    FRAME_EPILOG
+    ret
+gui_menu_open endp
+
+; gui_menu_close(rcx=hdlg) - hide the settings overlay, restore the vault.
+gui_menu_close proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [g_vault_ids]
+    mov     r8d, VAULT_ID_COUNT
+    mov     r9d, SW_SHOW
+    call    gui_show_ids
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [g_menu_ids]
+    mov     r8d, MENU_ID_COUNT
+    mov     r9d, SW_HIDE
+    call    gui_show_ids
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_MENU, addr wb_menu
+    mov     dword ptr [g_menu_open], 0
+    FRAME_EPILOG
+    ret
+gui_menu_close endp
+
+; gui_menu_toggle(rcx=hdlg) - open or close the settings overlay.
+gui_menu_toggle proc frame
+    FRAME_PROLOG 32
+    mov     qword ptr [rbp-24], rcx
+    cmp     dword ptr [g_menu_open], 0
+    jne     mtg_close
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_menu_open
+    FRAME_EPILOG
+    ret
+mtg_close:
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_menu_close
+    FRAME_EPILOG
+    ret
+gui_menu_toggle endp
+
+; gui_menu_save(rcx=hdlg) - apply the policy fields (HKCU) + the TPM toggle,
+;   then close the overlay.  HKLM-locked policy values are left untouched.
+gui_menu_save proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    cmp     dword ptr [g_pol_len_lock], 0
+    jne     msv_cls
+    WINCALL GetDlgItemInt, qword ptr [rbp-24], IDC_V_MLEN, 0, 0
+    test    eax, eax
+    jz      msv_cls
+    cmp     eax, 256
+    jbe     @F
+    mov     eax, 256
+@@: mov     dword ptr [g_cfg_pwminlen], eax
+    lea     rcx, [wv_pwlen]
+    mov     edx, dword ptr [g_cfg_pwminlen]
+    call    cfg_set_dword_hkcu
+msv_cls:
+    cmp     dword ptr [g_pol_cls_lock], 0
+    jne     msv_tpm
+    WINCALL GetDlgItemInt, qword ptr [rbp-24], IDC_V_MCLS, 0, 0
+    test    eax, eax
+    jz      msv_tpm
+    cmp     eax, 4
+    jbe     @F
+    mov     eax, 4
+@@: mov     dword ptr [g_cfg_pwminclasses], eax
+    lea     rcx, [wv_pwcls]
+    mov     edx, dword ptr [g_cfg_pwminclasses]
+    call    cfg_set_dword_hkcu
+msv_tpm:
+    WINCALL IsDlgButtonChecked, qword ptr [rbp-24], IDC_V_MTPM
+    mov     dword ptr [rbp-32], eax         ; want enrolled?
+    call    vault_tpm_has
+    mov     dword ptr [rbp-36], eax         ; currently enrolled?
+    cmp     dword ptr [rbp-32], 0
+    je      msv_unwant
+    cmp     dword ptr [rbp-36], 0
+    jne     msv_apply_close                 ; want + have -> nothing
+    call    vault_tpm_remember
+    jmp     msv_apply_close
+msv_unwant:
+    cmp     dword ptr [rbp-36], 0
+    je      msv_apply_close                 ; !want + !have -> nothing
+    call    vault_tpm_forget
+msv_apply_close:
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_menu_close
+    FRAME_EPILOG
+    ret
+gui_menu_save endp
+
+; =============================================================================
 ; vault_proc - DLG_VAULT dialog procedure (raw frame).
 ; =============================================================================
 vault_proc proc
@@ -1134,6 +1366,13 @@ vp_t_totp:
     call    gui_totp_refresh
     jmp     vp_handled
 vp_init:
+    mov     dword ptr [g_menu_open], 0
+    mov     rcx, qword ptr [rbp-8]           ; keep the settings overlay hidden
+    lea     rdx, [g_menu_ids]
+    mov     r8d, MENU_ID_COUNT
+    mov     r9d, SW_HIDE
+    call    gui_show_ids
+    WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_MENU, addr wb_menu
     mov     rcx, qword ptr [rbp-8]
     call    gui_poplist
     mov     eax, 1
@@ -1158,12 +1397,22 @@ vp_cmd:
     je      vp_remove
     cmp     eax, IDC_V_LOCK
     je      vp_lock
-    cmp     eax, IDC_V_FORGET
-    je      vp_forget
+    cmp     eax, IDC_V_MENU
+    je      vp_menu
+    cmp     eax, IDC_V_MSAVE
+    je      vp_msave
     cmp     eax, IDCANCEL
     je      vp_lock
     xor     eax, eax
     jmp     vp_ret
+vp_menu:
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_menu_toggle
+    jmp     vp_handled
+vp_msave:
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_menu_save
+    jmp     vp_handled
 vp_list:
     cmp     r10d, LBN_SELCHANGE
     jne     vp_unhandled
@@ -1253,13 +1502,6 @@ vp_remove:
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_SECRET, 0
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_URL, 0
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_NOTES, 0
-    jmp     vp_handled
-vp_forget:
-    WINCALL MessageBoxW, qword ptr [rbp-8], addr m_forget_q, addr t_forget, <MB_YESNO or MB_ICONQUESTION>
-    cmp     eax, IDYES
-    jne     vp_handled
-    call    vault_tpm_forget
-    WINCALL MessageBoxW, qword ptr [rbp-8], addr m_forgotten, addr t_forget, <MB_OK or MB_ICONINFORMATION>
     jmp     vp_handled
 vp_lock:
 vp_close:
@@ -1375,6 +1617,21 @@ gui_wipepw_create proc frame
     ret
 gui_wipepw_create endp
 
+; gui_file_exists(rcx = wide path) -> eax = 1 if the file exists, else 0.
+gui_file_exists proc frame
+    FRAME_PROLOG 32
+    WINCALL GetFileAttributesW, rcx
+    cmp     eax, -1                          ; INVALID_FILE_ATTRIBUTES
+    je      gfe_no
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gfe_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gui_file_exists endp
+
 ; gui_create_do(rcx = hdlg) -> eax = 1 if the vault was created + unlocked
 ;   (close the dialog), else 0 (an error message was shown, stay open).
 gui_create_do proc frame
@@ -1440,6 +1697,19 @@ cd_pwok:
 cd_polok:
     lea     rax, [g_vpath]
     mov     qword ptr [g_cfg_in], rax
+    ; never silently overwrite an existing vault file - confirm first
+    lea     rcx, [g_vpath]
+    call    gui_file_exists
+    test    eax, eax
+    jz      cd_doinit
+    WINCALL MessageBoxW, qword ptr [rbp-24], addr m_overwrite, addr t_overwrite, \
+            <MB_YESNO or MB_ICONWARNING or MB_DEFBUTTON2>
+    cmp     eax, IDYES
+    je      cd_doinit
+    lea     rax, [s_kept]                    ; declined -> keep existing vault
+    mov     qword ptr [rbp-56], rax
+    jmp     cd_status
+cd_doinit:
     call    do_init
     test    eax, eax
     jz      cd_created
@@ -1588,8 +1858,10 @@ create_proc endp
 gui_resolve_vault proc frame
     FRAME_PROLOG 32
     mov     dword ptr [g_is_default], 0
+    mov     dword ptr [g_vault_lock], 0
     lea     rcx, [g_vpath]
     mov     edx, 1024
+    lea     r8, [g_vault_lock]
     call    reg_load_vault
     test    eax, eax
     jz      grv_default
@@ -1603,8 +1875,18 @@ grv_default:
     test    eax, eax
     jz      grv_none
     mov     dword ptr [g_vpath_set], 1
-    mov     dword ptr [g_create], 1
     mov     dword ptr [g_is_default], 1
+    ; if the default vault file already exists, OPEN it (never overwrite);
+    ; otherwise this is a true first run -> create it
+    lea     rcx, [g_vpath]
+    call    gui_file_exists
+    test    eax, eax
+    jz      grv_def_new
+    mov     dword ptr [g_create], 0          ; existing default -> unlock
+    FRAME_EPILOG
+    ret
+grv_def_new:
+    mov     dword ptr [g_create], 1          ; no file -> create
     FRAME_EPILOG
     ret
 grv_none:
