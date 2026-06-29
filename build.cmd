@@ -70,7 +70,7 @@ link /nologo /subsystem:windows /entry:wstart /nodefaultlib /incremental:no ^
      /manifest:embed /manifestinput:vordr.manifest /manifestuac:no ^
      /libpath:"%SDKLIB%" ^
      /out:bin\vordr.exe obj\main.obj obj\console.obj obj\hardening.obj obj\random.obj obj\loadcfg.obj obj\sha256.obj obj\aesgcm.obj obj\blake2b.obj obj\argon2.obj obj\fileio.obj obj\secmem.obj obj\vault.obj obj\pwgen.obj obj\bench.obj obj\log.obj obj\selftest.obj obj\redteam.obj obj\gui.obj obj\vordr.res ^
-     kernel32.lib bcrypt.lib user32.lib advapi32.lib
+     kernel32.lib bcrypt.lib user32.lib advapi32.lib comdlg32.lib
 if errorlevel 1 goto :failed
 
 echo === mitigation check (optional, needs dumpbin) ===

@@ -14,14 +14,14 @@ launch**, and the program **fails closed** on any violation.
 
 > **Status: v0.1 — GUI-first; CLI is diagnostics only.** By design, **no master
 > password or secret is ever passed on the command line** (where it would leak
-> into shell history and process listings) — the vault and the password
-> generator are reached only through the GUI. The vault crypto and operations
-> (create / add / list / get / edit / remove, single-file, atomic writes), the
-> generator, and the per-launch self-test gate (10 known-answer tests) are all
-> implemented and self-tested; the command line exposes only `selftest` and
-> `bench`. **Caveat:** the GUI vault front-end is still in progress (today the
-> window is an About box), so there is not yet an interactive way to drive the
-> vault. No external review; single-process file locking only.
+> into shell history and process listings) — the vault is reached only through
+> the GUI. Launch `vordr.exe` with no arguments to get the **Unlock** dialog
+> (open an existing `.vordr` or create a new one + master password), then a
+> **Vault** window: an entry list with a detail pane (username / secret with
+> reveal + copy-to-clipboard / url / notes) and Add / Edit / Remove. The command
+> line exposes only `selftest` and `bench`. Still rough: standard (light) Win32
+> theme, single-process file locking, no clipboard auto-clear, no external
+> review.
 
 ## Design goals
 
