@@ -1,0 +1,20 @@
+# Build outputs (regenerable via build.cmd / build-gui.cmd)
+/bin/
+/obj/
+*.obj
+*.lst
+*.exe
+*.pdb
+*.ilk
+*.map
+
+# Editor / tooling local state
+/.claude/
+*.swp
+*~
+
+# Encrypted/plaintext working data — never commit user data
+*.mrk
+/checkpoints/
+/ztest/         # encrypted-zip test fixtures (regenerated via pyzipper)
+*.zip
