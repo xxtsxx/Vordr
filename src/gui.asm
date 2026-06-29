@@ -69,6 +69,9 @@ extern CloseClipboard:proc
 extern GlobalAlloc:proc
 extern GlobalLock:proc
 extern GlobalUnlock:proc
+extern GetClipboardSequenceNumber:proc
+extern SetTimer:proc
+extern KillTimer:proc
 extern MultiByteToWideChar:proc
 
 ; ---- constants ---------------------------------------------------------------
@@ -82,8 +85,11 @@ IDOK                equ 1
 IDCANCEL            equ 2
 
 WM_CLOSE            equ 10h
+WM_TIMER            equ 113h
 WM_INITDIALOG       equ 110h
 WM_COMMAND          equ 111h
+CLIP_TIMER          equ 1                  ; timer id for clipboard auto-clear
+CLIP_MS             equ 20000              ; clear a copied secret after 20 s
 LBN_SELCHANGE       equ 1
 LB_ADDSTRING        equ 180h
 LB_RESETCONTENT     equ 184h
@@ -197,6 +203,7 @@ g_hinst     dq ?
 g_vpath_set dd ?
 g_create    dd ?
 g_revealed  dd ?
+g_clip_seq  dd ?                      ; clipboard sequence number at last copy
 g_e_edit    dd ?
 g_e_idx     dd ?
 align 2
@@ -570,9 +577,11 @@ gr_done:
     ret
 gui_reveal endp
 
-; gui_copy() - copy g_secret_w (NUL-terminated wide) to the clipboard.
+; gui_copy(rcx = hdlg) - copy g_secret_w (NUL-terminated wide) to the clipboard
+;   and arm a timer to auto-clear it after CLIP_MS (only if still ours).
 gui_copy proc frame
     FRAME_PROLOG 64
+    mov     qword ptr [rbp-40], rcx         ; hdlg (for SetTimer)
     ; wide length (chars) incl NUL
     lea     r10, [g_secret_w]
     xor     ecx, ecx
@@ -614,10 +623,36 @@ gc_cpd:
     WINCALL EmptyClipboard
     WINCALL SetClipboardData, CF_UNICODETEXT, qword ptr [rbp-24]
     WINCALL CloseClipboard
+    ; remember the clipboard state and arm the auto-clear timer
+    WINCALL GetClipboardSequenceNumber
+    mov     dword ptr [g_clip_seq], eax
+    WINCALL KillTimer, qword ptr [rbp-40], CLIP_TIMER     ; cancel any prior
+    WINCALL SetTimer, qword ptr [rbp-40], CLIP_TIMER, CLIP_MS, 0
 gc_done:
     FRAME_EPILOG
     ret
 gui_copy endp
+
+; gui_clipclear() - if the clipboard still holds the secret we copied (unchanged
+;   sequence number), empty it; otherwise leave the user's newer content alone.
+gui_clipclear proc frame
+    FRAME_PROLOG 32
+    cmp     dword ptr [g_clip_seq], 0
+    je      gcc_done
+    WINCALL GetClipboardSequenceNumber
+    cmp     eax, dword ptr [g_clip_seq]
+    jne     gcc_keep                        ; changed since our copy -> don't touch
+    WINCALL OpenClipboard, 0
+    test    eax, eax
+    jz      gcc_keep
+    WINCALL EmptyClipboard
+    WINCALL CloseClipboard
+gcc_keep:
+    mov     dword ptr [g_clip_seq], 0
+gcc_done:
+    FRAME_EPILOG
+    ret
+gui_clipclear endp
 
 ; gui_lbsel(rcx = hdlg) -> eax = selected index, or -1 if none.
 gui_lbsel proc frame
@@ -829,8 +864,20 @@ vault_proc proc
     je      vp_cmd
     cmp     rdx, WM_CLOSE
     je      vp_close
+    cmp     rdx, WM_TIMER
+    je      vp_timer
     xor     eax, eax
     jmp     vp_ret
+vp_timer:
+    cmp     r8d, CLIP_TIMER
+    jne     vp_unhandled
+    sub     rsp, 32
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, CLIP_TIMER
+    call    KillTimer
+    add     rsp, 32
+    call    gui_clipclear
+    jmp     vp_handled
 vp_init:
     mov     rcx, qword ptr [rbp-8]
     call    gui_poplist
@@ -874,6 +921,7 @@ vp_reveal:
     call    gui_reveal
     jmp     vp_handled
 vp_copy:
+    mov     rcx, qword ptr [rbp-8]
     call    gui_copy
     jmp     vp_handled
 vp_add:
@@ -940,6 +988,15 @@ vp_remove:
     jmp     vp_handled
 vp_lock:
 vp_close:
+    sub     rsp, 32
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, CLIP_TIMER
+    call    KillTimer
+    add     rsp, 32
+    call    gui_clipclear                   ; clear the clipboard if it is still ours
+    lea     rcx, [g_secret_w]               ; wipe the in-memory revealed secret
+    mov     edx, EBUF*4
+    call    secure_zero
     WINCALL EndDialog, qword ptr [rbp-8], 0
 vp_handled:
     mov     eax, 1
@@ -979,6 +1036,7 @@ gm_loop:
     call    vault_lock                      ; wipe body + key on close
     jmp     gm_loop
 gm_done:
+    call    gui_clipclear                   ; never leave a copied secret behind
     FRAME_EPILOG
     ret
 gui_main endp
