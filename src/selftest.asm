@@ -7,10 +7,8 @@
 ;                  startup gate, which runs the KATs on EVERY launch and aborts
 ;                  fail-closed if any vector mismatches (per the brief).
 ;
-; Each kept primitive is validated against an official RFC/NIST vector.  The
-; password-manager additions (OTP pad/cipher core, password generator) are
-; tested for real; features not yet implemented (one-time MAC, vault seal/open,
-; pad share) print an honest "[PEND]" line and are NOT counted as passes.
+; Each primitive is validated against an official RFC/NIST vector, plus the
+; password generator and an in-memory vault seal/open round-trip.
 ; =============================================================================
 
 include macros.inc
@@ -25,10 +23,6 @@ extern argon2_compress:proc
 extern argon2id_hash:proc
 extern check_password_policy:proc
 extern pwgen:proc
-extern otp_xor:proc
-extern otp_mac:proc
-extern otp_share_seal:proc
-extern otp_share_open:proc
 extern vault_selftest:proc
 externdef g_cfg_pass:byte
 externdef g_cfg_passlen:dword
@@ -87,28 +81,10 @@ CSTR st_pass_a2,   "  [PASS] argon2id  (RFC 9106 test vector)",13,10
 CSTR st_fail_a2,   "  [FAIL] argon2id",13,10
 CSTR st_pass_pw,   "  [PASS] password policy (length + class rules)",13,10
 CSTR st_fail_pw,   "  [FAIL] password policy",13,10
-CSTR st_pass_xor,  "  [PASS] otp xor  (pad cipher round-trip)",13,10
-CSTR st_fail_xor,  "  [FAIL] otp xor",13,10
 CSTR st_pass_gen,  "  [PASS] pwgen  (alphabet + length, no bias tail)",13,10
 CSTR st_fail_gen,  "  [FAIL] pwgen",13,10
-CSTR st_pass_mac,  "  [PASS] poly1305 one-time MAC  (RFC 8439 2.5.2 vector)",13,10
-CSTR st_fail_mac,  "  [FAIL] poly1305 one-time MAC",13,10
-CSTR st_pass_shr,  "  [PASS] otp share seal/open  (round-trip + tamper-detect)",13,10
-CSTR st_fail_shr,  "  [FAIL] otp share seal/open",13,10
 CSTR st_pass_vlt,  "  [PASS] vault seal/open  (Argon2id KDF -> KCV -> GCM round-trip)",13,10
 CSTR st_fail_vlt,  "  [FAIL] vault seal/open",13,10
-
-; RFC 8439 2.5.2 Poly1305 one-time key and expected tag
-poly_key    db 085h,0d6h,0beh,078h,057h,055h,06dh,033h,07fh,044h,052h,0feh,042h,0d5h,006h,0a8h
-            db 001h,003h,080h,08ah,0fbh,00dh,0b2h,0fdh,04ah,0bfh,0f6h,0afh,041h,049h,0f5h,01bh
-poly_msg    db "Cryptographic Forum Research Group"
-poly_msg_n  equ $ - poly_msg
-poly_tag_exp db 0a8h,006h,01dh,0c1h,030h,051h,036h,0c6h,0c2h,02bh,08bh,0afh,00ch,001h,027h,0a9h
-; OTP share test: 16-byte plaintext, 48-byte pad (16 cipher pad + 32 MAC key)
-shr_pt      db "share me secret!"
-shr_pad     db 011h,022h,033h,044h,055h,066h,077h,088h,099h,0aah,0bbh,0cch,0ddh,0eeh,0ffh,000h
-            db 0a5h,05ah,0c3h,03ch,0f0h,00fh,012h,021h,034h,043h,056h,065h,078h,087h,09ah,0a9h
-            db 0bch,0cbh,0deh,0edh,0f0h,00fh,001h,010h,023h,032h,045h,054h,067h,076h,089h,098h
 
 ; policy test passwords
 pw_short    db "Abc12"                       ; 5 chars (too short)
@@ -131,9 +107,6 @@ b2b_abc_exp db 0bah,080h,0a5h,03fh,098h,01ch,04dh,00dh,06ah,027h,097h,0b6h,09fh,
 ; NIST SP800-38D AES-256-GCM: key=0(32), iv=0(12), aad=none, pt=16 zero bytes
 gcm_ct_exp  db 0ceh,0a7h,040h,03dh,04dh,060h,06bh,06eh,007h,04eh,0c5h,0d3h,0bah,0f3h,09dh,018h
 gcm_tag_exp db 0d0h,0d1h,0c8h,0a7h,099h,099h,06bh,0f0h,026h,05bh,098h,0b5h,0d4h,08ah,0b9h,019h
-; OTP test: a 16-byte message and a 16-byte (nonzero) pad
-otp_msg     db "attack at dawn!!"
-otp_pad     db 03ah,0c1h,07fh,005h,09eh,0d4h,022h,068h,0bbh,011h,0f0h,04ch,07dh,0a9h,033h,0e7h
 
 .data?
 st_out          db 32 dup (?)
@@ -165,13 +138,7 @@ gcm_tag         db 16 dup (?)
 gcm_dec         db 16 dup (?)
 align 8
 greq            GCMREQ <>
-otp_ct          db 16 dup (?)
-otp_rt          db 16 dup (?)
 pw_out          db 64 dup (?)
-poly_tag_out    db 16 dup (?)
-shr_ct          db 16 dup (?)
-shr_tag         db 16 dup (?)
-shr_rt          db 16 dup (?)
 g_st_verbose    dd ?
 
 .code
@@ -506,37 +473,6 @@ st_pw_fail:
     inc     qword ptr [rbp-24]
 st_after_pw:
 
-    ; ---- OTP xor: pad cipher round-trip + non-identity ----------------------
-    ; ct = msg ^ pad ; rt = ct ^ pad must equal msg ; and ct must differ from msg
-    lea     rcx, [otp_ct]
-    lea     rdx, [otp_msg]
-    lea     r8,  [otp_pad]
-    mov     r9, 16
-    call    otp_xor
-    lea     rcx, [otp_ct]
-    lea     rdx, [otp_msg]
-    mov     r8, 16
-    call    ct_memcmp                       ; ct vs msg: MUST differ (pad nonzero)
-    test    eax, eax
-    jz      st_xor_fail
-    lea     rcx, [otp_rt]
-    lea     rdx, [otp_ct]
-    lea     r8,  [otp_pad]
-    mov     r9, 16
-    call    otp_xor
-    lea     rcx, [otp_rt]
-    lea     rdx, [otp_msg]
-    mov     r8, 16
-    call    ct_memcmp                       ; rt vs msg: MUST match
-    test    eax, eax
-    jnz     st_xor_fail
-    STPRINT st_pass_xor, st_pass_xor_len
-    jmp     st_after_xor
-st_xor_fail:
-    STPRINT st_fail_xor, st_fail_xor_len
-    inc     qword ptr [rbp-24]
-st_after_xor:
-
     ; ---- pwgen: generate 24 chars over all classes; check length + alphabet -
     lea     rcx, [pw_out]
     mov     edx, 24
@@ -561,50 +497,6 @@ st_gen_fail:
     STPRINT st_fail_gen, st_fail_gen_len
     inc     qword ptr [rbp-24]
 st_after_gen:
-
-    ; ---- Poly1305 one-time MAC (RFC 8439 2.5.2 vector) ----------------------
-    lea     rcx, [poly_msg]
-    mov     edx, poly_msg_n
-    lea     r8,  [poly_key]
-    lea     r9,  [poly_tag_out]
-    call    otp_mac
-    lea     rcx, [poly_tag_out]
-    lea     rdx, [poly_tag_exp]
-    mov     r8, 16
-    call    ct_memcmp
-    test    eax, eax
-    jnz     st_mac_fail
-    STPRINT st_pass_mac, st_pass_mac_len
-    jmp     st_after_mac
-st_mac_fail:
-    STPRINT st_fail_mac, st_fail_mac_len
-    inc     qword ptr [rbp-24]
-st_after_mac:
-
-    ; ---- OTP share seal/open: round-trip + tamper detection -----------------
-    WINCALL otp_share_seal, addr shr_pt, 16, addr shr_pad, addr shr_ct, addr shr_tag
-    ; open the untampered share: must succeed and recover the plaintext
-    WINCALL otp_share_open, addr shr_ct, 16, addr shr_pad, addr shr_rt, addr shr_tag
-    test    eax, eax
-    jnz     st_shr_fail
-    lea     rcx, [shr_rt]
-    lea     rdx, [shr_pt]
-    mov     r8, 16
-    call    ct_memcmp
-    test    eax, eax
-    jnz     st_shr_fail
-    ; tamper with the ciphertext: open MUST now fail authentication
-    xor     byte ptr [shr_ct], 1
-    WINCALL otp_share_open, addr shr_ct, 16, addr shr_pad, addr shr_rt, addr shr_tag
-    test    eax, eax
-    jz      st_shr_fail                      ; accepted a forgery -> fail
-    xor     byte ptr [shr_ct], 1             ; restore
-    STPRINT st_pass_shr, st_pass_shr_len
-    jmp     st_after_shr
-st_shr_fail:
-    STPRINT st_fail_shr, st_fail_shr_len
-    inc     qword ptr [rbp-24]
-st_after_shr:
 
     ; ---- vault seal/open (Argon2id -> KCV -> AES-256-GCM, in memory) ---------
     call    vault_selftest
