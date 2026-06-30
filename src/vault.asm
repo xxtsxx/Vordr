@@ -54,6 +54,8 @@ externdef g_cfg_secret:qword
 externdef g_cfg_url:qword
 externdef g_cfg_notes:qword
 externdef g_cfg_totp:qword
+externdef g_field_list:qword
+externdef g_field_n:dword
 
 CP_UTF8         equ 65001
 
@@ -111,6 +113,16 @@ lbl_notes   db "  notes : "
 lbl_notes_n equ $ - lbl_notes
 nlcrlf      db 13,10
 vst_src     db "vault-kat-test!!"      ; 16-byte plaintext for vault_selftest
+; --- field-serialization KAT (labeled + duplicate fields) ------------------
+align 2
+kat_title   dw 'A','c','c','t',0
+kat_url1    dw 'a','.','c','o','m',0
+kat_work    dw 'W','o','r','k',0
+kat_url2    dw 'b','.','c','o','m',0
+kat_pinlbl  dw 'P','I','N',0
+kat_pinval  dw '1','2','3','4',0
+kat_exp_url1 db "a.com"
+kat_exp_pin  db "1234"
 CSTR e_io,      "error: cannot read/write the vault file",13,10
 CSTR e_corrupt, "error: not a Vordr vault (bad magic/version) or corrupt",13,10
 CSTR e_locked,  "error: wrong master password (key-check failed)",13,10
@@ -128,6 +140,7 @@ CSTR m_empty,   "(vault is empty)",13,10
 
 .data?
 align 16
+g_kat_body  db 512 dup (?)             ; scratch body for the field-serialization KAT
 g_vkey      db 32 dup (?)
 g_sha32     db 32 dup (?)
 g_hdr       db VH_TOTAL dup (?)
@@ -141,6 +154,7 @@ g_filesize  dq ?
 g_outbuf    dq ?
 g_outlen    dq ?
 g_conv      db CONV_CAP dup (?)
+g_convlabel db MAX_LABEL_BYTES dup (?)        ; utf8 label scratch (va_field_labeled)
 g_match     db CONV_CAP dup (?)
 align 2
 g_tmppath   dw MAX_PATH_CHARS dup (?)        ; "<vault>.tmp" for atomic replace
@@ -1236,11 +1250,22 @@ find_field_in proc
 ffi_loop:
     test    r8d, r8d
     jz      ffi_none
-    movzx   eax, word ptr [r10]
-    mov     r9d, dword ptr [r10+2]
-    cmp     eax, edx
+    movzx   eax, word ptr [r10]             ; raw type (kind | VF_LABELED)
+    mov     r9d, dword ptr [r10+2]          ; field bytes len
+    mov     ecx, eax
+    and     ecx, VF_KINDMASK                ; base kind
+    cmp     ecx, edx
     jne     ffi_skip
-    lea     rax, [r10+6]
+    lea     rcx, [r10+6]                    ; -> bytes
+    test    eax, VF_LABELED                 ; skip "u16 labellen | label" prefix
+    jz      ffi_plain
+    movzx   eax, word ptr [rcx]             ; labellen
+    add     rcx, 2
+    add     rcx, rax
+    sub     r9, 2
+    sub     r9, rax                         ; value len = fieldlen - 2 - labellen
+ffi_plain:
+    mov     rax, rcx
     mov     rdx, r9
     ret
 ffi_skip:
@@ -1764,6 +1789,9 @@ vst_k:
     call    ct_memcmp
     test    eax, eax
     jnz     vst_fail
+    call    vault_field_selftest            ; TLV labeled/duplicate-field roundtrip
+    test    eax, eax
+    jnz     vst_fail
     xor     eax, eax
     FRAME_EPILOG
     ret
@@ -1772,6 +1800,97 @@ vst_fail:
     FRAME_EPILOG
     ret
 vault_selftest endp
+
+; ===========================================================================
+; vault_field_selftest() -> eax = 0 ok / 1 fail.  Builds an entry with a plain
+; title, a plain URL, a *labelled* duplicate URL, and a *labelled custom* TEXT
+; field via vault_build_entry, then reads it back: positional decode
+; (vault_field_get) and by-kind lookup with label-skip (find_field_in).
+; Uses a private scratch body so it runs before any vault is unlocked.
+; ===========================================================================
+public vault_field_selftest
+vault_field_selftest proc frame
+    FRAME_PROLOG 96
+    ; point the body at the KAT scratch, entry_count = 0
+    lea     rax, [g_kat_body]
+    mov     qword ptr [g_body_ptr], rax
+    mov     dword ptr [rax], 0
+    mov     qword ptr [g_body_len], 4
+    ; compose g_field_list: title / url1 / (Work)url2 / (PIN)text
+    lea     r10, [g_field_list]
+    mov     qword ptr [r10+0], VF_TITLE
+    mov     qword ptr [r10+8], 0
+    lea     rax, [kat_title]
+    mov     qword ptr [r10+16], rax
+    mov     qword ptr [r10+24], VF_URL
+    mov     qword ptr [r10+32], 0
+    lea     rax, [kat_url1]
+    mov     qword ptr [r10+40], rax
+    mov     qword ptr [r10+48], VF_URL
+    lea     rax, [kat_work]
+    mov     qword ptr [r10+56], rax
+    lea     rax, [kat_url2]
+    mov     qword ptr [r10+64], rax
+    mov     qword ptr [r10+72], VF_TEXT
+    lea     rax, [kat_pinlbl]
+    mov     qword ptr [r10+80], rax
+    lea     rax, [kat_pinval]
+    mov     qword ptr [r10+88], rax
+    mov     dword ptr [g_field_n], 4
+    call    vault_build_entry
+    test    eax, eax
+    jnz     vfst_fail
+    ; field count == 4
+    xor     ecx, ecx
+    call    vault_field_count
+    cmp     eax, 4
+    jne     vfst_fail
+    ; find_field_in(VF_TEXT) must skip the "PIN" label and return "1234"
+    lea     rcx, [g_kat_body+4]
+    mov     edx, VF_TEXT
+    call    find_field_in
+    cmp     rdx, 4
+    jne     vfst_fail
+    mov     rcx, rax
+    lea     rdx, [kat_exp_pin]
+    mov     r8, 4
+    call    ct_memcmp
+    test    eax, eax
+    jnz     vfst_fail
+    ; find_field_in(VF_URL) returns the FIRST (plain) url = "a.com"
+    lea     rcx, [g_kat_body+4]
+    mov     edx, VF_URL
+    call    find_field_in
+    cmp     rdx, 5
+    jne     vfst_fail
+    mov     rcx, rax
+    lea     rdx, [kat_exp_url1]
+    mov     r8, 5
+    call    ct_memcmp
+    test    eax, eax
+    jnz     vfst_fail
+    ; positional: field 2 is the labelled URL (kind VF_URL, labellen 4)
+    xor     ecx, ecx
+    mov     edx, 2
+    lea     r8, [rbp-48]
+    call    vault_field_get
+    test    eax, eax
+    jz      vfst_fail
+    cmp     qword ptr [rbp-48], VF_URL
+    jne     vfst_fail
+    cmp     qword ptr [rbp-32], 4               ; out.labellen (= [rbp-48+16])
+    jne     vfst_fail
+    xor     eax, eax
+    jmp     vfst_done
+vfst_fail:
+    mov     eax, 1
+vfst_done:
+    mov     qword ptr [g_body_ptr], 0           ; leave globals clean for the real unlock
+    mov     qword ptr [g_body_len], 0
+    mov     dword ptr [g_field_n], 0
+    FRAME_EPILOG
+    ret
+vault_field_selftest endp
 
 ; ===========================================================================
 ; GUI session API.  The GUI unlocks the vault ONCE (key in g_vkey, body in
@@ -1970,6 +2089,290 @@ vae_fail:
     FRAME_EPILOG
     ret
 vault_add_entry endp
+
+; ===========================================================================
+; va_field_labeled(rcx = base type, rdx = label wide ptr (0/empty = none),
+;   r8 = value wide ptr) - append one TLV field at g_body[g_body_len], writing
+;   a custom-label prefix (and the VF_LABELED flag) when a non-empty label is
+;   supplied.  Empty values ARE persisted (composition is preserved).  -> eax=1.
+; ===========================================================================
+va_field_labeled proc frame
+    FRAME_PROLOG 96
+    ; [rbp-24]=type [rbp-32]=labellen [rbp-40]=vallen [rbp-48]=valwide [rbp-56]=lblwide
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-56], rdx
+    mov     qword ptr [rbp-48], r8
+    xor     eax, eax
+    mov     qword ptr [rbp-40], rax             ; vallen = 0 default
+    test    r8, r8
+    jz      vfl_lbl
+    mov     rcx, r8
+    lea     rdx, [g_conv]
+    mov     r8d, CONV_CAP
+    call    conv_w2u
+    mov     ecx, eax
+    mov     qword ptr [rbp-40], rcx
+vfl_lbl:
+    xor     eax, eax
+    mov     qword ptr [rbp-32], rax             ; labellen = 0 default
+    mov     r10, qword ptr [rbp-56]
+    test    r10, r10
+    jz      vfl_write
+    cmp     word ptr [r10], 0                   ; empty label -> treat as plain
+    je      vfl_write
+    mov     rcx, r10
+    lea     rdx, [g_convlabel]
+    mov     r8d, MAX_LABEL_BYTES
+    call    conv_w2u
+    mov     ecx, eax
+    mov     qword ptr [rbp-32], rcx
+vfl_write:
+    cmp     qword ptr [rbp-32], 0
+    jne     vfl_labeled
+    ; --- plain field: {type, vallen, value} ---
+    mov     r9, qword ptr [rbp-40]
+    mov     r10, qword ptr [g_body_len]
+    add     r10, 6
+    add     r10, r9
+    cmp     r10, VAULT_BODY_MAX
+    ja      vfl_of
+    mov     r11, qword ptr [g_body_ptr]
+    add     r11, qword ptr [g_body_len]
+    mov     rax, qword ptr [rbp-24]
+    mov     word ptr [r11], ax
+    mov     eax, dword ptr [rbp-40]
+    mov     dword ptr [r11+2], eax
+    add     r11, 6
+    lea     r9, [g_conv]
+    xor     r8, r8
+vfl_pcopy:
+    cmp     r8, qword ptr [rbp-40]
+    jae     vfl_pdone
+    mov     al, byte ptr [r9+r8]
+    mov     byte ptr [r11+r8], al
+    inc     r8
+    jmp     vfl_pcopy
+vfl_pdone:
+    mov     rax, qword ptr [g_body_len]
+    add     rax, 6
+    add     rax, qword ptr [rbp-40]
+    mov     qword ptr [g_body_len], rax
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+vfl_labeled:
+    ; --- labeled: {type|VF_LABELED, 2+labellen+vallen, u16 labellen|label|value} ---
+    mov     r9, qword ptr [rbp-32]
+    add     r9, qword ptr [rbp-40]
+    add     r9, 2
+    mov     r10, qword ptr [g_body_len]
+    add     r10, 6
+    add     r10, r9
+    cmp     r10, VAULT_BODY_MAX
+    ja      vfl_of
+    mov     r11, qword ptr [g_body_ptr]
+    add     r11, qword ptr [g_body_len]
+    mov     rax, qword ptr [rbp-24]
+    or      eax, VF_LABELED
+    mov     word ptr [r11], ax
+    mov     eax, r9d
+    mov     dword ptr [r11+2], eax
+    add     r11, 6
+    mov     eax, dword ptr [rbp-32]
+    mov     word ptr [r11], ax                  ; u16 labellen
+    add     r11, 2
+    lea     r9, [g_convlabel]
+    xor     r8, r8
+vfl_lcopy:
+    cmp     r8, qword ptr [rbp-32]
+    jae     vfl_lcdone
+    mov     al, byte ptr [r9+r8]
+    mov     byte ptr [r11+r8], al
+    inc     r8
+    jmp     vfl_lcopy
+vfl_lcdone:
+    add     r11, qword ptr [rbp-32]
+    lea     r9, [g_conv]
+    xor     r8, r8
+vfl_vcopy:
+    cmp     r8, qword ptr [rbp-40]
+    jae     vfl_vcdone
+    mov     al, byte ptr [r9+r8]
+    mov     byte ptr [r11+r8], al
+    inc     r8
+    jmp     vfl_vcopy
+vfl_vcdone:
+    mov     rax, qword ptr [g_body_len]
+    add     rax, 6
+    mov     r9, qword ptr [rbp-32]
+    add     r9, qword ptr [rbp-40]
+    add     r9, 2
+    add     rax, r9
+    mov     qword ptr [g_body_len], rax
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+vfl_of:
+    FASTFAIL FF_BOUNDS
+va_field_labeled endp
+
+; ===========================================================================
+; vault_field_count(rcx = entry index) -> eax = number of TLV fields (0 if oob).
+; ===========================================================================
+public vault_field_count
+vault_field_count proc frame
+    FRAME_PROLOG 32
+    call    vault_entry_ptr                     ; rcx = index -> rax = entry ptr
+    test    rax, rax
+    jz      vfc_zero
+    mov     eax, dword ptr [rax+32]
+    FRAME_EPILOG
+    ret
+vfc_zero:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+vault_field_count endp
+
+; ===========================================================================
+; vault_field_get(rcx = entry index, edx = field n, r8 = *out) - decode the
+;   n-th field (by position) into a 5-qword struct:
+;     [out+0]=kind  [out+8]=labelptr(0)  [out+16]=labellen
+;     [out+24]=valptr  [out+32]=vallen
+;   -> eax = 1 ok, 0 if index/n out of range.
+; ===========================================================================
+public vault_field_get
+vault_field_get proc frame
+    FRAME_PROLOG 48
+    mov     dword ptr [rbp-24], edx             ; n
+    mov     qword ptr [rbp-32], r8              ; out
+    call    vault_entry_ptr                     ; rcx = index -> rax = entry ptr
+    test    rax, rax
+    jz      vfg_none
+    lea     r10, [rax+32]
+    mov     r9d, dword ptr [r10]                ; field_count
+    add     r10, 4                              ; -> first field
+    mov     ecx, dword ptr [rbp-24]             ; n
+    cmp     ecx, r9d
+    jae     vfg_none
+vfg_walk:
+    test    ecx, ecx
+    jz      vfg_at
+    mov     eax, dword ptr [r10+2]              ; field len
+    add     r10, 6
+    add     r10, rax
+    dec     ecx
+    jmp     vfg_walk
+vfg_at:
+    movzx   eax, word ptr [r10]                 ; raw type
+    mov     ecx, eax
+    and     ecx, VF_KINDMASK                    ; kind
+    mov     r9d, dword ptr [r10+2]              ; field len
+    lea     r11, [r10+6]                        ; -> bytes
+    mov     r8, qword ptr [rbp-32]              ; out
+    mov     qword ptr [r8], rcx                 ; out.kind
+    test    eax, VF_LABELED
+    jnz     vfg_labeled
+    mov     qword ptr [r8+8], 0                 ; labelptr
+    mov     qword ptr [r8+16], 0               ; labellen
+    mov     qword ptr [r8+24], r11              ; valptr
+    mov     qword ptr [r8+32], r9               ; vallen
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+vfg_labeled:
+    movzx   ecx, word ptr [r11]                 ; labellen
+    lea     rax, [r11+2]
+    mov     qword ptr [r8+8], rax               ; labelptr
+    mov     qword ptr [r8+16], rcx              ; labellen
+    lea     rax, [r11+2]
+    add     rax, rcx
+    mov     qword ptr [r8+24], rax              ; valptr (after label)
+    sub     r9, 2
+    sub     r9, rcx
+    mov     qword ptr [r8+32], r9               ; vallen = fieldlen-2-labellen
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+vfg_none:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+vault_field_get endp
+
+; ===========================================================================
+; vault_build_entry() - append one entry built from the GUI's ordered field
+;   list g_field_list[0..g_field_n) (each = {qword type, qword labelwide,
+;   qword valuewide}).  Field 0 must be a non-empty title.  Does NOT reseal.
+;   -> eax = 0 ok / EXIT_USAGE (no title) / EXIT_NOSPACE (full).
+; ===========================================================================
+public vault_build_entry
+vault_build_entry proc frame
+    FRAME_PROLOG 64
+    ; [rbp-32]=entry start [rbp-40]=written fcount [rbp-48]=i
+    cmp     dword ptr [g_field_n], 0
+    je      vbe_fail
+    mov     r10, qword ptr [g_field_list+16]    ; field 0 value wide
+    test    r10, r10
+    jz      vbe_fail
+    cmp     word ptr [r10], 0                   ; require a non-empty title
+    je      vbe_fail
+    mov     rax, qword ptr [g_body_len]
+    add     rax, 36
+    cmp     rax, VAULT_BODY_MAX
+    ja      vbe_full
+    mov     r11, qword ptr [g_body_ptr]
+    add     r11, qword ptr [g_body_len]
+    mov     qword ptr [rbp-32], r11
+    mov     rcx, r11
+    mov     edx, 16
+    call    rng_fill                            ; 16-byte random id
+    test    eax, eax
+    jz      vbe_fail
+    lea     rcx, [g_ts]
+    call    GetSystemTimeAsFileTime
+    mov     r11, qword ptr [rbp-32]
+    mov     rax, qword ptr [g_ts]
+    mov     qword ptr [r11+16], rax             ; created
+    mov     qword ptr [r11+24], rax             ; modified
+    mov     dword ptr [r11+32], 0               ; field_count placeholder
+    mov     rax, qword ptr [g_body_len]
+    add     rax, 36
+    mov     qword ptr [g_body_len], rax
+    mov     dword ptr [rbp-40], 0
+    mov     dword ptr [rbp-48], 0
+vbe_loop:
+    mov     eax, dword ptr [rbp-48]
+    cmp     eax, dword ptr [g_field_n]
+    jae     vbe_patch
+    imul    eax, eax, 24                        ; descriptor stride = 3 qwords
+    lea     r10, [g_field_list]
+    add     r10, rax
+    mov     rcx, qword ptr [r10]                ; base type
+    mov     rdx, qword ptr [r10+8]              ; label wide (0=none)
+    mov     r8,  qword ptr [r10+16]             ; value wide
+    call    va_field_labeled
+    add     dword ptr [rbp-40], eax
+    inc     dword ptr [rbp-48]
+    jmp     vbe_loop
+vbe_patch:
+    mov     r11, qword ptr [rbp-32]
+    mov     eax, dword ptr [rbp-40]
+    mov     dword ptr [r11+32], eax             ; patch field_count
+    mov     r11, qword ptr [g_body_ptr]
+    inc     dword ptr [r11]                     ; entry_count++
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+vbe_full:
+    mov     eax, EXIT_NOSPACE
+    FRAME_EPILOG
+    ret
+vbe_fail:
+    mov     eax, EXIT_USAGE
+    FRAME_EPILOG
+    ret
+vault_build_entry endp
 
 ; vault_remove_at(rcx = index) - delete entry `index` from the in-memory body
 ;   (memmove the tail down, entry_count--).  Does NOT reseal.  -> eax = 0 / 1.

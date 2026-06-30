@@ -82,6 +82,15 @@ g_cfg_url           dq 0
 g_cfg_notes         dq 0
 g_cfg_totp          dq 0                ; --> wide base32 TOTP secret (GUI)
 
+; --- modular field list (the GUI composes this; vault_build_entry consumes it) --
+; g_field_list[] = up to MAX_FIELDS descriptors of 3 qwords each:
+;   { qword type(base kind), qword label-wide ptr (0=none), qword value-wide ptr }
+MAX_FIELDS          equ 32
+public g_field_list, g_field_n
+g_field_n           dd 0                ; number of composed fields
+align 8
+g_field_list        dq 3*MAX_FIELDS dup (0)
+
 .data?
 public g_cfg_pass, g_positionals, g_poscount
 g_argv          dq MAX_ARGS dup (?)
