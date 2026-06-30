@@ -27,6 +27,7 @@
 #define IDC_V_LOCK   212
 #define IDC_V_TOTP   213
 #define IDC_V_COPYTOTP 214
+#define IDC_V_TKEY   227
 #define IDC_V_MENU   216
 #define IDC_V_MBACK  217
 #define IDC_V_MTITLE 218
@@ -36,41 +37,28 @@
 #define IDC_V_MCLSL  222
 #define IDC_V_MCLS   223
 #define IDC_V_MTPM   224
-#define IDC_V_MSAVE  225
-#define DLG_ENTRY    300
-#define IDC_E_TITLE  301
-#define IDC_E_USER   302
-#define IDC_E_SECRET 303
-#define IDC_E_URL    304
-#define IDC_E_NOTES  305
-#define IDC_E_TOTP   306
+#define IDC_V_MTPMINFO 226
 #define DLG_CREATE   400
-#define IDC_C_PATH   401
 #define IDC_C_PW     402
 #define IDC_C_PW2    403
-#define IDC_C_LEN    404
-#define IDC_C_CLS    405
-#define IDC_C_STATUS 406
+#define IDC_C_PWBAR  404
+#define IDC_C_PW2BAR 405
+#define IDC_C_INFO   406
 
 /* application / window icon (lowest ID -> the shell's file icon) */
 1 ICON "vordr.ico"
 
-DLG_UNLOCK DIALOGEX 0, 0, 320, 168
+DLG_UNLOCK DIALOGEX 0, 0, 320, 104
 STYLE DS_CENTER | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Vordr - Unlock vault"
 FONT 9, "Segoe UI"
 BEGIN
     LTEXT           "Vault file:", -1, 12, 12, 50, 10
     LTEXT           "(no vault selected)", IDC_U_PATH, 66, 12, 242, 10
-    PUSHBUTTON      "Open existing...", IDC_U_OPEN, 12, 28, 70, 16
-    PUSHBUTTON      "Create new...", IDC_U_NEW, 88, 28, 70, 16
-    LTEXT           "Master password:", -1, 12, 58, 90, 10
-    EDITTEXT        IDC_U_PW, 12, 70, 296, 14, ES_PASSWORD | ES_AUTOHSCROLL
-    AUTOCHECKBOX    "Remember this device (fast unlock via Windows Hello / TPM)", IDC_U_REMEMBER, 12, 90, 296, 10
-    DEFPUSHBUTTON   "Unlock", IDC_U_UNLOCK, 196, 106, 54, 18
-    PUSHBUTTON      "Cancel", IDCANCEL, 254, 106, 54, 18
-    PUSHBUTTON      "Unlock with Windows Hello / TPM", IDC_U_TPM, 12, 106, 170, 18
-    LTEXT           "", IDC_U_STATUS, 12, 134, 296, 24
+    LTEXT           "Master password:", -1, 12, 34, 90, 10
+    EDITTEXT        IDC_U_PW, 12, 46, 296, 14, ES_PASSWORD | ES_AUTOHSCROLL
+    PUSHBUTTON      "Unlock", IDC_U_UNLOCK, 254, 70, 54, 18, BS_OWNERDRAW
+    LTEXT           "", IDC_U_STATUS, 12, 74, 232, 24
 END
 
 DLG_VAULT DIALOGEX 0, 0, 426, 286
@@ -78,85 +66,56 @@ STYLE DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Vordr - Vault"
 FONT 9, "Segoe UI"
 BEGIN
-    /* ---- vault content (left margin: list starts at x=30) ---------------- */
-    LISTBOX         IDC_V_LIST, 30, 10, 116, 240, LBS_NOTIFY | WS_VSCROLL | WS_BORDER | WS_TABSTOP
-    PUSHBUTTON      "Add...", IDC_V_ADD, 30, 256, 36, 18
-    PUSHBUTTON      "Edit...", IDC_V_EDIT, 69, 256, 36, 18
-    PUSHBUTTON      "Remove", IDC_V_REMOVE, 108, 256, 38, 18
-    LTEXT           "Title", -1, 158, 14, 40, 10
-    EDITTEXT        IDC_V_TITLE, 206, 12, 210, 13, ES_READONLY | ES_AUTOHSCROLL | WS_TABSTOP
-    LTEXT           "Username", -1, 158, 34, 40, 10
-    EDITTEXT        IDC_V_USER, 206, 32, 210, 13, ES_READONLY | ES_AUTOHSCROLL | WS_TABSTOP
-    LTEXT           "Secret", -1, 158, 54, 40, 10
-    EDITTEXT        IDC_V_SECRET, 206, 52, 150, 13, ES_READONLY | ES_AUTOHSCROLL
-    PUSHBUTTON      "Reveal", IDC_V_REVEAL, 358, 52, 28, 13
-    PUSHBUTTON      "Copy", IDC_V_COPY, 388, 52, 28, 13
-    LTEXT           "URL", -1, 158, 74, 40, 10
-    EDITTEXT        IDC_V_URL, 206, 72, 210, 13, ES_READONLY | ES_AUTOHSCROLL | WS_TABSTOP
-    LTEXT           "Notes", -1, 158, 94, 40, 10
-    EDITTEXT        IDC_V_NOTES, 206, 92, 210, 62, ES_READONLY | ES_MULTILINE | WS_VSCROLL | WS_TABSTOP
-    LTEXT           "Auth code", -1, 158, 164, 44, 10
-    EDITTEXT        IDC_V_TOTP, 206, 162, 110, 13, ES_READONLY | ES_AUTOHSCROLL
-    PUSHBUTTON      "Copy code", IDC_V_COPYTOTP, 320, 162, 56, 13
-    DEFPUSHBUTTON   "Lock", IDC_V_LOCK, 362, 256, 54, 18
+    /* ---- left-margin toolbar: add (+), edit (pencil), remove (-) ---------- */
+    PUSHBUTTON      "+", IDC_V_ADD, 6, 36, 18, 18, BS_OWNERDRAW
+    PUSHBUTTON      "e", IDC_V_EDIT, 6, 58, 18, 18, BS_OWNERDRAW
+    PUSHBUTTON      "-", IDC_V_REMOVE, 6, 80, 18, 18, BS_OWNERDRAW
+    LISTBOX         IDC_V_LIST, 30, 10, 116, 240, LBS_NOTIFY | WS_VSCROLL | WS_TABSTOP | NOT WS_BORDER
+    LTEXT           "Title", -1, 158, 14, 44, 10
+    EDITTEXT        IDC_V_TITLE, 206, 12, 210, 13, ES_AUTOHSCROLL | WS_TABSTOP | NOT WS_BORDER, 0
+    LTEXT           "Username", -1, 158, 34, 44, 10
+    EDITTEXT        IDC_V_USER, 206, 32, 210, 13, ES_AUTOHSCROLL | WS_TABSTOP | NOT WS_BORDER, 0
+    LTEXT           "Secret", -1, 158, 54, 44, 10
+    EDITTEXT        IDC_V_SECRET, 206, 52, 150, 13, ES_PASSWORD | ES_AUTOHSCROLL | WS_TABSTOP | NOT WS_BORDER, 0
+    PUSHBUTTON      "Reveal", IDC_V_REVEAL, 358, 52, 28, 13, BS_OWNERDRAW
+    PUSHBUTTON      "Copy", IDC_V_COPY, 388, 52, 28, 13, BS_OWNERDRAW
+    LTEXT           "URL", -1, 158, 74, 44, 10
+    EDITTEXT        IDC_V_URL, 206, 72, 210, 13, ES_AUTOHSCROLL | WS_TABSTOP | NOT WS_BORDER, 0
+    LTEXT           "Notes", -1, 158, 94, 44, 10
+    EDITTEXT        IDC_V_NOTES, 206, 92, 210, 40, ES_MULTILINE | WS_VSCROLL | ES_AUTOVSCROLL | WS_TABSTOP | NOT WS_BORDER, 0
+    LTEXT           "TOTP key", -1, 158, 140, 44, 10
+    EDITTEXT        IDC_V_TKEY, 206, 138, 210, 13, ES_AUTOHSCROLL | WS_TABSTOP | NOT WS_BORDER, 0
+    LTEXT           "Auth code", -1, 158, 160, 44, 10
+    EDITTEXT        IDC_V_TOTP, 206, 158, 110, 13, ES_READONLY | ES_AUTOHSCROLL | NOT WS_BORDER, 0
+    PUSHBUTTON      "Copy code", IDC_V_COPYTOTP, 320, 158, 56, 13, BS_OWNERDRAW
+    PUSHBUTTON      "Lock", IDC_V_LOCK, 362, 256, 54, 18, BS_OWNERDRAW
 
     /* ---- settings overlay (hidden until the burger is clicked) ----------- */
-    CONTROL         "", IDC_V_MBACK, "Static", SS_WHITERECT | WS_CHILD | WS_VISIBLE, 0, 0, 426, 286
+    CONTROL         "", IDC_V_MBACK, "Static", SS_OWNERDRAW | WS_CHILD | WS_VISIBLE, 0, 0, 426, 286
     LTEXT           "Settings", IDC_V_MTITLE, 30, 16, 200, 14
-    GROUPBOX        "Password policy", IDC_V_MPOLL, 30, 40, 360, 56
-    LTEXT           "Minimum length:", IDC_V_MLENL, 44, 58, 120, 10
-    EDITTEXT        IDC_V_MLEN, 170, 56, 36, 13, ES_NUMBER | ES_AUTOHSCROLL
-    LTEXT           "Minimum character types (1-4):", IDC_V_MCLSL, 44, 76, 120, 10
-    EDITTEXT        IDC_V_MCLS, 170, 74, 36, 13, ES_NUMBER | ES_AUTOHSCROLL
-    AUTOCHECKBOX    "Unlock this vault with Windows Hello / TPM on this device", IDC_V_MTPM, 30, 112, 360, 12
-    PUSHBUTTON      "Save settings", IDC_V_MSAVE, 30, 138, 70, 18
+    LTEXT           "Password policy", IDC_V_MPOLL, 30, 44, 360, 10
+    LTEXT           "Minimum length:", IDC_V_MLENL, 44, 60, 120, 10
+    EDITTEXT        IDC_V_MLEN, 170, 58, 36, 13, ES_NUMBER | ES_AUTOHSCROLL | NOT WS_BORDER, 0
+    LTEXT           "Minimum character types (1-4):", IDC_V_MCLSL, 44, 78, 120, 10
+    EDITTEXT        IDC_V_MCLS, 170, 76, 36, 13, ES_NUMBER | ES_AUTOHSCROLL | NOT WS_BORDER, 0
+    AUTOCHECKBOX    "TPM Unlock", IDC_V_MTPM, 30, 112, 70, 12
+    PUSHBUTTON      "i", IDC_V_MTPMINFO, 104, 110, 14, 14, BS_OWNERDRAW
 
-    /* ---- burger button (top-left, always on top) ------------------------ */
-    PUSHBUTTON      "=", IDC_V_MENU, 6, 6, 18, 16
+    /* ---- burger menu (top-left, last = always on top of the overlay) ------ */
+    PUSHBUTTON      "=", IDC_V_MENU, 6, 12, 18, 16, BS_OWNERDRAW
 END
 
-DLG_ENTRY DIALOGEX 0, 0, 300, 222
-STYLE DS_CENTER | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
-CAPTION "Vordr - Entry"
-FONT 9, "Segoe UI"
-BEGIN
-    LTEXT           "Title", -1, 12, 14, 50, 10
-    EDITTEXT        IDC_E_TITLE, 64, 12, 224, 13, ES_AUTOHSCROLL
-    LTEXT           "Username", -1, 12, 34, 50, 10
-    EDITTEXT        IDC_E_USER, 64, 32, 224, 13, ES_AUTOHSCROLL
-    LTEXT           "Secret", -1, 12, 54, 50, 10
-    EDITTEXT        IDC_E_SECRET, 64, 52, 224, 13, ES_AUTOHSCROLL
-    LTEXT           "URL", -1, 12, 74, 50, 10
-    EDITTEXT        IDC_E_URL, 64, 72, 224, 13, ES_AUTOHSCROLL
-    LTEXT           "Notes", -1, 12, 94, 50, 10
-    EDITTEXT        IDC_E_NOTES, 64, 92, 224, 56, ES_MULTILINE | WS_VSCROLL | ES_AUTOVSCROLL | ES_WANTRETURN
-    LTEXT           "TOTP key", -1, 12, 156, 50, 10
-    EDITTEXT        IDC_E_TOTP, 64, 154, 224, 13, ES_AUTOHSCROLL
-    LTEXT           "(base32 secret, e.g. JBSWY3DPEHPK3PXP)", -1, 64, 170, 224, 9
-    DEFPUSHBUTTON   "Save", IDOK, 178, 194, 54, 18
-    PUSHBUTTON      "Cancel", IDCANCEL, 236, 194, 54, 18
-END
-
-DLG_CREATE DIALOGEX 0, 0, 320, 196
+DLG_CREATE DIALOGEX 0, 0, 228, 108
 STYLE DS_CENTER | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Vordr - Create vault"
 FONT 9, "Segoe UI"
 BEGIN
-    LTEXT           "New vault:", -1, 12, 12, 48, 10
-    LTEXT           "", IDC_C_PATH, 64, 12, 244, 10
-    LTEXT           "Master password:", -1, 12, 32, 100, 10
-    EDITTEXT        IDC_C_PW, 120, 30, 188, 14, ES_PASSWORD | ES_AUTOHSCROLL
-    LTEXT           "Confirm password:", -1, 12, 50, 100, 10
-    EDITTEXT        IDC_C_PW2, 120, 48, 188, 14, ES_PASSWORD | ES_AUTOHSCROLL
-    GROUPBOX        "Password policy", -1, 12, 70, 296, 48
-    LTEXT           "Minimum length:", -1, 24, 86, 110, 10
-    EDITTEXT        IDC_C_LEN, 138, 84, 32, 13, ES_NUMBER | ES_AUTOHSCROLL
-    LTEXT           "Minimum character types (1-4):", -1, 24, 102, 110, 10
-    EDITTEXT        IDC_C_CLS, 138, 100, 32, 13, ES_NUMBER | ES_AUTOHSCROLL
-    LTEXT           "Types counted: lowercase, uppercase, number, symbol.", -1, 180, 92, 124, 18
-    DEFPUSHBUTTON   "Create", IDOK, 196, 124, 54, 18
-    PUSHBUTTON      "Cancel", IDCANCEL, 254, 124, 54, 18
-    LTEXT           "", IDC_C_STATUS, 12, 150, 296, 40
+    EDITTEXT        IDC_C_PW, 16, 22, 176, 14, ES_PASSWORD | ES_AUTOHSCROLL
+    PUSHBUTTON      "i", IDC_C_INFO, 198, 22, 14, 14, BS_OWNERDRAW
+    CONTROL         "", IDC_C_PWBAR, "Static", SS_OWNERDRAW | WS_CHILD | WS_VISIBLE, 16, 38, 176, 3
+    EDITTEXT        IDC_C_PW2, 16, 50, 176, 14, ES_PASSWORD | ES_AUTOHSCROLL
+    CONTROL         "", IDC_C_PW2BAR, "Static", SS_OWNERDRAW | WS_CHILD | WS_VISIBLE, 16, 66, 176, 3
+    PUSHBUTTON      "Create", IDOK, 158, 82, 54, 18, BS_OWNERDRAW
 END
 
 1 VERSIONINFO

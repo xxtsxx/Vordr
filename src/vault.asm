@@ -39,8 +39,9 @@ extern GetSystemTimeAsFileTime:proc
 extern tpm_seal:proc
 extern tpm_unseal:proc
 extern tpm_delete:proc
-extern DeleteFileW:proc
-extern GetFileAttributesW:proc
+extern reg_tpm_set:proc
+extern reg_tpm_get:proc
+extern reg_tpm_del:proc
 
 externdef g_cfg_in:qword
 externdef g_cfg_pass:byte
@@ -154,15 +155,8 @@ public g_use_tpm
 g_use_tpm   dd ?                    ; GUI sets 1 to unlock via TPM, else password
 align 2
 g_tpm_kn    dw 64 dup (?)           ; TPM key name (wide): "Vordr-" + KCV[0..7] hex
-g_tpm_sc    dw MAX_PATH_CHARS dup (?)   ; sidecar path (wide): "<vault>.tpm"
 align 8
 g_tpm_blob  db 512 dup (?)          ; sealed 32-byte master key (RSA-OAEP blob)
-g_tpm_wbuf  db 600 dup (?)          ; assembled sidecar (VTPM hdr + blob) to write
-g_tpm_scptr dq ?                    ; read_file-allocated sidecar buffer
-g_tpm_scsz  dq ?                    ; sidecar size (read_file out param)
-
-VTPM_MAGIC  equ 04D505456h          ; "VTPM" little-endian
-VTPM_HDR    equ 12                  ; magic(4) + version(4) + bloblen(4)
 
 .code
 
@@ -278,74 +272,30 @@ kn_lo_s:
 tpm_kn_build endp
 
 ; ===========================================================================
-; tpm_sc_build() - g_tpm_sc = [g_cfg_in] (wide vault path) + L".tpm".
-; ===========================================================================
-tpm_sc_build proc frame
-    FRAME_PROLOG 32
-    mov     r11, qword ptr [g_cfg_in]
-    lea     r10, [g_tpm_sc]
-    xor     r8d, r8d
-sc_cpy:
-    movzx   eax, word ptr [r11+r8*2]
-    test    eax, eax
-    jz      sc_end
-    mov     word ptr [r10+r8*2], ax
-    inc     r8d
-    cmp     r8d, MAX_PATH_CHARS - 8
-    jb      sc_cpy
-sc_end:
-    lea     r10, [r10+r8*2]
-    mov     word ptr [r10+0], '.'
-    mov     word ptr [r10+2], 't'
-    mov     word ptr [r10+4], 'p'
-    mov     word ptr [r10+6], 'm'
-    mov     word ptr [r10+8], 0
-    FRAME_EPILOG
-    ret
-tpm_sc_build endp
-
-; ===========================================================================
-; vk_derive_tpm() - read the sidecar, TPM-unseal it into g_vkey.
-;   Precondition: g_hdr holds the vault header (KCV).  -> eax = 0 / EXIT_LOCKED.
+; vk_derive_tpm() - fetch the wrapped key from HKCU\..\TPM-Unlock and TPM-unseal
+;   it into g_vkey.  Precondition: g_hdr holds the vault header (KCV) and
+;   g_cfg_in points at the wide vault path.  -> eax = 0 / EXIT_LOCKED.
 ; ===========================================================================
 vk_derive_tpm proc frame
     FRAME_PROLOG 48
     call    tpm_kn_build
-    call    tpm_sc_build
-    lea     rcx, [g_tpm_sc]
-    lea     rdx, [g_tpm_scptr]
-    lea     r8, [g_tpm_scsz]
-    call    read_file
+    mov     rcx, qword ptr [g_cfg_in]       ; value name = vault path
+    lea     rdx, [g_tpm_blob]
+    mov     r8d, 512
+    call    reg_tpm_get
     test    eax, eax
-    jnz     vdt_no
-    mov     r10, qword ptr [g_tpm_scptr]
-    cmp     dword ptr [r10], VTPM_MAGIC
-    jne     vdt_free
-    mov     eax, dword ptr [r10+8]          ; bloblen
-    cmp     eax, 512
-    ja      vdt_free
-    mov     dword ptr [rbp-32], eax
+    jz      vdt_no
+    mov     dword ptr [rbp-32], eax         ; blob length
     lea     rcx, [g_tpm_kn]
-    lea     rdx, [r10+VTPM_HDR]
+    lea     rdx, [g_tpm_blob]
     mov     r8d, dword ptr [rbp-32]
     lea     r9, [g_vkey]
     call    tpm_unseal
-    mov     dword ptr [rbp-40], eax         ; unseal result
-    ; free the sidecar buffer (allocated by read_file)
-    mov     rcx, qword ptr [g_tpm_scptr]
-    mov     rdx, qword ptr [g_tpm_scsz]
-    call    mem_free
-    mov     qword ptr [g_tpm_scptr], 0
-    cmp     dword ptr [rbp-40], 0
-    je      vdt_no
+    test    eax, eax
+    jz      vdt_no
     xor     eax, eax
     FRAME_EPILOG
     ret
-vdt_free:
-    mov     rcx, qword ptr [g_tpm_scptr]
-    mov     rdx, qword ptr [g_tpm_scsz]
-    call    mem_free
-    mov     qword ptr [g_tpm_scptr], 0
 vdt_no:
     mov     eax, EXIT_LOCKED
     FRAME_EPILOG
@@ -354,8 +304,9 @@ vk_derive_tpm endp
 
 ; ===========================================================================
 ; vault_tpm_remember() -> eax = 1/0.  Seal the current master key (g_vkey) to
-;   the TPM and write the per-vault sidecar, enabling fast unlock on this PC.
-;   Precondition: vault just unlocked (g_vkey + g_hdr valid, g_cfg_in = path).
+;   the TPM and store the wrapped blob under HKCU\..\TPM-Unlock, enabling fast
+;   unlock on this PC.  Precondition: vault just unlocked (g_vkey + g_hdr valid,
+;   g_cfg_in = path).
 ; ===========================================================================
 public vault_tpm_remember
 vault_tpm_remember proc frame
@@ -369,29 +320,12 @@ vault_tpm_remember proc frame
     test    eax, eax
     jz      vtr_fail
     mov     dword ptr [rbp-32], eax         ; blob length
-    lea     r10, [g_tpm_wbuf]
-    mov     dword ptr [r10], VTPM_MAGIC
-    mov     dword ptr [r10+4], 1
-    mov     eax, dword ptr [rbp-32]
-    mov     dword ptr [r10+8], eax
-    lea     r11, [g_tpm_blob]
-    xor     r8d, r8d
-vtr_cp:
-    cmp     r8d, dword ptr [rbp-32]
-    jae     vtr_cpd
-    mov     al, byte ptr [r11+r8]
-    mov     byte ptr [r10+VTPM_HDR+r8], al
-    inc     r8d
-    jmp     vtr_cp
-vtr_cpd:
-    call    tpm_sc_build
-    lea     rcx, [g_tpm_sc]
-    lea     rdx, [g_tpm_wbuf]
+    mov     rcx, qword ptr [g_cfg_in]       ; value name = vault path
+    lea     rdx, [g_tpm_blob]
     mov     r8d, dword ptr [rbp-32]
-    add     r8d, VTPM_HDR
-    call    write_file
+    call    reg_tpm_set
     test    eax, eax
-    jnz     vtr_fail
+    jz      vtr_fail
     mov     eax, 1
     FRAME_EPILOG
     ret
@@ -402,8 +336,9 @@ vtr_fail:
 vault_tpm_remember endp
 
 ; ===========================================================================
-; vault_tpm_forget() -> eax = 1.  Delete the TPM key + sidecar for this vault.
-;   Precondition: g_hdr holds the vault header (so the key name resolves).
+; vault_tpm_forget() -> eax = 1.  Delete the TPM key + the HKCU\..\TPM-Unlock
+;   entry for this vault.  Precondition: g_hdr holds the vault header (so the key
+;   name resolves) and g_cfg_in points at the vault path.
 ; ===========================================================================
 public vault_tpm_forget
 vault_tpm_forget proc frame
@@ -411,23 +346,26 @@ vault_tpm_forget proc frame
     call    tpm_kn_build
     lea     rcx, [g_tpm_kn]
     call    tpm_delete
-    call    tpm_sc_build
-    WINCALL DeleteFileW, addr g_tpm_sc
+    mov     rcx, qword ptr [g_cfg_in]       ; value name = vault path
+    call    reg_tpm_del
     mov     eax, 1
     FRAME_EPILOG
     ret
 vault_tpm_forget endp
 
 ; ===========================================================================
-; vault_tpm_has() -> eax = 1 if a TPM sidecar exists for g_cfg_in, else 0.
+; vault_tpm_has() -> eax = 1 if a TPM-Unlock registry entry exists for g_cfg_in,
+;   else 0.  Keyed by the vault path, so it works before the header is read.
 ; ===========================================================================
 public vault_tpm_has
 vault_tpm_has proc frame
     FRAME_PROLOG 32
-    call    tpm_sc_build
-    WINCALL GetFileAttributesW, addr g_tpm_sc
-    cmp     eax, -1                         ; INVALID_FILE_ATTRIBUTES
-    je      vth_no
+    mov     rcx, qword ptr [g_cfg_in]
+    lea     rdx, [g_tpm_blob]
+    mov     r8d, 512
+    call    reg_tpm_get
+    test    eax, eax
+    jz      vth_no
     mov     eax, 1
     FRAME_EPILOG
     ret
