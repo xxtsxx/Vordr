@@ -304,13 +304,14 @@ FD_FLAGS    equ 4               ; dd  bit0 = field carries a custom label
 FD_Y        equ 8              ; dd  row top in DLU (within the detail pane)
 FD_H        equ 12             ; dd  row height in DLU
 FD_HANDLES  equ 16             ; q[DYN_SLOTS]  control hwnd per slot (0 = absent)
-DESCSZ      equ 80             ; 16 + 8 handles*8
+DESCSZ      equ 144            ; 16 + 16 handles*8
 MAXROWS     equ 24
 FDF_LABELED equ 1               ; FD_FLAGS bit0 = carries a custom label
 FDF_REVEALED equ 2              ; FD_FLAGS bit1 = value currently unmasked
-; Runtime control ids: IDC_DYN_BASE + row*DYN_SLOTS + slot.
+; Runtime control ids: IDC_DYN_BASE + row*DYN_SLOTS + slot (DYN_SLOTS = power of 2).
 IDC_DYN_BASE equ 3000
-DYN_SLOTS   equ 8
+DYN_SLOTS   equ 16
+DYN_SLOTS_LOG2 equ 4
 DS_LABEL    equ 0
 DS_VALUE    equ 1
 DS_REVEAL   equ 2
@@ -319,8 +320,9 @@ DS_DOWN     equ 4
 DS_DEL      equ 5
 DS_TCODE    equ 6               ; TOTP live-code display
 DS_TBAR     equ 7               ; TOTP drain bar
+DS_COPY     equ 8               ; copy-to-clipboard (secret value / TOTP code)
 IDC_V_ADDFIELD equ 230          ; "+ Add field" button (edit mode)
-FIELD_AREA_BOTTOM equ 228        ; rows may not grow past here (DLU; Add-field is at 232)
+FIELD_AREA_BOTTOM equ 292        ; rows may not grow past here (DLU; Add-field is at 296)
 ; Win32 window styles (gui.asm builds controls at runtime; the RC gets these
 ; from windows.h, but this module needs the numeric values).
 WS_CHILD_       equ 40000000h
@@ -461,6 +463,8 @@ wb_down label word
     dw 0E70Dh, 0                                 ; ChevronDown (move field down)
 wb_eye label word
     dw 0E7B3h, 0                                 ; RedEye (reveal)
+wb_copy label word
+    dw 0E8C8h, 0                                 ; Copy (copy to clipboard)
 cls_edit label word
     dw 'E','d','i','t', 0
 cls_button label word
@@ -1671,6 +1675,8 @@ gra_secret:
             ES_PASSWORD_ or ES_AUTOHSCROLL_ or WS_TABSTOP_
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_REVEAL, addr cls_button, addr wb_eye, \
             BS_OWNERDRAW_
+    WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_COPY, addr cls_button, addr wb_copy, \
+            BS_OWNERDRAW_
     jmp     gra_reorder
 gra_notes:
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_VALUE, addr cls_edit, 0, \
@@ -1685,6 +1691,8 @@ gra_totp:
             SS_LEFTNOWORDWRAP_
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_TBAR, addr cls_static, 0, \
             SS_OWNERDRAW_
+    WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_COPY, addr cls_button, addr wb_copy, \
+            BS_OWNERDRAW_
 gra_reorder:
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_UP, addr cls_button, addr wb_up, \
             BS_OWNERDRAW_
@@ -1782,20 +1790,39 @@ grl_setyh:
     mov     r8d, 158
     mov     r9d, dword ptr [rbp-40]
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 44, 11
-    ; value  (206, y, 146, valH)
+    ; value  (206, y, 128, valH)
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_VALUE*8]
     mov     r8d, 206
     mov     r9d, dword ptr [rbp-40]
-    WINCALL move_ctl, rcx, rdx, r8d, r9d, 146, dword ptr [rbp-48]
-    ; reveal (356, y, 16, 12)
+    WINCALL move_ctl, rcx, rdx, r8d, r9d, 128, dword ptr [rbp-48]
+    ; reveal (338, y, 12, 12)
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_REVEAL*8]
-    mov     r8d, 356
+    mov     r8d, 338
     mov     r9d, dword ptr [rbp-40]
-    WINCALL move_ctl, rcx, rdx, r8d, r9d, 16, 12
+    WINCALL move_ctl, rcx, rdx, r8d, r9d, 12, 12
+    ; copy: secret -> right cluster (352,y); totp -> next to the live code (318,y+14)
+    mov     r10, qword ptr [rbp-32]
+    cmp     dword ptr [r10+FD_KIND], VF_TOTP
+    je      grl_copytotp
+    mov     rcx, qword ptr [rbp-24]
+    mov     rdx, qword ptr [r10+FD_HANDLES+DS_COPY*8]
+    mov     r8d, 352
+    mov     r9d, dword ptr [rbp-40]
+    WINCALL move_ctl, rcx, rdx, r8d, r9d, 12, 12
+    jmp     grl_copydone
+grl_copytotp:
+    mov     rcx, qword ptr [rbp-24]
+    mov     r10, qword ptr [rbp-32]
+    mov     rdx, qword ptr [r10+FD_HANDLES+DS_COPY*8]
+    mov     r8d, 318
+    mov     r9d, dword ptr [rbp-40]
+    add     r9d, 14
+    WINCALL move_ctl, rcx, rdx, r8d, r9d, 16, 11
+grl_copydone:
     ; totp code (206, y+14, 110, 11) + bar (206, y+25, 110, 2)
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
@@ -1811,23 +1838,23 @@ grl_setyh:
     mov     r9d, dword ptr [rbp-40]
     add     r9d, 25
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 110, 2
-    ; up/down/del  (376/390/404, y, 12, 11)
+    ; up/down/del  (368/382/396, y, 12, 11)
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_UP*8]
-    mov     r8d, 376
+    mov     r8d, 368
     mov     r9d, dword ptr [rbp-40]
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 12, 11
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_DOWN*8]
-    mov     r8d, 390
+    mov     r8d, 382
     mov     r9d, dword ptr [rbp-40]
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 12, 11
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_DEL*8]
-    mov     r8d, 404
+    mov     r8d, 396
     mov     r9d, dword ptr [rbp-40]
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 12, 11
     ; show/hide the reorder cluster per edit mode
@@ -1965,6 +1992,36 @@ grr_apply:
     FRAME_EPILOG
     ret
 gui_row_reveal endp
+
+; gui_row_copy(rcx=hdlg, edx=row) - copy the row to the clipboard (TOTP -> live
+;   6-digit code; otherwise the value), with the usual auto-clear timer.
+gui_row_copy proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-32], edx
+    mov     eax, edx
+    imul    eax, eax, DESCSZ
+    lea     r10, [g_fields]
+    add     r10, rax
+    cmp     dword ptr [r10+FD_KIND], VF_TOTP
+    jne     grc_value
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [g_totp_code_w]
+    call    gui_copy
+    jmp     grc_done
+grc_value:
+    mov     ecx, dword ptr [rbp-32]
+    mov     edx, DS_VALUE
+    call    dynid
+    mov     dword ptr [rbp-40], eax
+    WINCALL GetDlgItemTextW, qword ptr [rbp-24], dword ptr [rbp-40], addr g_secret_w, EBUF*2-1
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [g_secret_w]
+    call    gui_copy
+grc_done:
+    FRAME_EPILOG
+    ret
+gui_row_copy endp
 
 ; gui_arm_totp(rcx=hdlg) - find the (single) TOTP row, latch its code/bar handles
 ;   and base32 key, and (re)start the live-code timer.  Safe with no TOTP row.
@@ -2221,6 +2278,13 @@ gui_addfield_one proc frame
     mov     qword ptr [rbp-24], rcx
     mov     dword ptr [rbp-32], edx
     mov     qword ptr [rbp-40], r8
+    ; refuse a 2nd TOTP (the palette greys it; guard regardless)
+    cmp     dword ptr [rbp-32], VF_TOTP
+    jne     gao_chkroom
+    call    gui_has_totp
+    test    eax, eax
+    jnz     gao_done
+gao_chkroom:
     ; refuse if the new row wouldn't fit the field area
     mov     eax, dword ptr [rbp-32]              ; kind -> row height (incl gap)
     mov     r9d, 18
@@ -2293,6 +2357,28 @@ gao_done:
     ret
 gui_addfield_one endp
 
+; gui_has_totp() -> eax = 1 if any currently-composed row is a TOTP field.  Leaf.
+gui_has_totp proc
+    xor     r8d, r8d
+ght_loop:
+    cmp     r8d, dword ptr [g_field_count]
+    jae     ght_no
+    mov     eax, r8d
+    imul    eax, eax, DESCSZ
+    lea     r10, [g_fields]
+    add     r10, rax
+    cmp     dword ptr [r10+FD_KIND], VF_TOTP
+    je      ght_yes
+    inc     r8d
+    jmp     ght_loop
+ght_no:
+    xor     eax, eax
+    ret
+ght_yes:
+    mov     eax, 1
+    ret
+gui_has_totp endp
+
 ; gui_palette_add(rcx=hdlg, edx=menu id) - map a palette choice to a new field.
 gui_palette_add proc frame
     FRAME_PROLOG 48
@@ -2346,9 +2432,10 @@ gui_addfield_menu proc frame
     WINCALL AppendMenuW, qword ptr [rbp-32], 0, 4, addr kl_email
     WINCALL AppendMenuW, qword ptr [rbp-32], 0, 5, addr kl_notes
     mov     dword ptr [rbp-40], 0               ; MF_STRING|MF_ENABLED
-    cmp     dword ptr [g_totp_row], 0
-    jl      gam_totp
-    mov     dword ptr [rbp-40], 1               ; MF_GRAYED (one TOTP already)
+    call    gui_has_totp                        ; grey TOTP if one already exists (live rows)
+    test    eax, eax
+    jz      gam_totp
+    mov     dword ptr [rbp-40], 1               ; MF_GRAYED
 gam_totp:
     WINCALL AppendMenuW, qword ptr [rbp-32], dword ptr [rbp-40], 6, addr kl_totp
     WINCALL AppendMenuW, qword ptr [rbp-32], 0, 7, addr pm_custom
@@ -2778,7 +2865,7 @@ vp_dyn:
     sub     eax, IDC_DYN_BASE
     mov     ecx, eax
     and     ecx, DYN_SLOTS-1                  ; slot
-    shr     eax, 3                            ; row (DYN_SLOTS = 8)
+    shr     eax, DYN_SLOTS_LOG2               ; row
     cmp     ecx, DS_REVEAL
     je      vpd_reveal
     cmp     ecx, DS_UP
@@ -2787,6 +2874,13 @@ vp_dyn:
     je      vpd_down
     cmp     ecx, DS_DEL
     je      vpd_del
+    cmp     ecx, DS_COPY
+    je      vpd_copy
+    jmp     vp_handled
+vpd_copy:
+    mov     edx, eax
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_row_copy
     jmp     vp_handled
 vpd_reveal:
     mov     edx, eax
