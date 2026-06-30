@@ -119,6 +119,23 @@ extern theme_ctlcolor:proc
 extern theme_drawitem:proc
 extern theme_backdrop:proc
 extern theme_overlay:proc
+; --- system-tray / message-loop imports ---------------------------------------
+extern Shell_NotifyIconW:proc
+extern RegisterClassW:proc
+extern CreateWindowExW:proc
+extern DestroyWindow:proc
+extern DefWindowProcW:proc
+extern GetMessageW:proc
+extern TranslateMessage:proc
+extern DispatchMessageW:proc
+extern PostQuitMessage:proc
+extern LoadIconW:proc
+extern CreatePopupMenu:proc
+extern AppendMenuW:proc
+extern TrackPopupMenu:proc
+extern DestroyMenu:proc
+extern GetCursorPos:proc
+extern SetForegroundWindow:proc
 
 ; ---- constants ---------------------------------------------------------------
 MB_OK               equ 0
@@ -146,6 +163,23 @@ WM_CTLCOLORDLG      equ 136h
 WM_CTLCOLORSTATIC   equ 138h
 THEME_TIMER         equ 9
 EM_SETCUEBANNER     equ 1501h
+; ---- system tray / window-loop -----------------------------------------------
+WM_DESTROY          equ 2
+WM_LBUTTONUP        equ 0202h
+WM_LBUTTONDBLCLK    equ 0203h
+WM_RBUTTONUP        equ 0205h
+WM_TRAYICON         equ 8001h            ; WM_APP+1, our tray callback message
+NIM_ADD             equ 0
+NIM_DELETE          equ 2
+NIF_TRAY            equ 7                 ; NIF_MESSAGE | NIF_ICON | NIF_TIP
+MF_STRING           equ 0
+MF_SEPARATOR        equ 800h
+TPM_RIGHTBUTTON     equ 2
+WS_EX_TOOLWINDOW    equ 80h
+WS_POPUP            equ 80000000h
+IDM_ABOUT           equ 1001
+IDM_OPEN            equ 1002
+IDM_EXIT            equ 1003
 ; password-strength / match line colours (COLORREF 0x00BBGGRR)
 CLR_BAR_RED         equ 004545D6h         ; bad / no password / mismatch
 CLR_BAR_AMBER       equ 003CA5E1h         ; weak (meets the policy, minimal)
@@ -167,6 +201,7 @@ LB_SETCURSEL        equ 186h
 LB_GETCURSEL        equ 188h
 LB_ERR              equ -1
 EM_SETSEL           equ 0B1h
+EM_SETREADONLY      equ 0CFh
 
 CP_UTF8_            equ 65001
 CF_UNICODETEXT      equ 13
@@ -307,6 +342,15 @@ WSTR t_tpm,         <Windows Hello / TPM>
 WSTR m_forgotten,   <Windows Hello / TPM quick-unlock was removed for this device.>
 WSTR m_forget_q,    <Remove Windows Hello / TPM quick-unlock for this vault on this PC? The master password will still work.>
 WSTR t_forget,      <Forget this device>
+; --- system tray strings ------------------------------------------------------
+WSTR t_about,       <About Vordr>
+WSTR m_about,       <Vordr - a hardened password manager. AES-256-GCM with Argon2id key derivation. Fail-closed and self-tested on every launch. Written in x64 assembly with no runtime dependencies.>
+WSTR mi_open,       <Open>
+WSTR mi_exit,       <Exit>
+tray_cls label word
+    dw 'V','o','r','d','r','T','r','a','y', 0
+tray_wt label word
+    dw 'V','o','r','d','r', 0
 ; OPENFILENAMEW filter: "Vordr vault\0*.vordr\0All files\0*.*\0\0"
 align 2
 g_filter label word
@@ -326,6 +370,8 @@ wb_add label word
     dw 002Bh, 0                                  ; +  (add)
 wb_edit label word
     dw 270Eh, 0                                  ; pencil (edit)
+wb_save label word
+    dw 2713h, 0                                  ; check mark (save / leave edit mode)
 wb_rem label word
     dw 2212h, 0                                  ; minus sign (remove)
 ; control-id groups toggled when the settings overlay opens/closes
@@ -333,8 +379,8 @@ align 4
 g_vault_ids label dword
     dd IDC_V_LIST, IDC_V_ADD, IDC_V_EDIT, IDC_V_REMOVE, IDC_V_TITLE
     dd IDC_V_USER, IDC_V_SECRET, IDC_V_REVEAL, IDC_V_COPY, IDC_V_URL
-    dd IDC_V_NOTES, IDC_V_TOTP, IDC_V_COPYTOTP, IDC_V_LOCK
-VAULT_ID_COUNT equ 14
+    dd IDC_V_NOTES, IDC_V_TKEY, IDC_V_TOTP, IDC_V_COPYTOTP, IDC_V_LOCK
+VAULT_ID_COUNT equ 15
 g_menu_ids label dword
     dd IDC_V_MBACK, IDC_V_MTITLE, IDC_V_MPOLL, IDC_V_MLENL, IDC_V_MLEN
     dd IDC_V_MCLSL, IDC_V_MCLS, IDC_V_MTPM, IDC_V_MTPMINFO
@@ -343,6 +389,14 @@ MENU_ID_COUNT equ 9
 .data?
 align 8
 g_hinst     dq ?
+g_trayhwnd  dq ?                      ; hidden owner window that hosts the tray icon
+g_showing   dd ?                      ; 1 = a modal dialog is currently open (re-entry guard)
+align 8
+g_nid       db 976 dup (?)           ; NOTIFYICONDATAW (x64 full size)
+g_wc        db 80 dup (?)            ; WNDCLASSW (72 used)
+g_msg       db 56 dup (?)            ; MSG
+g_pt        db 8 dup (?)             ; POINT (cursor for the tray menu)
+align 8
 g_vpath_set dd ?
 g_create    dd ?
 g_is_default dd ?                     ; 1 = auto-created default vault (register it)
@@ -366,6 +420,7 @@ g_clip_seq  dd ?                      ; clipboard sequence number at last copy
 g_cur_idx   dd ?                      ; entry currently shown/edited inline (-1=none)
 g_dirty     dd ?                      ; 1 = inline fields edited since last load/save
 g_loading   dd ?                      ; 1 = programmatically loading fields (ignore EN_CHANGE)
+g_editmode  dd ?                      ; 1 = detail fields editable (view/edit toggle)
 align 2
 g_vpath     dw 1024 dup (?)        ; chosen vault path (wide, NUL-terminated)
 g_pwbuf     dw 1024 dup (?)        ; password field (wide; wiped after use)
@@ -634,6 +689,16 @@ up_init:
     mov     rcx, qword ptr [rbp-8]
     mov     edx, IDC_U_UNLOCK
     call    theme_attach
+    ; cue-banner label shown inside the (borderless) password box
+    sub     rsp, 48
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_U_PW
+    mov     r8d, EM_SETCUEBANNER
+    mov     r9d, 1
+    lea     rax, [cue_pw]
+    mov     qword ptr [rsp+32], rax
+    call    SendDlgItemMessageW
+    add     rsp, 48
     sub     rsp, 32
     cmp     dword ptr [g_vpath_set], 0
     je      up_init_x
@@ -1122,6 +1187,33 @@ gco_done:
     ret
 gui_commit endp
 
+; gui_set_editmode(rcx=hdlg, edx=on) - 1 = detail fields editable (edit mode),
+;   0 = read-only (view).  Toggles EM_SETREADONLY on the six fields and swaps
+;   the toolbar pencil glyph for a check mark while editing.
+gui_set_editmode proc frame
+    FRAME_PROLOG 80
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-32], edx
+    mov     dword ptr [g_editmode], edx
+    mov     eax, edx
+    xor     eax, 1
+    mov     dword ptr [rbp-40], eax           ; readonly = NOT on
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_TITLE,  EM_SETREADONLY, dword ptr [rbp-40], 0
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_USER,   EM_SETREADONLY, dword ptr [rbp-40], 0
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_SECRET, EM_SETREADONLY, dword ptr [rbp-40], 0
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_URL,    EM_SETREADONLY, dword ptr [rbp-40], 0
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_NOTES,  EM_SETREADONLY, dword ptr [rbp-40], 0
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_TKEY,   EM_SETREADONLY, dword ptr [rbp-40], 0
+    lea     rax, [wb_edit]
+    cmp     dword ptr [rbp-32], 0
+    je      sem_glyph
+    lea     rax, [wb_save]
+sem_glyph:
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_EDIT, rax
+    FRAME_EPILOG
+    ret
+gui_set_editmode endp
+
 ; =============================================================================
 ; Settings overlay (burger menu) helpers for DLG_VAULT.
 ; =============================================================================
@@ -1405,6 +1497,9 @@ vp_init:
     mov     dword ptr [g_loading], 0
     mov     rcx, qword ptr [rbp-8]
     call    gui_poplist
+    mov     rcx, qword ptr [rbp-8]            ; start in view mode (fields locked)
+    xor     edx, edx
+    call    gui_set_editmode
     mov     eax, 1
     jmp     vp_ret
 vp_cmd:
@@ -1470,9 +1565,31 @@ vp_list:
     call    gui_lbsel
     cmp     eax, LB_ERR
     je      vp_handled
+    mov     dword ptr [rbp-16], eax          ; B = newly clicked index
+    ; if editing the current entry with unsaved changes, save it first
+    cmp     dword ptr [g_editmode], 0
+    je      vl_load
+    cmp     dword ptr [g_dirty], 0
+    je      vl_load
+    mov     eax, dword ptr [g_cur_idx]
+    mov     dword ptr [rbp-24], eax          ; A = entry being edited
     mov     rcx, qword ptr [rbp-8]
-    mov     edx, eax
+    call    gui_commit                       ; removes A, appends -> A at end
+    ; commit shifted indices: entries after A move down by one
+    mov     eax, dword ptr [rbp-16]
+    cmp     eax, dword ptr [rbp-24]
+    jle     vl_resel
+    dec     eax
+    mov     dword ptr [rbp-16], eax
+vl_resel:
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_V_LIST, LB_SETCURSEL, dword ptr [rbp-16], 0
+vl_load:
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, dword ptr [rbp-16]
     call    gui_showdetail
+    mov     rcx, qword ptr [rbp-8]            ; viewing another record -> view mode
+    xor     edx, edx
+    call    gui_set_editmode
     jmp     vp_handled
 vp_reveal:
     mov     rcx, qword ptr [rbp-8]
@@ -1489,6 +1606,14 @@ vp_copytotp:
     call    gui_copy
     jmp     vp_handled
 vp_add:
+    ; save any unsaved edits to the current entry before adding a new one
+    cmp     dword ptr [g_editmode], 0
+    je      va_clear
+    cmp     dword ptr [g_dirty], 0
+    je      va_clear
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_commit
+va_clear:
     ; create a new entry (placeholder title) and edit it inline
     lea     rcx, [g_e_title]
     mov     edx, 1024
@@ -1530,6 +1655,9 @@ vpa_cpd:
     mov     rcx, qword ptr [rbp-8]
     mov     edx, dword ptr [g_cur_idx]
     call    gui_showdetail
+    mov     rcx, qword ptr [rbp-8]            ; new entry opens straight into edit mode
+    mov     edx, 1
+    call    gui_set_editmode
     mov     rcx, qword ptr [rbp-8]            ; focus the title for quick typing
     mov     edx, IDC_V_TITLE
     call    GetDlgItem
@@ -1540,11 +1668,32 @@ vpa_cpd:
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_V_TITLE, EM_SETSEL, 0, -1
     jmp     vp_handled
 vp_edit:
-    ; pencil = save the inline edits to the selected entry
+    ; pencil toggles edit mode: enter (make fields editable) or save + leave
+    cmp     dword ptr [g_editmode], 0
+    jne     ve_save
     cmp     dword ptr [g_cur_idx], 0
-    jl      vp_handled
+    jl      vp_handled                       ; nothing selected -> nothing to edit
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, 1
+    call    gui_set_editmode
+    mov     rcx, qword ptr [rbp-8]            ; focus the title for editing
+    mov     edx, IDC_V_TITLE
+    call    GetDlgItem
+    sub     rsp, 32
+    mov     rcx, rax
+    call    SetFocus
+    add     rsp, 32
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_V_TITLE, EM_SETSEL, 0, -1
+    jmp     vp_handled
+ve_save:
+    cmp     dword ptr [g_dirty], 0
+    je      ve_off
     mov     rcx, qword ptr [rbp-8]
     call    gui_commit
+ve_off:
+    mov     rcx, qword ptr [rbp-8]
+    xor     edx, edx
+    call    gui_set_editmode
     cmp     dword ptr [g_cur_idx], 0
     jl      vp_handled
     mov     rcx, qword ptr [rbp-8]
@@ -1577,6 +1726,9 @@ vp_remove:
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_TOTP, 0
     mov     dword ptr [g_cur_idx], -1
     mov     dword ptr [g_dirty], 0
+    mov     rcx, qword ptr [rbp-8]            ; back to view mode
+    xor     edx, edx
+    call    gui_set_editmode
     jmp     vp_handled
 vp_lock:
 vp_close:
@@ -1879,7 +2031,7 @@ ps_grade_mid:
     jae     ps_grade_good
     cmp     edx, 4
     je      ps_grade_good
-    mov     dword ptr [g_pw_level], 1         ; weak
+    mov     dword ptr [g_pw_level], 2         ; barely compliant -> still green
     jmp     ps_done
 ps_grade_good:
     mov     dword ptr [g_pw_level], 2         ; adequate
@@ -2245,43 +2397,214 @@ gta_no:
     ret
 gui_try_tpm_auto endp
 
-gui_main proc frame
+; =============================================================================
+; gui_open(rcx = owner hwnd) - run the create/unlock -> vault flow, then lock and
+;   return to the tray.  Guarded against re-entry while a dialog is already open.
+;   On leaving the vault (Lock / close) the data is wiped and we drop back to the
+;   tray WITHOUT showing the unlock screen.
+; =============================================================================
+gui_open proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    cmp     dword ptr [g_showing], 0
+    jne     go_done
+    mov     dword ptr [g_showing], 1
+    cmp     dword ptr [g_create], 0
+    jne     go_create
+    call    gui_try_tpm_auto                ; silent unlock if this device is enrolled
+    test    eax, eax
+    jnz     go_vault
+    WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_UNLOCK, qword ptr [rbp-24], addr unlock_proc, 0
+    cmp     rax, 1
+    jne     go_reset
+    jmp     go_vault
+go_create:
+    WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_CREATE, qword ptr [rbp-24], addr create_proc, 0
+    cmp     rax, 1
+    jne     go_reset
+go_vault:
+    WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_VAULT, qword ptr [rbp-24], addr vault_proc, 0
+    call    vault_lock                      ; wipe body + key, minimise to tray
+    call    gui_clipclear
+    call    gui_resolve_vault               ; refresh create/open state for next time
+go_reset:
+    mov     dword ptr [g_showing], 0
+go_done:
+    FRAME_EPILOG
+    ret
+gui_open endp
+
+; gui_tray_add(rcx = hwnd) - install the notification-area icon.
+gui_tray_add proc frame
     FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    lea     rcx, [g_nid]
+    mov     edx, 976
+    call    secure_zero
+    lea     r10, [g_nid]
+    mov     dword ptr [r10+0], 976
+    mov     rax, qword ptr [rbp-24]
+    mov     qword ptr [r10+8], rax           ; hWnd
+    mov     dword ptr [r10+16], 1            ; uID
+    mov     dword ptr [r10+20], NIF_TRAY     ; uFlags
+    mov     dword ptr [r10+24], WM_TRAYICON  ; uCallbackMessage
+    WINCALL LoadIconW, qword ptr [g_hinst], 1
+    lea     r10, [g_nid]
+    mov     qword ptr [r10+32], rax          ; hIcon
+    lea     r10, [g_nid+40]                  ; szTip
+    lea     r11, [tray_wt]
+    xor     ecx, ecx
+ga_tip:
+    mov     ax, word ptr [r11+rcx*2]
+    mov     word ptr [r10+rcx*2], ax
+    test    ax, ax
+    jz      ga_tipd
+    inc     ecx
+    jmp     ga_tip
+ga_tipd:
+    WINCALL Shell_NotifyIconW, NIM_ADD, addr g_nid
+    FRAME_EPILOG
+    ret
+gui_tray_add endp
+
+; gui_tray_del() - remove the notification-area icon.
+gui_tray_del proc frame
+    FRAME_PROLOG 32
+    WINCALL Shell_NotifyIconW, NIM_DELETE, addr g_nid
+    FRAME_EPILOG
+    ret
+gui_tray_del endp
+
+; gui_tray_menu(rcx = hwnd) - the right-click context menu (About / Open / Exit).
+gui_tray_menu proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx
+    WINCALL CreatePopupMenu
+    mov     qword ptr [rbp-32], rax
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_STRING, IDM_ABOUT, addr t_about
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_STRING, IDM_OPEN, addr mi_open
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_SEPARATOR, 0, 0
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_STRING, IDM_EXIT, addr mi_exit
+    WINCALL GetCursorPos, addr g_pt
+    WINCALL SetForegroundWindow, qword ptr [rbp-24]
+    WINCALL TrackPopupMenu, qword ptr [rbp-32], TPM_RIGHTBUTTON, dword ptr [g_pt], \
+            dword ptr [g_pt+4], 0, qword ptr [rbp-24], 0
+    WINCALL DestroyMenu, qword ptr [rbp-32]
+    FRAME_EPILOG
+    ret
+gui_tray_menu endp
+
+; =============================================================================
+; tray_wndproc - window proc for the hidden tray-owner window.  rax = LRESULT.
+; =============================================================================
+tray_wndproc proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 64
+    mov     qword ptr [rbp-8], rcx           ; hwnd
+    mov     qword ptr [rbp-16], rdx          ; msg
+    mov     qword ptr [rbp-24], r8           ; wParam
+    mov     qword ptr [rbp-32], r9           ; lParam
+    cmp     rdx, WM_TRAYICON
+    je      twp_tray
+    cmp     rdx, WM_COMMAND
+    je      twp_cmd
+    cmp     rdx, WM_DESTROY
+    je      twp_destroy
+    WINCALL DefWindowProcW, qword ptr [rbp-8], qword ptr [rbp-16], qword ptr [rbp-24], qword ptr [rbp-32]
+    jmp     twp_ret
+twp_tray:
+    movzx   eax, word ptr [rbp-32]           ; LOWORD(lParam) = mouse message
+    cmp     eax, WM_LBUTTONUP
+    je      twp_open
+    cmp     eax, WM_LBUTTONDBLCLK
+    je      twp_open
+    cmp     eax, WM_RBUTTONUP
+    je      twp_menu
+    xor     eax, eax
+    jmp     twp_ret
+twp_cmd:
+    movzx   eax, word ptr [rbp-24]           ; LOWORD(wParam) = menu id
+    cmp     eax, IDM_ABOUT
+    je      twp_about
+    cmp     eax, IDM_OPEN
+    je      twp_open
+    cmp     eax, IDM_EXIT
+    je      twp_exit
+    xor     eax, eax
+    jmp     twp_ret
+twp_open:
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_open
+    xor     eax, eax
+    jmp     twp_ret
+twp_menu:
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_tray_menu
+    xor     eax, eax
+    jmp     twp_ret
+twp_about:
+    WINCALL MessageBoxW, qword ptr [rbp-8], addr m_about, addr t_about, <MB_OK or MB_ICONINFORMATION>
+    xor     eax, eax
+    jmp     twp_ret
+twp_exit:
+    WINCALL DestroyWindow, qword ptr [rbp-8]
+    xor     eax, eax
+    jmp     twp_ret
+twp_destroy:
+    call    gui_tray_del
+    WINCALL PostQuitMessage, 0
+    xor     eax, eax
+twp_ret:
+    mov     rsp, rbp
+    pop     rbp
+    ret
+tray_wndproc endp
+
+; =============================================================================
+; gui_main - create the hidden tray-owner window, install the tray icon, and run
+;   the message loop.  The app starts minimised to the tray (no window shown);
+;   the user opens the vault by left-clicking the icon or via the menu.
+; =============================================================================
+gui_main proc frame
+    FRAME_PROLOG 112
     WINCALL GetModuleHandleW, 0
     mov     qword ptr [g_hinst], rax
     mov     dword ptr [rbp-24], 8           ; INITCOMMONCONTROLSEX.dwSize
     mov     dword ptr [rbp-20], 4000h       ; ICC_STANDARD_CLASSES (edit cue banners)
     WINCALL InitCommonControlsEx, addr rbp-24
-    call    theme_boot                      ; detect GPU/CPU tier, build LUT + brushes
-    call    tpm_available                   ; is there a usable platform TPM?
+    call    theme_boot
+    call    tpm_available
     mov     dword ptr [g_tpm_present], eax
-    call    gui_load_policy                 ; min length / classes (HKLM>HKCU>def)
-    call    gui_resolve_vault               ; registry path, or default to create
-    ; startup shortcut: an existing vault with a TPM sidecar unlocks silently
-    cmp     dword ptr [g_create], 0
-    jne     gm_loop
-    call    gui_try_tpm_auto
+    call    gui_load_policy
+    call    gui_resolve_vault
+    ; ---- register + create the hidden tray-owner window --------------------
+    lea     rcx, [g_wc]
+    mov     edx, 80
+    call    secure_zero
+    lea     r10, [g_wc]
+    lea     rax, [tray_wndproc]
+    mov     qword ptr [r10+8], rax           ; lpfnWndProc
+    mov     rax, qword ptr [g_hinst]
+    mov     qword ptr [r10+24], rax          ; hInstance
+    lea     rax, [tray_cls]
+    mov     qword ptr [r10+64], rax          ; lpszClassName
+    WINCALL RegisterClassW, addr g_wc
+    WINCALL CreateWindowExW, WS_EX_TOOLWINDOW, addr tray_cls, addr tray_wt, WS_POPUP, \
+            0, 0, 0, 0, 0, 0, qword ptr [g_hinst], 0
+    mov     qword ptr [g_trayhwnd], rax
+    mov     rcx, rax
+    call    gui_tray_add
+    ; ---- message loop (start minimised to the tray) -----------------------
+gm_msg:
+    WINCALL GetMessageW, addr g_msg, 0, 0, 0
     test    eax, eax
-    jnz     gm_vault
-gm_loop:
-    cmp     dword ptr [g_create], 0
-    je      gm_unlock
-    ; create mode (first run or "Create new...")
-    WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_CREATE, 0, addr create_proc, 0
-    cmp     rax, 1
-    jne     gm_done                         ; cancelled -> exit
-    jmp     gm_vault
-gm_unlock:
-    WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_UNLOCK, 0, addr unlock_proc, 0
-    cmp     rax, 1
-    je      gm_vault
-    jmp     gm_done                         ; cancelled / closed -> exit
-gm_vault:
-    WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_VAULT, 0, addr vault_proc, 0
-    call    vault_lock                      ; wipe body + key on close
-    jmp     gm_loop
-gm_done:
-    call    gui_clipclear                   ; never leave a copied secret behind
+    jle     gm_quit                          ; 0 = WM_QUIT, -1 = error
+    WINCALL TranslateMessage, addr g_msg
+    WINCALL DispatchMessageW, addr g_msg
+    jmp     gm_msg
+gm_quit:
+    call    gui_clipclear                    ; never leave a copied secret behind
     FRAME_EPILOG
     ret
 gui_main endp

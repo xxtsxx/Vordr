@@ -20,6 +20,8 @@ extern RegSetValueExW:proc
 extern RegDeleteValueW:proc
 extern RegCloseKey:proc
 extern SHGetFolderPathW:proc
+extern GetEnvironmentVariableW:proc
+extern CreateDirectoryW:proc
 
 REG_SZ          equ 1
 REG_BINARY      equ 3
@@ -40,6 +42,10 @@ cfg_value label word
     dw 'v','a','u','l','t', 0
 cfg_fname label word
     dw 5Ch,'v','a','u','l','t','.','v','o','r','d','r', 0
+env_onedrive label word
+    dw 'O','n','e','D','r','i','v','e', 0
+onedrive_sub label word
+    dw 5Ch,'V','o','r','d','r', 0
 align 8
 g_hklm  dq 080000002h            ; HKEY_LOCAL_MACHINE (as a clean 64-bit value)
 g_hkcu  dq 080000001h            ; HKEY_CURRENT_USER
@@ -270,24 +276,52 @@ rsv_fail:
 reg_save_vault endp
 
 ; ===========================================================================
-; cfg_default_vault(rcx=dst wide) -> eax = 1/0.  dst = "<Documents>\vault.vordr".
+; cfg_default_vault(rcx=dst wide) -> eax = 1/0.  Prefers a OneDrive-synced
+;   location ("%OneDrive%\Vordr\vault.vordr", creating the Vordr folder) when
+;   OneDrive is in use; otherwise falls back to "<Documents>\vault.vordr".
 ; ===========================================================================
 public cfg_default_vault
 cfg_default_vault proc frame
     FRAME_PROLOG 64
     mov     qword ptr [rbp-24], rcx
+    ; ---- prefer OneDrive if the %OneDrive% folder is configured -------------
+    WINCALL GetEnvironmentVariableW, addr env_onedrive, qword ptr [rbp-24], 980
+    test    eax, eax                         ; 0 = not set / error
+    jz      cdv_docs
+    cmp     eax, 980                          ; too long to fit -> use Documents
+    jae     cdv_docs
+    ; dst = "%OneDrive%"; append "\Vordr"
+    mov     r8d, eax                          ; char count (zero-extended)
+    mov     r11, qword ptr [rbp-24]
+    lea     r10, [r11+r8*2]                   ; end (GetEnv returned char count)
+    lea     r9, [onedrive_sub]
+    xor     ecx, ecx
+cdv_od_cpy:
+    movzx   eax, word ptr [r9+rcx*2]
+    mov     word ptr [r10+rcx*2], ax
+    test    eax, eax
+    jz      cdv_od_dir
+    inc     ecx
+    jmp     cdv_od_cpy
+cdv_od_dir:
+    WINCALL CreateDirectoryW, qword ptr [rbp-24], 0   ; ignore "already exists"
+    mov     rcx, qword ptr [rbp-24]
+    jmp     cdv_app                           ; append "\vault.vordr" to it
+cdv_docs:
     WINCALL SHGetFolderPathW, 0, CSIDL_PERSONAL, 0, 0, qword ptr [rbp-24]
     test    eax, eax                         ; S_OK = 0
     jnz     cdv_fail
-    ; find the terminating NUL, then append "\vault.vordr"
-    mov     r11, qword ptr [rbp-24]
+    mov     rcx, qword ptr [rbp-24]
+cdv_app:
+    ; find the terminating NUL of dst, then append "\vault.vordr"
+    mov     r11, rcx
     xor     r8d, r8d
 cdv_end:
     cmp     word ptr [r11+r8*2], 0
-    je      cdv_app
+    je      cdv_app2
     inc     r8d
     jmp     cdv_end
-cdv_app:
+cdv_app2:
     lea     r10, [r11+r8*2]
     lea     r9, [cfg_fname]
     xor     ecx, ecx
