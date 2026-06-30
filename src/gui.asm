@@ -42,6 +42,11 @@ extern vault_remove_at:proc
 extern vault_count:proc
 extern vault_title_at:proc
 extern vault_field_at:proc
+extern vault_field_count:proc
+extern vault_field_get:proc
+extern vault_build_entry:proc
+externdef g_field_list:qword
+externdef g_field_n:dword
 extern totp_from_b32:proc
 extern totp_secs_left:proc
 extern vault_tpm_remember:proc
@@ -98,6 +103,9 @@ extern GetDlgItemInt:proc
 extern GetFileAttributesW:proc
 extern CreateDirectoryW:proc
 extern ShowWindow:proc
+extern MoveWindow:proc
+extern MapDialogRect:proc
+extern SendMessageW:proc
 extern SetWindowTextW:proc
 extern CheckDlgButton:proc
 extern GetDlgCtrlID:proc
@@ -184,6 +192,8 @@ NIF_TRAY            equ 7                 ; NIF_MESSAGE | NIF_ICON | NIF_TIP
 MF_STRING           equ 0
 MF_SEPARATOR        equ 800h
 TPM_RIGHTBUTTON     equ 2
+TPM_LEFTALIGN       equ 0
+TPM_RETURNCMD       equ 0100h
 WS_EX_TOOLWINDOW    equ 80h
 WS_POPUP            equ 80000000h
 IDM_ABOUT           equ 1001
@@ -286,6 +296,46 @@ OFN_FILEMUSTEXIST   equ 1000h
 OFN_EXPLORER        equ 80000h
 
 EBUF        equ 4096            ; wide chars per entry-field buffer
+
+; --- modular field rows (runtime-built detail form) ------------------------
+; Per-row descriptor (flat record, stride DESCSZ) in g_fields[].
+FD_KIND     equ 0               ; dd  base kind (VF_TEXT/USERNAME/SECRET/URL/NOTES/TOTP)
+FD_FLAGS    equ 4               ; dd  bit0 = field carries a custom label
+FD_Y        equ 8              ; dd  row top in DLU (within the detail pane)
+FD_H        equ 12             ; dd  row height in DLU
+FD_HANDLES  equ 16             ; q[DYN_SLOTS]  control hwnd per slot (0 = absent)
+DESCSZ      equ 80             ; 16 + 8 handles*8
+MAXROWS     equ 24
+FDF_LABELED equ 1               ; FD_FLAGS bit0 = carries a custom label
+FDF_REVEALED equ 2              ; FD_FLAGS bit1 = value currently unmasked
+; Runtime control ids: IDC_DYN_BASE + row*DYN_SLOTS + slot.
+IDC_DYN_BASE equ 3000
+DYN_SLOTS   equ 8
+DS_LABEL    equ 0
+DS_VALUE    equ 1
+DS_REVEAL   equ 2
+DS_UP       equ 3
+DS_DOWN     equ 4
+DS_DEL      equ 5
+DS_TCODE    equ 6               ; TOTP live-code display
+DS_TBAR     equ 7               ; TOTP drain bar
+IDC_V_ADDFIELD equ 230          ; "+ Add field" button (edit mode)
+; Win32 window styles (gui.asm builds controls at runtime; the RC gets these
+; from windows.h, but this module needs the numeric values).
+WS_CHILD_       equ 40000000h
+WS_VISIBLE_     equ 10000000h
+WS_TABSTOP_     equ 00010000h
+WS_VSCROLL_     equ 00200000h
+ES_AUTOHSCROLL_ equ 0080h
+ES_AUTOVSCROLL_ equ 0040h
+ES_PASSWORD_    equ 0020h
+ES_MULTILINE_   equ 0004h
+ES_READONLY_    equ 0800h
+ES_WANTRETURN_  equ 1000h
+BS_OWNERDRAW_   equ 000Bh
+SS_OWNERDRAW_   equ 000Dh
+SS_LEFTNOWORDWRAP_ equ 000Ch
+WM_GETFONT      equ 31h
 
 ; OPENFILENAMEW (x64 layout; STRUCT 8 gives the correct natural alignment)
 OPENFILENAMEW struct 8
@@ -402,14 +452,43 @@ wb_save label word
     dw 2713h, 0                                  ; check mark (save / leave edit mode)
 wb_rem label word
     dw 0E74Dh, 0                                 ; Segoe Fluent Icons: Delete (trashcan)
+; --- runtime field-row glyphs, window classes, and default labels ---
+wb_up label word
+    dw 0E70Eh, 0                                 ; ChevronUp (move field up)
+wb_down label word
+    dw 0E70Dh, 0                                 ; ChevronDown (move field down)
+wb_eye label word
+    dw 0E7B3h, 0                                 ; RedEye (reveal)
+cls_edit label word
+    dw 'E','d','i','t', 0
+cls_button label word
+    dw 'B','u','t','t','o','n', 0
+cls_static label word
+    dw 'S','t','a','t','i','c', 0
+kl_user label word
+    dw 'U','s','e','r','n','a','m','e', 0
+kl_secret label word
+    dw 'P','a','s','s','w','o','r','d', 0
+kl_url label word
+    dw 'U','R','L', 0
+kl_notes label word
+    dw 'N','o','t','e','s', 0
+kl_totp label word
+    dw 'A','u','t','h','e','n','t','i','c','a','t','o','r', 0
+kl_text label word
+    dw 'T','e','x','t', 0
+kl_email label word
+    dw 'E','m','a','i','l', 0
+g_empty_w label word
+    dw 0                                          ; empty wide string (default field value)
+pm_custom label word
+    dw 'C','u','s','t','o','m',' ','f','i','e','l','d', 0
 ; control-id groups toggled when the settings overlay opens/closes
 align 4
 g_vault_ids label dword
     dd IDC_V_LIST, IDC_V_ADD, IDC_V_EDIT, IDC_V_REMOVE, IDC_V_TITLE
-    dd IDC_V_USER, IDC_V_SECRET, IDC_V_REVEAL, IDC_V_COPY, IDC_V_URL
-    dd IDC_V_NOTES, IDC_V_TKEY, IDC_V_TOTP, IDC_V_COPYTOTP, IDC_V_LOCK
-    dd IDC_V_TOTPBAR, IDC_V_TKEYREVEAL
-VAULT_ID_COUNT equ 17
+    dd IDC_V_ADDFIELD, IDC_V_LOCK
+VAULT_ID_COUNT equ 7
 g_menu_ids label dword
     dd IDC_V_MBACK, IDC_V_MTITLE, IDC_V_MPOLL, IDC_V_MLENL, IDC_V_MLEN
     dd IDC_V_MCLSL, IDC_V_MCLS, IDC_V_MTPM, IDC_V_MTPML, IDC_V_MTPMINFO
@@ -475,6 +554,19 @@ g_totp_code6 db 8 dup (?)            ; computed 6-digit code (ascii)
 g_totp_code_w dw 16 dup (?)          ; code as wide, 6 digits no space (for clipboard)
 g_totp_disp_w dw 16 dup (?)          ; code grouped "nnn nnn" wide (on-screen only)
 g_disp_a    db 32 dup (?)            ; "287082  (17s)" display, ascii
+align 8
+; --- modular field-row model (runtime detail form) ---
+g_fields      db MAXROWS*DESCSZ dup (?)   ; row descriptors
+g_field_count dd ?                        ; live row count
+g_rowkind     dd ?                        ; scratch: kind for a pending add
+g_dlgfont     dq ?                        ; the vault dialog's font (for runtime ctls)
+g_totp_row    dd ?                        ; row index of the TOTP field (-1 = none)
+g_totp_codehwnd dq ?                      ; live-code display control of the TOTP row
+g_totp_barhwnd  dq ?                      ; drain-bar control of the TOTP row
+align 2
+g_valblob   dw 32768 dup (?)          ; commit scratch: field values, NUL-joined
+g_lblblob   dw 4096 dup (?)           ; commit scratch: custom labels, NUL-joined
+g_rlabel    dw 128 dup (?)            ; per-row label read scratch
 align 8
 g_ofn       OPENFILENAMEW <>
 
@@ -822,17 +914,27 @@ gui_poplist endp
 ;   captured into g_secret_w and shown masked.
 ; =============================================================================
 gui_showdetail proc frame
-    FRAME_PROLOG 96
+    FRAME_PROLOG 128
     mov     qword ptr [rbp-24], rcx
     mov     dword ptr [rbp-32], edx
     mov     dword ptr [g_revealed], 0
-    mov     dword ptr [g_tkey_revealed], 0
-    mov     eax, dword ptr [rbp-32]           ; track the entry being edited inline
-    mov     dword ptr [g_cur_idx], eax
+    mov     dword ptr [g_cur_idx], edx
     mov     dword ptr [g_dirty], 0
     mov     dword ptr [g_loading], 1          ; suppress EN_CHANGE dirty while loading
-    ; title / user / url / notes
-    mov     rcx, qword ptr [rbp-32]
+    mov     dword ptr [g_totp_on], 0
+    mov     dword ptr [g_totp_row], -1
+    mov     qword ptr [g_totp_codehwnd], 0
+    mov     qword ptr [g_totp_barhwnd], 0
+    ; stop any prior live-code timer and tear down old rows
+    sub     rsp, 32
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, TOTP_TIMER
+    call    KillTimer
+    add     rsp, 32
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_rows_clear
+    ; Title (fixed control)
+    mov     ecx, dword ptr [rbp-32]
     mov     edx, VF_TITLE
     lea     r8, [rbp-48]
     call    vault_field_at
@@ -841,98 +943,75 @@ gui_showdetail proc frame
     mov     r8, rax
     mov     r9d, dword ptr [rbp-48]
     call    gui_setfield
-    mov     rcx, qword ptr [rbp-32]
-    mov     edx, VF_USERNAME
-    lea     r8, [rbp-48]
-    call    vault_field_at
+    ; walk every field by position; build one row per non-title field
+    mov     ecx, dword ptr [rbp-32]
+    call    vault_field_count
+    mov     dword ptr [rbp-52], eax              ; n
+    mov     dword ptr [rbp-40], 0                ; j
+gsd_floop:
+    mov     eax, dword ptr [rbp-40]
+    cmp     eax, dword ptr [rbp-52]
+    jae     gsd_fdone
+    mov     ecx, dword ptr [rbp-32]
+    mov     edx, dword ptr [rbp-40]
+    lea     r8, [rbp-96]                         ; out struct (kind/lbl/val)
+    call    vault_field_get
+    mov     eax, dword ptr [rbp-96]              ; out.kind
+    cmp     eax, VF_TITLE
+    je      gsd_fnext
     mov     rcx, qword ptr [rbp-24]
-    mov     edx, IDC_V_USER
-    mov     r8, rax
-    mov     r9d, dword ptr [rbp-48]
-    call    gui_setfield
-    mov     rcx, qword ptr [rbp-32]
-    mov     edx, VF_URL
-    lea     r8, [rbp-48]
-    call    vault_field_at
-    mov     rcx, qword ptr [rbp-24]
-    mov     edx, IDC_V_URL
-    mov     r8, rax
-    mov     r9d, dword ptr [rbp-48]
-    call    gui_setfield
-    mov     rcx, qword ptr [rbp-32]
-    mov     edx, VF_NOTES
-    lea     r8, [rbp-48]
-    call    vault_field_at
-    mov     rcx, qword ptr [rbp-24]
-    mov     edx, IDC_V_NOTES
-    mov     r8, rax
-    mov     r9d, dword ptr [rbp-48]
-    call    gui_setfield
-    ; secret -> editable password field (masked); keep g_secret_w for Copy
-    mov     rcx, qword ptr [rbp-32]
-    mov     edx, VF_SECRET
-    lea     r8, [rbp-48]
-    call    vault_field_at
-    mov     rcx, rax
-    mov     edx, dword ptr [rbp-48]
-    lea     r8, [g_secret_w]
-    mov     r9d, EBUF*2-1
-    call    gui_towide
-    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_SECRET, addr g_secret_w
-    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_SECRET, EM_SETPASSWORDCHAR, SECRET_MASK, 0
-    ; TOTP key -> editable field + arm the live code
-    mov     rcx, qword ptr [rbp-32]
-    mov     edx, VF_TOTP
-    lea     r8, [rbp-48]
-    call    vault_field_at
-    mov     qword ptr [rbp-56], rax           ; key ptr (or NULL)
-    mov     rcx, qword ptr [rbp-24]
-    mov     edx, IDC_V_TKEY
-    mov     r8, rax
-    mov     r9d, dword ptr [rbp-48]
-    call    gui_setfield
-    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_TKEY, EM_SETPASSWORDCHAR, SECRET_MASK, 0
-    mov     rax, qword ptr [rbp-56]
+    mov     edx, eax
+    call    gui_row_add                          ; eax = row (-1 if full)
+    cmp     eax, 0
+    jl      gsd_fdone
+    mov     dword ptr [rbp-44], eax              ; row
+    ; custom label (if the field carried one)
+    mov     rax, qword ptr [rbp-80]              ; out.labellen
     test    rax, rax
-    jz      gsd_nototp
-    mov     ecx, dword ptr [rbp-48]
-    cmp     ecx, 256
-    ja      gsd_nototp
-    mov     dword ptr [g_totp_b32len], ecx
-    mov     r11, rax                        ; src
-    lea     r10, [g_totp_b32]               ; dst
-    xor     r8d, r8d
-gsd_b32cp:
-    cmp     r8d, dword ptr [g_totp_b32len]
-    jae     gsd_b32d
-    mov     al, byte ptr [r11+r8]
-    mov     byte ptr [r10+r8], al
-    inc     r8d
-    jmp     gsd_b32cp
-gsd_b32d:
-    mov     dword ptr [g_totp_on], 1
+    jz      gsd_setval
+    mov     ecx, dword ptr [rbp-44]
+    mov     edx, DS_LABEL
+    call    dynid
     mov     rcx, qword ptr [rbp-24]
-    call    gui_totp_refresh
-    WINCALL SetTimer, qword ptr [rbp-24], TOTP_TIMER, TOTP_MS, 0
-    mov     dword ptr [g_loading], 0
-    mov     dword ptr [g_dirty], 0
-    FRAME_EPILOG
-    ret
-gsd_nototp:
-    mov     dword ptr [g_totp_on], 0
-    mov     dword ptr [g_totp_secs], 0
-    sub     rsp, 32
+    mov     edx, eax
+    mov     r8, qword ptr [rbp-88]              ; labelptr
+    mov     r9d, dword ptr [rbp-80]             ; labellen
+    call    gui_setfield
+    mov     eax, dword ptr [rbp-44]
+    imul    eax, eax, DESCSZ
+    lea     r10, [g_fields]
+    add     r10, rax
+    or      dword ptr [r10+FD_FLAGS], FDF_LABELED
+gsd_setval:
+    mov     ecx, dword ptr [rbp-44]
+    mov     edx, DS_VALUE
+    call    dynid
     mov     rcx, qword ptr [rbp-24]
-    mov     edx, TOTP_TIMER
-    call    KillTimer
-    add     rsp, 32
-    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_TOTP, 0
-    sub     rsp, 32                           ; redraw the (now empty) progress bar
+    mov     edx, eax
+    mov     r8, qword ptr [rbp-72]              ; valptr
+    mov     r9d, dword ptr [rbp-64]             ; vallen
+    call    gui_setfield
+    mov     eax, dword ptr [rbp-96]             ; kind
+    cmp     eax, VF_SECRET
+    je      gsd_mask
+    cmp     eax, VF_TOTP
+    je      gsd_mask
+    jmp     gsd_fnext
+gsd_mask:
+    mov     ecx, dword ptr [rbp-44]
+    mov     edx, DS_VALUE
+    call    dynid
+    mov     dword ptr [rbp-56], eax
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], dword ptr [rbp-56], \
+            EM_SETPASSWORDCHAR, SECRET_MASK, 0
+gsd_fnext:
+    inc     dword ptr [rbp-40]
+    jmp     gsd_floop
+gsd_fdone:
     mov     rcx, qword ptr [rbp-24]
-    mov     edx, IDC_V_TOTPBAR
-    call    GetDlgItem
-    add     rsp, 32
-    WINCALL InvalidateRect, rax, 0, 1
+    call    gui_rows_layout
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_arm_totp
     mov     dword ptr [g_loading], 0
     mov     dword ptr [g_dirty], 0
     FRAME_EPILOG
@@ -972,63 +1051,20 @@ gui_totp_refresh proc frame
     movzx   eax, word ptr [g_totp_code_w+10]
     mov     word ptr [g_totp_disp_w+12], ax
     mov     word ptr [g_totp_disp_w+14], 0
-    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_TOTP, addr g_totp_disp_w
+    WINCALL SetWindowTextW, qword ptr [g_totp_codehwnd], addr g_totp_disp_w
     call    totp_secs_left                  ; eax = seconds left (1..30)
     mov     dword ptr [g_totp_secs], eax
-    mov     rcx, qword ptr [rbp-24]          ; redraw the progress bar
-    mov     edx, IDC_V_TOTPBAR
-    call    GetDlgItem
-    WINCALL InvalidateRect, rax, 0, 1
+    WINCALL InvalidateRect, qword ptr [g_totp_barhwnd], 0, 1
     FRAME_EPILOG
     ret
 gtr_bad:
-    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_TOTP, 0
+    WINCALL SetWindowTextW, qword ptr [g_totp_codehwnd], 0
 gtr_done:
     FRAME_EPILOG
     ret
 gui_totp_refresh endp
 
-; gui_reveal(rcx = hdlg) - toggle the secret field between masked and revealed.
-gui_reveal proc frame
-    FRAME_PROLOG 32
-    mov     qword ptr [rbp-24], rcx
-    cmp     dword ptr [g_revealed], 0
-    jne     gr_hide
-    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_SECRET, EM_SETPASSWORDCHAR, 0, 0
-    mov     dword ptr [g_revealed], 1
-    jmp     gr_redraw
-gr_hide:
-    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_SECRET, EM_SETPASSWORDCHAR, SECRET_MASK, 0
-    mov     dword ptr [g_revealed], 0
-gr_redraw:
-    mov     rcx, qword ptr [rbp-24]
-    mov     edx, IDC_V_SECRET
-    call    GetDlgItem
-    WINCALL InvalidateRect, rax, 0, 1
-    FRAME_EPILOG
-    ret
-gui_reveal endp
-
-; gui_reveal_tkey(rcx = hdlg) - toggle the TOTP key field between masked/revealed.
-gui_reveal_tkey proc frame
-    FRAME_PROLOG 32
-    mov     qword ptr [rbp-24], rcx
-    cmp     dword ptr [g_tkey_revealed], 0
-    jne     grt_hide
-    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_TKEY, EM_SETPASSWORDCHAR, 0, 0
-    mov     dword ptr [g_tkey_revealed], 1
-    jmp     grt_redraw
-grt_hide:
-    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_TKEY, EM_SETPASSWORDCHAR, SECRET_MASK, 0
-    mov     dword ptr [g_tkey_revealed], 0
-grt_redraw:
-    mov     rcx, qword ptr [rbp-24]
-    mov     edx, IDC_V_TKEY
-    call    GetDlgItem
-    WINCALL InvalidateRect, rax, 0, 1
-    FRAME_EPILOG
-    ret
-gui_reveal_tkey endp
+; (gui_reveal / gui_reveal_tkey removed - per-row reveal is gui_row_reveal.)
 
 ; gui_copy(rcx = hdlg, rdx = wide NUL-terminated source) - copy to the clipboard
 ;   and arm a timer to auto-clear it after CLIP_MS (only if still ours).
@@ -1203,33 +1239,143 @@ gas_done:
     ret
 gui_addsave endp
 
-; gui_readfields(rcx = hdlg) - read the inline detail edits into the g_e_* buffers.
-gui_readfields proc frame
-    FRAME_PROLOG 48
-    mov     qword ptr [rbp-24], rcx
-    WINCALL GetDlgItemTextW, qword ptr [rbp-24], IDC_V_TITLE, addr g_e_title, 1024
-    WINCALL GetDlgItemTextW, qword ptr [rbp-24], IDC_V_USER, addr g_e_user, 1024
-    WINCALL GetDlgItemTextW, qword ptr [rbp-24], IDC_V_SECRET, addr g_e_secret, EBUF
-    WINCALL GetDlgItemTextW, qword ptr [rbp-24], IDC_V_URL, addr g_e_url, 1024
-    WINCALL GetDlgItemTextW, qword ptr [rbp-24], IDC_V_NOTES, addr g_e_notes, EBUF
-    WINCALL GetDlgItemTextW, qword ptr [rbp-24], IDC_V_TKEY, addr g_e_totp, 256
+; gui_gather(rcx = hdlg) - read Title + every row into the ordered descriptor
+;   array g_field_list[] (g_field_n) that vault_build_entry consumes.  Values go
+;   into g_valblob, custom labels into g_lblblob; a row whose label still matches
+;   its kind default is stored unlabelled.
+gui_gather proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx             ; hdlg
+    lea     rax, [g_valblob]
+    mov     qword ptr [rbp-40], rax             ; vc (value cursor)
+    mov     dword ptr [rbp-48], 32768           ; vcap (wide chars left)
+    lea     rax, [g_lblblob]
+    mov     qword ptr [rbp-56], rax             ; lc (label cursor)
+    ; field 0 = Title
+    WINCALL GetDlgItemTextW, qword ptr [rbp-24], IDC_V_TITLE, qword ptr [rbp-40], dword ptr [rbp-48]
+    lea     r10, [g_field_list]
+    mov     qword ptr [r10+0], VF_TITLE
+    mov     qword ptr [r10+8], 0
+    mov     r11, qword ptr [rbp-40]
+    mov     qword ptr [r10+16], r11
+    inc     eax
+    mov     edx, eax
+    sub     dword ptr [rbp-48], edx
+    shl     edx, 1
+    add     qword ptr [rbp-40], rdx
+    mov     dword ptr [rbp-32], 1               ; k = 1
+    mov     dword ptr [rbp-28], 0               ; row = 0
+gg_row:
+    mov     eax, dword ptr [rbp-28]
+    cmp     eax, dword ptr [g_field_count]
+    jae     gg_done
+    ; type = row kind
+    mov     eax, dword ptr [rbp-28]
+    imul    eax, eax, DESCSZ
+    lea     r10, [g_fields]
+    add     r10, rax
+    mov     r9d, dword ptr [r10+FD_KIND]
+    mov     eax, dword ptr [rbp-32]
+    imul    eax, eax, 24
+    lea     r11, [g_field_list]
+    add     r11, rax
+    mov     qword ptr [r11+0], r9
+    ; read value -> vc
+    mov     ecx, dword ptr [rbp-28]
+    mov     edx, DS_VALUE
+    call    dynid
+    mov     dword ptr [rbp-72], eax
+    WINCALL GetDlgItemTextW, qword ptr [rbp-24], dword ptr [rbp-72], qword ptr [rbp-40], dword ptr [rbp-48]
+    mov     ecx, dword ptr [rbp-32]
+    imul    ecx, ecx, 24
+    lea     r11, [g_field_list]
+    add     r11, rcx
+    mov     rdx, qword ptr [rbp-40]
+    mov     qword ptr [r11+16], rdx
+    mov     qword ptr [r11+8], 0                ; default: unlabelled
+    inc     eax
+    mov     edx, eax
+    sub     dword ptr [rbp-48], edx
+    shl     edx, 1
+    add     qword ptr [rbp-40], rdx
+    ; read label; if non-empty and != kind default -> custom label
+    mov     ecx, dword ptr [rbp-28]
+    mov     edx, DS_LABEL
+    call    dynid
+    mov     dword ptr [rbp-72], eax
+    WINCALL GetDlgItemTextW, qword ptr [rbp-24], dword ptr [rbp-72], addr g_rlabel, 128
+    cmp     word ptr [g_rlabel], 0
+    je      gg_next
+    mov     eax, dword ptr [rbp-28]
+    imul    eax, eax, DESCSZ
+    lea     r10, [g_fields]
+    add     r10, rax
+    mov     edx, dword ptr [r10+FD_KIND]
+    call    kind_label
+    lea     rcx, [g_rlabel]
+    mov     rdx, rax
+    call    gui_wstr_eq
+    test    eax, eax
+    jnz     gg_next
+    ; custom: copy g_rlabel -> lc, point the field's label at it
+    mov     ecx, dword ptr [rbp-32]
+    imul    ecx, ecx, 24
+    lea     r11, [g_field_list]
+    add     r11, rcx
+    mov     rax, qword ptr [rbp-56]
+    mov     qword ptr [r11+8], rax
+    lea     r10, [g_rlabel]
+    mov     r11, qword ptr [rbp-56]
+    xor     r8d, r8d
+gg_lcp:
+    mov     ax, word ptr [r10+r8*2]
+    mov     word ptr [r11+r8*2], ax
+    test    ax, ax
+    jz      gg_lcd
+    inc     r8d
+    cmp     r8d, 127
+    jb      gg_lcp
+gg_lcd:
+    inc     r8d
+    mov     eax, r8d
+    shl     eax, 1
+    add     qword ptr [rbp-56], rax
+gg_next:
+    inc     dword ptr [rbp-32]
+    inc     dword ptr [rbp-28]
+    jmp     gg_row
+gg_done:
+    mov     eax, dword ptr [rbp-32]
+    mov     dword ptr [g_field_n], eax
     FRAME_EPILOG
     ret
-gui_readfields endp
+gui_gather endp
 
-; gui_commit(rcx = hdlg) - write the inline edits back to the current entry
-;   (replace in place by remove + append) and persist.  Reselects the entry.
+; gui_commit(rcx = hdlg) - gather Title + rows into g_field_list and write the
+;   record back (remove the old entry, rebuild via vault_build_entry, reseal).
+;   Reselects the entry.  Refuses to save an empty title (keeps the old entry).
 gui_commit proc frame
     FRAME_PROLOG 48
     mov     qword ptr [rbp-24], rcx
     cmp     dword ptr [g_cur_idx], 0
     jl      gco_done                          ; nothing selected
     mov     rcx, qword ptr [rbp-24]
-    call    gui_readfields
+    call    gui_gather
+    mov     r10, qword ptr [g_field_list+16]  ; title value ptr
+    test    r10, r10
+    jz      gco_notitle
+    cmp     word ptr [r10], 0                 ; empty title -> keep the old entry
+    je      gco_notitle
     mov     ecx, dword ptr [g_cur_idx]
     call    vault_remove_at
+    call    vault_build_entry
+    test    eax, eax
+    jnz     gco_done
+    call    vault_reseal
+    test    eax, eax
+    jnz     gco_resealerr
     mov     rcx, qword ptr [rbp-24]
-    call    gui_addsave                       ; append + reseal + repopulate
+    call    gui_poplist
     call    vault_count
     test    eax, eax
     jz      gco_done
@@ -1237,6 +1383,13 @@ gui_commit proc frame
     mov     dword ptr [g_cur_idx], eax
     WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_SETCURSEL, \
             dword ptr [g_cur_idx], 0
+    jmp     gco_done
+gco_notitle:
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr s_notitle, addr t_err, <MB_OK or MB_ICONERROR>
+    FRAME_EPILOG
+    ret
+gco_resealerr:
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr s_resealfail, addr t_err, <MB_OK or MB_ICONERROR>
 gco_done:
     mov     dword ptr [g_dirty], 0
     FRAME_EPILOG
@@ -1247,19 +1400,49 @@ gui_commit endp
 ;   0 = read-only (view).  Toggles EM_SETREADONLY on the six fields and swaps
 ;   the toolbar pencil glyph for a check mark while editing.
 gui_set_editmode proc frame
-    FRAME_PROLOG 80
+    FRAME_PROLOG 96
     mov     qword ptr [rbp-24], rcx
     mov     dword ptr [rbp-32], edx
     mov     dword ptr [g_editmode], edx
     mov     eax, edx
     xor     eax, 1
-    mov     dword ptr [rbp-40], eax           ; readonly = NOT on
-    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_TITLE,  EM_SETREADONLY, dword ptr [rbp-40], 0
-    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_USER,   EM_SETREADONLY, dword ptr [rbp-40], 0
-    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_SECRET, EM_SETREADONLY, dword ptr [rbp-40], 0
-    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_URL,    EM_SETREADONLY, dword ptr [rbp-40], 0
-    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_NOTES,  EM_SETREADONLY, dword ptr [rbp-40], 0
-    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_TKEY,   EM_SETREADONLY, dword ptr [rbp-40], 0
+    mov     dword ptr [rbp-40], eax              ; readonly = NOT on
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_TITLE, EM_SETREADONLY, dword ptr [rbp-40], 0
+    ; each row's value + label edit
+    mov     dword ptr [rbp-44], 0                ; row
+sem_row:
+    mov     eax, dword ptr [rbp-44]
+    cmp     eax, dword ptr [g_field_count]
+    jae     sem_rowsdone
+    mov     ecx, dword ptr [rbp-44]
+    mov     edx, DS_VALUE
+    call    dynid
+    mov     dword ptr [rbp-48], eax
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], dword ptr [rbp-48], EM_SETREADONLY, \
+            dword ptr [rbp-40], 0
+    mov     ecx, dword ptr [rbp-44]
+    mov     edx, DS_LABEL
+    call    dynid
+    mov     dword ptr [rbp-48], eax
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], dword ptr [rbp-48], EM_SETREADONLY, \
+            dword ptr [rbp-40], 0
+    inc     dword ptr [rbp-44]
+    jmp     sem_row
+sem_rowsdone:
+    ; show/hide the "+ Add field" button + relayout (updates reorder visibility)
+    mov     dword ptr [rbp-52], SW_HIDE
+    cmp     dword ptr [rbp-32], 0
+    je      sem_addcmd
+    mov     dword ptr [rbp-52], SW_SHOW
+sem_addcmd:
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_V_ADDFIELD
+    call    GetDlgItem
+    mov     rcx, rax
+    mov     edx, dword ptr [rbp-52]
+    call    ShowWindow
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_rows_layout
     lea     rax, [wb_edit]
     cmp     dword ptr [rbp-32], 0
     je      sem_glyph
@@ -1299,6 +1482,854 @@ gsi_done:
     ret
 gui_show_ids endp
 
+; =============================================================================
+; Modular field rows - runtime-built, composable detail form.
+; =============================================================================
+
+; mk_ctl(rcx=parent, edx=id, r8=classwide, r9=captionwide,
+;        [+48]=style [+56]=dlux [+64]=dluy [+72]=dluw [+80]=dluh) -> rax=hwnd
+;   Create a themed child control: map the DLU rect to pixels, apply the dialog
+;   font.  Geometry can be a placeholder (gui_rows_layout repositions later).
+mk_ctl proc frame
+    FRAME_PROLOG 224
+    mov     qword ptr [rbp-24], rcx
+    mov     eax, edx
+    mov     qword ptr [rbp-32], rax              ; id (zero-extended)
+    mov     qword ptr [rbp-40], r8               ; class
+    mov     qword ptr [rbp-48], r9               ; caption
+    mov     rax, qword ptr [rbp+48]
+    or      rax, WS_CHILD_ or WS_VISIBLE_
+    mov     qword ptr [rbp-56], rax              ; style
+    mov     eax, dword ptr [rbp+56]              ; DLU rect at [rbp-80]
+    mov     dword ptr [rbp-80], eax
+    mov     eax, dword ptr [rbp+64]
+    mov     dword ptr [rbp-76], eax
+    mov     eax, dword ptr [rbp+56]
+    add     eax, dword ptr [rbp+72]
+    mov     dword ptr [rbp-72], eax
+    mov     eax, dword ptr [rbp+64]
+    add     eax, dword ptr [rbp+80]
+    mov     dword ptr [rbp-68], eax
+    WINCALL MapDialogRect, qword ptr [rbp-24], addr rbp-80
+    mov     eax, dword ptr [rbp-80]
+    mov     qword ptr [rbp-88], rax              ; px
+    mov     eax, dword ptr [rbp-76]
+    mov     qword ptr [rbp-96], rax              ; py
+    mov     eax, dword ptr [rbp-72]
+    sub     eax, dword ptr [rbp-80]
+    mov     qword ptr [rbp-104], rax             ; pw
+    mov     eax, dword ptr [rbp-68]
+    sub     eax, dword ptr [rbp-76]
+    mov     qword ptr [rbp-112], rax             ; ph
+    WINCALL CreateWindowExW, 0, qword ptr [rbp-40], qword ptr [rbp-48], qword ptr [rbp-56], \
+            qword ptr [rbp-88], qword ptr [rbp-96], qword ptr [rbp-104], qword ptr [rbp-112], \
+            qword ptr [rbp-24], qword ptr [rbp-32], qword ptr [g_hinst], 0
+    mov     qword ptr [rbp-16], rax
+    WINCALL SendMessageW, qword ptr [rbp-16], WM_SETFONT, qword ptr [g_dlgfont], 1
+    mov     rax, qword ptr [rbp-16]
+    FRAME_EPILOG
+    ret
+mk_ctl endp
+
+; row_mk(rcx=hdlg, edx=i, r8d=slot, r9=classwide, [+48]=captionwide, [+56]=style)
+;   -> rax=hwnd.  Create one row control with id = IDC_DYN_BASE+i*DYN_SLOTS+slot
+;   and store its handle in g_fields[i].handles[slot].
+row_mk proc frame
+    FRAME_PROLOG 128
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-32], edx              ; i
+    mov     dword ptr [rbp-40], r8d              ; slot
+    mov     qword ptr [rbp-48], r9               ; class
+    mov     eax, edx
+    imul    eax, eax, DYN_SLOTS
+    add     eax, r8d
+    add     eax, IDC_DYN_BASE
+    mov     dword ptr [rbp-56], eax              ; id
+    WINCALL mk_ctl, qword ptr [rbp-24], dword ptr [rbp-56], qword ptr [rbp-48], \
+            qword ptr [rbp+48], qword ptr [rbp+56], 0, 0, 1, 1
+    mov     qword ptr [rbp-64], rax              ; hwnd
+    mov     eax, dword ptr [rbp-32]
+    imul    eax, eax, DESCSZ
+    lea     r10, [g_fields]
+    add     r10, rax
+    mov     eax, dword ptr [rbp-40]
+    mov     r11, qword ptr [rbp-64]
+    mov     qword ptr [r10 + FD_HANDLES + rax*8], r11
+    mov     rax, r11
+    FRAME_EPILOG
+    ret
+row_mk endp
+
+; kind_label(edx=kind) -> rax = wide default-label ptr.  Leaf.
+kind_label proc
+    cmp     edx, VF_USERNAME
+    jne     @F
+    lea     rax, [kl_user]
+    ret
+@@: cmp     edx, VF_SECRET
+    jne     @F
+    lea     rax, [kl_secret]
+    ret
+@@: cmp     edx, VF_URL
+    jne     @F
+    lea     rax, [kl_url]
+    ret
+@@: cmp     edx, VF_NOTES
+    jne     @F
+    lea     rax, [kl_notes]
+    ret
+@@: cmp     edx, VF_TOTP
+    jne     @F
+    lea     rax, [kl_totp]
+    ret
+@@: lea     rax, [kl_text]
+    ret
+kind_label endp
+
+; gui_rows_clear(rcx=hdlg) - destroy every runtime row control; count -> 0.
+gui_rows_clear proc frame
+    FRAME_PROLOG 48
+    mov     dword ptr [rbp-24], 0                ; i
+grc_row:
+    mov     eax, dword ptr [rbp-24]
+    cmp     eax, dword ptr [g_field_count]
+    jae     grc_done
+    mov     dword ptr [rbp-32], 0                ; slot
+grc_slot:
+    mov     eax, dword ptr [rbp-32]
+    cmp     eax, DYN_SLOTS
+    jae     grc_nextrow
+    mov     eax, dword ptr [rbp-24]
+    imul    eax, eax, DESCSZ
+    lea     r10, [g_fields]
+    add     r10, rax
+    mov     eax, dword ptr [rbp-32]
+    lea     r10, [r10 + FD_HANDLES + rax*8]
+    mov     rcx, qword ptr [r10]
+    test    rcx, rcx
+    jz      grc_slotnext
+    mov     qword ptr [r10], 0
+    call    DestroyWindow
+grc_slotnext:
+    inc     dword ptr [rbp-32]
+    jmp     grc_slot
+grc_nextrow:
+    inc     dword ptr [rbp-24]
+    jmp     grc_row
+grc_done:
+    mov     dword ptr [g_field_count], 0
+    FRAME_EPILOG
+    ret
+gui_rows_clear endp
+
+; gui_row_add(rcx=hdlg, edx=kind) -> eax = row index (or -1 if at MAXROWS).
+;   Append a descriptor and create the kind-appropriate row controls (geometry
+;   is placeholder; call gui_rows_layout afterwards).
+gui_row_add proc frame
+    FRAME_PROLOG 80
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-32], edx              ; kind
+    mov     eax, dword ptr [g_field_count]
+    cmp     eax, MAXROWS
+    jae     gra_full
+    mov     dword ptr [rbp-40], eax              ; i
+    imul    eax, eax, DESCSZ
+    lea     r10, [g_fields]
+    add     r10, rax                             ; desc
+    mov     ecx, DESCSZ/8
+gra_zero:
+    mov     qword ptr [r10], 0
+    add     r10, 8
+    dec     ecx
+    jnz     gra_zero
+    mov     eax, dword ptr [rbp-40]
+    imul    eax, eax, DESCSZ
+    lea     r10, [g_fields]
+    add     r10, rax
+    mov     eax, dword ptr [rbp-32]
+    mov     dword ptr [r10+FD_KIND], eax
+    ; label (editable, kind's default caption)
+    mov     edx, dword ptr [rbp-32]
+    call    kind_label
+    WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_LABEL, addr cls_edit, rax, ES_AUTOHSCROLL_
+    ; value (kind-specific)
+    mov     eax, dword ptr [rbp-32]
+    cmp     eax, VF_SECRET
+    je      gra_secret
+    cmp     eax, VF_NOTES
+    je      gra_notes
+    cmp     eax, VF_TOTP
+    je      gra_totp
+    WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_VALUE, addr cls_edit, 0, \
+            ES_AUTOHSCROLL_ or WS_TABSTOP_
+    jmp     gra_reorder
+gra_secret:
+    WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_VALUE, addr cls_edit, 0, \
+            ES_PASSWORD_ or ES_AUTOHSCROLL_ or WS_TABSTOP_
+    WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_REVEAL, addr cls_button, addr wb_eye, \
+            BS_OWNERDRAW_
+    jmp     gra_reorder
+gra_notes:
+    WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_VALUE, addr cls_edit, 0, \
+            ES_MULTILINE_ or ES_AUTOVSCROLL_ or ES_WANTRETURN_ or WS_TABSTOP_
+    jmp     gra_reorder
+gra_totp:
+    WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_VALUE, addr cls_edit, 0, \
+            ES_PASSWORD_ or ES_AUTOHSCROLL_ or WS_TABSTOP_
+    WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_REVEAL, addr cls_button, addr wb_eye, \
+            BS_OWNERDRAW_
+    WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_TCODE, addr cls_static, 0, \
+            SS_LEFTNOWORDWRAP_
+    WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_TBAR, addr cls_static, 0, \
+            SS_OWNERDRAW_
+gra_reorder:
+    WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_UP, addr cls_button, addr wb_up, \
+            BS_OWNERDRAW_
+    WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_DOWN, addr cls_button, addr wb_down, \
+            BS_OWNERDRAW_
+    WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_DEL, addr cls_button, addr wb_rem, \
+            BS_OWNERDRAW_
+    inc     dword ptr [g_field_count]
+    mov     eax, dword ptr [rbp-40]
+    FRAME_EPILOG
+    ret
+gra_full:
+    mov     eax, -1
+    FRAME_EPILOG
+    ret
+gui_row_add endp
+
+; move_ctl(rcx=hdlg, rdx=hwnd, r8d=dlux, r9d=dluy, [+48]=dluw, [+56]=dluh)
+;   Map the DLU rect to pixels and MoveWindow the control.  No-op if hwnd=0.
+move_ctl proc frame
+    FRAME_PROLOG 112
+    test    rdx, rdx
+    jz      mvc_ret
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], rdx
+    mov     dword ptr [rbp-48], r8d              ; rc.left = x
+    mov     dword ptr [rbp-44], r9d              ; rc.top = y
+    mov     eax, r8d
+    add     eax, dword ptr [rbp+48]
+    mov     dword ptr [rbp-40], eax              ; rc.right = x+w
+    mov     eax, r9d
+    add     eax, dword ptr [rbp+56]
+    mov     dword ptr [rbp-36], eax              ; rc.bottom = y+h
+    WINCALL MapDialogRect, qword ptr [rbp-24], addr rbp-48
+    mov     eax, dword ptr [rbp-48]
+    mov     qword ptr [rbp-56], rax              ; px
+    mov     eax, dword ptr [rbp-44]
+    mov     qword ptr [rbp-64], rax              ; py
+    mov     eax, dword ptr [rbp-40]
+    sub     eax, dword ptr [rbp-48]
+    mov     qword ptr [rbp-72], rax              ; pw
+    mov     eax, dword ptr [rbp-36]
+    sub     eax, dword ptr [rbp-44]
+    mov     qword ptr [rbp-80], rax              ; ph
+    WINCALL MoveWindow, qword ptr [rbp-32], qword ptr [rbp-56], qword ptr [rbp-64], \
+            qword ptr [rbp-72], qword ptr [rbp-80], 1
+mvc_ret:
+    FRAME_EPILOG
+    ret
+move_ctl endp
+
+; rowh(rcx=desc) -> rax = slot handle helper is inlined; small accessors below.
+; gui_rows_layout(rcx=hdlg) - position every row's controls in the detail pane
+;   and show/hide the per-row reorder buttons according to g_editmode.
+gui_rows_layout proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx              ; hdlg
+    mov     dword ptr [rbp-36], 0                ; i
+    mov     dword ptr [rbp-40], 30               ; y (ROW_TOP)
+    mov     dword ptr [rbp-52], 0                ; show cmd (SW_HIDE)
+    cmp     dword ptr [g_editmode], 0
+    je      grl_havecmd
+    mov     dword ptr [rbp-52], SW_SHOW
+grl_havecmd:
+grl_row:
+    mov     eax, dword ptr [rbp-36]
+    cmp     eax, dword ptr [g_field_count]
+    jae     grl_done
+    imul    eax, eax, DESCSZ
+    lea     r10, [g_fields]
+    add     r10, rax
+    mov     qword ptr [rbp-32], r10              ; desc
+    mov     eax, dword ptr [r10+FD_KIND]
+    mov     dword ptr [rbp-44], 12               ; rowH
+    mov     dword ptr [rbp-48], 11               ; valH
+    cmp     eax, VF_NOTES
+    jne     grl_chktotp
+    mov     dword ptr [rbp-44], 40
+    mov     dword ptr [rbp-48], 40
+    jmp     grl_setyh
+grl_chktotp:
+    cmp     eax, VF_TOTP
+    jne     grl_setyh
+    mov     dword ptr [rbp-44], 28
+grl_setyh:
+    mov     r10, qword ptr [rbp-32]
+    mov     eax, dword ptr [rbp-40]
+    mov     dword ptr [r10+FD_Y], eax
+    mov     eax, dword ptr [rbp-44]
+    mov     dword ptr [r10+FD_H], eax
+    ; label  (158, y, 44, 11)
+    mov     rcx, qword ptr [rbp-24]
+    mov     r10, qword ptr [rbp-32]
+    mov     rdx, qword ptr [r10+FD_HANDLES+DS_LABEL*8]
+    mov     r8d, 158
+    mov     r9d, dword ptr [rbp-40]
+    WINCALL move_ctl, rcx, rdx, r8d, r9d, 44, 11
+    ; value  (206, y, 146, valH)
+    mov     rcx, qword ptr [rbp-24]
+    mov     r10, qword ptr [rbp-32]
+    mov     rdx, qword ptr [r10+FD_HANDLES+DS_VALUE*8]
+    mov     r8d, 206
+    mov     r9d, dword ptr [rbp-40]
+    WINCALL move_ctl, rcx, rdx, r8d, r9d, 146, dword ptr [rbp-48]
+    ; reveal (356, y, 16, 12)
+    mov     rcx, qword ptr [rbp-24]
+    mov     r10, qword ptr [rbp-32]
+    mov     rdx, qword ptr [r10+FD_HANDLES+DS_REVEAL*8]
+    mov     r8d, 356
+    mov     r9d, dword ptr [rbp-40]
+    WINCALL move_ctl, rcx, rdx, r8d, r9d, 16, 12
+    ; totp code (206, y+14, 110, 11) + bar (206, y+25, 110, 2)
+    mov     rcx, qword ptr [rbp-24]
+    mov     r10, qword ptr [rbp-32]
+    mov     rdx, qword ptr [r10+FD_HANDLES+DS_TCODE*8]
+    mov     r8d, 206
+    mov     r9d, dword ptr [rbp-40]
+    add     r9d, 14
+    WINCALL move_ctl, rcx, rdx, r8d, r9d, 110, 11
+    mov     rcx, qword ptr [rbp-24]
+    mov     r10, qword ptr [rbp-32]
+    mov     rdx, qword ptr [r10+FD_HANDLES+DS_TBAR*8]
+    mov     r8d, 206
+    mov     r9d, dword ptr [rbp-40]
+    add     r9d, 25
+    WINCALL move_ctl, rcx, rdx, r8d, r9d, 110, 2
+    ; up/down/del  (376/390/404, y, 12, 11)
+    mov     rcx, qword ptr [rbp-24]
+    mov     r10, qword ptr [rbp-32]
+    mov     rdx, qword ptr [r10+FD_HANDLES+DS_UP*8]
+    mov     r8d, 376
+    mov     r9d, dword ptr [rbp-40]
+    WINCALL move_ctl, rcx, rdx, r8d, r9d, 12, 11
+    mov     rcx, qword ptr [rbp-24]
+    mov     r10, qword ptr [rbp-32]
+    mov     rdx, qword ptr [r10+FD_HANDLES+DS_DOWN*8]
+    mov     r8d, 390
+    mov     r9d, dword ptr [rbp-40]
+    WINCALL move_ctl, rcx, rdx, r8d, r9d, 12, 11
+    mov     rcx, qword ptr [rbp-24]
+    mov     r10, qword ptr [rbp-32]
+    mov     rdx, qword ptr [r10+FD_HANDLES+DS_DEL*8]
+    mov     r8d, 404
+    mov     r9d, dword ptr [rbp-40]
+    WINCALL move_ctl, rcx, rdx, r8d, r9d, 12, 11
+    ; show/hide the reorder cluster per edit mode
+    mov     r10, qword ptr [rbp-32]
+    mov     rcx, qword ptr [r10+FD_HANDLES+DS_UP*8]
+    mov     edx, dword ptr [rbp-52]
+    call    ShowWindow
+    mov     r10, qword ptr [rbp-32]
+    mov     rcx, qword ptr [r10+FD_HANDLES+DS_DOWN*8]
+    mov     edx, dword ptr [rbp-52]
+    call    ShowWindow
+    mov     r10, qword ptr [rbp-32]
+    mov     rcx, qword ptr [r10+FD_HANDLES+DS_DEL*8]
+    mov     edx, dword ptr [rbp-52]
+    call    ShowWindow
+    ; advance y
+    mov     eax, dword ptr [rbp-40]
+    add     eax, dword ptr [rbp-44]
+    add     eax, 6
+    mov     dword ptr [rbp-40], eax
+    inc     dword ptr [rbp-36]
+    jmp     grl_row
+grl_done:
+    FRAME_EPILOG
+    ret
+gui_rows_layout endp
+
+; dynid(ecx=row, edx=slot) -> eax = control id.  Leaf.
+dynid proc
+    mov     eax, ecx
+    imul    eax, eax, DYN_SLOTS
+    add     eax, edx
+    add     eax, IDC_DYN_BASE
+    ret
+dynid endp
+
+; gui_row_handle(ecx=row, edx=slot) -> rax = hwnd (0 if none).  Leaf.
+gui_row_handle proc
+    mov     eax, ecx
+    imul    eax, eax, DESCSZ
+    lea     r10, [g_fields]
+    add     r10, rax
+    mov     eax, edx
+    mov     rax, qword ptr [r10 + FD_HANDLES + rax*8]
+    ret
+gui_row_handle endp
+
+; gui_wstr_eq(rcx=a, rdx=b) -> eax = 1 if the wide NUL-terminated strings match.  Leaf.
+gui_wstr_eq proc
+    xor     r8d, r8d
+wse_l:
+    movzx   eax, word ptr [rcx+r8*2]
+    movzx   r9d, word ptr [rdx+r8*2]
+    cmp     eax, r9d
+    jne     wse_ne
+    test    eax, eax
+    jz      wse_eq
+    inc     r8d
+    cmp     r8d, 4096
+    jb      wse_l
+wse_ne:
+    xor     eax, eax
+    ret
+wse_eq:
+    mov     eax, 1
+    ret
+gui_wstr_eq endp
+
+; gui_rows_show(rcx=hdlg, edx=cmd) - ShowWindow every runtime row control.
+gui_rows_show proc frame
+    FRAME_PROLOG 64
+    mov     dword ptr [rbp-32], edx
+    mov     dword ptr [rbp-24], 0
+grs_row:
+    mov     eax, dword ptr [rbp-24]
+    cmp     eax, dword ptr [g_field_count]
+    jae     grs_done
+    mov     dword ptr [rbp-40], 0
+grs_slot:
+    mov     eax, dword ptr [rbp-40]
+    cmp     eax, DYN_SLOTS
+    jae     grs_nextrow
+    mov     ecx, dword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-40]
+    call    gui_row_handle
+    test    rax, rax
+    jz      grs_slotnext
+    mov     rcx, rax
+    mov     edx, dword ptr [rbp-32]
+    call    ShowWindow
+grs_slotnext:
+    inc     dword ptr [rbp-40]
+    jmp     grs_slot
+grs_nextrow:
+    inc     dword ptr [rbp-24]
+    jmp     grs_row
+grs_done:
+    FRAME_EPILOG
+    ret
+gui_rows_show endp
+
+; gui_row_reveal(rcx=hdlg, edx=row) - toggle the row's value between masked/clear.
+gui_row_reveal proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-32], edx
+    mov     eax, edx
+    imul    eax, eax, DESCSZ
+    lea     r10, [g_fields]
+    add     r10, rax
+    mov     eax, dword ptr [r10+FD_FLAGS]
+    test    eax, FDF_REVEALED
+    jnz     grr_hide
+    or      eax, FDF_REVEALED
+    mov     dword ptr [r10+FD_FLAGS], eax
+    mov     dword ptr [rbp-40], 0                ; unmask
+    jmp     grr_apply
+grr_hide:
+    and     eax, NOT FDF_REVEALED
+    mov     dword ptr [r10+FD_FLAGS], eax
+    mov     dword ptr [rbp-40], SECRET_MASK
+grr_apply:
+    mov     ecx, dword ptr [rbp-32]
+    mov     edx, DS_VALUE
+    call    dynid
+    mov     dword ptr [rbp-48], eax              ; id
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], dword ptr [rbp-48], \
+            EM_SETPASSWORDCHAR, dword ptr [rbp-40], 0
+    mov     ecx, dword ptr [rbp-32]
+    mov     edx, DS_VALUE
+    call    gui_row_handle
+    WINCALL InvalidateRect, rax, 0, 1
+    FRAME_EPILOG
+    ret
+gui_row_reveal endp
+
+; gui_arm_totp(rcx=hdlg) - find the (single) TOTP row, latch its code/bar handles
+;   and base32 key, and (re)start the live-code timer.  Safe with no TOTP row.
+gui_arm_totp proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [g_totp_on], 0
+    mov     dword ptr [g_totp_row], -1
+    mov     qword ptr [g_totp_codehwnd], 0
+    mov     qword ptr [g_totp_barhwnd], 0
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, TOTP_TIMER
+    call    KillTimer
+    mov     dword ptr [rbp-32], 0
+gat_loop:
+    mov     eax, dword ptr [rbp-32]
+    cmp     eax, dword ptr [g_field_count]
+    jae     gat_done
+    mov     eax, dword ptr [rbp-32]
+    imul    eax, eax, DESCSZ
+    lea     r10, [g_fields]
+    add     r10, rax
+    cmp     dword ptr [r10+FD_KIND], VF_TOTP
+    jne     gat_next
+    mov     eax, dword ptr [rbp-32]
+    mov     dword ptr [g_totp_row], eax
+    mov     ecx, dword ptr [rbp-32]
+    mov     edx, DS_TCODE
+    call    gui_row_handle
+    mov     qword ptr [g_totp_codehwnd], rax
+    mov     ecx, dword ptr [rbp-32]
+    mov     edx, DS_TBAR
+    call    gui_row_handle
+    mov     qword ptr [g_totp_barhwnd], rax
+    mov     ecx, dword ptr [rbp-32]
+    mov     edx, DS_VALUE
+    call    dynid
+    mov     dword ptr [rbp-36], eax
+    WINCALL GetDlgItemTextW, qword ptr [rbp-24], dword ptr [rbp-36], addr g_e_totp, 256
+    lea     r10, [g_e_totp]                     ; ascii base32 (wide) -> bytes
+    lea     r11, [g_totp_b32]
+    xor     r8d, r8d
+gat_cp:
+    movzx   eax, word ptr [r10+r8*2]
+    test    eax, eax
+    jz      gat_cpd
+    cmp     r8d, 255
+    jae     gat_cpd
+    mov     byte ptr [r11+r8], al
+    inc     r8d
+    jmp     gat_cp
+gat_cpd:
+    mov     dword ptr [g_totp_b32len], r8d
+    test    r8d, r8d
+    jz      gat_done
+    mov     dword ptr [g_totp_on], 1
+    jmp     gat_done
+gat_next:
+    inc     dword ptr [rbp-32]
+    jmp     gat_loop
+gat_done:
+    cmp     dword ptr [g_totp_on], 0
+    je      gat_ret
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_totp_refresh
+    WINCALL SetTimer, qword ptr [rbp-24], TOTP_TIMER, TOTP_MS, 0
+gat_ret:
+    FRAME_EPILOG
+    ret
+gui_arm_totp endp
+
+; gui_rebuild_rows(rcx=hdlg) - tear down and recreate every row from the wide
+;   g_field_list[1..g_field_n) (built by gui_gather).  Used after reorder/delete.
+gui_rebuild_rows proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_rows_clear
+    mov     dword ptr [rbp-32], 1               ; k = 1 (skip title)
+grb_loop:
+    mov     eax, dword ptr [rbp-32]
+    cmp     eax, dword ptr [g_field_n]
+    jae     grb_done
+    mov     eax, dword ptr [rbp-32]
+    imul    eax, eax, 24
+    lea     r10, [g_field_list]
+    add     r10, rax
+    mov     qword ptr [rbp-40], r10             ; &list[k]
+    mov     r9d, dword ptr [r10]                ; type
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, r9d
+    call    gui_row_add
+    cmp     eax, 0
+    jl      grb_done
+    mov     dword ptr [rbp-44], eax             ; row
+    mov     r10, qword ptr [rbp-40]
+    mov     rax, qword ptr [r10+8]              ; label ptr (0=none)
+    test    rax, rax
+    jz      grb_setval
+    mov     qword ptr [rbp-56], rax
+    mov     ecx, dword ptr [rbp-44]
+    mov     edx, DS_LABEL
+    call    dynid
+    mov     dword ptr [rbp-48], eax
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], dword ptr [rbp-48], qword ptr [rbp-56]
+    mov     eax, dword ptr [rbp-44]
+    imul    eax, eax, DESCSZ
+    lea     r10, [g_fields]
+    add     r10, rax
+    or      dword ptr [r10+FD_FLAGS], FDF_LABELED
+grb_setval:
+    mov     r10, qword ptr [rbp-40]
+    mov     rax, qword ptr [r10+16]
+    mov     qword ptr [rbp-56], rax
+    mov     ecx, dword ptr [rbp-44]
+    mov     edx, DS_VALUE
+    call    dynid
+    mov     dword ptr [rbp-48], eax
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], dword ptr [rbp-48], qword ptr [rbp-56]
+    mov     r10, qword ptr [rbp-40]
+    mov     eax, dword ptr [r10]
+    cmp     eax, VF_SECRET
+    je      grb_mask
+    cmp     eax, VF_TOTP
+    je      grb_mask
+    jmp     grb_next
+grb_mask:
+    mov     ecx, dword ptr [rbp-44]
+    mov     edx, DS_VALUE
+    call    dynid
+    mov     dword ptr [rbp-48], eax
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], dword ptr [rbp-48], \
+            EM_SETPASSWORDCHAR, SECRET_MASK, 0
+grb_next:
+    inc     dword ptr [rbp-32]
+    jmp     grb_loop
+grb_done:
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_rows_layout
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_arm_totp
+    FRAME_EPILOG
+    ret
+gui_rebuild_rows endp
+
+; swap24(rcx=ptr a, rdx=ptr b) - swap two 24-byte field-list descriptors.  Leaf.
+swap24 proc
+    mov     rax, qword ptr [rcx]
+    mov     r8,  qword ptr [rdx]
+    mov     qword ptr [rcx], r8
+    mov     qword ptr [rdx], rax
+    mov     rax, qword ptr [rcx+8]
+    mov     r8,  qword ptr [rdx+8]
+    mov     qword ptr [rcx+8], r8
+    mov     qword ptr [rdx+8], rax
+    mov     rax, qword ptr [rcx+16]
+    mov     r8,  qword ptr [rdx+16]
+    mov     qword ptr [rcx+16], r8
+    mov     qword ptr [rdx+16], rax
+    ret
+swap24 endp
+
+; gui_row_moveup(rcx=hdlg, edx=row) - move dynamic row up one (no-op for row 0).
+gui_row_moveup proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-32], edx
+    cmp     edx, 0
+    jle     grmu_done
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_gather
+    mov     eax, dword ptr [rbp-32]             ; list[row] <-> list[row+1]
+    imul    eax, eax, 24
+    lea     rcx, [g_field_list]
+    add     rcx, rax
+    lea     rdx, [rcx+24]
+    call    swap24
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_rebuild_rows
+    mov     dword ptr [g_dirty], 1
+grmu_done:
+    FRAME_EPILOG
+    ret
+gui_row_moveup endp
+
+; gui_row_movedown(rcx=hdlg, edx=row) - move dynamic row down one.
+gui_row_movedown proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-32], edx
+    mov     eax, dword ptr [g_field_count]
+    dec     eax
+    cmp     edx, eax
+    jge     grmd_done
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_gather
+    mov     eax, dword ptr [rbp-32]             ; list[row+1] <-> list[row+2]
+    inc     eax
+    imul    eax, eax, 24
+    lea     rcx, [g_field_list]
+    add     rcx, rax
+    lea     rdx, [rcx+24]
+    call    swap24
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_rebuild_rows
+    mov     dword ptr [g_dirty], 1
+grmd_done:
+    FRAME_EPILOG
+    ret
+gui_row_movedown endp
+
+; gui_row_delete(rcx=hdlg, edx=row) - remove a dynamic row.
+gui_row_delete proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-32], edx
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_gather
+    ; shift list[k+1] -> list[k] for k = row+1 .. g_field_n-2
+    mov     eax, dword ptr [rbp-32]
+    inc     eax                                 ; k = row+1
+    mov     dword ptr [rbp-40], eax
+grd_shift:
+    mov     eax, dword ptr [g_field_n]
+    dec     eax
+    cmp     dword ptr [rbp-40], eax
+    jge     grd_shifted
+    mov     eax, dword ptr [rbp-40]
+    imul    eax, eax, 24
+    lea     r10, [g_field_list]
+    lea     r11, [r10+rax]                      ; &list[k]
+    add     r11, 0
+    lea     r10, [r11+24]                       ; &list[k+1]
+    mov     rax, qword ptr [r10]
+    mov     qword ptr [r11], rax
+    mov     rax, qword ptr [r10+8]
+    mov     qword ptr [r11+8], rax
+    mov     rax, qword ptr [r10+16]
+    mov     qword ptr [r11+16], rax
+    inc     dword ptr [rbp-40]
+    jmp     grd_shift
+grd_shifted:
+    dec     dword ptr [g_field_n]
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_rebuild_rows
+    mov     dword ptr [g_dirty], 1
+    FRAME_EPILOG
+    ret
+gui_row_delete endp
+
+; gui_addfield_one(rcx=hdlg, edx=kind, r8=label wide or 0) - append a field row.
+gui_addfield_one proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-32], edx
+    mov     qword ptr [rbp-40], r8
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-32]
+    call    gui_row_add
+    cmp     eax, 0
+    jl      gao_done
+    mov     dword ptr [rbp-44], eax             ; row
+    ; optional preset label
+    cmp     qword ptr [rbp-40], 0
+    je      gao_mask
+    mov     ecx, dword ptr [rbp-44]
+    mov     edx, DS_LABEL
+    call    dynid
+    mov     dword ptr [rbp-48], eax
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], dword ptr [rbp-48], qword ptr [rbp-40]
+gao_mask:
+    mov     eax, dword ptr [rbp-32]
+    cmp     eax, VF_SECRET
+    je      gao_dom
+    cmp     eax, VF_TOTP
+    je      gao_dom
+    jmp     gao_show
+gao_dom:
+    mov     ecx, dword ptr [rbp-44]
+    mov     edx, DS_VALUE
+    call    dynid
+    mov     dword ptr [rbp-48], eax
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], dword ptr [rbp-48], \
+            EM_SETPASSWORDCHAR, SECRET_MASK, 0
+gao_show:
+    mov     rcx, qword ptr [rbp-24]             ; (re)enter edit mode + relayout
+    mov     edx, 1
+    call    gui_set_editmode
+    mov     dword ptr [g_dirty], 1
+gao_done:
+    FRAME_EPILOG
+    ret
+gui_addfield_one endp
+
+; gui_palette_add(rcx=hdlg, edx=menu id) - map a palette choice to a new field.
+gui_palette_add proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    xor     r8, r8                              ; label = none
+    mov     ecx, edx
+    cmp     ecx, 1
+    jne     @F
+    mov     edx, VF_USERNAME
+    jmp     gpa_go
+@@: cmp     ecx, 2
+    jne     @F
+    mov     edx, VF_SECRET
+    jmp     gpa_go
+@@: cmp     ecx, 3
+    jne     @F
+    mov     edx, VF_URL
+    jmp     gpa_go
+@@: cmp     ecx, 4
+    jne     @F
+    mov     edx, VF_TEXT
+    lea     r8, [kl_email]
+    jmp     gpa_go
+@@: cmp     ecx, 5
+    jne     @F
+    mov     edx, VF_NOTES
+    jmp     gpa_go
+@@: cmp     ecx, 6
+    jne     @F
+    mov     edx, VF_TOTP
+    jmp     gpa_go
+@@: mov     edx, VF_TEXT                        ; 7 = custom (empty label)
+gpa_go:
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_addfield_one
+    FRAME_EPILOG
+    ret
+gui_palette_add endp
+
+; gui_addfield_menu(rcx=hdlg) - popup the field-type palette at the cursor.
+gui_addfield_menu proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx
+    WINCALL CreatePopupMenu
+    mov     qword ptr [rbp-32], rax
+    test    rax, rax
+    jz      gam_done
+    WINCALL AppendMenuW, qword ptr [rbp-32], 0, 1, addr kl_user
+    WINCALL AppendMenuW, qword ptr [rbp-32], 0, 2, addr kl_secret
+    WINCALL AppendMenuW, qword ptr [rbp-32], 0, 3, addr kl_url
+    WINCALL AppendMenuW, qword ptr [rbp-32], 0, 4, addr kl_email
+    WINCALL AppendMenuW, qword ptr [rbp-32], 0, 5, addr kl_notes
+    mov     dword ptr [rbp-40], 0               ; MF_STRING|MF_ENABLED
+    cmp     dword ptr [g_totp_row], 0
+    jl      gam_totp
+    mov     dword ptr [rbp-40], 1               ; MF_GRAYED (one TOTP already)
+gam_totp:
+    WINCALL AppendMenuW, qword ptr [rbp-32], dword ptr [rbp-40], 6, addr kl_totp
+    WINCALL AppendMenuW, qword ptr [rbp-32], 0, 7, addr pm_custom
+    lea     rcx, [rbp-56]                        ; POINT
+    call    GetCursorPos
+    WINCALL SetForegroundWindow, qword ptr [rbp-24]
+    WINCALL TrackPopupMenu, qword ptr [rbp-32], TPM_RETURNCMD or TPM_LEFTALIGN, \
+            dword ptr [rbp-56], dword ptr [rbp-52], 0, qword ptr [rbp-24], 0
+    mov     dword ptr [rbp-44], eax              ; chosen id
+    WINCALL DestroyMenu, qword ptr [rbp-32]
+    cmp     dword ptr [rbp-44], 0
+    je      gam_done
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-44]
+    call    gui_palette_add
+gam_done:
+    FRAME_EPILOG
+    ret
+gui_addfield_menu endp
+
 ; gui_menu_open(rcx=hdlg) - hide the vault content, reveal the settings overlay.
 gui_menu_open proc frame
     FRAME_PROLOG 48
@@ -1308,6 +2339,9 @@ gui_menu_open proc frame
     mov     r8d, VAULT_ID_COUNT
     mov     r9d, SW_HIDE
     call    gui_show_ids
+    mov     rcx, qword ptr [rbp-24]           ; hide the runtime field rows too
+    mov     edx, SW_HIDE
+    call    gui_rows_show
     mov     rcx, qword ptr [rbp-24]
     lea     rdx, [g_menu_ids]
     mov     r8d, MENU_ID_COUNT
@@ -1383,6 +2417,12 @@ gui_menu_close proc frame
     mov     r8d, MENU_ID_COUNT
     mov     r9d, SW_HIDE
     call    gui_show_ids
+    mov     rcx, qword ptr [rbp-24]           ; restore field rows + edit-mode state
+    mov     edx, SW_SHOW
+    call    gui_rows_show
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, dword ptr [g_editmode]
+    call    gui_set_editmode
     WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_MENU, addr wb_menu
     mov     dword ptr [g_menu_open], 0
     xor     ecx, ecx
@@ -1512,7 +2552,12 @@ vp_tdraw:
     mov     eax, dword ptr [r10+4]            ; DRAWITEMSTRUCT.CtlID
     cmp     eax, IDC_V_MTPM                   ; the TPM control = Fluent pill toggle
     je      vp_tdraw_toggle
-    cmp     eax, IDC_V_TOTPBAR                ; the TOTP countdown = progress bar
+    cmp     eax, IDC_DYN_BASE                 ; a runtime row's TOTP drain bar?
+    jb      vp_tdraw_def
+    mov     edx, eax
+    sub     edx, IDC_DYN_BASE
+    and     edx, DYN_SLOTS-1                  ; slot = (id-base) mod 8
+    cmp     edx, DS_TBAR
     je      vp_tdraw_totp
     jmp     vp_tdraw_def
 vp_tdraw_toggle:
@@ -1558,7 +2603,9 @@ vp_init:
     mov     rcx, qword ptr [rbp-8]
     mov     edx, IDC_V_LOCK
     call    theme_attach
-    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_V_TOTP, WM_SETFONT, qword ptr [g_font_totp], 1
+    WINCALL SendMessageW, qword ptr [rbp-8], WM_GETFONT, 0, 0   ; font for runtime ctls
+    mov     qword ptr [g_dlgfont], rax
+    mov     dword ptr [g_field_count], 0
     mov     dword ptr [g_menu_open], 0
     mov     rcx, qword ptr [rbp-8]           ; keep the settings overlay hidden
     lea     rdx, [g_menu_ids]
@@ -1591,27 +2638,15 @@ vp_cmd:
     jne     vp_cmd_disp
     cmp     eax, IDC_V_TITLE
     je      vp_setdirty
-    cmp     eax, IDC_V_USER
-    je      vp_setdirty
-    cmp     eax, IDC_V_SECRET
-    je      vp_setdirty
-    cmp     eax, IDC_V_URL
-    je      vp_setdirty
-    cmp     eax, IDC_V_NOTES
-    je      vp_setdirty
-    cmp     eax, IDC_V_TKEY
-    je      vp_setdirty
+    cmp     eax, IDC_DYN_BASE                 ; any runtime row value/label edit
+    jae     vp_setdirty
 vp_cmd_disp:
+    cmp     eax, IDC_DYN_BASE                 ; runtime row button (reveal/up/down/del)?
+    jae     vp_dyn
     cmp     eax, IDC_V_LIST
     je      vp_list
-    cmp     eax, IDC_V_REVEAL
-    je      vp_reveal
-    cmp     eax, IDC_V_TKEYREVEAL
-    je      vp_reveal_tkey
-    cmp     eax, IDC_V_COPY
-    je      vp_copy
-    cmp     eax, IDC_V_COPYTOTP
-    je      vp_copytotp
+    cmp     eax, IDC_V_ADDFIELD
+    je      vp_addfield
     cmp     eax, IDC_V_ADD
     je      vp_add
     cmp     eax, IDC_V_EDIT
@@ -1695,65 +2730,75 @@ vl_load:
     xor     edx, edx
     call    gui_set_editmode
     jmp     vp_handled
-vp_reveal:
+vp_addfield:
     mov     rcx, qword ptr [rbp-8]
-    call    gui_reveal
+    call    gui_addfield_menu
     jmp     vp_handled
-vp_reveal_tkey:
-    mov     rcx, qword ptr [rbp-8]
-    call    gui_reveal_tkey
+vp_dyn:
+    ; eax = control id of a runtime row button; decode row + slot
+    sub     eax, IDC_DYN_BASE
+    mov     ecx, eax
+    and     ecx, DYN_SLOTS-1                  ; slot
+    shr     eax, 3                            ; row (DYN_SLOTS = 8)
+    cmp     ecx, DS_REVEAL
+    je      vpd_reveal
+    cmp     ecx, DS_UP
+    je      vpd_up
+    cmp     ecx, DS_DOWN
+    je      vpd_down
+    cmp     ecx, DS_DEL
+    je      vpd_del
     jmp     vp_handled
-vp_copy:
+vpd_reveal:
+    mov     edx, eax
     mov     rcx, qword ptr [rbp-8]
-    lea     rdx, [g_secret_w]
-    call    gui_copy
+    call    gui_row_reveal
     jmp     vp_handled
-vp_copytotp:
+vpd_up:
+    mov     edx, eax
     mov     rcx, qword ptr [rbp-8]
-    lea     rdx, [g_totp_code_w]
-    call    gui_copy
+    call    gui_row_moveup
+    jmp     vp_handled
+vpd_down:
+    mov     edx, eax
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_row_movedown
+    jmp     vp_handled
+vpd_del:
+    mov     edx, eax
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_row_delete
     jmp     vp_handled
 vp_add:
     ; save any unsaved edits to the current entry before adding a new one
     cmp     dword ptr [g_editmode], 0
-    je      va_clear
+    je      va_build
     cmp     dword ptr [g_dirty], 0
-    je      va_clear
+    je      va_build
     mov     rcx, qword ptr [rbp-8]
     call    gui_commit
-va_clear:
-    ; create a new entry (placeholder title) and edit it inline
-    lea     rcx, [g_e_title]
-    mov     edx, 1024
-    call    gui_clrwbuf
-    lea     rcx, [g_e_user]
-    mov     edx, 1024
-    call    gui_clrwbuf
-    lea     rcx, [g_e_secret]
-    mov     edx, EBUF
-    call    gui_clrwbuf
-    lea     rcx, [g_e_url]
-    mov     edx, 1024
-    call    gui_clrwbuf
-    lea     rcx, [g_e_notes]
-    mov     edx, EBUF
-    call    gui_clrwbuf
-    lea     rcx, [g_e_totp]
-    mov     edx, 256
-    call    gui_clrwbuf
-    lea     r10, [wt_newentry]
-    lea     r11, [g_e_title]
-    xor     ecx, ecx
-vpa_cp:
-    mov     ax, word ptr [r10+rcx*2]
-    mov     word ptr [r11+rcx*2], ax
-    test    ax, ax
-    jz      vpa_cpd
-    inc     ecx
-    jmp     vpa_cp
-vpa_cpd:
+va_build:
+    ; new record = Title "New entry" + empty Username + empty Password
+    lea     r10, [g_field_list]
+    mov     qword ptr [r10+0], VF_TITLE
+    mov     qword ptr [r10+8], 0
+    lea     rax, [wt_newentry]
+    mov     qword ptr [r10+16], rax
+    mov     qword ptr [r10+24], VF_USERNAME
+    mov     qword ptr [r10+32], 0
+    lea     rax, [g_empty_w]
+    mov     qword ptr [r10+40], rax
+    mov     qword ptr [r10+48], VF_SECRET
+    mov     qword ptr [r10+56], 0
+    lea     rax, [g_empty_w]
+    mov     qword ptr [r10+64], rax
+    mov     dword ptr [g_field_n], 3
+    call    vault_build_entry
+    test    eax, eax
+    jnz     vp_handled
+    call    vault_reseal
     mov     rcx, qword ptr [rbp-8]
-    call    gui_addsave
+    call    gui_poplist
     call    vault_count
     test    eax, eax
     jz      vp_handled
@@ -1820,18 +2865,14 @@ vp_remove:
     mov     rcx, qword ptr [rbp-8]
     call    gui_poplist
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_TITLE, 0
-    WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_USER, 0
-    WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_SECRET, 0
-    WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_URL, 0
-    WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_NOTES, 0
-    WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_TKEY, 0
+    mov     rcx, qword ptr [rbp-8]            ; tear down the detail rows
+    call    gui_rows_clear
     mov     dword ptr [g_totp_on], 0          ; stop the live auth-code refresh
     sub     rsp, 32
     mov     rcx, qword ptr [rbp-8]
     mov     edx, TOTP_TIMER
     call    KillTimer
     add     rsp, 32
-    WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_TOTP, 0
     mov     dword ptr [g_cur_idx], -1
     mov     dword ptr [g_dirty], 0
     mov     rcx, qword ptr [rbp-8]            ; back to view mode

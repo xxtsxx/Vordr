@@ -1880,6 +1880,18 @@ vault_field_selftest proc frame
     jne     vfst_fail
     cmp     qword ptr [rbp-32], 4               ; out.labellen (= [rbp-48+16])
     jne     vfst_fail
+    ; vault_field_at(0, VF_TITLE) must also find the title (ptr != 0, len 4)
+    xor     ecx, ecx
+    mov     edx, VF_TITLE
+    lea     r8, [rbp-56]
+    call    vault_field_at
+    test    rax, rax
+    jz      vfst_fail
+    cmp     qword ptr [rbp-56], 4
+    jne     vfst_fail
+    mov     al, byte ptr [rax]                  ; first byte must be 'A'
+    cmp     al, 'A'
+    jne     vfst_fail
     xor     eax, eax
     jmp     vfst_done
 vfst_fail:
