@@ -1595,7 +1595,8 @@ kind_label endp
 
 ; gui_rows_clear(rcx=hdlg) - destroy every runtime row control; count -> 0.
 gui_rows_clear proc frame
-    FRAME_PROLOG 48
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-40], rcx              ; hdlg (for the post-clear repaint)
     mov     dword ptr [rbp-24], 0                ; i
 grc_row:
     mov     eax, dword ptr [rbp-24]
@@ -1625,6 +1626,8 @@ grc_nextrow:
     jmp     grc_row
 grc_done:
     mov     dword ptr [g_field_count], 0
+    ; repaint the dialog bg so destroyed edits leave no ghost focus-underline
+    WINCALL InvalidateRect, qword ptr [rbp-40], 0, 1
     FRAME_EPILOG
     ret
 gui_rows_clear endp
