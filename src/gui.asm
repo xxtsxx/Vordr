@@ -320,6 +320,7 @@ DS_DEL      equ 5
 DS_TCODE    equ 6               ; TOTP live-code display
 DS_TBAR     equ 7               ; TOTP drain bar
 IDC_V_ADDFIELD equ 230          ; "+ Add field" button (edit mode)
+FIELD_AREA_BOTTOM equ 228        ; rows may not grow past here (DLU; Add-field is at 232)
 ; Win32 window styles (gui.asm builds controls at runtime; the RC gets these
 ; from windows.h, but this module needs the numeric values).
 WS_CHILD_       equ 40000000h
@@ -383,6 +384,7 @@ WSTR s_corrupt,     <Not a Vordr vault or the file is corrupt.>
 WSTR s_io,          <Cannot read or write that file.>
 WSTR s_createfail,  <Could not create the vault (I/O or out of memory).>
 WSTR s_notitle,     <An entry needs a title.>
+WSTR s_nofieldroom, <No room for more fields on this record - remove one first.>
 WSTR s_full,        <Vault is full.>
 WSTR s_resealfail,  <Saved in memory but writing to disk failed.>
 WSTR s_firstrun,    <No vault yet - set a master password to create your default vault.>
@@ -558,6 +560,7 @@ align 8
 ; --- modular field-row model (runtime detail form) ---
 g_fields      db MAXROWS*DESCSZ dup (?)   ; row descriptors
 g_field_count dd ?                        ; live row count
+g_content_h   dd ?                        ; field-form content bottom (DLU) after layout
 g_rowkind     dd ?                        ; scratch: kind for a pending add
 g_dlgfont     dq ?                        ; the vault dialog's font (for runtime ctls)
 g_totp_row    dd ?                        ; row index of the TOTP field (-1 = none)
@@ -1848,6 +1851,8 @@ grl_setyh:
     inc     dword ptr [rbp-36]
     jmp     grl_row
 grl_done:
+    mov     eax, dword ptr [rbp-40]              ; content bottom (DLU) for overflow checks
+    mov     dword ptr [g_content_h], eax
     FRAME_EPILOG
     ret
 gui_rows_layout endp
@@ -2212,10 +2217,29 @@ gui_row_delete endp
 
 ; gui_addfield_one(rcx=hdlg, edx=kind, r8=label wide or 0) - append a field row.
 gui_addfield_one proc frame
-    FRAME_PROLOG 64
+    FRAME_PROLOG 96
     mov     qword ptr [rbp-24], rcx
     mov     dword ptr [rbp-32], edx
     mov     qword ptr [rbp-40], r8
+    ; refuse if the new row wouldn't fit the field area
+    mov     eax, dword ptr [rbp-32]              ; kind -> row height (incl gap)
+    mov     r9d, 18
+    cmp     eax, VF_NOTES
+    jne     gao_h1
+    mov     r9d, 46
+gao_h1:
+    cmp     eax, VF_TOTP
+    jne     gao_h2
+    mov     r9d, 34
+gao_h2:
+    mov     eax, dword ptr [g_content_h]
+    add     eax, r9d
+    cmp     eax, FIELD_AREA_BOTTOM
+    jle     gao_addit
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr s_nofieldroom, addr t_err, \
+            <MB_OK or MB_ICONINFORMATION>
+    jmp     gao_done
+gao_addit:
     mov     rcx, qword ptr [rbp-24]
     mov     edx, dword ptr [rbp-32]
     call    gui_row_add
@@ -2249,6 +2273,21 @@ gao_show:
     mov     edx, 1
     call    gui_set_editmode
     mov     dword ptr [g_dirty], 1
+    ; focus the new field for immediate typing (custom w/o label -> label, else value)
+    mov     edx, DS_VALUE
+    cmp     dword ptr [rbp-32], VF_TEXT
+    jne     gao_focus
+    cmp     qword ptr [rbp-40], 0
+    jne     gao_focus
+    mov     edx, DS_LABEL
+gao_focus:
+    mov     ecx, dword ptr [rbp-44]
+    call    dynid
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, eax
+    call    GetDlgItem
+    mov     rcx, rax
+    call    SetFocus
 gao_done:
     FRAME_EPILOG
     ret
