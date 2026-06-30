@@ -235,4 +235,69 @@ cpp_few:
     ret
 check_password_policy endp
 
+; ---------------------------------------------------------------------------
+; pw_metrics() -> eax = UTF-8 code-point count, edx = distinct class count (0..4)
+;   over g_cfg_pass / g_cfg_passlen.  Same scan as check_password_policy, exposed
+;   so the GUI can drive a live password strength / compliance indicator.
+; ---------------------------------------------------------------------------
+public pw_metrics
+pw_metrics proc
+    lea     r9, [g_cfg_pass]
+    mov     ecx, dword ptr [g_cfg_passlen]
+    xor     r10d, r10d                  ; code-point count
+    xor     r11d, r11d                  ; class mask (1=U 2=L 4=D 8=S)
+    xor     r8d, r8d
+pmx_loop:
+    cmp     r8d, ecx
+    jae     pmx_eval
+    movzx   eax, byte ptr [r9+r8]
+    mov     edx, eax                    ; code points: (b & 0xC0) != 0x80
+    and     edx, 0C0h
+    cmp     edx, 80h
+    je      pmx_noinc
+    inc     r10d
+pmx_noinc:
+    cmp     eax, 'A'
+    jb      pmx_lo
+    cmp     eax, 'Z'
+    ja      pmx_lo
+    or      r11d, 1
+    jmp     pmx_next
+pmx_lo:
+    cmp     eax, 'a'
+    jb      pmx_di
+    cmp     eax, 'z'
+    ja      pmx_di
+    or      r11d, 2
+    jmp     pmx_next
+pmx_di:
+    cmp     eax, '0'
+    jb      pmx_sy
+    cmp     eax, '9'
+    ja      pmx_sy
+    or      r11d, 4
+    jmp     pmx_next
+pmx_sy:
+    or      r11d, 8
+pmx_next:
+    inc     r8d
+    jmp     pmx_loop
+pmx_eval:
+    xor     edx, edx                    ; popcount of the 4-bit class mask
+    test    r11d, 1
+    jz      @F
+    inc     edx
+@@: test    r11d, 2
+    jz      @F
+    inc     edx
+@@: test    r11d, 4
+    jz      @F
+    inc     edx
+@@: test    r11d, 8
+    jz      @F
+    inc     edx
+@@: mov     eax, r10d
+    ret
+pw_metrics endp
+
 end

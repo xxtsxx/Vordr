@@ -17,10 +17,12 @@ extern RegOpenKeyExW:proc
 extern RegQueryValueExW:proc
 extern RegCreateKeyExW:proc
 extern RegSetValueExW:proc
+extern RegDeleteValueW:proc
 extern RegCloseKey:proc
 extern SHGetFolderPathW:proc
 
 REG_SZ          equ 1
+REG_BINARY      equ 3
 REG_DWORD       equ 4
 KEY_READ        equ 20019h
 KEY_WRITE       equ 20006h
@@ -31,6 +33,9 @@ align 2
 ; key/value names + filename suffix as raw UTF-16 (backslash = 5Ch)
 cfg_subkey label word
     dw 'S','O','F','T','W','A','R','E', 5Ch, 'V','o','r','d','r', 0
+tpm_subkey label word
+    dw 'S','O','F','T','W','A','R','E', 5Ch, 'V','o','r','d','r', 5Ch
+    dw 'T','P','M','-','U','n','l','o','c','k', 0
 cfg_value label word
     dw 'v','a','u','l','t', 0
 cfg_fname label word
@@ -302,5 +307,82 @@ cdv_fail:
     FRAME_EPILOG
     ret
 cfg_default_vault endp
+
+; ===========================================================================
+; TPM convenience-unlock blobs live under HKCU\SOFTWARE\Vordr\TPM-Unlock, one
+; REG_BINARY value per vault (value name = the wide vault path, so existence can
+; be checked before the vault header is read).  Replaces the old .tpm sidecars.
+;
+;   reg_tpm_set(rcx=value name, rdx=data, r8d=len) -> eax = 1/0
+;   reg_tpm_get(rcx=value name, rdx=outbuf, r8d=cap) -> eax = bytes read (0=none)
+;   reg_tpm_del(rcx=value name) -> eax = 1
+; ===========================================================================
+public reg_tpm_set
+reg_tpm_set proc frame
+    FRAME_PROLOG 128
+    mov     qword ptr [rbp-24], rcx          ; value name
+    mov     qword ptr [rbp-32], rdx          ; data
+    mov     dword ptr [rbp-40], r8d          ; len
+    WINCALL RegCreateKeyExW, qword ptr [g_hkcu], addr tpm_subkey, 0, 0, 0, \
+            KEY_WRITE, 0, addr g_cfg_khan, 0
+    test    eax, eax
+    jnz     rts_fail
+    WINCALL RegSetValueExW, qword ptr [g_cfg_khan], qword ptr [rbp-24], 0, \
+            REG_BINARY, qword ptr [rbp-32], dword ptr [rbp-40]
+    mov     dword ptr [rbp-48], eax
+    WINCALL RegCloseKey, qword ptr [g_cfg_khan]
+    cmp     dword ptr [rbp-48], 0
+    jne     rts_fail
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+rts_fail:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+reg_tpm_set endp
+
+public reg_tpm_get
+reg_tpm_get proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx          ; value name
+    mov     qword ptr [rbp-32], rdx          ; outbuf
+    mov     dword ptr [rbp-40], r8d          ; cap
+    WINCALL RegOpenKeyExW, qword ptr [g_hkcu], addr tpm_subkey, 0, KEY_READ, \
+            addr g_cfg_khan
+    test    eax, eax
+    jnz     rtg_no
+    mov     eax, dword ptr [rbp-40]
+    mov     dword ptr [g_cfg_cb], eax        ; cb in = cap
+    WINCALL RegQueryValueExW, qword ptr [g_cfg_khan], qword ptr [rbp-24], 0, 0, \
+            qword ptr [rbp-32], addr g_cfg_cb
+    mov     dword ptr [rbp-48], eax
+    WINCALL RegCloseKey, qword ptr [g_cfg_khan]
+    cmp     dword ptr [rbp-48], 0
+    jne     rtg_no
+    mov     eax, dword ptr [g_cfg_cb]        ; bytes actually read
+    FRAME_EPILOG
+    ret
+rtg_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+reg_tpm_get endp
+
+public reg_tpm_del
+reg_tpm_del proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx          ; value name
+    WINCALL RegOpenKeyExW, qword ptr [g_hkcu], addr tpm_subkey, 0, KEY_WRITE, \
+            addr g_cfg_khan
+    test    eax, eax
+    jnz     rtd_done
+    WINCALL RegDeleteValueW, qword ptr [g_cfg_khan], qword ptr [rbp-24]
+    WINCALL RegCloseKey, qword ptr [g_cfg_khan]
+rtd_done:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+reg_tpm_del endp
 
 end

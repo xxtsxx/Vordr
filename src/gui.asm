@@ -47,6 +47,7 @@ extern totp_secs_left:proc
 extern vault_tpm_remember:proc
 extern vault_tpm_forget:proc
 extern vault_tpm_has:proc
+extern tpm_available:proc
 extern reg_load_vault:proc
 extern reg_save_vault:proc
 extern cfg_default_vault:proc
@@ -91,11 +92,33 @@ extern MultiByteToWideChar:proc
 extern IsDlgButtonChecked:proc
 extern EnableWindow:proc
 extern GetDlgItem:proc
+extern SetFocus:proc
 extern SetDlgItemInt:proc
 extern GetDlgItemInt:proc
 extern GetFileAttributesW:proc
 extern ShowWindow:proc
 extern CheckDlgButton:proc
+extern GetDlgCtrlID:proc
+extern SetTextColor:proc
+extern SetBkMode:proc
+extern SetBkColor:proc
+extern GetSysColorBrush:proc
+extern GetStockObject:proc
+extern CreateSolidBrush:proc
+extern FillRect:proc
+extern InvalidateRect:proc
+extern RedrawWindow:proc
+extern InitCommonControlsEx:proc
+extern pw_metrics:proc
+extern theme_boot:proc
+extern theme_attach:proc
+extern theme_tick:proc
+extern theme_paint:proc
+extern theme_erase:proc
+extern theme_ctlcolor:proc
+extern theme_drawitem:proc
+extern theme_backdrop:proc
+extern theme_overlay:proc
 
 ; ---- constants ---------------------------------------------------------------
 MB_OK               equ 0
@@ -113,6 +136,26 @@ WM_CLOSE            equ 10h
 WM_TIMER            equ 113h
 WM_INITDIALOG       equ 110h
 WM_COMMAND          equ 111h
+WM_PAINT            equ 0Fh
+WM_ERASEBKGND       equ 14h
+WM_DRAWITEM         equ 2Bh
+WM_CTLCOLOREDIT     equ 133h
+WM_CTLCOLORLISTBOX  equ 134h
+WM_CTLCOLORBTN      equ 135h
+WM_CTLCOLORDLG      equ 136h
+WM_CTLCOLORSTATIC   equ 138h
+THEME_TIMER         equ 9
+EM_SETCUEBANNER     equ 1501h
+; password-strength / match line colours (COLORREF 0x00BBGGRR)
+CLR_BAR_RED         equ 004545D6h         ; bad / no password / mismatch
+CLR_BAR_AMBER       equ 003CA5E1h         ; weak (meets the policy, minimal)
+CLR_BAR_LGREEN      equ 006EC878h         ; adequate
+CLR_BAR_DGREEN      equ 0055AF2Dh         ; strong / match
+EN_CHANGE           equ 300h
+COLOR_BTNFACE       equ 0Fh
+BKMODE_TRANSPARENT  equ 1
+CLR_STRENGTH_OK     equ 00327D2Eh           ; green  - meets the policy
+CLR_STRENGTH_BAD    equ 000000C8h           ; red    - does not meet the policy
 CLIP_TIMER          equ 1                  ; timer id for clipboard auto-clear
 CLIP_MS             equ 20000              ; clear a copied secret after 20 s
 TOTP_TIMER          equ 2                  ; timer id for live auth-code refresh
@@ -120,8 +163,10 @@ TOTP_MS             equ 1000               ; recompute the code once a second
 LBN_SELCHANGE       equ 1
 LB_ADDSTRING        equ 180h
 LB_RESETCONTENT     equ 184h
+LB_SETCURSEL        equ 186h
 LB_GETCURSEL        equ 188h
 LB_ERR              equ -1
+EM_SETSEL           equ 0B1h
 
 CP_UTF8_            equ 65001
 CF_UNICODETEXT      equ 13
@@ -152,7 +197,10 @@ IDC_V_REMOVE equ 211
 IDC_V_LOCK   equ 212
 IDC_V_TOTP   equ 213
 IDC_V_COPYTOTP equ 214
+IDC_V_TKEY   equ 227
 IDC_V_MENU   equ 216
+EM_SETPASSWORDCHAR equ 0CCh
+SECRET_MASK  equ 2022h                ; bullet mask char for the secret field
 IDC_V_MBACK  equ 217
 IDC_V_MTITLE equ 218
 IDC_V_MPOLL  equ 219
@@ -161,23 +209,15 @@ IDC_V_MLEN   equ 221
 IDC_V_MCLSL  equ 222
 IDC_V_MCLS   equ 223
 IDC_V_MTPM   equ 224
-IDC_V_MSAVE  equ 225
+IDC_V_MTPMINFO equ 226
 SW_HIDE      equ 0
 SW_SHOW      equ 5
-DLG_ENTRY    equ 300
-IDC_E_TITLE  equ 301
-IDC_E_USER   equ 302
-IDC_E_SECRET equ 303
-IDC_E_URL    equ 304
-IDC_E_NOTES  equ 305
-IDC_E_TOTP   equ 306
 DLG_CREATE   equ 400
-IDC_C_PATH   equ 401
 IDC_C_PW     equ 402
 IDC_C_PW2    equ 403
-IDC_C_LEN    equ 404
-IDC_C_CLS    equ 405
-IDC_C_STATUS equ 406
+IDC_C_PWBAR  equ 404                  ; strength line under the master-password box
+IDC_C_PW2BAR equ 405                  ; match line under the confirm box
+IDC_C_INFO   equ 406                  ; (i) password-requirements callout
 
 OFN_OVERWRITEPROMPT equ 2
 OFN_HIDEREADONLY    equ 4
@@ -243,6 +283,20 @@ WSTR s_pwmismatch,  <The passwords do not match.>
 WSTR s_pwshort,     <Password is too short for the current policy.>
 WSTR s_pwclasses,   <Password needs more character types (lowercase / uppercase / number / symbol).>
 WSTR s_pollocked,   <Password policy is set by your administrator and cannot be changed here.>
+WSTR s_str_short,   <Too short for the policy.>
+WSTR s_str_few,     <Needs more character types for the policy.>
+WSTR s_str_fair,    <Fair - meets the policy.>
+WSTR s_str_good,    <Good - meets the policy.>
+WSTR s_str_strong,  <Strong - meets the policy.>
+WSTR wt_newentry,   <New entry>
+WSTR t_tpminfo,     <TPM Unlock>
+WSTR m_tpminfo,     <The TPM chip in this computer can unlock the vault automatically on this device. You will not need to type the master password at startup. The password still works everywhere and is never stored.>
+WSTR cue_pw,        <Master password>
+WSTR cue_pw2,       <Confirm password>
+WSTR t_req,         <Password requirements>
+WSTR req_p1,        <Your master password must be at least >
+WSTR req_p2,        < characters and use at least >
+WSTR req_p3,        < of 4 character types - lowercase / uppercase / number / symbol.>
 WSTR wv_pwlen,      <PwMinLen>
 WSTR wv_pwcls,      <PwMinClasses>
 WSTR s_tpmnone,     <No Windows Hello / TPM unlock saved for this vault on this PC.>
@@ -263,13 +317,17 @@ g_filter label word
     dw 0
 g_defext label word
     dw 'v','o','r','d','r',0
-g_mask label word
-    dw 2022h,2022h,2022h,2022h,2022h,2022h,2022h,2022h,0    ; eight bullets
 ; burger / close glyphs for the settings button (wide)
 wb_menu label word
     dw 2630h, 0                                  ; trigram for heaven (hamburger)
 wb_close label word
     dw 2715h, 0                                  ; multiplication X
+wb_add label word
+    dw 002Bh, 0                                  ; +  (add)
+wb_edit label word
+    dw 270Eh, 0                                  ; pencil (edit)
+wb_rem label word
+    dw 2212h, 0                                  ; minus sign (remove)
 ; control-id groups toggled when the settings overlay opens/closes
 align 4
 g_vault_ids label dword
@@ -279,7 +337,7 @@ g_vault_ids label dword
 VAULT_ID_COUNT equ 14
 g_menu_ids label dword
     dd IDC_V_MBACK, IDC_V_MTITLE, IDC_V_MPOLL, IDC_V_MLENL, IDC_V_MLEN
-    dd IDC_V_MCLSL, IDC_V_MCLS, IDC_V_MTPM, IDC_V_MSAVE
+    dd IDC_V_MCLSL, IDC_V_MCLS, IDC_V_MTPM, IDC_V_MTPMINFO
 MENU_ID_COUNT equ 9
 
 .data?
@@ -290,12 +348,24 @@ g_create    dd ?
 g_is_default dd ?                     ; 1 = auto-created default vault (register it)
 g_pol_len_lock dd ?                   ; 1 = min-length set by HKLM policy (locked)
 g_pol_cls_lock dd ?                   ; 1 = min-classes set by HKLM policy (locked)
+g_pw_compliant dd ?                   ; 1 = create-dialog password meets the policy
+g_tpm_present dd ?                    ; 1 = a usable platform TPM was detected
+g_pw_level  dd ?                      ; 0 bad/none, 1 weak, 2 adequate, 3 strong
+g_pw_match  dd ?                      ; 1 = confirm matches a non-empty password
+align 8
+g_br_red    dq ?                      ; cached strength/match line brushes (0=unbuilt)
+g_br_amber  dq ?
+g_br_lgreen dq ?
+g_br_dgreen dq ?
+g_reqbuf    dw 512 dup (?)            ; formatted password-requirements callout text
+g_numtmp    db 16 dup (?)             ; scratch for uint-to-decimal
 g_vault_lock dd ?                     ; 1 = vault path set by HKLM (locked)
 g_menu_open  dd ?                     ; 1 = settings overlay is showing
 g_revealed  dd ?
 g_clip_seq  dd ?                      ; clipboard sequence number at last copy
-g_e_edit    dd ?
-g_e_idx     dd ?
+g_cur_idx   dd ?                      ; entry currently shown/edited inline (-1=none)
+g_dirty     dd ?                      ; 1 = inline fields edited since last load/save
+g_loading   dd ?                      ; 1 = programmatically loading fields (ignore EN_CHANGE)
 align 2
 g_vpath     dw 1024 dup (?)        ; chosen vault path (wide, NUL-terminated)
 g_pwbuf     dw 1024 dup (?)        ; password field (wide; wiped after use)
@@ -467,16 +537,10 @@ gu_open:
     jne     gu_fail
     ; first opened the auto-default vault -> record its path in HKCU
     cmp     dword ptr [g_is_default], 0
-    je      gu_remember
+    je      gu_success
     lea     rcx, [g_vpath]
     call    reg_save_vault
     mov     dword ptr [g_is_default], 0
-gu_remember:
-    ; optionally register this device for Windows Hello / TPM quick-unlock
-    WINCALL IsDlgButtonChecked, qword ptr [rbp-24], IDC_U_REMEMBER
-    cmp     eax, 1
-    jne     gu_success
-    call    vault_tpm_remember
 gu_success:
     WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_U_PW, 0
     WINCALL EndDialog, qword ptr [rbp-24], 1
@@ -496,44 +560,6 @@ gu_done:
     FRAME_EPILOG
     ret
 gui_unlock endp
-
-; =============================================================================
-; gui_unlock_tpm(rcx = hdlg) - unlock via the TPM sidecar (no password typed).
-;   Falls back to a status message if there is no saved device or it fails.
-; =============================================================================
-gui_unlock_tpm proc frame
-    FRAME_PROLOG 48
-    mov     qword ptr [rbp-24], rcx
-    cmp     dword ptr [g_vpath_set], 0
-    jne     gut_havepath
-    mov     rcx, qword ptr [rbp-24]
-    lea     rdx, [s_pickvault]
-    call    gui_status
-    jmp     gut_done
-gut_havepath:
-    lea     rax, [g_vpath]
-    mov     qword ptr [g_cfg_in], rax
-    mov     dword ptr [g_use_tpm], 1
-    call    vault_unlock
-    mov     dword ptr [rbp-32], eax
-    mov     dword ptr [g_use_tpm], 0
-    cmp     dword ptr [rbp-32], 0
-    jne     gut_fail
-    WINCALL EndDialog, qword ptr [rbp-24], 1
-    jmp     gut_done
-gut_fail:
-    ; EXIT_LOCKED here means "no/!matching TPM data" or a TPM error
-    mov     rcx, qword ptr [rbp-24]
-    lea     rdx, [s_tpmfail]
-    cmp     dword ptr [rbp-32], EXIT_LOCKED
-    jne     @F
-    lea     rdx, [s_tpmnone]
-@@: mov     rcx, qword ptr [rbp-24]
-    call    gui_status
-gut_done:
-    FRAME_EPILOG
-    ret
-gui_unlock_tpm endp
 
 ; gui_wipepw() - scrub the UTF-8 master password buffer.
 gui_wipepw proc frame
@@ -558,9 +584,56 @@ unlock_proc proc
     je      up_init
     cmp     rdx, WM_COMMAND
     je      up_cmd
+    cmp     rdx, WM_PAINT
+    je      up_tpaint
+    cmp     rdx, WM_ERASEBKGND
+    je      up_terase
+    cmp     rdx, WM_DRAWITEM
+    je      up_tdraw
+    cmp     rdx, WM_TIMER
+    je      up_ttimer
+    cmp     rdx, WM_CTLCOLOREDIT
+    je      up_tcolor
+    cmp     rdx, WM_CTLCOLORLISTBOX
+    je      up_tcolor
+    cmp     rdx, WM_CTLCOLORBTN
+    je      up_tcolor
+    cmp     rdx, WM_CTLCOLORDLG
+    je      up_tcolor
+    cmp     rdx, WM_CTLCOLORSTATIC
+    je      up_tcolor
+    xor     eax, eax
+    jmp     up_ret
+up_tcolor:
+    call    theme_ctlcolor
+    jmp     up_ret
+up_tpaint:
+    mov     rcx, qword ptr [rbp-8]
+    call    theme_paint
+    jmp     up_ret
+up_terase:
+    mov     rcx, r8
+    mov     rdx, qword ptr [rbp-8]
+    call    theme_erase
+    jmp     up_ret
+up_tdraw:
+    mov     rcx, r9
+    call    theme_drawitem
+    jmp     up_ret
+up_ttimer:
+    cmp     r8d, THEME_TIMER
+    jne     up_tunh
+    mov     rcx, qword ptr [rbp-8]
+    call    theme_tick
+    mov     eax, 1
+    jmp     up_ret
+up_tunh:
     xor     eax, eax
     jmp     up_ret
 up_init:
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_U_UNLOCK
+    call    theme_attach
     sub     rsp, 32
     cmp     dword ptr [g_vpath_set], 0
     je      up_init_x
@@ -568,73 +641,21 @@ up_init:
     mov     edx, IDC_U_PATH
     lea     r8, [g_vpath]
     call    SetDlgItemTextW
-    ; if HKLM mandates the vault path, lock the "Open"/"Create new" pickers
-    cmp     dword ptr [g_vault_lock], 0
-    je      up_init_hint
-    mov     rcx, qword ptr [rbp-8]
-    mov     edx, IDC_U_OPEN
-    call    GetDlgItem
-    mov     rcx, rax
-    xor     edx, edx
-    call    EnableWindow
-    mov     rcx, qword ptr [rbp-8]
-    mov     edx, IDC_U_NEW
-    call    GetDlgItem
-    mov     rcx, rax
-    xor     edx, edx
-    call    EnableWindow
-up_init_hint:
-    cmp     dword ptr [g_create], 0
-    je      up_init_x
-    mov     rcx, qword ptr [rbp-8]           ; first-run hint
-    lea     rdx, [s_firstrun]
-    call    gui_status
 up_init_x:
     add     rsp, 32
     mov     eax, 1
     jmp     up_ret
 up_cmd:
     movzx   eax, r8w                        ; LOWORD(wParam) = control id
-    cmp     eax, IDC_U_OPEN
-    je      up_open
-    cmp     eax, IDC_U_NEW
-    je      up_new
     cmp     eax, IDC_U_UNLOCK
     je      up_unlock
-    cmp     eax, IDC_U_TPM
-    je      up_tpm
     cmp     eax, IDCANCEL
     je      up_cancel
     xor     eax, eax
     jmp     up_ret
-up_open:
-    mov     rcx, qword ptr [rbp-8]
-    xor     edx, edx
-    call    gui_browse
-    mov     eax, 1
-    jmp     up_ret
-up_new:
-    mov     rcx, qword ptr [rbp-8]
-    mov     edx, 1
-    call    gui_browse
-    cmp     dword ptr [g_create], 0          ; a path was picked -> go to create
-    je      up_new_stay
-    sub     rsp, 32
-    mov     rcx, qword ptr [rbp-8]
-    mov     edx, 2                           ; signal gui_main: show create dialog
-    call    EndDialog
-    add     rsp, 32
-up_new_stay:
-    mov     eax, 1
-    jmp     up_ret
 up_unlock:
     mov     rcx, qword ptr [rbp-8]
     call    gui_unlock
-    mov     eax, 1
-    jmp     up_ret
-up_tpm:
-    mov     rcx, qword ptr [rbp-8]
-    call    gui_unlock_tpm
     mov     eax, 1
     jmp     up_ret
 up_cancel:
@@ -685,10 +706,14 @@ gui_poplist endp
 ;   captured into g_secret_w and shown masked.
 ; =============================================================================
 gui_showdetail proc frame
-    FRAME_PROLOG 64
+    FRAME_PROLOG 96
     mov     qword ptr [rbp-24], rcx
     mov     dword ptr [rbp-32], edx
     mov     dword ptr [g_revealed], 0
+    mov     eax, dword ptr [rbp-32]           ; track the entry being edited inline
+    mov     dword ptr [g_cur_idx], eax
+    mov     dword ptr [g_dirty], 0
+    mov     dword ptr [g_loading], 1          ; suppress EN_CHANGE dirty while loading
     ; title / user / url / notes
     mov     rcx, qword ptr [rbp-32]
     mov     edx, VF_TITLE
@@ -726,7 +751,7 @@ gui_showdetail proc frame
     mov     r8, rax
     mov     r9d, dword ptr [rbp-48]
     call    gui_setfield
-    ; secret -> g_secret_w (kept), display masked
+    ; secret -> editable password field (masked); keep g_secret_w for Copy
     mov     rcx, qword ptr [rbp-32]
     mov     edx, VF_SECRET
     lea     r8, [rbp-48]
@@ -736,12 +761,20 @@ gui_showdetail proc frame
     lea     r8, [g_secret_w]
     mov     r9d, EBUF*2-1
     call    gui_towide
-    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_SECRET, addr g_mask
-    ; TOTP: if the entry has a base32 key, store it and arm the live refresh
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_SECRET, addr g_secret_w
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_SECRET, EM_SETPASSWORDCHAR, SECRET_MASK, 0
+    ; TOTP key -> editable field + arm the live code
     mov     rcx, qword ptr [rbp-32]
     mov     edx, VF_TOTP
     lea     r8, [rbp-48]
     call    vault_field_at
+    mov     qword ptr [rbp-56], rax           ; key ptr (or NULL)
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_V_TKEY
+    mov     r8, rax
+    mov     r9d, dword ptr [rbp-48]
+    call    gui_setfield
+    mov     rax, qword ptr [rbp-56]
     test    rax, rax
     jz      gsd_nototp
     mov     ecx, dword ptr [rbp-48]
@@ -763,6 +796,8 @@ gsd_b32d:
     mov     rcx, qword ptr [rbp-24]
     call    gui_totp_refresh
     WINCALL SetTimer, qword ptr [rbp-24], TOTP_TIMER, TOTP_MS, 0
+    mov     dword ptr [g_loading], 0
+    mov     dword ptr [g_dirty], 0
     FRAME_EPILOG
     ret
 gsd_nototp:
@@ -773,6 +808,8 @@ gsd_nototp:
     call    KillTimer
     add     rsp, 32
     WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_TOTP, 0
+    mov     dword ptr [g_loading], 0
+    mov     dword ptr [g_dirty], 0
     FRAME_EPILOG
     ret
 gui_showdetail endp
@@ -857,13 +894,17 @@ gui_reveal proc frame
     mov     qword ptr [rbp-24], rcx
     cmp     dword ptr [g_revealed], 0
     jne     gr_hide
-    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_SECRET, addr g_secret_w
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_SECRET, EM_SETPASSWORDCHAR, 0, 0
     mov     dword ptr [g_revealed], 1
-    jmp     gr_done
+    jmp     gr_redraw
 gr_hide:
-    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_SECRET, addr g_mask
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_SECRET, EM_SETPASSWORDCHAR, SECRET_MASK, 0
     mov     dword ptr [g_revealed], 0
-gr_done:
+gr_redraw:
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_V_SECRET
+    call    GetDlgItem
+    WINCALL InvalidateRect, rax, 0, 1
     FRAME_EPILOG
     ret
 gui_reveal endp
@@ -1041,121 +1082,45 @@ gas_done:
     ret
 gui_addsave endp
 
-; gui_loadentry(rcx = hdlg, edx = index) - fill g_e_* from an existing entry
-;   (for editing).
-gui_loadentry proc frame
+; gui_readfields(rcx = hdlg) - read the inline detail edits into the g_e_* buffers.
+gui_readfields proc frame
     FRAME_PROLOG 48
-    mov     dword ptr [rbp-32], edx
-    LOADF macro vftype, dstbuf
-    mov     rcx, qword ptr [rbp-32]
-    mov     edx, vftype
-    lea     r8, [rbp-40]
-    call    vault_field_at
-    mov     rcx, rax
-    mov     edx, dword ptr [rbp-40]
-    lea     r8, [dstbuf]
-    mov     r9d, lengthof dstbuf - 1
-    call    gui_towide
-    endm
-    LOADF VF_TITLE,    g_e_title
-    LOADF VF_USERNAME, g_e_user
-    LOADF VF_SECRET,   g_e_secret
-    LOADF VF_URL,      g_e_url
-    LOADF VF_NOTES,    g_e_notes
-    LOADF VF_TOTP,     g_e_totp
+    mov     qword ptr [rbp-24], rcx
+    WINCALL GetDlgItemTextW, qword ptr [rbp-24], IDC_V_TITLE, addr g_e_title, 1024
+    WINCALL GetDlgItemTextW, qword ptr [rbp-24], IDC_V_USER, addr g_e_user, 1024
+    WINCALL GetDlgItemTextW, qword ptr [rbp-24], IDC_V_SECRET, addr g_e_secret, EBUF
+    WINCALL GetDlgItemTextW, qword ptr [rbp-24], IDC_V_URL, addr g_e_url, 1024
+    WINCALL GetDlgItemTextW, qword ptr [rbp-24], IDC_V_NOTES, addr g_e_notes, EBUF
+    WINCALL GetDlgItemTextW, qword ptr [rbp-24], IDC_V_TKEY, addr g_e_totp, 256
     FRAME_EPILOG
     ret
-gui_loadentry endp
+gui_readfields endp
 
-; =============================================================================
-; entry_proc - DLG_ENTRY (add/edit form).  Pre-fills from g_e_* on edit; on OK
-;   reads the fields back into g_e_*.  rax = BOOL.
-; =============================================================================
-entry_proc proc
-    push    rbp
-    mov     rbp, rsp
-    sub     rsp, 64
-    mov     qword ptr [rbp-8], rcx          ; hdlg
-    cmp     rdx, WM_INITDIALOG
-    je      ep_init
-    cmp     rdx, WM_COMMAND
-    je      ep_cmd
-    xor     eax, eax
-    jmp     ep_ret
-ep_init:
-    ; pre-fill the edit controls from g_e_* (empty buffers for "add")
-    sub     rsp, 32
-    mov     rcx, qword ptr [rbp-8]
-    mov     edx, IDC_E_TITLE
-    lea     r8, [g_e_title]
-    call    SetDlgItemTextW
-    mov     rcx, qword ptr [rbp-8]
-    mov     edx, IDC_E_USER
-    lea     r8, [g_e_user]
-    call    SetDlgItemTextW
-    mov     rcx, qword ptr [rbp-8]
-    mov     edx, IDC_E_SECRET
-    lea     r8, [g_e_secret]
-    call    SetDlgItemTextW
-    mov     rcx, qword ptr [rbp-8]
-    mov     edx, IDC_E_URL
-    lea     r8, [g_e_url]
-    call    SetDlgItemTextW
-    mov     rcx, qword ptr [rbp-8]
-    mov     edx, IDC_E_NOTES
-    lea     r8, [g_e_notes]
-    call    SetDlgItemTextW
-    mov     rcx, qword ptr [rbp-8]
-    mov     edx, IDC_E_TOTP
-    lea     r8, [g_e_totp]
-    call    SetDlgItemTextW
-    add     rsp, 32
-    mov     eax, 1
-    jmp     ep_ret
-ep_cmd:
-    movzx   eax, r8w
-    cmp     eax, IDOK
-    je      ep_ok
-    cmp     eax, IDCANCEL
-    je      ep_cancel
-    xor     eax, eax
-    jmp     ep_ret
-ep_ok:
-    ; read fields back into g_e_*
-    GETF macro id, dstbuf, cap
-    sub     rsp, 32
-    mov     rcx, qword ptr [rbp-8]
-    mov     edx, id
-    lea     r8, [dstbuf]
-    mov     r9d, cap
-    call    GetDlgItemTextW
-    add     rsp, 32
-    endm
-    GETF IDC_E_TITLE,  g_e_title,  1024
-    GETF IDC_E_USER,   g_e_user,   1024
-    GETF IDC_E_SECRET, g_e_secret, EBUF
-    GETF IDC_E_URL,    g_e_url,    1024
-    GETF IDC_E_NOTES,  g_e_notes,  EBUF
-    GETF IDC_E_TOTP,   g_e_totp,   256
-    sub     rsp, 32
-    mov     rcx, qword ptr [rbp-8]
-    mov     edx, IDOK
-    call    EndDialog
-    add     rsp, 32
-    mov     eax, 1
-    jmp     ep_ret
-ep_cancel:
-    sub     rsp, 32
-    mov     rcx, qword ptr [rbp-8]
-    mov     edx, IDCANCEL
-    call    EndDialog
-    add     rsp, 32
-    mov     eax, 1
-ep_ret:
-    mov     rsp, rbp
-    pop     rbp
+; gui_commit(rcx = hdlg) - write the inline edits back to the current entry
+;   (replace in place by remove + append) and persist.  Reselects the entry.
+gui_commit proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    cmp     dword ptr [g_cur_idx], 0
+    jl      gco_done                          ; nothing selected
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_readfields
+    mov     ecx, dword ptr [g_cur_idx]
+    call    vault_remove_at
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_addsave                       ; append + reseal + repopulate
+    call    vault_count
+    test    eax, eax
+    jz      gco_done
+    dec     eax
+    mov     dword ptr [g_cur_idx], eax
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_SETCURSEL, \
+            dword ptr [g_cur_idx], 0
+gco_done:
+    mov     dword ptr [g_dirty], 0
+    FRAME_EPILOG
     ret
-entry_proc endp
+gui_commit endp
 
 ; =============================================================================
 ; Settings overlay (burger menu) helpers for DLG_VAULT.
@@ -1230,20 +1195,35 @@ mo_len_ok:
     xor     edx, edx
     call    EnableWindow
 mo_cls_ok:
-    ; reflect the current TPM enrolment in the toggle
+    ; TPM toggle: only meaningful with hardware -> check it iff enrolled, and
+    ; enable the checkbox only when the platform TPM is present.
+    mov     dword ptr [rbp-32], 0
+    cmp     dword ptr [g_tpm_present], 0
+    je      mo_tpm_set
     call    vault_tpm_has
-    mov     r8d, eax
-    WINCALL CheckDlgButton, qword ptr [rbp-24], IDC_V_MTPM, r8d
+    mov     dword ptr [rbp-32], eax
+mo_tpm_set:
+    WINCALL CheckDlgButton, qword ptr [rbp-24], IDC_V_MTPM, dword ptr [rbp-32]
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_V_MTPM
+    call    GetDlgItem
+    mov     rcx, rax
+    mov     edx, dword ptr [g_tpm_present]    ; enable iff hardware present
+    call    EnableWindow
     WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_MENU, addr wb_close
     mov     dword ptr [g_menu_open], 1
+    mov     ecx, 1                            ; opaque backdrop in theme_paint
+    call    theme_overlay
+    WINCALL RedrawWindow, qword ptr [rbp-24], 0, 0, 0185h  ; INVALIDATE|ERASE|ALLCHILDREN|UPDATENOW
     FRAME_EPILOG
     ret
 gui_menu_open endp
 
-; gui_menu_close(rcx=hdlg) - hide the settings overlay, restore the vault.
+; gui_menu_close(rcx=hdlg) - apply the settings, then hide the overlay.
 gui_menu_close proc frame
     FRAME_PROLOG 48
     mov     qword ptr [rbp-24], rcx
+    call    gui_menu_save                    ; save all settings on leaving the screen
     mov     rcx, qword ptr [rbp-24]
     lea     rdx, [g_vault_ids]
     mov     r8d, VAULT_ID_COUNT
@@ -1256,6 +1236,9 @@ gui_menu_close proc frame
     call    gui_show_ids
     WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_MENU, addr wb_menu
     mov     dword ptr [g_menu_open], 0
+    xor     ecx, ecx
+    call    theme_overlay
+    WINCALL RedrawWindow, qword ptr [rbp-24], 0, 0, 0185h
     FRAME_EPILOG
     ret
 gui_menu_close endp
@@ -1308,6 +1291,8 @@ msv_cls:
     mov     edx, dword ptr [g_cfg_pwminclasses]
     call    cfg_set_dword_hkcu
 msv_tpm:
+    cmp     dword ptr [g_tpm_present], 0
+    je      msv_apply_close                 ; no TPM -> nothing to enrol/forget
     WINCALL IsDlgButtonChecked, qword ptr [rbp-24], IDC_V_MTPM
     mov     dword ptr [rbp-32], eax         ; want enrolled?
     call    vault_tpm_has
@@ -1323,8 +1308,6 @@ msv_unwant:
     je      msv_apply_close                 ; !want + !have -> nothing
     call    vault_tpm_forget
 msv_apply_close:
-    mov     rcx, qword ptr [rbp-24]
-    call    gui_menu_close
     FRAME_EPILOG
     ret
 gui_menu_save endp
@@ -1345,9 +1328,47 @@ vault_proc proc
     je      vp_close
     cmp     rdx, WM_TIMER
     je      vp_timer
+    cmp     rdx, WM_PAINT
+    je      vp_tpaint
+    cmp     rdx, WM_ERASEBKGND
+    je      vp_terase
+    cmp     rdx, WM_DRAWITEM
+    je      vp_tdraw
+    cmp     rdx, WM_CTLCOLOREDIT
+    je      vp_tcolor
+    cmp     rdx, WM_CTLCOLORLISTBOX
+    je      vp_tcolor
+    cmp     rdx, WM_CTLCOLORBTN
+    je      vp_tcolor
+    cmp     rdx, WM_CTLCOLORDLG
+    je      vp_tcolor
+    cmp     rdx, WM_CTLCOLORSTATIC
+    je      vp_tcolor
     xor     eax, eax
     jmp     vp_ret
+vp_tcolor:
+    call    theme_ctlcolor
+    jmp     vp_ret
+vp_tpaint:
+    mov     rcx, qword ptr [rbp-8]
+    call    theme_paint
+    jmp     vp_ret
+vp_terase:
+    mov     rcx, r8
+    mov     rdx, qword ptr [rbp-8]
+    call    theme_erase
+    jmp     vp_ret
+vp_tdraw:
+    mov     rcx, r9
+    call    theme_drawitem
+    jmp     vp_ret
 vp_timer:
+    cmp     r8d, THEME_TIMER
+    jne     vp_timer_clip
+    mov     rcx, qword ptr [rbp-8]
+    call    theme_tick
+    jmp     vp_handled
+vp_timer_clip:
     cmp     r8d, CLIP_TIMER
     je      vp_t_clip
     cmp     r8d, TOTP_TIMER
@@ -1366,6 +1387,9 @@ vp_t_totp:
     call    gui_totp_refresh
     jmp     vp_handled
 vp_init:
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_V_LOCK
+    call    theme_attach
     mov     dword ptr [g_menu_open], 0
     mov     rcx, qword ptr [rbp-8]           ; keep the settings overlay hidden
     lea     rdx, [g_menu_ids]
@@ -1373,6 +1397,12 @@ vp_init:
     mov     r9d, SW_HIDE
     call    gui_show_ids
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_MENU, addr wb_menu
+    WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_ADD, addr wb_add
+    WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_EDIT, addr wb_edit
+    WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_REMOVE, addr wb_rem
+    mov     dword ptr [g_cur_idx], -1         ; no entry selected yet
+    mov     dword ptr [g_dirty], 0
+    mov     dword ptr [g_loading], 0
     mov     rcx, qword ptr [rbp-8]
     call    gui_poplist
     mov     eax, 1
@@ -1381,6 +1411,21 @@ vp_cmd:
     movzx   eax, r8w                        ; control id
     mov     r10d, r8d
     shr     r10d, 16                        ; notification code
+    cmp     r10d, EN_CHANGE                 ; inline edit changed -> mark dirty
+    jne     vp_cmd_disp
+    cmp     eax, IDC_V_TITLE
+    je      vp_setdirty
+    cmp     eax, IDC_V_USER
+    je      vp_setdirty
+    cmp     eax, IDC_V_SECRET
+    je      vp_setdirty
+    cmp     eax, IDC_V_URL
+    je      vp_setdirty
+    cmp     eax, IDC_V_NOTES
+    je      vp_setdirty
+    cmp     eax, IDC_V_TKEY
+    je      vp_setdirty
+vp_cmd_disp:
     cmp     eax, IDC_V_LIST
     je      vp_list
     cmp     eax, IDC_V_REVEAL
@@ -1399,19 +1444,24 @@ vp_cmd:
     je      vp_lock
     cmp     eax, IDC_V_MENU
     je      vp_menu
-    cmp     eax, IDC_V_MSAVE
-    je      vp_msave
+    cmp     eax, IDC_V_MTPMINFO
+    je      vp_tpminfo
     cmp     eax, IDCANCEL
     je      vp_lock
     xor     eax, eax
     jmp     vp_ret
+vp_setdirty:
+    cmp     dword ptr [g_loading], 0          ; ignore programmatic field loads
+    jne     vp_handled
+    mov     dword ptr [g_dirty], 1
+    jmp     vp_handled
 vp_menu:
     mov     rcx, qword ptr [rbp-8]
     call    gui_menu_toggle
     jmp     vp_handled
-vp_msave:
-    mov     rcx, qword ptr [rbp-8]
-    call    gui_menu_save
+vp_tpminfo:
+    WINCALL MessageBoxW, qword ptr [rbp-8], addr m_tpminfo, addr t_tpminfo, \
+            <MB_OK or MB_ICONINFORMATION>
     jmp     vp_handled
 vp_list:
     cmp     r10d, LBN_SELCHANGE
@@ -1439,7 +1489,8 @@ vp_copytotp:
     call    gui_copy
     jmp     vp_handled
 vp_add:
-    lea     rcx, [g_e_title]                ; clear the form buffers
+    ; create a new entry (placeholder title) and edit it inline
+    lea     rcx, [g_e_title]
     mov     edx, 1024
     call    gui_clrwbuf
     lea     rcx, [g_e_user]
@@ -1457,54 +1508,88 @@ vp_add:
     lea     rcx, [g_e_totp]
     mov     edx, 256
     call    gui_clrwbuf
-    mov     dword ptr [g_e_edit], 0
-    WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_ENTRY, qword ptr [rbp-8], addr entry_proc, 0
-    cmp     rax, IDOK
-    jne     vp_handled
+    lea     r10, [wt_newentry]
+    lea     r11, [g_e_title]
+    xor     ecx, ecx
+vpa_cp:
+    mov     ax, word ptr [r10+rcx*2]
+    mov     word ptr [r11+rcx*2], ax
+    test    ax, ax
+    jz      vpa_cpd
+    inc     ecx
+    jmp     vpa_cp
+vpa_cpd:
     mov     rcx, qword ptr [rbp-8]
     call    gui_addsave
+    call    vault_count
+    test    eax, eax
+    jz      vp_handled
+    dec     eax
+    mov     dword ptr [g_cur_idx], eax
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_V_LIST, LB_SETCURSEL, dword ptr [g_cur_idx], 0
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, dword ptr [g_cur_idx]
+    call    gui_showdetail
+    mov     rcx, qword ptr [rbp-8]            ; focus the title for quick typing
+    mov     edx, IDC_V_TITLE
+    call    GetDlgItem
+    sub     rsp, 32
+    mov     rcx, rax
+    call    SetFocus
+    add     rsp, 32
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_V_TITLE, EM_SETSEL, 0, -1
     jmp     vp_handled
 vp_edit:
+    ; pencil = save the inline edits to the selected entry
+    cmp     dword ptr [g_cur_idx], 0
+    jl      vp_handled
     mov     rcx, qword ptr [rbp-8]
-    call    gui_lbsel
-    cmp     eax, LB_ERR
-    je      vp_handled
-    mov     dword ptr [g_e_idx], eax
+    call    gui_commit
+    cmp     dword ptr [g_cur_idx], 0
+    jl      vp_handled
     mov     rcx, qword ptr [rbp-8]
-    mov     edx, eax
-    call    gui_loadentry
-    mov     dword ptr [g_e_edit], 1
-    WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_ENTRY, qword ptr [rbp-8], addr entry_proc, 0
-    cmp     rax, IDOK
-    jne     vp_handled
-    mov     ecx, dword ptr [g_e_idx]        ; remove the old, append the edited
-    call    vault_remove_at
-    mov     rcx, qword ptr [rbp-8]
-    call    gui_addsave
+    mov     edx, dword ptr [g_cur_idx]
+    call    gui_showdetail
     jmp     vp_handled
 vp_remove:
-    mov     rcx, qword ptr [rbp-8]
-    call    gui_lbsel
-    cmp     eax, LB_ERR
-    je      vp_handled
-    mov     dword ptr [g_e_idx], eax
+    cmp     dword ptr [g_cur_idx], 0
+    jl      vp_handled
     WINCALL MessageBoxW, qword ptr [rbp-8], addr t_remove, addr t_err, <MB_YESNO or MB_ICONQUESTION>
     cmp     eax, IDYES
     jne     vp_handled
-    mov     ecx, dword ptr [g_e_idx]
+    mov     ecx, dword ptr [g_cur_idx]
     call    vault_remove_at
     call    vault_reseal
     mov     rcx, qword ptr [rbp-8]
     call    gui_poplist
-    ; clear detail (no selection)
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_TITLE, 0
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_USER, 0
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_SECRET, 0
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_URL, 0
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_NOTES, 0
+    WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_TKEY, 0
+    mov     dword ptr [g_totp_on], 0          ; stop the live auth-code refresh
+    sub     rsp, 32
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, TOTP_TIMER
+    call    KillTimer
+    add     rsp, 32
+    WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_TOTP, 0
+    mov     dword ptr [g_cur_idx], -1
+    mov     dword ptr [g_dirty], 0
     jmp     vp_handled
 vp_lock:
 vp_close:
+    cmp     dword ptr [g_menu_open], 0       ; closing while settings open -> save
+    je      vp_lock_dirty
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_menu_save
+vp_lock_dirty:
+    cmp     dword ptr [g_dirty], 0           ; unsaved inline edits -> commit
+    je      vp_lock_go
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_commit
+vp_lock_go:
     sub     rsp, 32
     mov     rcx, qword ptr [rbp-8]
     mov     edx, CLIP_TIMER
@@ -1653,28 +1738,7 @@ cd_havepw:
     mov     qword ptr [rbp-56], rax
     jmp     cd_status
 cd_match:
-    ; adopt any user-edited policy values (editable fields only)
-    cmp     dword ptr [g_pol_len_lock], 0
-    jne     cd_len_done
-    WINCALL GetDlgItemInt, qword ptr [rbp-24], IDC_C_LEN, 0, 0
-    test    eax, eax
-    jz      cd_len_done
-    cmp     eax, 256
-    jbe     @F
-    mov     eax, 256
-@@: mov     dword ptr [g_cfg_pwminlen], eax
-cd_len_done:
-    cmp     dword ptr [g_pol_cls_lock], 0
-    jne     cd_cls_done
-    WINCALL GetDlgItemInt, qword ptr [rbp-24], IDC_C_CLS, 0, 0
-    test    eax, eax
-    jz      cd_cls_done
-    cmp     eax, 4
-    jbe     @F
-    mov     eax, 4
-@@: mov     dword ptr [g_cfg_pwminclasses], eax
-cd_cls_done:
-    ; password -> utf8, then enforce the policy
+    ; the policy is fixed here (set in Settings / by HKLM); just enforce it
     lea     rcx, [g_pwbuf]
     call    password_to_utf8
     test    eax, eax
@@ -1744,6 +1808,10 @@ cd_open:
     lea     rax, [s_createfail]
     mov     qword ptr [rbp-56], rax
     jmp     cd_status
+    ; TPM unlock is on by default for a new vault when the hardware supports it
+    cmp     dword ptr [g_tpm_present], 0
+    je      cd_done
+    call    vault_tpm_remember
 cd_done:
     mov     dword ptr [g_create], 0
     call    gui_wipepw
@@ -1753,12 +1821,223 @@ cd_done:
     ret
 cd_status:
     call    gui_wipepw_create
-    mov     r8, qword ptr [rbp-56]
-    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_C_STATUS, r8
+    WINCALL MessageBoxW, qword ptr [rbp-24], qword ptr [rbp-56], addr t_err, \
+            <MB_OK or MB_ICONWARNING>
     xor     eax, eax
     FRAME_EPILOG
     ret
 gui_create_do endp
+
+; gui_pw_strength(rcx = hdlg) - recompute the strength level (g_pw_level) and
+;   confirm-match (g_pw_match) from the two password boxes, enable Create only
+;   when valid, and repaint the two colour lines.
+gui_pw_strength proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx          ; hdlg
+    WINCALL GetDlgItemTextW, qword ptr [rbp-24], IDC_C_PW, addr g_pwbuf, 1024
+    mov     dword ptr [rbp-32], eax          ; password length (chars)
+    WINCALL GetDlgItemTextW, qword ptr [rbp-24], IDC_C_PW2, addr g_pw2buf, 1024
+    ; ---- confirm matches a non-empty password? -----------------------------
+    mov     dword ptr [g_pw_match], 0
+    movzx   eax, word ptr [g_pw2buf]
+    test    eax, eax
+    jz      ps_nomatch
+    call    gui_pw_match
+    test    eax, eax
+    jz      ps_nomatch
+    mov     dword ptr [g_pw_match], 1
+ps_nomatch:
+    ; ---- strength level from the master password ---------------------------
+    cmp     dword ptr [rbp-32], 0
+    je      ps_bad
+    lea     rcx, [g_pwbuf]
+    call    password_to_utf8                 ; -> g_cfg_pass; wipes g_pwbuf
+    test    eax, eax
+    jz      ps_bad
+    call    pw_metrics                       ; eax = code points, edx = classes
+    mov     dword ptr [rbp-32], eax
+    mov     dword ptr [rbp-40], edx
+    call    gui_wipepw                       ; scrub the utf-8 copy
+    mov     eax, dword ptr [rbp-32]
+    mov     edx, dword ptr [rbp-40]
+    cmp     eax, dword ptr [g_cfg_pwminlen]
+    jb      ps_bad
+    cmp     edx, dword ptr [g_cfg_pwminclasses]
+    jb      ps_bad
+    mov     r8d, dword ptr [g_cfg_pwminlen]
+    add     r8d, 8
+    cmp     eax, r8d                         ; >= min+8 chars AND all 4 types?
+    jb      ps_grade_mid
+    cmp     edx, 4
+    jne     ps_grade_mid
+    mov     dword ptr [g_pw_level], 3         ; strong
+    jmp     ps_done
+ps_grade_mid:
+    mov     r8d, dword ptr [g_cfg_pwminlen]
+    add     r8d, 4
+    cmp     eax, r8d                         ; >= min+4 chars OR all 4 types?
+    jae     ps_grade_good
+    cmp     edx, 4
+    je      ps_grade_good
+    mov     dword ptr [g_pw_level], 1         ; weak
+    jmp     ps_done
+ps_grade_good:
+    mov     dword ptr [g_pw_level], 2         ; adequate
+    jmp     ps_done
+ps_bad:
+    mov     dword ptr [g_pw_level], 0
+ps_done:
+    xor     eax, eax
+    cmp     dword ptr [g_pw_level], 0
+    setne   al
+    mov     dword ptr [g_pw_compliant], eax
+    call    gui_wipepw_create                 ; scrub both wide buffers
+    ; enable Create only when the password is valid AND the confirm matches
+    mov     ecx, dword ptr [g_pw_compliant]
+    and     ecx, dword ptr [g_pw_match]
+    mov     dword ptr [rbp-48], ecx
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDOK
+    call    GetDlgItem
+    mov     rcx, rax
+    mov     edx, dword ptr [rbp-48]
+    call    EnableWindow
+    ; repaint the two colour lines
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_C_PWBAR
+    call    GetDlgItem
+    WINCALL InvalidateRect, rax, 0, 1
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_C_PW2BAR
+    call    GetDlgItem
+    WINCALL InvalidateRect, rax, 0, 1
+    FRAME_EPILOG
+    ret
+gui_pw_strength endp
+
+; gui_pwbars_init() - build the four strength/match line brushes once.
+gui_pwbars_init proc frame
+    FRAME_PROLOG 32
+    cmp     qword ptr [g_br_red], 0
+    jne     pbi_done
+    WINCALL CreateSolidBrush, CLR_BAR_RED
+    mov     qword ptr [g_br_red], rax
+    WINCALL CreateSolidBrush, CLR_BAR_AMBER
+    mov     qword ptr [g_br_amber], rax
+    WINCALL CreateSolidBrush, CLR_BAR_LGREEN
+    mov     qword ptr [g_br_lgreen], rax
+    WINCALL CreateSolidBrush, CLR_BAR_DGREEN
+    mov     qword ptr [g_br_dgreen], rax
+pbi_done:
+    FRAME_EPILOG
+    ret
+gui_pwbars_init endp
+
+; gui_drawbar(rcx = lpdrawitem, edx = 0 strength / 1 match) - fill the colour
+;   line: strength uses red/amber/light-green/deep-green by g_pw_level; match
+;   uses red (mismatch) / deep-green (match).
+gui_drawbar proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx          ; lpdis
+    cmp     edx, 0
+    jne     db_match
+    ; strength: pick by g_pw_level
+    mov     eax, dword ptr [g_pw_level]
+    lea     r10, [g_br_red]
+    mov     rax, qword ptr [r10+rax*8]        ; brushes are contiguous red/amber/lg/dg
+    jmp     db_fill
+db_match:
+    mov     rax, qword ptr [g_br_red]
+    cmp     dword ptr [g_pw_match], 0
+    je      db_fill_have
+    mov     rax, qword ptr [g_br_dgreen]
+db_fill_have:
+db_fill:
+    mov     qword ptr [rbp-32], rax           ; brush
+    mov     rcx, qword ptr [rbp-24]
+    mov     rax, qword ptr [rcx+32]           ; hDC
+    mov     qword ptr [rbp-40], rax
+    ; FillRect(hDC, &rcItem, brush)
+    mov     rcx, qword ptr [rbp-40]
+    mov     rax, qword ptr [rbp-24]
+    lea     rdx, [rax+40]                     ; &rcItem
+    mov     r8, qword ptr [rbp-32]
+    call    FillRect
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gui_drawbar endp
+
+; gui_w_appendz(rcx = dst wide, rdx = src wideZ) -> rax = dst end (no NUL copied).
+gui_w_appendz proc
+az_loop:
+    movzx   eax, word ptr [rdx]
+    test    eax, eax
+    jz      az_done
+    mov     word ptr [rcx], ax
+    add     rcx, 2
+    add     rdx, 2
+    jmp     az_loop
+az_done:
+    mov     rax, rcx
+    ret
+gui_w_appendz endp
+
+; gui_uint_w(rcx = dst wide, edx = value) -> rax = dst end.  Wide decimal, no NUL.
+gui_uint_w proc
+    push    rbx
+    mov     rbx, rcx                          ; dst
+    mov     eax, edx                          ; value
+    lea     r9, [g_numtmp+16]                 ; write digits backwards from here
+    mov     r8, r9
+    mov     ecx, 10
+uw_div:
+    xor     edx, edx
+    div     ecx                               ; eax/=10, edx=remainder
+    add     edx, '0'
+    sub     r8, 1
+    mov     byte ptr [r8], dl
+    test    eax, eax
+    jnz     uw_div
+uw_cpy:
+    cmp     r8, r9
+    jae     uw_done
+    movzx   eax, byte ptr [r8]
+    mov     word ptr [rbx], ax
+    add     rbx, 2
+    inc     r8
+    jmp     uw_cpy
+uw_done:
+    mov     rax, rbx
+    pop     rbx
+    ret
+gui_uint_w endp
+
+; gui_show_info(rcx = hdlg) - compose the active policy into the (i) callout.
+gui_show_info proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    lea     rcx, [g_reqbuf]
+    lea     rdx, [req_p1]
+    call    gui_w_appendz
+    mov     rcx, rax
+    mov     edx, dword ptr [g_cfg_pwminlen]
+    call    gui_uint_w
+    mov     rcx, rax
+    lea     rdx, [req_p2]
+    call    gui_w_appendz
+    mov     rcx, rax
+    mov     edx, dword ptr [g_cfg_pwminclasses]
+    call    gui_uint_w
+    mov     rcx, rax
+    lea     rdx, [req_p3]
+    call    gui_w_appendz
+    mov     word ptr [rax], 0                 ; terminate
+    WINCALL MessageBoxW, qword ptr [rbp-24], addr g_reqbuf, addr t_req, \
+            <MB_OK or MB_ICONINFORMATION>
+    FRAME_EPILOG
+    ret
+gui_show_info endp
 
 ; =============================================================================
 ; create_proc - DLG_CREATE dialog procedure (raw frame; OS callback).
@@ -1773,58 +2052,108 @@ create_proc proc
     je      cp_init
     cmp     rdx, WM_COMMAND
     je      cp_cmd
+    cmp     rdx, WM_CTLCOLORSTATIC
+    je      cp_tcolor
+    cmp     rdx, WM_PAINT
+    je      cp_tpaint
+    cmp     rdx, WM_ERASEBKGND
+    je      cp_terase
+    cmp     rdx, WM_DRAWITEM
+    je      cp_tdraw
+    cmp     rdx, WM_TIMER
+    je      cp_ttimer
+    cmp     rdx, WM_CTLCOLOREDIT
+    je      cp_tcolor
+    cmp     rdx, WM_CTLCOLORLISTBOX
+    je      cp_tcolor
+    cmp     rdx, WM_CTLCOLORBTN
+    je      cp_tcolor
+    cmp     rdx, WM_CTLCOLORDLG
+    je      cp_tcolor
+    xor     eax, eax
+    jmp     cp_ret
+cp_tcolor:
+    call    theme_ctlcolor
+    jmp     cp_ret
+cp_tpaint:
+    mov     rcx, qword ptr [rbp-8]
+    call    theme_paint
+    jmp     cp_ret
+cp_terase:
+    mov     rcx, r8
+    mov     rdx, qword ptr [rbp-8]
+    call    theme_erase
+    jmp     cp_ret
+cp_tdraw:
+    ; the two colour lines are owner-draw statics; everything else is themed
+    mov     eax, dword ptr [r9+4]            ; DRAWITEMSTRUCT.CtlID
+    cmp     eax, IDC_C_PWBAR
+    je      cp_drawbar_pw
+    cmp     eax, IDC_C_PW2BAR
+    je      cp_drawbar_pw2
+    mov     rcx, r9
+    call    theme_drawitem
+    jmp     cp_ret
+cp_drawbar_pw:
+    mov     rcx, r9
+    xor     edx, edx                         ; strength
+    call    gui_drawbar
+    jmp     cp_ret
+cp_drawbar_pw2:
+    mov     rcx, r9
+    mov     edx, 1                           ; match
+    call    gui_drawbar
+    jmp     cp_ret
+cp_ttimer:
+    cmp     r8d, THEME_TIMER
+    jne     cp_tunh
+    mov     rcx, qword ptr [rbp-8]
+    call    theme_tick
+    mov     eax, 1
+    jmp     cp_ret
+cp_tunh:
     xor     eax, eax
     jmp     cp_ret
 cp_init:
-    sub     rsp, 32
-    mov     rcx, qword ptr [rbp-8]           ; show the path being created
-    mov     edx, IDC_C_PATH
-    lea     r8, [g_vpath]
-    call    SetDlgItemTextW
-    mov     rcx, qword ptr [rbp-8]           ; prefill policy fields
-    mov     edx, IDC_C_LEN
-    mov     r8d, dword ptr [g_cfg_pwminlen]
-    xor     r9d, r9d
-    call    SetDlgItemInt
     mov     rcx, qword ptr [rbp-8]
-    mov     edx, IDC_C_CLS
-    mov     r8d, dword ptr [g_cfg_pwminclasses]
-    xor     r9d, r9d
-    call    SetDlgItemInt
-    ; disable policy fields that are locked by HKLM
-    cmp     dword ptr [g_pol_len_lock], 0
-    je      cp_len_ok
-    mov     rcx, qword ptr [rbp-8]
-    mov     edx, IDC_C_LEN
-    call    GetDlgItem
-    mov     rcx, rax
-    xor     edx, edx
-    call    EnableWindow
-cp_len_ok:
-    cmp     dword ptr [g_pol_cls_lock], 0
-    je      cp_cls_ok
-    mov     rcx, qword ptr [rbp-8]
-    mov     edx, IDC_C_CLS
-    call    GetDlgItem
-    mov     rcx, rax
-    xor     edx, edx
-    call    EnableWindow
-cp_cls_ok:
-    add     rsp, 32
-    mov     eax, dword ptr [g_pol_len_lock]
-    or      eax, dword ptr [g_pol_cls_lock]
-    jz      cp_init_done
-    WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_C_STATUS, addr s_pollocked
-cp_init_done:
+    mov     edx, IDOK
+    call    theme_attach
+    call    gui_pwbars_init                  ; build the colour-line brushes
+    ; placeholder cue text inside the two password boxes
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_C_PW, EM_SETCUEBANNER, 1, addr cue_pw
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_C_PW2, EM_SETCUEBANNER, 1, addr cue_pw2
+    mov     rcx, qword ptr [rbp-8]           ; prime the colour lines + Create state
+    call    gui_pw_strength
     mov     eax, 1
     jmp     cp_ret
 cp_cmd:
-    movzx   eax, r8w
+    movzx   eax, r8w                         ; LOWORD(wParam) = control id
+    mov     r10d, r8d
+    shr     r10d, 16                         ; HIWORD(wParam) = notification code
+    cmp     eax, IDC_C_INFO
+    je      cp_info
+    cmp     eax, IDC_C_PW
+    je      cp_pwchg
+    cmp     eax, IDC_C_PW2
+    je      cp_pwchg
     cmp     eax, IDOK
     je      cp_ok
     cmp     eax, IDCANCEL
     je      cp_cancel
+cp_ignore:
     xor     eax, eax
+    jmp     cp_ret
+cp_pwchg:
+    cmp     r10d, EN_CHANGE
+    jne     cp_ignore
+    mov     rcx, qword ptr [rbp-8]           ; a password box changed -> recompute
+    call    gui_pw_strength
+    mov     eax, 1
+    jmp     cp_ret
+cp_info:
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_show_info
+    mov     eax, 1
     jmp     cp_ret
 cp_ok:
     mov     rcx, qword ptr [rbp-8]
@@ -1852,9 +2181,10 @@ cp_ret:
     ret
 create_proc endp
 
-; gui_resolve_vault() - pick the vault path from the registry (HKLM>HKCU), or
-;   fall back to a default Documents\vault.vordr that the first unlock creates.
-;   Sets g_vpath / g_vpath_set / g_create / g_is_default.
+; gui_resolve_vault() - decide which vault to mount at startup.
+;   Path:  HKLM (if set) > HKCU (if set) > default Documents\vault.vordr.
+;   Mode:  no file at that path -> create (g_create=1); file present -> open.
+;   Sets g_vpath / g_vpath_set / g_create / g_is_default / g_vault_lock.
 gui_resolve_vault proc frame
     FRAME_PROLOG 32
     mov     dword ptr [g_is_default], 0
@@ -1862,31 +2192,27 @@ gui_resolve_vault proc frame
     lea     rcx, [g_vpath]
     mov     edx, 1024
     lea     r8, [g_vault_lock]
-    call    reg_load_vault
+    call    reg_load_vault                  ; HKLM>HKCU registered path, if any
     test    eax, eax
-    jz      grv_default
-    mov     dword ptr [g_vpath_set], 1
-    mov     dword ptr [g_create], 0
-    FRAME_EPILOG
-    ret
-grv_default:
+    jnz     grv_havepath
+    ; nothing in the registry -> fall back to the default Documents\vault.vordr
     lea     rcx, [g_vpath]
     call    cfg_default_vault
     test    eax, eax
     jz      grv_none
+    mov     dword ptr [g_is_default], 1     ; first run registers this path in HKCU
+grv_havepath:
     mov     dword ptr [g_vpath_set], 1
-    mov     dword ptr [g_is_default], 1
-    ; if the default vault file already exists, OPEN it (never overwrite);
-    ; otherwise this is a true first run -> create it
+    ; create vs open is decided purely by whether a file exists at the path
     lea     rcx, [g_vpath]
     call    gui_file_exists
     test    eax, eax
-    jz      grv_def_new
-    mov     dword ptr [g_create], 0          ; existing default -> unlock
+    jz      grv_create
+    mov     dword ptr [g_create], 0          ; file present -> TPM / password unlock
     FRAME_EPILOG
     ret
-grv_def_new:
-    mov     dword ptr [g_create], 1          ; no file -> create
+grv_create:
+    mov     dword ptr [g_create], 1          ; no file -> create + set-password
     FRAME_EPILOG
     ret
 grv_none:
@@ -1920,9 +2246,15 @@ gta_no:
 gui_try_tpm_auto endp
 
 gui_main proc frame
-    FRAME_PROLOG 32
+    FRAME_PROLOG 48
     WINCALL GetModuleHandleW, 0
     mov     qword ptr [g_hinst], rax
+    mov     dword ptr [rbp-24], 8           ; INITCOMMONCONTROLSEX.dwSize
+    mov     dword ptr [rbp-20], 4000h       ; ICC_STANDARD_CLASSES (edit cue banners)
+    WINCALL InitCommonControlsEx, addr rbp-24
+    call    theme_boot                      ; detect GPU/CPU tier, build LUT + brushes
+    call    tpm_available                   ; is there a usable platform TPM?
+    mov     dword ptr [g_tpm_present], eax
     call    gui_load_policy                 ; min length / classes (HKLM>HKCU>def)
     call    gui_resolve_vault               ; registry path, or default to create
     ; startup shortcut: an existing vault with a TPM sidecar unlocks silently
@@ -1943,9 +2275,7 @@ gm_unlock:
     WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_UNLOCK, 0, addr unlock_proc, 0
     cmp     rax, 1
     je      gm_vault
-    cmp     rax, 2                          ; "Create new..." -> switch to create
-    je      gm_loop
-    jmp     gm_done                         ; cancelled -> exit
+    jmp     gm_done                         ; cancelled / closed -> exit
 gm_vault:
     WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_VAULT, 0, addr vault_proc, 0
     call    vault_lock                      ; wipe body + key on close
