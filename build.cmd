@@ -53,14 +53,21 @@ for %%f in (%SOURCES%) do (
     if errorlevel 1 goto :failed
 )
 
-rem SDK import libraries (adjust version here if the SDK is updated)
-set SDKLIB=C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\um\x64
-rem SDK bin (for mt.exe, used by /manifest:embed) - prepend to PATH if present
-set SDKBIN=C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64
+rem ---------------------------------------------------------------------------
+rem Windows SDK paths (adjust the version here if the SDK is updated).  The tools
+rem (ml64/rc/link) must be on PATH; passing the SDK include dirs to rc.exe
+rem explicitly means this script builds from a plain prompt too, not only from an
+rem "x64 Native Tools Command Prompt" that pre-sets the INCLUDE variable.
+rem ---------------------------------------------------------------------------
+set SDKROOT=C:\Program Files (x86)\Windows Kits\10
+set SDKVER=10.0.26100.0
+set SDKLIB=%SDKROOT%\Lib\%SDKVER%\um\x64
+set SDKBIN=%SDKROOT%\bin\%SDKVER%\x64
+set SDKINC=%SDKROOT%\Include\%SDKVER%
 if exist "%SDKBIN%\mt.exe" set PATH=%SDKBIN%;%PATH%
 
 echo === resource (VERSIONINFO) ===
-rc /nologo /fo obj\vordr.res vordr.rc
+rc /nologo /I "%SDKINC%\um" /I "%SDKINC%\shared" /I "%SDKINC%\ucrt" /fo obj\vordr.res vordr.rc
 if errorlevel 1 goto :failed
 
 echo === linking vordr.exe (%GUARDFLAGS%) ===

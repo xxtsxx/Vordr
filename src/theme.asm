@@ -40,6 +40,7 @@ extern SetBkColor:proc
 extern SetBkMode:proc
 extern GetStockObject:proc
 extern RoundRect:proc
+extern Ellipse:proc
 
 extern GetClientRect:proc
 extern InvalidateRect:proc
@@ -51,6 +52,7 @@ extern GetWindowTextW:proc
 extern GetClassNameW:proc
 extern GetWindowLongPtrW:proc
 extern SetWindowLongPtrW:proc
+extern GetDlgItem:proc
 extern SetTimer:proc
 extern SendMessageW:proc
 extern EnumChildWindows:proc
@@ -58,6 +60,7 @@ extern SetWindowTheme:proc
 extern SetLayeredWindowAttributes:proc
 extern GetWindowRect:proc
 extern ScreenToClient:proc
+extern GetFocus:proc
 extern IsWindowVisible:proc
 extern GetSystemInfo:proc
 extern GetSystemPowerStatus:proc
@@ -72,17 +75,22 @@ DM_SETDEFID         equ 401h
 THEME_TIMER         equ 9
 GWL_STYLE           equ -16
 GWL_EXSTYLE         equ -20
+GWL_USERDATA        equ -21                  ; 1 = Fluent accent (primary) button
 WS_CLIPCHILDREN     equ 02000000h
 WS_EX_LAYERED       equ 00080000h
 LWA_ALPHA           equ 2
 WIN_ALPHA           equ 250                  ; 98% of 255
 DWMWA_DARK          equ 20
+DWMWA_CORNER        equ 33                   ; DWMWA_WINDOW_CORNER_PREFERENCE
+DWMWCP_ROUND        equ 2                    ; rounded corners (Fluent)
 BI_RGB              equ 0
 DIB_RGB_COLORS      equ 0
 SRCCOPY             equ 0CC0020h
 HALFTONE            equ 4
 NULL_BRUSH          equ 5
 PS_SOLID            equ 0
+WHITE_BRUSH         equ 0
+NULL_PEN            equ 8
 BS_TYPEMASK         equ 0Fh
 BS_GROUPBOX         equ 7
 ODS_SELECTED        equ 1
@@ -92,16 +100,19 @@ BKMODE_TRANSP       equ 1
 DT_CFLAGS           equ 25h                 ; DT_CENTER|DT_VCENTER|DT_SINGLELINE
 DT_LFLAGS           equ 24h                 ; DT_LEFT|DT_VCENTER|DT_SINGLELINE
 
-; ---- flat dark palette (COLORREF 0x00BBGGRR) --------------------------------
-COL_BG       equ 001E1F1Fh                  ; main window      #1F1F1E
-COL_PANEL    equ 00262626h                  ; input area bg    #262626
-COL_FRAME    equ 00373737h                  ; input area frame #373737
-COL_BTN      equ 00262626h                  ; button face
-COL_BTNSEL   equ 00333333h                  ; button face (pressed)
-COL_TEXT     equ 00E9E0DFh                  ; primary text
-COL_TEXTDIM  equ 00989898h                  ; secondary text
-COL_BORDER   equ 00373737h                  ; hairline border  #373737
-COL_ACCENT   equ 00B4D23Ah                  ; teal accent (default button)
+; ---- Fluent 2 dark palette (COLORREF 0x00BBGGRR) ----------------------------
+COL_BG       equ 00202020h                  ; SolidBackgroundFillColorBase #202020
+COL_PANEL    equ 002D2D2Dh                  ; ControlFillColorDefault      #2D2D2D
+COL_FRAME    equ 003D3D3Dh                  ; ControlStroke                #3D3D3D
+COL_BTN      equ 002D2D2Dh                  ; button face (rest)           #2D2D2D
+COL_BTNSEL   equ 002A2A2Ah                  ; button face (pressed)        #2A2A2A
+COL_TEXT     equ 00FFFFFFh                  ; TextFillColorPrimary         #FFFFFF
+COL_TEXTDIM  equ 00C8C8C8h                  ; TextFillColorSecondary       #C8C8C8
+COL_BORDER   equ 003D3D3Dh                  ; control hairline stroke      #3D3D3D
+COL_ACCENT   equ 00FFC24Ch                  ; AccentFillColorDefault       #4CC2FF
+COL_ACCSEL   equ 00DBA03Ah                  ; accent pressed               #3AA0DB
+COL_ONACC    equ 00000000h                  ; text on accent fill          #000000
+COL_FOCUS    equ 00FFC24Ch                  ; focus underline = accent     #4CC2FF
 
 ; aurora-borealis tuning: vertical curtains rising from the horizon, a star
 ;   field above, slow drift.  Darker than a flat glow.
@@ -144,9 +155,16 @@ g_br_panel  dq 0
 g_br_frame  dq 0
 g_br_btn    dq 0
 g_br_btnsel dq 0
+g_br_accent dq 0                            ; Fluent accent fill (primary button)
+g_br_accsel dq 0                            ; Fluent accent fill pressed
+g_br_dim    dq 0                            ; #C8C8C8 (toggle off thumb)
 g_pen_bd    dq 0
 g_pen_acc   dq 0
+g_pen_focus dq 0                            ; 2px accent focus underline
 g_font_big  dq 0                            ; large glyph font for toolbar buttons
+g_font_icon dq 0                            ; Segoe Fluent Icons (PUA glyph buttons)
+public g_font_totp
+g_font_totp dq 0                            ; slightly larger font for the TOTP code
 g_frame_hdc dq 0                            ; EnumChildWindows frame-draw context
 g_frame_par dq 0
 
@@ -154,6 +172,8 @@ td_dark label word                      ; control theme class for dark scrollbar
     dw 'D','a','r','k','M','o','d','e','_','E','x','p','l','o','r','e','r', 0
 td_font label word                      ; toolbar glyph font face
     dw 'S','e','g','o','e',' ','U','I',0
+td_iconfont label word                  ; Fluent icon font (PUA glyphs e.g. trashcan)
+    dw 'S','e','g','o','e',' ','F','l','u','e','n','t',' ','I','c','o','n','s',0
 
 .data?
 align 16
@@ -309,13 +329,27 @@ theme_boot proc frame
     mov     qword ptr [g_br_btn], rax
     WINCALL CreateSolidBrush, COL_BTNSEL
     mov     qword ptr [g_br_btnsel], rax
+    WINCALL CreateSolidBrush, COL_ACCENT
+    mov     qword ptr [g_br_accent], rax
+    WINCALL CreateSolidBrush, COL_ACCSEL
+    mov     qword ptr [g_br_accsel], rax
+    WINCALL CreateSolidBrush, COL_TEXTDIM
+    mov     qword ptr [g_br_dim], rax
     WINCALL CreatePen, PS_SOLID, 1, COL_BORDER
     mov     qword ptr [g_pen_bd], rax
     WINCALL CreatePen, PS_SOLID, 1, COL_ACCENT
     mov     qword ptr [g_pen_acc], rax
-    ; large semibold font for the small toolbar symbol buttons (+ pencil -)
-    WINCALL CreateFontW, -18, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, addr td_font
+    WINCALL CreatePen, PS_SOLID, 2, COL_FOCUS
+    mov     qword ptr [g_pen_focus], rax
+    ; large semibold font for the small toolbar symbol buttons (+ pencil)
+    WINCALL CreateFontW, -18, 0, 0, 0, 100, 0, 0, 0, 1, 0, 0, 5, 0, addr td_font
     mov     qword ptr [g_font_big], rax
+    ; Fluent icon font for PUA glyph buttons (the trashcan)
+    WINCALL CreateFontW, -18, 0, 0, 0, 100, 0, 0, 0, 1, 0, 0, 5, 0, addr td_iconfont
+    mov     qword ptr [g_font_icon], rax
+    ; slightly larger semibold font for the live TOTP code box
+    WINCALL CreateFontW, -16, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, addr td_font
+    mov     qword ptr [g_font_totp], rax
     FRAME_EPILOG
     ret
 theme_boot endp
@@ -631,6 +665,8 @@ theme_attach proc frame
     mov     dword ptr [rbp-32], edx
     mov     dword ptr [rbp-40], 1
     WINCALL DwmSetWindowAttribute, qword ptr [rbp-24], DWMWA_DARK, addr rbp-40, 4
+    mov     dword ptr [rbp-40], DWMWCP_ROUND          ; Fluent rounded window corners
+    WINCALL DwmSetWindowAttribute, qword ptr [rbp-24], DWMWA_CORNER, addr rbp-40, 4
     WINCALL GetWindowLongPtrW, qword ptr [rbp-24], GWL_STYLE
     or      rax, WS_CLIPCHILDREN            ; clip children so the frame ring isn't overpainted
     WINCALL SetWindowLongPtrW, qword ptr [rbp-24], GWL_STYLE, rax
@@ -644,6 +680,9 @@ theme_attach proc frame
     cmp     dword ptr [rbp-32], 0
     je      ta_done
     WINCALL SendMessageW, qword ptr [rbp-24], DM_SETDEFID, qword ptr [rbp-32], 0
+    ; tag the default button so theme_drawitem paints it as the accent primary
+    WINCALL GetDlgItem, qword ptr [rbp-24], dword ptr [rbp-32]
+    WINCALL SetWindowLongPtrW, rax, GWL_USERDATA, 1
 ta_done:
     FRAME_EPILOG
     ret
@@ -708,12 +747,13 @@ theme_overlay proc
     ret
 theme_overlay endp
 
-; frame_cb(rcx=child, rdx=lparam) -> BOOL - draw a #373737 frame around each
-;   visible Edit / ListBox so the input areas are segmented.  EnumChildWindows cb.
+; frame_cb(rcx=child, rdx=lparam) -> BOOL - draw a Fluent bottom-border underline
+;   under each visible Edit: 1px #3D3D3D at rest, 2px accent when focused.
+;   EnumChildWindows callback.  src RECT @ [rbp-40], underline RECT @ [rbp-72].
 frame_cb proc
     push    rbp
     mov     rbp, rsp
-    sub     rsp, 96                          ; [rbp-8] child  RECT @ [rbp-40]
+    sub     rsp, 112
     mov     qword ptr [rbp-8], rcx
     mov     rcx, qword ptr [rbp-8]
     call    IsWindowVisible
@@ -724,28 +764,40 @@ frame_cb proc
     mov     r8d, 16
     call    GetClassNameW
     movzx   eax, word ptr [g_clsbuf]
-    cmp     eax, 'E'                          ; "Edit"
-    je      fc_frame
-    cmp     eax, 'L'                          ; "ListBox"
-    je      fc_frame
-    jmp     fc_skip
-fc_frame:
+    cmp     eax, 'E'                          ; only "Edit" controls get the underline
+    jne     fc_skip
     mov     rcx, qword ptr [rbp-8]
     lea     rdx, [rbp-40]
-    call    GetWindowRect                     ; screen rect
+    call    GetWindowRect                     ; screen rect L,T,R,B
     mov     rcx, qword ptr [g_frame_par]
-    lea     rdx, [rbp-40]                     ; top-left point
+    lea     rdx, [rbp-40]                     ; left/top -> client
     call    ScreenToClient
     mov     rcx, qword ptr [g_frame_par]
-    lea     rdx, [rbp-32]                     ; bottom-right point
+    lea     rdx, [rbp-32]                     ; right/bottom -> client
     call    ScreenToClient
-    dec     dword ptr [rbp-40]                ; inflate by 1px
-    dec     dword ptr [rbp-36]
-    inc     dword ptr [rbp-32]
-    inc     dword ptr [rbp-28]
-    mov     rcx, qword ptr [g_frame_hdc]
-    lea     rdx, [rbp-40]
+    ; underline rect spans the field width, sitting on its bottom edge
+    mov     eax, dword ptr [rbp-40]           ; left
+    mov     dword ptr [rbp-72], eax
+    mov     eax, dword ptr [rbp-32]           ; right
+    mov     dword ptr [rbp-64], eax
+    mov     eax, dword ptr [rbp-28]           ; bottom (B)
+    mov     dword ptr [rbp-68], eax           ; underline top = B
+    call    GetFocus
+    cmp     rax, qword ptr [rbp-8]
+    je      fc_focus
+    mov     eax, dword ptr [rbp-28]
+    add     eax, 1
+    mov     dword ptr [rbp-60], eax           ; 1px
     mov     r8, qword ptr [g_br_frame]
+    jmp     fc_fill
+fc_focus:
+    mov     eax, dword ptr [rbp-28]
+    add     eax, 2
+    mov     dword ptr [rbp-60], eax           ; 2px accent
+    mov     r8, qword ptr [g_br_accent]
+fc_fill:
+    mov     rcx, qword ptr [g_frame_hdc]
+    lea     rdx, [rbp-72]
     call    FillRect
 fc_skip:
     mov     eax, 1
@@ -764,6 +816,12 @@ theme_erase proc frame
     mov     qword ptr [rbp-32], rdx           ; hwnd
     WINCALL GetClientRect, qword ptr [rbp-32], addr rbp-72
     WINCALL FillRect, qword ptr [rbp-24], addr rbp-72, qword ptr [g_br_bg]
+    ; Fluent input underlines: 1px rest / 2px accent-on-focus under each Edit
+    mov     rax, qword ptr [rbp-24]
+    mov     qword ptr [g_frame_hdc], rax
+    mov     rax, qword ptr [rbp-32]
+    mov     qword ptr [g_frame_par], rax
+    WINCALL EnumChildWindows, qword ptr [rbp-32], addr frame_cb, 0
     mov     eax, 1
     FRAME_EPILOG
     ret
@@ -867,33 +925,59 @@ tdi_notstatic:
     and     eax, BS_TYPEMASK
     cmp     eax, BS_GROUPBOX
     je      tdi_group
-    ; ---------- push button --------------------------------------------------
+    ; ---------- push button (Fluent: accent primary / neutral standard) ------
+    WINCALL GetWindowLongPtrW, qword ptr [rbp-40], GWL_USERDATA
+    test    rax, rax
+    jnz     tdi_accent
+    ; standard button - control fill + hairline stroke + light text
     mov     rax, qword ptr [g_br_btn]
     test    dword ptr [rbp-48], ODS_SELECTED
-    jz      tdi_face
+    jz      @F
     mov     rax, qword ptr [g_br_btnsel]
-tdi_face:
-    WINCALL SelectObject, qword ptr [rbp-32], rax
-    mov     rax, qword ptr [g_pen_bd]
-    test    dword ptr [rbp-48], ODS_DEFAULT
-    jz      tdi_pen
-    mov     rax, qword ptr [g_pen_acc]
-tdi_pen:
-    WINCALL SelectObject, qword ptr [rbp-32], rax
+@@: WINCALL SelectObject, qword ptr [rbp-32], rax
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_pen_bd]
+    mov     dword ptr [rbp-116], COL_TEXT
+    jmp     tdi_btnshape
+tdi_accent:
+    test    dword ptr [rbp-48], ODS_DISABLED  ; Fluent disabled accent = muted neutral
+    jz      tdi_acc_on
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_br_btn]
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_pen_bd]
+    mov     dword ptr [rbp-116], COL_TEXTDIM
+    jmp     tdi_btnshape
+tdi_acc_on:
+    ; primary button - accent fill + black text
+    mov     rax, qword ptr [g_br_accent]
+    test    dword ptr [rbp-48], ODS_SELECTED
+    jz      @F
+    mov     rax, qword ptr [g_br_accsel]
+@@: WINCALL SelectObject, qword ptr [rbp-32], rax
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_pen_acc]
+    mov     dword ptr [rbp-116], COL_ONACC
+tdi_btnshape:
     WINCALL RoundRect, qword ptr [rbp-32], dword ptr [rbp-80], dword ptr [rbp-76], \
             dword ptr [rbp-72], dword ptr [rbp-68], 8, 8
-    mov     ecx, COL_TEXT
+    mov     ecx, dword ptr [rbp-116]
     test    dword ptr [rbp-48], ODS_DISABLED
     jz      tdi_tcol
     mov     ecx, COL_TEXTDIM
 tdi_tcol:
     WINCALL SetTextColor, qword ptr [rbp-32], rcx
-    ; small toolbar buttons (narrow) get the large glyph font for clarity
-    mov     eax, dword ptr [rbp-72]
-    sub     eax, dword ptr [rbp-80]
-    cmp     eax, 32
-    jge     tdi_dt
+    ; single-glyph buttons get a large glyph font for clarity; multi-char
+    ; captions (Reveal/Copy/Lock/accent buttons) keep the default font.  A
+    ; private-use glyph (>= U+E000) uses the Fluent icon font (e.g. trashcan).
+    cmp     word ptr [g_txtbuf+2], 0          ; >1 char -> a word caption
+    jne     tdi_dt
+    movzx   eax, word ptr [g_txtbuf]
+    test    eax, eax                          ; empty caption -> default
+    jz      tdi_dt
+    cmp     eax, 0E000h
+    jb      tdi_bigfont
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_font_icon]
+    jmp     tdi_drawglyph
+tdi_bigfont:
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_font_big]
+tdi_drawglyph:
     mov     qword ptr [rbp-112], rax           ; old font
     WINCALL DrawTextW, qword ptr [rbp-32], addr g_txtbuf, -1, addr rbp-80, DT_CFLAGS
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-112]
@@ -927,5 +1011,138 @@ tdi_group:
     FRAME_EPILOG
     ret
 theme_drawitem endp
+
+; =============================================================================
+; theme_toggle(rcx=lpdis, edx=on) -> 1 - draw a Fluent pill toggle switch in the
+;   owner-draw button's rect.  on: accent track + white thumb right; off: panel
+;   track + hairline border + dim thumb left.
+; =============================================================================
+public theme_toggle
+theme_toggle proc frame
+    FRAME_PROLOG 112
+    mov     qword ptr [rbp-24], rcx           ; lpdis
+    mov     dword ptr [rbp-36], edx           ; on
+    mov     r10, rcx
+    mov     rax, qword ptr [r10+32]
+    mov     qword ptr [rbp-32], rax           ; hdc
+    mov     eax, dword ptr [r10+40]
+    mov     dword ptr [rbp-40], eax           ; L
+    mov     eax, dword ptr [r10+44]
+    mov     dword ptr [rbp-44], eax           ; T
+    mov     eax, dword ptr [r10+48]
+    mov     dword ptr [rbp-48], eax           ; R
+    mov     eax, dword ptr [r10+52]
+    mov     dword ptr [rbp-52], eax           ; B
+    mov     eax, dword ptr [rbp-52]
+    sub     eax, dword ptr [rbp-44]
+    mov     dword ptr [rbp-56], eax           ; height = pill diameter
+    ; ---- track ----
+    cmp     dword ptr [rbp-36], 0
+    je      tg_off
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_br_accent]
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_pen_acc]
+    jmp     tg_track
+tg_off:
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_br_panel]
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_pen_bd]
+tg_track:
+    WINCALL RoundRect, qword ptr [rbp-32], dword ptr [rbp-40], dword ptr [rbp-44], \
+            dword ptr [rbp-48], dword ptr [rbp-52], dword ptr [rbp-56], dword ptr [rbp-56]
+    ; ---- thumb ----
+    cmp     dword ptr [rbp-36], 0
+    je      tg_tb_off
+    WINCALL GetStockObject, WHITE_BRUSH
+    jmp     tg_tb_sel
+tg_tb_off:
+    mov     rax, qword ptr [g_br_dim]
+tg_tb_sel:
+    WINCALL SelectObject, qword ptr [rbp-32], rax
+    WINCALL GetStockObject, NULL_PEN
+    WINCALL SelectObject, qword ptr [rbp-32], rax
+    mov     eax, dword ptr [rbp-56]
+    sub     eax, 4
+    mov     dword ptr [rbp-60], eax           ; thumb diameter (pad 2)
+    mov     eax, dword ptr [rbp-44]
+    add     eax, 2
+    mov     dword ptr [rbp-64], eax           ; y1 = T+2
+    mov     eax, dword ptr [rbp-52]
+    sub     eax, 2
+    mov     dword ptr [rbp-68], eax           ; y2 = B-2
+    cmp     dword ptr [rbp-36], 0
+    je      tg_tb_left
+    mov     eax, dword ptr [rbp-48]
+    sub     eax, 2
+    mov     dword ptr [rbp-76], eax           ; x2 = R-2
+    sub     eax, dword ptr [rbp-60]
+    mov     dword ptr [rbp-72], eax           ; x1 = x2 - thumbd
+    jmp     tg_tb_draw
+tg_tb_left:
+    mov     eax, dword ptr [rbp-40]
+    add     eax, 2
+    mov     dword ptr [rbp-72], eax           ; x1 = L+2
+    add     eax, dword ptr [rbp-60]
+    mov     dword ptr [rbp-76], eax           ; x2 = x1 + thumbd
+tg_tb_draw:
+    WINCALL Ellipse, qword ptr [rbp-32], dword ptr [rbp-72], dword ptr [rbp-64], \
+            dword ptr [rbp-76], dword ptr [rbp-68]
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+theme_toggle endp
+
+; =============================================================================
+; theme_progressbar(rcx=lpdis, edx=num, r8d=denom) -> 1 - draw a Fluent progress
+;   bar in the owner-draw control's rect: a hairline track with an accent fill of
+;   width num/denom from the left.  Used as the TOTP countdown under the code box.
+; =============================================================================
+public theme_progressbar
+theme_progressbar proc frame
+    FRAME_PROLOG 112
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-36], edx           ; num (seconds left)
+    mov     dword ptr [rbp-40], r8d           ; denom (window seconds)
+    mov     r10, rcx
+    mov     rax, qword ptr [r10+32]
+    mov     qword ptr [rbp-32], rax           ; hdc
+    mov     eax, dword ptr [r10+40]
+    mov     dword ptr [rbp-56], eax           ; rect L
+    mov     eax, dword ptr [r10+44]
+    mov     dword ptr [rbp-52], eax           ; rect T
+    mov     eax, dword ptr [r10+48]
+    mov     dword ptr [rbp-48], eax           ; rect R
+    mov     eax, dword ptr [r10+52]
+    mov     dword ptr [rbp-44], eax           ; rect B
+    WINCALL FillRect, qword ptr [rbp-32], addr rbp-56, qword ptr [g_br_frame]
+    mov     eax, dword ptr [rbp-48]
+    sub     eax, dword ptr [rbp-56]
+    mov     dword ptr [rbp-60], eax           ; width
+    cmp     dword ptr [rbp-40], 0             ; denom 0 -> no fill
+    jle     tpb_done
+    mov     eax, dword ptr [rbp-36]           ; clamp num to 0..denom
+    test    eax, eax
+    jns     tpb_lo
+    xor     eax, eax
+tpb_lo:
+    cmp     eax, dword ptr [rbp-40]
+    jle     tpb_hi
+    mov     eax, dword ptr [rbp-40]
+tpb_hi:
+    imul    eax, dword ptr [rbp-60]
+    xor     edx, edx
+    div     dword ptr [rbp-40]                ; eax = fill width
+    mov     ecx, dword ptr [rbp-56]
+    mov     dword ptr [rbp-76], ecx           ; fill L
+    mov     edx, dword ptr [rbp-52]
+    mov     dword ptr [rbp-72], edx           ; fill T
+    add     ecx, eax
+    mov     dword ptr [rbp-68], ecx           ; fill R = L + fill
+    mov     edx, dword ptr [rbp-44]
+    mov     dword ptr [rbp-64], edx           ; fill B
+    WINCALL FillRect, qword ptr [rbp-32], addr rbp-76, qword ptr [g_br_accent]
+tpb_done:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+theme_progressbar endp
 
 end
