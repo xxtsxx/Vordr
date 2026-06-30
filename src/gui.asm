@@ -2008,13 +2008,26 @@ grl_row:
 grl_chktotp:
     cmp     eax, VF_TOTP
     jne     grl_setyh
-    mov     dword ptr [rbp-44], 28
+    mov     dword ptr [rbp-44], 12               ; view mode: code + bar only (short)
+    cmp     dword ptr [g_editmode], 0
+    je      grl_setyh
+    mov     dword ptr [rbp-44], 28               ; edit mode: key + code + bar (tall)
 grl_setyh:
     mov     r10, qword ptr [rbp-32]
     mov     eax, dword ptr [rbp-40]
     mov     dword ptr [r10+FD_Y], eax
     mov     eax, dword ptr [rbp-44]
     mov     dword ptr [r10+FD_H], eax
+    ; TOTP code/bar vertical offset: under the key field while editing, at the row
+    ; top in view mode (where the key field is hidden)
+    mov     dword ptr [rbp-56], 0
+    mov     r10, qword ptr [rbp-32]
+    cmp     dword ptr [r10+FD_KIND], VF_TOTP
+    jne     grl_offdone
+    cmp     dword ptr [g_editmode], 0
+    je      grl_offdone
+    mov     dword ptr [rbp-56], 14
+grl_offdone:
     ; label  (158, y, 44, 11)
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
@@ -2052,23 +2065,24 @@ grl_copytotp:
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_COPY*8]
     mov     r8d, 318
     mov     r9d, dword ptr [rbp-40]
-    add     r9d, 14
+    add     r9d, dword ptr [rbp-56]
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 16, 11
 grl_copydone:
-    ; totp code (206, y+14, 110, 11) + bar (206, y+25, 110, 2)
+    ; totp code (206, y+off, 110, 11) + bar (206, y+off+11, 110, 2)
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_TCODE*8]
     mov     r8d, 206
     mov     r9d, dword ptr [rbp-40]
-    add     r9d, 14
+    add     r9d, dword ptr [rbp-56]
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 110, 11
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_TBAR*8]
     mov     r8d, 206
     mov     r9d, dword ptr [rbp-40]
-    add     r9d, 25
+    add     r9d, dword ptr [rbp-56]
+    add     r9d, 11
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 110, 2
     ; up/down/del  (368/382/396, y, 12, 11)
     mov     rcx, qword ptr [rbp-24]
@@ -2102,6 +2116,18 @@ grl_copydone:
     mov     rcx, qword ptr [r10+FD_HANDLES+DS_DEL*8]
     mov     edx, dword ptr [rbp-52]
     call    ShowWindow
+    ; TOTP key field + its reveal are edit-mode only (view shows just the live code)
+    mov     r10, qword ptr [rbp-32]
+    cmp     dword ptr [r10+FD_KIND], VF_TOTP
+    jne     grl_totptog_done
+    mov     rcx, qword ptr [r10+FD_HANDLES+DS_VALUE*8]
+    mov     edx, dword ptr [rbp-52]
+    call    ShowWindow
+    mov     r10, qword ptr [rbp-32]
+    mov     rcx, qword ptr [r10+FD_HANDLES+DS_REVEAL*8]
+    mov     edx, dword ptr [rbp-52]
+    call    ShowWindow
+grl_totptog_done:
     ; advance y
     mov     eax, dword ptr [rbp-40]
     add     eax, dword ptr [rbp-44]
@@ -2112,6 +2138,9 @@ grl_copydone:
 grl_done:
     mov     eax, dword ptr [rbp-40]              ; content bottom (DLU) for overflow checks
     mov     dword ptr [g_content_h], eax
+    ; repaint the dialog bg so controls just hidden (e.g. the TOTP key in view
+    ; mode) leave no ghost pixels behind
+    WINCALL InvalidateRect, qword ptr [rbp-24], 0, 1
     FRAME_EPILOG
     ret
 gui_rows_layout endp
@@ -3258,22 +3287,22 @@ vp_save:
     call    gui_copy_topmost
     jmp     vp_handled
 vp_save_real:
-    ; explicit Save: commit edits but stay in edit mode (the pencil leaves edit
-    ; mode; this just persists).  No-op outside edit mode / with nothing selected.
+    ; explicit Save: commit the edits and return to view mode.  No-op outside
+    ; edit mode / with nothing selected.
     cmp     dword ptr [g_editmode], 0
     je      vp_handled
     cmp     dword ptr [g_cur_idx], 0
     jl      vp_handled
     mov     rcx, qword ptr [rbp-8]
     call    gui_commit
+    mov     rcx, qword ptr [rbp-8]            ; leave edit mode (hides the TOTP key etc.)
+    xor     edx, edx
+    call    gui_set_editmode
     cmp     dword ptr [g_cur_idx], 0
     jl      vp_handled
     mov     rcx, qword ptr [rbp-8]
     mov     edx, dword ptr [g_cur_idx]
     call    gui_showdetail
-    mov     rcx, qword ptr [rbp-8]
-    mov     edx, 1
-    call    gui_set_editmode
     jmp     vp_handled
 vp_remove:
     cmp     dword ptr [g_cur_idx], 0
