@@ -97,6 +97,8 @@ extern MultiByteToWideChar:proc
 extern IsDlgButtonChecked:proc
 extern EnableWindow:proc
 extern GetDlgItem:proc
+extern GetFocus:proc
+extern CharUpperBuffW:proc
 extern SetFocus:proc
 extern SetDlgItemInt:proc
 extern GetDlgItemInt:proc
@@ -106,6 +108,7 @@ extern ShowWindow:proc
 extern MoveWindow:proc
 extern MapDialogRect:proc
 extern SendMessageW:proc
+extern PostMessageW:proc
 extern SetWindowTextW:proc
 extern CheckDlgButton:proc
 extern GetDlgCtrlID:proc
@@ -220,6 +223,9 @@ LB_ADDSTRING        equ 180h
 LB_RESETCONTENT     equ 184h
 LB_SETCURSEL        equ 186h
 LB_GETCURSEL        equ 188h
+LB_GETCOUNT         equ 18Bh
+LB_GETITEMDATA      equ 199h
+LB_SETITEMDATA      equ 19Ah
 LB_ERR              equ -1
 EM_SETSEL           equ 0B1h
 EM_SETREADONLY      equ 0CFh
@@ -322,6 +328,8 @@ DS_TCODE    equ 6               ; TOTP live-code display
 DS_TBAR     equ 7               ; TOTP drain bar
 DS_COPY     equ 8               ; copy-to-clipboard (secret value / TOTP code)
 IDC_V_ADDFIELD equ 230          ; "+ Add field" button (edit mode)
+IDC_V_SAVE   equ 231          ; "Save" button (edit mode, accent/primary)
+IDC_V_SEARCH equ 232          ; search/filter box under the entry list
 FIELD_AREA_BOTTOM equ 292        ; rows may not grow past here (DLU; Add-field is at 296)
 ; Win32 window styles (gui.asm builds controls at runtime; the RC gets these
 ; from windows.h, but this module needs the numeric values).
@@ -403,6 +411,7 @@ WSTR s_str_fair,    <Fair - meets the policy.>
 WSTR s_str_good,    <Good - meets the policy.>
 WSTR s_str_strong,  <Strong - meets the policy.>
 WSTR wt_newentry,   <New entry>
+WSTR cue_search,    <Search>
 WSTR t_tpminfo,     <TPM Unlock>
 WSTR m_tpminfo,     <The TPM chip in this computer can unlock the vault automatically on this device. You will not need to type the master password at startup. The password still works everywhere and is never stored.>
 WSTR cue_pw,        <Master password>
@@ -493,8 +502,8 @@ pm_custom label word
 align 4
 g_vault_ids label dword
     dd IDC_V_LIST, IDC_V_ADD, IDC_V_EDIT, IDC_V_REMOVE, IDC_V_TITLE
-    dd IDC_V_ADDFIELD, IDC_V_LOCK
-VAULT_ID_COUNT equ 7
+    dd IDC_V_ADDFIELD, IDC_V_SAVE, IDC_V_LOCK
+VAULT_ID_COUNT equ 8
 g_menu_ids label dword
     dd IDC_V_MBACK, IDC_V_MTITLE, IDC_V_MPOLL, IDC_V_MLENL, IDC_V_MLEN
     dd IDC_V_MCLSL, IDC_V_MCLS, IDC_V_MTPM, IDC_V_MTPML, IDC_V_MTPMINFO
@@ -540,7 +549,11 @@ g_cur_idx   dd ?                      ; entry currently shown/edited inline (-1=
 g_dirty     dd ?                      ; 1 = inline fields edited since last load/save
 g_loading   dd ?                      ; 1 = programmatically loading fields (ignore EN_CHANGE)
 g_editmode  dd ?                      ; 1 = detail fields editable (view/edit toggle)
+align 8
+g_vaulthwnd dq ?                      ; the open DLG_VAULT window (0 when not shown)
 align 2
+g_search_w  dw 512 dup (?)            ; current search query (wide, upper-cased)
+g_match_w   dw EBUF*2 dup (?)         ; scratch: a field value/label folded for matching
 g_vpath     dw 1024 dup (?)        ; chosen vault path (wide, NUL-terminated)
 g_pwbuf     dw 1024 dup (?)        ; password field (wide; wiped after use)
 g_pw2buf    dw 1024 dup (?)        ; confirm-password field (wide; wiped)
@@ -890,31 +903,245 @@ unlock_proc endp
 ; gui_poplist(rcx = hdlg) - clear and repopulate the entry list from the vault.
 ; =============================================================================
 gui_poplist proc frame
-    FRAME_PROLOG 64
+    FRAME_PROLOG 96
     mov     qword ptr [rbp-24], rcx
-    WINCALL SendDlgItemMessageW, rcx, IDC_V_LIST, LB_RESETCONTENT, 0, 0
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_RESETCONTENT, 0, 0
+    ; read the search query and upper-case it for case-insensitive matching
+    WINCALL GetDlgItemTextW, qword ptr [rbp-24], IDC_V_SEARCH, addr g_search_w, 255
+    mov     dword ptr [rbp-56], eax              ; query length (chars)
+    test    eax, eax
+    jz      gp_nofold
+    WINCALL CharUpperBuffW, addr g_search_w, dword ptr [rbp-56]
+gp_nofold:
     call    vault_count
-    mov     dword ptr [rbp-32], eax         ; count
-    mov     qword ptr [rbp-40], 0           ; index
+    mov     dword ptr [rbp-32], eax              ; count
+    mov     dword ptr [rbp-40], 0               ; index
 gp_loop:
-    mov     rax, qword ptr [rbp-40]
+    mov     eax, dword ptr [rbp-40]
     cmp     eax, dword ptr [rbp-32]
     jae     gp_done
-    mov     rcx, rax
-    lea     rdx, [rbp-48]                   ; &len
-    call    vault_title_at                  ; rax = title ptr, [rbp-48] = len
+    cmp     dword ptr [rbp-56], 0               ; empty query -> show everything
+    je      gp_show
+    mov     ecx, dword ptr [rbp-40]
+    call    gui_entry_matches
+    test    eax, eax
+    jz      gp_next
+gp_show:
+    mov     ecx, dword ptr [rbp-40]
+    lea     rdx, [rbp-48]                       ; &len
+    call    vault_title_at                      ; rax = title ptr, [rbp-48] = len
     mov     rcx, rax
     mov     edx, dword ptr [rbp-48]
     lea     r8, [g_conv_w]
     mov     r9d, EBUF*2-1
     call    gui_towide
     WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_ADDSTRING, 0, addr g_conv_w
-    inc     qword ptr [rbp-40]
+    mov     dword ptr [rbp-64], eax             ; sorted insert position
+    cmp     eax, 0
+    jl      gp_next
+    ; tag the new row with the real vault index (sorting/filtering scrambles order)
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_SETITEMDATA, \
+            dword ptr [rbp-64], qword ptr [rbp-40]
+gp_next:
+    inc     dword ptr [rbp-40]
     jmp     gp_loop
 gp_done:
     FRAME_EPILOG
     ret
 gui_poplist endp
+
+; gui_entry_matches(ecx = entry index) -> eax = 1 if any non-sensitive field
+;   (value or custom label) contains the current g_search_w query, else 0.
+;   Secret and TOTP fields are skipped entirely.  Assumes g_search_w is non-empty
+;   and already upper-cased.
+gui_entry_matches proc frame
+    FRAME_PROLOG 112
+    mov     dword ptr [rbp-24], ecx              ; idx
+    call    vault_field_count                    ; ecx still = idx
+    mov     dword ptr [rbp-32], eax              ; n
+    mov     dword ptr [rbp-40], 0               ; j
+gem_loop:
+    mov     eax, dword ptr [rbp-40]
+    cmp     eax, dword ptr [rbp-32]
+    jae     gem_no
+    mov     ecx, dword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-40]
+    lea     r8, [rbp-88]                         ; out struct: -88 kind, -80 lblptr,
+    call    vault_field_get                      ;   -72 lbllen, -64 valptr, -56 vallen
+    test    eax, eax
+    jz      gem_next
+    mov     eax, dword ptr [rbp-88]              ; kind
+    cmp     eax, VF_SECRET                       ; sensitive -> never searched
+    je      gem_next
+    cmp     eax, VF_TOTP
+    je      gem_next
+    mov     rcx, qword ptr [rbp-64]              ; value ptr
+    mov     edx, dword ptr [rbp-56]             ; value len
+    call    gem_field
+    test    eax, eax
+    jnz     gem_yes
+    mov     rax, qword ptr [rbp-72]             ; label len
+    test    rax, rax
+    jz      gem_next
+    mov     rcx, qword ptr [rbp-80]             ; label ptr
+    mov     edx, dword ptr [rbp-72]
+    call    gem_field
+    test    eax, eax
+    jnz     gem_yes
+gem_next:
+    inc     dword ptr [rbp-40]
+    jmp     gem_loop
+gem_yes:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gem_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gui_entry_matches endp
+
+; gem_field(rcx = utf8 ptr, edx = byte len) -> eax = 1 if the folded text contains
+;   the g_search_w query.  Converts to wide in g_match_w, upper-cases, substring-scans.
+gem_field proc frame
+    FRAME_PROLOG 32
+    test    rcx, rcx
+    jz      gf_no
+    test    edx, edx
+    jz      gf_no
+    lea     r8, [g_match_w]
+    mov     r9d, EBUF*2-1
+    call    gui_towide                           ; eax = wide chars written
+    test    eax, eax
+    jz      gf_no
+    WINCALL CharUpperBuffW, addr g_match_w, eax
+    lea     rcx, [g_match_w]
+    lea     rdx, [g_search_w]
+    call    wide_find
+    FRAME_EPILOG
+    ret
+gf_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gem_field endp
+
+; wide_find(rcx = haystack, rdx = needle) -> eax = 1 if needle is a substring of
+;   haystack (both NUL-terminated wide).  Leaf; needle assumed non-empty.
+wide_find proc
+    mov     r8, rcx                              ; hay cursor
+wf_outer:
+    cmp     word ptr [r8], 0
+    je      wf_no
+    mov     r9, r8                               ; hay compare ptr
+    mov     r10, rdx                             ; needle ptr
+wf_inner:
+    mov     ax, word ptr [r10]
+    test    ax, ax
+    jz      wf_yes                               ; needle exhausted -> match
+    mov     r11w, word ptr [r9]
+    test    r11w, r11w
+    jz      wf_no                                ; hay ended first
+    cmp     ax, r11w
+    jne     wf_adv
+    add     r9, 2
+    add     r10, 2
+    jmp     wf_inner
+wf_adv:
+    add     r8, 2
+    jmp     wf_outer
+wf_yes:
+    mov     eax, 1
+    ret
+wf_no:
+    xor     eax, eax
+    ret
+wide_find endp
+
+; gui_lb_seldata(rcx = hdlg) -> eax = vault index of the selected row (its item
+;   data), or -1 if nothing is selected.
+gui_lb_seldata proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_GETCURSEL, 0, 0
+    mov     dword ptr [rbp-32], eax
+    cmp     eax, LB_ERR
+    je      gls_none
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_GETITEMDATA, \
+            dword ptr [rbp-32], 0
+    FRAME_EPILOG
+    ret
+gls_none:
+    mov     eax, -1
+    FRAME_EPILOG
+    ret
+gui_lb_seldata endp
+
+; gui_lb_selbydata(rcx = hdlg, edx = vault index) -> eax = selected row, or -1.
+;   Finds the row whose item data == the vault index and selects it.
+gui_lb_selbydata proc frame
+    FRAME_PROLOG 80
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-32], edx              ; target vault index
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_GETCOUNT, 0, 0
+    mov     dword ptr [rbp-40], eax              ; row count
+    mov     dword ptr [rbp-48], 0               ; i
+glb_loop:
+    mov     eax, dword ptr [rbp-48]
+    cmp     eax, dword ptr [rbp-40]
+    jae     glb_none
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_GETITEMDATA, \
+            dword ptr [rbp-48], 0
+    cmp     eax, dword ptr [rbp-32]
+    jne     glb_next
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_SETCURSEL, \
+            dword ptr [rbp-48], 0
+    mov     eax, dword ptr [rbp-48]
+    FRAME_EPILOG
+    ret
+glb_next:
+    inc     dword ptr [rbp-48]
+    jmp     glb_loop
+glb_none:
+    mov     eax, -1
+    FRAME_EPILOG
+    ret
+gui_lb_selbydata endp
+
+; gui_copy_topmost(rcx = hdlg) - copy the first Secret of the top (first) listed
+;   record to the clipboard (auto-clear armed).  No-op if the list is empty or the
+;   top record has no Secret field.
+gui_copy_topmost proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_GETCOUNT, 0, 0
+    test    eax, eax
+    jz      gct_done                             ; empty list
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_GETITEMDATA, 0, 0
+    mov     dword ptr [rbp-32], eax              ; topmost vault index
+    cmp     eax, 0
+    jl      gct_done
+    mov     ecx, dword ptr [rbp-32]
+    mov     edx, VF_SECRET
+    lea     r8, [rbp-40]                         ; &len
+    call    vault_field_at                       ; rax = first secret ptr
+    test    rax, rax
+    jz      gct_done                             ; no password on that record
+    mov     rcx, rax
+    mov     edx, dword ptr [rbp-40]
+    lea     r8, [g_match_w]
+    mov     r9d, EBUF*2-1
+    call    gui_towide
+    lea     rdx, [g_match_w]
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_copy
+    lea     rcx, [g_match_w]                     ; scrub the staged plaintext
+    mov     edx, EBUF*4
+    call    secure_zero
+gct_done:
+    FRAME_EPILOG
+    ret
+gui_copy_topmost endp
 
 ; =============================================================================
 ; gui_showdetail(rcx = hdlg, edx = index) - fill the detail fields; secret is
@@ -1388,8 +1615,9 @@ gui_commit proc frame
     jz      gco_done
     dec     eax
     mov     dword ptr [g_cur_idx], eax
-    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_SETCURSEL, \
-            dword ptr [g_cur_idx], 0
+    mov     rcx, qword ptr [rbp-24]              ; reselect by vault index (list is sorted)
+    mov     edx, dword ptr [g_cur_idx]
+    call    gui_lb_selbydata
     jmp     gco_done
 gco_notitle:
     WINCALL gui_msgbox, qword ptr [rbp-24], addr s_notitle, addr t_err, <MB_OK or MB_ICONERROR>
@@ -1448,14 +1676,15 @@ sem_addcmd:
     mov     rcx, rax
     mov     edx, dword ptr [rbp-52]
     call    ShowWindow
+    mov     rcx, qword ptr [rbp-24]           ; Save button shares the Add-field visibility
+    mov     edx, IDC_V_SAVE
+    call    GetDlgItem
+    mov     rcx, rax
+    mov     edx, dword ptr [rbp-52]
+    call    ShowWindow
     mov     rcx, qword ptr [rbp-24]
     call    gui_rows_layout
-    lea     rax, [wb_edit]
-    cmp     dword ptr [rbp-32], 0
-    je      sem_glyph
-    lea     rax, [wb_save]
-sem_glyph:
-    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_EDIT, rax
+    ; the pencil button stays a pencil in both modes (Save handles committing)
     FRAME_EPILOG
     ret
 gui_set_editmode endp
@@ -2729,8 +2958,10 @@ vp_t_totp:
     call    gui_totp_refresh
     jmp     vp_handled
 vp_init:
+    mov     rax, qword ptr [rbp-8]            ; remember the window for the tray toggle
+    mov     qword ptr [g_vaulthwnd], rax
     mov     rcx, qword ptr [rbp-8]
-    mov     edx, IDC_V_LOCK
+    mov     edx, IDC_V_SAVE                   ; Save is the accent/primary (default) button
     call    theme_attach
     WINCALL SendMessageW, qword ptr [rbp-8], WM_GETFONT, 0, 0   ; font for runtime ctls
     mov     qword ptr [g_dlgfont], rax
@@ -2745,6 +2976,7 @@ vp_init:
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_ADD, addr wb_add
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_EDIT, addr wb_edit
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_REMOVE, addr wb_rem
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_V_SEARCH, EM_SETCUEBANNER, 1, addr cue_search
     mov     dword ptr [g_cur_idx], -1         ; no entry selected yet
     mov     dword ptr [g_dirty], 0
     mov     dword ptr [g_loading], 0
@@ -2753,7 +2985,18 @@ vp_init:
     mov     rcx, qword ptr [rbp-8]            ; start in view mode (fields locked)
     xor     edx, edx
     call    gui_set_editmode
-    mov     eax, 1
+    sub     rsp, 32                          ; foreground the window so keystrokes land
+    mov     rcx, qword ptr [rbp-8]            ;   here (launched from the tray, it is
+    call    SetForegroundWindow              ;   otherwise visible but not active)
+    add     rsp, 32
+    mov     rcx, qword ptr [rbp-8]            ; the search box takes focus on show
+    mov     edx, IDC_V_SEARCH
+    call    GetDlgItem
+    sub     rsp, 32
+    mov     rcx, rax
+    call    SetFocus
+    add     rsp, 32
+    xor     eax, eax                          ; we set focus ourselves -> return FALSE
     jmp     vp_ret
 vp_cmd:
     movzx   eax, r8w                        ; control id
@@ -2765,6 +3008,8 @@ vp_cmd:
     je      vp_refocus
     cmp     r10d, EN_CHANGE                 ; inline edit changed -> mark dirty
     jne     vp_cmd_disp
+    cmp     eax, IDC_V_SEARCH                 ; query changed -> re-filter the list
+    je      vp_searchchg
     cmp     eax, IDC_V_TITLE
     je      vp_setdirty
     cmp     eax, IDC_DYN_BASE                 ; any runtime row value/label edit
@@ -2780,6 +3025,8 @@ vp_cmd_disp:
     je      vp_add
     cmp     eax, IDC_V_EDIT
     je      vp_edit
+    cmp     eax, IDC_V_SAVE
+    je      vp_save
     cmp     eax, IDC_V_REMOVE
     je      vp_remove
     cmp     eax, IDC_V_LOCK
@@ -2815,6 +3062,10 @@ vp_setdirty:
     jne     vp_handled
     mov     dword ptr [g_dirty], 1
     jmp     vp_handled
+vp_searchchg:
+    mov     rcx, qword ptr [rbp-8]            ; refilter the entry list on each keystroke
+    call    gui_poplist
+    jmp     vp_handled
 vp_refocus:
     WINCALL InvalidateRect, qword ptr [rbp-8], 0, 1
     jmp     vp_handled
@@ -2830,10 +3081,10 @@ vp_list:
     cmp     r10d, LBN_SELCHANGE
     jne     vp_unhandled
     mov     rcx, qword ptr [rbp-8]
-    call    gui_lbsel
+    call    gui_lb_seldata                   ; B = clicked row's vault index (item data)
     cmp     eax, LB_ERR
     je      vp_handled
-    mov     dword ptr [rbp-16], eax          ; B = newly clicked index
+    mov     dword ptr [rbp-16], eax          ; B = newly clicked vault index
     ; if editing the current entry with unsaved changes, save it first
     cmp     dword ptr [g_editmode], 0
     je      vl_load
@@ -2850,7 +3101,9 @@ vp_list:
     dec     eax
     mov     dword ptr [rbp-16], eax
 vl_resel:
-    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_V_LIST, LB_SETCURSEL, dword ptr [rbp-16], 0
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, dword ptr [rbp-16]
+    call    gui_lb_selbydata
 vl_load:
     mov     rcx, qword ptr [rbp-8]
     mov     edx, dword ptr [rbp-16]
@@ -2940,7 +3193,9 @@ va_build:
     jz      vp_handled
     dec     eax
     mov     dword ptr [g_cur_idx], eax
-    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_V_LIST, LB_SETCURSEL, dword ptr [g_cur_idx], 0
+    mov     rcx, qword ptr [rbp-8]            ; reselect by vault index (list is sorted)
+    mov     edx, dword ptr [g_cur_idx]
+    call    gui_lb_selbydata
     mov     rcx, qword ptr [rbp-8]
     mov     edx, dword ptr [g_cur_idx]
     call    gui_showdetail
@@ -2988,6 +3243,37 @@ ve_off:
     mov     rcx, qword ptr [rbp-8]
     mov     edx, dword ptr [g_cur_idx]
     call    gui_showdetail
+    jmp     vp_handled
+vp_save:
+    ; Enter while typing in the search box (default-button command, focus in
+    ; search) copies the top record's first password instead of saving.
+    call    GetFocus
+    mov     qword ptr [rbp-24], rax
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_V_SEARCH
+    call    GetDlgItem
+    cmp     rax, qword ptr [rbp-24]
+    jne     vp_save_real
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_copy_topmost
+    jmp     vp_handled
+vp_save_real:
+    ; explicit Save: commit edits but stay in edit mode (the pencil leaves edit
+    ; mode; this just persists).  No-op outside edit mode / with nothing selected.
+    cmp     dword ptr [g_editmode], 0
+    je      vp_handled
+    cmp     dword ptr [g_cur_idx], 0
+    jl      vp_handled
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_commit
+    cmp     dword ptr [g_cur_idx], 0
+    jl      vp_handled
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, dword ptr [g_cur_idx]
+    call    gui_showdetail
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, 1
+    call    gui_set_editmode
     jmp     vp_handled
 vp_remove:
     cmp     dword ptr [g_cur_idx], 0
@@ -3046,6 +3332,7 @@ vp_lock_go:
     lea     rcx, [g_e_totp]
     mov     edx, 512
     call    secure_zero
+    mov     qword ptr [g_vaulthwnd], 0       ; window going away -> tray reopens it
     WINCALL EndDialog, qword ptr [rbp-8], 0
 vp_handled:
     mov     eax, 1
@@ -3854,11 +4141,19 @@ tray_wndproc proc
 twp_tray:
     movzx   eax, word ptr [rbp-32]           ; LOWORD(lParam) = mouse message
     cmp     eax, WM_LBUTTONUP
-    je      twp_open
+    je      twp_toggle
     cmp     eax, WM_LBUTTONDBLCLK
-    je      twp_open
+    je      twp_toggle
     cmp     eax, WM_RBUTTONUP
     je      twp_menu
+    xor     eax, eax
+    jmp     twp_ret
+twp_toggle:
+    ; left-click toggles: if the vault window is up, close it (back to tray);
+    ; otherwise open the unlock/vault flow.
+    cmp     qword ptr [g_vaulthwnd], 0
+    je      twp_open
+    WINCALL PostMessageW, qword ptr [g_vaulthwnd], WM_COMMAND, IDCANCEL, 0
     xor     eax, eax
     jmp     twp_ret
 twp_cmd:

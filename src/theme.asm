@@ -79,7 +79,7 @@ GWL_USERDATA        equ -21                  ; 1 = Fluent accent (primary) butto
 WS_CLIPCHILDREN     equ 02000000h
 WS_EX_LAYERED       equ 00080000h
 LWA_ALPHA           equ 2
-WIN_ALPHA           equ 250                  ; 98% of 255
+WIN_ALPHA           equ 255                  ; 100% (fully opaque)
 DWMWA_DARK          equ 20
 DWMWA_CORNER        equ 33                   ; DWMWA_WINDOW_CORNER_PREFERENCE
 DWMWCP_ROUND        equ 2                    ; rounded corners (Fluent)
@@ -670,7 +670,7 @@ theme_attach proc frame
     WINCALL GetWindowLongPtrW, qword ptr [rbp-24], GWL_STYLE
     or      rax, WS_CLIPCHILDREN            ; clip children so the frame ring isn't overpainted
     WINCALL SetWindowLongPtrW, qword ptr [rbp-24], GWL_STYLE, rax
-    ; translucent window: WS_EX_LAYERED + 92% alpha
+    ; WS_EX_LAYERED at full (100%) alpha — opaque window
     WINCALL GetWindowLongPtrW, qword ptr [rbp-24], GWL_EXSTYLE
     or      rax, WS_EX_LAYERED
     WINCALL SetWindowLongPtrW, qword ptr [rbp-24], GWL_EXSTYLE, rax
