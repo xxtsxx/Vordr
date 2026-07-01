@@ -1690,6 +1690,46 @@ gds_have:
     ret
 gui_draw_sbadge endp
 
+; gui_draw_field_cards(rcx=hdc, rdx=hdlg) - fill a COL_PANEL rounded card behind
+;   every field row (label+value edits already paint COL_PANEL, so they blend).
+gui_draw_field_cards proc frame
+    FRAME_PROLOG 160
+    mov     qword ptr [rbp-24], rcx            ; hdc
+    mov     qword ptr [rbp-32], rdx            ; hdlg
+    WINCALL CreateSolidBrush, 002D2D2Dh        ; COL_PANEL
+    mov     qword ptr [rbp-40], rax
+    WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-40]
+    mov     qword ptr [rbp-48], rax            ; old brush
+    WINCALL GetStockObject, 8                  ; NULL_PEN
+    WINCALL SelectObject, qword ptr [rbp-24], rax
+    mov     qword ptr [rbp-56], rax            ; old pen
+    mov     dword ptr [rbp-64], 0              ; row i
+gfc_lp:
+    mov     eax, dword ptr [rbp-64]
+    cmp     eax, dword ptr [g_field_count]
+    jae     gfc_done
+    imul    eax, eax, DESCSZ
+    lea     r10, [g_fields]
+    add     r10, rax
+    mov     eax, dword ptr [r10+FD_Y]
+    mov     dword ptr [rbp-84], eax            ; T
+    add     eax, dword ptr [r10+FD_H]
+    mov     dword ptr [rbp-76], eax            ; B
+    mov     dword ptr [rbp-88], 156            ; L
+    mov     dword ptr [rbp-80], 414            ; R
+    WINCALL MapDialogRect, qword ptr [rbp-32], addr rbp-88
+    WINCALL RoundRect, qword ptr [rbp-24], dword ptr [rbp-88], dword ptr [rbp-84], \
+            dword ptr [rbp-80], dword ptr [rbp-76], 10, 10
+    inc     dword ptr [rbp-64]
+    jmp     gfc_lp
+gfc_done:
+    WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-48]   ; restore brush
+    WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-56]   ; restore pen
+    WINCALL DeleteObject, qword ptr [rbp-40]
+    FRAME_EPILOG
+    ret
+gui_draw_field_cards endp
+
 ; gui_entry_matches(ecx = entry index) -> eax = 1 if any non-sensitive field
 ;   (value or custom label) contains the current g_search_w query, else 0.
 ;   Secret and TOTP fields are skipped entirely.  Assumes g_search_w is non-empty
@@ -3837,30 +3877,30 @@ grl_row:
     add     r10, rax
     mov     qword ptr [rbp-32], r10              ; desc
     mov     eax, dword ptr [r10+FD_KIND]
-    mov     dword ptr [rbp-44], 12               ; rowH
+    mov     dword ptr [rbp-44], 27               ; rowH (card = label band 14 + value)
     mov     dword ptr [rbp-48], 11               ; valH
     cmp     eax, VF_NOTES
     jne     grl_chkimg
-    mov     dword ptr [rbp-44], 40
+    mov     dword ptr [rbp-44], 54
     mov     dword ptr [rbp-48], 40
     jmp     grl_setyh
 grl_chkimg:
     cmp     eax, VF_IMAGE
     jne     grl_chkfile
-    mov     dword ptr [rbp-44], 60               ; image: thumbnail row
+    mov     dword ptr [rbp-44], 74               ; image: thumbnail row
     jmp     grl_setyh
 grl_chkfile:
     cmp     eax, VF_FILE
     jne     grl_chktotp
-    mov     dword ptr [rbp-44], 74               ; file: thumbnail + name + buttons
+    mov     dword ptr [rbp-44], 88               ; file: thumbnail + name + buttons
     jmp     grl_setyh
 grl_chktotp:
     cmp     eax, VF_TOTP
     jne     grl_setyh
-    mov     dword ptr [rbp-44], 12               ; view mode: code + bar only (short)
+    mov     dword ptr [rbp-44], 27               ; view mode: code + bar only (short)
     cmp     dword ptr [g_editmode], 0
     je      grl_setyh
-    mov     dword ptr [rbp-44], 28               ; edit mode: key + code + bar (tall)
+    mov     dword ptr [rbp-44], 42               ; edit mode: key + code + bar (tall)
 grl_setyh:
     mov     r10, qword ptr [rbp-32]
     mov     eax, dword ptr [rbp-40]
@@ -3877,26 +3917,30 @@ grl_setyh:
     je      grl_offdone
     mov     dword ptr [rbp-56], 14
 grl_offdone:
-    ; label  (158, y, 44, 11)
+    mov     eax, dword ptr [rbp-40]              ; content_y = card top + label band
+    add     eax, 14
+    mov     dword ptr [rbp-60], eax
+    ; label  (164, y+3, 176, 10) - caption across the top of the card
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_LABEL*8]
-    mov     r8d, 158
+    mov     r8d, 164
     mov     r9d, dword ptr [rbp-40]
-    WINCALL move_ctl, rcx, rdx, r8d, r9d, 44, 11
-    ; value  (206, y, 128, valH)
+    add     r9d, 3
+    WINCALL move_ctl, rcx, rdx, r8d, r9d, 176, 10
+    ; value  (164, content_y, 180, valH)
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_VALUE*8]
-    mov     r8d, 206
-    mov     r9d, dword ptr [rbp-40]
-    WINCALL move_ctl, rcx, rdx, r8d, r9d, 128, dword ptr [rbp-48]
-    ; reveal (338, y, 12, 12)
+    mov     r8d, 164
+    mov     r9d, dword ptr [rbp-60]
+    WINCALL move_ctl, rcx, rdx, r8d, r9d, 180, dword ptr [rbp-48]
+    ; reveal (348, content_y, 12, 12)
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_REVEAL*8]
-    mov     r8d, 338
-    mov     r9d, dword ptr [rbp-40]
+    mov     r8d, 348
+    mov     r9d, dword ptr [rbp-60]
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 12, 12
     ; copy: secret -> right cluster (352,y); totp -> next to the live code (318,y+14)
     mov     r10, qword ptr [rbp-32]
@@ -3904,16 +3948,16 @@ grl_offdone:
     je      grl_copytotp
     mov     rcx, qword ptr [rbp-24]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_COPY*8]
-    mov     r8d, 352
-    mov     r9d, dword ptr [rbp-40]
+    mov     r8d, 362
+    mov     r9d, dword ptr [rbp-60]
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 12, 12
     jmp     grl_copydone
 grl_copytotp:
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_COPY*8]
-    mov     r8d, 318
-    mov     r9d, dword ptr [rbp-40]
+    mov     r8d, 284
+    mov     r9d, dword ptr [rbp-60]
     add     r9d, dword ptr [rbp-56]
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 16, 11
 grl_copydone:
@@ -3921,36 +3965,39 @@ grl_copydone:
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_TCODE*8]
-    mov     r8d, 206
-    mov     r9d, dword ptr [rbp-40]
+    mov     r8d, 164
+    mov     r9d, dword ptr [rbp-60]
     add     r9d, dword ptr [rbp-56]
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 110, 11
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_TBAR*8]
-    mov     r8d, 206
-    mov     r9d, dword ptr [rbp-40]
+    mov     r8d, 164
+    mov     r9d, dword ptr [rbp-60]
     add     r9d, dword ptr [rbp-56]
     add     r9d, 11
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 110, 2
-    ; up/down/del  (368/382/396, y, 12, 11)
+    ; up/down/del  (350/366/382, y+2, 12, 11) - top-right of the card (edit mode)
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_UP*8]
-    mov     r8d, 368
+    mov     r8d, 350
     mov     r9d, dword ptr [rbp-40]
+    add     r9d, 2
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 12, 11
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_DOWN*8]
-    mov     r8d, 382
+    mov     r8d, 366
     mov     r9d, dword ptr [rbp-40]
+    add     r9d, 2
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 12, 11
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_DEL*8]
-    mov     r8d, 396
+    mov     r8d, 382
     mov     r9d, dword ptr [rbp-40]
+    add     r9d, 2
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 12, 11
     ; show/hide the reorder cluster per edit mode
     mov     r10, qword ptr [rbp-32]
@@ -3971,9 +4018,10 @@ grl_copydone:
     jne     grl_sbadge_done
     mov     rcx, qword ptr [rbp-24]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_SBADGE*8]
-    mov     r8d, 368
+    mov     r8d, 348
     mov     r9d, dword ptr [rbp-40]
-    WINCALL move_ctl, rcx, rdx, r8d, r9d, 46, 12
+    add     r9d, 2
+    WINCALL move_ctl, rcx, rdx, r8d, r9d, 48, 11
     mov     eax, dword ptr [rbp-52]           ; edit=SW_SHOW, view=SW_HIDE
     xor     eax, SW_SHOW                      ; badge shows in view (opposite)
     mov     r10, qword ptr [rbp-32]
@@ -3999,20 +4047,20 @@ grl_totptog_done:
     jne     grl_filelayout
     mov     rcx, qword ptr [rbp-24]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_THUMB*8]
-    mov     r8d, 206
-    mov     r9d, dword ptr [rbp-40]
+    mov     r8d, 164
+    mov     r9d, dword ptr [rbp-60]
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 120, 58
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_IMPORT*8]
-    mov     r8d, 330
-    mov     r9d, dword ptr [rbp-40]
+    mov     r8d, 290
+    mov     r9d, dword ptr [rbp-60]
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 34, 14
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_PASTE*8]
-    mov     r8d, 330
-    mov     r9d, dword ptr [rbp-40]
+    mov     r8d, 290
+    mov     r9d, dword ptr [rbp-60]
     add     r9d, 18
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 34, 14
     ; Import/Paste show only in edit mode
@@ -4029,43 +4077,43 @@ grl_filelayout:
     mov     r10, qword ptr [rbp-32]
     cmp     dword ptr [r10+FD_KIND], VF_FILE
     jne     grl_advance
-    mov     rcx, qword ptr [rbp-24]                  ; thumbnail (206,y,100,58)
+    mov     rcx, qword ptr [rbp-24]                  ; thumbnail (164,content_y,100,58)
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_THUMB*8]
-    mov     r8d, 206
-    mov     r9d, dword ptr [rbp-40]
+    mov     r8d, 164
+    mov     r9d, dword ptr [rbp-60]
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 100, 58
-    mov     rcx, qword ptr [rbp-24]                  ; filename (206,y+60,100,11)
+    mov     rcx, qword ptr [rbp-24]                  ; filename (164,content_y+60,100,11)
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_VALUE*8]
-    mov     r8d, 206
-    mov     r9d, dword ptr [rbp-40]
+    mov     r8d, 164
+    mov     r9d, dword ptr [rbp-60]
     add     r9d, 60
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 100, 11
-    mov     rcx, qword ptr [rbp-24]                  ; Choose (312,y,40,14)
+    mov     rcx, qword ptr [rbp-24]                  ; Choose (270,content_y,40,14)
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_IMPORT*8]
-    mov     r8d, 312
-    mov     r9d, dword ptr [rbp-40]
+    mov     r8d, 270
+    mov     r9d, dword ptr [rbp-60]
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 40, 14
-    mov     rcx, qword ptr [rbp-24]                  ; Paste (312,y+16,40,14)
+    mov     rcx, qword ptr [rbp-24]                  ; Paste (270,content_y+16,40,14)
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_PASTE*8]
-    mov     r8d, 312
-    mov     r9d, dword ptr [rbp-40]
+    mov     r8d, 270
+    mov     r9d, dword ptr [rbp-60]
     add     r9d, 16
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 40, 14
-    mov     rcx, qword ptr [rbp-24]                  ; Open (312,y+32,40,14)
+    mov     rcx, qword ptr [rbp-24]                  ; Open (270,content_y+32,40,14)
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_OPEN*8]
-    mov     r8d, 312
-    mov     r9d, dword ptr [rbp-40]
+    mov     r8d, 270
+    mov     r9d, dword ptr [rbp-60]
     add     r9d, 32
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 40, 14
-    mov     rcx, qword ptr [rbp-24]                  ; Save (312,y+48,40,14)
+    mov     rcx, qword ptr [rbp-24]                  ; Save (270,content_y+48,40,14)
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_EXPORT*8]
-    mov     r8d, 312
-    mov     r9d, dword ptr [rbp-40]
+    mov     r8d, 270
+    mov     r9d, dword ptr [rbp-60]
     add     r9d, 48
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 40, 14
     ; Choose + Paste show only in edit mode
@@ -5087,9 +5135,14 @@ vp_tpaint:
     call    theme_paint
     jmp     vp_ret
 vp_terase:
+    mov     qword ptr [rbp-16], r8            ; hdc
     mov     rcx, r8
     mov     rdx, qword ptr [rbp-8]
     call    theme_erase
+    mov     rcx, qword ptr [rbp-16]           ; draw the field cards on the erased bg
+    mov     rdx, qword ptr [rbp-8]
+    call    gui_draw_field_cards
+    mov     eax, 1
     jmp     vp_ret
 vp_tdraw:
     mov     r10, r9
