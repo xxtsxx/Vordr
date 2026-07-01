@@ -143,6 +143,8 @@ extern CheckDlgButton:proc
 extern GetDlgCtrlID:proc
 extern SetTextColor:proc
 extern SetBkMode:proc
+extern TextOutW:proc
+extern GetTextExtentPoint32W:proc
 extern SetBkColor:proc
 extern GetSysColorBrush:proc
 extern GetStockObject:proc
@@ -331,6 +333,15 @@ IDC_A_TEXT   equ 612
 IDC_A_OK     equ 613
 STM_SETICON  equ 0170h
 DLG_IMGVIEW  equ 620                  ; enlarge/export image viewer
+DLG_PWREAD   equ 700                  ; "read password" popup (class colors + phonetic)
+IDC_PR_COLOR equ 701
+IDC_PR_LEGEND equ 702
+IDC_PR_PHON  equ 703
+; password character-class colours (COLORREF 0x00BBGGRR)
+CLR_CLS_UPPER  equ 00FFC24Ch          ; blue
+CLR_CLS_LOWER  equ 00E8E8E8h          ; near-white
+CLR_CLS_DIGIT  equ 0060D060h          ; green
+CLR_CLS_SYMBOL equ 003C7DFFh          ; orange
 IDC_IV_PIC   equ 621
 IDC_IV_EXPORT equ 622
 CF_BITMAP    equ 2
@@ -560,6 +571,22 @@ gen_presets label dword                          ; {n, style, opt} per preset
     dd 8,  PWS_PIN,        0
     dd 32, PWS_HEX,        0
 GEN_PRESET_N equ 6
+align 4
+cls_colors label dword                           ; by class 0 upper/1 lower/2 digit/3 sym
+    dd CLR_CLS_UPPER, CLR_CLS_LOWER, CLR_CLS_DIGIT, CLR_CLS_SYMBOL
+f_mono label word
+    dw 'C','o','n','s','o','l','a','s', 0
+pr_sp2 dw ' ',' ', 0                              ; separators for the phonetic lines
+pr_crlf dw 13,10, 0
+pr_symdef dw 's','y','m','b','o','l', 0
+lg_upper dw 'A','B','C', 0
+lg_lower dw 'a','b','c', 0
+lg_digit dw '1','2','3', 0
+lg_sym   dw '!','@','#', 0
+pr_zero  dw '0', 0
+align 8
+lg_ptrs  dq lg_upper, lg_lower, lg_digit, lg_sym
+include phonetic.inc
 cls_edit label word
     dw 'E','d','i','t', 0
 cls_button label word
@@ -624,6 +651,8 @@ om_copyuser label word
     dw 'C','o','p','y',' ','u','s','e','r','n','a','m','e', 0
 om_delete label word
     dw 'D','e','l','e','t','e',' ','e','n','t','r','y', 0
+om_read label word
+    dw 'R','e','a','d',' ','p','a','s','s','w','o','r','d', 0
 t_created label word
     dw 'C','r','e','a','t','e','d',' ', 0
 t_modified label word
@@ -727,6 +756,8 @@ g_times_w   dw 128 dup (?)           ; "Created ... Modified ..." line (wide)
 g_st        dw 8 dup (?)             ; SYSTEMTIME scratch (FileTimeToSystemTime)
 g_genout    db 260 dup (?)           ; generator ASCII output (wiped after use)
 g_genout_w  dw 260 dup (?)           ; generator output widened for the edit
+g_readpw    dw 260 dup (?)           ; password being read out (wiped on close)
+g_phon_w    dw 4096 dup (?)          ; phonetic spelling text (wiped on close)
 align 8
 ; --- modular field-row model (runtime detail form) ---
 g_fields      db MAXROWS*DESCSZ dup (?)   ; row descriptors
@@ -745,6 +776,7 @@ g_cardfont    dq ?                         ; list entry title (semibold)
 g_subfont     dq ?                         ; list entry subtitle (regular, dim)
 g_titlefont   dq ?                         ; detail-header title (large semibold)
 g_chevfont    dq ?                         ; small Fluent icons for flat reorder chevrons
+g_monofont    dq ?                         ; monospace font for the colored password readout
 g_sub_w       dw 512 dup (?)               ; subtitle scratch (wide)
 g_cmpbuf      db 256 dup (?)               ; title-A copy for WM_COMPAREITEM
 align 4
@@ -1140,6 +1172,8 @@ gui_make_listfonts proc frame
     mov     qword ptr [g_titlefont], rax
     WINCALL CreateFontW, -11, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, addr f_iconname
     mov     qword ptr [g_chevfont], rax
+    WINCALL CreateFontW, -24, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, addr f_mono
+    mov     qword ptr [g_monofont], rax
 mlf_done:
     FRAME_EPILOG
     ret
@@ -4862,6 +4896,7 @@ gui_overflow_menu proc frame
     jz      gom_done
     WINCALL AppendMenuW, qword ptr [rbp-32], 0, 1, addr om_copypw
     WINCALL AppendMenuW, qword ptr [rbp-32], 0, 2, addr om_copyuser
+    WINCALL AppendMenuW, qword ptr [rbp-32], 0, 4, addr om_read
     WINCALL AppendMenuW, qword ptr [rbp-32], MF_SEPARATOR, 0, 0
     WINCALL AppendMenuW, qword ptr [rbp-32], 0, 3, addr om_delete
     lea     rcx, [rbp-56]                        ; POINT
@@ -4876,6 +4911,12 @@ gui_overflow_menu proc frame
     WINCALL PostMessageW, qword ptr [rbp-24], WM_COMMAND, IDC_V_REMOVE, 0
     jmp     gom_done
 gom_notdel:
+    cmp     dword ptr [rbp-44], 4
+    jne     gom_notread
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_read_password
+    jmp     gom_done
+gom_notread:
     cmp     dword ptr [rbp-44], 1
     je      gom_cppw
     cmp     dword ptr [rbp-44], 2
@@ -5004,6 +5045,396 @@ ggm_done:
     FRAME_EPILOG
     ret
 gui_gen_menu endp
+
+; gui_pw_class(ecx = char) -> eax = 0 upper / 1 lower / 2 digit / 3 symbol.  Leaf.
+gui_pw_class proc
+    cmp     cl, 'A'
+    jb      gpc_l
+    cmp     cl, 'Z'
+    ja      gpc_l
+    xor     eax, eax
+    ret
+gpc_l:
+    cmp     cl, 'a'
+    jb      gpc_d
+    cmp     cl, 'z'
+    ja      gpc_d
+    mov     eax, 1
+    ret
+gpc_d:
+    cmp     cl, '0'
+    jb      gpc_s
+    cmp     cl, '9'
+    ja      gpc_s
+    mov     eax, 2
+    ret
+gpc_s:
+    mov     eax, 3
+    ret
+gui_pw_class endp
+
+; gui_wapp_lc(rcx = dst, rdx = src wideZ, r8d = lowercase flag) -> rax = dst end.
+;   Appends src to dst (no NUL); lowercases A-Z when r8d != 0.  Leaf.
+gui_wapp_lc proc
+wal_lp:
+    movzx   eax, word ptr [rdx]
+    test    eax, eax
+    jz      wal_done
+    test    r8d, r8d
+    jz      wal_put
+    cmp     ax, 'A'
+    jb      wal_put
+    cmp     ax, 'Z'
+    ja      wal_put
+    add     ax, 20h
+wal_put:
+    mov     word ptr [rcx], ax
+    add     rcx, 2
+    add     rdx, 2
+    jmp     wal_lp
+wal_done:
+    mov     rax, rcx
+    ret
+gui_wapp_lc endp
+
+; gui_build_phonetic() - fill g_phon_w with "<c>  <Word>\r\n" for each char of
+;   g_readpw (NATO letters w/ case, digit + symbol names).
+gui_build_phonetic proc frame
+    FRAME_PROLOG 64
+    lea     rax, [g_phon_w]
+    mov     qword ptr [rbp-24], rax           ; dst cursor
+    mov     dword ptr [rbp-32], 0             ; i
+gbp_loop:
+    mov     eax, dword ptr [rbp-32]
+    lea     r10, [g_readpw]
+    movzx   ecx, word ptr [r10+rax*2]
+    test    ecx, ecx
+    jz      gbp_done
+    mov     dword ptr [rbp-40], ecx           ; char
+    mov     r10, qword ptr [rbp-24]           ; append the char itself
+    mov     word ptr [r10], cx
+    add     qword ptr [rbp-24], 2
+    mov     rcx, qword ptr [rbp-24]           ; "  "
+    lea     rdx, [pr_sp2]
+    xor     r8d, r8d
+    call    gui_wapp_lc
+    mov     qword ptr [rbp-24], rax
+    ; resolve the phonetic word + lowercase flag
+    mov     ecx, dword ptr [rbp-40]
+    cmp     ecx, 'A'
+    jb      gbp_notU
+    cmp     ecx, 'Z'
+    ja      gbp_notU
+    sub     ecx, 'A'
+    lea     r10, [nato_ptrs]
+    mov     rdx, qword ptr [r10+rcx*8]
+    xor     r8d, r8d
+    jmp     gbp_have
+gbp_notU:
+    cmp     ecx, 'a'
+    jb      gbp_notL
+    cmp     ecx, 'z'
+    ja      gbp_notL
+    sub     ecx, 'a'
+    lea     r10, [nato_ptrs]
+    mov     rdx, qword ptr [r10+rcx*8]
+    mov     r8d, 1
+    jmp     gbp_have
+gbp_notL:
+    cmp     ecx, '0'
+    jb      gbp_sym
+    cmp     ecx, '9'
+    ja      gbp_sym
+    sub     ecx, '0'
+    lea     r10, [digit_ptrs]
+    mov     rdx, qword ptr [r10+rcx*8]
+    xor     r8d, r8d
+    jmp     gbp_have
+gbp_sym:
+    lea     r10, [sym_chars]
+    xor     r9d, r9d
+gbp_symf:
+    cmp     r9d, SYM_COUNT
+    jae     gbp_symdef
+    movzx   eax, byte ptr [r10+r9]
+    cmp     eax, dword ptr [rbp-40]
+    je      gbp_symhit
+    inc     r9d
+    jmp     gbp_symf
+gbp_symhit:
+    lea     r11, [sym_ptrs]
+    mov     rdx, qword ptr [r11+r9*8]
+    xor     r8d, r8d
+    jmp     gbp_have
+gbp_symdef:
+    lea     rdx, [pr_symdef]
+    xor     r8d, r8d
+gbp_have:
+    mov     qword ptr [rbp-48], rdx           ; word ptr
+    mov     dword ptr [rbp-52], r8d           ; lower flag
+    mov     rcx, qword ptr [rbp-24]
+    mov     rdx, qword ptr [rbp-48]
+    mov     r8d, dword ptr [rbp-52]
+    call    gui_wapp_lc
+    mov     qword ptr [rbp-24], rax
+    mov     rcx, qword ptr [rbp-24]           ; CRLF
+    lea     rdx, [pr_crlf]
+    xor     r8d, r8d
+    call    gui_wapp_lc
+    mov     qword ptr [rbp-24], rax
+    inc     dword ptr [rbp-32]
+    cmp     dword ptr [rbp-32], 256
+    jb      gbp_loop
+gbp_done:
+    mov     r10, qword ptr [rbp-24]
+    mov     word ptr [r10], 0
+    FRAME_EPILOG
+    ret
+gui_build_phonetic endp
+
+; gui_draw_colorpw(rcx = lpdis) - draw g_readpw in monospace, each char coloured
+;   by its character class, wrapping within the control rect.
+gui_draw_colorpw proc frame
+    FRAME_PROLOG 160
+    mov     qword ptr [rbp-24], rcx
+    mov     r10, rcx
+    mov     rax, qword ptr [r10+32]
+    mov     qword ptr [rbp-32], rax           ; hdc
+    mov     eax, dword ptr [r10+40]
+    mov     dword ptr [rbp-40], eax           ; L
+    mov     eax, dword ptr [r10+44]
+    mov     dword ptr [rbp-44], eax           ; T
+    mov     eax, dword ptr [r10+48]
+    mov     dword ptr [rbp-48], eax           ; R
+    ; background
+    WINCALL CreateSolidBrush, 00202020h
+    mov     qword ptr [rbp-56], rax
+    mov     r10, qword ptr [rbp-24]
+    lea     rdx, [r10+40]
+    WINCALL FillRect, qword ptr [rbp-32], rdx, qword ptr [rbp-56]
+    WINCALL DeleteObject, qword ptr [rbp-56]
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_monofont]
+    mov     qword ptr [rbp-64], rax           ; old font
+    WINCALL SetBkMode, qword ptr [rbp-32], 1
+    ; measure the (monospace) cell size from "0"
+    WINCALL GetTextExtentPoint32W, qword ptr [rbp-32], addr pr_zero, 1, addr rbp-88
+    mov     eax, dword ptr [rbp-88]           ; cell width (cx)
+    mov     dword ptr [rbp-72], eax
+    mov     eax, dword ptr [rbp-84]           ; cell height (cy)
+    add     eax, 2
+    mov     dword ptr [rbp-76], eax           ; line height
+    mov     eax, dword ptr [rbp-40]
+    add     eax, 4
+    mov     dword ptr [rbp-92], eax           ; x
+    mov     eax, dword ptr [rbp-44]
+    add     eax, 2
+    mov     dword ptr [rbp-96], eax           ; y
+    mov     dword ptr [rbp-100], 0            ; i
+gcp_loop:
+    mov     eax, dword ptr [rbp-100]
+    lea     r10, [g_readpw]
+    movzx   ecx, word ptr [r10+rax*2]
+    test    ecx, ecx
+    jz      gcp_done
+    mov     dword ptr [rbp-104], ecx          ; char
+    call    gui_pw_class
+    lea     r10, [cls_colors]
+    mov     eax, dword ptr [r10+rax*4]
+    WINCALL SetTextColor, qword ptr [rbp-32], eax
+    ; wrap if past the right edge
+    mov     eax, dword ptr [rbp-92]
+    add     eax, dword ptr [rbp-72]
+    mov     r10d, dword ptr [rbp-48]
+    sub     r10d, 4
+    cmp     eax, r10d
+    jle     gcp_draw
+    mov     eax, dword ptr [rbp-40]
+    add     eax, 4
+    mov     dword ptr [rbp-92], eax
+    mov     eax, dword ptr [rbp-96]
+    add     eax, dword ptr [rbp-76]
+    mov     dword ptr [rbp-96], eax
+gcp_draw:
+    lea     rax, [rbp-104]
+    WINCALL TextOutW, qword ptr [rbp-32], dword ptr [rbp-92], dword ptr [rbp-96], \
+            addr rbp-104, 1
+    mov     eax, dword ptr [rbp-72]
+    add     dword ptr [rbp-92], eax
+    inc     dword ptr [rbp-100]
+    cmp     dword ptr [rbp-100], 256
+    jb      gcp_loop
+gcp_done:
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-64]
+    FRAME_EPILOG
+    ret
+gui_draw_colorpw endp
+
+; gui_draw_pwlegend(rcx = lpdis) - draw a small colour key (ABC abc 123 !@#).
+gui_draw_pwlegend proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx
+    mov     r10, rcx
+    mov     rax, qword ptr [r10+32]
+    mov     qword ptr [rbp-32], rax           ; hdc
+    mov     eax, dword ptr [r10+40]
+    mov     dword ptr [rbp-40], eax           ; L
+    mov     eax, dword ptr [r10+44]
+    mov     dword ptr [rbp-44], eax           ; T
+    WINCALL CreateSolidBrush, 00202020h
+    mov     qword ptr [rbp-56], rax
+    mov     r10, qword ptr [rbp-24]
+    lea     rdx, [r10+40]
+    WINCALL FillRect, qword ptr [rbp-32], rdx, qword ptr [rbp-56]
+    WINCALL DeleteObject, qword ptr [rbp-56]
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_subfont]
+    mov     qword ptr [rbp-64], rax
+    WINCALL SetBkMode, qword ptr [rbp-32], 1
+    mov     eax, dword ptr [rbp-40]
+    mov     dword ptr [rbp-72], eax           ; x
+    mov     ecx, 0                            ; token index
+lg_loop:
+    cmp     ecx, 4
+    jae     lg_done
+    mov     dword ptr [rbp-76], ecx
+    lea     r10, [cls_colors]
+    mov     eax, dword ptr [r10+rcx*4]
+    WINCALL SetTextColor, qword ptr [rbp-32], eax
+    mov     ecx, dword ptr [rbp-76]           ; token text ptr
+    lea     r10, [lg_ptrs]
+    mov     r8, qword ptr [r10+rcx*8]
+    mov     qword ptr [rbp-80], r8
+    WINCALL TextOutW, qword ptr [rbp-32], dword ptr [rbp-72], dword ptr [rbp-44], \
+            qword ptr [rbp-80], 3
+    add     dword ptr [rbp-72], 74
+    mov     ecx, dword ptr [rbp-76]
+    inc     ecx
+    jmp     lg_loop
+lg_done:
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-64]
+    FRAME_EPILOG
+    ret
+gui_draw_pwlegend endp
+
+; pwread_proc - DLG_PWREAD dialog procedure (colored password + phonetic).
+pwread_proc proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 64
+    mov     qword ptr [rbp-8], rcx
+    cmp     rdx, WM_INITDIALOG
+    je      pr_init
+    cmp     rdx, WM_COMMAND
+    je      pr_cmd
+    cmp     rdx, WM_PAINT
+    je      pr_paint
+    cmp     rdx, WM_ERASEBKGND
+    je      pr_erase
+    cmp     rdx, WM_DRAWITEM
+    je      pr_draw
+    cmp     rdx, WM_CTLCOLOREDIT
+    je      pr_color
+    cmp     rdx, WM_CTLCOLORBTN
+    je      pr_color
+    cmp     rdx, WM_CTLCOLORDLG
+    je      pr_color
+    cmp     rdx, WM_CTLCOLORSTATIC
+    je      pr_color
+    xor     eax, eax
+    jmp     pr_ret
+pr_color:
+    call    theme_ctlcolor
+    jmp     pr_ret
+pr_init:
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDOK
+    call    theme_attach
+    call    gui_build_phonetic
+    WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_PR_PHON, addr g_phon_w
+    WINCALL SetForegroundWindow, qword ptr [rbp-8]
+    mov     eax, 1
+    jmp     pr_ret
+pr_paint:
+    mov     rcx, qword ptr [rbp-8]
+    call    theme_paint
+    jmp     pr_ret
+pr_erase:
+    mov     rcx, r8
+    mov     rdx, qword ptr [rbp-8]
+    call    theme_erase
+    jmp     pr_ret
+pr_draw:
+    mov     r10, r9
+    mov     eax, dword ptr [r10+4]
+    cmp     eax, IDC_PR_COLOR
+    je      pr_drawpw
+    cmp     eax, IDC_PR_LEGEND
+    je      pr_drawlg
+    mov     rcx, r9
+    call    theme_drawitem
+    jmp     pr_ret
+pr_drawpw:
+    mov     rcx, r9
+    call    gui_draw_colorpw
+    mov     eax, 1
+    jmp     pr_ret
+pr_drawlg:
+    mov     rcx, r9
+    call    gui_draw_pwlegend
+    mov     eax, 1
+    jmp     pr_ret
+pr_cmd:
+    movzx   eax, r8w
+    cmp     eax, IDOK
+    je      pr_close
+    cmp     eax, IDCANCEL
+    je      pr_close
+    xor     eax, eax
+    jmp     pr_ret
+pr_close:
+    WINCALL EndDialog, qword ptr [rbp-8], 0
+    mov     eax, 1
+pr_ret:
+    mov     rsp, rbp
+    pop     rbp
+    ret
+pwread_proc endp
+
+; gui_read_password(rcx = hdlg) - read the entry's first secret aloud: copy its
+;   plaintext into g_readpw, show DLG_PWREAD, then wipe the scratch buffers.
+gui_read_password proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    mov     edx, VF_SECRET
+    call    gui_row_of_kind
+    cmp     eax, 0
+    jl      grp_done
+    mov     ecx, eax                          ; row -> DS_VALUE id
+    mov     edx, DS_VALUE
+    call    dynid
+    WINCALL GetDlgItemTextW, qword ptr [rbp-24], eax, addr g_readpw, 256
+    WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_PWREAD, qword ptr [rbp-24], \
+            addr pwread_proc, 0
+    lea     r10, [g_readpw]                   ; wipe plaintext + phonetic scratch
+    xor     ecx, ecx
+grp_wipe:
+    cmp     ecx, 260
+    jae     grp_wiped
+    mov     word ptr [r10+rcx*2], 0
+    inc     ecx
+    jmp     grp_wipe
+grp_wiped:
+    lea     r10, [g_phon_w]
+    xor     ecx, ecx
+grp_wipe2:
+    cmp     ecx, 4096
+    jae     grp_done
+    mov     word ptr [r10+rcx*2], 0
+    inc     ecx
+    jmp     grp_wipe2
+grp_done:
+    FRAME_EPILOG
+    ret
+gui_read_password endp
 
 ; gui_u2pad(rcx=dst wide, edx=val 0..99) -> rax = dst end.  2 digits, zero-padded.
 ;   Leaf; clobbers eax/edx/r9.
