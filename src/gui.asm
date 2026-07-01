@@ -343,7 +343,7 @@ EBUF        equ 4096            ; wide chars per entry-field buffer
 ; --- modular field rows (runtime-built detail form) ------------------------
 ; Per-row descriptor (flat record, stride DESCSZ) in g_fields[].
 FD_KIND     equ 0               ; dd  base kind (VF_TEXT/USERNAME/SECRET/URL/NOTES/TOTP)
-FD_FLAGS    equ 4               ; dd  bit0 = field carries a custom label
+FD_FLAGS    equ 4               ; dd  bit0 = custom label; bits4-5 = pw-strength grade
 FD_Y        equ 8              ; dd  row top in DLU (within the detail pane)
 FD_H        equ 12             ; dd  row height in DLU
 FD_HANDLES  equ 16             ; q[DYN_SLOTS]  control hwnd per slot (0 = absent)
@@ -355,6 +355,8 @@ MAXROWS     equ 24
 FDF_LABELED equ 1               ; FD_FLAGS bit0 = carries a custom label
 FDF_REVEALED equ 2              ; FD_FLAGS bit1 = value currently unmasked
 FDF_HASIMG  equ 4               ; FD_FLAGS bit2 = image row has data in FD_ARF/FD_IMG
+FDF_PWLVL_MASK equ 30h          ; FD_FLAGS bits4-5 = secret strength grade 0..3
+FDF_PWLVL_SHIFT equ 4
 ; Runtime control ids: IDC_DYN_BASE + row*DYN_SLOTS + slot (DYN_SLOTS = power of 2).
 IDC_DYN_BASE equ 3000
 DYN_SLOTS   equ 16
@@ -373,6 +375,7 @@ DS_IMPORT   equ 10              ; image/file: import/choose from file (edit mode
 DS_PASTE    equ 11              ; image: paste from clipboard (edit mode)
 DS_EXPORT   equ 12              ; file: save attachment to disk
 DS_OPEN     equ 13              ; file: open attachment in the default app
+DS_SBADGE   equ 14              ; secret: password-strength badge (owner-draw, view mode)
 IDC_V_ADDFIELD equ 230          ; "+ Add field" button (edit mode)
 IDC_V_SAVE   equ 231          ; "Save" button (edit mode, accent/primary)
 IDC_V_SEARCH equ 232          ; search/filter box under the entry list
@@ -572,6 +575,14 @@ cap_paste label word
     dw 'P','a','s','t','e', 0
 cap_export label word
     dw 'E','x','p','o','r','t', 0
+badge_weak label word
+    dw 'W','e','a','k', 0
+badge_fair label word
+    dw 'F','a','i','r', 0
+badge_good label word
+    dw 'G','o','o','d', 0
+badge_strong label word
+    dw 'S','t','r','o','n','g', 0
 cap_noimg label word
     dw '(','n','o',' ','i','m','a','g','e',')', 0
 suffix_imgpng label word
@@ -1480,6 +1491,177 @@ gdh_done:
     ret
 gui_draw_header endp
 
+; gui_pw_grade(rcx=ptr utf8, edx=len) -> eax = strength 0 weak /1 fair /2 good /3 strong.
+;   Self-contained: character-class count + length.  Leaf.
+gui_pw_grade proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-32], edx
+    xor     r8d, r8d                          ; class mask (l/u/d/sym)
+    xor     r9d, r9d                          ; i
+gpg_lp:
+    cmp     r9d, dword ptr [rbp-32]
+    jae     gpg_classes
+    mov     r10, qword ptr [rbp-24]
+    movzx   eax, byte ptr [r10+r9]
+    cmp     al, 'a'
+    jb      gpg_cku
+    cmp     al, 'z'
+    ja      gpg_cku
+    or      r8d, 1
+    jmp     gpg_next
+gpg_cku:
+    cmp     al, 'A'
+    jb      gpg_ckd
+    cmp     al, 'Z'
+    ja      gpg_ckd
+    or      r8d, 2
+    jmp     gpg_next
+gpg_ckd:
+    cmp     al, '0'
+    jb      gpg_sym
+    cmp     al, '9'
+    ja      gpg_sym
+    or      r8d, 4
+    jmp     gpg_next
+gpg_sym:
+    or      r8d, 8
+gpg_next:
+    inc     r9d
+    jmp     gpg_lp
+gpg_classes:
+    xor     ecx, ecx                          ; class count
+    test    r8d, 1
+    jz      gpg_c2
+    inc     ecx
+gpg_c2:
+    test    r8d, 2
+    jz      gpg_c3
+    inc     ecx
+gpg_c3:
+    test    r8d, 4
+    jz      gpg_c4
+    inc     ecx
+gpg_c4:
+    test    r8d, 8
+    jz      gpg_grade
+    inc     ecx
+gpg_grade:
+    mov     edx, dword ptr [rbp-32]           ; L
+    xor     eax, eax                          ; weak
+    cmp     edx, 8
+    jb      gpg_ret                           ; <8 chars -> weak
+    mov     eax, 1                            ; fair
+    cmp     edx, 12                           ; good: (L>=12 & c>=2) | (L>=10 & c>=3)
+    jb      gpg_g2
+    cmp     ecx, 2
+    jae     gpg_good
+gpg_g2:
+    cmp     edx, 10
+    jb      gpg_ret
+    cmp     ecx, 3
+    jb      gpg_ret
+gpg_good:
+    mov     eax, 2                            ; good
+    cmp     edx, 16                           ; strong: (L>=16 & c>=3) | (L>=12 & c==4)
+    jb      gpg_s2
+    cmp     ecx, 3
+    jae     gpg_strong
+gpg_s2:
+    cmp     edx, 12
+    jb      gpg_ret
+    cmp     ecx, 4
+    jb      gpg_ret
+gpg_strong:
+    mov     eax, 3                            ; strong
+gpg_ret:
+    FRAME_EPILOG
+    ret
+gui_pw_grade endp
+
+; gui_draw_sbadge(rcx=lpdis) - draw a secret row's password-strength badge: a
+;   colored rounded pill with Weak/Fair/Good/Strong, keyed off FD_PWLEVEL.
+gui_draw_sbadge proc frame
+    FRAME_PROLOG 192
+    mov     qword ptr [rbp-24], rcx
+    mov     r10, rcx
+    mov     rax, qword ptr [r10+32]
+    mov     qword ptr [rbp-32], rax            ; hdc
+    mov     eax, dword ptr [r10+40]
+    mov     dword ptr [rbp-40], eax            ; L
+    mov     eax, dword ptr [r10+44]
+    mov     dword ptr [rbp-48], eax            ; T
+    mov     eax, dword ptr [r10+48]
+    mov     dword ptr [rbp-56], eax            ; R
+    mov     eax, dword ptr [r10+52]
+    mov     dword ptr [rbp-64], eax            ; B
+    ; clear to dialog base so nothing lingers behind the pill
+    WINCALL CreateSolidBrush, 00202020h
+    mov     qword ptr [rbp-72], rax
+    mov     r10, qword ptr [rbp-24]
+    lea     rdx, [r10+40]
+    WINCALL FillRect, qword ptr [rbp-32], rdx, qword ptr [rbp-72]
+    WINCALL DeleteObject, qword ptr [rbp-72]
+    ; row index from ctl id -> FD_PWLEVEL
+    mov     r10, qword ptr [rbp-24]
+    mov     eax, dword ptr [r10+4]             ; CtlID
+    sub     eax, IDC_DYN_BASE
+    shr     eax, DYN_SLOTS_LOG2                ; row
+    imul    eax, eax, DESCSZ
+    lea     r10, [g_fields]
+    add     r10, rax
+    mov     eax, dword ptr [r10+FD_FLAGS]
+    shr     eax, FDF_PWLVL_SHIFT
+    and     eax, 3                             ; level 0..3
+    ; caption + color by level
+    lea     r8, [badge_weak]
+    mov     ecx, CLR_BAR_RED
+    cmp     eax, 1
+    jb      gds_have
+    lea     r8, [badge_fair]
+    mov     ecx, CLR_BAR_AMBER
+    je      gds_have
+    lea     r8, [badge_good]
+    mov     ecx, CLR_BAR_LGREEN
+    cmp     eax, 2
+    je      gds_have
+    lea     r8, [badge_strong]
+    mov     ecx, CLR_BAR_DGREEN
+gds_have:
+    mov     qword ptr [rbp-88], r8             ; caption ptr
+    mov     dword ptr [rbp-96], ecx            ; color
+    ; pill
+    WINCALL CreateSolidBrush, dword ptr [rbp-96]
+    mov     qword ptr [rbp-104], rax
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-104]
+    mov     qword ptr [rbp-112], rax           ; old brush
+    WINCALL GetStockObject, 8                  ; NULL_PEN
+    WINCALL SelectObject, qword ptr [rbp-32], rax
+    mov     qword ptr [rbp-120], rax           ; old pen
+    WINCALL RoundRect, qword ptr [rbp-32], dword ptr [rbp-40], dword ptr [rbp-48], \
+            dword ptr [rbp-56], dword ptr [rbp-64], 8, 8
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-112]
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-120]
+    WINCALL DeleteObject, qword ptr [rbp-104]
+    ; caption (subfont, white, centered)
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_subfont]
+    mov     qword ptr [rbp-112], rax           ; old font
+    WINCALL SetTextColor, qword ptr [rbp-32], 00FFFFFFh
+    WINCALL SetBkMode, qword ptr [rbp-32], 1
+    mov     eax, dword ptr [rbp-40]
+    mov     dword ptr [rbp-160], eax           ; rect L
+    mov     eax, dword ptr [rbp-48]
+    mov     dword ptr [rbp-156], eax           ; rect T
+    mov     eax, dword ptr [rbp-56]
+    mov     dword ptr [rbp-152], eax           ; rect R
+    mov     eax, dword ptr [rbp-64]
+    mov     dword ptr [rbp-148], eax           ; rect B
+    WINCALL DrawTextW, qword ptr [rbp-32], qword ptr [rbp-88], -1, addr rbp-160, DT_IMGFLAGS
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-112]
+    FRAME_EPILOG
+    ret
+gui_draw_sbadge endp
+
 ; gui_entry_matches(ecx = entry index) -> eax = 1 if any non-sensitive field
 ;   (value or custom label) contains the current g_search_w query, else 0.
 ;   Secret and TOTP fields are skipped entirely.  Assumes g_search_w is non-empty
@@ -1762,10 +1944,25 @@ gsd_setval:
     call    gui_setfield
     mov     eax, dword ptr [rbp-96]             ; kind
     cmp     eax, VF_SECRET
-    je      gsd_mask
+    je      gsd_secret
     cmp     eax, VF_TOTP
     je      gsd_mask
     jmp     gsd_fnext
+gsd_secret:
+    ; grade the password for the strength badge (uses the plaintext value)
+    mov     rcx, qword ptr [rbp-72]            ; valptr (utf8)
+    mov     edx, dword ptr [rbp-64]            ; vallen
+    call    gui_pw_grade                       ; eax = 0..3
+    shl     eax, FDF_PWLVL_SHIFT
+    mov     ecx, dword ptr [rbp-44]           ; row
+    imul    ecx, ecx, DESCSZ
+    lea     r10, [g_fields]
+    add     r10, rcx
+    mov     edx, dword ptr [r10+FD_FLAGS]
+    and     edx, NOT FDF_PWLVL_MASK           ; preserve other flag bits
+    or      edx, eax
+    mov     dword ptr [r10+FD_FLAGS], edx
+    jmp     gsd_mask
 gsd_mask:
     mov     ecx, dword ptr [rbp-44]
     mov     edx, DS_VALUE
@@ -2573,6 +2770,8 @@ gra_secret:
             BS_OWNERDRAW_
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_COPY, addr cls_button, addr wb_copy, \
             BS_OWNERDRAW_
+    WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_SBADGE, addr cls_static, 0, \
+            SS_OWNERDRAW_
     jmp     gra_reorder
 gra_notes:
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_VALUE, addr cls_edit, 0, \
@@ -3690,6 +3889,22 @@ grl_copydone:
     mov     rcx, qword ptr [r10+FD_HANDLES+DS_DEL*8]
     mov     edx, dword ptr [rbp-52]
     call    ShowWindow
+    ; secret strength badge: (368,y,46,12) in view mode; hidden while editing
+    mov     r10, qword ptr [rbp-32]
+    cmp     dword ptr [r10+FD_KIND], VF_SECRET
+    jne     grl_sbadge_done
+    mov     rcx, qword ptr [rbp-24]
+    mov     rdx, qword ptr [r10+FD_HANDLES+DS_SBADGE*8]
+    mov     r8d, 368
+    mov     r9d, dword ptr [rbp-40]
+    WINCALL move_ctl, rcx, rdx, r8d, r9d, 46, 12
+    mov     eax, dword ptr [rbp-52]           ; edit=SW_SHOW, view=SW_HIDE
+    xor     eax, SW_SHOW                      ; badge shows in view (opposite)
+    mov     r10, qword ptr [rbp-32]
+    mov     rcx, qword ptr [r10+FD_HANDLES+DS_SBADGE*8]
+    mov     edx, eax
+    call    ShowWindow
+grl_sbadge_done:
     ; TOTP key field + its reveal are edit-mode only (view shows just the live code)
     mov     r10, qword ptr [rbp-32]
     cmp     dword ptr [r10+FD_KIND], VF_TOTP
@@ -4640,10 +4855,17 @@ vp_tdraw:
     je      vp_tdraw_totp
     cmp     edx, DS_THUMB
     je      vp_tdraw_thumb
+    cmp     edx, DS_SBADGE
+    je      vp_tdraw_sbadge
     jmp     vp_tdraw_def
 vp_tdraw_header:
     mov     rcx, r9
     call    gui_draw_header
+    mov     eax, 1
+    jmp     vp_ret
+vp_tdraw_sbadge:
+    mov     rcx, r9
+    call    gui_draw_sbadge
     mov     eax, 1
     jmp     vp_ret
 vp_tdraw_thumb:
