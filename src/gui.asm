@@ -381,6 +381,7 @@ IDC_V_SAVE   equ 231          ; "Save" button (edit mode, accent/primary)
 IDC_V_SEARCH equ 232          ; search/filter box under the entry list
 IDC_V_HEADER equ 233          ; detail-pane header (icon tile + title, view mode)
 IDC_V_TITLELBL equ 234        ; "Title" static label (edit mode only)
+IDC_V_OVFL   equ 235          ; header overflow (...) menu button
 FIELD_AREA_BOTTOM equ 292        ; rows may not grow past here (DLU; Add-field is at 296)
 ; Win32 window styles (gui.asm builds controls at runtime; the RC gets these
 ; from windows.h, but this module needs the numeric values).
@@ -525,6 +526,8 @@ wb_eye label word
     dw 0E7B3h, 0                                 ; RedEye (reveal)
 wb_copy label word
     dw 0E8C8h, 0                                 ; Copy (copy to clipboard)
+wb_more label word
+    dw 0E712h, 0                                 ; More (header overflow menu)
 cls_edit label word
     dw 'E','d','i','t', 0
 cls_button label word
@@ -583,6 +586,12 @@ badge_good label word
     dw 'G','o','o','d', 0
 badge_strong label word
     dw 'S','t','r','o','n','g', 0
+om_copypw label word
+    dw 'C','o','p','y',' ','p','a','s','s','w','o','r','d', 0
+om_copyuser label word
+    dw 'C','o','p','y',' ','u','s','e','r','n','a','m','e', 0
+om_delete label word
+    dw 'D','e','l','e','t','e',' ','e','n','t','r','y', 0
 cap_noimg label word
     dw '(','n','o',' ','i','m','a','g','e',')', 0
 suffix_imgpng label word
@@ -1456,6 +1465,7 @@ gui_draw_header proc frame
     add     eax, 1
     mov     dword ptr [rbp-100], eax           ; rect T
     mov     eax, dword ptr [rbp-56]
+    sub     eax, 8                              ; small right padding
     mov     dword ptr [rbp-96], eax            ; rect R
     mov     eax, dword ptr [rbp-48]
     add     eax, 26
@@ -2496,6 +2506,16 @@ sem_addcmd:
     mov     edx, eax
     call    ShowWindow
     WINCALL InvalidateRect, qword ptr [rbp-72], 0, 1   ; repaint header for this entry
+    ; overflow (...) button shares the header's view-mode visibility
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_V_OVFL
+    call    GetDlgItem
+    mov     qword ptr [rbp-72], rax
+    mov     eax, dword ptr [rbp-52]
+    xor     eax, SW_SHOW
+    mov     rcx, qword ptr [rbp-72]
+    mov     edx, eax
+    call    ShowWindow
     mov     rcx, qword ptr [rbp-24]
     call    gui_rows_layout
     ; the pencil button stays a pencil in both modes (Save handles committing)
@@ -4561,6 +4581,75 @@ gpa_go:
     ret
 gui_palette_add endp
 
+; gui_row_of_kind(edx=kind) -> eax = first row index with that FD_KIND, or -1.  Leaf.
+gui_row_of_kind proc
+    xor     r8d, r8d
+grk_lp:
+    cmp     r8d, dword ptr [g_field_count]
+    jae     grk_none
+    mov     eax, r8d
+    imul    eax, eax, DESCSZ
+    lea     r10, [g_fields]
+    add     r10, rax
+    cmp     dword ptr [r10+FD_KIND], edx
+    je      grk_found
+    inc     r8d
+    jmp     grk_lp
+grk_found:
+    mov     eax, r8d
+    ret
+grk_none:
+    mov     eax, -1
+    ret
+gui_row_of_kind endp
+
+; gui_overflow_menu(rcx=hdlg) - the header "..." menu: copy password/username,
+;   delete entry.  Copies reuse gui_row_copy; delete posts IDC_V_REMOVE.
+gui_overflow_menu proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx
+    WINCALL CreatePopupMenu
+    mov     qword ptr [rbp-32], rax
+    test    rax, rax
+    jz      gom_done
+    WINCALL AppendMenuW, qword ptr [rbp-32], 0, 1, addr om_copypw
+    WINCALL AppendMenuW, qword ptr [rbp-32], 0, 2, addr om_copyuser
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_SEPARATOR, 0, 0
+    WINCALL AppendMenuW, qword ptr [rbp-32], 0, 3, addr om_delete
+    lea     rcx, [rbp-56]                        ; POINT
+    call    GetCursorPos
+    WINCALL SetForegroundWindow, qword ptr [rbp-24]
+    WINCALL TrackPopupMenu, qword ptr [rbp-32], TPM_RETURNCMD or TPM_LEFTALIGN, \
+            dword ptr [rbp-56], dword ptr [rbp-52], 0, qword ptr [rbp-24], 0
+    mov     dword ptr [rbp-44], eax              ; chosen id
+    WINCALL DestroyMenu, qword ptr [rbp-32]
+    cmp     dword ptr [rbp-44], 3
+    jne     gom_notdel
+    WINCALL PostMessageW, qword ptr [rbp-24], WM_COMMAND, IDC_V_REMOVE, 0
+    jmp     gom_done
+gom_notdel:
+    cmp     dword ptr [rbp-44], 1
+    je      gom_cppw
+    cmp     dword ptr [rbp-44], 2
+    je      gom_cpuser
+    jmp     gom_done
+gom_cppw:
+    mov     edx, VF_SECRET
+    jmp     gom_docopy
+gom_cpuser:
+    mov     edx, VF_USERNAME
+gom_docopy:
+    call    gui_row_of_kind                     ; eax = row or -1
+    cmp     eax, 0
+    jl      gom_done
+    mov     edx, eax
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_row_copy
+gom_done:
+    FRAME_EPILOG
+    ret
+gui_overflow_menu endp
+
 ; gui_addfield_menu(rcx=hdlg) - popup the field-type palette at the cursor.
 gui_addfield_menu proc frame
     FRAME_PROLOG 96
@@ -4932,6 +5021,7 @@ vp_init:
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_ADD, addr wb_add
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_EDIT, addr wb_edit
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_REMOVE, addr wb_rem
+    WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_OVFL, addr wb_more
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_V_SEARCH, EM_SETCUEBANNER, 1, addr cue_search
     mov     dword ptr [g_cur_idx], -1         ; no entry selected yet
     mov     dword ptr [g_dirty], 0
@@ -4989,6 +5079,8 @@ vp_cmd_disp:
     je      vp_lock
     cmp     eax, IDC_V_MENU
     je      vp_menu
+    cmp     eax, IDC_V_OVFL
+    je      vp_ovfl
     cmp     eax, IDC_V_MTPMINFO
     je      vp_tpminfo
     cmp     eax, IDC_V_MTPM
@@ -5028,6 +5120,12 @@ vp_refocus:
 vp_menu:
     mov     rcx, qword ptr [rbp-8]
     call    gui_menu_toggle
+    jmp     vp_handled
+vp_ovfl:
+    cmp     dword ptr [g_cur_idx], 0             ; only with an entry shown
+    jl      vp_handled
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_overflow_menu
     jmp     vp_handled
 vp_tpminfo:
     WINCALL gui_msgbox, qword ptr [rbp-8], addr m_tpminfo, addr t_tpminfo, \
