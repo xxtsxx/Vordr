@@ -41,6 +41,8 @@ extern img_startup:proc                 ; GDI+ diagnostics (img.asm)
 extern img_load:proc
 extern img_dims:proc
 extern img_free:proc
+extern shell_thumb:proc
+extern DeleteObject:proc
 extern read_file:proc
 ifdef DBG_TRACE
 extern cmd_redteam:proc                 ; fault-injection self-test (redteam.asm)
@@ -131,6 +133,7 @@ CSTR msg_st_fail,  "SELFTEST FAILURE",13,10
 WSTR w_selftest, <selftest>
 WSTR w_bench,    <bench>
 WSTR w_imgtest,  <imgtest>
+WSTR w_thumbtest,<thumbtest>
 ifdef DBG_TRACE
 WSTR w_redteam,  <redteam>
 WSTR w_tpmtest,  <tpmtest>
@@ -159,12 +162,13 @@ cmd_table label CMDENT
     CMDENT { w_selftest,  cmd_selftest,  0, 0 }
     CMDENT { w_bench,     cmd_bench,     0, 0 }
     CMDENT { w_imgtest,   cmd_imgtest,   1, 0 }   ; decode probe: exit=(w<<16)|h
+    CMDENT { w_thumbtest, cmd_thumbtest, 1, 0 }   ; shell-thumbnail probe: exit 0 ok
 ifdef DBG_TRACE
     CMDENT { w_redteam,   cmd_redteam,   1, 0 }   ; fault-injection self-test (dbg)
     CMDENT { w_tpmtest,   cmd_tpmtest,   0, 0 }   ; TPM round-trip probe (dbg)
-CMD_COUNT equ 5
+CMD_COUNT equ 6
 else
-CMD_COUNT equ 3
+CMD_COUNT equ 4
 endif
 
 .data?
@@ -863,6 +867,29 @@ cit_load:
     FRAME_EPILOG
     ret
 cmd_imgtest endp
+
+; cmd_thumbtest - fetch the shell thumbnail for argv[2]; exit 0 if an HBITMAP came
+;   back, 0xE010 if none.  Probes the shell COM path headlessly.
+LANDING_PAD
+cmd_thumbtest proc frame
+    FRAME_PROLOG 48
+    lea     r10, [g_argv]
+    mov     rcx, qword ptr [r10+16]
+    mov     edx, 128
+    mov     r8d, 128
+    call    shell_thumb
+    test    rax, rax
+    jz      ctt_none
+    mov     rcx, rax
+    call    DeleteObject
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+ctt_none:
+    mov     eax, 0E010h
+    FRAME_EPILOG
+    ret
+cmd_thumbtest endp
 
 ; =============================================================================
 ; is_cli_command -> eax = 1 if argv[1] names a known command verb, else 0.

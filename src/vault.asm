@@ -3091,8 +3091,11 @@ ab_frow:
     mov     edx, dword ptr [rbp-80]
     lea     r8, [rbp-128]                       ; out struct
     call    vault_field_get
-    cmp     qword ptr [rbp-128], VF_IMAGE
+    cmp     qword ptr [rbp-128], VF_IMAGE       ; image + generic-file fields carry
+    je      ab_isatt                           ;   an AttachRef value
+    cmp     qword ptr [rbp-128], VF_FILE
     jne     ab_fadv
+ab_isatt:
     mov     rax, qword ptr [rbp-104]            ; out.valptr (= [rbp-128+24])
     mov     qword ptr [rbp-136], rax            ; ref
     mov     rcx, qword ptr [rax+ARF_PTLEN]
