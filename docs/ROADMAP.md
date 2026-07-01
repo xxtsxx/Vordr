@@ -119,17 +119,28 @@ Consider a fuzz harness feeding malformed attachment sections to `attach_index_b
 - **Drag-and-drop image import** (WM_DROPFILES) — natural complement to the picker.
 - **Multiple images per record** already works (modular fields); add a gallery/strip
   layout when a record has several.
-- **Generic file attachments** — DONE. `VF_FILE` stores any file as an encrypted
-  attachment (own key/nonce, separate file section) + its filename; a row shows a
-  shell thumbnail, the filename, and Open / Save (Export) / Choose. Preview uses
-  `IShellItemImageFactory::GetImage` (Windows built-in), which renders a **PDF's
-  first page** where a thumbnail provider exists, else the file-type icon.
-  *Caveat / follow-up:* Open and preview decrypt to a `%TEMP%` file (the shell API
-  is path-based). Preview deletes it immediately; **Open leaves plaintext in %TEMP%
-  until the OS cleans it** — the app the user opens holds it. Follow-ups: shred the
-  temp on lock, or use a per-session RAM disk / restricted-ACL temp dir; render PDF
-  in-memory via `Windows.Data.Pdf` (WinRT) to avoid the temp entirely (hard from
-  no-CRT MASM); larger enlarge preview (re-request the shell thumbnail at view size).
+- **Generic file attachments + PDF preview** — DONE. `VF_FILE` stores any file as an
+  encrypted attachment (own key/nonce, separate file section) + its filename; a row
+  shows a shell thumbnail, the filename, and Open / Save (Export) / Choose.
+  - **Row thumbnail:** `IShellItemImageFactory::GetImage` (SIIGBF_THUMBNAILONLY, icon
+    fallback) — renders a PDF's first page where a *thumbnail provider* is registered,
+    else the file-type icon. NOTE: on machines whose default PDF app registers no
+    thumbnail provider (e.g. Edge-only), PDFs show the icon in the row.
+  - **Enlarge viewer:** `src/preview.asm` hosts the system **IPreviewHandler** for the
+    file's type (built-in COM), rendering the actual page/content into the viewer.
+    Falls back to the thumbnail if no preview handler. This is how PDF page content is
+    shown. Edge's PDF handler only supports `IInitializeWithFile`, so it's fed a temp
+    file; `IInitializeWithStream` is tried first for handlers that support it.
+  - *Security caveat / follow-ups:* Open and the file-init preview decrypt to a
+    `%TEMP%` file (path-based APIs); preview deletes it on viewer close, **Open leaves
+    plaintext in %TEMP%** until the OS cleans it. Follow-ups: shred (overwrite) the
+    temp instead of DeleteFile; restricted-ACL temp dir; render PDF in-memory via
+    `Windows.Data.Pdf` (WinRT) to drop the temp entirely (hard from no-CRT MASM);
+    `IObjectWithSite` if some handlers need a site; larger/zoomable preview.
+  - *Possible simplification (open):* images could be folded into `VF_FILE` (shell
+    thumbnail + image preview handler) and the dedicated `VF_IMAGE` kind retired — at
+    the cost of GDI+ full-res rendering and clipboard paste unless paste is re-added to
+    files.
 - **Password history** per secret (keep prior values, timestamped).
 - **Vault-wide export/import** (encrypted backup, or plaintext export behind a scary
   confirm) and **merge**.

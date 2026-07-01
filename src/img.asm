@@ -405,7 +405,7 @@ img_from_hbitmap endp
 ;   preview via the registered handler, else the file-type icon).
 public shell_thumb
 shell_thumb proc frame
-    FRAME_PROLOG 80
+    FRAME_PROLOG 96
     mov     qword ptr [rbp-24], rcx
     mov     dword ptr [rbp-40], edx
     mov     dword ptr [rbp-48], r8d
@@ -417,20 +417,35 @@ shell_thumb proc frame
     jnz     st_fail
     cmp     qword ptr [rbp-32], 0
     je      st_fail
-    ; GetImage(this, SIZE{w,h} by value, flags=0, &hbitmap)  -- vtable[3]
+    ; pack SIZE{cx,cy} into one 64-bit value (passed by value in rdx)
     mov     eax, dword ptr [rbp-40]
     mov     r10d, dword ptr [rbp-48]
     shl     r10, 32
     or      rax, r10
-    mov     rdx, rax                             ; SIZE by value
+    mov     qword ptr [rbp-64], rax
+    ; attempt 1: SIIGBF_THUMBNAILONLY (0x08) -> force the rendered page, never an icon
     mov     rcx, qword ptr [rbp-32]
-    xor     r8d, r8d                             ; SIIGBF_RESIZETOFIT
+    mov     rdx, qword ptr [rbp-64]
+    mov     r8d, 8
+    lea     r9, [rbp-56]
+    mov     rax, qword ptr [rcx]
+    mov     rax, qword ptr [rax+24]              ; GetImage (vtable[3])
+    sub     rsp, 32
+    call    rax
+    add     rsp, 32
+    cmp     qword ptr [rbp-56], 0
+    jne     st_release
+    ; attempt 2: default flags -> thumbnail-or-icon fallback
+    mov     rcx, qword ptr [rbp-32]
+    mov     rdx, qword ptr [rbp-64]
+    xor     r8d, r8d
     lea     r9, [rbp-56]
     mov     rax, qword ptr [rcx]
     mov     rax, qword ptr [rax+24]
     sub     rsp, 32
     call    rax
     add     rsp, 32
+st_release:
     mov     rcx, qword ptr [rbp-32]              ; factory->Release()
     mov     rax, qword ptr [rcx]
     mov     rax, qword ptr [rax+16]

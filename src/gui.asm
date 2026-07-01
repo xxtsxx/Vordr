@@ -62,6 +62,11 @@ extern ShellExecuteW:proc
 extern GetTempPathW:proc
 extern shell_thumb:proc
 extern img_from_hbitmap:proc
+extern preview_open:proc
+extern preview_show:proc
+extern preview_setrect:proc
+extern preview_close:proc
+extern GetClientRect:proc
 extern DeleteFileW:proc
 extern DeleteObject:proc
 externdef g_field_list:qword
@@ -665,6 +670,8 @@ g_imgbuf      dq ?                         ; imported file bytes (mem_alloc'd)
 g_imgbuflen   dq ?
 g_iv_img      dq ?                         ; image handle shown in the enlarge dialog
 g_iv_ref      dq ?                         ; AttachRef ptr for the enlarge dialog's Export
+g_iv_isfile   dd ?                         ; 1 = enlarge target is a VF_FILE (try preview)
+g_iv_preview  dq ?                         ; hosted preview handle in the viewer (0=none)
 g_pickfilter  dq ?                         ; OPENFILENAME filter for the next pick (0=image)
 g_tmpfile     dw 1024 dup (?)              ; temp path for file open/preview (wide)
 align 2
@@ -2572,12 +2579,19 @@ gui_img_enlarge proc frame
     mov     qword ptr [rbp-24], rcx
     mov     ecx, edx
     call    gui_desc
-    mov     rcx, qword ptr [rax+FD_IMG]
-    test    rcx, rcx
-    jz      gie_done                            ; nothing to show
-    mov     qword ptr [g_iv_img], rcx
+    mov     qword ptr [rbp-32], rax             ; desc
+    test    dword ptr [rax+FD_FLAGS], FDF_HASIMG
+    jz      gie_done                            ; nothing attached
+    mov     r10, qword ptr [rax+FD_IMG]
+    mov     qword ptr [g_iv_img], r10           ; thumbnail (may be 0 for files)
     lea     rdx, [rax+FD_ARF+4]
     mov     qword ptr [g_iv_ref], rdx
+    xor     eax, eax
+    mov     r10, qword ptr [rbp-32]
+    cmp     dword ptr [r10+FD_KIND], VF_FILE    ; files try a live preview handler
+    jne     @F
+    mov     eax, 1
+@@: mov     dword ptr [g_iv_isfile], eax
     WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_IMGVIEW, qword ptr [rbp-24], addr imgview_proc, 0
 gie_done:
     FRAME_EPILOG
@@ -2845,6 +2859,90 @@ gfo_done:
     ret
 gui_file_open endp
 
+; gui_ext_of(rcx=wide filename) -> rax = ptr to the last '.' (incl.), or 0.  Leaf.
+gui_ext_of proc
+    mov     r10, rcx
+    xor     rax, rax
+geo_l:
+    mov     dx, word ptr [r10]
+    test    dx, dx
+    jz      geo_done
+    cmp     dx, '.'
+    jne     @F
+    mov     rax, r10
+@@: add     r10, 2
+    jmp     geo_l
+geo_done:
+    ret
+gui_ext_of endp
+
+; gui_iv_preview_setup(rcx=hdlg) -> eax = 1 if a live preview handler was hosted in
+;   IDC_IV_PIC (renders the actual page content), else 0 (fall back to thumbnail).
+gui_iv_preview_setup proc frame
+    FRAME_PROLOG 128
+    ; [rbp-24]=hdlg [rbp-32]=len [rbp-40]=bytes [rbp-48]=ext [rbp-56]=templen
+    ; [rbp-64]=ph [rbp-72]=pichwnd  RECT @ [rbp-96]
+    mov     qword ptr [rbp-24], rcx
+    mov     rcx, qword ptr [g_iv_ref]
+    lea     rdx, [rbp-32]
+    call    attach_open
+    test    rax, rax
+    jz      gps_fail
+    mov     qword ptr [rbp-40], rax
+    mov     rcx, qword ptr [g_iv_ref]
+    add     rcx, 68                             ; filename (wide)
+    call    gui_ext_of
+    test    rax, rax
+    jz      gps_freebytes
+    mov     qword ptr [rbp-48], rax
+    ; temp path = %TEMP%\<filename>
+    WINCALL GetTempPathW, 500, addr g_tmpfile
+    mov     qword ptr [rbp-56], rax
+    lea     rcx, [g_tmpfile]
+    mov     r10, qword ptr [rbp-56]
+    lea     rcx, [rcx+r10*2]
+    mov     rdx, qword ptr [g_iv_ref]
+    add     rdx, 68
+    call    gui_wcpy_capped
+    ; preview_open(ext, bytes, len, temp)
+    mov     rcx, qword ptr [rbp-48]
+    mov     rdx, qword ptr [rbp-40]
+    mov     r8, qword ptr [rbp-32]
+    lea     r9, [g_tmpfile]
+    call    preview_open
+    mov     qword ptr [rbp-64], rax
+    mov     rcx, qword ptr [rbp-40]             ; free the decrypted bytes now
+    mov     rdx, qword ptr [rbp-32]
+    call    mem_free
+    cmp     qword ptr [rbp-64], 0
+    je      gps_fail
+    mov     rax, qword ptr [rbp-64]
+    mov     qword ptr [g_iv_preview], rax
+    ; host it in IDC_IV_PIC at its full client rect
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_IV_PIC
+    call    GetDlgItem
+    mov     qword ptr [rbp-72], rax
+    mov     rcx, rax
+    lea     rdx, [rbp-96]
+    call    GetClientRect
+    mov     rcx, qword ptr [g_iv_preview]
+    mov     rdx, qword ptr [rbp-72]
+    lea     r8, [rbp-96]
+    call    preview_show
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gps_freebytes:
+    mov     rcx, qword ptr [rbp-40]
+    mov     rdx, qword ptr [rbp-32]
+    call    mem_free
+gps_fail:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gui_iv_preview_setup endp
+
 ; imgview_proc - DLG_IMGVIEW procedure (themed; shows g_iv_img, Export/Close).
 imgview_proc proc
     push    rbp
@@ -2873,9 +2971,15 @@ iv_color:
     call    theme_ctlcolor
     jmp     iv_ret
 iv_init:
+    mov     qword ptr [g_iv_preview], 0
     mov     rcx, qword ptr [rbp-8]
     mov     edx, IDC_IV_EXPORT
     call    theme_attach
+    cmp     dword ptr [g_iv_isfile], 0
+    je      iv_init_done
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_iv_preview_setup
+iv_init_done:
     mov     eax, 1
     jmp     iv_ret
 iv_paint:
@@ -2893,9 +2997,12 @@ iv_draw:
     mov     eax, dword ptr [r10+4]              ; CtlID
     cmp     eax, IDC_IV_PIC
     jne     iv_drawbtn
+    cmp     qword ptr [g_iv_preview], 0         ; hosted preview covers the pic -> skip
+    jne     iv_pic_done
     mov     rcx, r9
     mov     rdx, qword ptr [g_iv_img]
     call    gui_img_paint
+iv_pic_done:
     mov     eax, 1
     jmp     iv_ret
 iv_drawbtn:
@@ -2918,6 +3025,12 @@ iv_export:
     mov     eax, 1
     jmp     iv_ret
 iv_close:
+    cmp     qword ptr [g_iv_preview], 0
+    je      iv_close_end
+    mov     rcx, qword ptr [g_iv_preview]
+    call    preview_close
+    mov     qword ptr [g_iv_preview], 0
+iv_close_end:
     WINCALL EndDialog, qword ptr [rbp-8], 0
     mov     eax, 1
 iv_ret:
