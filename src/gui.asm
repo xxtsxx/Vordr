@@ -44,6 +44,7 @@ extern vault_title_at:proc
 extern vault_field_at:proc
 extern vault_entry_ptr:proc
 extern g_carry_created:qword
+extern pwgen_ex:proc
 extern vault_field_count:proc
 extern vault_field_get:proc
 extern vault_build_entry:proc
@@ -380,6 +381,7 @@ DS_PASTE    equ 11              ; image: paste from clipboard (edit mode)
 DS_EXPORT   equ 12              ; file: save attachment to disk
 DS_OPEN     equ 13              ; file: open attachment in the default app
 DS_SBADGE   equ 14              ; secret: password-strength badge (owner-draw, view mode)
+DS_GEN      equ 15              ; secret: generate-password button (edit mode)
 IDC_V_ADDFIELD equ 230          ; "+ Add field" button (edit mode)
 IDC_V_SAVE   equ 231          ; "Save" button (edit mode, accent/primary)
 IDC_V_SEARCH equ 232          ; search/filter box under the entry list
@@ -540,6 +542,24 @@ wb_starf label word
     dw 0E735h, 0                                 ; FavoriteStarFill (favorited)
 fav_one label word
     dw '1', 0                                    ; VF_FAV marker value
+wb_gen label word
+    dw 0E72Ch, 0                                 ; Refresh (generate password)
+gm_l1 dw 'S','t','r','o','n','g',' ','r','a','n','d','o','m',' ','2','0',0
+gm_l2 dw 'A','l','p','h','a','n','u','m','e','r','i','c',' ','2','0',0
+gm_l3 dw 'P','a','s','s','p','h','r','a','s','e',' ','5',' ','w','o','r','d','s',0
+gm_l4 dw 'P','r','o','n','o','u','n','c','e','a','b','l','e',' ','1','6',0
+gm_l5 dw 'P','I','N',' ','8',' ','d','i','g','i','t','s',0
+gm_l6 dw 'H','e','x',' ','3','2',0
+align 8
+gm_labels dq gm_l1, gm_l2, gm_l3, gm_l4, gm_l5, gm_l6
+gen_presets label dword                          ; {n, style, opt} per preset
+    dd 20, PWS_RANDOM,     15 or PWO_NOAMBIG
+    dd 20, PWS_RANDOM,     7 or PWO_NOAMBIG       ; upper+lower+digit, no symbols
+    dd 5,  PWS_PASSPHRASE, PWO_CAP or PWO_DASH or PWO_DIGIT
+    dd 16, PWS_PRONOUNCE,  PWO_CAP or PWO_DIGIT
+    dd 8,  PWS_PIN,        0
+    dd 32, PWS_HEX,        0
+GEN_PRESET_N equ 6
 cls_edit label word
     dw 'E','d','i','t', 0
 cls_button label word
@@ -705,6 +725,8 @@ g_totp_disp_w dw 16 dup (?)          ; code grouped "nnn nnn" wide (on-screen on
 g_disp_a    db 32 dup (?)            ; "287082  (17s)" display, ascii
 g_times_w   dw 128 dup (?)           ; "Created ... Modified ..." line (wide)
 g_st        dw 8 dup (?)             ; SYSTEMTIME scratch (FileTimeToSystemTime)
+g_genout    db 260 dup (?)           ; generator ASCII output (wiped after use)
+g_genout_w  dw 260 dup (?)           ; generator output widened for the edit
 align 8
 ; --- modular field-row model (runtime detail form) ---
 g_fields      db MAXROWS*DESCSZ dup (?)   ; row descriptors
@@ -2953,6 +2975,8 @@ gra_secret:
             BS_OWNERDRAW_
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_SBADGE, addr cls_static, 0, \
             SS_OWNERDRAW_
+    WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_GEN, addr cls_button, addr wb_gen, \
+            BS_OWNERDRAW_
     jmp     gra_reorder
 gra_notes:
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_VALUE, addr cls_edit, 0, \
@@ -4097,6 +4121,17 @@ grl_copydone:
     mov     rcx, qword ptr [r10+FD_HANDLES+DS_SBADGE*8]
     mov     edx, eax
     call    ShowWindow
+    ; generate button (400, content_y, 12, 12) - edit mode only
+    mov     rcx, qword ptr [rbp-24]
+    mov     r10, qword ptr [rbp-32]
+    mov     rdx, qword ptr [r10+FD_HANDLES+DS_GEN*8]
+    mov     r8d, 400
+    mov     r9d, dword ptr [rbp-60]
+    WINCALL move_ctl, rcx, rdx, r8d, r9d, 12, 12
+    mov     r10, qword ptr [rbp-32]
+    mov     rcx, qword ptr [r10+FD_HANDLES+DS_GEN*8]
+    mov     edx, dword ptr [rbp-52]
+    call    ShowWindow
 grl_sbadge_done:
     ; TOTP key field + its reveal are edit-mode only (view shows just the live code)
     mov     r10, qword ptr [rbp-32]
@@ -4863,6 +4898,113 @@ gom_done:
     ret
 gui_overflow_menu endp
 
+; gui_gen_menu(rcx=hdlg, edx=row) - popup the password-generator presets; on a
+;   choice, generate a fresh password, fill the row's value, and update the badge.
+gui_gen_menu proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx           ; hdlg
+    mov     dword ptr [rbp-28], edx           ; row
+    WINCALL CreatePopupMenu
+    mov     qword ptr [rbp-32], rax
+    test    rax, rax
+    jz      ggm_done
+    mov     dword ptr [rbp-36], 0             ; i
+ggm_add:
+    mov     eax, dword ptr [rbp-36]
+    cmp     eax, GEN_PRESET_N
+    jae     ggm_show
+    lea     r10, [gm_labels]
+    mov     r11, qword ptr [r10+rax*8]
+    mov     qword ptr [rbp-64], r11           ; label ptr
+    inc     eax
+    mov     dword ptr [rbp-68], eax           ; menu id = i+1
+    WINCALL AppendMenuW, qword ptr [rbp-32], 0, dword ptr [rbp-68], qword ptr [rbp-64]
+    inc     dword ptr [rbp-36]
+    jmp     ggm_add
+ggm_show:
+    lea     rcx, [rbp-56]
+    call    GetCursorPos
+    WINCALL SetForegroundWindow, qword ptr [rbp-24]
+    WINCALL TrackPopupMenu, qword ptr [rbp-32], TPM_RETURNCMD or TPM_LEFTALIGN, \
+            dword ptr [rbp-56], dword ptr [rbp-52], 0, qword ptr [rbp-24], 0
+    mov     dword ptr [rbp-40], eax           ; choice (1..N, 0 = none)
+    WINCALL DestroyMenu, qword ptr [rbp-32]
+    cmp     dword ptr [rbp-40], 0
+    je      ggm_done
+    mov     eax, dword ptr [rbp-40]           ; preset = gen_presets[choice-1]
+    dec     eax
+    imul    eax, eax, 12
+    lea     r10, [gen_presets]
+    add     r10, rax
+    lea     rcx, [g_genout]
+    mov     edx, dword ptr [r10+0]            ; n
+    mov     r8d, dword ptr [r10+4]            ; style
+    mov     r9d, dword ptr [r10+8]            ; opt
+    call    pwgen_ex
+    test    eax, eax
+    jz      ggm_done
+    lea     r10, [g_genout]                   ; strlen -> [rbp-44]
+    xor     ecx, ecx
+ggm_len:
+    cmp     byte ptr [r10+rcx], 0
+    je      ggm_lend
+    inc     ecx
+    cmp     ecx, 258
+    jb      ggm_len
+ggm_lend:
+    mov     dword ptr [rbp-44], ecx
+    lea     rcx, [g_genout]                   ; grade -> FD_FLAGS bits4-5 (badge)
+    mov     edx, dword ptr [rbp-44]
+    call    gui_pw_grade
+    shl     eax, FDF_PWLVL_SHIFT
+    mov     ecx, dword ptr [rbp-28]
+    imul    ecx, ecx, DESCSZ
+    lea     r11, [g_fields]
+    add     r11, rcx
+    mov     edx, dword ptr [r11+FD_FLAGS]
+    and     edx, NOT FDF_PWLVL_MASK
+    or      edx, eax
+    mov     dword ptr [r11+FD_FLAGS], edx
+    lea     rcx, [g_genout]                   ; widen for the edit
+    mov     edx, dword ptr [rbp-44]
+    lea     r8, [g_genout_w]
+    mov     r9d, 258
+    call    gui_towide
+    mov     ecx, dword ptr [rbp-28]
+    mov     edx, DS_VALUE
+    call    dynid
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], eax, addr g_genout_w
+    lea     r10, [g_genout]                   ; wipe plaintext scratch
+    xor     ecx, ecx
+ggm_wipe:
+    cmp     ecx, 260
+    jae     ggm_wiped
+    mov     byte ptr [r10+rcx], 0
+    inc     ecx
+    jmp     ggm_wipe
+ggm_wiped:
+    lea     r10, [g_genout_w]
+    xor     ecx, ecx
+ggm_wipe2:
+    cmp     ecx, 260
+    jae     ggm_wiped2
+    mov     word ptr [r10+rcx*2], 0
+    inc     ecx
+    jmp     ggm_wipe2
+ggm_wiped2:
+    mov     dword ptr [g_dirty], 1
+    mov     ecx, dword ptr [rbp-28]           ; repaint the strength badge
+    mov     edx, DS_SBADGE
+    call    dynid
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, eax
+    call    GetDlgItem
+    WINCALL InvalidateRect, rax, 0, 1
+ggm_done:
+    FRAME_EPILOG
+    ret
+gui_gen_menu endp
+
 ; gui_u2pad(rcx=dst wide, edx=val 0..99) -> rax = dst end.  2 digits, zero-padded.
 ;   Leaf; clobbers eax/edx/r9.
 gui_u2pad proc
@@ -5548,6 +5690,8 @@ vp_dyn:
     je      vpd_open
     cmp     ecx, DS_EXPORT
     je      vpd_export
+    cmp     ecx, DS_GEN
+    je      vpd_gen
     jmp     vp_handled
 vpd_import:
     ; file rows choose any file; image rows use the image picker
@@ -5589,6 +5733,11 @@ vpd_copy:
     mov     edx, eax
     mov     rcx, qword ptr [rbp-8]
     call    gui_row_copy
+    jmp     vp_handled
+vpd_gen:
+    mov     edx, eax
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_gen_menu
     jmp     vp_handled
 vpd_reveal:
     mov     edx, eax
