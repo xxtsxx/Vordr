@@ -42,6 +42,8 @@ extern vault_remove_at:proc
 extern vault_count:proc
 extern vault_title_at:proc
 extern vault_field_at:proc
+extern vault_entry_ptr:proc
+extern g_carry_created:qword
 extern vault_field_count:proc
 extern vault_field_get:proc
 extern vault_build_entry:proc
@@ -150,6 +152,7 @@ extern GetSysColor:proc
 extern CreateSolidBrush:proc
 extern FillRect:proc
 extern InvalidateRect:proc
+extern FileTimeToSystemTime:proc
 extern RedrawWindow:proc
 extern InitCommonControlsEx:proc
 extern pw_metrics:proc
@@ -382,6 +385,7 @@ IDC_V_SEARCH equ 232          ; search/filter box under the entry list
 IDC_V_HEADER equ 233          ; detail-pane header (icon tile + title, view mode)
 IDC_V_TITLELBL equ 234        ; "Title" static label (edit mode only)
 IDC_V_OVFL   equ 235          ; header overflow (...) menu button
+IDC_V_TIMES  equ 236          ; created/modified timestamps line (detail pane bottom)
 FIELD_AREA_BOTTOM equ 292        ; rows may not grow past here (DLU; Add-field is at 296)
 ; Win32 window styles (gui.asm builds controls at runtime; the RC gets these
 ; from windows.h, but this module needs the numeric values).
@@ -592,6 +596,10 @@ om_copyuser label word
     dw 'C','o','p','y',' ','u','s','e','r','n','a','m','e', 0
 om_delete label word
     dw 'D','e','l','e','t','e',' ','e','n','t','r','y', 0
+t_created label word
+    dw 'C','r','e','a','t','e','d',' ', 0
+t_modified label word
+    dw ' ',' ',' ',' ','M','o','d','i','f','i','e','d',' ', 0
 cap_noimg label word
     dw '(','n','o',' ','i','m','a','g','e',')', 0
 suffix_imgpng label word
@@ -687,6 +695,8 @@ g_totp_code6 db 8 dup (?)            ; computed 6-digit code (ascii)
 g_totp_code_w dw 16 dup (?)          ; code as wide, 6 digits no space (for clipboard)
 g_totp_disp_w dw 16 dup (?)          ; code grouped "nnn nnn" wide (on-screen only)
 g_disp_a    db 32 dup (?)            ; "287082  (17s)" display, ascii
+g_times_w   dw 128 dup (?)           ; "Created ... Modified ..." line (wide)
+g_st        dw 8 dup (?)             ; SYSTEMTIME scratch (FileTimeToSystemTime)
 align 8
 ; --- modular field-row model (runtime detail form) ---
 g_fields      db MAXROWS*DESCSZ dup (?)   ; row descriptors
@@ -2017,6 +2027,8 @@ gsd_fdone:
     mov     edx, IDC_V_HEADER
     call    GetDlgItem
     WINCALL InvalidateRect, rax, 0, 1
+    mov     rcx, qword ptr [rbp-24]           ; created/modified line
+    call    gui_show_times
     mov     rcx, qword ptr [rbp-24]
     call    gui_arm_totp
     mov     dword ptr [g_loading], 0
@@ -2401,6 +2413,13 @@ gui_commit proc frame
     jz      gco_notitle
     cmp     word ptr [r10], 0                 ; empty title -> keep the old entry
     je      gco_notitle
+    mov     ecx, dword ptr [g_cur_idx]        ; preserve the original creation date
+    call    vault_entry_ptr
+    test    rax, rax
+    jz      gco_nocarry
+    mov     rdx, qword ptr [rax+16]           ; original created FILETIME
+    mov     qword ptr [g_carry_created], rdx
+gco_nocarry:
     mov     ecx, dword ptr [g_cur_idx]
     call    vault_remove_at
     call    vault_build_entry
@@ -4649,6 +4668,87 @@ gom_done:
     FRAME_EPILOG
     ret
 gui_overflow_menu endp
+
+; gui_u2pad(rcx=dst wide, edx=val 0..99) -> rax = dst end.  2 digits, zero-padded.
+;   Leaf; clobbers eax/edx/r9.
+gui_u2pad proc
+    mov     eax, edx
+    xor     edx, edx
+    mov     r9d, 10
+    div     r9d                                 ; eax=tens, edx=ones
+    add     eax, '0'
+    mov     word ptr [rcx], ax
+    add     edx, '0'
+    mov     word ptr [rcx+2], dx
+    lea     rax, [rcx+4]
+    ret
+gui_u2pad endp
+
+; gui_fmt_datetime(rcx=dst wide, rdx=FILETIME ptr) -> rax = dst end.
+;   Writes "YYYY-MM-DD HH:MM" (no NUL).
+gui_fmt_datetime proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx             ; dst
+    mov     qword ptr [rbp-32], rdx             ; FILETIME ptr (stage: avoids WINCALL rdx dep)
+    WINCALL FileTimeToSystemTime, qword ptr [rbp-32], addr g_st
+    mov     rcx, qword ptr [rbp-24]
+    movzx   edx, word ptr [g_st+0]              ; year
+    call    gui_uint_w
+    mov     word ptr [rax], '-'
+    lea     rcx, [rax+2]
+    movzx   edx, word ptr [g_st+2]              ; month
+    call    gui_u2pad
+    mov     word ptr [rax], '-'
+    lea     rcx, [rax+2]
+    movzx   edx, word ptr [g_st+6]              ; day
+    call    gui_u2pad
+    mov     word ptr [rax], ' '
+    lea     rcx, [rax+2]
+    movzx   edx, word ptr [g_st+8]              ; hour
+    call    gui_u2pad
+    mov     word ptr [rax], ':'
+    lea     rcx, [rax+2]
+    movzx   edx, word ptr [g_st+10]             ; minute
+    call    gui_u2pad
+    FRAME_EPILOG
+    ret
+gui_fmt_datetime endp
+
+; gui_show_times(rcx=hdlg) - fill IDC_V_TIMES with the current entry's
+;   "Created <dt>  Modified <dt>" (blank when no entry).
+gui_show_times proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    cmp     dword ptr [g_cur_idx], 0
+    jl      gts_clear
+    mov     ecx, dword ptr [g_cur_idx]
+    call    vault_entry_ptr
+    test    rax, rax
+    jz      gts_clear
+    mov     qword ptr [rbp-32], rax             ; entry ptr
+    lea     rcx, [g_times_w]
+    lea     rdx, [t_created]
+    call    gui_w_appendz
+    mov     rcx, rax
+    mov     rdx, qword ptr [rbp-32]
+    add     rdx, 16                             ; created FILETIME
+    call    gui_fmt_datetime
+    mov     rcx, rax
+    lea     rdx, [t_modified]
+    call    gui_w_appendz
+    mov     rcx, rax
+    mov     rdx, qword ptr [rbp-32]
+    add     rdx, 24                             ; modified FILETIME
+    call    gui_fmt_datetime
+    mov     word ptr [rax], 0                   ; NUL-terminate
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_TIMES, addr g_times_w
+    FRAME_EPILOG
+    ret
+gts_clear:
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_TIMES, 0
+    FRAME_EPILOG
+    ret
+gui_show_times endp
 
 ; gui_addfield_menu(rcx=hdlg) - popup the field-type palette at the cursor.
 gui_addfield_menu proc frame
