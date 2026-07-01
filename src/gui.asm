@@ -353,6 +353,7 @@ FD_HANDLES  equ 16             ; q[DYN_SLOTS]  control hwnd per slot (0 = absent
 FD_ARF      equ 144            ; {u32 len, AttachRef[68], filename wide}  image value blob
 IMG_BLOBCAP equ 328            ; 4 + 68 + up to 256 bytes of wide filename
 FD_IMG      equ 472            ; q  decoded image handle (img_load) for the thumbnail
+ARFBLOB     equ 328            ; FD_IMG-FD_ARF: size of the {u32 len,AttachRef,filename} blob
 DESCSZ      equ 480            ; 16 + 16 handles*8 + 328 arf blob + 8 img (16-aligned)
 MAXROWS     equ 24
 FDF_LABELED equ 1               ; FD_FLAGS bit0 = carries a custom label
@@ -707,6 +708,7 @@ g_st        dw 8 dup (?)             ; SYSTEMTIME scratch (FileTimeToSystemTime)
 align 8
 ; --- modular field-row model (runtime detail form) ---
 g_fields      db MAXROWS*DESCSZ dup (?)   ; row descriptors
+g_gatherblob  db 32*ARFBLOB dup (?)        ; per-field attachment blobs held across reorder
 g_field_count dd ?                        ; live row count
 g_fav_state   dd ?                         ; current entry is a favorite (0/1)
 g_content_h   dd ?                        ; field-form content bottom (DLU) after layout
@@ -720,6 +722,7 @@ g_iconfont    dq ?                         ; Segoe Fluent Icons for list/tile gl
 g_cardfont    dq ?                         ; list entry title (semibold)
 g_subfont     dq ?                         ; list entry subtitle (regular, dim)
 g_titlefont   dq ?                         ; detail-header title (large semibold)
+g_chevfont    dq ?                         ; small Fluent icons for flat reorder chevrons
 g_sub_w       dw 512 dup (?)               ; subtitle scratch (wide)
 g_cmpbuf      db 256 dup (?)               ; title-A copy for WM_COMPAREITEM
 align 4
@@ -1113,6 +1116,8 @@ gui_make_listfonts proc frame
     mov     qword ptr [g_subfont], rax
     WINCALL CreateFontW, -21, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, addr f_segoeui
     mov     qword ptr [g_titlefont], rax
+    WINCALL CreateFontW, -11, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, addr f_iconname
+    mov     qword ptr [g_chevfont], rax
 mlf_done:
     FRAME_EPILOG
     ret
@@ -1729,6 +1734,50 @@ gfc_done:
     FRAME_EPILOG
     ret
 gui_draw_field_cards endp
+
+; gui_draw_flatchevron(rcx=lpdis) - draw a reorder chevron as a bare dim glyph on
+;   the dialog bg (no button chrome).  Up for DS_UP, down otherwise.
+gui_draw_flatchevron proc frame
+    FRAME_PROLOG 160
+    mov     qword ptr [rbp-24], rcx
+    mov     r10, rcx
+    mov     rax, qword ptr [r10+32]
+    mov     qword ptr [rbp-32], rax            ; hdc
+    WINCALL CreateSolidBrush, 00202020h        ; COL_BG (left gutter)
+    mov     qword ptr [rbp-40], rax
+    mov     r10, qword ptr [rbp-24]
+    lea     rdx, [r10+40]
+    WINCALL FillRect, qword ptr [rbp-32], rdx, qword ptr [rbp-40]
+    WINCALL DeleteObject, qword ptr [rbp-40]
+    mov     r10, qword ptr [rbp-24]
+    mov     eax, dword ptr [r10+4]             ; ctl id -> slot
+    sub     eax, IDC_DYN_BASE
+    and     eax, DYN_SLOTS-1
+    mov     ecx, 0E70Eh                        ; ChevronUp
+    cmp     eax, DS_UP
+    je      gfv_have
+    mov     ecx, 0E70Dh                        ; ChevronDown
+gfv_have:
+    mov     word ptr [g_glyph_w], cx
+    mov     word ptr [g_glyph_w+2], 0
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_chevfont]
+    mov     qword ptr [rbp-48], rax            ; old font
+    WINCALL SetTextColor, qword ptr [rbp-32], 000A0A0A0h
+    WINCALL SetBkMode, qword ptr [rbp-32], 1
+    mov     r10, qword ptr [rbp-24]
+    mov     eax, dword ptr [r10+40]
+    mov     dword ptr [rbp-104], eax           ; L
+    mov     eax, dword ptr [r10+44]
+    mov     dword ptr [rbp-100], eax           ; T
+    mov     eax, dword ptr [r10+48]
+    mov     dword ptr [rbp-96], eax            ; R
+    mov     eax, dword ptr [r10+52]
+    mov     dword ptr [rbp-92], eax            ; B
+    WINCALL DrawTextW, qword ptr [rbp-32], addr g_glyph_w, -1, addr rbp-104, DT_IMGFLAGS
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-48]
+    FRAME_EPILOG
+    ret
+gui_draw_flatchevron endp
 
 ; gui_entry_matches(ecx = entry index) -> eax = 1 if any non-sensitive field
 ;   (value or custom label) contains the current g_search_w query, else 0.
@@ -2431,17 +2480,33 @@ gg_image:
     add     r10, rax
     test    dword ptr [r10+FD_FLAGS], FDF_HASIMG
     jz      gg_imgskip
+    mov     eax, dword ptr [r10+FD_ARF]          ; blob length prefix; sanity-check
+    cmp     eax, 324                             ; AttachRef+filename must fit FD_ARF region
+    ja      gg_imgskip                           ; corrupt/oversize -> drop safely (no crash)
+    ; copy the blob into g_gatherblob[k] so it survives rows_clear/rebuild on reorder
+    mov     ecx, dword ptr [rbp-32]
+    imul    ecx, ecx, ARFBLOB
+    lea     r11, [g_gatherblob]
+    add     r11, rcx                             ; dst = &g_gatherblob[k]
+    lea     rax, [r10+FD_ARF]                    ; src
+    xor     r8d, r8d
+gg_imgcpy:
+    cmp     r8d, ARFBLOB
+    jae     gg_imgcpd
+    mov     r9b, byte ptr [rax+r8]
+    mov     byte ptr [r11+r8], r9b
+    inc     r8d
+    jmp     gg_imgcpy
+gg_imgcpd:
     mov     ecx, dword ptr [rbp-32]
     imul    ecx, ecx, 24
-    lea     r11, [g_field_list]
-    add     r11, rcx
-    mov     eax, dword ptr [r10+FD_KIND]         ; VF_IMAGE or VF_FILE
-    or      eax, VFL_RAW
-    mov     qword ptr [r11+0], rax
-    mov     rax, r10
-    add     rax, FD_ARF                          ; {u32 len, AttachRef, filename}
-    mov     qword ptr [r11+16], rax
-    mov     qword ptr [r11+8], 0
+    lea     rax, [g_field_list]
+    add     rax, rcx                             ; &list[k]
+    mov     r9d, dword ptr [r10+FD_KIND]         ; VF_IMAGE or VF_FILE
+    or      r9d, VFL_RAW
+    mov     qword ptr [rax+0], r9
+    mov     qword ptr [rax+16], r11              ; value -> the side-buffer copy
+    mov     qword ptr [rax+8], 0
     jmp     gg_label
 gg_imgskip:
     inc     dword ptr [rbp-28]                   ; drop empty image rows (k unchanged)
@@ -3897,10 +3962,10 @@ grl_chkfile:
 grl_chktotp:
     cmp     eax, VF_TOTP
     jne     grl_setyh
-    mov     dword ptr [rbp-44], 27               ; view mode: code + bar only (short)
+    mov     dword ptr [rbp-44], 29               ; view mode: code + bar only (short)
     cmp     dword ptr [g_editmode], 0
     je      grl_setyh
-    mov     dword ptr [rbp-44], 42               ; edit mode: key + code + bar (tall)
+    mov     dword ptr [rbp-44], 45               ; edit mode: key + code + bar (tall)
 grl_setyh:
     mov     r10, qword ptr [rbp-32]
     mov     eax, dword ptr [rbp-40]
@@ -3934,12 +3999,12 @@ grl_offdone:
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_VALUE*8]
     mov     r8d, 164
     mov     r9d, dword ptr [rbp-60]
-    WINCALL move_ctl, rcx, rdx, r8d, r9d, 180, dword ptr [rbp-48]
-    ; reveal (348, content_y, 12, 12)
+    WINCALL move_ctl, rcx, rdx, r8d, r9d, 196, dword ptr [rbp-48]
+    ; reveal (368, content_y, 12, 12) - right-aligned on the value line
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_REVEAL*8]
-    mov     r8d, 348
+    mov     r8d, 368
     mov     r9d, dword ptr [rbp-60]
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 12, 12
     ; copy: secret -> right cluster (352,y); totp -> next to the live code (318,y+14)
@@ -3948,7 +4013,7 @@ grl_offdone:
     je      grl_copytotp
     mov     rcx, qword ptr [rbp-24]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_COPY*8]
-    mov     r8d, 362
+    mov     r8d, 384
     mov     r9d, dword ptr [rbp-60]
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 12, 12
     jmp     grl_copydone
@@ -3956,7 +4021,7 @@ grl_copytotp:
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_COPY*8]
-    mov     r8d, 284
+    mov     r8d, 252
     mov     r9d, dword ptr [rbp-60]
     add     r9d, dword ptr [rbp-56]
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 16, 11
@@ -3968,7 +4033,7 @@ grl_copydone:
     mov     r8d, 164
     mov     r9d, dword ptr [rbp-60]
     add     r9d, dword ptr [rbp-56]
-    WINCALL move_ctl, rcx, rdx, r8d, r9d, 110, 11
+    WINCALL move_ctl, rcx, rdx, r8d, r9d, 84, 11
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_TBAR*8]
@@ -3976,28 +4041,32 @@ grl_copydone:
     mov     r9d, dword ptr [rbp-60]
     add     r9d, dword ptr [rbp-56]
     add     r9d, 11
-    WINCALL move_ctl, rcx, rdx, r8d, r9d, 110, 2
-    ; up/down/del  (350/366/382, y+2, 12, 11) - top-right of the card (edit mode)
+    WINCALL move_ctl, rcx, rdx, r8d, r9d, 84, 3
+    ; reorder chevrons: stacked in the left gutter (edit mode), flat glyphs;
+    ; delete stays as a button in the card's top-right corner
+    mov     eax, dword ptr [rbp-44]              ; card mid = top + H/2
+    sar     eax, 1
+    add     eax, dword ptr [rbp-40]
+    mov     dword ptr [rbp-64], eax
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_UP*8]
-    mov     r8d, 350
-    mov     r9d, dword ptr [rbp-40]
-    add     r9d, 2
-    WINCALL move_ctl, rcx, rdx, r8d, r9d, 12, 11
+    mov     r8d, 147
+    mov     r9d, dword ptr [rbp-64]
+    sub     r9d, 9
+    WINCALL move_ctl, rcx, rdx, r8d, r9d, 9, 9
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_DOWN*8]
-    mov     r8d, 366
-    mov     r9d, dword ptr [rbp-40]
-    add     r9d, 2
-    WINCALL move_ctl, rcx, rdx, r8d, r9d, 12, 11
+    mov     r8d, 147
+    mov     r9d, dword ptr [rbp-64]
+    WINCALL move_ctl, rcx, rdx, r8d, r9d, 9, 9
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_DEL*8]
-    mov     r8d, 382
+    mov     r8d, 390
     mov     r9d, dword ptr [rbp-40]
-    add     r9d, 2
+    add     r9d, 3
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 12, 11
     ; show/hide the reorder cluster per edit mode
     mov     r10, qword ptr [rbp-32]
@@ -4018,9 +4087,9 @@ grl_copydone:
     jne     grl_sbadge_done
     mov     rcx, qword ptr [rbp-24]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_SBADGE*8]
-    mov     r8d, 348
+    mov     r8d, 354
     mov     r9d, dword ptr [rbp-40]
-    add     r9d, 2
+    add     r9d, 3
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 48, 11
     mov     eax, dword ptr [rbp-52]           ; edit=SW_SHOW, view=SW_HIDE
     xor     eax, SW_SHOW                      ; badge shows in view (opposite)
@@ -4369,9 +4438,14 @@ grb_loop:
     lea     r10, [g_field_list]
     add     r10, rax
     mov     qword ptr [rbp-40], r10             ; &list[k]
-    mov     r9d, dword ptr [r10]                ; type
+    mov     r9d, dword ptr [r10]                ; raw type (may carry VFL_RAW)
+    mov     dword ptr [rbp-64], r9d
+    mov     eax, r9d
+    and     eax, NOT VFL_RAW                    ; clean base kind
+    cmp     eax, VF_FAV                         ; reserved favorite marker: not a row
+    je      grb_next
     mov     rcx, qword ptr [rbp-24]
-    mov     edx, r9d
+    mov     edx, eax
     call    gui_row_add
     cmp     eax, 0
     jl      grb_done
@@ -4392,6 +4466,8 @@ grb_loop:
     add     r10, rax
     or      dword ptr [r10+FD_FLAGS], FDF_LABELED
 grb_setval:
+    test    dword ptr [rbp-64], VFL_RAW        ; image/file value is a binary attachment blob
+    jnz     grb_rawval
     mov     r10, qword ptr [rbp-40]
     mov     rax, qword ptr [r10+16]
     mov     qword ptr [rbp-56], rax
@@ -4414,6 +4490,39 @@ grb_mask:
     mov     dword ptr [rbp-48], eax
     WINCALL SendDlgItemMessageW, qword ptr [rbp-24], dword ptr [rbp-48], \
             EM_SETPASSWORDCHAR, SECRET_MASK, 0
+    jmp     grb_next
+grb_rawval:
+    ; restore an image/file attachment from the gather side-buffer + re-decode
+    mov     r10, qword ptr [rbp-40]            ; &list[k]
+    mov     r11, qword ptr [r10+16]            ; &g_gatherblob[k] = {u32 len, AttachRef, filename}
+    mov     eax, dword ptr [r11]               ; len
+    mov     dword ptr [rbp-48], eax
+    lea     rax, [r11+4]                       ; {AttachRef, filename}
+    mov     qword ptr [rbp-56], rax
+    mov     ecx, dword ptr [rbp-44]            ; row
+    mov     rdx, rax
+    mov     r8d, dword ptr [rbp-48]
+    call    gui_img_setblob
+    mov     eax, dword ptr [rbp-64]
+    and     eax, NOT VFL_RAW
+    cmp     eax, VF_FILE
+    je      grb_filerestore
+    mov     ecx, dword ptr [rbp-44]            ; image: decode the thumbnail
+    call    gui_img_decode
+    jmp     grb_next
+grb_filerestore:
+    mov     eax, dword ptr [rbp-48]            ; file: show filename (if present) + preview
+    cmp     eax, 68
+    jbe     grb_filethumb
+    mov     ecx, dword ptr [rbp-44]
+    mov     edx, DS_VALUE
+    call    dynid
+    mov     r8, qword ptr [rbp-56]
+    add     r8, 68                             ; filename wide
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], eax, r8
+grb_filethumb:
+    mov     ecx, dword ptr [rbp-44]
+    call    gui_file_preview
 grb_next:
     inc     dword ptr [rbp-32]
     jmp     grb_loop
@@ -5164,6 +5273,10 @@ vp_tdraw:
     je      vp_tdraw_thumb
     cmp     edx, DS_SBADGE
     je      vp_tdraw_sbadge
+    cmp     edx, DS_UP
+    je      vp_tdraw_chev
+    cmp     edx, DS_DOWN
+    je      vp_tdraw_chev
     jmp     vp_tdraw_def
 vp_tdraw_header:
     mov     rcx, r9
@@ -5173,6 +5286,11 @@ vp_tdraw_header:
 vp_tdraw_sbadge:
     mov     rcx, r9
     call    gui_draw_sbadge
+    mov     eax, 1
+    jmp     vp_ret
+vp_tdraw_chev:
+    mov     rcx, r9
+    call    gui_draw_flatchevron
     mov     eax, 1
     jmp     vp_ret
 vp_tdraw_thumb:
