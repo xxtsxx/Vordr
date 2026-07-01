@@ -61,6 +61,7 @@ extern SetLayeredWindowAttributes:proc
 extern GetWindowRect:proc
 extern ScreenToClient:proc
 extern GetFocus:proc
+extern GetDlgCtrlID:proc
 extern IsWindowVisible:proc
 extern GetSystemInfo:proc
 extern GetSystemPowerStatus:proc
@@ -766,6 +767,10 @@ frame_cb proc
     movzx   eax, word ptr [g_clsbuf]
     cmp     eax, 'E'                          ; only "Edit" controls get the underline
     jne     fc_skip
+    mov     rcx, qword ptr [rbp-8]            ; row-card edits (id >= 3000) sit on filled
+    call    GetDlgCtrlID                      ;   panels -> no underline (clean cards)
+    cmp     eax, 3000                         ; IDC_DYN_BASE
+    jae     fc_skip
     mov     rcx, qword ptr [rbp-8]
     lea     rdx, [rbp-40]
     call    GetWindowRect                     ; screen rect L,T,R,B
