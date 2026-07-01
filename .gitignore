@@ -18,3 +18,7 @@
 /checkpoints/
 /ztest/         # encrypted-zip test fixtures (regenerated via pyzipper)
 *.zip
+
+# diagnostic outputs (imgtest/thumbtest/pvtest)
+thumb_out.png
+pvtmp.pdf
