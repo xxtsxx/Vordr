@@ -143,6 +143,10 @@ extern SetBkMode:proc
 extern SetBkColor:proc
 extern GetSysColorBrush:proc
 extern GetStockObject:proc
+extern RoundRect:proc
+extern SelectObject:proc
+extern CreateFontW:proc
+extern GetSysColor:proc
 extern CreateSolidBrush:proc
 extern FillRect:proc
 extern InvalidateRect:proc
@@ -202,6 +206,8 @@ WM_COMMAND          equ 111h
 WM_PAINT            equ 0Fh
 WM_ERASEBKGND       equ 14h
 WM_DRAWITEM         equ 2Bh
+WM_MEASUREITEM      equ 2Ch
+WM_COMPAREITEM      equ 39h
 WM_CTLCOLOREDIT     equ 133h
 WM_CTLCOLORLISTBOX  equ 134h
 WM_CTLCOLORBTN      equ 135h
@@ -550,6 +556,14 @@ cap_nofile label word
     dw '(','f','i','l','e',')', 0
 verb_open label word
     dw 'o','p','e','n', 0
+f_iconname label word
+    dw 'S','e','g','o','e',' ','F','l','u','e','n','t',' ','I','c','o','n','s', 0
+f_segoeui label word
+    dw 'S','e','g','o','e',' ','U','I', 0
+align 4
+g_tilepal label dword                         ; 8 tile colours (COLORREF 0x00BBGGRR)
+    dd 000C06020h, 00050A028h, 0001E78E6h, 000C85A96h
+    dd 000AAAA1Eh, 0004646D2h, 0009650DCh, 000826450h
 name_default_att label word
     dw 'v','o','r','d','r','_','a','t','t','a','c','h','.','b','i','n', 0
 cap_paste label word
@@ -661,6 +675,16 @@ g_dlgfont     dq ?                        ; the vault dialog's font (for runtime
 g_totp_row    dd ?                        ; row index of the TOTP field (-1 = none)
 g_totp_codehwnd dq ?                      ; live-code display control of the TOTP row
 g_totp_barhwnd  dq ?                      ; drain-bar control of the TOTP row
+align 8
+g_iconfont    dq ?                         ; Segoe Fluent Icons for list/tile glyphs
+g_cardfont    dq ?                         ; list entry title (semibold)
+g_subfont     dq ?                         ; list entry subtitle (regular, dim)
+g_sub_w       dw 512 dup (?)               ; subtitle scratch (wide)
+g_cmpbuf      db 256 dup (?)               ; title-A copy for WM_COMPAREITEM
+align 4
+g_tilecolor   dd ?                         ; fill color for the next tile draw
+align 2
+g_glyph_w     dw 2 dup (?)                 ; one glyph char + NUL
 align 8
 g_imgstageref db 68 dup (?)               ; scratch AttachRef from attach_stage
 g_imgblob     db IMG_BLOBCAP dup (?)       ; scratch {AttachRef, filename wide} value blob
@@ -1019,21 +1043,10 @@ gp_loop:
     test    eax, eax
     jz      gp_next
 gp_show:
-    mov     ecx, dword ptr [rbp-40]
-    lea     rdx, [rbp-48]                       ; &len
-    call    vault_title_at                      ; rax = title ptr, [rbp-48] = len
-    mov     rcx, rax
-    mov     edx, dword ptr [rbp-48]
-    lea     r8, [g_conv_w]
-    mov     r9d, EBUF*2-1
-    call    gui_towide
-    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_ADDSTRING, 0, addr g_conv_w
-    mov     dword ptr [rbp-64], eax             ; sorted insert position
-    cmp     eax, 0
-    jl      gp_next
-    ; tag the new row with the real vault index (sorting/filtering scrambles order)
-    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_SETITEMDATA, \
-            dword ptr [rbp-64], qword ptr [rbp-40]
+    ; owner-draw list: the item data IS the vault index; WM_COMPAREITEM sorts by
+    ; title, WM_DRAWITEM renders the icon card.
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_ADDSTRING, 0, \
+            qword ptr [rbp-40]
 gp_next:
     inc     dword ptr [rbp-40]
     jmp     gp_loop
@@ -1041,6 +1054,338 @@ gp_done:
     FRAME_EPILOG
     ret
 gui_poplist endp
+
+; =============================================================================
+; Owner-draw entry list: icon-tile cards (glyph + title + subtitle)
+; =============================================================================
+
+; gui_make_listfonts() - lazily create the list fonts.
+gui_make_listfonts proc frame
+    FRAME_PROLOG 112
+    cmp     qword ptr [g_iconfont], 0
+    jne     mlf_done
+    WINCALL CreateFontW, -19, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, addr f_iconname
+    mov     qword ptr [g_iconfont], rax
+    WINCALL CreateFontW, -14, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, addr f_segoeui
+    mov     qword ptr [g_cardfont], rax
+    WINCALL CreateFontW, -12, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, addr f_segoeui
+    mov     qword ptr [g_subfont], rax
+mlf_done:
+    FRAME_EPILOG
+    ret
+gui_make_listfonts endp
+
+; gui_title_cmp(ecx=idxA, edx=idxB) -> eax = -1/0/1 (case-insensitive title order).
+gui_title_cmp proc frame
+    FRAME_PROLOG 64
+    mov     dword ptr [rbp-24], ecx
+    mov     dword ptr [rbp-28], edx
+    mov     ecx, dword ptr [rbp-24]
+    lea     rdx, [rbp-40]
+    call    vault_title_at                      ; rax=ptrA, [rbp-40]=lenA
+    mov     r8, qword ptr [rbp-40]
+    cmp     r8, 255
+    jbe     @F
+    mov     r8, 255
+@@: mov     dword ptr [rbp-32], r8d              ; lenA (capped)
+    lea     r10, [g_cmpbuf]
+    mov     r11, rax
+    xor     r9d, r9d
+gtc_cp:
+    cmp     r9d, dword ptr [rbp-32]
+    jae     gtc_cpd
+    mov     al, byte ptr [r11+r9]
+    mov     byte ptr [r10+r9], al
+    inc     r9d
+    jmp     gtc_cp
+gtc_cpd:
+    mov     ecx, dword ptr [rbp-28]
+    lea     rdx, [rbp-48]
+    call    vault_title_at                      ; rax=ptrB, [rbp-48]=lenB
+    mov     qword ptr [rbp-56], rax
+    xor     r9d, r9d
+gtc_lp:
+    cmp     r9d, dword ptr [rbp-32]              ; i>=lenA?
+    jae     gtc_aend
+    mov     r10d, dword ptr [rbp-48]
+    cmp     r9d, r10d                            ; i>=lenB?
+    jae     gtc_gt
+    lea     r10, [g_cmpbuf]
+    movzx   eax, byte ptr [r10+r9]
+    mov     r11, qword ptr [rbp-56]
+    movzx   r8d, byte ptr [r11+r9]
+    cmp     eax, 'A'
+    jb      gtc_af
+    cmp     eax, 'Z'
+    ja      gtc_af
+    add     eax, 20h
+gtc_af:
+    cmp     r8d, 'A'
+    jb      gtc_bf
+    cmp     r8d, 'Z'
+    ja      gtc_bf
+    add     r8d, 20h
+gtc_bf:
+    cmp     eax, r8d
+    jb      gtc_lt
+    ja      gtc_gt
+    inc     r9d
+    jmp     gtc_lp
+gtc_aend:
+    mov     r10d, dword ptr [rbp-48]
+    cmp     r9d, r10d
+    jae     gtc_eq                              ; both exhausted -> equal
+gtc_lt:
+    mov     eax, -1
+    FRAME_EPILOG
+    ret
+gtc_gt:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gtc_eq:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gui_title_cmp endp
+
+; gui_entry_glyph(ecx=idx) -> eax = a Fluent icon char based on the record's fields.
+gui_entry_glyph proc frame
+    FRAME_PROLOG 112
+    mov     dword ptr [rbp-24], ecx
+    mov     dword ptr [rbp-28], 0               ; hasurl
+    mov     dword ptr [rbp-32], 0               ; hasuser
+    mov     ecx, dword ptr [rbp-24]
+    call    vault_field_count
+    mov     dword ptr [rbp-36], eax
+    mov     dword ptr [rbp-40], 0
+geg_lp:
+    mov     eax, dword ptr [rbp-40]
+    cmp     eax, dword ptr [rbp-36]
+    jae     geg_done
+    mov     ecx, dword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-40]
+    lea     r8, [rbp-88]
+    call    vault_field_get
+    mov     eax, dword ptr [rbp-88]
+    cmp     eax, VF_URL
+    jne     geg_chkuser
+    mov     dword ptr [rbp-28], 1
+geg_chkuser:
+    cmp     eax, VF_USERNAME
+    jne     geg_next
+    mov     dword ptr [rbp-32], 1
+geg_next:
+    inc     dword ptr [rbp-40]
+    jmp     geg_lp
+geg_done:
+    cmp     dword ptr [rbp-28], 0
+    je      geg_noturl
+    mov     eax, 0E774h                         ; Globe (has URL)
+    FRAME_EPILOG
+    ret
+geg_noturl:
+    cmp     dword ptr [rbp-32], 0
+    je      geg_deflt
+    mov     eax, 0E77Bh                         ; Contact (has username)
+    FRAME_EPILOG
+    ret
+geg_deflt:
+    mov     eax, 0E72Eh                         ; Lock (default)
+    FRAME_EPILOG
+    ret
+gui_entry_glyph endp
+
+; gui_entry_color(ecx=idx) -> eax = a stable tile color from the title hash.
+gui_entry_color proc frame
+    FRAME_PROLOG 48
+    lea     rdx, [rbp-24]
+    call    vault_title_at                      ; rax=ptr, [rbp-24]=len
+    mov     r8, qword ptr [rbp-24]
+    mov     r10, rax
+    xor     r9d, r9d
+    xor     eax, eax
+gec_lp:
+    cmp     r9, r8
+    jae     gec_done
+    movzx   edx, byte ptr [r10+r9]
+    add     eax, edx
+    inc     r9
+    jmp     gec_lp
+gec_done:
+    and     eax, 7
+    lea     r10, [g_tilepal]
+    mov     eax, dword ptr [r10+rax*4]
+    FRAME_EPILOG
+    ret
+gui_entry_color endp
+
+; gui_entry_subtitle(ecx=idx) - fill g_sub_w with the username (or URL) value.
+gui_entry_subtitle proc frame
+    FRAME_PROLOG 48
+    mov     dword ptr [rbp-24], ecx
+    mov     ecx, dword ptr [rbp-24]
+    mov     edx, VF_USERNAME
+    lea     r8, [rbp-32]
+    call    vault_field_at
+    test    rax, rax
+    jnz     ges_have
+    mov     ecx, dword ptr [rbp-24]
+    mov     edx, VF_URL
+    lea     r8, [rbp-32]
+    call    vault_field_at
+    test    rax, rax
+    jnz     ges_have
+    mov     word ptr [g_sub_w], 0
+    FRAME_EPILOG
+    ret
+ges_have:
+    mov     rcx, rax
+    mov     edx, dword ptr [rbp-32]
+    lea     r8, [g_sub_w]
+    mov     r9d, 500
+    call    gui_towide
+    FRAME_EPILOG
+    ret
+gui_entry_subtitle endp
+
+; gui_draw_tile(rcx=hdc, edx=x, r8d=y, r9d=size) - filled rounded square (g_tilecolor)
+;   with the centered glyph in g_glyph_w drawn white.
+gui_draw_tile proc frame
+    FRAME_PROLOG 160
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-32], edx
+    mov     dword ptr [rbp-40], r8d
+    mov     dword ptr [rbp-48], r9d
+    mov     eax, edx
+    add     eax, r9d
+    mov     dword ptr [rbp-56], eax             ; x2
+    mov     eax, r8d
+    add     eax, r9d
+    mov     dword ptr [rbp-64], eax             ; y2
+    WINCALL CreateSolidBrush, dword ptr [g_tilecolor]
+    mov     qword ptr [rbp-72], rax
+    WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-72]
+    mov     qword ptr [rbp-80], rax             ; old brush
+    WINCALL GetStockObject, 8                   ; NULL_PEN
+    WINCALL SelectObject, qword ptr [rbp-24], rax
+    mov     qword ptr [rbp-88], rax             ; old pen
+    WINCALL RoundRect, qword ptr [rbp-24], dword ptr [rbp-32], dword ptr [rbp-40], \
+            dword ptr [rbp-56], dword ptr [rbp-64], 10, 10
+    WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-80]   ; restore brush
+    WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-88]   ; restore pen
+    WINCALL DeleteObject, qword ptr [rbp-72]
+    ; glyph
+    WINCALL SelectObject, qword ptr [rbp-24], qword ptr [g_iconfont]
+    mov     qword ptr [rbp-80], rax             ; old font
+    WINCALL SetTextColor, qword ptr [rbp-24], 00FFFFFFh
+    WINCALL SetBkMode, qword ptr [rbp-24], 1
+    mov     eax, dword ptr [rbp-32]
+    mov     dword ptr [rbp-104], eax            ; rect L
+    mov     eax, dword ptr [rbp-40]
+    mov     dword ptr [rbp-100], eax            ; rect T
+    mov     eax, dword ptr [rbp-56]
+    mov     dword ptr [rbp-96], eax             ; rect R
+    mov     eax, dword ptr [rbp-64]
+    mov     dword ptr [rbp-92], eax             ; rect B
+    WINCALL DrawTextW, qword ptr [rbp-24], addr g_glyph_w, -1, addr rbp-104, DT_IMGFLAGS
+    WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-80]   ; restore font
+    FRAME_EPILOG
+    ret
+gui_draw_tile endp
+
+; gui_draw_listitem(rcx=lpdis) - draw one owner-draw list entry card.
+gui_draw_listitem proc frame
+    FRAME_PROLOG 192
+    mov     qword ptr [rbp-24], rcx
+    mov     r10, rcx
+    mov     eax, dword ptr [r10+8]              ; itemID
+    cmp     eax, -1
+    je      gli_done                            ; empty listbox (focus-rect draw)
+    mov     rax, qword ptr [r10+32]
+    mov     qword ptr [rbp-32], rax             ; hdc
+    mov     eax, dword ptr [r10+40]
+    mov     dword ptr [rbp-40], eax             ; L
+    mov     eax, dword ptr [r10+44]
+    mov     dword ptr [rbp-48], eax             ; T
+    mov     eax, dword ptr [r10+48]
+    mov     dword ptr [rbp-56], eax             ; R
+    mov     eax, dword ptr [r10+52]
+    mov     dword ptr [rbp-64], eax             ; B
+    mov     eax, dword ptr [r10+16]
+    mov     dword ptr [rbp-72], eax             ; itemState
+    mov     eax, dword ptr [r10+56]
+    mov     dword ptr [rbp-80], eax             ; vault idx (itemData)
+    ; background
+    mov     eax, 00242424h
+    test    dword ptr [rbp-72], 1               ; ODS_SELECTED
+    jz      @F
+    mov     eax, 003D3D3Dh
+@@: mov     dword ptr [rbp-88], eax
+    WINCALL CreateSolidBrush, dword ptr [rbp-88]
+    mov     qword ptr [rbp-96], rax
+    mov     r10, qword ptr [rbp-24]
+    lea     rdx, [r10+40]
+    WINCALL FillRect, qword ptr [rbp-32], rdx, qword ptr [rbp-96]
+    WINCALL DeleteObject, qword ptr [rbp-96]
+    ; icon tile (L+5, T+5, 34)
+    mov     ecx, dword ptr [rbp-80]
+    call    gui_entry_color
+    mov     dword ptr [g_tilecolor], eax
+    mov     ecx, dword ptr [rbp-80]
+    call    gui_entry_glyph
+    mov     word ptr [g_glyph_w], ax
+    mov     word ptr [g_glyph_w+2], 0
+    mov     rcx, qword ptr [rbp-32]
+    mov     edx, dword ptr [rbp-40]
+    add     edx, 5
+    mov     r8d, dword ptr [rbp-48]
+    add     r8d, 5
+    mov     r9d, 34
+    call    gui_draw_tile
+    ; title (cardfont, white)
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_cardfont]
+    mov     qword ptr [rbp-104], rax           ; old font
+    WINCALL SetTextColor, qword ptr [rbp-32], 00FFFFFFh
+    WINCALL SetBkMode, qword ptr [rbp-32], 1
+    mov     eax, dword ptr [rbp-40]
+    add     eax, 46
+    mov     dword ptr [rbp-152], eax           ; rect L
+    mov     eax, dword ptr [rbp-48]
+    add     eax, 4
+    mov     dword ptr [rbp-148], eax           ; rect T
+    mov     eax, dword ptr [rbp-56]
+    sub     eax, 4
+    mov     dword ptr [rbp-144], eax           ; rect R
+    mov     eax, dword ptr [rbp-48]
+    add     eax, 22
+    mov     dword ptr [rbp-140], eax           ; rect B
+    mov     ecx, dword ptr [rbp-80]
+    lea     rdx, [rbp-136]
+    call    vault_title_at                     ; rax=ptr, [rbp-136]=len
+    mov     rcx, rax
+    mov     edx, dword ptr [rbp-136]
+    lea     r8, [g_conv_w]
+    mov     r9d, EBUF*2-1
+    call    gui_towide
+    WINCALL DrawTextW, qword ptr [rbp-32], addr g_conv_w, -1, addr rbp-152, 8024h
+    ; subtitle (subfont, dim)
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_subfont]
+    WINCALL SetTextColor, qword ptr [rbp-32], 00A0A0A0h
+    mov     ecx, dword ptr [rbp-80]
+    call    gui_entry_subtitle                 ; -> g_sub_w
+    mov     eax, dword ptr [rbp-48]
+    add     eax, 22
+    mov     dword ptr [rbp-148], eax           ; rect T
+    mov     eax, dword ptr [rbp-64]
+    sub     eax, 2
+    mov     dword ptr [rbp-140], eax           ; rect B
+    WINCALL DrawTextW, qword ptr [rbp-32], addr g_sub_w, -1, addr rbp-152, 8024h
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-104]   ; restore font
+gli_done:
+    FRAME_EPILOG
+    ret
+gui_draw_listitem endp
 
 ; gui_entry_matches(ecx = entry index) -> eax = 1 if any non-sensitive field
 ;   (value or custom label) contains the current g_search_w query, else 0.
@@ -4113,6 +4458,10 @@ vault_proc proc
     je      vp_terase
     cmp     rdx, WM_DRAWITEM
     je      vp_tdraw
+    cmp     rdx, WM_MEASUREITEM
+    je      vp_measure
+    cmp     rdx, WM_COMPAREITEM
+    je      vp_compare
     cmp     rdx, WM_CTLCOLOREDIT
     je      vp_tcolor
     cmp     rdx, WM_CTLCOLORLISTBOX
@@ -4128,6 +4477,22 @@ vault_proc proc
 vp_tcolor:
     call    theme_ctlcolor
     jmp     vp_ret
+vp_tdraw_list:
+    mov     rcx, r9
+    call    gui_draw_listitem
+    mov     eax, 1
+    jmp     vp_ret
+vp_measure:
+    mov     r10, r9                          ; MEASUREITEMSTRUCT.itemHeight = 42
+    mov     dword ptr [r10+16], 42
+    mov     eax, 1
+    jmp     vp_ret
+vp_compare:
+    mov     r10, r9                          ; COMPAREITEMSTRUCT: idx at +24/+40
+    mov     ecx, dword ptr [r10+24]
+    mov     edx, dword ptr [r10+40]
+    call    gui_title_cmp
+    jmp     vp_ret
 vp_tpaint:
     mov     rcx, qword ptr [rbp-8]
     call    theme_paint
@@ -4142,6 +4507,8 @@ vp_tdraw:
     mov     eax, dword ptr [r10+4]            ; DRAWITEMSTRUCT.CtlID
     cmp     eax, IDC_V_MTPM                   ; the TPM control = Fluent pill toggle
     je      vp_tdraw_toggle
+    cmp     eax, IDC_V_LIST                   ; the entry list = icon cards
+    je      vp_tdraw_list
     cmp     eax, IDC_DYN_BASE                 ; a runtime row's TOTP drain bar?
     jb      vp_tdraw_def
     mov     edx, eax
@@ -4199,6 +4566,7 @@ vp_t_totp:
 vp_init:
     mov     rax, qword ptr [rbp-8]            ; remember the window for the tray toggle
     mov     qword ptr [g_vaulthwnd], rax
+    call    gui_make_listfonts               ; entry-list icon/title/subtitle fonts
     mov     rcx, qword ptr [rbp-8]
     mov     edx, IDC_V_SAVE                   ; Save is the accent/primary (default) button
     call    theme_attach
