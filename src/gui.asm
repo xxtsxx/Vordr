@@ -376,6 +376,8 @@ DS_OPEN     equ 13              ; file: open attachment in the default app
 IDC_V_ADDFIELD equ 230          ; "+ Add field" button (edit mode)
 IDC_V_SAVE   equ 231          ; "Save" button (edit mode, accent/primary)
 IDC_V_SEARCH equ 232          ; search/filter box under the entry list
+IDC_V_HEADER equ 233          ; detail-pane header (icon tile + title, view mode)
+IDC_V_TITLELBL equ 234        ; "Title" static label (edit mode only)
 FIELD_AREA_BOTTOM equ 292        ; rows may not grow past here (DLU; Add-field is at 296)
 ; Win32 window styles (gui.asm builds controls at runtime; the RC gets these
 ; from windows.h, but this module needs the numeric values).
@@ -679,6 +681,7 @@ align 8
 g_iconfont    dq ?                         ; Segoe Fluent Icons for list/tile glyphs
 g_cardfont    dq ?                         ; list entry title (semibold)
 g_subfont     dq ?                         ; list entry subtitle (regular, dim)
+g_titlefont   dq ?                         ; detail-header title (large semibold)
 g_sub_w       dw 512 dup (?)               ; subtitle scratch (wide)
 g_cmpbuf      db 256 dup (?)               ; title-A copy for WM_COMPAREITEM
 align 4
@@ -1070,6 +1073,8 @@ gui_make_listfonts proc frame
     mov     qword ptr [g_cardfont], rax
     WINCALL CreateFontW, -12, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, addr f_segoeui
     mov     qword ptr [g_subfont], rax
+    WINCALL CreateFontW, -21, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, addr f_segoeui
+    mov     qword ptr [g_titlefont], rax
 mlf_done:
     FRAME_EPILOG
     ret
@@ -1386,6 +1391,94 @@ gli_done:
     FRAME_EPILOG
     ret
 gui_draw_listitem endp
+
+; gui_draw_header(rcx=lpdis) - draw the detail-pane header for the current entry:
+;   a large icon tile + title + subtitle (shown in view mode).  Blank when no
+;   entry is selected.  Coords are the control's own client rect (0,0-origin).
+gui_draw_header proc frame
+    FRAME_PROLOG 192
+    mov     qword ptr [rbp-24], rcx
+    mov     r10, rcx
+    mov     rax, qword ptr [r10+32]
+    mov     qword ptr [rbp-32], rax            ; hdc
+    mov     eax, dword ptr [r10+40]
+    mov     dword ptr [rbp-40], eax            ; L
+    mov     eax, dword ptr [r10+44]
+    mov     dword ptr [rbp-48], eax            ; T
+    mov     eax, dword ptr [r10+48]
+    mov     dword ptr [rbp-56], eax            ; R
+    mov     eax, dword ptr [r10+52]
+    mov     dword ptr [rbp-64], eax            ; B
+    ; background fill (dialog base color #202020)
+    WINCALL CreateSolidBrush, 00202020h
+    mov     qword ptr [rbp-72], rax
+    mov     r10, qword ptr [rbp-24]
+    lea     rdx, [r10+40]
+    WINCALL FillRect, qword ptr [rbp-32], rdx, qword ptr [rbp-72]
+    WINCALL DeleteObject, qword ptr [rbp-72]
+    ; nothing selected -> leave the header blank
+    cmp     dword ptr [g_cur_idx], 0
+    jl      gdh_done
+    ; icon tile (L, T+2, 38)
+    mov     ecx, dword ptr [g_cur_idx]
+    call    gui_entry_color
+    mov     dword ptr [g_tilecolor], eax
+    mov     ecx, dword ptr [g_cur_idx]
+    call    gui_entry_glyph
+    mov     word ptr [g_glyph_w], ax
+    mov     word ptr [g_glyph_w+2], 0
+    mov     rcx, qword ptr [rbp-32]
+    mov     edx, dword ptr [rbp-40]
+    mov     r8d, dword ptr [rbp-48]
+    add     r8d, 2
+    mov     r9d, 38
+    call    gui_draw_tile
+    ; title (large semibold, white)
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_titlefont]
+    mov     qword ptr [rbp-80], rax            ; old font
+    WINCALL SetTextColor, qword ptr [rbp-32], 00FFFFFFh
+    WINCALL SetBkMode, qword ptr [rbp-32], 1
+    mov     eax, dword ptr [rbp-40]
+    add     eax, 48
+    mov     dword ptr [rbp-104], eax           ; rect L
+    mov     eax, dword ptr [rbp-48]
+    add     eax, 1
+    mov     dword ptr [rbp-100], eax           ; rect T
+    mov     eax, dword ptr [rbp-56]
+    mov     dword ptr [rbp-96], eax            ; rect R
+    mov     eax, dword ptr [rbp-48]
+    add     eax, 26
+    mov     dword ptr [rbp-92], eax            ; rect B
+    mov     ecx, dword ptr [g_cur_idx]
+    lea     rdx, [rbp-112]
+    call    vault_title_at                     ; rax=ptr, [rbp-112]=len
+    mov     rcx, rax
+    mov     edx, dword ptr [rbp-112]
+    lea     r8, [g_conv_w]
+    mov     r9d, EBUF*2-1
+    call    gui_towide
+    WINCALL DrawTextW, qword ptr [rbp-32], addr g_conv_w, -1, addr rbp-104, 8024h
+    ; subtitle (username/url, dim)
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_subfont]
+    WINCALL SetTextColor, qword ptr [rbp-32], 00A0A0A0h
+    mov     ecx, dword ptr [g_cur_idx]
+    call    gui_entry_subtitle                 ; -> g_sub_w
+    mov     eax, dword ptr [rbp-40]
+    add     eax, 48
+    mov     dword ptr [rbp-104], eax           ; rect L
+    mov     eax, dword ptr [rbp-48]
+    add     eax, 26
+    mov     dword ptr [rbp-100], eax           ; rect T
+    mov     eax, dword ptr [rbp-56]
+    mov     dword ptr [rbp-96], eax            ; rect R
+    mov     eax, dword ptr [rbp-64]
+    mov     dword ptr [rbp-92], eax            ; rect B
+    WINCALL DrawTextW, qword ptr [rbp-32], addr g_sub_w, -1, addr rbp-104, 8024h
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-80]   ; restore font
+gdh_done:
+    FRAME_EPILOG
+    ret
+gui_draw_header endp
 
 ; gui_entry_matches(ecx = entry index) -> eax = 1 if any non-sensitive field
 ;   (value or custom label) contains the current g_search_w query, else 0.
@@ -1713,6 +1806,10 @@ gsd_fnext:
 gsd_fdone:
     mov     rcx, qword ptr [rbp-24]
     call    gui_rows_layout
+    mov     rcx, qword ptr [rbp-24]           ; repaint the header tile+title for this entry
+    mov     edx, IDC_V_HEADER
+    call    GetDlgItem
+    WINCALL InvalidateRect, rax, 0, 1
     mov     rcx, qword ptr [rbp-24]
     call    gui_arm_totp
     mov     dword ptr [g_loading], 0
@@ -2132,7 +2229,7 @@ gui_commit endp
 ;   0 = read-only (view).  Toggles EM_SETREADONLY on the six fields and swaps
 ;   the toolbar pencil glyph for a check mark while editing.
 gui_set_editmode proc frame
-    FRAME_PROLOG 96
+    FRAME_PROLOG 128
     mov     qword ptr [rbp-24], rcx
     mov     dword ptr [rbp-32], edx
     mov     dword ptr [g_editmode], edx
@@ -2179,6 +2276,29 @@ sem_addcmd:
     mov     rcx, rax
     mov     edx, dword ptr [rbp-52]
     call    ShowWindow
+    ; header (view) vs. editable Title label+edit (edit): show one, hide the other
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_V_TITLE
+    call    GetDlgItem
+    mov     rcx, rax
+    mov     edx, dword ptr [rbp-52]
+    call    ShowWindow
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_V_TITLELBL
+    call    GetDlgItem
+    mov     rcx, rax
+    mov     edx, dword ptr [rbp-52]
+    call    ShowWindow
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_V_HEADER
+    call    GetDlgItem
+    mov     qword ptr [rbp-72], rax           ; header hwnd (own 8-byte slot)
+    mov     eax, dword ptr [rbp-52]           ; SW_SHOW in edit, SW_HIDE in view
+    xor     eax, SW_SHOW                      ; opposite: SW_SHOW in view
+    mov     rcx, qword ptr [rbp-72]
+    mov     edx, eax
+    call    ShowWindow
+    WINCALL InvalidateRect, qword ptr [rbp-72], 0, 1   ; repaint header for this entry
     mov     rcx, qword ptr [rbp-24]
     call    gui_rows_layout
     ; the pencil button stays a pencil in both modes (Save handles committing)
@@ -3427,7 +3547,7 @@ gui_rows_layout proc frame
     FRAME_PROLOG 96
     mov     qword ptr [rbp-24], rcx              ; hdlg
     mov     dword ptr [rbp-36], 0                ; i
-    mov     dword ptr [rbp-40], 30               ; y (ROW_TOP)
+    mov     dword ptr [rbp-40], 52               ; y (ROW_TOP - below the detail header)
     mov     dword ptr [rbp-52], 0                ; show cmd (SW_HIDE)
     cmp     dword ptr [g_editmode], 0
     je      grl_havecmd
@@ -4509,6 +4629,8 @@ vp_tdraw:
     je      vp_tdraw_toggle
     cmp     eax, IDC_V_LIST                   ; the entry list = icon cards
     je      vp_tdraw_list
+    cmp     eax, IDC_V_HEADER                 ; detail-pane header (tile + title)
+    je      vp_tdraw_header
     cmp     eax, IDC_DYN_BASE                 ; a runtime row's TOTP drain bar?
     jb      vp_tdraw_def
     mov     edx, eax
@@ -4519,6 +4641,11 @@ vp_tdraw:
     cmp     edx, DS_THUMB
     je      vp_tdraw_thumb
     jmp     vp_tdraw_def
+vp_tdraw_header:
+    mov     rcx, r9
+    call    gui_draw_header
+    mov     eax, 1
+    jmp     vp_ret
 vp_tdraw_thumb:
     mov     rcx, r9
     call    gui_img_drawthumb
