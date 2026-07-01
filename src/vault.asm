@@ -97,8 +97,26 @@ VH_SALT         equ 20
 VH_NONCE        equ 52
 VH_KCV          equ 64
 VH_TOTAL        equ 80          ; header + KCV (= GCM AAD)
-VAULT_BODY_MAX  equ 1048576     ; 1 MiB plaintext cap
+VAULT_BODY_MAX  equ 16777216    ; 16 MiB plaintext cap (record fields only)
 CONV_CAP        equ 16384
+
+; --- large-attachment section (separate part of the vault file) --------------
+; The record body stays small: a VF_IMAGE field's value is a 68-byte AttachRef,
+; not the pixels.  Each attachment's bytes live after the body tag, individually
+; AES-256-GCM'd under a per-attachment random key/nonce that is itself stored
+; (encrypted) inside the body.  A 12-byte trailer terminates the file so an
+; attachment-free vault is byte-identical to the old format (fully compatible).
+;   file = [80 hdr][body_ct][16 tag] ( [id16][u64 ctlen][ct][tag16] )* [trailer]
+;   trailer = [u32 ATT_MAGIC][u64 entries_len]   (present only when >=1 image)
+ATT_MAGIC       equ 54544156h   ; "VATT"
+ATT_TRAILER     equ 12          ; sizeof trailer
+ARF_ID          equ 0           ; AttachRef: 16-byte attachment id
+ARF_KEY         equ 16          ;            32-byte AES-256 key
+ARF_NONCE       equ 48          ;            12-byte GCM nonce
+ARF_PTLEN       equ 60          ;            u64 plaintext length
+ARF_SIZE        equ 68
+ATT_ENThDR      equ 24          ; on-disk entry header = id16 + u64 ctlen
+MAX_ATT         equ 512         ; index / pending-table capacity
 
 .const
 lbl_title   db "  title : "
@@ -123,6 +141,10 @@ kat_pinlbl  dw 'P','I','N',0
 kat_pinval  dw '1','2','3','4',0
 kat_exp_url1 db "a.com"
 kat_exp_pin  db "1234"
+align 4
+kat_img      dd 7                              ; {u32 len, raw bytes} for VFL_RAW
+kat_img_b    db 089h,'P','N','G',000h,001h,0FFh   ; binary incl NUL + high byte
+kat_exp_img  db 089h,'P','N','G',000h,001h,0FFh
 CSTR e_io,      "error: cannot read/write the vault file",13,10
 CSTR e_corrupt, "error: not a Vordr vault (bad magic/version) or corrupt",13,10
 CSTR e_locked,  "error: wrong master password (key-check failed)",13,10
@@ -153,6 +175,15 @@ g_filebuf   dq ?
 g_filesize  dq ?
 g_outbuf    dq ?
 g_outlen    dq ?
+align 16
+g_att_greq  GCMREQ <>                          ; GCM req for attachment seal/open
+g_newatt    db MAX_ATT * 32 dup (?)            ; pending new: {id16, qword pt, qword ptlen}
+g_newatt_n  dd ?
+g_attidx    db MAX_ATT * 32 dup (?)            ; from file: {id16, qword ct, qword ctlen}
+g_attidx_n  dd ?
+g_att_aad   db 32 dup (?)                       ; GCM AAD scratch = id16 | u64 ptlen
+g_att_start dq ?                                ; file offset where attachments begin
+g_att_total dq ?                                ; attachment entries byte length
 g_conv      db CONV_CAP dup (?)
 g_convlabel db MAX_LABEL_BYTES dup (?)        ; utf8 label scratch (va_field_labeled)
 g_match     db CONV_CAP dup (?)
@@ -163,6 +194,11 @@ g_ts        dq ?                ; GetSystemTimeAsFileTime scratch
 vst_ct      db 16 dup (?)
 vst_dec     db 16 dup (?)
 vst_tag     db 16 dup (?)
+align 16
+att_katpt   db 40 dup (?)               ; attachment KAT: plaintext
+att_katct   db 80 dup (?)               ;                 ciphertext+tag scratch
+att_katref  db ARF_SIZE dup (?)         ;                 AttachRef
+att_katout  dq ?                        ;                 opened plaintext len
 g_editbuf   db MAX_ENTRY_BYTES dup (?)     ; scratch copy of an entry for `edit`
 align 4
 public g_use_tpm
@@ -407,9 +443,15 @@ vk_kcv endp
 ; ===========================================================================
 vault_seal_write proc frame
     FRAME_PROLOG 48
-    ; total = VH_TOTAL + body_len + 16
+    ; [rbp-32] = attachment section bytes (entries + trailer)
+    xor     ecx, ecx                            ; emit=0: size the attachment section
+    xor     edx, edx
+    call    attach_build
+    mov     qword ptr [rbp-32], rax
+    ; total = VH_TOTAL + body_len + 16 + attachment section
     mov     rax, qword ptr [g_body_len]
     add     rax, VH_TOTAL + 16
+    add     rax, qword ptr [rbp-32]
     mov     qword ptr [g_outlen], rax
     mov     rcx, rax
     call    mem_alloc
@@ -448,6 +490,16 @@ vsw_hcpy:
     mov     qword ptr [r10].GCMREQ.tag, rax
     lea     rcx, [g_greq]
     call    gcm_seal
+    ; emit the attachment section right after the body tag (seals new blobs,
+    ; copies existing ones from the old image)
+    cmp     qword ptr [rbp-32], 0
+    je      vsw_write
+    mov     ecx, 1                              ; emit=1
+    mov     rdx, qword ptr [g_outbuf]
+    add     rdx, VH_TOTAL + 16
+    add     rdx, qword ptr [g_body_len]
+    call    attach_build
+vsw_write:
     ; --- atomic write: build temp path = g_cfg_in + ".tmp" -----------------
     mov     r10, qword ptr [g_cfg_in]
     lea     r11, [g_tmppath]
@@ -482,7 +534,27 @@ vsw_pdone:
     mov     rdx, qword ptr [g_cfg_in]
     call    file_rename
     mov     dword ptr [rbp-24], eax
-    jmp     vsw_free
+    test    eax, eax
+    jnz     vsw_free                            ; write/rename failed -> free outbuf
+    ; success: the image we just wrote becomes the resident file image, so newly
+    ; sealed attachments are readable without a re-read.  Retire the old image,
+    ; drop the pending list, and rebuild the attachment index.
+    mov     rcx, qword ptr [g_filebuf]
+    test    rcx, rcx
+    jz      vsw_swap
+    mov     rdx, qword ptr [g_filesize]
+    call    mem_free
+vsw_swap:
+    mov     rax, qword ptr [g_outbuf]
+    mov     qword ptr [g_filebuf], rax
+    mov     rax, qword ptr [g_outlen]
+    mov     qword ptr [g_filesize], rax
+    mov     qword ptr [g_outbuf], 0             ; ownership moved to g_filebuf
+    call    attach_reset
+    call    attach_rescan
+    mov     eax, dword ptr [rbp-24]
+    FRAME_EPILOG
+    ret
 vsw_io:
     mov     dword ptr [rbp-24], EXIT_IO
 vsw_free:
@@ -556,10 +628,37 @@ vu_havekey:
     call    ct_memcmp
     test    eax, eax
     jnz     vu_locked
-    ; ciphertext length = filesize - 80 - 16
+    ; detect the attachments trailer at the end of the file (absent = old format)
+    mov     qword ptr [g_att_total], 0
+    mov     rax, qword ptr [g_filesize]
+    cmp     rax, VH_TOTAL + 4 + 16 + ATT_TRAILER
+    jb      vu_ctlen
+    mov     r11, qword ptr [g_filebuf]
+    add     r11, rax
+    sub     r11, ATT_TRAILER
+    cmp     dword ptr [r11], ATT_MAGIC
+    jne     vu_ctlen
+    mov     r9, qword ptr [r11+4]               ; attachment entries length
+    mov     rcx, r9
+    add     rcx, VH_TOTAL + 16 + ATT_TRAILER + 4
+    cmp     rcx, rax
+    ja      vu_ctlen                            ; implausible -> ignore
+    mov     qword ptr [g_att_total], r9
+vu_ctlen:
+    ; body ciphertext length = filesize - 80 - 16 - (att_total + trailer)
     mov     rax, qword ptr [g_filesize]
     sub     rax, VH_TOTAL + 16
+    mov     r9, qword ptr [g_att_total]
+    test    r9, r9
+    jz      vu_ctset
+    sub     rax, r9
+    sub     rax, ATT_TRAILER
+vu_ctset:
     mov     qword ptr [rbp-24], rax
+    ; attachments begin right after the body tag
+    mov     r10, rax
+    add     r10, VH_TOTAL + 16
+    mov     qword ptr [g_att_start], r10
     cmp     rax, VAULT_BODY_MAX
     ja      vu_corrupt
     ; allocate locked plaintext arena
@@ -594,11 +693,9 @@ vu_havekey:
     jnz     vu_auth
     mov     rax, qword ptr [rbp-24]
     mov     qword ptr [g_body_len], rax
-    ; free the (non-secret) ciphertext buffer
-    mov     rcx, qword ptr [g_filebuf]
-    mov     rdx, qword ptr [g_filesize]
-    call    mem_free
-    mov     qword ptr [g_filebuf], 0
+    ; keep the file image resident: attachment ciphertext lives in it.  Build the
+    ; id->ciphertext index from the attachments section.
+    call    attach_index_build
     xor     eax, eax
     FRAME_EPILOG
     ret
@@ -653,6 +750,14 @@ vault_lock proc frame
     call    secmem_free
     mov     qword ptr [g_body_ptr], 0
 vl_key:
+    call    attach_reset                        ; free pending attachment plaintext
+    mov     rcx, qword ptr [g_filebuf]           ; free the resident file image
+    test    rcx, rcx
+    jz      vl_wipe
+    mov     rdx, qword ptr [g_filesize]
+    call    mem_free
+    mov     qword ptr [g_filebuf], 0
+vl_wipe:
     lea     rcx, [g_vkey]
     mov     rdx, 32
     call    secure_zero
@@ -1390,6 +1495,97 @@ vfr_of:
 va_field_raw endp
 
 ; ===========================================================================
+; va_field_bin_labeled(rcx = base type, rdx = label wide (0=none), r8 = raw
+;   value ptr, r9 = raw value len) - append a TLV field whose value is raw bytes
+;   (e.g. an encoded image), with an optional wide custom label.  Mirrors
+;   va_field_labeled but does NOT wide->utf8 the value.  -> eax = 1.
+; ===========================================================================
+va_field_bin_labeled proc frame
+    FRAME_PROLOG 64
+    ; [rbp-24]=type [rbp-32]=rawptr [rbp-40]=rawlen [rbp-48]=labellen
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], r8
+    mov     qword ptr [rbp-40], r9
+    xor     eax, eax
+    mov     qword ptr [rbp-48], rax             ; labellen = 0 default
+    test    rdx, rdx
+    jz      vfb_write
+    cmp     word ptr [rdx], 0                   ; empty label -> plain
+    je      vfb_write
+    mov     rcx, rdx
+    lea     rdx, [g_convlabel]
+    mov     r8d, MAX_LABEL_BYTES
+    call    conv_w2u
+    mov     ecx, eax
+    mov     qword ptr [rbp-48], rcx
+vfb_write:
+    cmp     qword ptr [rbp-48], 0
+    jne     vfb_labeled
+    ; --- plain: {type, rawlen, rawbytes} ---
+    mov     rcx, qword ptr [rbp-24]
+    mov     rdx, qword ptr [rbp-32]
+    mov     r8,  qword ptr [rbp-40]
+    call    va_field_raw
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+vfb_labeled:
+    ; --- labeled: {type|VF_LABELED, 2+labellen+rawlen, u16 labellen|label|raw} ---
+    mov     r9, qword ptr [rbp-48]
+    add     r9, qword ptr [rbp-40]
+    add     r9, 2
+    mov     r10, qword ptr [g_body_len]
+    add     r10, 6
+    add     r10, r9
+    cmp     r10, VAULT_BODY_MAX
+    ja      vfb_of
+    mov     r11, qword ptr [g_body_ptr]
+    add     r11, qword ptr [g_body_len]
+    mov     rax, qword ptr [rbp-24]
+    or      eax, VF_LABELED
+    mov     word ptr [r11], ax
+    mov     eax, r9d
+    mov     dword ptr [r11+2], eax
+    add     r11, 6
+    mov     eax, dword ptr [rbp-48]
+    mov     word ptr [r11], ax                  ; u16 labellen
+    add     r11, 2
+    lea     r9, [g_convlabel]
+    xor     r8, r8
+vfb_lcopy:
+    cmp     r8, qword ptr [rbp-48]
+    jae     vfb_lcdone
+    mov     al, byte ptr [r9+r8]
+    mov     byte ptr [r11+r8], al
+    inc     r8
+    jmp     vfb_lcopy
+vfb_lcdone:
+    add     r11, qword ptr [rbp-48]
+    mov     r9, qword ptr [rbp-32]              ; raw value bytes
+    xor     r8, r8
+vfb_vcopy:
+    cmp     r8, qword ptr [rbp-40]
+    jae     vfb_vcdone
+    mov     al, byte ptr [r9+r8]
+    mov     byte ptr [r11+r8], al
+    inc     r8
+    jmp     vfb_vcopy
+vfb_vcdone:
+    mov     rax, qword ptr [g_body_len]
+    add     rax, 6
+    mov     r9, qword ptr [rbp-48]
+    add     r9, qword ptr [rbp-40]
+    add     r9, 2
+    add     rax, r9
+    mov     qword ptr [g_body_len], rax
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+vfb_of:
+    FASTFAIL FF_BOUNDS
+va_field_bin_labeled endp
+
+; ===========================================================================
 ; edit_field(rcx = type, rdx = override wide ptr) -> eax = field-count delta.
 ;   If an override is supplied, append it (via va_field, wide->utf8); else keep
 ;   the existing value from g_editbuf (via va_field_raw).
@@ -1792,6 +1988,9 @@ vst_k:
     call    vault_field_selftest            ; TLV labeled/duplicate-field roundtrip
     test    eax, eax
     jnz     vst_fail
+    call    attach_selftest                 ; per-attachment seal/open + AAD binding
+    test    eax, eax
+    jnz     vst_fail
     xor     eax, eax
     FRAME_EPILOG
     ret
@@ -1836,14 +2035,18 @@ vault_field_selftest proc frame
     mov     qword ptr [r10+80], rax
     lea     rax, [kat_pinval]
     mov     qword ptr [r10+88], rax
-    mov     dword ptr [g_field_n], 4
+    mov     qword ptr [r10+96], VF_IMAGE or VFL_RAW   ; raw binary value field
+    mov     qword ptr [r10+104], 0              ; no label
+    lea     rax, [kat_img]
+    mov     qword ptr [r10+112], rax            ; -> {u32 len, bytes}
+    mov     dword ptr [g_field_n], 5
     call    vault_build_entry
     test    eax, eax
     jnz     vfst_fail
-    ; field count == 4
+    ; field count == 5
     xor     ecx, ecx
     call    vault_field_count
-    cmp     eax, 4
+    cmp     eax, 5
     jne     vfst_fail
     ; find_field_in(VF_TEXT) must skip the "PIN" label and return "1234"
     lea     rcx, [g_kat_body+4]
@@ -1892,6 +2095,23 @@ vault_field_selftest proc frame
     mov     al, byte ptr [rax]                  ; first byte must be 'A'
     cmp     al, 'A'
     jne     vfst_fail
+    ; positional field 4 = VF_IMAGE: 7 raw bytes (incl NUL) round-trip verbatim
+    xor     ecx, ecx
+    mov     edx, 4
+    lea     r8, [rbp-48]
+    call    vault_field_get
+    test    eax, eax
+    jz      vfst_fail
+    cmp     qword ptr [rbp-48], VF_IMAGE        ; out.kind
+    jne     vfst_fail
+    cmp     qword ptr [rbp-16], 7               ; out.vallen (= [rbp-48+32])
+    jne     vfst_fail
+    mov     rcx, qword ptr [rbp-24]             ; out.valptr (= [rbp-48+24])
+    lea     rdx, [kat_exp_img]
+    mov     r8, 7
+    call    ct_memcmp
+    test    eax, eax
+    jnz     vfst_fail
     xor     eax, eax
     jmp     vfst_done
 vfst_fail:
@@ -2360,10 +2580,22 @@ vbe_loop:
     imul    eax, eax, 24                        ; descriptor stride = 3 qwords
     lea     r10, [g_field_list]
     add     r10, rax
-    mov     rcx, qword ptr [r10]                ; base type
+    mov     rcx, qword ptr [r10]                ; descriptor type
+    test    ecx, VFL_RAW                        ; raw binary value (image)?
+    jnz     vbe_bin
     mov     rdx, qword ptr [r10+8]              ; label wide (0=none)
     mov     r8,  qword ptr [r10+16]             ; value wide
     call    va_field_labeled
+    jmp     vbe_acc
+vbe_bin:
+    and     ecx, NOT VFL_RAW                    ; strip GUI marker -> base kind
+    mov     rdx, qword ptr [r10+8]              ; label wide (0=none)
+    mov     r9,  qword ptr [r10+16]             ; -> {u32 len, raw bytes}
+    mov     r8d, dword ptr [r9]                 ; rawlen
+    add     r9, 4                               ; rawptr
+    xchg    r8, r9                              ; r8=rawptr, r9=rawlen
+    call    va_field_bin_labeled
+vbe_acc:
     add     dword ptr [rbp-40], eax
     inc     dword ptr [rbp-48]
     jmp     vbe_loop
@@ -2427,5 +2659,575 @@ vra_none:
     FRAME_EPILOG
     ret
 vault_remove_at endp
+
+; ===========================================================================
+; ATTACHMENTS - large per-attachment-encrypted blobs in a separate file section
+; ===========================================================================
+
+; att_cpy(rcx=dst, rdx=src, r8=len) - byte copy.  Leaf.
+att_cpy proc
+    xor     r9, r9
+ac_l:
+    cmp     r9, r8
+    jae     ac_d
+    mov     al, byte ptr [rdx+r9]
+    mov     byte ptr [rcx+r9], al
+    inc     r9
+    jmp     ac_l
+ac_d:
+    ret
+att_cpy endp
+
+; att_aad(rcx=id ptr, rdx=ptlen) - build g_att_aad = id[16] | u64 ptlen.  Leaf.
+att_aad proc
+    lea     r10, [g_att_aad]
+    xor     r9d, r9d
+aa_l:
+    mov     al, byte ptr [rcx+r9]
+    mov     byte ptr [r10+r9], al
+    inc     r9d
+    cmp     r9d, 16
+    jb      aa_l
+    mov     qword ptr [r10+16], rdx
+    ret
+att_aad endp
+
+; attach_find(rcx=id ptr, rdx=table base, r8d=count) -> eax = index or -1.  Leaf.
+attach_find proc
+    xor     r9d, r9d
+af_row:
+    cmp     r9d, r8d
+    jae     af_none
+    mov     r10, rdx
+    mov     eax, r9d
+    imul    eax, eax, 32
+    add     r10, rax
+    xor     r11d, r11d
+af_cmp:
+    mov     al, byte ptr [rcx+r11]
+    cmp     al, byte ptr [r10+r11]
+    jne     af_next
+    inc     r11d
+    cmp     r11d, 16
+    jb      af_cmp
+    mov     eax, r9d
+    ret
+af_next:
+    inc     r9d
+    jmp     af_row
+af_none:
+    mov     eax, -1
+    ret
+attach_find endp
+
+; attach_reset() - free pending new-attachment plaintext buffers, clear tables.
+public attach_reset
+attach_reset proc frame
+    FRAME_PROLOG 48
+    mov     dword ptr [rbp-24], 0
+ar_loop:
+    mov     eax, dword ptr [rbp-24]
+    cmp     eax, dword ptr [g_newatt_n]
+    jae     ar_done
+    imul    eax, eax, 32
+    lea     r10, [g_newatt]
+    add     r10, rax
+    mov     rcx, qword ptr [r10+16]
+    test    rcx, rcx
+    jz      ar_next
+    mov     rdx, qword ptr [r10+24]
+    call    mem_free
+ar_next:
+    inc     dword ptr [rbp-24]
+    jmp     ar_loop
+ar_done:
+    mov     dword ptr [g_newatt_n], 0
+    mov     dword ptr [g_attidx_n], 0
+    FRAME_EPILOG
+    ret
+attach_reset endp
+
+; attach_stage(rcx=plaintext ptr, rdx=len, r8=AttachRef out) -> eax = 0 / 1(err).
+;   Copies the plaintext to a heap buffer and fills a fresh AttachRef
+;   (random id/key/nonce, ptlen).  The bytes are sealed into the file on save.
+public attach_stage
+attach_stage proc frame
+    FRAME_PROLOG 80
+    mov     qword ptr [rbp-24], rcx             ; plaintext
+    mov     qword ptr [rbp-32], rdx             ; len
+    mov     qword ptr [rbp-40], r8              ; ref
+    mov     eax, dword ptr [g_newatt_n]
+    cmp     eax, MAX_ATT
+    jae     as_err
+    mov     rcx, qword ptr [rbp-32]
+    call    mem_alloc
+    test    rax, rax
+    jz      as_err
+    mov     qword ptr [rbp-48], rax             ; buf
+    mov     rcx, rax
+    mov     rdx, qword ptr [rbp-24]
+    mov     r8, qword ptr [rbp-32]
+    call    att_cpy
+    ; fill AttachRef: id(16) key(32) nonce(12) ptlen
+    mov     rcx, qword ptr [rbp-40]
+    mov     edx, 16
+    call    rng_fill
+    test    eax, eax
+    jz      as_err
+    mov     rcx, qword ptr [rbp-40]
+    add     rcx, ARF_KEY
+    mov     edx, 32
+    call    rng_fill
+    test    eax, eax
+    jz      as_err
+    mov     rcx, qword ptr [rbp-40]
+    add     rcx, ARF_NONCE
+    mov     edx, 12
+    call    rng_fill
+    test    eax, eax
+    jz      as_err
+    mov     r10, qword ptr [rbp-40]
+    mov     rax, qword ptr [rbp-32]
+    mov     qword ptr [r10+ARF_PTLEN], rax
+    ; append to g_newatt = {id16, buf, len}
+    mov     eax, dword ptr [g_newatt_n]
+    imul    eax, eax, 32
+    lea     r10, [g_newatt]
+    add     r10, rax
+    mov     qword ptr [rbp-56], r10
+    mov     rcx, r10
+    mov     rdx, qword ptr [rbp-40]             ; ref id (ARF_ID=0)
+    mov     r8, 16
+    call    att_cpy
+    mov     r10, qword ptr [rbp-56]
+    mov     rax, qword ptr [rbp-48]
+    mov     qword ptr [r10+16], rax
+    mov     rax, qword ptr [rbp-32]
+    mov     qword ptr [r10+24], rax
+    inc     dword ptr [g_newatt_n]
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+as_err:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+attach_stage endp
+
+; attach_index_build() - scan the file image's attachment section (g_att_start,
+;   g_att_total in g_filebuf) into g_attidx = {id16, ct ptr, ctlen}.
+attach_index_build proc frame
+    FRAME_PROLOG 48
+    mov     dword ptr [g_attidx_n], 0
+    mov     rax, qword ptr [g_att_total]
+    test    rax, rax
+    jz      aib_done
+    mov     r10, qword ptr [g_filebuf]
+    add     r10, qword ptr [g_att_start]
+    mov     r11, r10
+    add     r11, qword ptr [g_att_total]
+aib_loop:
+    cmp     r10, r11
+    jae     aib_done
+    mov     eax, dword ptr [g_attidx_n]
+    cmp     eax, MAX_ATT
+    jae     aib_done
+    imul    eax, eax, 32
+    lea     r8, [g_attidx]
+    add     r8, rax
+    xor     r9d, r9d
+aib_idcp:
+    mov     al, byte ptr [r10+r9]
+    mov     byte ptr [r8+r9], al
+    inc     r9d
+    cmp     r9d, 16
+    jb      aib_idcp
+    mov     rax, qword ptr [r10+16]             ; ctlen
+    lea     rcx, [r10+ATT_ENThDR]               ; ct ptr
+    mov     qword ptr [r8+16], rcx
+    mov     qword ptr [r8+24], rax
+    inc     dword ptr [g_attidx_n]
+    add     r10, ATT_ENThDR
+    add     r10, rax
+    add     r10, 16
+    jmp     aib_loop
+aib_done:
+    FRAME_EPILOG
+    ret
+attach_index_build endp
+
+; attach_rescan() - recompute g_att_start/g_att_total for the current file image
+;   (g_filebuf/g_filesize, body = g_body_len) and rebuild the index.
+public attach_rescan
+attach_rescan proc frame
+    FRAME_PROLOG 48
+    mov     rax, qword ptr [g_body_len]
+    add     rax, VH_TOTAL + 16
+    mov     qword ptr [g_att_start], rax        ; att_start = 80 + bodyct + 16
+    mov     qword ptr [g_att_total], 0
+    mov     rax, qword ptr [g_att_start]
+    add     rax, ATT_TRAILER
+    cmp     rax, qword ptr [g_filesize]
+    ja      ars_build
+    mov     r11, qword ptr [g_filebuf]
+    add     r11, qword ptr [g_filesize]
+    sub     r11, ATT_TRAILER
+    cmp     dword ptr [r11], ATT_MAGIC
+    jne     ars_build
+    mov     r9, qword ptr [r11+4]               ; entries_len
+    mov     rax, qword ptr [g_att_start]
+    add     rax, r9
+    add     rax, ATT_TRAILER
+    cmp     rax, qword ptr [g_filesize]
+    jne     ars_build                           ; inconsistent -> ignore
+    mov     qword ptr [g_att_total], r9
+ars_build:
+    call    attach_index_build
+    FRAME_EPILOG
+    ret
+attach_rescan endp
+
+; attach_open(rcx=AttachRef ptr, rdx=*outlen) -> rax = heap plaintext ptr (0 err).
+;   Pending (unsaved) attachments return a copy of their plaintext; on-disk ones
+;   are GCM-opened from the resident file image with the ref's key/nonce.
+public attach_open
+attach_open proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx             ; ref
+    mov     qword ptr [rbp-32], rdx             ; outlen*
+    mov     rax, qword ptr [rcx+ARF_PTLEN]
+    mov     qword ptr [rbp-40], rax             ; ptlen
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [g_newatt]
+    mov     r8d, dword ptr [g_newatt_n]
+    call    attach_find
+    cmp     eax, -1
+    je      ao_disk
+    ; pending: return a copy of the plaintext
+    mov     rcx, qword ptr [rbp-40]
+    call    mem_alloc
+    test    rax, rax
+    jz      ao_fail
+    mov     qword ptr [rbp-48], rax
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [g_newatt]
+    mov     r8d, dword ptr [g_newatt_n]
+    call    attach_find
+    imul    eax, eax, 32
+    lea     r10, [g_newatt]
+    add     r10, rax
+    mov     rdx, qword ptr [r10+16]
+    mov     rcx, qword ptr [rbp-48]
+    mov     r8, qword ptr [rbp-40]
+    call    att_cpy
+    jmp     ao_ok
+ao_disk:
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [g_attidx]
+    mov     r8d, dword ptr [g_attidx_n]
+    call    attach_find
+    cmp     eax, -1
+    je      ao_fail
+    imul    eax, eax, 32
+    lea     r10, [g_attidx]
+    add     r10, rax
+    mov     r11, qword ptr [r10+16]
+    mov     qword ptr [rbp-56], r11             ; ct ptr
+    mov     rcx, qword ptr [r10+24]
+    mov     qword ptr [rbp-64], rcx             ; ctlen
+    mov     rcx, qword ptr [rbp-40]
+    call    mem_alloc
+    test    rax, rax
+    jz      ao_fail
+    mov     qword ptr [rbp-48], rax
+    mov     rcx, qword ptr [rbp-24]
+    mov     rdx, qword ptr [rbp-40]
+    call    att_aad
+    lea     r10, [g_att_greq]
+    mov     rax, qword ptr [rbp-24]
+    add     rax, ARF_KEY
+    mov     qword ptr [r10].GCMREQ.key, rax
+    mov     rax, qword ptr [rbp-24]
+    add     rax, ARF_NONCE
+    mov     qword ptr [r10].GCMREQ.iv, rax
+    lea     rax, [g_att_aad]
+    mov     qword ptr [r10].GCMREQ.aad, rax
+    mov     qword ptr [r10].GCMREQ.aadlen, 24
+    mov     rax, qword ptr [rbp-56]
+    mov     qword ptr [r10].GCMREQ.inp, rax
+    mov     rax, qword ptr [rbp-64]
+    mov     qword ptr [r10].GCMREQ.inlen, rax
+    mov     rax, qword ptr [rbp-48]
+    mov     qword ptr [r10].GCMREQ.outp, rax
+    mov     rax, qword ptr [rbp-56]
+    add     rax, qword ptr [rbp-64]
+    mov     qword ptr [r10].GCMREQ.tag, rax
+    lea     rcx, [g_att_greq]
+    call    gcm_open
+    test    eax, eax
+    jnz     ao_authfail
+ao_ok:
+    mov     r10, qword ptr [rbp-32]
+    test    r10, r10
+    jz      ao_ret
+    mov     rax, qword ptr [rbp-40]
+    mov     qword ptr [r10], rax
+ao_ret:
+    mov     rax, qword ptr [rbp-48]
+    FRAME_EPILOG
+    ret
+ao_authfail:
+    mov     rcx, qword ptr [rbp-48]
+    mov     rdx, qword ptr [rbp-40]
+    call    mem_free
+ao_fail:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+attach_open endp
+
+; attach_emit_one(rcx=AttachRef ptr, rdx=cur out ptr, r8=ptlen) - write one
+;   attachment entry [id16][u64 ctlen][ct][tag16] at cur.  New (pending) refs are
+;   GCM-sealed from their plaintext; existing refs are copied from the old image.
+attach_emit_one proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx             ; ref
+    mov     qword ptr [rbp-32], rdx             ; cur
+    mov     qword ptr [rbp-40], r8              ; ptlen
+    ; id16 at cur
+    mov     rcx, rdx
+    mov     rdx, qword ptr [rbp-24]
+    mov     r8, 16
+    call    att_cpy
+    ; ctlen (= ptlen) at cur+16
+    mov     r10, qword ptr [rbp-32]
+    mov     rax, qword ptr [rbp-40]
+    mov     qword ptr [r10+16], rax
+    ; AAD = id | ptlen
+    mov     rcx, qword ptr [rbp-24]
+    mov     rdx, qword ptr [rbp-40]
+    call    att_aad
+    ; pending?
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [g_newatt]
+    mov     r8d, dword ptr [g_newatt_n]
+    call    attach_find
+    cmp     eax, -1
+    jne     aeo_new
+    ; existing -> copy ct+tag from old image
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [g_attidx]
+    mov     r8d, dword ptr [g_attidx_n]
+    call    attach_find
+    cmp     eax, -1
+    je      aeo_done
+    imul    eax, eax, 32
+    lea     r10, [g_attidx]
+    add     r10, rax
+    mov     rdx, qword ptr [r10+16]             ; src ct
+    mov     rcx, qword ptr [rbp-32]
+    add     rcx, ATT_ENThDR                     ; dst = cur+24
+    mov     r8, qword ptr [rbp-40]
+    add     r8, 16                              ; ct + tag
+    call    att_cpy
+    jmp     aeo_done
+aeo_new:
+    imul    eax, eax, 32
+    lea     r10, [g_newatt]
+    add     r10, rax
+    mov     r11, qword ptr [r10+16]             ; plaintext ptr
+    lea     r10, [g_att_greq]
+    mov     rax, qword ptr [rbp-24]
+    add     rax, ARF_KEY
+    mov     qword ptr [r10].GCMREQ.key, rax
+    mov     rax, qword ptr [rbp-24]
+    add     rax, ARF_NONCE
+    mov     qword ptr [r10].GCMREQ.iv, rax
+    lea     rax, [g_att_aad]
+    mov     qword ptr [r10].GCMREQ.aad, rax
+    mov     qword ptr [r10].GCMREQ.aadlen, 24
+    mov     qword ptr [r10].GCMREQ.inp, r11
+    mov     rax, qword ptr [rbp-40]
+    mov     qword ptr [r10].GCMREQ.inlen, rax
+    mov     rcx, qword ptr [rbp-32]
+    add     rcx, ATT_ENThDR
+    mov     qword ptr [r10].GCMREQ.outp, rcx
+    mov     rcx, qword ptr [rbp-32]
+    add     rcx, ATT_ENThDR
+    add     rcx, qword ptr [rbp-40]
+    mov     qword ptr [r10].GCMREQ.tag, rcx
+    lea     rcx, [g_att_greq]
+    call    gcm_seal
+aeo_done:
+    FRAME_EPILOG
+    ret
+attach_emit_one endp
+
+; attach_build(ecx=emit, rdx=out ptr) -> rax = total section bytes (entries + the
+;   12-byte trailer), or 0 when the vault has no image fields.  emit=0 sizes only;
+;   emit=1 also writes the section at [rdx].  Walks every VF_IMAGE AttachRef.
+attach_build proc frame
+    FRAME_PROLOG 192
+    mov     dword ptr [rbp-24], ecx             ; emit
+    mov     qword ptr [rbp-32], rdx             ; cur
+    mov     qword ptr [rbp-40], 0               ; total
+    mov     dword ptr [rbp-48], 0               ; count
+    call    vault_count
+    mov     dword ptr [rbp-56], eax             ; nentries
+    mov     dword ptr [rbp-64], 0               ; ei
+ab_erow:
+    mov     eax, dword ptr [rbp-64]
+    cmp     eax, dword ptr [rbp-56]
+    jae     ab_edone
+    mov     ecx, dword ptr [rbp-64]
+    call    vault_field_count
+    mov     dword ptr [rbp-72], eax             ; fc
+    mov     dword ptr [rbp-80], 0               ; fj
+ab_frow:
+    mov     eax, dword ptr [rbp-80]
+    cmp     eax, dword ptr [rbp-72]
+    jae     ab_fnext
+    mov     ecx, dword ptr [rbp-64]
+    mov     edx, dword ptr [rbp-80]
+    lea     r8, [rbp-128]                       ; out struct
+    call    vault_field_get
+    cmp     qword ptr [rbp-128], VF_IMAGE
+    jne     ab_fadv
+    mov     rax, qword ptr [rbp-104]            ; out.valptr (= [rbp-128+24])
+    mov     qword ptr [rbp-136], rax            ; ref
+    mov     rcx, qword ptr [rax+ARF_PTLEN]
+    mov     qword ptr [rbp-144], rcx            ; ptlen
+    cmp     dword ptr [rbp-24], 0
+    je      ab_acc
+    mov     rcx, qword ptr [rbp-136]
+    mov     rdx, qword ptr [rbp-32]
+    mov     r8, qword ptr [rbp-144]
+    call    attach_emit_one
+ab_acc:
+    mov     rax, qword ptr [rbp-144]
+    add     rax, ATT_ENThDR + 16                ; 24 + ptlen + 16
+    add     qword ptr [rbp-40], rax
+    cmp     dword ptr [rbp-24], 0
+    je      ab_cnt
+    mov     rcx, qword ptr [rbp-32]
+    add     rcx, rax
+    mov     qword ptr [rbp-32], rcx
+ab_cnt:
+    inc     dword ptr [rbp-48]
+ab_fadv:
+    inc     dword ptr [rbp-80]
+    jmp     ab_frow
+ab_fnext:
+    inc     dword ptr [rbp-64]
+    jmp     ab_erow
+ab_edone:
+    cmp     dword ptr [rbp-48], 0
+    je      ab_ret
+    cmp     dword ptr [rbp-24], 0
+    je      ab_trail
+    mov     rcx, qword ptr [rbp-32]
+    mov     dword ptr [rcx], ATT_MAGIC
+    mov     rax, qword ptr [rbp-40]
+    mov     qword ptr [rcx+4], rax
+ab_trail:
+    add     qword ptr [rbp-40], ATT_TRAILER
+ab_ret:
+    mov     rax, qword ptr [rbp-40]
+    FRAME_EPILOG
+    ret
+attach_build endp
+
+; attach_selftest() -> eax = 0 ok / 1 fail.  Stage a blob, seal it, then open it
+;   from a synthetic disk index and check the plaintext round-trips (+ AAD bind).
+public attach_selftest
+attach_selftest proc frame
+    FRAME_PROLOG 64
+    call    attach_reset
+    ; fill a 40-byte plaintext pattern
+    lea     r10, [att_katpt]
+    xor     r9d, r9d
+ast_fill:
+    mov     eax, r9d
+    add     eax, 7
+    mov     byte ptr [r10+r9], al
+    inc     r9d
+    cmp     r9d, 40
+    jb      ast_fill
+    ; stage -> att_katref, g_newatt[0]
+    lea     rcx, [att_katpt]
+    mov     rdx, 40
+    lea     r8, [att_katref]
+    call    attach_stage
+    test    eax, eax
+    jnz     ast_fail
+    ; seal manually into att_katct (like emit does): AAD = id|ptlen
+    lea     rcx, [att_katref]
+    mov     rdx, 40
+    call    att_aad
+    lea     r10, [g_att_greq]
+    lea     rax, [att_katref+ARF_KEY]
+    mov     qword ptr [r10].GCMREQ.key, rax
+    lea     rax, [att_katref+ARF_NONCE]
+    mov     qword ptr [r10].GCMREQ.iv, rax
+    lea     rax, [g_att_aad]
+    mov     qword ptr [r10].GCMREQ.aad, rax
+    mov     qword ptr [r10].GCMREQ.aadlen, 24
+    lea     rax, [att_katpt]
+    mov     qword ptr [r10].GCMREQ.inp, rax
+    mov     qword ptr [r10].GCMREQ.inlen, 40
+    lea     rax, [att_katct]
+    mov     qword ptr [r10].GCMREQ.outp, rax
+    lea     rax, [att_katct+40]
+    mov     qword ptr [r10].GCMREQ.tag, rax
+    lea     rcx, [g_att_greq]
+    call    gcm_seal
+    ; synthesize a disk index entry {id, ct=att_katct, ctlen=40}; drop the pending
+    mov     dword ptr [g_newatt_n], 0
+    lea     r10, [g_attidx]
+    lea     rcx, [att_katref]                   ; id
+    xor     r9d, r9d
+ast_idcp:
+    mov     al, byte ptr [rcx+r9]
+    mov     byte ptr [r10+r9], al
+    inc     r9d
+    cmp     r9d, 16
+    jb      ast_idcp
+    lea     rax, [att_katct]
+    mov     qword ptr [r10+16], rax
+    mov     qword ptr [r10+24], 40
+    mov     dword ptr [g_attidx_n], 1
+    ; open it back
+    lea     rcx, [att_katref]
+    lea     rdx, [att_katout]
+    call    attach_open
+    test    rax, rax
+    jz      ast_fail
+    mov     qword ptr [rbp-24], rax             ; opened buf
+    cmp     qword ptr [att_katout], 40
+    jne     ast_freefail
+    mov     rcx, rax
+    lea     rdx, [att_katpt]
+    mov     r8, 40
+    call    ct_memcmp
+    test    eax, eax
+    jnz     ast_freefail
+    ; free the opened buffer
+    mov     rcx, qword ptr [rbp-24]
+    mov     rdx, 40
+    call    mem_free
+    call    attach_reset
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+ast_freefail:
+    mov     rcx, qword ptr [rbp-24]
+    mov     rdx, 40
+    call    mem_free
+ast_fail:
+    call    attach_reset
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+attach_selftest endp
 
 end

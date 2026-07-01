@@ -99,6 +99,7 @@ VF_NOTES            equ 5
 VF_TAGS             equ 6
 VF_TOTP             equ 7          ; base32 TOTP secret (RFC 6238)
 VF_TEXT             equ 8          ; generic single-line text (custom fields)
+VF_IMAGE            equ 9          ; raw encoded image bytes (PNG/JPEG/BMP)
 ; A stored field type carries the base kind in its low byte; VF_LABELED in the
 ; high byte marks a field whose value bytes are prefixed with a custom label:
 ;   labeled: bytes = u16 labellen | label_utf8 | value_utf8
@@ -106,6 +107,9 @@ VF_TEXT             equ 8          ; generic single-line text (custom fields)
 VF_LABELED          equ 8000h      ; "this field carries a custom label" flag
 VF_KINDMASK         equ 00FFh      ; mask to recover the base kind from a type
 MAX_LABEL_BYTES     equ 128        ; bound on a single field's custom label
+; GUI->vault_build_entry descriptor marker (in the g_field_list type qword, never
+; stored): the value pointer is a raw binary blob {u32 len, bytes}, not wide text.
+VFL_RAW             equ 40000000h
 VAULT_ID_LEN        equ 16         ; per-entry random id
 MAX_ENTRY_BYTES     equ 65536      ; bound on a single serialized entry
 MAX_FIELD_BYTES     equ 16384      ; bound on a single TLV field

@@ -37,6 +37,11 @@ extern secure_zero:proc
 extern run_selftest:proc
 extern log_result:proc
 extern do_bench:proc                    ; benchmark (bench.asm)
+extern img_startup:proc                 ; GDI+ diagnostics (img.asm)
+extern img_load:proc
+extern img_dims:proc
+extern img_free:proc
+extern read_file:proc
 ifdef DBG_TRACE
 extern cmd_redteam:proc                 ; fault-injection self-test (redteam.asm)
 extern cmd_tpmtest:proc                 ; TPM seal/unseal round-trip (tpm.asm)
@@ -95,6 +100,8 @@ g_field_list        dq 3*MAX_FIELDS dup (0)
 public g_cfg_pass, g_positionals, g_poscount
 g_argv          dq MAX_ARGS dup (?)
 g_argbuf        dw ARGBUF_CHARS dup (?)
+g_it_buf        dq ?                     ; imgtest: file buffer
+g_it_len        dq ?
 g_cfg_pass      db MAX_PASSWORD_BYTES+1 dup (?)
 g_positionals   dq MAX_ARGS dup (?)  ; -> UTF-16 positional argument strings
 g_poscount      dq ?                 ; number of positionals
@@ -123,6 +130,7 @@ CSTR msg_st_fail,  "SELFTEST FAILURE",13,10
 
 WSTR w_selftest, <selftest>
 WSTR w_bench,    <bench>
+WSTR w_imgtest,  <imgtest>
 ifdef DBG_TRACE
 WSTR w_redteam,  <redteam>
 WSTR w_tpmtest,  <tpmtest>
@@ -150,12 +158,13 @@ CMDENT ends
 cmd_table label CMDENT
     CMDENT { w_selftest,  cmd_selftest,  0, 0 }
     CMDENT { w_bench,     cmd_bench,     0, 0 }
+    CMDENT { w_imgtest,   cmd_imgtest,   1, 0 }   ; decode probe: exit=(w<<16)|h
 ifdef DBG_TRACE
     CMDENT { w_redteam,   cmd_redteam,   1, 0 }   ; fault-injection self-test (dbg)
     CMDENT { w_tpmtest,   cmd_tpmtest,   0, 0 }   ; TPM round-trip probe (dbg)
-CMD_COUNT equ 4
+CMD_COUNT equ 5
 else
-CMD_COUNT equ 2
+CMD_COUNT equ 3
 endif
 
 .data?
@@ -806,6 +815,54 @@ cst_ok:
     FRAME_EPILOG
     ret
 cmd_selftest endp
+
+; cmd_imgtest - decode argv[2] as an image and return exit=(width<<16)|height,
+;   or 0xE00n on failure.  A headless probe for the GDI+ decode path.
+LANDING_PAD
+cmd_imgtest proc frame
+    FRAME_PROLOG 64
+    call    img_startup
+    test    eax, eax
+    jz      cit_start
+    lea     r10, [g_argv]
+    mov     rcx, qword ptr [r10+16]         ; argv[2] = image path
+    lea     rdx, [g_it_buf]
+    lea     r8, [g_it_len]
+    call    read_file
+    test    eax, eax
+    jnz     cit_read
+    mov     rcx, qword ptr [g_it_buf]
+    mov     rdx, qword ptr [g_it_len]
+    call    img_load
+    test    rax, rax
+    jz      cit_load
+    mov     qword ptr [rbp-24], rax
+    mov     rcx, rax
+    lea     rdx, [rbp-40]                    ; &w
+    lea     r8, [rbp-44]                     ; &h
+    call    img_dims
+    mov     rcx, qword ptr [rbp-24]
+    call    img_free
+    mov     eax, dword ptr [rbp-40]
+    shl     eax, 16
+    mov     ecx, dword ptr [rbp-44]
+    and     ecx, 0FFFFh
+    or      eax, ecx
+    FRAME_EPILOG
+    ret
+cit_start:
+    mov     eax, 0E001h
+    FRAME_EPILOG
+    ret
+cit_read:
+    mov     eax, 0E002h
+    FRAME_EPILOG
+    ret
+cit_load:
+    mov     eax, 0E003h
+    FRAME_EPILOG
+    ret
+cmd_imgtest endp
 
 ; =============================================================================
 ; is_cli_command -> eax = 1 if argv[1] names a known command verb, else 0.
