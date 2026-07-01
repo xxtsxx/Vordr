@@ -191,6 +191,9 @@ align 2
 g_tmppath   dw MAX_PATH_CHARS dup (?)        ; "<vault>.tmp" for atomic replace
 g_matchlen  dq ?
 g_ts        dq ?                ; GetSystemTimeAsFileTime scratch
+public g_carry_created
+g_carry_created dq ?            ; if !=0, vault_build_entry uses it as `created`
+                               ; (one-shot; lets a GUI edit preserve the orig date)
 vst_ct      db 16 dup (?)
 vst_dec     db 16 dup (?)
 vst_tag     db 16 dup (?)
@@ -2540,8 +2543,11 @@ vault_field_get endp
 ; ===========================================================================
 public vault_build_entry
 vault_build_entry proc frame
-    FRAME_PROLOG 64
-    ; [rbp-32]=entry start [rbp-40]=written fcount [rbp-48]=i
+    FRAME_PROLOG 80
+    ; [rbp-32]=entry start [rbp-40]=written fcount [rbp-48]=i [rbp-56]=carried created
+    mov     rax, qword ptr [g_carry_created]    ; consume the one-shot carry immediately
+    mov     qword ptr [rbp-56], rax
+    mov     qword ptr [g_carry_created], 0
     cmp     dword ptr [g_field_n], 0
     je      vbe_fail
     mov     r10, qword ptr [g_field_list+16]    ; field 0 value wide
@@ -2564,9 +2570,14 @@ vault_build_entry proc frame
     lea     rcx, [g_ts]
     call    GetSystemTimeAsFileTime
     mov     r11, qword ptr [rbp-32]
-    mov     rax, qword ptr [g_ts]
+    mov     rax, qword ptr [g_ts]               ; now
+    mov     qword ptr [r11+24], rax             ; modified = now
+    mov     rdx, qword ptr [rbp-56]             ; carried created (0 = none -> now)
+    test    rdx, rdx
+    jz      vbe_crnow
+    mov     rax, rdx
+vbe_crnow:
     mov     qword ptr [r11+16], rax             ; created
-    mov     qword ptr [r11+24], rax             ; modified
     mov     dword ptr [r11+32], 0               ; field_count placeholder
     mov     rax, qword ptr [g_body_len]
     add     rax, 36
