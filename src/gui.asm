@@ -5687,14 +5687,15 @@ ve_save:
     mov     rcx, qword ptr [rbp-8]
     call    gui_commit
 ve_off:
-    mov     rcx, qword ptr [rbp-8]
-    xor     edx, edx
-    call    gui_set_editmode
     cmp     dword ptr [g_cur_idx], 0
-    jl      vp_handled
-    mov     rcx, qword ptr [rbp-8]
+    jl      ve_view
+    mov     rcx, qword ptr [rbp-8]           ; rebuild the rows first...
     mov     edx, dword ptr [g_cur_idx]
     call    gui_showdetail
+ve_view:
+    mov     rcx, qword ptr [rbp-8]           ; ...then apply view-mode read-only + layout
+    xor     edx, edx
+    call    gui_set_editmode
     jmp     vp_handled
 vp_save:
     ; Enter while typing in the search box (default-button command, focus in
@@ -5718,14 +5719,15 @@ vp_save_real:
     jl      vp_handled
     mov     rcx, qword ptr [rbp-8]
     call    gui_commit
-    mov     rcx, qword ptr [rbp-8]            ; leave edit mode (hides the TOTP key etc.)
-    xor     edx, edx
-    call    gui_set_editmode
     cmp     dword ptr [g_cur_idx], 0
-    jl      vp_handled
-    mov     rcx, qword ptr [rbp-8]
+    jl      vsr_view
+    mov     rcx, qword ptr [rbp-8]            ; rebuild the rows first...
     mov     edx, dword ptr [g_cur_idx]
     call    gui_showdetail
+vsr_view:
+    mov     rcx, qword ptr [rbp-8]            ; ...then apply view-mode read-only + layout
+    xor     edx, edx
+    call    gui_set_editmode
     jmp     vp_handled
 vp_remove:
     cmp     dword ptr [g_cur_idx], 0
