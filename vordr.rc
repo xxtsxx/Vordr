@@ -58,6 +58,9 @@
 #define IDC_A_ICON   611
 #define IDC_A_TEXT   612
 #define IDC_A_OK     613
+#define DLG_IMGVIEW  620
+#define IDC_IV_PIC   621
+#define IDC_IV_EXPORT 622
 
 /* application / window icon (lowest ID -> the shell's file icon) */
 1 ICON "vordr.ico"
@@ -130,9 +133,19 @@ CAPTION "About Vordr"
 STYLE DS_CENTER | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
 FONT 9, "Segoe UI"
 {
-    CONTROL "", IDC_A_ICON, "Static", SS_ICON | WS_CHILD | WS_VISIBLE , 22 , 24 , 24 , 24 
+    CONTROL "", IDC_A_ICON, "Static", SS_ICON | WS_CHILD | WS_VISIBLE , 22 , 24 , 24 , 24
     LTEXT "", IDC_A_TEXT, 80, 24, 172, 78
     PUSHBUTTON "OK", IDC_A_OK, 214, 104, 56, 22, BS_OWNERDRAW
+}
+
+DLG_IMGVIEW DIALOGEX 0, 0, 400, 322
+CAPTION "Vordr - Image"
+STYLE DS_CENTER | DS_SETFOREGROUND | WS_POPUP | WS_CAPTION | WS_SYSMENU
+FONT 9, "Segoe UI"
+{
+    CONTROL "", IDC_IV_PIC, "Static", SS_OWNERDRAW | WS_CHILD | WS_VISIBLE, 8, 8, 384, 282
+    PUSHBUTTON "Export", IDC_IV_EXPORT, 280, 298, 54, 18, BS_OWNERDRAW
+    PUSHBUTTON "Close", IDOK, 338, 298, 54, 18, BS_OWNERDRAW
 }
 
 1 VERSIONINFO
