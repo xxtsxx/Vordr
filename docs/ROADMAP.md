@@ -119,9 +119,17 @@ Consider a fuzz harness feeding malformed attachment sections to `attach_index_b
 - **Drag-and-drop image import** (WM_DROPFILES) — natural complement to the picker.
 - **Multiple images per record** already works (modular fields); add a gallery/strip
   layout when a record has several.
-- **Generic file attachments** (PDF, keys, recovery codes) — the attachment layer is
-  content-agnostic already; add a non-image `VF_FILE` kind that stores a filename +
-  opens/exports without decoding. Small once 1.1 lands.
+- **Generic file attachments** — DONE. `VF_FILE` stores any file as an encrypted
+  attachment (own key/nonce, separate file section) + its filename; a row shows a
+  shell thumbnail, the filename, and Open / Save (Export) / Choose. Preview uses
+  `IShellItemImageFactory::GetImage` (Windows built-in), which renders a **PDF's
+  first page** where a thumbnail provider exists, else the file-type icon.
+  *Caveat / follow-up:* Open and preview decrypt to a `%TEMP%` file (the shell API
+  is path-based). Preview deletes it immediately; **Open leaves plaintext in %TEMP%
+  until the OS cleans it** — the app the user opens holds it. Follow-ups: shred the
+  temp on lock, or use a per-session RAM disk / restricted-ACL temp dir; render PDF
+  in-memory via `Windows.Data.Pdf` (WinRT) to avoid the temp entirely (hard from
+  no-CRT MASM); larger enlarge preview (re-request the shell thumbnail at view size).
 - **Password history** per secret (keep prior values, timestamped).
 - **Vault-wide export/import** (encrypted backup, or plaintext export behind a scary
   confirm) and **merge**.

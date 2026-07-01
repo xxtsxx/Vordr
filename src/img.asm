@@ -29,6 +29,8 @@ extern GdipSaveImageToStream:proc
 extern GdipGetImageEncodersSize:proc
 extern GdipGetImageEncoders:proc
 extern SHCreateMemStream:proc
+extern SHCreateItemFromParsingName:proc
+extern CoInitializeEx:proc
 extern CreateStreamOnHGlobal:proc
 extern GetHGlobalFromStream:proc
 extern GlobalLock:proc
@@ -55,6 +57,10 @@ g_gdip_in    dd 1
              dd 0
 ; "image/png" wide, for encoder CLSID lookup
 w_png        dw 'i','m','a','g','e','/','p','n','g',0
+; IID_IShellItemImageFactory {BCC18B79-BA16-442F-80C4-8A59C30C463B}
+align 8
+IID_ISIIF    db 079h,08Bh,0C1h,0BCh, 016h,0BAh, 02Fh,044h
+             db 080h,0C4h,08Ah,059h,0C3h,00Ch,046h,03Bh
 
 .code
 
@@ -361,6 +367,93 @@ ie_fail:
     FRAME_EPILOG
     ret
 img_encode_hbitmap endp
+
+; img_from_hbitmap(rcx = HBITMAP) -> rax = image handle wrapping it (or 0).
+;   The handle has no backing stream; img_free disposes the GDI+ bitmap.
+public img_from_hbitmap
+img_from_hbitmap proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], 0
+    call    img_startup
+    test    eax, eax
+    jz      ifh_fail
+    WINCALL GdipCreateBitmapFromHBITMAP, qword ptr [rbp-24], 0, addr rbp-32
+    test    eax, eax
+    jnz     ifh_fail
+    cmp     qword ptr [rbp-32], 0
+    je      ifh_fail
+    mov     rcx, 16
+    call    mem_alloc
+    test    rax, rax
+    jz      ifh_dispose
+    mov     r10, qword ptr [rbp-32]
+    mov     qword ptr [rax], r10
+    mov     qword ptr [rax+8], 0
+    FRAME_EPILOG
+    ret
+ifh_dispose:
+    WINCALL GdipDisposeImage, qword ptr [rbp-32]
+ifh_fail:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+img_from_hbitmap endp
+
+; shell_thumb(rcx = wide path, edx = w, r8d = h) -> rax = HBITMAP (or 0).
+;   Ask the shell image factory for the file's thumbnail (PDF first page / doc
+;   preview via the registered handler, else the file-type icon).
+public shell_thumb
+shell_thumb proc frame
+    FRAME_PROLOG 80
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-40], edx
+    mov     dword ptr [rbp-48], r8d
+    mov     qword ptr [rbp-32], 0                ; factory
+    mov     qword ptr [rbp-56], 0                ; hbitmap
+    WINCALL CoInitializeEx, 0, 2                 ; COINIT_APARTMENTTHREADED (idempotent)
+    WINCALL SHCreateItemFromParsingName, qword ptr [rbp-24], 0, addr IID_ISIIF, addr rbp-32
+    test    eax, eax
+    jnz     st_fail
+    cmp     qword ptr [rbp-32], 0
+    je      st_fail
+    ; GetImage(this, SIZE{w,h} by value, flags=0, &hbitmap)  -- vtable[3]
+    mov     eax, dword ptr [rbp-40]
+    mov     r10d, dword ptr [rbp-48]
+    shl     r10, 32
+    or      rax, r10
+    mov     rdx, rax                             ; SIZE by value
+    mov     rcx, qword ptr [rbp-32]
+    xor     r8d, r8d                             ; SIIGBF_RESIZETOFIT
+    lea     r9, [rbp-56]
+    mov     rax, qword ptr [rcx]
+    mov     rax, qword ptr [rax+24]
+    sub     rsp, 32
+    call    rax
+    add     rsp, 32
+    mov     rcx, qword ptr [rbp-32]              ; factory->Release()
+    mov     rax, qword ptr [rcx]
+    mov     rax, qword ptr [rax+16]
+    sub     rsp, 32
+    call    rax
+    add     rsp, 32
+    mov     rax, qword ptr [rbp-56]
+    FRAME_EPILOG
+    ret
+st_fail:
+    mov     rcx, qword ptr [rbp-32]
+    test    rcx, rcx
+    jz      st_ret
+    mov     rax, qword ptr [rcx]
+    mov     rax, qword ptr [rax+16]
+    sub     rsp, 32
+    call    rax
+    add     rsp, 32
+st_ret:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+shell_thumb endp
 
 ; ie_cpy(rcx=dst, rdx=src, r8=len) leaf byte copy
 ie_cpy proc
