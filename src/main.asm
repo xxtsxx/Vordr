@@ -55,6 +55,7 @@ endif
 ENC_VAR              equ 0FFFFFFFEh  ; CMDENT.pos_args sentinel: variable (>=1)
 extern con_init:proc
 extern print_a:proc
+extern pwgen_ex:proc                    ; styled password generator (pwgen.asm)
 extern print_err:proc
 
 CP_UTF8              equ 65001
@@ -107,6 +108,7 @@ g_argv          dq MAX_ARGS dup (?)
 g_argbuf        dw ARGBUF_CHARS dup (?)
 g_it_buf        dq ?                     ; imgtest: file buffer
 g_it_len        dq ?
+g_gen_buf       db 160 dup (?)           ; genpw: sample output buffer
 g_cfg_pass      db MAX_PASSWORD_BYTES+1 dup (?)
 g_positionals   dq MAX_ARGS dup (?)  ; -> UTF-16 positional argument strings
 g_poscount      dq ?                 ; number of positionals
@@ -132,12 +134,24 @@ CSTR msg_nocpu,    "error: CPU lacks required features (AES-NI, PCLMULQDQ, SSE4.
 CSTR msg_badnum,   "error: numeric argument out of range",13,10
 CSTR msg_st_ok,    "all self-tests passed",13,10
 CSTR msg_st_fail,  "SELFTEST FAILURE",13,10
+gl_rand   db "  random     : "
+gl_rand_len   equ $ - gl_rand
+gl_phrase db "  passphrase : "
+gl_phrase_len equ $ - gl_phrase
+gl_pron   db "  pronounce  : "
+gl_pron_len   equ $ - gl_pron
+gl_pin    db "  pin        : "
+gl_pin_len    equ $ - gl_pin
+gl_hex    db "  hex        : "
+gl_hex_len    equ $ - gl_hex
+gp_crlf   db 13,10
 
 WSTR w_selftest, <selftest>
 WSTR w_bench,    <bench>
 WSTR w_imgtest,  <imgtest>
 WSTR w_thumbtest,<thumbtest>
 WSTR w_pvtest,   <pvtest>
+WSTR w_genpw,    <genpw>
 WSTR ext_pdf,    <.pdf>
 WSTR w_pvtmp,    <pvtmp.pdf>
 ifdef DBG_TRACE
@@ -170,12 +184,13 @@ cmd_table label CMDENT
     CMDENT { w_imgtest,   cmd_imgtest,   1, 0 }   ; decode probe: exit=(w<<16)|h
     CMDENT { w_thumbtest, cmd_thumbtest, 1, 0 }   ; shell-thumbnail probe: exit 0 ok
     CMDENT { w_pvtest,    cmd_pvtest,    1, 0 }   ; preview-handler probe (.pdf): exit 0 ok
+    CMDENT { w_genpw,     cmd_genpw,     0, 0 }   ; print one sample of each generator style
 ifdef DBG_TRACE
     CMDENT { w_redteam,   cmd_redteam,   1, 0 }   ; fault-injection self-test (dbg)
     CMDENT { w_tpmtest,   cmd_tpmtest,   0, 0 }   ; TPM round-trip probe (dbg)
-CMD_COUNT equ 7
+CMD_COUNT equ 8
 else
-CMD_COUNT equ 5
+CMD_COUNT equ 6
 endif
 
 .data?
@@ -826,6 +841,69 @@ cst_ok:
     FRAME_EPILOG
     ret
 cmd_selftest endp
+
+; gp_println - print g_gen_buf (NUL-terminated, <160) then CRLF.  Internal.
+gp_println proc frame
+    FRAME_PROLOG 32
+    lea     r10, [g_gen_buf]
+    xor     ecx, ecx
+gpl_len:
+    cmp     byte ptr [r10+rcx], 0
+    je      gpl_go
+    inc     ecx
+    cmp     ecx, 159
+    jb      gpl_len
+gpl_go:
+    WINCALL print_a, addr g_gen_buf, ecx
+    WINCALL print_a, addr gp_crlf, 2
+    FRAME_EPILOG
+    ret
+gp_println endp
+
+; cmd_genpw - print one sample of each generator style (visual smoke test).
+;   Non-sensitive: fresh random samples, never a stored secret.
+LANDING_PAD
+cmd_genpw proc frame
+    FRAME_PROLOG 48
+    WINCALL print_a, addr gl_rand, gl_rand_len
+    lea     rcx, [g_gen_buf]
+    mov     edx, 20
+    mov     r8d, PWS_RANDOM
+    mov     r9d, 15 or PWO_NOAMBIG
+    call    pwgen_ex
+    call    gp_println
+    WINCALL print_a, addr gl_phrase, gl_phrase_len
+    lea     rcx, [g_gen_buf]
+    mov     edx, 5
+    mov     r8d, PWS_PASSPHRASE
+    mov     r9d, PWO_CAP or PWO_DASH or PWO_DIGIT
+    call    pwgen_ex
+    call    gp_println
+    WINCALL print_a, addr gl_pron, gl_pron_len
+    lea     rcx, [g_gen_buf]
+    mov     edx, 14
+    mov     r8d, PWS_PRONOUNCE
+    mov     r9d, PWO_CAP or PWO_DIGIT
+    call    pwgen_ex
+    call    gp_println
+    WINCALL print_a, addr gl_pin, gl_pin_len
+    lea     rcx, [g_gen_buf]
+    mov     edx, 8
+    mov     r8d, PWS_PIN
+    xor     r9d, r9d
+    call    pwgen_ex
+    call    gp_println
+    WINCALL print_a, addr gl_hex, gl_hex_len
+    lea     rcx, [g_gen_buf]
+    mov     edx, 24
+    mov     r8d, PWS_HEX
+    xor     r9d, r9d
+    call    pwgen_ex
+    call    gp_println
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+cmd_genpw endp
 
 ; cmd_imgtest - decode argv[2] as an image and return exit=(width<<16)|height,
 ;   or 0xE00n on failure.  A headless probe for the GDI+ decode path.

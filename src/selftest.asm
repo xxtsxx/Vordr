@@ -23,6 +23,7 @@ extern argon2_compress:proc
 extern argon2id_hash:proc
 extern check_password_policy:proc
 extern pwgen:proc
+extern pwgen_ex:proc
 extern vault_selftest:proc
 extern hmac_sha1:proc
 extern base32_decode:proc
@@ -86,6 +87,8 @@ CSTR st_pass_pw,   "  [PASS] password policy (length + class rules)",13,10
 CSTR st_fail_pw,   "  [FAIL] password policy",13,10
 CSTR st_pass_gen,  "  [PASS] pwgen  (alphabet + length, no bias tail)",13,10
 CSTR st_fail_gen,  "  [FAIL] pwgen",13,10
+CSTR st_pass_gx,   "  [PASS] pwgen_ex  (random/passphrase/pronounce/pin/hex + entropy)",13,10
+CSTR st_fail_gx,   "  [FAIL] pwgen_ex",13,10
 CSTR st_pass_vlt,  "  [PASS] vault seal/open  (Argon2id KDF -> KCV -> GCM round-trip)",13,10
 CSTR st_fail_vlt,  "  [FAIL] vault seal/open",13,10
 CSTR st_pass_mac,  "  [PASS] hmac-sha1  (RFC 2202 test case 1)",13,10
@@ -535,6 +538,60 @@ st_gen_fail:
     STPRINT st_fail_gen, st_fail_gen_len
     inc     qword ptr [rbp-24]
 st_after_gen:
+
+    ; ---- pwgen_ex: each style yields printable output + nonzero entropy ------
+    lea     rcx, [pw_out]                       ; RANDOM, all classes, no ambiguous
+    mov     edx, 20
+    mov     r8d, PWS_RANDOM
+    mov     r9d, 15 or PWO_NOAMBIG
+    call    pwgen_ex
+    cmp     eax, 90                             ; 20 chars * ~5.9 bits ~= 118, floor >= 90
+    jb      st_gx_fail
+    lea     rcx, [pw_out]                       ; PASSPHRASE, 4 words, capitalized + dashes
+    mov     edx, 4
+    mov     r8d, PWS_PASSPHRASE
+    mov     r9d, PWO_CAP or PWO_DASH
+    call    pwgen_ex
+    cmp     eax, 32                             ; 4 words * 8 bits
+    jne     st_gx_fail
+    lea     rcx, [pw_out]                       ; PRONOUNCE, 12 chars
+    mov     edx, 12
+    mov     r8d, PWS_PRONOUNCE
+    mov     r9d, PWO_CAP
+    call    pwgen_ex
+    test    eax, eax
+    jz      st_gx_fail
+    lea     rcx, [pw_out]                       ; PIN, 6 digits
+    mov     edx, 6
+    mov     r8d, PWS_PIN
+    xor     r9d, r9d
+    call    pwgen_ex
+    cmp     eax, 19                             ; 6 * log2(10) = 19.9 -> 19
+    jne     st_gx_fail
+    lea     r10, [pw_out]                       ; and all-digits
+    mov     ecx, 6
+st_gx_pin:
+    movzx   eax, byte ptr [r10]
+    cmp     al, '0'
+    jb      st_gx_fail
+    cmp     al, '9'
+    ja      st_gx_fail
+    inc     r10
+    dec     ecx
+    jnz     st_gx_pin
+    lea     rcx, [pw_out]                       ; HEX, 16 chars
+    mov     edx, 16
+    mov     r8d, PWS_HEX
+    xor     r9d, r9d
+    call    pwgen_ex
+    cmp     eax, 64                             ; 16 * 4 bits
+    jne     st_gx_fail
+    STPRINT st_pass_gx, st_pass_gx_len
+    jmp     st_after_gx
+st_gx_fail:
+    STPRINT st_fail_gx, st_fail_gx_len
+    inc     qword ptr [rbp-24]
+st_after_gx:
 
     ; ---- vault seal/open (Argon2id -> KCV -> AES-256-GCM, in memory) ---------
     call    vault_selftest
