@@ -386,6 +386,7 @@ IDC_V_HEADER equ 233          ; detail-pane header (icon tile + title, view mode
 IDC_V_TITLELBL equ 234        ; "Title" static label (edit mode only)
 IDC_V_OVFL   equ 235          ; header overflow (...) menu button
 IDC_V_TIMES  equ 236          ; created/modified timestamps line (detail pane bottom)
+IDC_V_FAV    equ 237          ; header favorite (star) toggle
 FIELD_AREA_BOTTOM equ 292        ; rows may not grow past here (DLU; Add-field is at 296)
 ; Win32 window styles (gui.asm builds controls at runtime; the RC gets these
 ; from windows.h, but this module needs the numeric values).
@@ -532,6 +533,12 @@ wb_copy label word
     dw 0E8C8h, 0                                 ; Copy (copy to clipboard)
 wb_more label word
     dw 0E712h, 0                                 ; More (header overflow menu)
+wb_star label word
+    dw 0E734h, 0                                 ; FavoriteStar (outline = not favorite)
+wb_starf label word
+    dw 0E735h, 0                                 ; FavoriteStarFill (favorited)
+fav_one label word
+    dw '1', 0                                    ; VF_FAV marker value
 cls_edit label word
     dw 'E','d','i','t', 0
 cls_button label word
@@ -701,6 +708,7 @@ align 8
 ; --- modular field-row model (runtime detail form) ---
 g_fields      db MAXROWS*DESCSZ dup (?)   ; row descriptors
 g_field_count dd ?                        ; live row count
+g_fav_state   dd ?                         ; current entry is a favorite (0/1)
 g_content_h   dd ?                        ; field-form content bottom (DLU) after layout
 g_rowkind     dd ?                        ; scratch: kind for a pending add
 g_dlgfont     dq ?                        ; the vault dialog's font (for runtime ctls)
@@ -1891,6 +1899,9 @@ gui_showdetail proc frame
     mov     dword ptr [g_totp_row], -1
     mov     qword ptr [g_totp_codehwnd], 0
     mov     qword ptr [g_totp_barhwnd], 0
+    mov     ecx, dword ptr [rbp-32]           ; favorite state for this entry
+    call    gui_entry_is_fav
+    mov     dword ptr [g_fav_state], eax
     ; stop any prior live-code timer and tear down old rows
     sub     rsp, 32
     mov     rcx, qword ptr [rbp-24]
@@ -1924,6 +1935,8 @@ gsd_floop:
     call    vault_field_get
     mov     eax, dword ptr [rbp-96]              ; out.kind
     cmp     eax, VF_TITLE
+    je      gsd_fnext
+    cmp     eax, VF_FAV                          ; reserved favorite marker: not a row
     je      gsd_fnext
     mov     rcx, qword ptr [rbp-24]
     mov     edx, eax
@@ -2029,6 +2042,8 @@ gsd_fdone:
     WINCALL InvalidateRect, rax, 0, 1
     mov     rcx, qword ptr [rbp-24]           ; created/modified line
     call    gui_show_times
+    mov     rcx, qword ptr [rbp-24]           ; favorite star glyph
+    call    gui_update_fav_glyph
     mov     rcx, qword ptr [rbp-24]
     call    gui_arm_totp
     mov     dword ptr [g_loading], 0
@@ -2392,6 +2407,19 @@ gg_imgskip:
     inc     dword ptr [rbp-28]                   ; drop empty image rows (k unchanged)
     jmp     gg_row
 gg_done:
+    ; append the reserved favorite marker field when set
+    cmp     dword ptr [g_fav_state], 0
+    je      gg_favdone
+    mov     eax, dword ptr [rbp-32]
+    imul    eax, eax, 24
+    lea     r11, [g_field_list]
+    add     r11, rax
+    mov     qword ptr [r11+0], VF_FAV
+    mov     qword ptr [r11+8], 0                 ; no label
+    lea     rax, [fav_one]
+    mov     qword ptr [r11+16], rax              ; value "1"
+    inc     dword ptr [rbp-32]
+gg_favdone:
     mov     eax, dword ptr [rbp-32]
     mov     dword ptr [g_field_n], eax
     FRAME_EPILOG
@@ -2528,6 +2556,15 @@ sem_addcmd:
     ; overflow (...) button shares the header's view-mode visibility
     mov     rcx, qword ptr [rbp-24]
     mov     edx, IDC_V_OVFL
+    call    GetDlgItem
+    mov     qword ptr [rbp-72], rax
+    mov     eax, dword ptr [rbp-52]
+    xor     eax, SW_SHOW
+    mov     rcx, qword ptr [rbp-72]
+    mov     edx, eax
+    call    ShowWindow
+    mov     rcx, qword ptr [rbp-24]           ; favorite star shares the header visibility
+    mov     edx, IDC_V_FAV
     call    GetDlgItem
     mov     qword ptr [rbp-72], rax
     mov     eax, dword ptr [rbp-52]
@@ -4750,6 +4787,34 @@ gts_clear:
     ret
 gui_show_times endp
 
+; gui_entry_is_fav(ecx=idx) -> eax = 1 if the entry carries a VF_FAV field.
+gui_entry_is_fav proc frame
+    FRAME_PROLOG 48
+    mov     edx, VF_FAV
+    lea     r8, [rbp-24]
+    call    vault_field_at                      ; rax = ptr or 0
+    xor     ecx, ecx
+    test    rax, rax
+    setnz   cl
+    mov     eax, ecx
+    FRAME_EPILOG
+    ret
+gui_entry_is_fav endp
+
+; gui_update_fav_glyph(rcx=hdlg) - set the star button glyph from g_fav_state.
+gui_update_fav_glyph proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    lea     rax, [wb_star]                       ; outline (not favorite)
+    cmp     dword ptr [g_fav_state], 0
+    je      guf_set
+    lea     rax, [wb_starf]                      ; filled (favorite)
+guf_set:
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_FAV, rax
+    FRAME_EPILOG
+    ret
+gui_update_fav_glyph endp
+
 ; gui_addfield_menu(rcx=hdlg) - popup the field-type palette at the cursor.
 gui_addfield_menu proc frame
     FRAME_PROLOG 96
@@ -5122,6 +5187,7 @@ vp_init:
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_EDIT, addr wb_edit
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_REMOVE, addr wb_rem
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_OVFL, addr wb_more
+    WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_FAV, addr wb_star
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_V_SEARCH, EM_SETCUEBANNER, 1, addr cue_search
     mov     dword ptr [g_cur_idx], -1         ; no entry selected yet
     mov     dword ptr [g_dirty], 0
@@ -5181,6 +5247,8 @@ vp_cmd_disp:
     je      vp_menu
     cmp     eax, IDC_V_OVFL
     je      vp_ovfl
+    cmp     eax, IDC_V_FAV
+    je      vp_fav
     cmp     eax, IDC_V_MTPMINFO
     je      vp_tpminfo
     cmp     eax, IDC_V_MTPM
@@ -5226,6 +5294,19 @@ vp_ovfl:
     jl      vp_handled
     mov     rcx, qword ptr [rbp-8]
     call    gui_overflow_menu
+    jmp     vp_handled
+vp_fav:
+    cmp     dword ptr [g_cur_idx], 0             ; only with an entry shown
+    jl      vp_handled
+    mov     eax, dword ptr [g_fav_state]         ; toggle favorite
+    xor     eax, 1
+    mov     dword ptr [g_fav_state], eax
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_update_fav_glyph
+    mov     rcx, qword ptr [rbp-8]               ; persist immediately
+    call    gui_commit
+    mov     rcx, qword ptr [rbp-8]               ; refresh Modified (commit bumped it)
+    call    gui_show_times
     jmp     vp_handled
 vp_tpminfo:
     WINCALL gui_msgbox, qword ptr [rbp-8], addr m_tpminfo, addr t_tpminfo, \
