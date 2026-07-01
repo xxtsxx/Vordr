@@ -108,6 +108,17 @@ VF_FAV              equ 11         ; reserved marker: entry is a favorite (value
 ;   plain:   bytes = value_utf8
 VF_LABELED          equ 8000h      ; "this field carries a custom label" flag
 VF_KINDMASK         equ 00FFh      ; mask to recover the base kind from a type
+
+; Password generator styles (pwgen_ex) + options
+PWS_RANDOM          equ 0          ; n random chars from the class mask (opt low nibble)
+PWS_PASSPHRASE      equ 1          ; n words from the embedded list, 8 bits/word
+PWS_PRONOUNCE       equ 2          ; n chars, alternating consonant/vowel (readable)
+PWS_PIN             equ 3          ; n decimal digits
+PWS_HEX             equ 4          ; n lowercase hex chars
+PWO_CAP             equ 100h       ; capitalize each word / first letter
+PWO_DIGIT           equ 200h       ; append a random digit
+PWO_DASH            equ 400h       ; separate passphrase words with '-'
+PWO_NOAMBIG         equ 800h       ; random: drop ambiguous glyphs (0O1lI)
 MAX_LABEL_BYTES     equ 128        ; bound on a single field's custom label
 ; GUI->vault_build_entry descriptor marker (in the g_field_list type qword, never
 ; stored): the value pointer is a raw binary blob {u32 len, bytes}, not wide text.
