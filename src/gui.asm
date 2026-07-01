@@ -2078,12 +2078,14 @@ gra_zero:
             ES_AUTOHSCROLL_ or WS_TABSTOP_
     jmp     gra_reorder
 gra_file:
-    ; thumbnail (owner-draw preview) + read-only filename + Choose/Open/Save
+    ; thumbnail (owner-draw preview) + read-only filename + Choose/Paste/Open/Save
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_THUMB, addr cls_button, 0, \
             BS_OWNERDRAW_ or WS_TABSTOP_
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_VALUE, addr cls_edit, 0, \
             ES_AUTOHSCROLL_ or ES_READONLY_
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_IMPORT, addr cls_button, addr cap_choose, \
+            BS_OWNERDRAW_ or WS_TABSTOP_
+    WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_PASTE, addr cls_button, addr cap_paste, \
             BS_OWNERDRAW_ or WS_TABSTOP_
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_OPEN, addr cls_button, addr cap_open, \
             BS_OWNERDRAW_ or WS_TABSTOP_
@@ -3289,23 +3291,34 @@ grl_filelayout:
     mov     r8d, 312
     mov     r9d, dword ptr [rbp-40]
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 40, 14
-    mov     rcx, qword ptr [rbp-24]                  ; Open (312,y+16,40,14)
+    mov     rcx, qword ptr [rbp-24]                  ; Paste (312,y+16,40,14)
     mov     r10, qword ptr [rbp-32]
-    mov     rdx, qword ptr [r10+FD_HANDLES+DS_OPEN*8]
+    mov     rdx, qword ptr [r10+FD_HANDLES+DS_PASTE*8]
     mov     r8d, 312
     mov     r9d, dword ptr [rbp-40]
     add     r9d, 16
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 40, 14
-    mov     rcx, qword ptr [rbp-24]                  ; Save (312,y+32,40,14)
+    mov     rcx, qword ptr [rbp-24]                  ; Open (312,y+32,40,14)
     mov     r10, qword ptr [rbp-32]
-    mov     rdx, qword ptr [r10+FD_HANDLES+DS_EXPORT*8]
+    mov     rdx, qword ptr [r10+FD_HANDLES+DS_OPEN*8]
     mov     r8d, 312
     mov     r9d, dword ptr [rbp-40]
     add     r9d, 32
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 40, 14
-    ; Choose shows only in edit mode
+    mov     rcx, qword ptr [rbp-24]                  ; Save (312,y+48,40,14)
+    mov     r10, qword ptr [rbp-32]
+    mov     rdx, qword ptr [r10+FD_HANDLES+DS_EXPORT*8]
+    mov     r8d, 312
+    mov     r9d, dword ptr [rbp-40]
+    add     r9d, 48
+    WINCALL move_ctl, rcx, rdx, r8d, r9d, 40, 14
+    ; Choose + Paste show only in edit mode
     mov     r10, qword ptr [rbp-32]
     mov     rcx, qword ptr [r10+FD_HANDLES+DS_IMPORT*8]
+    mov     edx, dword ptr [rbp-52]
+    call    ShowWindow
+    mov     r10, qword ptr [rbp-32]
+    mov     rcx, qword ptr [r10+FD_HANDLES+DS_PASTE*8]
     mov     edx, dword ptr [rbp-52]
     call    ShowWindow
 grl_advance:
@@ -3888,7 +3901,6 @@ gui_addfield_menu proc frame
     mov     dword ptr [rbp-40], 1               ; MF_GRAYED
 gam_totp:
     WINCALL AppendMenuW, qword ptr [rbp-32], dword ptr [rbp-40], 6, addr kl_totp
-    WINCALL AppendMenuW, qword ptr [rbp-32], 0, 8, addr kl_image
     WINCALL AppendMenuW, qword ptr [rbp-32], 0, 9, addr kl_file
     WINCALL AppendMenuW, qword ptr [rbp-32], 0, 7, addr pm_custom
     lea     rcx, [rbp-56]                        ; POINT
