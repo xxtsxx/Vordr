@@ -62,6 +62,8 @@ extern GetWindowRect:proc
 extern ScreenToClient:proc
 extern GetFocus:proc
 extern GetDlgCtrlID:proc
+extern MapDialogRect:proc
+IDC_V_SEARCH_TH equ 232               ; = IDC_V_SEARCH in gui.asm (sidebar search box)
 extern IsWindowVisible:proc
 extern GetSystemInfo:proc
 extern GetSystemPowerStatus:proc
@@ -143,8 +145,9 @@ g_memdc     dq 0
 g_hbm       dq 0
 g_bits      dq 0
 ; ---- runtime-selectable colour scheme -------------------------------------
-; g_col_* are 12 consecutive dwords (order matches each schemes[] row).
+; g_col_* are 13 consecutive dwords (order matches each schemes[] row).
 public g_scheme, g_col_bg, g_col_panel, g_col_text, g_col_textdim, g_col_frame, g_col_dark
+public g_col_side
 g_scheme    dd 0
 align 4
 g_col_bg    dd 00202020h
@@ -159,19 +162,21 @@ g_col_accent dd 00FFC24Ch
 g_col_accsel dd 00DBA03Ah
 g_col_focus dd 00FFC24Ch
 g_col_dark  dd 1
-SCHEME_DW   equ 12                        ; dwords per scheme row
+g_col_side  dd 00342A26h                  ; sidebar (list + search) panel colour
+SCHEME_DW   equ 13                        ; dwords per scheme row
 SCHEME_COUNT equ 8
 schemes label dword
-    ; bg       panel     frame     btn       btnsel    text      textdim   border    accent    accsel    focus     dark
-    dd 00202020h,002D2D2Dh,003D3D3Dh,002D2D2Dh,002A2A2Ah,00FFFFFFh,00C8C8C8h,003D3D3Dh,00FFC24Ch,00DBA03Ah,00FFC24Ch,1  ; Dark
-    dd 00F3F3F3h,00FFFFFFh,00D2D2D2h,00FFFFFFh,00E6E6E6h,00202020h,00707070h,00D2D2D2h,00C26A00h,00A05800h,00C26A00h,0  ; Light
-    dd 001A1410h,00282018h,00403420h,00282018h,00201810h,00FFF0E0h,00C0B0A0h,00403420h,00E0C040h,00B09020h,00E0C040h,1  ; Midnight
-    dd 00000000h,00151515h,00808080h,00202020h,00404040h,00FFFFFFh,00E0E0E0h,00808080h,0000FFFFh,0000C0C0h,0000FFFFh,1  ; Contrast
-    dd 00E3F6FDh,00D5E8EEh,00A1A193h,00D5E8EEh,00C8DAE0h,00756E58h,00969483h,00A1A193h,00D28B26h,00A86F1Eh,00D28B26h,0  ; Solarized
-    dd 00D8ECF4h,00E0F3FBh,00A8C8D8h,00E0F3FBh,00C0DFEAh,002A3B4Bh,00556A7Ah,00A8C8D8h,001D65B5h,00144E90h,001D65B5h,0  ; Sepia
-    dd 0040342Eh,0052423Bh,006A564Ch,0052423Bh,005E4C43h,00F4EFECh,00E9DED8h,006A564Ch,00D0C088h,00B0A06Fh,00D0C088h,1  ; Nord
-    dd 00F3F0FFh,00FFFFFFh,00D0C8F0h,00FFFFFFh,00E4DCFAh,00302A3Ah,00746A8Ah,00D0C8F0h,006C33D6h,005A28B0h,006C33D6h,0  ; Rose
+    ; bg       panel     frame     btn       btnsel    text      textdim   border    accent    accsel    focus     dark  side
+    dd 00202020h,002D2D2Dh,003D3D3Dh,002D2D2Dh,002A2A2Ah,00FFFFFFh,00C8C8C8h,003D3D3Dh,00FFC24Ch,00DBA03Ah,00FFC24Ch,1,00342A26h  ; Dark
+    dd 00F3F3F3h,00FFFFFFh,00D2D2D2h,00FFFFFFh,00E6E6E6h,00202020h,00707070h,00D2D2D2h,00C26A00h,00A05800h,00C26A00h,0,00F5E9E1h  ; Light
+    dd 001A1410h,00282018h,00403420h,00282018h,00201810h,00FFF0E0h,00C0B0A0h,00403420h,00E0C040h,00B09020h,00E0C040h,1,00161C22h  ; Midnight
+    dd 00000000h,00151515h,00808080h,00202020h,00404040h,00FFFFFFh,00E0E0E0h,00808080h,0000FFFFh,0000C0C0h,0000FFFFh,1,001E0C0Ch  ; Contrast
+    dd 00E3F6FDh,00D5E8EEh,00A1A193h,00D5E8EEh,00C8DAE0h,00756E58h,00969483h,00A1A193h,00D28B26h,00A86F1Eh,00D28B26h,0,00DEE2D0h  ; Solarized
+    dd 00D8ECF4h,00E0F3FBh,00A8C8D8h,00E0F3FBh,00C0DFEAh,002A3B4Bh,00556A7Ah,00A8C8D8h,001D65B5h,00144E90h,001D65B5h,0,00E2D6BEh  ; Sepia
+    dd 0040342Eh,0052423Bh,006A564Ch,0052423Bh,005E4C43h,00F4EFECh,00E9DED8h,006A564Ch,00D0C088h,00B0A06Fh,00D0C088h,1,00524232h  ; Nord
+    dd 00F3F0FFh,00FFFFFFh,00D0C8F0h,00FFFFFFh,00E4DCFAh,00302A3Ah,00746A8Ah,00D0C8F0h,006C33D6h,005A28B0h,006C33D6h,0,00F8E0E9h  ; Rose
 g_br_bg     dq 0
+g_br_side   dq 0                            ; sidebar (list + search) fill
 g_br_panel  dq 0
 g_br_frame  dq 0
 g_br_btn    dq 0
@@ -381,6 +386,8 @@ theme_rebrush proc frame
     FRAME_PROLOG 48
     lea     rcx, [g_br_bg]
     call    theme_del_gdi
+    lea     rcx, [g_br_side]
+    call    theme_del_gdi
     lea     rcx, [g_br_panel]
     call    theme_del_gdi
     lea     rcx, [g_br_frame]
@@ -403,6 +410,8 @@ theme_rebrush proc frame
     call    theme_del_gdi
     WINCALL CreateSolidBrush, dword ptr [g_col_bg]
     mov     qword ptr [g_br_bg], rax
+    WINCALL CreateSolidBrush, dword ptr [g_col_side]
+    mov     qword ptr [g_br_side], rax
     WINCALL CreateSolidBrush, dword ptr [g_col_panel]
     mov     qword ptr [g_br_panel], rax
     WINCALL CreateSolidBrush, dword ptr [g_col_frame]
@@ -826,6 +835,91 @@ tt_done:
     ret
 theme_tick endp
 
+; col_darken(ecx=col, edx=factor[0..256]) -> eax = per-channel col*factor/256   leaf
+col_darken proc
+    movzx   eax, cl
+    imul    eax, edx
+    shr     eax, 8
+    mov     r9d, eax
+    mov     eax, ecx
+    shr     eax, 8
+    movzx   eax, al
+    imul    eax, edx
+    shr     eax, 8
+    shl     eax, 8
+    or      r9d, eax
+    mov     eax, ecx
+    shr     eax, 16
+    movzx   eax, al
+    imul    eax, edx
+    shr     eax, 8
+    shl     eax, 16
+    or      r9d, eax
+    mov     eax, r9d
+    ret
+col_darken endp
+
+; =============================================================================
+; theme_sidecard(rcx=hwnd, rdx=hdc) - draw the sidebar as a rounded, 1px-bordered
+;   card in the scheme sidebar colour, with a thin drop shadow, sized to the
+;   list + search box (they sit inside it and blend via the same fill colour).
+; =============================================================================
+theme_sidecard proc frame
+    FRAME_PROLOG 192
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], rdx
+    ; card bounds in DLU (list+search bbox, outset ~3 DLU so the edge/round shows)
+    mov     dword ptr [rbp-64], 27
+    mov     dword ptr [rbp-60], 7
+    mov     dword ptr [rbp-56], 207
+    mov     dword ptr [rbp-52], 308
+    WINCALL MapDialogRect, qword ptr [rbp-24], addr rbp-64
+    mov     eax, dword ptr [rbp-64]
+    mov     dword ptr [rbp-72], eax           ; card L
+    mov     eax, dword ptr [rbp-60]
+    mov     dword ptr [rbp-68], eax           ; card T
+    mov     eax, dword ptr [rbp-56]
+    mov     dword ptr [rbp-76], eax           ; card R
+    mov     eax, dword ptr [rbp-52]
+    mov     dword ptr [rbp-80], eax           ; card B
+    ; ---- drop shadow (offset +2,+3), NULL pen ----
+    WINCALL GetStockObject, 8                 ; NULL_PEN
+    WINCALL SelectObject, qword ptr [rbp-32], rax
+    mov     qword ptr [rbp-104], rax          ; old pen
+    mov     ecx, dword ptr [g_col_bg]         ; shadow = darkened window bg
+    mov     edx, 176
+    call    col_darken
+    WINCALL CreateSolidBrush, eax
+    mov     qword ptr [rbp-88], rax           ; shadow brush
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-88]
+    mov     qword ptr [rbp-96], rax           ; old brush
+    mov     eax, dword ptr [rbp-72]
+    add     eax, 2
+    mov     dword ptr [rbp-112], eax          ; shadow L
+    mov     eax, dword ptr [rbp-68]
+    add     eax, 3
+    mov     dword ptr [rbp-116], eax          ; shadow T
+    mov     eax, dword ptr [rbp-76]
+    add     eax, 2
+    mov     dword ptr [rbp-120], eax          ; shadow R
+    mov     eax, dword ptr [rbp-80]
+    add     eax, 3
+    mov     dword ptr [rbp-124], eax          ; shadow B
+    WINCALL RoundRect, qword ptr [rbp-32], dword ptr [rbp-112], dword ptr [rbp-116], \
+            dword ptr [rbp-120], dword ptr [rbp-124], 14, 14
+    ; ---- the card: side fill + 1px border pen ----
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_pen_bd]
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_br_side]
+    WINCALL RoundRect, qword ptr [rbp-32], dword ptr [rbp-72], dword ptr [rbp-68], \
+            dword ptr [rbp-76], dword ptr [rbp-80], 14, 14
+    ; restore GDI objects, free the shadow brush
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-104]
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-96]
+    WINCALL DeleteObject, qword ptr [rbp-88]
+    FRAME_EPILOG
+    ret
+theme_sidecard endp
+
 ; =============================================================================
 ; theme_paint(rcx=hwnd) -> 1
 ; =============================================================================
@@ -845,7 +939,12 @@ theme_paint proc frame
     ; when the settings overlay is open, paint an opaque dark backdrop over the
     ; aurora so the (transparent) menu controls read against a solid page
     cmp     dword ptr [g_overlay], 0
-    je      tp_done
+    jne     tp_ovl
+    mov     rcx, qword ptr [rbp-24]           ; else draw the sidebar card
+    mov     rdx, qword ptr [rbp-32]
+    call    theme_sidecard
+    jmp     tp_done
+tp_ovl:
     WINCALL FillRect, qword ptr [rbp-32], addr rbp-152, qword ptr [g_br_bg]
 tp_done:
     WINCALL EndPaint, qword ptr [rbp-24], addr rbp-120
@@ -941,6 +1040,12 @@ theme_erase proc frame
     mov     qword ptr [rbp-32], rdx           ; hwnd
     WINCALL GetClientRect, qword ptr [rbp-32], addr rbp-72
     WINCALL FillRect, qword ptr [rbp-24], addr rbp-72, qword ptr [g_br_bg]
+    cmp     dword ptr [g_overlay], 0          ; draw the sidebar card (flat path)
+    jne     te_noside
+    mov     rcx, qword ptr [rbp-32]
+    mov     rdx, qword ptr [rbp-24]
+    call    theme_sidecard
+te_noside:
     ; Fluent input underlines: 1px rest / 2px accent-on-focus under each Edit
     mov     rax, qword ptr [rbp-24]
     mov     qword ptr [g_frame_hdc], rax
@@ -971,9 +1076,9 @@ theme_ctlcolor proc frame
     mov     qword ptr [rbp-32], rdx           ; msg
     mov     qword ptr [rbp-40], r9            ; hctl
     cmp     rdx, WM_CTLCOLORLISTBOX
-    je      tc_listbox
+    je      tc_side
     cmp     rdx, WM_CTLCOLOREDIT
-    je      tc_panel
+    je      tc_edit
     cmp     rdx, WM_CTLCOLORSTATIC
     je      tc_static
     ; dialog background / checkbox / radio text -> opaque near-black, light text
@@ -1000,12 +1105,19 @@ tc_panel:
     mov     rax, qword ptr [g_br_panel]
     FRAME_EPILOG
     ret
-tc_listbox:
-    ; the entry list's empty area must match the item cards (g_col_bg), not the
-    ; panel colour, so the bottom of the list has no visible box edge
+tc_edit:
+    ; the sidebar search box uses the sidebar colour; detail-pane field edits
+    ; keep the panel colour
+    WINCALL GetDlgCtrlID, qword ptr [rbp-40]
+    cmp     eax, IDC_V_SEARCH_TH
+    je      tc_side
+    jmp     tc_panel
+tc_side:
+    ; the entry list + search box paint in the sidebar colour so the whole left
+    ; panel reads as one tinted region (matches the sidebar background fill)
     WINCALL SetTextColor, qword ptr [rbp-24], dword ptr [g_col_text]
-    WINCALL SetBkColor, qword ptr [rbp-24], dword ptr [g_col_bg]
-    mov     rax, qword ptr [g_br_bg]
+    WINCALL SetBkColor, qword ptr [rbp-24], dword ptr [g_col_side]
+    mov     rax, qword ptr [g_br_side]
     FRAME_EPILOG
     ret
 theme_ctlcolor endp
