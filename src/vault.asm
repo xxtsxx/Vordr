@@ -26,6 +26,7 @@ extern ct_memcmp:proc
 extern rng_fill:proc
 extern secure_zero:proc
 extern secmem_alloc:proc
+extern pwgen_ex:proc
 extern secmem_free:proc
 extern read_file:proc
 extern write_file:proc
@@ -191,6 +192,11 @@ align 2
 g_tmppath   dw MAX_PATH_CHARS dup (?)        ; "<vault>.tmp" for atomic replace
 g_matchlen  dq ?
 g_ts        dq ?                ; GetSystemTimeAsFileTime scratch
+seed_title_w dw 80 dup (?)      ; seedtest scratch: entry field strings (wide)
+seed_user_w  dw 96 dup (?)
+seed_url_w   dw 96 dup (?)
+seed_pass_a  db 40 dup (?)
+seed_pass_w  dw 40 dup (?)
 public g_carry_created
 g_carry_created dq ?            ; if !=0, vault_build_entry uses it as `created`
                                ; (one-shot; lets a GUI edit preserve the orig date)
@@ -901,6 +907,225 @@ di_oom:
     FRAME_EPILOG
     ret
 do_init endp
+
+; ===========================================================================
+; seedtest: bulk-create a fresh vault full of realistic entries (perf/search
+;   testing).  do_seed(ecx = count).  Uses g_cfg_in/pass/t/m already set up.
+; ===========================================================================
+url_pfx db "https://www.", 0
+include seed_data.inc
+
+; asc2w(rcx = dst wide, rdx = src ascii NUL-term, r8d = lowercase) -> rax = dst end.
+asc2w proc
+a2w_lp:
+    movzx   eax, byte ptr [rdx]
+    test    al, al
+    jz      a2w_done
+    test    r8d, r8d
+    jz      a2w_put
+    cmp     al, 'A'
+    jb      a2w_put
+    cmp     al, 'Z'
+    ja      a2w_put
+    add     al, 20h
+a2w_put:
+    mov     word ptr [rcx], ax
+    add     rcx, 2
+    inc     rdx
+    jmp     a2w_lp
+a2w_done:
+    mov     rax, rcx
+    ret
+asc2w endp
+
+; seed_make_entry(ecx = index) - build g_field_list (title/user/url/secret) for a
+;   deterministic, realistic entry.
+seed_make_entry proc frame
+    FRAME_PROLOG 96
+    mov     dword ptr [rbp-24], ecx           ; i
+    mov     eax, ecx                           ; svc = i mod SVC_COUNT
+    xor     edx, edx
+    mov     r8d, SVC_COUNT
+    div     r8d
+    mov     dword ptr [rbp-28], edx            ; svc
+    xor     edx, edx                           ; qual = (i / SVC_COUNT) mod QUAL_COUNT
+    mov     r8d, QUAL_COUNT
+    div     r8d
+    mov     dword ptr [rbp-32], edx            ; qual
+    mov     eax, dword ptr [rbp-24]            ; first = (i*7+3) mod FN_COUNT
+    imul    eax, eax, 7
+    add     eax, 3
+    xor     edx, edx
+    mov     r8d, FN_COUNT
+    div     r8d
+    mov     dword ptr [rbp-36], edx
+    mov     eax, dword ptr [rbp-24]            ; last = (i*13+5) mod LN_COUNT
+    imul    eax, eax, 13
+    add     eax, 5
+    xor     edx, edx
+    mov     r8d, LN_COUNT
+    div     r8d
+    mov     dword ptr [rbp-40], edx
+    mov     eax, dword ptr [rbp-28]            ; svc name / domain ptrs
+    imul    eax, eax, SVC_W
+    lea     r10, [svc_names]
+    add     r10, rax
+    mov     qword ptr [rbp-48], r10
+    mov     eax, dword ptr [rbp-28]
+    imul    eax, eax, DOM_W
+    lea     r10, [svc_doms]
+    add     r10, rax
+    mov     qword ptr [rbp-56], r10
+    ; title = "<name> <qual>"
+    lea     rcx, [seed_title_w]
+    mov     rdx, qword ptr [rbp-48]
+    xor     r8d, r8d
+    call    asc2w
+    mov     word ptr [rax], ' '
+    add     rax, 2
+    mov     rcx, rax
+    mov     eax, dword ptr [rbp-32]
+    imul    eax, eax, QUAL_W
+    lea     r10, [quals]
+    add     r10, rax
+    mov     rdx, r10
+    xor     r8d, r8d
+    call    asc2w
+    mov     word ptr [rax], 0
+    ; username = "<first>.<last>@<domain>" (lowercased)
+    lea     rcx, [seed_user_w]
+    mov     eax, dword ptr [rbp-36]
+    imul    eax, eax, NAME_W
+    lea     r10, [first_names]
+    add     r10, rax
+    mov     rdx, r10
+    mov     r8d, 1
+    call    asc2w
+    mov     word ptr [rax], '.'
+    add     rax, 2
+    mov     rcx, rax
+    mov     eax, dword ptr [rbp-40]
+    imul    eax, eax, NAME_W
+    lea     r10, [last_names]
+    add     r10, rax
+    mov     rdx, r10
+    mov     r8d, 1
+    call    asc2w
+    mov     word ptr [rax], '@'
+    add     rax, 2
+    mov     rcx, rax
+    mov     rdx, qword ptr [rbp-56]
+    xor     r8d, r8d
+    call    asc2w
+    mov     word ptr [rax], 0
+    ; url = "https://www.<domain>"
+    lea     rcx, [seed_url_w]
+    lea     rdx, [url_pfx]
+    xor     r8d, r8d
+    call    asc2w
+    mov     rcx, rax
+    mov     rdx, qword ptr [rbp-56]
+    xor     r8d, r8d
+    call    asc2w
+    mov     word ptr [rax], 0
+    ; secret = random 16 (no ambiguous)
+    lea     rcx, [seed_pass_a]
+    mov     edx, 16
+    mov     r8d, PWS_RANDOM
+    mov     r9d, 15 or PWO_NOAMBIG
+    call    pwgen_ex
+    lea     rcx, [seed_pass_w]
+    lea     rdx, [seed_pass_a]
+    xor     r8d, r8d
+    call    asc2w
+    mov     word ptr [rax], 0
+    ; compose g_field_list (title / username / url / secret)
+    lea     r11, [g_field_list]
+    mov     qword ptr [r11+0], VF_TITLE
+    mov     qword ptr [r11+8], 0
+    lea     rax, [seed_title_w]
+    mov     qword ptr [r11+16], rax
+    mov     qword ptr [r11+24], VF_USERNAME
+    mov     qword ptr [r11+32], 0
+    lea     rax, [seed_user_w]
+    mov     qword ptr [r11+40], rax
+    mov     qword ptr [r11+48], VF_URL
+    mov     qword ptr [r11+56], 0
+    lea     rax, [seed_url_w]
+    mov     qword ptr [r11+64], rax
+    mov     qword ptr [r11+72], VF_SECRET
+    mov     qword ptr [r11+80], 0
+    lea     rax, [seed_pass_w]
+    mov     qword ptr [r11+88], rax
+    mov     dword ptr [g_field_n], 4
+    FRAME_EPILOG
+    ret
+seed_make_entry endp
+
+public do_seed
+do_seed proc frame
+    FRAME_PROLOG 48
+    mov     dword ptr [rbp-24], ecx            ; count
+    mov     dword ptr [g_hdr+0], VAULT_MAGIC
+    mov     dword ptr [g_hdr+4], VAULT_VERSION
+    mov     eax, dword ptr [g_cfg_t]
+    mov     dword ptr [g_hdr+VH_T], eax
+    mov     eax, dword ptr [g_cfg_m]
+    mov     dword ptr [g_hdr+VH_M], eax
+    mov     dword ptr [g_hdr+VH_LANES], 1
+    lea     rcx, [g_hdr+VH_SALT]
+    mov     edx, 32
+    call    rng_fill
+    test    eax, eax
+    jz      ds_oom
+    lea     rcx, [g_hdr+VH_NONCE]
+    mov     edx, 12
+    call    rng_fill
+    test    eax, eax
+    jz      ds_oom
+    call    vk_derive
+    test    eax, eax
+    jnz     ds_oom
+    call    vk_kcv
+    lea     r10, [g_sha32]
+    lea     r9, [g_hdr+VH_KCV]
+    xor     r8, r8
+ds_kcv:
+    mov     al, byte ptr [r10+r8]
+    mov     byte ptr [r9+r8], al
+    inc     r8
+    cmp     r8, KCV_LEN
+    jb      ds_kcv
+    mov     rcx, VAULT_BODY_MAX
+    call    secmem_alloc
+    test    rax, rax
+    jz      ds_oom
+    mov     qword ptr [g_body_ptr], rax
+    mov     dword ptr [rax], 0
+    mov     qword ptr [g_body_len], 4
+    mov     dword ptr [rbp-28], 0             ; i
+ds_loop:
+    mov     eax, dword ptr [rbp-28]
+    cmp     eax, dword ptr [rbp-24]
+    jae     ds_seal
+    mov     ecx, eax
+    call    seed_make_entry
+    call    vault_build_entry
+    inc     dword ptr [rbp-28]
+    jmp     ds_loop
+ds_seal:
+    call    vault_seal_write
+    mov     dword ptr [rbp-32], eax
+    call    vault_lock
+    mov     eax, dword ptr [rbp-32]
+    FRAME_EPILOG
+    ret
+ds_oom:
+    call    vault_lock
+    mov     eax, EXIT_OOM
+    FRAME_EPILOG
+    ret
+do_seed endp
 
 ; ===========================================================================
 ; do_add - unlock, append one entry from --title/--user/--secret/--url/--notes,
