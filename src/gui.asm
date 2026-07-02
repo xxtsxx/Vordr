@@ -433,7 +433,7 @@ IDC_V_SEARCH equ 232          ; search/filter box under the entry list
 IDC_V_HEADER equ 233          ; detail-pane header (icon tile + title, view mode)
 IDC_V_TITLELBL equ 234        ; "Title" static label (edit mode only)
 IDC_V_OVFL   equ 235          ; header overflow (...) menu button
-IDC_V_TIMES  equ 236          ; created/modified timestamps line (detail pane bottom)
+IDC_V_TIMES  equ 236          ; created/modified timestamps line (below the last row)
 IDC_V_FAV    equ 237          ; header favorite (star) toggle
 IDC_V_CANCEL equ 238          ; "Cancel" button (edit mode, discards edits)
 FIELD_AREA_BOTTOM equ 292        ; rows may not grow past here (DLU; Add-field is at 296)
@@ -4418,7 +4418,15 @@ grl_advance:
     inc     dword ptr [rbp-36]
     jmp     grl_row
 grl_done:
-    mov     eax, dword ptr [rbp-40]              ; content bottom (DLU) for overflow checks
+    ; place the created/modified line just below the last record, flowing with
+    ; the field rows (x=164 matches the row content column)
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_V_TIMES
+    call    GetDlgItem
+    mov     qword ptr [rbp-32], rax
+    WINCALL move_ctl, qword ptr [rbp-24], qword ptr [rbp-32], 164, dword ptr [rbp-40], 244, 10
+    mov     eax, dword ptr [rbp-40]              ; content bottom incl. the timestamps line
+    add     eax, 12
     mov     dword ptr [g_content_h], eax
     ; repaint just the detail pane (not the whole window) so the sidebar card's
     ; border/shadow don't flicker when rows are laid out
@@ -7563,6 +7571,84 @@ gui_xlsx_savepath proc frame
 gui_xlsx_savepath endp
 
 ; =============================================================================
+; gui_xlpw_policy() -> eax = 0 ok / 1 too short / 2 too few classes.
+;   Scans the wide (UTF-16) export password in g_xlpw against the active
+;   g_cfg_pwminlen / g_cfg_pwminclasses policy - the same rule the master
+;   password must satisfy.  Leaf proc: deliberately does NOT go through
+;   password_to_utf8 / g_cfg_pass (that buffer holds the live master password
+;   used to reseal the vault, and password_to_utf8 wipes its input).
+; =============================================================================
+gui_xlpw_policy proc
+    lea     r9, [g_xlpw]
+    xor     r8d, r8d                     ; unit index
+    xor     r10d, r10d                  ; code-point count
+    xor     r11d, r11d                  ; class mask (1=U 2=L 4=D 8=S)
+xpol_loop:
+    movzx   eax, word ptr [r9+r8*2]
+    test    eax, eax
+    jz      xpol_eval
+    inc     r8d
+    mov     edx, eax                    ; low surrogate (DC00-DFFF): tail of a
+    and     edx, 0FC00h                 ;   pair -> not a new code point
+    cmp     edx, 0DC00h
+    je      xpol_symonly
+    inc     r10d                        ; new code point
+    cmp     eax, 'A'
+    jb      xpol_lo
+    cmp     eax, 'Z'
+    ja      xpol_lo
+    or      r11d, 1
+    jmp     xpol_loop
+xpol_lo:
+    cmp     eax, 'a'
+    jb      xpol_di
+    cmp     eax, 'z'
+    ja      xpol_di
+    or      r11d, 2
+    jmp     xpol_loop
+xpol_di:
+    cmp     eax, '0'
+    jb      xpol_sym
+    cmp     eax, '9'
+    ja      xpol_sym
+    or      r11d, 4
+    jmp     xpol_loop
+xpol_sym:
+    or      r11d, 8                     ; non-alnum (incl. non-ASCII) -> symbol
+    jmp     xpol_loop
+xpol_symonly:
+    or      r11d, 8
+    jmp     xpol_loop
+xpol_eval:
+    mov     eax, dword ptr [g_cfg_pwminlen]
+    cmp     r10d, eax
+    jb      xpol_short
+    xor     eax, eax                    ; popcount of the class mask
+    test    r11d, 1
+    jz      @F
+    inc     eax
+@@: test    r11d, 2
+    jz      @F
+    inc     eax
+@@: test    r11d, 4
+    jz      @F
+    inc     eax
+@@: test    r11d, 8
+    jz      @F
+    inc     eax
+@@: cmp     eax, dword ptr [g_cfg_pwminclasses]
+    jb      xpol_few
+    xor     eax, eax
+    ret
+xpol_short:
+    mov     eax, 1
+    ret
+xpol_few:
+    mov     eax, 2
+    ret
+gui_xlpw_policy endp
+
+; =============================================================================
 ; xlpw_proc - DLG_XLPW dialog procedure (export password + confirm).  Raw frame.
 ; =============================================================================
 xlpw_proc proc
@@ -7645,6 +7731,19 @@ xpp_ok:
     call    gui_wstr_eq
     test    eax, eax
     jz      xpp_mismatch
+    call    gui_xlpw_policy                      ; enforce the vault password policy
+    test    eax, eax
+    jz      xpp_polok
+    cmp     eax, 1
+    jne     xpp_polfew
+    WINCALL MessageBoxW, qword ptr [rbp-8], addr s_pwshort, addr xp_mm_title, 030h
+    mov     eax, 1
+    jmp     xpp_ret
+xpp_polfew:
+    WINCALL MessageBoxW, qword ptr [rbp-8], addr s_pwclasses, addr xp_mm_title, 030h
+    mov     eax, 1
+    jmp     xpp_ret
+xpp_polok:
     mov     eax, dword ptr [rbp-16]
     shl     eax, 1                               ; bytes = chars * 2
     mov     dword ptr [g_xlpwlen], eax
