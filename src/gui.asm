@@ -144,6 +144,9 @@ extern GetFileAttributesW:proc
 extern CreateDirectoryW:proc
 extern ShowWindow:proc
 extern MoveWindow:proc
+extern GetWindowRect:proc
+extern ScreenToClient:proc
+extern SetWindowPos:proc
 extern DrawTextW:proc
 extern FrameRect:proc
 extern MapDialogRect:proc
@@ -325,6 +328,7 @@ IDC_V_MTHEME equ 240                  ; color-scheme cycle button (settings)
 IDC_V_MTHEMEL equ 241                 ; "Color scheme" label
 IDC_V_MLAYOUT equ 242                 ; layout cycle button (settings)
 IDC_V_MLAYOUTL equ 243                ; "Layout" label
+IDC_V_COLORPW equ 244                 ; overlay: colored revealed secret (owner-draw)
 SW_HIDE      equ 0
 SW_SHOW      equ 5
 DLG_CREATE   equ 400
@@ -604,8 +608,9 @@ gen_presets label dword                          ; {n, style, opt} per preset
     dd 32, PWS_HEX,        0
 GEN_PRESET_N equ 6
 align 4
-cls_colors label dword                           ; by class 0 upper/1 lower/2 digit/3 sym
-    dd CLR_CLS_UPPER, CLR_CLS_LOWER, CLR_CLS_DIGIT, CLR_CLS_SYMBOL
+; class accent colors (index 0 upper / 2 digit / 3 symbol; lowercase uses g_col_text)
+cls_accent_dark  dd 00FFC24Ch, 0, 0060D060h, 003C7DFFh   ; light-blue / green / orange
+cls_accent_light dd 00CC6600h, 0, 00008000h, 000055CCh   ; strong-blue / dk-green / dk-orange
 f_mono label word
     dw 'C','o','n','s','o','l','a','s', 0
 pr_sp2 dw ' ',' ', 0                              ; separators for the phonetic lines
@@ -801,6 +806,8 @@ g_gatherblob  db 32*ARFBLOB dup (?)        ; per-field attachment blobs held acr
 g_field_count dd ?                        ; live row count
 g_fav_state   dd ?                         ; current entry is a favorite (0/1)
 g_layout      dd ?                         ; UI layout/density index (0 comfortable)
+g_colorpw_row dd ?                         ; row whose revealed secret is colored (-1=none)
+g_rowpw_w     dw 512 dup (?)               ; revealed secret text for the color overlay
 g_content_h   dd ?                        ; field-form content bottom (DLU) after layout
 g_rowkind     dd ?                        ; scratch: kind for a pending add
 g_dlgfont     dq ?                        ; the vault dialog's font (for runtime ctls)
@@ -2089,6 +2096,8 @@ gui_showdetail proc frame
     mov     dword ptr [g_totp_row], -1
     mov     qword ptr [g_totp_codehwnd], 0
     mov     qword ptr [g_totp_barhwnd], 0
+    mov     rcx, qword ptr [rbp-24]           ; drop any revealed-secret color overlay
+    call    gui_colorpw_hide
     mov     ecx, dword ptr [rbp-32]           ; favorite state for this entry
     call    gui_entry_is_fav
     mov     dword ptr [g_fav_state], eax
@@ -2693,6 +2702,7 @@ gui_set_editmode proc frame
     mov     qword ptr [rbp-24], rcx
     mov     dword ptr [rbp-32], edx
     mov     dword ptr [g_editmode], edx
+    call    gui_colorpw_hide                    ; a mode change drops the color overlay
     mov     eax, edx
     xor     eax, 1
     mov     dword ptr [rbp-40], eax              ; readonly = NOT on
@@ -4456,6 +4466,19 @@ grr_apply:
     mov     edx, DS_VALUE
     call    gui_row_handle
     WINCALL InvalidateRect, rax, 0, 1
+    ; view mode: overlay the class-coloured plaintext when revealed, hide when masked
+    cmp     dword ptr [g_editmode], 0
+    jne     grr_ret
+    cmp     dword ptr [rbp-40], 0             ; 0 = now revealed
+    jne     grr_maskhide
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-32]
+    call    gui_colorpw_show
+    jmp     grr_ret
+grr_maskhide:
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_colorpw_hide
+grr_ret:
     FRAME_EPILOG
     ret
 gui_row_reveal endp
@@ -5148,6 +5171,22 @@ gpc_s:
     ret
 gui_pw_class endp
 
+; gui_class_color(ecx = class 0..3) -> eax = a colour that contrasts with the
+;   active scheme background (lowercase = primary text; others = light/dark accent).
+gui_class_color proc
+    cmp     ecx, 1
+    jne     gcc_accent
+    mov     eax, dword ptr [g_col_text]
+    ret
+gcc_accent:
+    lea     r10, [cls_accent_dark]
+    cmp     dword ptr [g_col_dark], 0
+    jne     @F
+    lea     r10, [cls_accent_light]
+@@: mov     eax, dword ptr [r10+rcx*4]
+    ret
+gui_class_color endp
+
 ; gui_wapp_lc(rcx = dst, rdx = src wideZ, r8d = lowercase flag) -> rax = dst end.
 ;   Appends src to dst (no NUL); lowercases A-Z when r8d != 0.  Leaf.
 gui_wapp_lc proc
@@ -5322,8 +5361,8 @@ gcp_loop:
     jz      gcp_done
     mov     dword ptr [rbp-104], ecx          ; char
     call    gui_pw_class
-    lea     r10, [cls_colors]
-    mov     eax, dword ptr [r10+rax*4]
+    mov     ecx, eax
+    call    gui_class_color
     WINCALL SetTextColor, qword ptr [rbp-32], eax
     ; wrap if past the right edge
     mov     eax, dword ptr [rbp-92]
@@ -5380,8 +5419,7 @@ lg_loop:
     cmp     ecx, 4
     jae     lg_done
     mov     dword ptr [rbp-76], ecx
-    lea     r10, [cls_colors]
-    mov     eax, dword ptr [r10+rcx*4]
+    call    gui_class_color                   ; ecx = class
     WINCALL SetTextColor, qword ptr [rbp-32], eax
     mov     ecx, dword ptr [rbp-76]           ; token text ptr
     lea     r10, [lg_ptrs]
@@ -5398,6 +5436,120 @@ lg_done:
     FRAME_EPILOG
     ret
 gui_draw_pwlegend endp
+
+; gui_draw_rowcolor(rcx = lpdis) - the IDC_V_COLORPW overlay: draw g_colorpw_row's
+;   revealed secret in the dialog font with each glyph coloured by character class.
+gui_draw_rowcolor proc frame
+    FRAME_PROLOG 160
+    mov     qword ptr [rbp-24], rcx
+    mov     r10, rcx
+    mov     rax, qword ptr [r10+32]
+    mov     qword ptr [rbp-32], rax           ; hdc
+    WINCALL CreateSolidBrush, dword ptr [g_col_panel]
+    mov     qword ptr [rbp-40], rax
+    mov     r10, qword ptr [rbp-24]
+    lea     rdx, [r10+40]
+    WINCALL FillRect, qword ptr [rbp-32], rdx, qword ptr [rbp-40]
+    WINCALL DeleteObject, qword ptr [rbp-40]
+    cmp     dword ptr [g_colorpw_row], 0
+    jl      drc_done
+    mov     ecx, dword ptr [g_colorpw_row]    ; fetch the plaintext
+    mov     edx, DS_VALUE
+    call    dynid
+    WINCALL GetDlgItemTextW, qword ptr [g_vaulthwnd], eax, addr g_rowpw_w, 256
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_dlgfont]
+    mov     qword ptr [rbp-48], rax           ; old font
+    WINCALL SetBkMode, qword ptr [rbp-32], 1
+    WINCALL GetTextExtentPoint32W, qword ptr [rbp-32], addr pr_zero, 1, addr rbp-88
+    mov     r10, qword ptr [rbp-24]           ; y = vertically centered in the rect
+    mov     eax, dword ptr [r10+52]
+    sub     eax, dword ptr [r10+44]
+    sub     eax, dword ptr [rbp-84]
+    sar     eax, 1
+    mov     dword ptr [rbp-60], eax           ; y
+    mov     dword ptr [rbp-56], 1             ; x (edit left inset)
+    mov     dword ptr [rbp-64], 0             ; i
+drc_loop:
+    mov     eax, dword ptr [rbp-64]
+    lea     r10, [g_rowpw_w]
+    movzx   ecx, word ptr [r10+rax*2]
+    test    ecx, ecx
+    jz      drc_end
+    mov     dword ptr [rbp-100], ecx
+    call    gui_pw_class
+    mov     ecx, eax
+    call    gui_class_color
+    WINCALL SetTextColor, qword ptr [rbp-32], eax
+    WINCALL GetTextExtentPoint32W, qword ptr [rbp-32], addr rbp-100, 1, addr rbp-88
+    WINCALL TextOutW, qword ptr [rbp-32], dword ptr [rbp-56], dword ptr [rbp-60], \
+            addr rbp-100, 1
+    mov     eax, dword ptr [rbp-88]
+    add     dword ptr [rbp-56], eax
+    inc     dword ptr [rbp-64]
+    cmp     dword ptr [rbp-64], 256
+    jb      drc_loop
+drc_end:
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-48]
+drc_done:
+    FRAME_EPILOG
+    ret
+gui_draw_rowcolor endp
+
+; gui_colorpw_hide(rcx=hdlg) - hide the revealed-secret colour overlay.
+gui_colorpw_hide proc frame
+    FRAME_PROLOG 32
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [g_colorpw_row], -1
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_V_COLORPW
+    call    GetDlgItem
+    mov     rcx, rax
+    xor     edx, edx
+    call    ShowWindow
+    FRAME_EPILOG
+    ret
+gui_colorpw_hide endp
+
+; gui_colorpw_show(rcx=hdlg, edx=row) - position the colour overlay over the row's
+;   value edit, raise it, and paint (used when a secret is revealed in view mode).
+gui_colorpw_show proc frame
+    FRAME_PROLOG 128
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-28], edx
+    mov     dword ptr [g_colorpw_row], edx
+    mov     ecx, edx
+    mov     edx, DS_VALUE
+    call    gui_row_handle                    ; -> rax = value edit hwnd
+    test    rax, rax
+    jz      cps_done
+    mov     qword ptr [rbp-32], rax
+    mov     rcx, rax                           ; screen rect of the edit
+    lea     rdx, [rbp-56]
+    call    GetWindowRect
+    mov     rcx, qword ptr [rbp-24]            ; -> client coords of the dialog
+    lea     rdx, [rbp-56]
+    call    ScreenToClient
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [rbp-48]
+    call    ScreenToClient
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_V_COLORPW
+    call    GetDlgItem
+    mov     qword ptr [rbp-64], rax           ; overlay hwnd
+    mov     eax, dword ptr [rbp-48]
+    sub     eax, dword ptr [rbp-56]
+    mov     dword ptr [rbp-68], eax           ; width
+    mov     eax, dword ptr [rbp-44]
+    sub     eax, dword ptr [rbp-52]
+    mov     dword ptr [rbp-72], eax           ; height
+    WINCALL MoveWindow, qword ptr [rbp-64], dword ptr [rbp-56], dword ptr [rbp-52], \
+            dword ptr [rbp-68], dword ptr [rbp-72], 1
+    WINCALL SetWindowPos, qword ptr [rbp-64], 0, 0, 0, 0, 0, 43h  ; TOP|NOMOVE|NOSIZE|SHOW
+    WINCALL InvalidateRect, qword ptr [rbp-64], 0, 1
+cps_done:
+    FRAME_EPILOG
+    ret
+gui_colorpw_show endp
 
 ; pwread_proc - DLG_PWREAD dialog procedure (colored password + phonetic).
 pwread_proc proc
@@ -5751,6 +5903,8 @@ gui_menu_open proc frame
     mov     edx, SW_HIDE
     call    gui_rows_show
     mov     rcx, qword ptr [rbp-24]
+    call    gui_colorpw_hide
+    mov     rcx, qword ptr [rbp-24]
     lea     rdx, [g_menu_ids]
     mov     r8d, MENU_ID_COUNT
     mov     r9d, SW_SHOW
@@ -5989,6 +6143,8 @@ vp_tdraw:
     je      vp_tdraw_list
     cmp     eax, IDC_V_HEADER                 ; detail-pane header (tile + title)
     je      vp_tdraw_header
+    cmp     eax, IDC_V_COLORPW                ; revealed-secret colour overlay
+    je      vp_tdraw_colorpw
     cmp     eax, IDC_DYN_BASE                 ; a runtime row's TOTP drain bar?
     jb      vp_tdraw_def
     mov     edx, eax
@@ -6008,6 +6164,11 @@ vp_tdraw:
 vp_tdraw_header:
     mov     rcx, r9
     call    gui_draw_header
+    mov     eax, 1
+    jmp     vp_ret
+vp_tdraw_colorpw:
+    mov     rcx, r9
+    call    gui_draw_rowcolor
     mov     eax, 1
     jmp     vp_ret
 vp_tdraw_sbadge:
@@ -6093,6 +6254,7 @@ vp_init:
     call    gui_apply_layout
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_V_SEARCH, EM_SETCUEBANNER, 1, addr cue_search
     mov     dword ptr [g_cur_idx], -1         ; no entry selected yet
+    mov     dword ptr [g_colorpw_row], -1
     mov     dword ptr [g_dirty], 0
     mov     dword ptr [g_loading], 0
     mov     rcx, qword ptr [rbp-8]
