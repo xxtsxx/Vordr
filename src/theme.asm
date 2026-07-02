@@ -101,19 +101,10 @@ BKMODE_TRANSP       equ 1
 DT_CFLAGS           equ 25h                 ; DT_CENTER|DT_VCENTER|DT_SINGLELINE
 DT_LFLAGS           equ 24h                 ; DT_LEFT|DT_VCENTER|DT_SINGLELINE
 
-; ---- Fluent 2 dark palette (COLORREF 0x00BBGGRR) ----------------------------
-COL_BG       equ 00202020h                  ; SolidBackgroundFillColorBase #202020
-COL_PANEL    equ 002D2D2Dh                  ; ControlFillColorDefault      #2D2D2D
-COL_FRAME    equ 003D3D3Dh                  ; ControlStroke                #3D3D3D
-COL_BTN      equ 002D2D2Dh                  ; button face (rest)           #2D2D2D
-COL_BTNSEL   equ 002A2A2Ah                  ; button face (pressed)        #2A2A2A
-COL_TEXT     equ 00FFFFFFh                  ; TextFillColorPrimary         #FFFFFF
-COL_TEXTDIM  equ 00C8C8C8h                  ; TextFillColorSecondary       #C8C8C8
-COL_BORDER   equ 003D3D3Dh                  ; control hairline stroke      #3D3D3D
-COL_ACCENT   equ 00FFC24Ch                  ; AccentFillColorDefault       #4CC2FF
-COL_ACCSEL   equ 00DBA03Ah                  ; accent pressed               #3AA0DB
+; ---- palette (COLORREF 0x00BBGGRR) -----------------------------------------
+; The live UI colours are the runtime g_col_* globals (see the schemes[] table
+; further down); only text-on-accent stays constant.
 COL_ONACC    equ 00000000h                  ; text on accent fill          #000000
-COL_FOCUS    equ 00FFC24Ch                  ; focus underline = accent     #4CC2FF
 
 ; aurora-borealis tuning: vertical curtains rising from the horizon, a star
 ;   field above, slow drift.  Darker than a flat glow.

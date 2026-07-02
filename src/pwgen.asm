@@ -12,9 +12,8 @@
 ;       (reads g_cfg_pass/g_cfg_passlen and the
 ;       g_cfg_pwminlen / g_cfg_pwminclasses policy globals.)
 ;
-; TODO (next step): guarantee at least one character from each requested class
-; (currently the draw is uniform but does not force class coverage), and add an
-; --exclude-ambiguous alphabet variant.
+; pwgen_ex(outbuf, n, style, opt) -> entropy bits builds on this with passphrase /
+; pronounceable / pin / hex styles and a PWO_NOAMBIG (exclude 0O1lI) variant.
 ; =============================================================================
 
 include macros.inc

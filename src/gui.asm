@@ -256,10 +256,6 @@ CLR_BAR_DGREEN      equ 0055AF2Dh         ; strong / match
 EN_CHANGE           equ 300h
 EN_SETFOCUS         equ 100h
 EN_KILLFOCUS        equ 200h
-COLOR_BTNFACE       equ 0Fh
-BKMODE_TRANSPARENT  equ 1
-CLR_STRENGTH_OK     equ 0055AF2Dh           ; green  - meets the policy
-CLR_STRENGTH_BAD    equ 000000C8h           ; red    - does not meet the policy
 CLIP_TIMER          equ 1                  ; timer id for clipboard auto-clear
 CLIP_MS             equ 20000              ; clear a copied secret after 20 s
 TOTP_TIMER          equ 2                  ; timer id for live auth-code refresh
