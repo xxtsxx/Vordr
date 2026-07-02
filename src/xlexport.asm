@@ -20,6 +20,9 @@ extern vault_count:proc
 extern vault_field_at:proc
 
 XL_BUFCAP equ 16*1024*1024          ; 16 MiB each for part + zip scratch
+XL_ZIP_MIN equ 4224                  ; pad tiny packages past the 4096 OLE
+                                    ; mini-stream cutoff (keep EncryptedPackage
+                                    ; a regular stream); see zip_finish
 
 .data?
 align 8
@@ -468,6 +471,21 @@ zf_eocd:
     mov     rax, qword ptr [r10+8]
     sub     rax, qword ptr [rbp-24]
     mov     qword ptr [rbp-48], rax              ; central-dir size
+    ; Pad the package via the (ignored) EOCD comment so the encrypted stream
+    ; stays >= 4096 bytes.  OLE streams smaller than the 4096 mini-stream cutoff
+    ; must be stored in the mini stream, but EncryptedPackage is always written
+    ; as a regular stream; a small vault would otherwise land under the cutoff
+    ; and Excel would read the package from the wrong place -> "corrupt".
+    lea     r10, [g_zipbuf]
+    mov     rax, qword ptr [r10+8]               ; current length
+    add     rax, 22                              ; + the fixed EOCD record
+    xor     edx, edx                             ; padN = 0
+    cmp     rax, XL_ZIP_MIN
+    jae     zf_padset
+    mov     edx, XL_ZIP_MIN
+    sub     edx, eax                             ; padN = target - projected
+zf_padset:
+    mov     dword ptr [rbp-56], edx              ; padN (comment length)
     ZP32    06054b50h
     ZP16    0
     ZP16    0
@@ -475,7 +493,13 @@ zf_eocd:
     ZP16    dword ptr [g_cd_n]                    ; entries total
     ZP32    dword ptr [rbp-48]                    ; cd size
     ZP32    dword ptr [rbp-24]                    ; cd offset
-    ZP16    0                                    ; comment length
+    ZP16    dword ptr [rbp-56]                    ; comment length = padN
+    cmp     dword ptr [rbp-56], 0
+    je      zf_done
+    lea     rcx, [g_zipbuf]                       ; append padN zero bytes
+    mov     edx, dword ptr [rbp-56]
+    call    buf_zero
+zf_done:
     FRAME_EPILOG
     ret
 zip_finish endp
