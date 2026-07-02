@@ -5175,7 +5175,7 @@ gui_wapp_lc endp
 ; gui_build_phonetic() - fill g_phon_w with a PH_COLS-column grid of fixed-width
 ;   "<c>  <Word>" cells (NATO w/ CAP- marker for uppercase, digit + symbol names).
 gui_build_phonetic proc frame
-    FRAME_PROLOG 64
+    FRAME_PROLOG 96                            ; keep locals clear of the callee shadow
     lea     rax, [g_phon_w]
     mov     qword ptr [rbp-24], rax           ; dst cursor
     mov     dword ptr [rbp-32], 0             ; i
@@ -5268,6 +5268,8 @@ gbp_have:
     mov     r8d, PH_CELL
     sub     r8d, eax
     jle     gbp_col
+    cmp     r8d, PH_CELL                        ; clamp: never pad more than a cell width
+    ja      gbp_col
 gbp_pad:
     mov     r10, qword ptr [rbp-24]
     mov     word ptr [r10], ' '
