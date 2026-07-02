@@ -435,6 +435,7 @@ IDC_V_TITLELBL equ 234        ; "Title" static label (edit mode only)
 IDC_V_OVFL   equ 235          ; header overflow (...) menu button
 IDC_V_TIMES  equ 236          ; created/modified timestamps line (detail pane bottom)
 IDC_V_FAV    equ 237          ; header favorite (star) toggle
+IDC_V_CANCEL equ 238          ; "Cancel" button (edit mode, discards edits)
 FIELD_AREA_BOTTOM equ 292        ; rows may not grow past here (DLU; Add-field is at 296)
 ; Win32 window styles (gui.asm builds controls at runtime; the RC gets these
 ; from windows.h, but this module needs the numeric values).
@@ -803,6 +804,7 @@ g_dirty     dd ?                      ; 1 = inline fields edited since last load
 g_loading   dd ?                      ; 1 = programmatically loading fields (ignore EN_CHANGE)
 g_editmode  dd ?                      ; 1 = detail fields editable (view/edit toggle)
 align 8
+public g_vaulthwnd
 g_vaulthwnd dq ?                      ; the open DLG_VAULT window (0 when not shown)
 align 2
 g_search_w  dw 512 dup (?)            ; current search query (wide, upper-cased)
@@ -2765,6 +2767,12 @@ sem_addcmd:
     call    ShowWindow
     mov     rcx, qword ptr [rbp-24]           ; Save button shares the Add-field visibility
     mov     edx, IDC_V_SAVE
+    call    GetDlgItem
+    mov     rcx, rax
+    mov     edx, dword ptr [rbp-52]
+    call    ShowWindow
+    mov     rcx, qword ptr [rbp-24]           ; Cancel button shares the edit-mode visibility
+    mov     edx, IDC_V_CANCEL
     call    GetDlgItem
     mov     rcx, rax
     mov     edx, dword ptr [rbp-52]
@@ -6430,6 +6438,8 @@ vp_cmd_disp:
     je      vp_edit
     cmp     eax, IDC_V_SAVE
     je      vp_save
+    cmp     eax, IDC_V_CANCEL
+    je      ve_save                           ; discard edits, back to view mode
     cmp     eax, IDC_V_REMOVE
     je      vp_remove
     cmp     eax, IDC_V_LOCK
@@ -6551,25 +6561,9 @@ vp_list:
     cmp     eax, LB_ERR
     je      vp_handled
     mov     dword ptr [rbp-16], eax          ; B = newly clicked vault index
-    ; if editing the current entry with unsaved changes, save it first
-    cmp     dword ptr [g_editmode], 0
-    je      vl_load
-    cmp     dword ptr [g_dirty], 0
-    je      vl_load
-    mov     eax, dword ptr [g_cur_idx]
-    mov     dword ptr [rbp-24], eax          ; A = entry being edited
-    mov     rcx, qword ptr [rbp-8]
-    call    gui_commit                       ; removes A, appends -> A at end
-    ; commit shifted indices: entries after A move down by one
-    mov     eax, dword ptr [rbp-16]
-    cmp     eax, dword ptr [rbp-24]
-    jle     vl_resel
-    dec     eax
-    mov     dword ptr [rbp-16], eax
-vl_resel:
-    mov     rcx, qword ptr [rbp-8]
-    mov     edx, dword ptr [rbp-16]
-    call    gui_lb_selbydata
+    ; switching entries discards any unsaved inline edits (edits are only
+    ; persisted by an explicit Save)
+    mov     dword ptr [g_dirty], 0
 vl_load:
     mov     rcx, qword ptr [rbp-8]
     mov     edx, dword ptr [rbp-16]
@@ -6678,13 +6672,9 @@ vpd_del:
     call    gui_row_delete
     jmp     vp_handled
 vp_add:
-    ; save any unsaved edits to the current entry before adding a new one
-    cmp     dword ptr [g_editmode], 0
-    je      va_build
-    cmp     dword ptr [g_dirty], 0
-    je      va_build
-    mov     rcx, qword ptr [rbp-8]
-    call    gui_commit
+    ; adding a new entry discards any unsaved inline edits to the current one
+    ; (edits are only persisted by an explicit Save)
+    mov     dword ptr [g_dirty], 0
 va_build:
     ; new record = Title "New entry" + empty Username + empty Password
     lea     r10, [g_field_list]
@@ -6731,7 +6721,8 @@ va_build:
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_V_TITLE, EM_SETSEL, 0, -1
     jmp     vp_handled
 vp_edit:
-    ; pencil toggles edit mode: enter (make fields editable) or save + leave
+    ; pencil toggles edit mode: enter (make fields editable) or discard + leave
+    ; (edits are only persisted by an explicit Save)
     cmp     dword ptr [g_editmode], 0
     jne     ve_save
     cmp     dword ptr [g_cur_idx], 0
@@ -6749,14 +6740,12 @@ vp_edit:
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_V_TITLE, EM_SETSEL, 0, -1
     jmp     vp_handled
 ve_save:
-    cmp     dword ptr [g_dirty], 0
-    je      ve_off
-    mov     rcx, qword ptr [rbp-8]
-    call    gui_commit
-ve_off:
+    ; Cancel / pencil-off: discard any unsaved inline edits (edits are only
+    ; persisted by an explicit Save) and return to view mode.
+    mov     dword ptr [g_dirty], 0
     cmp     dword ptr [g_cur_idx], 0
     jl      ve_view
-    mov     rcx, qword ptr [rbp-8]           ; rebuild the rows first...
+    mov     rcx, qword ptr [rbp-8]           ; reload the entry from the vault (drops edits)
     mov     edx, dword ptr [g_cur_idx]
     call    gui_showdetail
 ve_view:
@@ -6829,10 +6818,7 @@ vp_close:
     mov     rcx, qword ptr [rbp-8]
     call    gui_menu_save
 vp_lock_dirty:
-    cmp     dword ptr [g_dirty], 0           ; unsaved inline edits -> commit
-    je      vp_lock_go
-    mov     rcx, qword ptr [rbp-8]
-    call    gui_commit
+    mov     dword ptr [g_dirty], 0           ; locking discards unsaved inline edits
 vp_lock_go:
     sub     rsp, 32
     mov     rcx, qword ptr [rbp-8]
