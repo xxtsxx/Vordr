@@ -5261,34 +5261,13 @@ gbp_have:
     mov     r8d, dword ptr [rbp-52]
     call    gui_wapp_lc
     mov     qword ptr [rbp-24], rax
-    ; pad the cell out to PH_CELL chars
-    mov     rax, qword ptr [rbp-24]
-    sub     rax, qword ptr [rbp-56]
-    sar     rax, 1                            ; chars written in this cell
-    mov     r8d, PH_CELL
-    sub     r8d, eax
-    jle     gbp_col
-    cmp     r8d, PH_CELL                        ; clamp: never pad more than a cell width
-    ja      gbp_col
-gbp_pad:
-    mov     r10, qword ptr [rbp-24]
-    mov     word ptr [r10], ' '
-    add     qword ptr [rbp-24], 2
-    dec     r8d
-    jnz     gbp_pad
-gbp_col:
-    inc     dword ptr [rbp-60]                ; col++; CRLF after PH_COLS cells
-    cmp     dword ptr [rbp-60], PH_COLS
-    jb      gbp_next
-    mov     rcx, qword ptr [rbp-24]
+    mov     rcx, qword ptr [rbp-24]           ; one entry per line
     lea     rdx, [pr_crlf]
     xor     r8d, r8d
     call    gui_wapp_lc
     mov     qword ptr [rbp-24], rax
-    mov     dword ptr [rbp-60], 0
-gbp_next:
     inc     dword ptr [rbp-32]
-    cmp     dword ptr [rbp-32], 180           ; cap (fits g_phon_w with margin)
+    cmp     dword ptr [rbp-32], 200
     jb      gbp_loop
 gbp_done:
     mov     r10, qword ptr [rbp-24]
