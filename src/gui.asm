@@ -1268,9 +1268,21 @@ gui_make_listfonts endp
 
 ; gui_title_cmp(ecx=idxA, edx=idxB) -> eax = -1/0/1 (case-insensitive title order).
 gui_title_cmp proc frame
-    FRAME_PROLOG 64
+    FRAME_PROLOG 96
     mov     dword ptr [rbp-24], ecx
     mov     dword ptr [rbp-28], edx
+    ; favorites sort ahead of everything else; ties fall through to the title
+    mov     ecx, dword ptr [rbp-24]
+    call    gui_entry_is_fav
+    mov     dword ptr [rbp-60], eax              ; favA
+    mov     ecx, dword ptr [rbp-28]
+    call    gui_entry_is_fav                     ; eax = favB
+    cmp     dword ptr [rbp-60], eax
+    je      gtc_bytitle
+    cmp     dword ptr [rbp-60], 0                ; A favorite, B not -> A first
+    jne     gtc_lt
+    jmp     gtc_gt                               ; B favorite, A not -> A after
+gtc_bytitle:
     mov     ecx, dword ptr [rbp-24]
     lea     rdx, [rbp-40]
     call    vault_title_at                      ; rax=ptrA, [rbp-40]=lenA
@@ -1573,6 +1585,30 @@ gui_draw_listitem proc frame
     mov     dword ptr [rbp-140], eax           ; rect B
     WINCALL DrawTextW, qword ptr [rbp-32], addr g_sub_w, -1, addr rbp-152, 8024h
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-104]   ; restore font
+    ; favorite marker: a small gold star on the card's right edge
+    mov     ecx, dword ptr [rbp-80]
+    call    gui_entry_is_fav
+    test    eax, eax
+    jz      gli_done
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_chevfont]
+    mov     qword ptr [rbp-104], rax
+    WINCALL SetTextColor, qword ptr [rbp-32], 002EB2F6h            ; amber
+    mov     word ptr [g_glyph_w], 0E735h                          ; FavoriteStarFill
+    mov     word ptr [g_glyph_w+2], 0
+    mov     eax, dword ptr [rbp-56]
+    sub     eax, 20
+    mov     dword ptr [rbp-152], eax                              ; rect L = R-20
+    mov     eax, dword ptr [rbp-48]
+    add     eax, 4
+    mov     dword ptr [rbp-148], eax                              ; rect T
+    mov     eax, dword ptr [rbp-56]
+    sub     eax, 4
+    mov     dword ptr [rbp-144], eax                              ; rect R = R-4
+    mov     eax, dword ptr [rbp-48]
+    add     eax, 22
+    mov     dword ptr [rbp-140], eax                              ; rect B
+    WINCALL DrawTextW, qword ptr [rbp-32], addr g_glyph_w, -1, addr rbp-152, 025h
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-104]
 gli_done:
     FRAME_EPILOG
     ret
