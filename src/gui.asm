@@ -54,6 +54,7 @@ extern g_col_dark:dword
 extern DwmSetWindowAttribute:proc
 extern g_scheme:dword
 extern theme_set_scheme:proc
+extern theme_scrollbars:proc
 extern cfg_set_dword_hkcu:proc
 extern cfg_get_dword:proc
 extern vault_field_count:proc
@@ -70,6 +71,12 @@ extern mem_alloc:proc
 extern mem_free:proc
 extern read_file:proc
 extern write_file:proc
+extern xl_build_xlsx:proc               ; encrypted-Excel export (xlexport.asm / xlcrypt.asm)
+extern xl_free:proc
+extern xl_encrypt:proc
+extern xl_encrypt_free:proc
+extern g_ole_ptr:qword
+extern g_ole_len:qword
 extern GetClipboardData:proc
 extern IsClipboardFormatAvailable:proc
 extern ShellExecuteW:proc
@@ -266,6 +273,9 @@ CLIP_TIMER          equ 1                  ; timer id for clipboard auto-clear
 CLIP_MS             equ 20000              ; clear a copied secret after 20 s
 TOTP_TIMER          equ 2                  ; timer id for live auth-code refresh
 TOTP_MS             equ 1000               ; recompute the code once a second
+SEARCH_TIMER        equ 3                  ; timer id for debounced search-as-you-type
+SEARCH_MS           equ 300                ; refilter only after 0.3 s of no keystrokes
+SEARCH_DEBOUNCE_MIN equ 200               ; ...but only when the list exceeds this many entries
 LBN_SELCHANGE       equ 1
 LB_ADDSTRING        equ 180h
 LB_RESETCONTENT     equ 184h
@@ -329,6 +339,13 @@ IDC_V_MTHEMEL equ 241                 ; "Color scheme" label
 IDC_V_MLAYOUT equ 242                 ; layout cycle button (settings)
 IDC_V_MLAYOUTL equ 243                ; "Layout" label
 IDC_V_COLORPW equ 244                 ; overlay: colored revealed secret (owner-draw)
+IDC_V_MEXPORT equ 245                 ; "Export all secrets to Excel" button (settings)
+DLG_XLPW     equ 720                  ; export-password prompt dialog
+IDC_XP_PW    equ 721
+IDC_XP_PW2   equ 722
+IDC_XP_WARN  equ 723
+IDC_XP_PWL   equ 724
+IDC_XP_PW2L  equ 725
 SW_HIDE      equ 0
 SW_SHOW      equ 5
 DLG_CREATE   equ 400
@@ -391,6 +408,7 @@ FDF_PWLVL_SHIFT equ 4
 ; Runtime control ids: IDC_DYN_BASE + row*DYN_SLOTS + slot (DYN_SLOTS = power of 2).
 IDC_DYN_BASE equ 3000
 DYN_SLOTS   equ 16
+VDX_DLU     equ 58              ; detail-pane x-shift (DLU): widened sidebar by 50% (116->174)
 DYN_SLOTS_LOG2 equ 4
 DS_LABEL    equ 0
 DS_VALUE    equ 1
@@ -538,6 +556,20 @@ g_filter label word
     dw 0
 g_defext label word
     dw 'v','o','r','d','r',0
+xlsx_filter label word
+    dw 'E','x','c','e','l',' ','W','o','r','k','b','o','o','k',0
+    dw '*','.','x','l','s','x',0
+    dw 0
+xlsx_defext label word
+    dw 'x','l','s','x',0
+WSTR xp_mm_title,    <Export all secrets>
+WSTR xp_mm_warn,     <Export ALL secrets (every password and TOTP) into one Excel file, protected only by the password you set next? Keep the file safe and delete it when done.>
+WSTR xp_mm_empty,    <Please enter an export password.>
+WSTR xp_mm_mismatch, <The two passwords do not match. Please re-enter them.>
+WSTR xp_mm_ok,       <All secrets were exported to the encrypted Excel file.>
+WSTR xp_mm_fail,     <The export could not be completed.>
+WSTR cue_xppw,       <Export password>
+WSTR cue_xppw2,      <Confirm password>
 ; burger / close glyphs for the settings button (wide)
 wb_menu label word
     dw 2630h, 0                                  ; trigram for heaven (hamburger)
@@ -726,8 +758,8 @@ VAULT_ID_COUNT equ 8
 g_menu_ids label dword
     dd IDC_V_MBACK, IDC_V_MTITLE, IDC_V_MPOLL, IDC_V_MLENL, IDC_V_MLEN
     dd IDC_V_MCLSL, IDC_V_MCLS, IDC_V_MTPM, IDC_V_MTPML, IDC_V_MTPMINFO
-    dd IDC_V_MTHEMEL, IDC_V_MTHEME, IDC_V_MLAYOUTL, IDC_V_MLAYOUT
-MENU_ID_COUNT equ 14
+    dd IDC_V_MTHEMEL, IDC_V_MTHEME, IDC_V_MLAYOUTL, IDC_V_MLAYOUT, IDC_V_MEXPORT
+MENU_ID_COUNT equ 15
 
 .data?
 align 8
@@ -775,6 +807,10 @@ align 2
 g_search_w  dw 512 dup (?)            ; current search query (wide, upper-cased)
 g_match_w   dw EBUF*2 dup (?)         ; scratch: a field value/label folded for matching
 g_vpath     dw 1024 dup (?)        ; chosen vault path (wide, NUL-terminated)
+g_xlpath    dw 1024 dup (?)        ; chosen .xlsx export path (wide)
+g_xlpw      dw 256 dup (?)         ; export password (wide; wiped after use)
+g_xlpw2     dw 256 dup (?)         ; export confirm password (wide; wiped)
+g_xlpwlen   dd ?                   ; export password length in bytes
 g_pwbuf     dw 1024 dup (?)        ; password field (wide; wiped after use)
 g_pw2buf    dw 1024 dup (?)        ; confirm-password field (wide; wiped)
 g_conv_w    dw EBUF*2 dup (?)      ; utf8 -> wide display scratch
@@ -1595,7 +1631,7 @@ gui_draw_header proc frame
     sub     eax, 8                              ; small right padding
     mov     dword ptr [rbp-96], eax            ; rect R
     mov     eax, dword ptr [rbp-48]
-    add     eax, 26
+    add     eax, 40                             ; span the icon height so DT_VCENTER centers it
     mov     dword ptr [rbp-92], eax            ; rect B
     mov     ecx, dword ptr [g_cur_idx]
     lea     rdx, [rbp-112]
@@ -1606,22 +1642,7 @@ gui_draw_header proc frame
     mov     r9d, EBUF*2-1
     call    gui_towide
     WINCALL DrawTextW, qword ptr [rbp-32], addr g_conv_w, -1, addr rbp-104, 8024h
-    ; subtitle (username/url, dim)
-    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_subfont]
-    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_textdim]
-    mov     ecx, dword ptr [g_cur_idx]
-    call    gui_entry_subtitle                 ; -> g_sub_w
-    mov     eax, dword ptr [rbp-40]
-    add     eax, 48
-    mov     dword ptr [rbp-104], eax           ; rect L
-    mov     eax, dword ptr [rbp-48]
-    add     eax, 26
-    mov     dword ptr [rbp-100], eax           ; rect T
-    mov     eax, dword ptr [rbp-56]
-    mov     dword ptr [rbp-96], eax            ; rect R
-    mov     eax, dword ptr [rbp-64]
-    mov     dword ptr [rbp-92], eax            ; rect B
-    WINCALL DrawTextW, qword ptr [rbp-32], addr g_sub_w, -1, addr rbp-104, 8024h
+    ; (the username subtitle was redundant with the Username field below - removed)
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-80]   ; restore font
 gdh_done:
     FRAME_EPILOG
@@ -1828,8 +1849,8 @@ gfc_lp:
     mov     dword ptr [rbp-84], eax            ; T
     add     eax, dword ptr [r10+FD_H]
     mov     dword ptr [rbp-76], eax            ; B
-    mov     dword ptr [rbp-88], 156            ; L
-    mov     dword ptr [rbp-80], 414            ; R
+    mov     dword ptr [rbp-88], 214            ; L (156 + VDX_DLU)
+    mov     dword ptr [rbp-80], 472            ; R (414 + VDX_DLU)
     WINCALL MapDialogRect, qword ptr [rbp-32], addr rbp-88
     WINCALL RoundRect, qword ptr [rbp-24], dword ptr [rbp-88], dword ptr [rbp-84], \
             dword ptr [rbp-80], dword ptr [rbp-76], 10, 10
@@ -4008,11 +4029,12 @@ move_ctl proc frame
     jz      mvc_ret
     mov     qword ptr [rbp-24], rcx
     mov     qword ptr [rbp-32], rdx
-    mov     dword ptr [rbp-48], r8d              ; rc.left = x
+    add     r8d, VDX_DLU                         ; shift the whole detail pane right (wider sidebar)
+    mov     dword ptr [rbp-48], r8d              ; rc.left = x + dx
     mov     dword ptr [rbp-44], r9d              ; rc.top = y
     mov     eax, r8d
     add     eax, dword ptr [rbp+48]
-    mov     dword ptr [rbp-40], eax              ; rc.right = x+w
+    mov     dword ptr [rbp-40], eax              ; rc.right = x + dx + w
     mov     eax, r9d
     add     eax, dword ptr [rbp+56]
     mov     dword ptr [rbp-36], eax              ; rc.bottom = y+h
@@ -5050,12 +5072,7 @@ gui_gen_menu proc frame
     FRAME_PROLOG 96
     mov     qword ptr [rbp-24], rcx           ; hdlg
     mov     dword ptr [rbp-28], edx           ; row (clicked)
-    mov     edx, VF_SECRET                    ; always fill a password field, never username
-    call    gui_row_of_kind
-    cmp     eax, 0
-    jl      @F
-    mov     dword ptr [rbp-28], eax
-@@: WINCALL CreatePopupMenu
+    WINCALL CreatePopupMenu
     mov     qword ptr [rbp-32], rax
     test    rax, rax
     jz      ggm_done
@@ -5082,6 +5099,16 @@ ggm_show:
     WINCALL DestroyMenu, qword ptr [rbp-32]
     cmp     dword ptr [rbp-40], 0
     je      ggm_done
+    ; Resolve the target row AFTER the popup: TrackPopupMenu ran a nested modal
+    ; message loop, during which the detail pane may have been rebuilt (list/focus/
+    ; timer) - a row index captured earlier could be stale.  Always fill the first
+    ; secret row, never the username; fall back to the clicked row if none.
+    mov     edx, VF_SECRET
+    call    gui_row_of_kind
+    cmp     eax, 0
+    jl      @F
+    mov     dword ptr [rbp-28], eax
+@@:
     mov     eax, dword ptr [rbp-40]           ; preset = gen_presets[choice-1]
     dec     eax
     imul    eax, eax, 12
@@ -5750,6 +5777,8 @@ gui_apply_scheme proc frame
     mov     eax, dword ptr [g_col_dark]          ; match the title bar to the scheme
     mov     dword ptr [rbp-40], eax
     WINCALL DwmSetWindowAttribute, qword ptr [rbp-24], 20, addr rbp-40, 4
+    mov     rcx, qword ptr [rbp-24]              ; re-theme scrollbars to match dark/light
+    call    theme_scrollbars
     WINCALL RedrawWindow, qword ptr [rbp-24], 0, 0, 185h
     FRAME_EPILOG
     ret
@@ -5960,11 +5989,11 @@ gui_menu_open proc frame
     mov     r8d, VAULT_ID_COUNT
     mov     r9d, SW_HIDE
     call    gui_show_ids
-    mov     rcx, qword ptr [rbp-24]           ; hide the runtime field rows too
-    mov     edx, SW_HIDE
+    mov     rcx, qword ptr [rbp-24]           ; drop the revealed-secret overlay FIRST: it
+    call    gui_colorpw_hide                  ;   re-shows the plaintext value edit, which the
+    mov     rcx, qword ptr [rbp-24]           ;   row-hide below then hides (else it would show
+    mov     edx, SW_HIDE                      ;   through the settings overlay)
     call    gui_rows_show
-    mov     rcx, qword ptr [rbp-24]
-    call    gui_colorpw_hide
     mov     rcx, qword ptr [rbp-24]
     lea     rdx, [g_menu_ids]
     mov     r8d, MENU_ID_COUNT
@@ -6273,6 +6302,8 @@ vp_timer_clip:
     je      vp_t_clip
     cmp     r8d, TOTP_TIMER
     je      vp_t_totp
+    cmp     r8d, SEARCH_TIMER
+    je      vp_t_search
     jmp     vp_unhandled
 vp_t_clip:
     sub     rsp, 32
@@ -6285,6 +6316,15 @@ vp_t_clip:
 vp_t_totp:
     mov     rcx, qword ptr [rbp-8]
     call    gui_totp_refresh
+    jmp     vp_handled
+vp_t_search:
+    sub     rsp, 32                           ; debounce elapsed -> one-shot: stop then refilter
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, SEARCH_TIMER
+    call    KillTimer
+    add     rsp, 32
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_poplist
     jmp     vp_handled
 vp_init:
     mov     rax, qword ptr [rbp-8]            ; remember the window for the tray toggle
@@ -6375,6 +6415,8 @@ vp_cmd_disp:
     je      vp_theme
     cmp     eax, IDC_V_MLAYOUT
     je      vp_layout
+    cmp     eax, IDC_V_MEXPORT
+    je      vp_export
     cmp     eax, IDC_V_OVFL
     je      vp_ovfl
     cmp     eax, IDC_V_FAV
@@ -6409,7 +6451,15 @@ vp_setdirty:
     mov     dword ptr [g_dirty], 1
     jmp     vp_handled
 vp_searchchg:
-    mov     rcx, qword ptr [rbp-8]            ; refilter the entry list on each keystroke
+    call    vault_count                       ; big list -> debounce; small list -> live
+    cmp     eax, SEARCH_DEBOUNCE_MIN
+    jbe     vp_search_now
+    ; (re)arm a one-shot timer; SetTimer with the same id resets the interval, so a
+    ; run of fast keystrokes keeps pushing the refilter out until the user pauses 0.3 s.
+    WINCALL SetTimer, qword ptr [rbp-8], SEARCH_TIMER, SEARCH_MS, 0
+    jmp     vp_handled
+vp_search_now:
+    mov     rcx, qword ptr [rbp-8]            ; refilter the entry list immediately
     call    gui_poplist
     jmp     vp_handled
 vp_refocus:
@@ -6440,6 +6490,10 @@ vp_layout:
     mov     rcx, qword ptr [rbp-8]
     call    gui_apply_layout
     call    gui_save_prefs
+    jmp     vp_handled
+vp_export:
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_export_secrets
     jmp     vp_handled
 vp_ovfl:
     cmp     dword ptr [g_cur_idx], 0             ; only with an entry shown
@@ -6761,6 +6815,9 @@ vp_lock_go:
     call    KillTimer
     mov     rcx, qword ptr [rbp-8]
     mov     edx, TOTP_TIMER
+    call    KillTimer
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, SEARCH_TIMER               ; drop any pending debounced refilter
     call    KillTimer
     add     rsp, 32
     mov     dword ptr [g_totp_on], 0
@@ -7399,6 +7456,215 @@ cp_ret:
     pop     rbp
     ret
 create_proc endp
+
+; =============================================================================
+; gui_export_secrets(rcx = hdlg) - warn, prompt for an export password, pick a
+;   file, then build + agile-encrypt the whole vault into a password-protected
+;   .xlsx.  The vault is already unlocked (settings overlay is open).
+; =============================================================================
+gui_export_secrets proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    WINCALL MessageBoxW, qword ptr [rbp-24], addr xp_mm_warn, addr xp_mm_title, <030h or 1>  ; ICONWARNING|OKCANCEL
+    cmp     eax, 1                               ; IDOK
+    jne     ges_done
+    WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_XLPW, qword ptr [rbp-24], addr xlpw_proc, 0
+    cmp     eax, 1
+    jne     ges_done
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_xlsx_savepath
+    test    eax, eax
+    jz      ges_wipe
+    call    xl_build_xlsx
+    test    eax, eax
+    jnz     ges_bfail
+    lea     rcx, [g_xlpw]
+    mov     edx, dword ptr [g_xlpwlen]
+    call    xl_encrypt
+    test    eax, eax
+    jnz     ges_efail
+    lea     rcx, [g_xlpath]
+    mov     rdx, qword ptr [g_ole_ptr]
+    mov     r8, qword ptr [g_ole_len]
+    call    write_file
+    mov     dword ptr [rbp-32], eax
+    call    xl_encrypt_free
+    call    xl_free
+    call    ges_wipepw
+    cmp     dword ptr [rbp-32], 0
+    jne     ges_showfail
+    WINCALL MessageBoxW, qword ptr [rbp-24], addr xp_mm_ok, addr xp_mm_title, 040h  ; ICONINFORMATION
+    jmp     ges_done
+ges_efail:
+    call    xl_free                              ; encrypt failed -> free the plaintext package
+    jmp     ges_failwipe
+ges_bfail:                                       ; build failed -> already freed
+ges_failwipe:
+    call    ges_wipepw
+ges_showfail:
+    WINCALL MessageBoxW, qword ptr [rbp-24], addr xp_mm_fail, addr xp_mm_title, 010h  ; ICONERROR
+    jmp     ges_done
+ges_wipe:
+    call    ges_wipepw
+ges_done:
+    FRAME_EPILOG
+    ret
+gui_export_secrets endp
+
+; ges_wipepw - zero the export password buffers
+ges_wipepw proc frame
+    FRAME_PROLOG 32
+    lea     rcx, [g_xlpw]
+    mov     edx, 512
+    call    secure_zero
+    lea     rcx, [g_xlpw2]
+    mov     edx, 512
+    call    secure_zero
+    mov     dword ptr [g_xlpwlen], 0
+    FRAME_EPILOG
+    ret
+ges_wipepw endp
+
+; gui_xlsx_savepath(rcx = hdlg) -> eax = 1 if a path was chosen (in g_xlpath)
+gui_xlsx_savepath proc frame
+    FRAME_PROLOG 32
+    mov     qword ptr [rbp-24], rcx
+    lea     rcx, [g_ofn]
+    mov     edx, sizeof OPENFILENAMEW
+    call    secure_zero
+    lea     r10, [g_ofn]
+    mov     dword ptr [r10].OPENFILENAMEW.lStructSize, sizeof OPENFILENAMEW
+    mov     rax, qword ptr [rbp-24]
+    mov     qword ptr [r10].OPENFILENAMEW.hwndOwner, rax
+    lea     rax, [xlsx_filter]
+    mov     qword ptr [r10].OPENFILENAMEW.lpstrFilter, rax
+    lea     rax, [g_xlpath]
+    mov     qword ptr [r10].OPENFILENAMEW.lpstrFile, rax
+    mov     dword ptr [r10].OPENFILENAMEW.nMaxFile, 1024
+    lea     rax, [xlsx_defext]
+    mov     qword ptr [r10].OPENFILENAMEW.lpstrDefExt, rax
+    mov     dword ptr [r10].OPENFILENAMEW.nFilterIndex, 1
+    mov     word ptr [g_xlpath], 0
+    mov     dword ptr [r10].OPENFILENAMEW.Flags, OFN_OVERWRITEPROMPT or OFN_PATHMUSTEXIST or OFN_HIDEREADONLY or OFN_EXPLORER
+    WINCALL GetSaveFileNameW, addr g_ofn
+    FRAME_EPILOG
+    ret
+gui_xlsx_savepath endp
+
+; =============================================================================
+; xlpw_proc - DLG_XLPW dialog procedure (export password + confirm).  Raw frame.
+; =============================================================================
+xlpw_proc proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 64
+    mov     qword ptr [rbp-8], rcx
+    cmp     rdx, WM_INITDIALOG
+    je      xpp_init
+    cmp     rdx, WM_COMMAND
+    je      xpp_cmd
+    cmp     rdx, WM_CTLCOLORSTATIC
+    je      xpp_col
+    cmp     rdx, WM_CTLCOLOREDIT
+    je      xpp_col
+    cmp     rdx, WM_CTLCOLORBTN
+    je      xpp_col
+    cmp     rdx, WM_CTLCOLORDLG
+    je      xpp_col
+    cmp     rdx, WM_PAINT
+    je      xpp_paint
+    cmp     rdx, WM_ERASEBKGND
+    je      xpp_erase
+    cmp     rdx, WM_DRAWITEM
+    je      xpp_draw
+    cmp     rdx, WM_TIMER
+    je      xpp_timer
+    xor     eax, eax
+    jmp     xpp_ret
+xpp_col:
+    call    theme_ctlcolor
+    jmp     xpp_ret
+xpp_paint:
+    mov     rcx, qword ptr [rbp-8]
+    call    theme_paint
+    jmp     xpp_ret
+xpp_erase:
+    mov     rcx, r8
+    mov     rdx, qword ptr [rbp-8]
+    call    theme_erase
+    jmp     xpp_ret
+xpp_draw:
+    mov     rcx, r9
+    call    theme_drawitem
+    jmp     xpp_ret
+xpp_timer:
+    cmp     r8d, THEME_TIMER
+    jne     xpp_unh
+    mov     rcx, qword ptr [rbp-8]
+    call    theme_tick
+    mov     eax, 1
+    jmp     xpp_ret
+xpp_unh:
+    xor     eax, eax
+    jmp     xpp_ret
+xpp_init:
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDOK
+    call    theme_attach
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_XP_PW, EM_SETCUEBANNER, 1, addr cue_xppw
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_XP_PW2, EM_SETCUEBANNER, 1, addr cue_xppw2
+    mov     eax, 1
+    jmp     xpp_ret
+xpp_cmd:
+    movzx   eax, r8w
+    cmp     eax, IDOK
+    je      xpp_ok
+    cmp     eax, IDCANCEL
+    je      xpp_cancel
+    xor     eax, eax
+    jmp     xpp_ret
+xpp_ok:
+    WINCALL GetDlgItemTextW, qword ptr [rbp-8], IDC_XP_PW, addr g_xlpw, 255
+    mov     dword ptr [rbp-16], eax             ; length in chars
+    WINCALL GetDlgItemTextW, qword ptr [rbp-8], IDC_XP_PW2, addr g_xlpw2, 255
+    cmp     dword ptr [rbp-16], 0
+    je      xpp_empty
+    lea     rcx, [g_xlpw]
+    lea     rdx, [g_xlpw2]
+    call    gui_wstr_eq
+    test    eax, eax
+    jz      xpp_mismatch
+    mov     eax, dword ptr [rbp-16]
+    shl     eax, 1                               ; bytes = chars * 2
+    mov     dword ptr [g_xlpwlen], eax
+    lea     rcx, [g_xlpw2]                       ; wipe the confirm copy
+    mov     edx, 512
+    call    secure_zero
+    WINCALL EndDialog, qword ptr [rbp-8], 1
+    mov     eax, 1
+    jmp     xpp_ret
+xpp_empty:
+    WINCALL MessageBoxW, qword ptr [rbp-8], addr xp_mm_empty, addr xp_mm_title, 030h
+    mov     eax, 1
+    jmp     xpp_ret
+xpp_mismatch:
+    WINCALL MessageBoxW, qword ptr [rbp-8], addr xp_mm_mismatch, addr xp_mm_title, 030h
+    mov     eax, 1
+    jmp     xpp_ret
+xpp_cancel:
+    lea     rcx, [g_xlpw]
+    mov     edx, 512
+    call    secure_zero
+    lea     rcx, [g_xlpw2]
+    mov     edx, 512
+    call    secure_zero
+    WINCALL EndDialog, qword ptr [rbp-8], 0
+    mov     eax, 1
+xpp_ret:
+    mov     rsp, rbp
+    pop     rbp
+    ret
+xlpw_proc endp
 
 ; gui_resolve_vault() - decide which vault to mount at startup.
 ;   Path:  HKLM (if set) > HKCU (if set) > default Documents\vault.vordr.

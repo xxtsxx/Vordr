@@ -191,6 +191,8 @@ g_frame_par dq 0
 
 td_dark label word                      ; control theme class for dark scrollbars
     dw 'D','a','r','k','M','o','d','e','_','E','x','p','l','o','r','e','r', 0
+td_light label word                     ; control theme class for light scrollbars
+    dw 'E','x','p','l','o','r','e','r', 0
 td_font label word                      ; toolbar glyph font face
     dw 'S','e','g','o','e',' ','U','I',0
 td_iconfont label word                  ; Fluent icon font (PUA glyphs e.g. trashcan)
@@ -744,17 +746,33 @@ be_fail:
     ret
 bg_ensure endp
 
-; theme_dark_cb(rcx=hwnd, rdx=lparam) -> BOOL - give each control the dark
-;   "explorer" theme so its scrollbars/borders render dark.  EnumChildWindows cb.
+; theme_dark_cb(rcx=hwnd, rdx=lparam) -> BOOL - give each control the explorer
+;   theme so its scrollbars/borders match the scheme: DarkMode_Explorer for dark
+;   schemes, plain Explorer (light) otherwise.  EnumChildWindows callback.
 theme_dark_cb proc
     sub     rsp, 40
     lea     rdx, [td_dark]
+    cmp     dword ptr [g_col_dark], 0        ; light scheme -> light scrollbars
+    jne     tdc_go
+    lea     rdx, [td_light]
+tdc_go:
     xor     r8, r8
     call    SetWindowTheme
     add     rsp, 40
     mov     eax, 1
     ret
 theme_dark_cb endp
+
+; theme_scrollbars(rcx=hwnd) - re-theme every child control's scrollbars to match
+;   the current scheme (call after a scheme switch so they follow dark<->light).
+public theme_scrollbars
+theme_scrollbars proc frame
+    FRAME_PROLOG 32
+    mov     qword ptr [rbp-24], rcx
+    WINCALL EnumChildWindows, qword ptr [rbp-24], addr theme_dark_cb, 0
+    FRAME_EPILOG
+    ret
+theme_scrollbars endp
 
 ; =============================================================================
 ; theme_attach(rcx=hwnd, edx=defid)
