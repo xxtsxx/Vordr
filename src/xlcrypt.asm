@@ -40,6 +40,7 @@ SPIN_COUNT  equ 100000
 ENDCHAIN    equ 0FFFFFFFEh
 FREESECT    equ 0FFFFFFFFh
 FATSECT     equ 0FFFFFFFDh
+DIFSECT     equ 0FFFFFFFCh
 
 .data?
 align 16
@@ -75,6 +76,8 @@ g_miniCSec  dd ?
 g_pkgSec    dd ?
 g_miniFSec  dd ?
 g_F         dd ?
+g_D         dd ?                     ; number of DIFAT sectors (0 if F<=109)
+g_difatStart dd ?                    ; first DIFAT sector (valid if D>0)
 g_T         dd ?
 g_dirStart  dd ?
 g_mfStart   dd ?
@@ -519,9 +522,15 @@ ole_hdr proc frame
     OP32    00001000h                            ; mini stream cutoff
     OP32    dword ptr [g_mfStart]                ; first MiniFAT sector
     OP32    dword ptr [g_miniFSec]               ; num MiniFAT sectors
-    OP32    ENDCHAIN                             ; first DIFAT sector
-    OP32    0                                    ; num DIFAT sectors
-    ; DIFAT[109]: first F entries are 0..F-1, rest FREESECT
+    cmp     dword ptr [g_D], 0                   ; first DIFAT sector: difatStart
+    je      oh_nodifat                           ;   if any, else ENDCHAIN
+    OP32    dword ptr [g_difatStart]
+    jmp     oh_difdone
+oh_nodifat:
+    OP32    ENDCHAIN
+oh_difdone:
+    OP32    dword ptr [g_D]                      ; num DIFAT sectors
+    ; DIFAT[109]: first min(F,109) entries are 0..n-1, rest FREESECT
     mov     dword ptr [rbp-24], 0
 oh_dl:
     mov     eax, dword ptr [rbp-24]
@@ -556,8 +565,21 @@ of_lp:
     mov     r10d, FREESECT
     ; FAT sectors themselves
     cmp     eax, dword ptr [g_F]
-    jae     of_c_dir
+    jae     of_c_difat
     mov     r10d, FATSECT
+    jmp     of_emit
+of_c_difat:
+    ; DIFAT run [difatStart, difatStart+D) - self-describing DIFSECT marks
+    cmp     dword ptr [g_D], 0
+    je      of_c_dir
+    mov     ecx, dword ptr [g_difatStart]
+    cmp     eax, ecx
+    jb      of_c_dir
+    mov     edx, ecx
+    add     edx, dword ptr [g_D]
+    cmp     eax, edx
+    jae     of_c_dir
+    mov     r10d, DIFSECT
     jmp     of_emit
 of_c_dir:
     ; directory run [dirStart, dirStart+3)
@@ -626,6 +648,61 @@ of_chain proc
 ofc_ret:
     ret
 of_chain endp
+
+; ole_difat() - the DIFAT sectors (only when F>109).  Each sector holds 127 FAT
+;   sector locations followed by a pointer to the next DIFAT sector (ENDCHAIN on
+;   the last).  The header's inline array already covers FAT sectors 0..108, so
+;   DIFAT sector s covers FAT sectors 109+s*127 .. +126, padded with FREESECT.
+ole_difat proc frame
+    FRAME_PROLOG 48
+    cmp     dword ptr [g_D], 0
+    je      od_done
+    mov     dword ptr [rbp-24], 0                ; s (DIFAT sector index)
+od_slp:
+    mov     eax, dword ptr [rbp-24]
+    cmp     eax, dword ptr [g_D]
+    jae     od_done
+    imul    eax, eax, 127                        ; fatbase = 109 + s*127
+    add     eax, 109
+    mov     dword ptr [rbp-32], eax
+    mov     dword ptr [rbp-40], 0                ; j (0..126)
+od_jlp:
+    cmp     dword ptr [rbp-40], 127
+    jae     od_jdone
+    mov     eax, dword ptr [rbp-32]              ; fatIdx = fatbase + j
+    add     eax, dword ptr [rbp-40]
+    mov     r10d, FREESECT                       ; past the real FAT -> free
+    cmp     eax, dword ptr [g_F]
+    jae     od_pv
+    mov     r10d, eax
+od_pv:
+    lea     rcx, [g_olebuf]
+    mov     edx, r10d
+    call    buf_pu32
+    inc     dword ptr [rbp-40]
+    jmp     od_jlp
+od_jdone:
+    mov     eax, dword ptr [rbp-24]              ; next DIFAT sector or ENDCHAIN
+    inc     eax
+    cmp     eax, dword ptr [g_D]
+    jb      od_next
+    mov     r10d, ENDCHAIN
+    jmp     od_pn
+od_next:
+    mov     eax, dword ptr [g_difatStart]
+    add     eax, dword ptr [rbp-24]
+    inc     eax
+    mov     r10d, eax
+od_pn:
+    lea     rcx, [g_olebuf]
+    mov     edx, r10d
+    call    buf_pu32
+    inc     dword ptr [rbp-24]
+    jmp     od_slp
+od_done:
+    FRAME_EPILOG
+    ret
+ole_difat endp
 
 ; ole_dirent(rcx=wname, edx=namelenbytes, r8d=objtype, r9d=left) using globals
 ;   g_de_right / g_de_child / g_de_start / g_de_size
@@ -839,23 +916,47 @@ xl_ole_write proc frame
     add     ecx, dword ptr [g_miniFSec]
     add     ecx, dword ptr [g_miniCSec]
     add     ecx, dword ptr [g_pkgSec]
-    ; iterate F
-    mov     edx, 1
+    ; iterate F (FAT sectors) and D (DIFAT sectors) together: adding DIFAT
+    ; sectors grows the total, which can grow F, which can grow D again.
+    mov     edx, 1                               ; F
+    xor     r8d, r8d                             ; D
 xow_fit:
-    mov     eax, edx
+    mov     eax, edx                             ; T = F + D + nonFat
+    add     eax, r8d
     add     eax, ecx
     add     eax, 127
-    shr     eax, 7
-    cmp     eax, edx
-    jbe     xow_fdone
+    shr     eax, 7                               ; newF = ceil(T/128)
+    ; newD = (newF>109) ? ceil((newF-109)/127) : 0  (D is small: div-free loop)
+    xor     r9d, r9d
+    cmp     eax, 109
+    jbe     xf_cmp
+    mov     r11d, eax
+    sub     r11d, 109
+xf_dcnt:
+    inc     r9d
+    cmp     r11d, 127
+    jbe     xf_cmp
+    sub     r11d, 127
+    jmp     xf_dcnt
+xf_cmp:
+    cmp     eax, edx                             ; converged? (newF==F && newD==D)
+    jne     xf_upd
+    cmp     r9d, r8d
+    je      xow_fdone
+xf_upd:
     mov     edx, eax
+    mov     r8d, r9d
     jmp     xow_fit
 xow_fdone:
     mov     dword ptr [g_F], edx
-    mov     eax, edx
+    mov     dword ptr [g_D], r8d
+    mov     eax, edx                             ; T = F + D + nonFat
+    add     eax, r8d
     add     eax, ecx
     mov     dword ptr [g_T], eax
-    mov     eax, dword ptr [g_F]
+    mov     eax, dword ptr [g_F]                 ; DIFAT sectors sit right after the FAT
+    mov     dword ptr [g_difatStart], eax
+    add     eax, r8d                             ; dirStart = F + D
     mov     dword ptr [g_dirStart], eax
     add     eax, 3                               ; directory is 3 sectors
     mov     dword ptr [g_mfStart], eax
@@ -865,6 +966,7 @@ xow_fdone:
     mov     dword ptr [g_pkgStart], eax
     call    ole_hdr
     call    ole_fat
+    call    ole_difat
     call    ole_dir
     call    ole_minifat
     call    ole_minicont
