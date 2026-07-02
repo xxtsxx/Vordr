@@ -611,6 +611,9 @@ f_mono label word
 pr_sp2 dw ' ',' ', 0                              ; separators for the phonetic lines
 pr_crlf dw 13,10, 0
 pr_symdef dw 's','y','m','b','o','l', 0
+pr_cap  dw 'C','A','P','-', 0                     ; capital-letter marker
+PH_CELL equ 22                                    ; phonetic cell width (chars)
+PH_COLS equ 3                                     ; phonetic columns
 lg_upper dw 'A','B','C', 0
 lg_lower dw 'a','b','c', 0
 lg_digit dw '1','2','3', 0
@@ -790,7 +793,7 @@ g_st        dw 8 dup (?)             ; SYSTEMTIME scratch (FileTimeToSystemTime)
 g_genout    db 260 dup (?)           ; generator ASCII output (wiped after use)
 g_genout_w  dw 260 dup (?)           ; generator output widened for the edit
 g_readpw    dw 260 dup (?)           ; password being read out (wiped on close)
-g_phon_w    dw 4096 dup (?)          ; phonetic spelling text (wiped on close)
+g_phon_w    dw 6144 dup (?)          ; phonetic spelling text (wiped on close)
 align 8
 ; --- modular field-row model (runtime detail form) ---
 g_fields      db MAXROWS*DESCSZ dup (?)   ; row descriptors
@@ -811,6 +814,7 @@ g_subfont     dq ?                         ; list entry subtitle (regular, dim)
 g_titlefont   dq ?                         ; detail-header title (large semibold)
 g_chevfont    dq ?                         ; small Fluent icons for flat reorder chevrons
 g_monofont    dq ?                         ; monospace font for the colored password readout
+g_phonfont    dq ?                         ; small monospace font for the phonetic columns
 g_sub_w       dw 512 dup (?)               ; subtitle scratch (wide)
 g_cmpbuf      db 256 dup (?)               ; title-A copy for WM_COMPAREITEM
 align 4
@@ -1208,6 +1212,8 @@ gui_make_listfonts proc frame
     mov     qword ptr [g_chevfont], rax
     WINCALL CreateFontW, -24, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, addr f_mono
     mov     qword ptr [g_monofont], rax
+    WINCALL CreateFontW, -12, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, addr f_mono
+    mov     qword ptr [g_phonfont], rax
 mlf_done:
     FRAME_EPILOG
     ret
@@ -5166,13 +5172,14 @@ wal_done:
     ret
 gui_wapp_lc endp
 
-; gui_build_phonetic() - fill g_phon_w with "<c>  <Word>\r\n" for each char of
-;   g_readpw (NATO letters w/ case, digit + symbol names).
+; gui_build_phonetic() - fill g_phon_w with a PH_COLS-column grid of fixed-width
+;   "<c>  <Word>" cells (NATO w/ CAP- marker for uppercase, digit + symbol names).
 gui_build_phonetic proc frame
     FRAME_PROLOG 64
     lea     rax, [g_phon_w]
     mov     qword ptr [rbp-24], rax           ; dst cursor
     mov     dword ptr [rbp-32], 0             ; i
+    mov     dword ptr [rbp-60], 0             ; col
 gbp_loop:
     mov     eax, dword ptr [rbp-32]
     lea     r10, [g_readpw]
@@ -5180,6 +5187,8 @@ gbp_loop:
     test    ecx, ecx
     jz      gbp_done
     mov     dword ptr [rbp-40], ecx           ; char
+    mov     rax, qword ptr [rbp-24]
+    mov     qword ptr [rbp-56], rax           ; cell start
     mov     r10, qword ptr [rbp-24]           ; append the char itself
     mov     word ptr [r10], cx
     add     qword ptr [rbp-24], 2
@@ -5194,6 +5203,12 @@ gbp_loop:
     jb      gbp_notU
     cmp     ecx, 'Z'
     ja      gbp_notU
+    mov     rcx, qword ptr [rbp-24]           ; uppercase -> "CAP-" prefix
+    lea     rdx, [pr_cap]
+    xor     r8d, r8d
+    call    gui_wapp_lc
+    mov     qword ptr [rbp-24], rax
+    mov     ecx, dword ptr [rbp-40]
     sub     ecx, 'A'
     lea     r10, [nato_ptrs]
     mov     rdx, qword ptr [r10+rcx*8]
@@ -5246,13 +5261,32 @@ gbp_have:
     mov     r8d, dword ptr [rbp-52]
     call    gui_wapp_lc
     mov     qword ptr [rbp-24], rax
-    mov     rcx, qword ptr [rbp-24]           ; CRLF
+    ; pad the cell out to PH_CELL chars
+    mov     rax, qword ptr [rbp-24]
+    sub     rax, qword ptr [rbp-56]
+    sar     rax, 1                            ; chars written in this cell
+    mov     r8d, PH_CELL
+    sub     r8d, eax
+    jle     gbp_col
+gbp_pad:
+    mov     r10, qword ptr [rbp-24]
+    mov     word ptr [r10], ' '
+    add     qword ptr [rbp-24], 2
+    dec     r8d
+    jnz     gbp_pad
+gbp_col:
+    inc     dword ptr [rbp-60]                ; col++; CRLF after PH_COLS cells
+    cmp     dword ptr [rbp-60], PH_COLS
+    jb      gbp_next
+    mov     rcx, qword ptr [rbp-24]
     lea     rdx, [pr_crlf]
     xor     r8d, r8d
     call    gui_wapp_lc
     mov     qword ptr [rbp-24], rax
+    mov     dword ptr [rbp-60], 0
+gbp_next:
     inc     dword ptr [rbp-32]
-    cmp     dword ptr [rbp-32], 256
+    cmp     dword ptr [rbp-32], 180           ; cap (fits g_phon_w with margin)
     jb      gbp_loop
 gbp_done:
     mov     r10, qword ptr [rbp-24]
@@ -5417,6 +5451,8 @@ pr_init:
     mov     rcx, qword ptr [rbp-8]
     mov     edx, IDOK
     call    theme_attach
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_PR_PHON, WM_SETFONT, \
+            qword ptr [g_phonfont], 1         ; monospace so the columns align
     call    gui_build_phonetic
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_PR_PHON, addr g_phon_w
     WINCALL SetForegroundWindow, qword ptr [rbp-8]
@@ -5495,7 +5531,7 @@ grp_wiped:
     lea     r10, [g_phon_w]
     xor     ecx, ecx
 grp_wipe2:
-    cmp     ecx, 4096
+    cmp     ecx, 6144
     jae     grp_done
     mov     word ptr [r10+rcx*2], 0
     inc     ecx
