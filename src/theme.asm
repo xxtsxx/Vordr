@@ -151,6 +151,31 @@ g_bh        dd 0
 g_memdc     dq 0
 g_hbm       dq 0
 g_bits      dq 0
+; ---- runtime-selectable colour scheme -------------------------------------
+; g_col_* are 12 consecutive dwords (order matches each schemes[] row).
+public g_scheme, g_col_bg, g_col_panel, g_col_text, g_col_textdim
+g_scheme    dd 0
+align 4
+g_col_bg    dd 00202020h
+g_col_panel dd 002D2D2Dh
+g_col_frame dd 003D3D3Dh
+g_col_btn   dd 002D2D2Dh
+g_col_btnsel dd 002A2A2Ah
+g_col_text  dd 00FFFFFFh
+g_col_textdim dd 00C8C8C8h
+g_col_border dd 003D3D3Dh
+g_col_accent dd 00FFC24Ch
+g_col_accsel dd 00DBA03Ah
+g_col_focus dd 00FFC24Ch
+g_col_dark  dd 1
+SCHEME_DW   equ 12                        ; dwords per scheme row
+SCHEME_COUNT equ 4
+schemes label dword
+    ; bg       panel     frame     btn       btnsel    text      textdim   border    accent    accsel    focus     dark
+    dd 00202020h,002D2D2Dh,003D3D3Dh,002D2D2Dh,002A2A2Ah,00FFFFFFh,00C8C8C8h,003D3D3Dh,00FFC24Ch,00DBA03Ah,00FFC24Ch,1  ; Dark
+    dd 00F3F3F3h,00FFFFFFh,00D2D2D2h,00FFFFFFh,00E6E6E6h,00202020h,00707070h,00D2D2D2h,00C26A00h,00A05800h,00C26A00h,0  ; Light
+    dd 001A1410h,00282018h,00403420h,00282018h,00201810h,00FFF0E0h,00C0B0A0h,00403420h,00E0C040h,00B09020h,00E0C040h,1  ; Midnight
+    dd 00000000h,00151515h,00808080h,00202020h,00404040h,00FFFFFFh,00E0E0E0h,00808080h,0000FFFFh,0000C0C0h,0000FFFFh,1  ; Contrast
 g_br_bg     dq 0
 g_br_panel  dq 0
 g_br_frame  dq 0
@@ -320,28 +345,8 @@ theme_detect endp
 public theme_boot
 theme_boot proc frame
     FRAME_PROLOG 112                          ; room for the 14-arg CreateFontW
-    WINCALL CreateSolidBrush, COL_BG
-    mov     qword ptr [g_br_bg], rax
-    WINCALL CreateSolidBrush, COL_PANEL
-    mov     qword ptr [g_br_panel], rax
-    WINCALL CreateSolidBrush, COL_FRAME
-    mov     qword ptr [g_br_frame], rax
-    WINCALL CreateSolidBrush, COL_BTN
-    mov     qword ptr [g_br_btn], rax
-    WINCALL CreateSolidBrush, COL_BTNSEL
-    mov     qword ptr [g_br_btnsel], rax
-    WINCALL CreateSolidBrush, COL_ACCENT
-    mov     qword ptr [g_br_accent], rax
-    WINCALL CreateSolidBrush, COL_ACCSEL
-    mov     qword ptr [g_br_accsel], rax
-    WINCALL CreateSolidBrush, COL_TEXTDIM
-    mov     qword ptr [g_br_dim], rax
-    WINCALL CreatePen, PS_SOLID, 1, COL_BORDER
-    mov     qword ptr [g_pen_bd], rax
-    WINCALL CreatePen, PS_SOLID, 1, COL_ACCENT
-    mov     qword ptr [g_pen_acc], rax
-    WINCALL CreatePen, PS_SOLID, 2, COL_FOCUS
-    mov     qword ptr [g_pen_focus], rax
+    mov     ecx, dword ptr [g_scheme]         ; build brushes/pens from the active scheme
+    call    theme_set_scheme
     ; large semibold font for the small toolbar symbol buttons (+ pencil)
     WINCALL CreateFontW, -18, 0, 0, 0, 100, 0, 0, 0, 1, 0, 0, 5, 0, addr td_font
     mov     qword ptr [g_font_big], rax
@@ -354,6 +359,107 @@ theme_boot proc frame
     FRAME_EPILOG
     ret
 theme_boot endp
+
+; =============================================================================
+; theme_del_gdi(rcx = &handle) - DeleteObject the handle if non-zero, then 0 it.
+; =============================================================================
+theme_del_gdi proc frame
+    FRAME_PROLOG 32
+    mov     qword ptr [rbp-24], rcx
+    mov     rcx, qword ptr [rcx]
+    test    rcx, rcx
+    jz      tdg_done
+    call    DeleteObject
+    mov     r10, qword ptr [rbp-24]
+    mov     qword ptr [r10], 0
+tdg_done:
+    FRAME_EPILOG
+    ret
+theme_del_gdi endp
+
+; =============================================================================
+; theme_rebrush - (re)create the scheme brushes/pens from g_col_*.
+; =============================================================================
+theme_rebrush proc frame
+    FRAME_PROLOG 48
+    lea     rcx, [g_br_bg]
+    call    theme_del_gdi
+    lea     rcx, [g_br_panel]
+    call    theme_del_gdi
+    lea     rcx, [g_br_frame]
+    call    theme_del_gdi
+    lea     rcx, [g_br_btn]
+    call    theme_del_gdi
+    lea     rcx, [g_br_btnsel]
+    call    theme_del_gdi
+    lea     rcx, [g_br_accent]
+    call    theme_del_gdi
+    lea     rcx, [g_br_accsel]
+    call    theme_del_gdi
+    lea     rcx, [g_br_dim]
+    call    theme_del_gdi
+    lea     rcx, [g_pen_bd]
+    call    theme_del_gdi
+    lea     rcx, [g_pen_acc]
+    call    theme_del_gdi
+    lea     rcx, [g_pen_focus]
+    call    theme_del_gdi
+    WINCALL CreateSolidBrush, dword ptr [g_col_bg]
+    mov     qword ptr [g_br_bg], rax
+    WINCALL CreateSolidBrush, dword ptr [g_col_panel]
+    mov     qword ptr [g_br_panel], rax
+    WINCALL CreateSolidBrush, dword ptr [g_col_frame]
+    mov     qword ptr [g_br_frame], rax
+    WINCALL CreateSolidBrush, dword ptr [g_col_btn]
+    mov     qword ptr [g_br_btn], rax
+    WINCALL CreateSolidBrush, dword ptr [g_col_btnsel]
+    mov     qword ptr [g_br_btnsel], rax
+    WINCALL CreateSolidBrush, dword ptr [g_col_accent]
+    mov     qword ptr [g_br_accent], rax
+    WINCALL CreateSolidBrush, dword ptr [g_col_accsel]
+    mov     qword ptr [g_br_accsel], rax
+    WINCALL CreateSolidBrush, dword ptr [g_col_textdim]
+    mov     qword ptr [g_br_dim], rax
+    WINCALL CreatePen, PS_SOLID, 1, dword ptr [g_col_border]
+    mov     qword ptr [g_pen_bd], rax
+    WINCALL CreatePen, PS_SOLID, 1, dword ptr [g_col_accent]
+    mov     qword ptr [g_pen_acc], rax
+    WINCALL CreatePen, PS_SOLID, 2, dword ptr [g_col_focus]
+    mov     qword ptr [g_pen_focus], rax
+    FRAME_EPILOG
+    ret
+theme_rebrush endp
+
+; =============================================================================
+; theme_set_scheme(ecx = index) - select a colour scheme: copy its colours into
+;   g_col_* and rebuild the brushes/pens.  Clamps out-of-range to 0 (Dark).
+; =============================================================================
+public theme_set_scheme
+theme_set_scheme proc frame
+    FRAME_PROLOG 48
+    cmp     ecx, SCHEME_COUNT
+    jb      tss_ok
+    xor     ecx, ecx
+tss_ok:
+    mov     dword ptr [g_scheme], ecx
+    mov     eax, ecx
+    imul    eax, eax, SCHEME_DW*4
+    lea     r10, [schemes]
+    add     r10, rax
+    lea     r11, [g_col_bg]
+    xor     eax, eax
+tss_cp:
+    cmp     eax, SCHEME_DW
+    jae     tss_done
+    mov     edx, dword ptr [r10+rax*4]
+    mov     dword ptr [r11+rax*4], edx
+    inc     eax
+    jmp     tss_cp
+tss_done:
+    call    theme_rebrush
+    FRAME_EPILOG
+    ret
+theme_set_scheme endp
 
 ; =============================================================================
 ; bg_render - paint the aurora-borealis background into g_bits for g_phase:
@@ -857,7 +963,7 @@ theme_ctlcolor proc frame
     cmp     rdx, WM_CTLCOLORSTATIC
     je      tc_static
     ; dialog background / checkbox / radio text -> opaque near-black, light text
-    WINCALL SetTextColor, qword ptr [rbp-24], COL_TEXT
+    WINCALL SetTextColor, qword ptr [rbp-24], dword ptr [g_col_text]
     WINCALL SetBkMode, qword ptr [rbp-24], BKMODE_TRANSP
     mov     rax, qword ptr [g_br_bg]
     FRAME_EPILOG
@@ -869,14 +975,14 @@ tc_static:
     movzx   eax, word ptr [g_clsbuf]
     cmp     eax, 'E'
     je      tc_panel
-    WINCALL SetTextColor, qword ptr [rbp-24], COL_TEXT
+    WINCALL SetTextColor, qword ptr [rbp-24], dword ptr [g_col_text]
     WINCALL SetBkMode, qword ptr [rbp-24], BKMODE_TRANSP
     mov     rax, qword ptr [g_br_bg]
     FRAME_EPILOG
     ret
 tc_panel:
-    WINCALL SetTextColor, qword ptr [rbp-24], COL_TEXT
-    WINCALL SetBkColor, qword ptr [rbp-24], COL_PANEL
+    WINCALL SetTextColor, qword ptr [rbp-24], dword ptr [g_col_text]
+    WINCALL SetBkColor, qword ptr [rbp-24], dword ptr [g_col_panel]
     mov     rax, qword ptr [g_br_panel]
     FRAME_EPILOG
     ret
@@ -941,14 +1047,16 @@ tdi_notstatic:
     mov     rax, qword ptr [g_br_btnsel]
 @@: WINCALL SelectObject, qword ptr [rbp-32], rax
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_pen_bd]
-    mov     dword ptr [rbp-116], COL_TEXT
+    mov     eax, dword ptr [g_col_text]
+    mov     dword ptr [rbp-116], eax
     jmp     tdi_btnshape
 tdi_accent:
     test    dword ptr [rbp-48], ODS_DISABLED  ; Fluent disabled accent = muted neutral
     jz      tdi_acc_on
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_br_btn]
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_pen_bd]
-    mov     dword ptr [rbp-116], COL_TEXTDIM
+    mov     eax, dword ptr [g_col_textdim]
+    mov     dword ptr [rbp-116], eax
     jmp     tdi_btnshape
 tdi_acc_on:
     ; primary button - accent fill + black text
@@ -965,7 +1073,7 @@ tdi_btnshape:
     mov     ecx, dword ptr [rbp-116]
     test    dword ptr [rbp-48], ODS_DISABLED
     jz      tdi_tcol
-    mov     ecx, COL_TEXTDIM
+    mov     ecx, dword ptr [g_col_textdim]
 tdi_tcol:
     WINCALL SetTextColor, qword ptr [rbp-32], rcx
     ; single-glyph buttons get a large glyph font for clarity; multi-char
@@ -1004,7 +1112,7 @@ tdi_group:
     mov     dword ptr [rbp-112], eax          ; frame top below caption
     WINCALL RoundRect, qword ptr [rbp-32], dword ptr [rbp-80], dword ptr [rbp-112], \
             dword ptr [rbp-72], dword ptr [rbp-68], 8, 8
-    WINCALL SetTextColor, qword ptr [rbp-32], COL_TEXTDIM
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_textdim]
     mov     eax, dword ptr [rbp-80]
     add     eax, 9
     mov     dword ptr [rbp-80], eax           ; caption left indent

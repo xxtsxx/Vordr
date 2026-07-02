@@ -45,6 +45,14 @@ extern vault_field_at:proc
 extern vault_entry_ptr:proc
 extern g_carry_created:qword
 extern pwgen_ex:proc
+extern g_col_bg:dword
+extern g_col_panel:dword
+extern g_col_text:dword
+extern g_col_textdim:dword
+extern g_scheme:dword
+extern theme_set_scheme:proc
+extern reg_tpm_set:proc
+extern reg_tpm_get:proc
 extern vault_field_count:proc
 extern vault_field_get:proc
 extern vault_build_entry:proc
@@ -314,6 +322,10 @@ IDC_V_MCLS   equ 223
 IDC_V_MTPM   equ 224
 IDC_V_MTPMINFO equ 226
 IDC_V_MTPML  equ 228                  ; "TPM Unlock" label beside the toggle
+IDC_V_MTHEME equ 240                  ; color-scheme cycle button (settings)
+IDC_V_MTHEMEL equ 241                 ; "Color scheme" label
+IDC_V_MLAYOUT equ 242                 ; layout cycle button (settings)
+IDC_V_MLAYOUTL equ 243                ; "Layout" label
 SW_HIDE      equ 0
 SW_SHOW      equ 5
 DLG_CREATE   equ 400
@@ -555,6 +567,22 @@ fav_one label word
     dw '1', 0                                    ; VF_FAV marker value
 wb_gen label word
     dw 0E72Ch, 0                                 ; Refresh (generate password)
+sn_dark dw 'D','a','r','k',0
+sn_light dw 'L','i','g','h','t',0
+sn_mid  dw 'M','i','d','n','i','g','h','t',0
+sn_contrast dw 'C','o','n','t','r','a','s','t',0
+align 8
+scheme_names dq sn_dark, sn_light, sn_mid, sn_contrast
+GUI_SCHEME_COUNT equ 4
+ln_comfy dw 'C','o','m','f','o','r','t','a','b','l','e',0
+ln_compact dw 'C','o','m','p','a','c','t',0
+ln_spacious dw 'S','p','a','c','i','o','u','s',0
+align 8
+layout_names dq ln_comfy, ln_compact, ln_spacious
+layout_gaps  dd 7, 3, 14                          ; inter-card gap (DLU) per layout
+GUI_LAYOUT_COUNT equ 3
+pref_scheme dw 'u','i','_','s','c','h','e','m','e',0
+pref_layout dw 'u','i','_','l','a','y','o','u','t',0
 gm_l1 dw 'S','t','r','o','n','g',' ','r','a','n','d','o','m',' ','2','0',0
 gm_l2 dw 'A','l','p','h','a','n','u','m','e','r','i','c',' ','2','0',0
 gm_l3 dw 'P','a','s','s','p','h','r','a','s','e',' ','5',' ','w','o','r','d','s',0
@@ -686,7 +714,8 @@ VAULT_ID_COUNT equ 8
 g_menu_ids label dword
     dd IDC_V_MBACK, IDC_V_MTITLE, IDC_V_MPOLL, IDC_V_MLENL, IDC_V_MLEN
     dd IDC_V_MCLSL, IDC_V_MCLS, IDC_V_MTPM, IDC_V_MTPML, IDC_V_MTPMINFO
-MENU_ID_COUNT equ 10
+    dd IDC_V_MTHEMEL, IDC_V_MTHEME, IDC_V_MLAYOUTL, IDC_V_MLAYOUT
+MENU_ID_COUNT equ 14
 
 .data?
 align 8
@@ -764,6 +793,7 @@ g_fields      db MAXROWS*DESCSZ dup (?)   ; row descriptors
 g_gatherblob  db 32*ARFBLOB dup (?)        ; per-field attachment blobs held across reorder
 g_field_count dd ?                        ; live row count
 g_fav_state   dd ?                         ; current entry is a favorite (0/1)
+g_layout      dd ?                         ; UI layout/density index (0 comfortable)
 g_content_h   dd ?                        ; field-form content bottom (DLU) after layout
 g_rowkind     dd ?                        ; scratch: kind for a pending add
 g_dlgfont     dq ?                        ; the vault dialog's font (for runtime ctls)
@@ -1509,7 +1539,7 @@ gui_draw_header proc frame
     mov     eax, dword ptr [r10+52]
     mov     dword ptr [rbp-64], eax            ; B
     ; background fill (dialog base color #202020)
-    WINCALL CreateSolidBrush, 00202020h
+    WINCALL CreateSolidBrush, dword ptr [g_col_bg]
     mov     qword ptr [rbp-72], rax
     mov     r10, qword ptr [rbp-24]
     lea     rdx, [r10+40]
@@ -1532,10 +1562,10 @@ gui_draw_header proc frame
     add     r8d, 2
     mov     r9d, 38
     call    gui_draw_tile
-    ; title (large semibold, white)
+    ; title (large semibold, active text colour)
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_titlefont]
     mov     qword ptr [rbp-80], rax            ; old font
-    WINCALL SetTextColor, qword ptr [rbp-32], 00FFFFFFh
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_text]
     WINCALL SetBkMode, qword ptr [rbp-32], 1
     mov     eax, dword ptr [rbp-40]
     add     eax, 48
@@ -1560,7 +1590,7 @@ gui_draw_header proc frame
     WINCALL DrawTextW, qword ptr [rbp-32], addr g_conv_w, -1, addr rbp-104, 8024h
     ; subtitle (username/url, dim)
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_subfont]
-    WINCALL SetTextColor, qword ptr [rbp-32], 00A0A0A0h
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_textdim]
     mov     ecx, dword ptr [g_cur_idx]
     call    gui_entry_subtitle                 ; -> g_sub_w
     mov     eax, dword ptr [rbp-40]
@@ -1685,7 +1715,7 @@ gui_draw_sbadge proc frame
     mov     eax, dword ptr [r10+52]
     mov     dword ptr [rbp-64], eax            ; B
     ; clear to dialog base so nothing lingers behind the pill
-    WINCALL CreateSolidBrush, 00202020h
+    WINCALL CreateSolidBrush, dword ptr [g_col_bg]
     mov     qword ptr [rbp-72], rax
     mov     r10, qword ptr [rbp-24]
     lea     rdx, [r10+40]
@@ -1757,7 +1787,7 @@ gui_draw_field_cards proc frame
     FRAME_PROLOG 160
     mov     qword ptr [rbp-24], rcx            ; hdc
     mov     qword ptr [rbp-32], rdx            ; hdlg
-    WINCALL CreateSolidBrush, 002D2D2Dh        ; COL_PANEL
+    WINCALL CreateSolidBrush, dword ptr [g_col_panel]   ; card fill (active scheme)
     mov     qword ptr [rbp-40], rax
     WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-40]
     mov     qword ptr [rbp-48], rax            ; old brush
@@ -1799,7 +1829,7 @@ gui_draw_flatchevron proc frame
     mov     r10, rcx
     mov     rax, qword ptr [r10+32]
     mov     qword ptr [rbp-32], rax            ; hdc
-    WINCALL CreateSolidBrush, 00202020h        ; COL_BG (left gutter)
+    WINCALL CreateSolidBrush, dword ptr [g_col_bg]        ; COL_BG (left gutter)
     mov     qword ptr [rbp-40], rax
     mov     r10, qword ptr [rbp-24]
     lea     rdx, [r10+40]
@@ -4264,10 +4294,12 @@ grl_filelayout:
     mov     edx, dword ptr [rbp-52]
     call    ShowWindow
 grl_advance:
-    ; advance y
+    ; advance y by the card height + the layout's inter-card gap
     mov     eax, dword ptr [rbp-40]
     add     eax, dword ptr [rbp-44]
-    add     eax, 6
+    mov     r10d, dword ptr [g_layout]
+    lea     r11, [layout_gaps]
+    add     eax, dword ptr [r11+r10*4]
     mov     dword ptr [rbp-40], eax
     inc     dword ptr [rbp-36]
     jmp     grl_row
@@ -5207,7 +5239,7 @@ gui_draw_colorpw proc frame
     mov     eax, dword ptr [r10+48]
     mov     dword ptr [rbp-48], eax           ; R
     ; background
-    WINCALL CreateSolidBrush, 00202020h
+    WINCALL CreateSolidBrush, dword ptr [g_col_bg]
     mov     qword ptr [rbp-56], rax
     mov     r10, qword ptr [rbp-24]
     lea     rdx, [r10+40]
@@ -5280,7 +5312,7 @@ gui_draw_pwlegend proc frame
     mov     dword ptr [rbp-40], eax           ; L
     mov     eax, dword ptr [r10+44]
     mov     dword ptr [rbp-44], eax           ; T
-    WINCALL CreateSolidBrush, 00202020h
+    WINCALL CreateSolidBrush, dword ptr [g_col_bg]
     mov     qword ptr [rbp-56], rax
     mov     r10, qword ptr [rbp-24]
     lea     rdx, [r10+40]
@@ -5435,6 +5467,81 @@ grp_done:
     FRAME_EPILOG
     ret
 gui_read_password endp
+
+; gui_apply_scheme(rcx=hdlg) - apply g_scheme: rebuild theme brushes, update the
+;   settings button caption, and repaint the whole window + children.
+gui_apply_scheme proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    mov     ecx, dword ptr [g_scheme]
+    call    theme_set_scheme
+    mov     eax, dword ptr [g_scheme]
+    lea     r10, [scheme_names]
+    mov     rax, qword ptr [r10+rax*8]
+    mov     qword ptr [rbp-32], rax
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_MTHEME, qword ptr [rbp-32]
+    WINCALL RedrawWindow, qword ptr [rbp-24], 0, 0, 185h
+    FRAME_EPILOG
+    ret
+gui_apply_scheme endp
+
+; gui_apply_layout(rcx=hdlg) - apply g_layout: relayout the current entry, update
+;   the settings button caption, repaint.
+gui_apply_layout proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    mov     eax, dword ptr [g_layout]
+    lea     r10, [layout_names]
+    mov     rax, qword ptr [r10+rax*8]
+    mov     qword ptr [rbp-32], rax
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_MLAYOUT, qword ptr [rbp-32]
+    cmp     dword ptr [g_cur_idx], 0
+    jl      gal_paint
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_rows_layout
+gal_paint:
+    WINCALL RedrawWindow, qword ptr [rbp-24], 0, 0, 185h
+    FRAME_EPILOG
+    ret
+gui_apply_layout endp
+
+; gui_save_prefs() - persist the UI scheme + layout to the registry.
+gui_save_prefs proc frame
+    FRAME_PROLOG 48
+    mov     eax, dword ptr [g_scheme]
+    mov     dword ptr [rbp-24], eax
+    WINCALL reg_tpm_set, addr pref_scheme, addr rbp-24, 4
+    mov     eax, dword ptr [g_layout]
+    mov     dword ptr [rbp-24], eax
+    WINCALL reg_tpm_set, addr pref_layout, addr rbp-24, 4
+    FRAME_EPILOG
+    ret
+gui_save_prefs endp
+
+; gui_load_prefs() - load the persisted UI scheme + layout (clamped).
+gui_load_prefs proc frame
+    FRAME_PROLOG 48
+    mov     dword ptr [rbp-24], 0
+    WINCALL reg_tpm_get, addr pref_scheme, addr rbp-24, 4
+    test    eax, eax
+    jz      glp_layout
+    mov     eax, dword ptr [rbp-24]
+    cmp     eax, GUI_SCHEME_COUNT
+    jae     glp_layout
+    mov     dword ptr [g_scheme], eax
+glp_layout:
+    mov     dword ptr [rbp-24], 0
+    WINCALL reg_tpm_get, addr pref_layout, addr rbp-24, 4
+    test    eax, eax
+    jz      glp_done
+    mov     eax, dword ptr [rbp-24]
+    cmp     eax, GUI_LAYOUT_COUNT
+    jae     glp_done
+    mov     dword ptr [g_layout], eax
+glp_done:
+    FRAME_EPILOG
+    ret
+gui_load_prefs endp
 
 ; gui_u2pad(rcx=dst wide, edx=val 0..99) -> rax = dst end.  2 digits, zero-padded.
 ;   Leaf; clobbers eax/edx/r9.
@@ -5932,6 +6039,11 @@ vp_init:
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_REMOVE, addr wb_rem
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_OVFL, addr wb_more
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_FAV, addr wb_star
+    call    gui_load_prefs                    ; apply persisted color scheme + layout
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_apply_scheme
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_apply_layout
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_V_SEARCH, EM_SETCUEBANNER, 1, addr cue_search
     mov     dword ptr [g_cur_idx], -1         ; no entry selected yet
     mov     dword ptr [g_dirty], 0
@@ -5989,6 +6101,10 @@ vp_cmd_disp:
     je      vp_lock
     cmp     eax, IDC_V_MENU
     je      vp_menu
+    cmp     eax, IDC_V_MTHEME
+    je      vp_theme
+    cmp     eax, IDC_V_MLAYOUT
+    je      vp_layout
     cmp     eax, IDC_V_OVFL
     je      vp_ovfl
     cmp     eax, IDC_V_FAV
@@ -6032,6 +6148,28 @@ vp_refocus:
 vp_menu:
     mov     rcx, qword ptr [rbp-8]
     call    gui_menu_toggle
+    jmp     vp_handled
+vp_theme:
+    mov     eax, dword ptr [g_scheme]            ; cycle color scheme
+    inc     eax
+    cmp     eax, GUI_SCHEME_COUNT
+    jb      @F
+    xor     eax, eax
+@@: mov     dword ptr [g_scheme], eax
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_apply_scheme
+    call    gui_save_prefs
+    jmp     vp_handled
+vp_layout:
+    mov     eax, dword ptr [g_layout]            ; cycle layout density
+    inc     eax
+    cmp     eax, GUI_LAYOUT_COUNT
+    jb      @F
+    xor     eax, eax
+@@: mov     dword ptr [g_layout], eax
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_apply_layout
+    call    gui_save_prefs
     jmp     vp_handled
 vp_ovfl:
     cmp     dword ptr [g_cur_idx], 0             ; only with an entry shown
