@@ -63,6 +63,7 @@ extern ScreenToClient:proc
 extern GetFocus:proc
 extern GetDlgCtrlID:proc
 extern MapDialogRect:proc
+extern g_vaulthwnd:qword              ; the DLG_VAULT window (sidebar card only there)
 IDC_V_SEARCH_TH equ 232               ; = IDC_V_SEARCH in gui.asm (sidebar search box)
 extern IsWindowVisible:proc
 extern GetSystemInfo:proc
@@ -168,12 +169,12 @@ SCHEME_COUNT equ 8
 schemes label dword
     ; bg       panel     frame     btn       btnsel    text      textdim   border    accent    accsel    focus     dark  side
     dd 00202020h,002D2D2Dh,003D3D3Dh,002D2D2Dh,002A2A2Ah,00FFFFFFh,00C8C8C8h,003D3D3Dh,00FFC24Ch,00DBA03Ah,00FFC24Ch,1,00342A26h  ; Dark
-    dd 00F3F3F3h,00FFFFFFh,00D2D2D2h,00FFFFFFh,00E6E6E6h,00202020h,00707070h,00D2D2D2h,00C26A00h,00A05800h,00C26A00h,0,00F5E9E1h  ; Light
-    dd 001A1410h,00282018h,00403420h,00282018h,00201810h,00FFF0E0h,00C0B0A0h,00403420h,00E0C040h,00B09020h,00E0C040h,1,00161C22h  ; Midnight
+    dd 00F3F3F3h,00FFFFFFh,00D2D2D2h,00FFFFFFh,00E6E6E6h,00202020h,00707070h,00D2D2D2h,00C26A00h,00A05800h,00C26A00h,0,00FFFFFFh  ; Light
+    dd 001A1410h,00282018h,00403420h,00282018h,00201810h,00FFF0E0h,00C0B0A0h,00403420h,00E0C040h,00B09020h,00E0C040h,1,00170F0Fh  ; Midnight
     dd 00000000h,00151515h,00808080h,00202020h,00404040h,00FFFFFFh,00E0E0E0h,00808080h,0000FFFFh,0000C0C0h,0000FFFFh,1,001E0C0Ch  ; Contrast
-    dd 00E3F6FDh,00D5E8EEh,00A1A193h,00D5E8EEh,00C8DAE0h,00756E58h,00969483h,00A1A193h,00D28B26h,00A86F1Eh,00D28B26h,0,00DEE2D0h  ; Solarized
-    dd 00D8ECF4h,00E0F3FBh,00A8C8D8h,00E0F3FBh,00C0DFEAh,002A3B4Bh,00556A7Ah,00A8C8D8h,001D65B5h,00144E90h,001D65B5h,0,00E2D6BEh  ; Sepia
-    dd 0040342Eh,0052423Bh,006A564Ch,0052423Bh,005E4C43h,00F4EFECh,00E9DED8h,006A564Ch,00D0C088h,00B0A06Fh,00D0C088h,1,00524232h  ; Nord
+    dd 00E3F6FDh,00D5E8EEh,00A1A193h,00D5E8EEh,00C8DAE0h,00756E58h,00969483h,00A1A193h,00D28B26h,00A86F1Eh,00D28B26h,0,00B0E4EFh  ; Solarized
+    dd 00D8ECF4h,00E0F3FBh,00A8C8D8h,00E0F3FBh,00C0DFEAh,002A3B4Bh,00556A7Ah,00A8C8D8h,001D65B5h,00144E90h,001D65B5h,0,00C4D2D6h  ; Sepia
+    dd 0040342Eh,0052423Bh,006A564Ch,0052423Bh,005E4C43h,00F4EFECh,00E9DED8h,006A564Ch,00D0C088h,00B0A06Fh,00D0C088h,1,004F4039h  ; Nord
     dd 00F3F0FFh,00FFFFFFh,00D0C8F0h,00FFFFFFh,00E4DCFAh,00302A3Ah,00746A8Ah,00D0C8F0h,006C33D6h,005A28B0h,006C33D6h,0,00F8E0E9h  ; Rose
 g_br_bg     dq 0
 g_br_side   dq 0                            ; sidebar (list + search) fill
@@ -940,6 +941,9 @@ theme_paint proc frame
     ; aurora so the (transparent) menu controls read against a solid page
     cmp     dword ptr [g_overlay], 0
     jne     tp_ovl
+    mov     rax, qword ptr [rbp-24]           ; sidebar card only on the vault window
+    cmp     rax, qword ptr [g_vaulthwnd]
+    jne     tp_done
     mov     rcx, qword ptr [rbp-24]           ; else draw the sidebar card
     mov     rdx, qword ptr [rbp-32]
     call    theme_sidecard
@@ -1041,6 +1045,9 @@ theme_erase proc frame
     WINCALL GetClientRect, qword ptr [rbp-32], addr rbp-72
     WINCALL FillRect, qword ptr [rbp-24], addr rbp-72, qword ptr [g_br_bg]
     cmp     dword ptr [g_overlay], 0          ; draw the sidebar card (flat path)
+    jne     te_noside
+    mov     rax, qword ptr [rbp-32]           ; only on the vault window
+    cmp     rax, qword ptr [g_vaulthwnd]
     jne     te_noside
     mov     rcx, qword ptr [rbp-32]
     mov     rdx, qword ptr [rbp-24]
