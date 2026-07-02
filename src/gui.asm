@@ -72,6 +72,9 @@ extern mem_alloc:proc
 extern mem_free:proc
 extern read_file:proc
 extern write_file:proc
+extern csv_to_wide:proc                 ; CSV import (csvimport.asm)
+extern csv_import_buffer:proc
+externdef g_csv_alloc:qword
 extern xl_build_xlsx:proc               ; encrypted-Excel export (xlexport.asm / xlcrypt.asm)
 extern xl_free:proc
 extern xl_encrypt:proc
@@ -341,6 +344,7 @@ IDC_V_MLAYOUT equ 242                 ; layout cycle button (settings)
 IDC_V_MLAYOUTL equ 243                ; "Layout" label
 IDC_V_COLORPW equ 244                 ; overlay: colored revealed secret (owner-draw)
 IDC_V_MEXPORT equ 245                 ; "Export all secrets to Excel" button (settings)
+IDC_V_MIMPCSV equ 246                 ; "Import from CSV" button (settings)
 DLG_XLPW     equ 720                  ; export-password prompt dialog
 IDC_XP_PW    equ 721
 IDC_XP_PW2   equ 722
@@ -566,6 +570,11 @@ xlsx_defext label word
     dw 'x','l','s','x',0
 WSTR xp_mm_title,    <Export all secrets>
 WSTR xp_mm_warn,     <Export ALL secrets (every password and TOTP) into one Excel file, protected only by the password you set next? Keep the file safe and delete it when done.>
+WSTR imp_csv_title,  <Import from CSV>
+WSTR imp_csv_pre,    <Imported >
+WSTR imp_csv_post,   < entries from the CSV file.>
+WSTR imp_csv_none,   <No importable entries were found in that CSV file.>
+WSTR imp_csv_rderr,  <Could not read the selected file.>
 WSTR xp_mm_empty,    <Please enter an export password.>
 WSTR xp_mm_mismatch, <The two passwords do not match. Please re-enter them.>
 WSTR xp_mm_ok,       <All secrets were exported to the encrypted Excel file.>
@@ -747,6 +756,11 @@ g_imgfilter label word          ; "Images\0*.png;*.jpg;*.jpeg;*.bmp;*.gif\0All\0
 g_allfilter label word          ; "All files\0*.*\0\0"
     dw 'A','l','l',' ','f','i','l','e','s',0
     dw '*','.','*',0,0
+g_csvfilter label word          ; "CSV files\0*.csv\0All files\0*.*\0\0"
+    dw 'C','S','V',' ','f','i','l','e','s',0
+    dw '*','.','c','s','v',0
+    dw 'A','l','l',' ','f','i','l','e','s',0
+    dw '*','.','*',0,0
 g_empty_w label word
     dw 0                                          ; empty wide string (default field value)
 pm_custom label word
@@ -761,7 +775,8 @@ g_menu_ids label dword
     dd IDC_V_MBACK, IDC_V_MTITLE, IDC_V_MPOLL, IDC_V_MLENL, IDC_V_MLEN
     dd IDC_V_MCLSL, IDC_V_MCLS, IDC_V_MTPM, IDC_V_MTPML, IDC_V_MTPMINFO
     dd IDC_V_MTHEMEL, IDC_V_MTHEME, IDC_V_MLAYOUTL, IDC_V_MLAYOUT, IDC_V_MEXPORT
-MENU_ID_COUNT equ 15
+    dd IDC_V_MIMPCSV
+MENU_ID_COUNT equ 16
 
 .data?
 align 8
@@ -864,6 +879,7 @@ g_monofont    dq ?                         ; monospace font for the colored pass
 g_phonfont    dq ?                         ; small monospace font for the phonetic columns
 g_sub_w       dw 512 dup (?)               ; subtitle scratch (wide)
 g_cmpbuf      db 256 dup (?)               ; title-A copy for WM_COMPAREITEM
+g_imp_msgw    dw 160 dup (?)               ; CSV-import result message scratch (wide)
 align 4
 g_tilecolor   dd ?                         ; fill color for the next tile draw
 align 2
@@ -6496,6 +6512,8 @@ vp_cmd_disp:
     je      vp_layout
     cmp     eax, IDC_V_MEXPORT
     je      vp_export
+    cmp     eax, IDC_V_MIMPCSV
+    je      vp_impcsv
     cmp     eax, IDC_V_OVFL
     je      vp_ovfl
     cmp     eax, IDC_V_FAV
@@ -6573,6 +6591,10 @@ vp_layout:
 vp_export:
     mov     rcx, qword ptr [rbp-8]
     call    gui_export_secrets
+    jmp     vp_handled
+vp_impcsv:
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_import_csv
     jmp     vp_handled
 vp_ovfl:
     cmp     dword ptr [g_cur_idx], 0             ; only with an entry shown
@@ -7565,6 +7587,122 @@ ges_done:
     FRAME_EPILOG
     ret
 gui_export_secrets endp
+
+; gui_wstrcpy(rcx=dst, rdx=src wide) -> rax = ptr to the terminating NUL in dst.  Leaf.
+gui_wstrcpy proc
+    xor     r8d, r8d
+gwsc_l:
+    movzx   eax, word ptr [rdx+r8*2]
+    mov     word ptr [rcx+r8*2], ax
+    test    eax, eax
+    jz      gwsc_d
+    inc     r8d
+    jmp     gwsc_l
+gwsc_d:
+    lea     rax, [rcx+r8*2]
+    ret
+gui_wstrcpy endp
+
+; gui_u32w(ecx=val, rdx=dst) -> rax = ptr past the written decimal (NUL-terminated).
+gui_u32w proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rdx             ; dst
+    mov     eax, ecx
+    lea     r10, [rbp-40]                        ; reversed-digit scratch
+    xor     r8d, r8d
+    mov     r9d, 10
+gu32_dl:
+    xor     edx, edx
+    div     r9d
+    add     dl, '0'
+    mov     byte ptr [r10+r8], dl
+    inc     r8d
+    test    eax, eax
+    jnz     gu32_dl
+    mov     rcx, qword ptr [rbp-24]
+    xor     r11d, r11d
+gu32_wl:
+    dec     r8d
+    movzx   eax, byte ptr [r10+r8]
+    mov     word ptr [rcx+r11*2], ax
+    inc     r11d
+    test    r8d, r8d
+    jnz     gu32_wl
+    mov     word ptr [rcx+r11*2], 0
+    lea     rax, [rcx+r11*2]
+    FRAME_EPILOG
+    ret
+gui_u32w endp
+
+; =============================================================================
+; gui_import_csv(rcx = hdlg) -> eax = entries imported.  Pick a CSV file, decode
+;   it (UTF-8 / UTF-16), append every row as a new entry, reseal and refresh.
+; =============================================================================
+public gui_import_csv
+gui_import_csv proc frame
+    FRAME_PROLOG 112
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-64], 0               ; imported count
+    lea     rax, [g_csvfilter]
+    mov     qword ptr [g_pickfilter], rax
+    mov     rcx, qword ptr [rbp-24]
+    xor     edx, edx
+    call    img_pick
+    test    eax, eax
+    jz      gic_done
+    lea     rcx, [g_imgpath]
+    lea     rdx, [rbp-32]                       ; *raw
+    lea     r8, [rbp-40]                        ; *rawlen
+    call    read_file
+    test    eax, eax
+    jz      gic_read_ok
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr imp_csv_rderr, addr imp_csv_title, 030h
+    jmp     gic_done
+gic_read_ok:
+    mov     rcx, qword ptr [rbp-32]
+    mov     edx, dword ptr [rbp-40]
+    lea     r8, [rbp-48]                        ; *wptr
+    lea     r9, [rbp-56]                        ; *wcount
+    call    csv_to_wide
+    test    eax, eax
+    jnz     gic_freeraw
+    mov     rcx, qword ptr [rbp-48]
+    mov     edx, dword ptr [rbp-56]
+    call    csv_import_buffer
+    mov     dword ptr [rbp-64], eax
+    ; free the wide buffer if csv_to_wide allocated one (UTF-8 path)
+    cmp     qword ptr [g_csv_alloc], 0
+    je      gic_freeraw
+    mov     rcx, qword ptr [rbp-48]
+    mov     rdx, qword ptr [g_csv_alloc]
+    call    mem_free
+gic_freeraw:
+    mov     rcx, qword ptr [rbp-32]             ; wipe + free the raw CSV (plaintext)
+    mov     rdx, qword ptr [rbp-40]
+    call    mem_free
+    cmp     dword ptr [rbp-64], 0
+    jle     gic_none
+    call    vault_reseal
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_poplist
+    lea     rcx, [g_imp_msgw]                   ; "Imported N entries from the CSV file."
+    lea     rdx, [imp_csv_pre]
+    call    gui_wstrcpy
+    mov     ecx, dword ptr [rbp-64]
+    mov     rdx, rax
+    call    gui_u32w
+    mov     rcx, rax
+    lea     rdx, [imp_csv_post]
+    call    gui_wstrcpy
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr g_imp_msgw, addr imp_csv_title, 040h
+    jmp     gic_done
+gic_none:
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr imp_csv_none, addr imp_csv_title, 030h
+gic_done:
+    mov     eax, dword ptr [rbp-64]
+    FRAME_EPILOG
+    ret
+gui_import_csv endp
 
 ; ges_wipepw - zero the export password buffers
 ges_wipepw proc frame
