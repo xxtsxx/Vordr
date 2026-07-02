@@ -583,6 +583,7 @@ ln_spacious dw 'S','p','a','c','i','o','u','s',0
 align 8
 layout_names dq ln_comfy, ln_compact, ln_spacious
 layout_gaps  dd 7, 3, 14                          ; inter-card gap (DLU) per layout
+lay_band     dd 14, 0, 18                         ; label band: card(top) vs 0=flat(left)
 GUI_LAYOUT_COUNT equ 3
 pref_scheme dw 'u','i','_','s','c','h','e','m','e',0
 pref_layout dw 'u','i','_','l','a','y','o','u','t',0
@@ -1790,6 +1791,10 @@ gui_draw_field_cards proc frame
     FRAME_PROLOG 160
     mov     qword ptr [rbp-24], rcx            ; hdc
     mov     qword ptr [rbp-32], rdx            ; hdlg
+    mov     eax, dword ptr [g_layout]          ; flat (Compact) layout draws no cards
+    lea     r10, [lay_band]
+    cmp     dword ptr [r10+rax*4], 0
+    je      gfc_ret
     WINCALL CreateSolidBrush, dword ptr [g_col_panel]   ; card fill (active scheme)
     mov     qword ptr [rbp-40], rax
     WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-40]
@@ -1820,6 +1825,7 @@ gfc_done:
     WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-48]   ; restore brush
     WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-56]   ; restore pen
     WINCALL DeleteObject, qword ptr [rbp-40]
+gfc_ret:
     FRAME_EPILOG
     ret
 gui_draw_field_cards endp
@@ -4024,6 +4030,10 @@ gui_rows_layout proc frame
     je      grl_havecmd
     mov     dword ptr [rbp-52], SW_SHOW
 grl_havecmd:
+    mov     eax, dword ptr [g_layout]            ; label band: >0 card(top), 0 flat(left)
+    lea     r10, [lay_band]
+    mov     eax, dword ptr [r10+rax*4]
+    mov     dword ptr [rbp-68], eax
 grl_row:
     mov     eax, dword ptr [rbp-36]
     cmp     eax, dword ptr [g_field_count]
@@ -4058,6 +4068,9 @@ grl_chktotp:
     je      grl_setyh
     mov     dword ptr [rbp-44], 45               ; edit mode: key + code + bar (tall)
 grl_setyh:
+    mov     eax, dword ptr [rbp-68]              ; adjust height for the layout band
+    sub     eax, 14                              ; (base heights assume a 14-DLU band)
+    add     dword ptr [rbp-44], eax
     mov     r10, qword ptr [rbp-32]
     mov     eax, dword ptr [rbp-40]
     mov     dword ptr [r10+FD_Y], eax
@@ -4073,24 +4086,40 @@ grl_setyh:
     je      grl_offdone
     mov     dword ptr [rbp-56], 14
 grl_offdone:
-    mov     eax, dword ptr [rbp-40]              ; content_y = card top + label band
-    add     eax, 14
+    mov     eax, dword ptr [rbp-40]              ; content_y = row top + label band
+    add     eax, dword ptr [rbp-68]
     mov     dword ptr [rbp-60], eax
-    ; label  (164, y+3, 176, 10) - caption across the top of the card
+    ; label: card layouts put it on top (164, y+3); flat puts it left (158, y)
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_LABEL*8]
+    cmp     dword ptr [rbp-68], 0
+    je      grl_lbl_flat
     mov     r8d, 164
     mov     r9d, dword ptr [rbp-40]
     add     r9d, 3
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 176, 10
-    ; value  (164, content_y, 180, valH)
+    jmp     grl_lbl_done
+grl_lbl_flat:
+    mov     r8d, 158
+    mov     r9d, dword ptr [rbp-40]
+    WINCALL move_ctl, rcx, rdx, r8d, r9d, 44, 11
+grl_lbl_done:
+    ; value: card (164, content_y, 196); flat (206, y, 150)
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_VALUE*8]
+    cmp     dword ptr [rbp-68], 0
+    je      grl_val_flat
     mov     r8d, 164
     mov     r9d, dword ptr [rbp-60]
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 196, dword ptr [rbp-48]
+    jmp     grl_val_done
+grl_val_flat:
+    mov     r8d, 206
+    mov     r9d, dword ptr [rbp-60]
+    WINCALL move_ctl, rcx, rdx, r8d, r9d, 150, dword ptr [rbp-48]
+grl_val_done:
     ; reveal (368, content_y, 12, 12) - right-aligned on the value line
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
