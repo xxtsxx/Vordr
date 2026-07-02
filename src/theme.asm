@@ -971,7 +971,7 @@ theme_ctlcolor proc frame
     mov     qword ptr [rbp-32], rdx           ; msg
     mov     qword ptr [rbp-40], r9            ; hctl
     cmp     rdx, WM_CTLCOLORLISTBOX
-    je      tc_panel
+    je      tc_listbox
     cmp     rdx, WM_CTLCOLOREDIT
     je      tc_panel
     cmp     rdx, WM_CTLCOLORSTATIC
@@ -998,6 +998,14 @@ tc_panel:
     WINCALL SetTextColor, qword ptr [rbp-24], dword ptr [g_col_text]
     WINCALL SetBkColor, qword ptr [rbp-24], dword ptr [g_col_panel]
     mov     rax, qword ptr [g_br_panel]
+    FRAME_EPILOG
+    ret
+tc_listbox:
+    ; the entry list's empty area must match the item cards (g_col_bg), not the
+    ; panel colour, so the bottom of the list has no visible box edge
+    WINCALL SetTextColor, qword ptr [rbp-24], dword ptr [g_col_text]
+    WINCALL SetBkColor, qword ptr [rbp-24], dword ptr [g_col_bg]
+    mov     rax, qword ptr [g_br_bg]
     FRAME_EPILOG
     ret
 theme_ctlcolor endp
