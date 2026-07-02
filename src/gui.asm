@@ -1369,9 +1369,182 @@ gtc_eq:
 gui_title_cmp endp
 
 ; gui_entry_glyph(ecx=idx) -> eax = a Fluent icon char based on the record's fields.
+; geg_contains(rcx=hay, edx=haylen, r8=lowercase-asciiz kw) -> eax = 1/0.
+;   case-insensitive byte substring (hay is UTF-8/ASCII title bytes).
+geg_contains proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-32], edx
+    mov     qword ptr [rbp-40], r8
+    xor     r9d, r9d                             ; i
+gc_outer:
+    mov     r10d, r9d                            ; j
+    mov     r11, qword ptr [rbp-40]              ; k
+gc_inner:
+    movzx   eax, byte ptr [r11]                  ; kw char (already lowercase)
+    test    eax, eax
+    jz      gc_yes
+    cmp     r10d, dword ptr [rbp-32]
+    jae     gc_next
+    mov     rcx, qword ptr [rbp-24]
+    movzx   edx, byte ptr [rcx+r10]              ; hay char
+    cmp     edx, 'A'
+    jb      gc_cmp
+    cmp     edx, 'Z'
+    ja      gc_cmp
+    add     edx, 20h
+gc_cmp:
+    cmp     eax, edx
+    jne     gc_next
+    inc     r10d
+    inc     r11
+    jmp     gc_inner
+gc_next:
+    inc     r9d
+    cmp     r9d, dword ptr [rbp-32]
+    jb      gc_outer
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gc_yes:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+geg_contains endp
+
+.const
+gk_mail db "mail",0
+gk_outlook db "outlook",0
+gk_proton db "proton",0
+gk_yahoo db "yahoo",0
+gk_icloud db "icloud",0
+gk_facebook db "facebook",0
+gk_insta db "insta",0
+gk_twitter db "twitter",0
+gk_linkedin db "linkedin",0
+gk_reddit db "reddit",0
+gk_tiktok db "tiktok",0
+gk_discord db "discord",0
+gk_snap db "snap",0
+gk_telegram db "telegram",0
+gk_whatsapp db "whatsapp",0
+gk_amazon db "amazon",0
+gk_ebay db "ebay",0
+gk_etsy db "etsy",0
+gk_walmart db "walmart",0
+gk_target db "target",0
+gk_ali db "aliexpress",0
+gk_ikea db "ikea",0
+gk_paypal db "paypal",0
+gk_shop db "shop",0
+gk_steam db "steam",0
+gk_epic db "epic",0
+gk_xbox db "xbox",0
+gk_playstation db "playstation",0
+gk_nintendo db "nintendo",0
+gk_riot db "riot",0
+gk_game db "game",0
+gk_netflix db "netflix",0
+gk_hulu db "hulu",0
+gk_disney db "disney",0
+gk_spotify db "spotify",0
+gk_youtube db "youtube",0
+gk_twitch db "twitch",0
+gk_video db "video",0
+gk_github db "github",0
+gk_gitlab db "gitlab",0
+gk_aws db "aws",0
+gk_azure db "azure",0
+gk_cloud db "cloud",0
+gk_docker db "docker",0
+gk_verizon db "verizon",0
+gk_mobile db "mobile",0
+align 8
+GK macro lbl, gl
+    dq lbl
+    dd gl
+    dd 0
+endm
+geg_kwtab label qword
+    GK gk_mail, 0E715h
+    GK gk_outlook, 0E715h
+    GK gk_proton, 0E715h
+    GK gk_yahoo, 0E715h
+    GK gk_icloud, 0E715h
+    GK gk_facebook, 0E716h
+    GK gk_insta, 0E716h
+    GK gk_twitter, 0E716h
+    GK gk_linkedin, 0E716h
+    GK gk_reddit, 0E716h
+    GK gk_tiktok, 0E716h
+    GK gk_discord, 0E716h
+    GK gk_snap, 0E716h
+    GK gk_telegram, 0E716h
+    GK gk_whatsapp, 0E716h
+    GK gk_amazon, 0E7BFh
+    GK gk_ebay, 0E7BFh
+    GK gk_etsy, 0E7BFh
+    GK gk_walmart, 0E7BFh
+    GK gk_target, 0E7BFh
+    GK gk_ali, 0E7BFh
+    GK gk_ikea, 0E7BFh
+    GK gk_paypal, 0E7BFh
+    GK gk_shop, 0E7BFh
+    GK gk_steam, 0E7FCh
+    GK gk_epic, 0E7FCh
+    GK gk_xbox, 0E7FCh
+    GK gk_playstation, 0E7FCh
+    GK gk_nintendo, 0E7FCh
+    GK gk_riot, 0E7FCh
+    GK gk_game, 0E7FCh
+    GK gk_netflix, 0E714h
+    GK gk_hulu, 0E714h
+    GK gk_disney, 0E714h
+    GK gk_spotify, 0E714h
+    GK gk_youtube, 0E714h
+    GK gk_twitch, 0E714h
+    GK gk_video, 0E714h
+    GK gk_github, 0E753h
+    GK gk_gitlab, 0E753h
+    GK gk_aws, 0E753h
+    GK gk_azure, 0E753h
+    GK gk_cloud, 0E753h
+    GK gk_docker, 0E753h
+    GK gk_verizon, 0E717h
+    GK gk_mobile, 0E717h
+    dq 0
+    dd 0, 0
+.code
+
 gui_entry_glyph proc frame
     FRAME_PROLOG 112
     mov     dword ptr [rbp-24], ecx
+    ; brand/keyword match on the title first
+    mov     ecx, dword ptr [rbp-24]
+    lea     rdx, [rbp-96]
+    call    vault_title_at                      ; rax=ptr, [rbp-96]=len
+    mov     qword ptr [rbp-56], rax
+    mov     eax, dword ptr [rbp-96]
+    mov     dword ptr [rbp-60], eax
+    lea     r10, [geg_kwtab]
+geg_kwlp:
+    mov     r8, qword ptr [r10]
+    test    r8, r8
+    jz      geg_kwdone
+    mov     qword ptr [rbp-72], r10
+    mov     rcx, qword ptr [rbp-56]
+    mov     edx, dword ptr [rbp-60]
+    call    geg_contains
+    mov     r10, qword ptr [rbp-72]
+    test    eax, eax
+    jz      geg_kwnext
+    mov     eax, dword ptr [r10+8]
+    FRAME_EPILOG
+    ret
+geg_kwnext:
+    add     r10, 16
+    jmp     geg_kwlp
+geg_kwdone:
     mov     dword ptr [rbp-28], 0               ; hasurl
     mov     dword ptr [rbp-32], 0               ; hasuser
     mov     ecx, dword ptr [rbp-24]
