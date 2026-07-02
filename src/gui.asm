@@ -4290,16 +4290,16 @@ grl_copydone:
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_UP*8]
-    mov     r8d, 147
+    mov     r8d, 149                             ; left gutter, clear of the sidebar card
     mov     r9d, dword ptr [rbp-64]
     sub     r9d, 9
-    WINCALL move_ctl, rcx, rdx, r8d, r9d, 9, 9
+    WINCALL move_ctl, rcx, rdx, r8d, r9d, 7, 9
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_DOWN*8]
-    mov     r8d, 147
+    mov     r8d, 149                             ; left gutter, clear of the sidebar card
     mov     r9d, dword ptr [rbp-64]
-    WINCALL move_ctl, rcx, rdx, r8d, r9d, 9, 9
+    WINCALL move_ctl, rcx, rdx, r8d, r9d, 7, 9
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_DEL*8]

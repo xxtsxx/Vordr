@@ -872,7 +872,7 @@ theme_sidecard proc frame
     ; card bounds in DLU (list+search bbox, outset ~3 DLU so the edge/round shows)
     mov     dword ptr [rbp-64], 27
     mov     dword ptr [rbp-60], 7
-    mov     dword ptr [rbp-56], 207
+    mov     dword ptr [rbp-56], 205
     mov     dword ptr [rbp-52], 308
     WINCALL MapDialogRect, qword ptr [rbp-24], addr rbp-64
     mov     eax, dword ptr [rbp-64]
