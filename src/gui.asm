@@ -51,6 +51,7 @@ extern g_col_frame:dword
 extern g_col_text:dword
 extern g_col_textdim:dword
 extern g_col_dark:dword
+extern g_col_side:dword
 extern DwmSetWindowAttribute:proc
 extern g_scheme:dword
 extern theme_set_scheme:proc
@@ -1504,8 +1505,8 @@ gui_draw_listitem proc frame
     mov     dword ptr [rbp-72], eax             ; itemState
     mov     eax, dword ptr [r10+56]
     mov     dword ptr [rbp-80], eax             ; vault idx (itemData)
-    ; background (active scheme: base fill, frame color when selected)
-    mov     eax, dword ptr [g_col_bg]
+    ; background (active scheme: sidebar fill, frame color when selected)
+    mov     eax, dword ptr [g_col_side]
     test    dword ptr [rbp-72], 1               ; ODS_SELECTED
     jz      @F
     mov     eax, dword ptr [g_col_frame]
@@ -3002,11 +3003,34 @@ grc_noimg:
     jmp     grc_row
 grc_done:
     mov     dword ptr [g_field_count], 0
-    ; repaint the dialog bg so destroyed edits leave no ghost focus-underline
-    WINCALL InvalidateRect, qword ptr [rbp-40], 0, 1
+    ; repaint only the detail pane (not the whole window) so the sidebar card's
+    ; border/shadow don't flicker on every selection
+    mov     rcx, qword ptr [rbp-40]
+    call    gui_inval_detail
     FRAME_EPILOG
     ret
 gui_rows_clear endp
+
+; gui_inval_detail(rcx = hdlg) - invalidate just the detail pane (x >= 210 DLU),
+;   leaving the sidebar card untouched (avoids flicker of its border/shadow).
+gui_inval_detail proc frame
+    FRAME_PROLOG 128
+    mov     qword ptr [rbp-24], rcx
+    WINCALL GetClientRect, qword ptr [rbp-24], addr rbp-56
+    mov     dword ptr [rbp-80], 210              ; DLU x=210 -> px (detail-left)
+    mov     dword ptr [rbp-76], 0
+    mov     dword ptr [rbp-72], 210
+    mov     dword ptr [rbp-68], 8
+    WINCALL MapDialogRect, qword ptr [rbp-24], addr rbp-80
+    mov     dword ptr [rbp-76], 0                ; rect = {mapped-left, 0, clientW, clientH}
+    mov     eax, dword ptr [rbp-48]              ; rc.right = clientW
+    mov     dword ptr [rbp-72], eax
+    mov     eax, dword ptr [rbp-44]              ; rc.bottom = clientH
+    mov     dword ptr [rbp-68], eax
+    WINCALL InvalidateRect, qword ptr [rbp-24], addr rbp-80, 1
+    FRAME_EPILOG
+    ret
+gui_inval_detail endp
 
 ; gui_row_add(rcx=hdlg, edx=kind) -> eax = row index (or -1 if at MAXROWS).
 ;   Append a descriptor and create the kind-appropriate row controls (geometry
@@ -4388,9 +4412,10 @@ grl_advance:
 grl_done:
     mov     eax, dword ptr [rbp-40]              ; content bottom (DLU) for overflow checks
     mov     dword ptr [g_content_h], eax
-    ; repaint the dialog bg so controls just hidden (e.g. the TOTP key in view
-    ; mode) leave no ghost pixels behind
-    WINCALL InvalidateRect, qword ptr [rbp-24], 0, 1
+    ; repaint just the detail pane (not the whole window) so the sidebar card's
+    ; border/shadow don't flicker when rows are laid out
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_inval_detail
     FRAME_EPILOG
     ret
 gui_rows_layout endp
