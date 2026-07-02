@@ -56,6 +56,7 @@ ENC_VAR              equ 0FFFFFFFEh  ; CMDENT.pos_args sentinel: variable (>=1)
 extern con_init:proc
 extern print_a:proc
 extern pwgen_ex:proc                    ; styled password generator (pwgen.asm)
+extern do_seed:proc                     ; bulk test-vault seeder (vault.asm)
 extern print_err:proc
 
 CP_UTF8              equ 65001
@@ -145,6 +146,8 @@ gl_pin_len    equ $ - gl_pin
 gl_hex    db "  hex        : "
 gl_hex_len    equ $ - gl_hex
 gp_crlf   db 13,10
+CSTR msg_seed_ok, "seeded 5000 realistic test entries.  unlock the vault with password: vordrtest",13,10
+seed_pw   db "vordrtest", 0
 
 WSTR w_selftest, <selftest>
 WSTR w_bench,    <bench>
@@ -152,6 +155,7 @@ WSTR w_imgtest,  <imgtest>
 WSTR w_thumbtest,<thumbtest>
 WSTR w_pvtest,   <pvtest>
 WSTR w_genpw,    <genpw>
+WSTR w_seedtest, <seedtest>
 WSTR ext_pdf,    <.pdf>
 WSTR w_pvtmp,    <pvtmp.pdf>
 ifdef DBG_TRACE
@@ -185,12 +189,13 @@ cmd_table label CMDENT
     CMDENT { w_thumbtest, cmd_thumbtest, 1, 0 }   ; shell-thumbnail probe: exit 0 ok
     CMDENT { w_pvtest,    cmd_pvtest,    1, 0 }   ; preview-handler probe (.pdf): exit 0 ok
     CMDENT { w_genpw,     cmd_genpw,     0, 0 }   ; print one sample of each generator style
+    CMDENT { w_seedtest,  cmd_seedtest,  1, 0 }   ; bulk-fill a test vault with 5000 entries
 ifdef DBG_TRACE
     CMDENT { w_redteam,   cmd_redteam,   1, 0 }   ; fault-injection self-test (dbg)
     CMDENT { w_tpmtest,   cmd_tpmtest,   0, 0 }   ; TPM round-trip probe (dbg)
-CMD_COUNT equ 8
+CMD_COUNT equ 9
 else
-CMD_COUNT equ 6
+CMD_COUNT equ 7
 endif
 
 .data?
@@ -904,6 +909,44 @@ cmd_genpw proc frame
     FRAME_EPILOG
     ret
 cmd_genpw endp
+
+; cmd_seedtest - create a fresh vault at argv[2] with 5000 realistic entries
+;   (perf/search testing), unlockable with the fixed test password "vordrtest".
+LANDING_PAD
+cmd_seedtest proc frame
+    FRAME_PROLOG 48
+    lea     r10, [g_argv]
+    mov     rax, qword ptr [r10+16]           ; argv[2] = vault path
+    mov     qword ptr [g_cfg_in], rax
+    lea     r10, [seed_pw]                     ; fixed test password
+    lea     r11, [g_cfg_pass]
+    xor     ecx, ecx
+cst_cp:
+    mov     al, byte ptr [r10+rcx]
+    mov     byte ptr [r11+rcx], al
+    test    al, al
+    jz      cst_cpd
+    inc     ecx
+    cmp     ecx, 32
+    jb      cst_cp
+cst_cpd:
+    mov     dword ptr [g_cfg_passlen], 9
+    mov     ecx, 5000
+    call    do_seed
+    mov     dword ptr [rbp-24], eax
+    test    eax, eax
+    jnz     cst_fail
+    WINCALL print_a, addr msg_seed_ok, msg_seed_ok_len
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+cst_fail:
+    mov     eax, dword ptr [rbp-24]
+    FRAME_EPILOG
+    ret
+cmd_seedtest endp
+
+
 
 ; cmd_imgtest - decode argv[2] as an image and return exit=(width<<16)|height,
 ;   or 0xE00n on failure.  A headless probe for the GDI+ decode path.
