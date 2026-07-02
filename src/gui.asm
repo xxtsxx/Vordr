@@ -47,12 +47,15 @@ extern g_carry_created:qword
 extern pwgen_ex:proc
 extern g_col_bg:dword
 extern g_col_panel:dword
+extern g_col_frame:dword
 extern g_col_text:dword
 extern g_col_textdim:dword
+extern g_col_dark:dword
+extern DwmSetWindowAttribute:proc
 extern g_scheme:dword
 extern theme_set_scheme:proc
-extern reg_tpm_set:proc
-extern reg_tpm_get:proc
+extern cfg_set_dword_hkcu:proc
+extern cfg_get_dword:proc
 extern vault_field_count:proc
 extern vault_field_get:proc
 extern vault_build_entry:proc
@@ -567,9 +570,13 @@ sn_dark dw 'D','a','r','k',0
 sn_light dw 'L','i','g','h','t',0
 sn_mid  dw 'M','i','d','n','i','g','h','t',0
 sn_contrast dw 'C','o','n','t','r','a','s','t',0
+sn_solar dw 'S','o','l','a','r','i','z','e','d',0
+sn_sepia dw 'S','e','p','i','a',0
+sn_nord dw 'N','o','r','d',0
+sn_rose dw 'R','o','s','e',0
 align 8
-scheme_names dq sn_dark, sn_light, sn_mid, sn_contrast
-GUI_SCHEME_COUNT equ 4
+scheme_names dq sn_dark, sn_light, sn_mid, sn_contrast, sn_solar, sn_sepia, sn_nord, sn_rose
+GUI_SCHEME_COUNT equ 8
 ln_comfy dw 'C','o','m','f','o','r','t','a','b','l','e',0
 ln_compact dw 'C','o','m','p','a','c','t',0
 ln_spacious dw 'S','p','a','c','i','o','u','s',0
@@ -1446,11 +1453,11 @@ gui_draw_listitem proc frame
     mov     dword ptr [rbp-72], eax             ; itemState
     mov     eax, dword ptr [r10+56]
     mov     dword ptr [rbp-80], eax             ; vault idx (itemData)
-    ; background
-    mov     eax, 00242424h
+    ; background (active scheme: base fill, frame color when selected)
+    mov     eax, dword ptr [g_col_bg]
     test    dword ptr [rbp-72], 1               ; ODS_SELECTED
     jz      @F
-    mov     eax, 003D3D3Dh
+    mov     eax, dword ptr [g_col_frame]
 @@: mov     dword ptr [rbp-88], eax
     WINCALL CreateSolidBrush, dword ptr [rbp-88]
     mov     qword ptr [rbp-96], rax
@@ -1473,10 +1480,10 @@ gui_draw_listitem proc frame
     add     r8d, 5
     mov     r9d, 34
     call    gui_draw_tile
-    ; title (cardfont, white)
+    ; title (cardfont, active text colour)
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_cardfont]
     mov     qword ptr [rbp-104], rax           ; old font
-    WINCALL SetTextColor, qword ptr [rbp-32], 00FFFFFFh
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_text]
     WINCALL SetBkMode, qword ptr [rbp-32], 1
     mov     eax, dword ptr [rbp-40]
     add     eax, 46
@@ -1501,7 +1508,7 @@ gui_draw_listitem proc frame
     WINCALL DrawTextW, qword ptr [rbp-32], addr g_conv_w, -1, addr rbp-152, 8024h
     ; subtitle (subfont, dim)
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_subfont]
-    WINCALL SetTextColor, qword ptr [rbp-32], 00A0A0A0h
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_textdim]
     mov     ecx, dword ptr [rbp-80]
     call    gui_entry_subtitle                 ; -> g_sub_w
     mov     eax, dword ptr [rbp-48]
@@ -1844,7 +1851,7 @@ gfv_have:
     mov     word ptr [g_glyph_w+2], 0
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_chevfont]
     mov     qword ptr [rbp-48], rax            ; old font
-    WINCALL SetTextColor, qword ptr [rbp-32], 000A0A0A0h
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_textdim]
     WINCALL SetBkMode, qword ptr [rbp-32], 1
     mov     r10, qword ptr [rbp-24]
     mov     eax, dword ptr [r10+40]
@@ -4972,8 +4979,13 @@ gui_overflow_menu endp
 gui_gen_menu proc frame
     FRAME_PROLOG 96
     mov     qword ptr [rbp-24], rcx           ; hdlg
-    mov     dword ptr [rbp-28], edx           ; row
-    WINCALL CreatePopupMenu
+    mov     dword ptr [rbp-28], edx           ; row (clicked)
+    mov     edx, VF_SECRET                    ; always fill a password field, never username
+    call    gui_row_of_kind
+    cmp     eax, 0
+    jl      @F
+    mov     dword ptr [rbp-28], eax
+@@: WINCALL CreatePopupMenu
     mov     qword ptr [rbp-32], rax
     test    rax, rax
     jz      ggm_done
@@ -5299,7 +5311,7 @@ gui_draw_colorpw endp
 
 ; gui_draw_pwlegend(rcx = lpdis) - draw a small colour key (ABC abc 123 !@#).
 gui_draw_pwlegend proc frame
-    FRAME_PROLOG 96
+    FRAME_PROLOG 128                          ; TextOutW's 5th arg must clear [rbp-80]
     mov     qword ptr [rbp-24], rcx
     mov     r10, rcx
     mov     rax, qword ptr [r10+32]
@@ -5476,6 +5488,9 @@ gui_apply_scheme proc frame
     mov     rax, qword ptr [r10+rax*8]
     mov     qword ptr [rbp-32], rax
     WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_MTHEME, qword ptr [rbp-32]
+    mov     eax, dword ptr [g_col_dark]          ; match the title bar to the scheme
+    mov     dword ptr [rbp-40], eax
+    WINCALL DwmSetWindowAttribute, qword ptr [rbp-24], 20, addr rbp-40, 4
     WINCALL RedrawWindow, qword ptr [rbp-24], 0, 0, 185h
     FRAME_EPILOG
     ret
@@ -5491,6 +5506,8 @@ gui_apply_layout proc frame
     mov     rax, qword ptr [r10+rax*8]
     mov     qword ptr [rbp-32], rax
     WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_MLAYOUT, qword ptr [rbp-32]
+    cmp     dword ptr [g_menu_open], 0           ; settings open: rows are hidden, don't
+    jne     gal_paint                            ;   re-show them (re-lays out on close)
     cmp     dword ptr [g_cur_idx], 0
     jl      gal_paint
     mov     rcx, qword ptr [rbp-24]
@@ -5501,36 +5518,24 @@ gal_paint:
     ret
 gui_apply_layout endp
 
-; gui_save_prefs() - persist the UI scheme + layout to the registry.
+; gui_save_prefs() - persist the UI scheme + layout to HKCU\Software\Vordr.
 gui_save_prefs proc frame
     FRAME_PROLOG 48
-    mov     eax, dword ptr [g_scheme]
-    mov     dword ptr [rbp-24], eax
-    WINCALL reg_tpm_set, addr pref_scheme, addr rbp-24, 4
-    mov     eax, dword ptr [g_layout]
-    mov     dword ptr [rbp-24], eax
-    WINCALL reg_tpm_set, addr pref_layout, addr rbp-24, 4
+    WINCALL cfg_set_dword_hkcu, addr pref_scheme, dword ptr [g_scheme]
+    WINCALL cfg_set_dword_hkcu, addr pref_layout, dword ptr [g_layout]
     FRAME_EPILOG
     ret
 gui_save_prefs endp
 
-; gui_load_prefs() - load the persisted UI scheme + layout (clamped).
+; gui_load_prefs() - load the persisted UI scheme + layout (clamped to range).
 gui_load_prefs proc frame
     FRAME_PROLOG 48
-    mov     dword ptr [rbp-24], 0
-    WINCALL reg_tpm_get, addr pref_scheme, addr rbp-24, 4
-    test    eax, eax
-    jz      glp_layout
-    mov     eax, dword ptr [rbp-24]
+    WINCALL cfg_get_dword, addr pref_scheme, 0, 0
     cmp     eax, GUI_SCHEME_COUNT
     jae     glp_layout
     mov     dword ptr [g_scheme], eax
 glp_layout:
-    mov     dword ptr [rbp-24], 0
-    WINCALL reg_tpm_get, addr pref_layout, addr rbp-24, 4
-    test    eax, eax
-    jz      glp_done
-    mov     eax, dword ptr [rbp-24]
+    WINCALL cfg_get_dword, addr pref_layout, 0, 0
     cmp     eax, GUI_LAYOUT_COUNT
     jae     glp_done
     mov     dword ptr [g_layout], eax
