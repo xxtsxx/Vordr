@@ -2725,7 +2725,7 @@ gui_set_editmode proc frame
     mov     dword ptr [rbp-32], edx
     mov     dword ptr [g_editmode], edx
     call    gui_colorpw_hide                    ; a mode change drops the color overlay
-    mov     eax, edx
+    mov     eax, dword ptr [rbp-32]              ; mode (edx was clobbered by the call above)
     xor     eax, 1
     mov     dword ptr [rbp-40], eax              ; readonly = NOT on
     WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_TITLE, EM_SETREADONLY, dword ptr [rbp-40], 0
