@@ -1,36 +1,24 @@
 <svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Vordr">
   <title>Vordr</title>
-  <desc>A warm charcoal rounded tile with an amber-gold guardian shield whose keyhole is cut through to the background.</desc>
+  <desc>An amber-gold guardian shield, scaled to fill the frame, whose keyhole is cut through to transparency.</desc>
   <defs>
-    <radialGradient id="v-bg" cx="50%" cy="32%" r="85%">
-      <stop offset="0%" stop-color="#2b2620"/>
-      <stop offset="58%" stop-color="#15110c"/>
-      <stop offset="100%" stop-color="#050403"/>
-    </radialGradient>
     <linearGradient id="v-shield" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0%" stop-color="#ffd96b"/>
       <stop offset="55%" stop-color="#f6b22e"/>
       <stop offset="100%" stop-color="#e8920a"/>
     </linearGradient>
-    <clipPath id="v-tile"><rect width="512" height="512" rx="112"/></clipPath>
     <path id="v-shape" d="M148 158 Q148 140 166 136 C210 124 302 124 346 136 Q364 140 364 158 L364 250 C364 318 322 364 256 398 C190 364 148 318 148 250 Z"/>
-  </defs>
-
-  <rect width="512" height="512" rx="112" fill="url(#v-bg)"/>
-
-  <g clip-path="url(#v-tile)">
-    <!-- scanning shine, echoing the animated wordmark -->
-    <polygon points="120,-40 250,-40 -40,250 -40,120" fill="#ffffff" opacity="0.05"/>
-    <!-- guardian shield with a keyhole punched through to the background -->
     <mask id="v-keyhole">
       <use href="#v-shape" fill="#ffffff"/>
       <circle cx="256" cy="231" r="33" fill="#000000"/>
       <path d="M239 255 L273 255 L288 324 L224 324 Z" fill="#000000"/>
     </mask>
+  </defs>
+
+  <!-- scale the shield to fill the frame top-to-bottom (aspect kept) -->
+  <g transform="translate(-227.66 -239.94) scale(1.889299)">
     <use href="#v-shape" fill="url(#v-shield)" mask="url(#v-keyhole)"/>
     <!-- soft top sheen on the shield -->
     <path d="M166 136 C210 124 302 124 346 136 Q360 140 360 156 C300 142 212 142 152 156 Q152 140 166 136 Z" fill="#ffffff" opacity="0.16"/>
   </g>
-
-  <rect x="2.5" y="2.5" width="507" height="507" rx="109.5" fill="none" stroke="#ffffff" stroke-opacity="0.06" stroke-width="3"/>
 </svg>
