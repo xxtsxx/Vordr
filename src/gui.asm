@@ -2199,7 +2199,16 @@ gui_draw_flatchevron proc frame
     mov     r10, rcx
     mov     rax, qword ptr [r10+32]
     mov     qword ptr [rbp-32], rax            ; hdc
-    WINCALL CreateSolidBrush, dword ptr [g_col_bg]        ; COL_BG (left gutter)
+    ; chevrons sit inside the tile in card layouts -> blend with the panel;
+    ; flat (Compact) has no card -> blend with the dialog background
+    mov     eax, dword ptr [g_col_bg]
+    mov     r11d, dword ptr [g_layout]
+    lea     r10, [lay_band]
+    cmp     dword ptr [r10+r11*4], 0
+    je      gfv_bgok
+    mov     eax, dword ptr [g_col_panel]
+gfv_bgok:
+    WINCALL CreateSolidBrush, eax
     mov     qword ptr [rbp-40], rax
     mov     r10, qword ptr [rbp-24]
     lea     rdx, [r10+40]
@@ -4457,10 +4466,10 @@ grl_chkfile:
 grl_chktotp:
     cmp     eax, VF_TOTP
     jne     grl_setyh
-    mov     dword ptr [rbp-44], 29               ; view mode: code + bar only (short)
+    mov     dword ptr [rbp-44], 39               ; view mode: code + bar + room below the bar
     cmp     dword ptr [g_editmode], 0
     je      grl_setyh
-    mov     dword ptr [rbp-44], 45               ; edit mode: key + code + bar (tall)
+    mov     dword ptr [rbp-44], 55               ; edit mode: key + code + bar + room below
 grl_setyh:
     mov     eax, dword ptr [rbp-68]              ; adjust height for the layout band
     sub     eax, 14                              ; (base heights assume a 14-DLU band)
@@ -4489,10 +4498,10 @@ grl_offdone:
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_LABEL*8]
     cmp     dword ptr [rbp-68], 0
     je      grl_lbl_flat
-    mov     r8d, 164
+    mov     r8d, 176                             ; content column (chevrons live to the left)
     mov     r9d, dword ptr [rbp-40]
     add     r9d, 3
-    WINCALL move_ctl, rcx, rdx, r8d, r9d, 176, 10
+    WINCALL move_ctl, rcx, rdx, r8d, r9d, 150, 10   ; narrow: clears the top-right cluster
     jmp     grl_lbl_done
 grl_lbl_flat:
     mov     r8d, 158
@@ -4507,7 +4516,7 @@ grl_lbl_done:
     mov     dword ptr [rbp-76], 150             ; flat default
 @@: cmp     dword ptr [r10+FD_KIND], VF_SECRET
     jne     grl_valpos
-    mov     dword ptr [rbp-76], 172             ; card secret
+    mov     dword ptr [rbp-76], 196             ; card secret (badge moved to the top-right)
     cmp     dword ptr [rbp-68], 0
     jne     grl_valpos
     mov     dword ptr [rbp-76], 130             ; flat secret
@@ -4517,7 +4526,7 @@ grl_valpos:
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_VALUE*8]
     cmp     dword ptr [rbp-68], 0
     je      grl_val_flat
-    mov     r8d, 164
+    mov     r8d, 176                             ; content column (shifted for chevrons)
     mov     r9d, dword ptr [rbp-60]
     WINCALL move_ctl, rcx, rdx, r8d, r9d, dword ptr [rbp-76], dword ptr [rbp-48]
     jmp     grl_val_done
@@ -4547,7 +4556,7 @@ grl_copytotp:
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_COPY*8]
-    mov     r8d, 252
+    mov     r8d, 264                             ; next to the live code
     mov     r9d, dword ptr [rbp-60]
     add     r9d, dword ptr [rbp-56]
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 16, 11
@@ -4556,14 +4565,14 @@ grl_copydone:
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_TCODE*8]
-    mov     r8d, 164
+    mov     r8d, 176
     mov     r9d, dword ptr [rbp-60]
     add     r9d, dword ptr [rbp-56]
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 84, 11
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_TBAR*8]
-    mov     r8d, 164
+    mov     r8d, 176
     mov     r9d, dword ptr [rbp-60]
     add     r9d, dword ptr [rbp-56]
     add     r9d, 11
@@ -4577,22 +4586,22 @@ grl_copydone:
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_UP*8]
-    mov     r8d, 149                             ; left gutter, clear of the sidebar card
+    mov     r8d, 158                             ; inside the tile's left edge
     mov     r9d, dword ptr [rbp-64]
     sub     r9d, 9
-    WINCALL move_ctl, rcx, rdx, r8d, r9d, 7, 9
+    WINCALL move_ctl, rcx, rdx, r8d, r9d, 11, 9
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_DOWN*8]
-    mov     r8d, 149                             ; left gutter, clear of the sidebar card
+    mov     r8d, 158                             ; inside the tile's left edge
     mov     r9d, dword ptr [rbp-64]
-    WINCALL move_ctl, rcx, rdx, r8d, r9d, 7, 9
+    WINCALL move_ctl, rcx, rdx, r8d, r9d, 11, 9
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_DEL*8]
-    mov     r8d, 390
+    mov     r8d, 398                             ; trash: tile's top-right corner
     mov     r9d, dword ptr [rbp-40]
-    add     r9d, 3
+    add     r9d, 4
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 12, 11
     ; show/hide the reorder cluster per edit mode
     mov     r10, qword ptr [rbp-32]
@@ -4607,27 +4616,29 @@ grl_copydone:
     mov     rcx, qword ptr [r10+FD_HANDLES+DS_DEL*8]
     mov     edx, dword ptr [rbp-52]
     call    ShowWindow
-    ; secret strength badge: (368,y,46,12) in view mode; hidden while editing
+    ; secret strength badge: top-right cluster (left of the trash) in view mode
     mov     r10, qword ptr [rbp-32]
     cmp     dword ptr [r10+FD_KIND], VF_SECRET
     jne     grl_sbadge_done
     mov     rcx, qword ptr [rbp-24]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_SBADGE*8]
-    mov     r8d, 340
-    mov     r9d, dword ptr [rbp-60]
-    WINCALL move_ctl, rcx, rdx, r8d, r9d, 40, 12
+    mov     r8d, 332
+    mov     r9d, dword ptr [rbp-40]
+    add     r9d, 4
+    WINCALL move_ctl, rcx, rdx, r8d, r9d, 40, 11
     mov     eax, dword ptr [rbp-52]           ; edit=SW_SHOW, view=SW_HIDE
     xor     eax, SW_SHOW                      ; badge shows in view (opposite)
     mov     r10, qword ptr [rbp-32]
     mov     rcx, qword ptr [r10+FD_HANDLES+DS_SBADGE*8]
     mov     edx, eax
     call    ShowWindow
-    ; generate button (340, content_y, 12, 12) - edit mode only (where the badge sits in view)
+    ; generate button: top-right, just left of the trash (edit mode only)
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_GEN*8]
-    mov     r8d, 340
-    mov     r9d, dword ptr [rbp-60]
+    mov     r8d, 380
+    mov     r9d, dword ptr [rbp-40]
+    add     r9d, 4
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 12, 12
     mov     r10, qword ptr [rbp-32]
     mov     rcx, qword ptr [r10+FD_HANDLES+DS_GEN*8]
@@ -4652,7 +4663,7 @@ grl_totptog_done:
     jne     grl_filelayout
     mov     rcx, qword ptr [rbp-24]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_THUMB*8]
-    mov     r8d, 164
+    mov     r8d, 176
     mov     r9d, dword ptr [rbp-60]
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 120, 58
     mov     rcx, qword ptr [rbp-24]
@@ -4742,12 +4753,12 @@ grl_advance:
     jmp     grl_row
 grl_done:
     ; place the created/modified line just below the last record, flowing with
-    ; the field rows (x=164 matches the row content column)
+    ; the field rows (x=176 matches the row content column)
     mov     rcx, qword ptr [rbp-24]
     mov     edx, IDC_V_TIMES
     call    GetDlgItem
     mov     qword ptr [rbp-32], rax
-    WINCALL move_ctl, qword ptr [rbp-24], qword ptr [rbp-32], 164, dword ptr [rbp-40], 244, 10
+    WINCALL move_ctl, qword ptr [rbp-24], qword ptr [rbp-32], 176, dword ptr [rbp-40], 244, 10
     mov     eax, dword ptr [rbp-40]              ; content bottom incl. the timestamps line
     add     eax, 12
     mov     dword ptr [g_content_h], eax
