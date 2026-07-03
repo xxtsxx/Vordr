@@ -466,7 +466,6 @@ hexdig    db "0123456789abcdef"
 g_json      dq 3 dup (?)             ; {ptr,len,cap} for the fields JSON
 g_csvbuf    dq 3 dup (?)             ; {ptr,len,cap} for the CSV text
 g_ze_u8pw   db 512 dup (?)           ; wide->UTF-8 export password scratch
-g_ze_u8len  dd ?                      ; UTF-8 password length (stable copy for re-assert)
 g_zj_fld    db 40 dup (?)            ; vault_field_get out struct
 g_zj_fn     db 512 dup (?)           ; attachment filename (UTF-8)
 g_zj_path   db 768 dup (?)           ; "<title-folder>/<filename>" zip path
@@ -1232,17 +1231,6 @@ ze_build_csv endp
 ;   other combination (CSV, JSON, or any format WITH attachments) is wrapped in
 ;   the AES-256 encrypted ZIP (0).
 ; =============================================================================
-; zc_reassert_pw - restore g_ze_pw / g_ze_pwlen from the stable UTF-8 copy.  The
-;   data-file builders (ze_build_json / ze_build_csv) walk every entry/field and
-;   have, in some layouts, clobbered the export password length before the KDF
-;   consumes it; g_ze_u8len is captured up front and used to re-assert it right
-;   before each ze_add_file.  Tail-calls the leaf ze_set_pw.
-zc_reassert_pw proc
-    lea     rcx, [g_ze_u8pw]
-    mov     edx, dword ptr [g_ze_u8len]
-    jmp     ze_set_pw
-zc_reassert_pw endp
-
 public ze_compose
 ze_compose proc frame
     FRAME_PROLOG 96
@@ -1275,9 +1263,11 @@ comp_zip:
     ; ---- encrypted ZIP: wide pw -> UTF-8, then assemble ----
     mov     eax, dword ptr [rbp-32]
     shr     eax, 1                              ; wide chars
-    WINCALL WideCharToMultiByte, CP_UTF8_, 0, qword ptr [rbp-24], eax, addr g_ze_u8pw, 500, 0, 0
+    mov     r9d, eax                            ; stage cchWideChar in r9d: WINCALL clobbers
+                                                ;   rax while lea-ing the `addr g_ze_u8pw` stack
+                                                ;   arg, so the 4th arg must NOT come from eax
+    WINCALL WideCharToMultiByte, CP_UTF8_, 0, qword ptr [rbp-24], r9d, addr g_ze_u8pw, 500, 0, 0
     mov     dword ptr [rbp-44], eax             ; UTF-8 length
-    mov     dword ptr [g_ze_u8len], eax         ; stable copy (see the re-assert note below)
     call    ze_reset
     test    eax, eax
     jnz     comp_err
@@ -1293,7 +1283,6 @@ comp_zip:
     call    xl_build_xlsx
     test    eax, eax
     jnz     comp_ziperr
-    call    zc_reassert_pw
     lea     rcx, [zj_xlsxname]
     mov     edx, 10
     mov     r8, qword ptr [g_xlsx_ptr]
@@ -1305,7 +1294,6 @@ comp_json:
     call    ze_build_json
     test    eax, eax
     jnz     comp_ziperr
-    call    zc_reassert_pw
     lea     rcx, [zj_jsonname]
     mov     edx, 10
     lea     r10, [g_json]
@@ -1321,7 +1309,6 @@ comp_csv:
     call    ze_build_csv
     test    eax, eax
     jnz     comp_ziperr
-    call    zc_reassert_pw
     lea     rcx, [zj_csvname]
     mov     edx, 9
     lea     r10, [g_csvbuf]

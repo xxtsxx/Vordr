@@ -328,6 +328,14 @@ endm
 ;
 ; Clobbers rax (scratch for address / memory stack arguments).
 ;
+; !!! FOOTGUN: because rax is the scratch for `addr X` / 64-bit-memory STACK args
+; (5th+), which are emitted BEFORE the register args, DO NOT pass a 1st-4th
+; argument that is sourced from rax/eax (e.g. a bare `eax` holding a count) when
+; any 5th+ argument is `addr X` or a 64-bit memory value.  The `lea rax,[X]` for
+; that stack arg overwrites eax first, so the register arg then loads garbage.
+; Stage such a value in a non-rax register (r8d/r9d) and pass THAT instead.  (This
+; caused a chaotic, ASLR-dependent cchWideChar bug in ze_compose - 2026-07.)
+;
 ; Ordering: stack arguments (5th+) are stored BEFORE the register arguments are
 ; loaded.  This is safe unless a register argument's SOURCE is a memory slot that
 ; a stack-argument DESTINATION overwrites -- which only happens when a proc's
