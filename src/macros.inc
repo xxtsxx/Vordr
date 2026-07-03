@@ -111,6 +111,11 @@ VF_ICON             equ 12         ; reserved: custom icon override, value = 12 
 VF_LABELED          equ 8000h      ; "this field carries a custom label" flag
 VF_KINDMASK         equ 00FFh      ; mask to recover the base kind from a type
 
+; Export format selector (consolidated Export dialog / ze_compose)
+EXP_EXCEL           equ 0          ; encrypted .xlsx (or plain .xlsx inside the zip)
+EXP_CSV             equ 1          ; CSV text (always wrapped in the encrypted zip)
+EXP_JSON            equ 2          ; vordr.json (always wrapped in the encrypted zip)
+
 ; Password generator styles (pwgen_ex) + options
 PWS_RANDOM          equ 0          ; n random chars from the class mask (opt low nibble)
 PWS_PASSPHRASE      equ 1          ; n words from the embedded list, 8 bits/word

@@ -37,6 +37,12 @@ extern vault_field_count:proc
 extern vault_field_get:proc
 extern attach_open:proc
 extern WideCharToMultiByte:proc
+; --- Excel builder / agile encryptor (for the excel format inside ze_compose) ---
+extern xl_build_xlsx:proc
+extern xl_free:proc
+extern xl_encrypt:proc
+extern g_xlsx_ptr:qword
+extern g_xlsx_len:qword
 
 VF_IMAGE_   equ 9
 VF_FILE_    equ 10
@@ -261,7 +267,7 @@ ze_add_file proc frame
     ; ---- local file header ----
     ZB32    04034b50h
     ZB16    20
-    ZB16    0
+    ZB16    1                                    ; flag bit0 = encrypted (WinZip AE)
     ZB16    99
     ZB16    0
     ZB16    0
@@ -367,7 +373,7 @@ zfn_lp:
     ZB32    02014b50h
     ZB16    20                                   ; version made by
     ZB16    20                                   ; version needed
-    ZB16    0
+    ZB16    1                                    ; flag bit0 = encrypted (WinZip AE)
     ZB16    99                                   ; method AES
     ZB16    0
     ZB16    0
@@ -418,10 +424,16 @@ zj_flabel db ',"label":',0
 zj_fvalue db ',"value":',0
 zj_jsonname db "vordr.json"
 zj_defname  db "attachment.bin"
+zj_csvname  db "vordr.csv"
+zj_xlsxname db "vordr.xlsx"
+csv_hdr   db "title,username,password,url,notes,totp",13,10,0
+csv_kinds db VF_TITLE, VF_USERNAME, VF_SECRET, VF_URL, VF_NOTES, VF_TOTP
 hexdig    db "0123456789abcdef"
 
 .data?
 g_json      dq 3 dup (?)             ; {ptr,len,cap} for the fields JSON
+g_csvbuf    dq 3 dup (?)             ; {ptr,len,cap} for the CSV text
+g_ze_u8pw   db 512 dup (?)           ; wide->UTF-8 export password scratch
 g_zj_fld    db 40 dup (?)            ; vault_field_get out struct
 g_zj_fn     db 512 dup (?)           ; attachment filename (UTF-8)
 
@@ -637,34 +649,13 @@ zbj_err:
 ze_build_json endp
 
 ; =============================================================================
-; ze_export_all(rcx = utf8 pw, edx = pwlen) -> eax 0/err.  Builds the finished
-;   encrypted archive in g_zbuf: vordr.json (all text fields) + every attachment.
+; ze_add_attachments() -> eax 0/err.  Append every image/file attachment in the
+;   vault to the open archive (ze_reset + ze_set_pw must precede).  Each blob is
+;   decrypted to plaintext, added under its stored filename, then wiped + freed.
 ; =============================================================================
-public ze_export_all
-ze_export_all proc frame
+public ze_add_attachments
+ze_add_attachments proc frame
     FRAME_PROLOG 144
-    mov     qword ptr [rbp-24], rcx
-    mov     dword ptr [rbp-32], edx
-    call    ze_reset
-    test    eax, eax
-    jnz     zea_err
-    mov     rcx, qword ptr [rbp-24]
-    mov     edx, dword ptr [rbp-32]
-    call    ze_set_pw
-    call    ze_build_json
-    test    eax, eax
-    jnz     zea_err
-    lea     rcx, [zj_jsonname]
-    mov     edx, 10
-    lea     r10, [g_json]
-    mov     r8, qword ptr [r10]
-    mov     r9, qword ptr [r10+8]
-    call    ze_add_file
-    lea     r10, [g_json]                       ; free the JSON (already copied in)
-    mov     rcx, qword ptr [r10]
-    mov     rdx, qword ptr [r10+16]
-    call    mem_free
-    ; attachments
     call    vault_count
     mov     dword ptr [rbp-40], eax             ; n
     mov     dword ptr [rbp-44], 0               ; e
@@ -736,6 +727,42 @@ zea_enext:
     inc     dword ptr [rbp-44]
     jmp     zea_elp
 zea_fin:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+ze_add_attachments endp
+
+; =============================================================================
+; ze_export_all(rcx = utf8 pw, edx = pwlen) -> eax 0/err.  Builds the finished
+;   encrypted archive in g_zbuf: vordr.json (all text fields) + every attachment.
+; =============================================================================
+public ze_export_all
+ze_export_all proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-32], edx
+    call    ze_reset
+    test    eax, eax
+    jnz     zea_err
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-32]
+    call    ze_set_pw
+    call    ze_build_json
+    test    eax, eax
+    jnz     zea_err
+    lea     rcx, [zj_jsonname]
+    mov     edx, 10
+    lea     r10, [g_json]
+    mov     r8, qword ptr [r10]
+    mov     r9, qword ptr [r10+8]
+    call    ze_add_file
+    lea     r10, [g_json]                       ; free the JSON (already copied in)
+    mov     rcx, qword ptr [r10]
+    mov     rdx, qword ptr [r10+16]
+    call    mem_free
+    call    ze_add_attachments
+    test    eax, eax
+    jnz     zea_err
     call    ze_finish
     xor     eax, eax
     FRAME_EPILOG
@@ -745,5 +772,318 @@ zea_err:
     FRAME_EPILOG
     ret
 ze_export_all endp
+
+; =============================================================================
+; ze_csv_cell(rcx = g_csvbuf, rdx = ptr, r8 = len) - append one RFC-4180 CSV
+;   cell.  If the value contains a quote, comma, CR or LF it is wrapped in double
+;   quotes with internal quotes doubled; otherwise the raw bytes are copied.
+; =============================================================================
+ze_csv_cell proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx             ; buf
+    mov     qword ptr [rbp-32], rdx             ; ptr
+    mov     qword ptr [rbp-40], r8              ; len
+    ; ---- scan for characters that force quoting ----
+    xor     r10d, r10d                          ; index
+    xor     r11d, r11d                          ; needQuote
+cc_scan:
+    cmp     r10, qword ptr [rbp-40]
+    jae     cc_scandone
+    mov     rax, qword ptr [rbp-32]
+    movzx   eax, byte ptr [rax+r10]
+    cmp     eax, '"'
+    je      cc_need
+    cmp     eax, ','
+    je      cc_need
+    cmp     eax, 13
+    je      cc_need
+    cmp     eax, 10
+    je      cc_need
+    jmp     cc_scannext
+cc_need:
+    mov     r11d, 1
+cc_scannext:
+    inc     r10
+    jmp     cc_scan
+cc_scandone:
+    test    r11d, r11d
+    jnz     cc_quoted
+    ; ---- plain: raw bytes ----
+    mov     rcx, qword ptr [rbp-24]
+    mov     rdx, qword ptr [rbp-32]
+    mov     r8d, dword ptr [rbp-40]
+    call    buf_putn
+    FRAME_EPILOG
+    ret
+cc_quoted:
+    mov     rcx, qword ptr [rbp-24]             ; opening quote
+    mov     dl, '"'
+    call    buf_putb
+    xor     r10d, r10d
+cc_qlp:
+    cmp     r10, qword ptr [rbp-40]
+    jae     cc_qdone
+    mov     rax, qword ptr [rbp-32]
+    movzx   eax, byte ptr [rax+r10]
+    mov     dword ptr [rbp-48], eax
+    cmp     eax, '"'
+    jne     cc_qput
+    mov     rcx, qword ptr [rbp-24]             ; double an embedded quote
+    mov     dl, '"'
+    call    buf_putb
+cc_qput:
+    mov     rcx, qword ptr [rbp-24]
+    mov     dl, byte ptr [rbp-48]
+    call    buf_putb
+    inc     r10
+    jmp     cc_qlp
+cc_qdone:
+    mov     rcx, qword ptr [rbp-24]             ; closing quote
+    mov     dl, '"'
+    call    buf_putb
+    FRAME_EPILOG
+    ret
+ze_csv_cell endp
+
+; =============================================================================
+; ze_csv_field(ecx = entry, edx = kind) -> rax = value ptr, rdx = len (0/0 none).
+;   Returns the first field of the given base kind for the entry.
+; =============================================================================
+ze_csv_field proc frame
+    FRAME_PROLOG 48
+    mov     dword ptr [rbp-24], ecx             ; entry
+    mov     dword ptr [rbp-28], edx             ; kind
+    mov     ecx, dword ptr [rbp-24]
+    call    vault_field_count
+    mov     dword ptr [rbp-32], eax             ; fc
+    mov     dword ptr [rbp-36], 0               ; f
+cf_lp:
+    mov     eax, dword ptr [rbp-36]
+    cmp     eax, dword ptr [rbp-32]
+    jae     cf_none
+    mov     ecx, dword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-36]
+    lea     r8, [g_zj_fld]
+    call    vault_field_get
+    test    eax, eax
+    jz      cf_next
+    mov     eax, dword ptr [g_zj_fld]
+    cmp     eax, dword ptr [rbp-28]
+    jne     cf_next
+    mov     rax, qword ptr [g_zj_fld+24]        ; value ptr
+    mov     rdx, qword ptr [g_zj_fld+32]        ; value len
+    FRAME_EPILOG
+    ret
+cf_next:
+    inc     dword ptr [rbp-36]
+    jmp     cf_lp
+cf_none:
+    xor     eax, eax
+    xor     edx, edx
+    FRAME_EPILOG
+    ret
+ze_csv_field endp
+
+; =============================================================================
+; ze_build_csv() -> eax 0/err.  Builds g_csvbuf: a UTF-8 CSV (BOM + header row)
+;   with one row per entry and the canonical columns title,username,password,
+;   url,notes,totp.  Round-trips through the CSV importer's header keywords.
+; =============================================================================
+public ze_build_csv
+ze_build_csv proc frame
+    FRAME_PROLOG 48
+    mov     rcx, JSON_CAP
+    call    mem_alloc
+    test    rax, rax
+    jz      bc_err
+    lea     r10, [g_csvbuf]
+    mov     qword ptr [r10], rax
+    mov     qword ptr [r10+8], 0
+    mov     qword ptr [r10+16], JSON_CAP
+    lea     rcx, [g_csvbuf]                     ; UTF-8 BOM (EF BB BF) for Excel
+    mov     dl, 0EFh
+    call    buf_putb
+    lea     rcx, [g_csvbuf]
+    mov     dl, 0BBh
+    call    buf_putb
+    lea     rcx, [g_csvbuf]
+    mov     dl, 0BFh
+    call    buf_putb
+    lea     rcx, [g_csvbuf]
+    lea     rdx, [csv_hdr]
+    call    buf_putcstr
+    call    vault_count
+    mov     dword ptr [rbp-24], eax             ; n
+    mov     dword ptr [rbp-28], 0               ; e
+bc_elp:
+    mov     eax, dword ptr [rbp-28]
+    cmp     eax, dword ptr [rbp-24]
+    jae     bc_done
+    mov     dword ptr [rbp-32], 0               ; col
+bc_clp:
+    cmp     dword ptr [rbp-32], 6
+    jae     bc_erow
+    cmp     dword ptr [rbp-32], 0
+    je      bc_c0
+    lea     rcx, [g_csvbuf]                     ; column separator
+    mov     dl, ','
+    call    buf_putb
+bc_c0:
+    mov     r10d, dword ptr [rbp-32]
+    lea     r11, [csv_kinds]
+    movzx   edx, byte ptr [r11+r10]             ; kind
+    mov     ecx, dword ptr [rbp-28]             ; entry
+    call    ze_csv_field                        ; rax=ptr, rdx=len (0/0 none)
+    test    rax, rax
+    jz      bc_ncol
+    mov     r8, rdx
+    mov     rdx, rax
+    lea     rcx, [g_csvbuf]
+    call    ze_csv_cell
+bc_ncol:
+    inc     dword ptr [rbp-32]
+    jmp     bc_clp
+bc_erow:
+    lea     rcx, [g_csvbuf]                     ; CRLF row terminator
+    mov     dl, 13
+    call    buf_putb
+    lea     rcx, [g_csvbuf]
+    mov     dl, 10
+    call    buf_putb
+    inc     dword ptr [rbp-28]
+    jmp     bc_elp
+bc_done:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+bc_err:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+ze_build_csv endp
+
+; =============================================================================
+; ze_compose(rcx = wide password ptr, edx = password bytes, r8d = EXP_* format,
+;   r9d = include-attachments flag) -> eax:
+;     0 = an encrypted ZIP is ready in g_zbuf   (caller: write it, then ze_free)
+;     2 = a standalone encrypted .xlsx is ready in g_ole_ptr/g_ole_len
+;         (caller: write it, then xl_encrypt_free + xl_free)
+;     1 = error
+;   Excel with no attachments -> the standalone encrypted workbook (2); every
+;   other combination (CSV, JSON, or any format WITH attachments) is wrapped in
+;   the AES-256 encrypted ZIP (0).
+; =============================================================================
+public ze_compose
+ze_compose proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx             ; wide pw
+    mov     dword ptr [rbp-32], edx             ; pw bytes
+    mov     dword ptr [rbp-36], r8d             ; format
+    mov     dword ptr [rbp-40], r9d             ; attachments
+    cmp     dword ptr [rbp-36], EXP_EXCEL
+    jne     comp_zip
+    cmp     dword ptr [rbp-40], 0
+    jne     comp_zip
+    ; ---- standalone encrypted .xlsx ----
+    call    xl_build_xlsx
+    test    eax, eax
+    jnz     comp_err
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-32]
+    call    xl_encrypt
+    test    eax, eax
+    jnz     comp_xerr
+    mov     eax, 2
+    FRAME_EPILOG
+    ret
+comp_xerr:
+    call    xl_free                             ; encrypt failed -> free plaintext package
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+comp_zip:
+    ; ---- encrypted ZIP: wide pw -> UTF-8, then assemble ----
+    mov     eax, dword ptr [rbp-32]
+    shr     eax, 1                              ; wide chars
+    WINCALL WideCharToMultiByte, CP_UTF8_, 0, qword ptr [rbp-24], eax, addr g_ze_u8pw, 500, 0, 0
+    mov     dword ptr [rbp-44], eax             ; UTF-8 length
+    call    ze_reset
+    test    eax, eax
+    jnz     comp_err
+    lea     rcx, [g_ze_u8pw]
+    mov     edx, dword ptr [rbp-44]
+    call    ze_set_pw
+    mov     eax, dword ptr [rbp-36]
+    cmp     eax, EXP_JSON
+    je      comp_json
+    cmp     eax, EXP_CSV
+    je      comp_csv
+    ; ---- excel format wrapped in the zip: plain .xlsx package (zip encrypts) ----
+    call    xl_build_xlsx
+    test    eax, eax
+    jnz     comp_ziperr
+    lea     rcx, [zj_xlsxname]
+    mov     edx, 10
+    mov     r8, qword ptr [g_xlsx_ptr]
+    mov     r9, qword ptr [g_xlsx_len]
+    call    ze_add_file
+    call    xl_free
+    jmp     comp_attach
+comp_json:
+    call    ze_build_json
+    test    eax, eax
+    jnz     comp_ziperr
+    lea     rcx, [zj_jsonname]
+    mov     edx, 10
+    lea     r10, [g_json]
+    mov     r8, qword ptr [r10]
+    mov     r9, qword ptr [r10+8]
+    call    ze_add_file
+    lea     r10, [g_json]
+    mov     rcx, qword ptr [r10]
+    mov     rdx, qword ptr [r10+16]
+    call    mem_free
+    jmp     comp_attach
+comp_csv:
+    call    ze_build_csv
+    test    eax, eax
+    jnz     comp_ziperr
+    lea     rcx, [zj_csvname]
+    mov     edx, 9
+    lea     r10, [g_csvbuf]
+    mov     r8, qword ptr [r10]
+    mov     r9, qword ptr [r10+8]
+    call    ze_add_file
+    lea     r10, [g_csvbuf]
+    mov     rcx, qword ptr [r10]
+    mov     rdx, qword ptr [r10+16]
+    call    mem_free
+    jmp     comp_attach
+comp_attach:
+    cmp     dword ptr [rbp-40], 0
+    je      comp_fin
+    call    ze_add_attachments
+    test    eax, eax
+    jnz     comp_ziperr
+comp_fin:
+    call    ze_finish
+    lea     rcx, [g_ze_u8pw]                    ; wipe the UTF-8 password copy
+    mov     edx, 500
+    call    secure_zero
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+comp_ziperr:
+    lea     rcx, [g_ze_u8pw]
+    mov     edx, 500
+    call    secure_zero
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+comp_err:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+ze_compose endp
 
 end
