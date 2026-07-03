@@ -75,6 +75,9 @@ extern write_file:proc
 extern csv_to_wide:proc                 ; CSV import (csvimport.asm)
 extern csv_import_buffer:proc
 externdef g_csv_alloc:qword
+extern ze_export_all:proc               ; encrypted-ZIP export (zipexport.asm)
+extern ze_free:proc
+externdef g_zbuf:qword
 extern xl_build_xlsx:proc               ; encrypted-Excel export (xlexport.asm / xlcrypt.asm)
 extern xl_free:proc
 extern xl_encrypt:proc
@@ -143,6 +146,7 @@ extern GetClipboardSequenceNumber:proc
 extern SetTimer:proc
 extern KillTimer:proc
 extern MultiByteToWideChar:proc
+extern WideCharToMultiByte:proc
 extern IsDlgButtonChecked:proc
 extern EnableWindow:proc
 extern GetDlgItem:proc
@@ -345,6 +349,7 @@ IDC_V_MLAYOUTL equ 243                ; "Layout" label
 IDC_V_COLORPW equ 244                 ; overlay: colored revealed secret (owner-draw)
 IDC_V_MEXPORT equ 245                 ; "Export all secrets to Excel" button (settings)
 IDC_V_MIMPCSV equ 246                 ; "Import from CSV" button (settings)
+IDC_V_MEXPZIP equ 247                 ; "Export to encrypted ZIP" button (settings)
 DLG_XLPW     equ 720                  ; export-password prompt dialog
 IDC_XP_PW    equ 721
 IDC_XP_PW2   equ 722
@@ -575,6 +580,11 @@ WSTR imp_csv_pre,    <Imported >
 WSTR imp_csv_post,   < entries from the CSV file.>
 WSTR imp_csv_none,   <No importable entries were found in that CSV file.>
 WSTR imp_csv_rderr,  <Could not read the selected file.>
+WSTR zip_title,      <Export to encrypted ZIP>
+WSTR zip_warn,       <Export EVERY entry - all fields plus attached files and images - into one AES-256 encrypted ZIP, protected only by the password you set next? Store it safely and delete it when done.>
+WSTR zip_ok,         <Export complete. The encrypted ZIP contains vordr.json (all fields) and every attachment.>
+WSTR zip_fail,       <The export could not be created.>
+WSTR zip_defname,    <vordr-export.zip>
 WSTR xp_mm_empty,    <Please enter an export password.>
 WSTR xp_mm_mismatch, <The two passwords do not match. Please re-enter them.>
 WSTR xp_mm_ok,       <All secrets were exported to the encrypted Excel file.>
@@ -761,6 +771,9 @@ g_csvfilter label word          ; "CSV files\0*.csv\0All files\0*.*\0\0"
     dw '*','.','c','s','v',0
     dw 'A','l','l',' ','f','i','l','e','s',0
     dw '*','.','*',0,0
+g_zipfilter label word          ; "ZIP archive\0*.zip\0\0"
+    dw 'Z','I','P',' ','a','r','c','h','i','v','e',0
+    dw '*','.','z','i','p',0,0
 g_empty_w label word
     dw 0                                          ; empty wide string (default field value)
 pm_custom label word
@@ -775,8 +788,8 @@ g_menu_ids label dword
     dd IDC_V_MBACK, IDC_V_MTITLE, IDC_V_MPOLL, IDC_V_MLENL, IDC_V_MLEN
     dd IDC_V_MCLSL, IDC_V_MCLS, IDC_V_MTPM, IDC_V_MTPML, IDC_V_MTPMINFO
     dd IDC_V_MTHEMEL, IDC_V_MTHEME, IDC_V_MLAYOUTL, IDC_V_MLAYOUT, IDC_V_MEXPORT
-    dd IDC_V_MIMPCSV
-MENU_ID_COUNT equ 16
+    dd IDC_V_MIMPCSV, IDC_V_MEXPZIP
+MENU_ID_COUNT equ 17
 
 .data?
 align 8
@@ -880,6 +893,7 @@ g_phonfont    dq ?                         ; small monospace font for the phonet
 g_sub_w       dw 512 dup (?)               ; subtitle scratch (wide)
 g_cmpbuf      db 256 dup (?)               ; title-A copy for WM_COMPAREITEM
 g_imp_msgw    dw 160 dup (?)               ; CSV-import result message scratch (wide)
+g_zippw       db 512 dup (?)               ; UTF-8 export-zip password (wiped after use)
 align 4
 g_tilecolor   dd ?                         ; fill color for the next tile draw
 align 2
@@ -6687,6 +6701,8 @@ vp_cmd_disp:
     je      vp_export
     cmp     eax, IDC_V_MIMPCSV
     je      vp_impcsv
+    cmp     eax, IDC_V_MEXPZIP
+    je      vp_expzip
     cmp     eax, IDC_V_OVFL
     je      vp_ovfl
     cmp     eax, IDC_V_FAV
@@ -6768,6 +6784,10 @@ vp_export:
 vp_impcsv:
     mov     rcx, qword ptr [rbp-8]
     call    gui_import_csv
+    jmp     vp_handled
+vp_expzip:
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_export_zip
     jmp     vp_handled
 vp_ovfl:
     cmp     dword ptr [g_cur_idx], 0             ; only with an entry shown
@@ -7876,6 +7896,63 @@ gic_done:
     FRAME_EPILOG
     ret
 gui_import_csv endp
+
+; =============================================================================
+; gui_export_zip(rcx = hdlg) - warn, prompt for a password, export every entry
+;   (all fields as vordr.json + every attachment) into an AES-256 (WinZip AE-2)
+;   encrypted ZIP, then pick a save path and write it.
+; =============================================================================
+public gui_export_zip
+gui_export_zip proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    WINCALL MessageBoxW, qword ptr [rbp-24], addr zip_warn, addr zip_title, <030h or 1>
+    cmp     eax, 1
+    jne     gez_done
+    WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_XLPW, qword ptr [rbp-24], addr xlpw_proc, 0
+    cmp     eax, 1
+    jne     gez_done
+    mov     eax, dword ptr [g_xlpwlen]           ; wide chars = bytes/2
+    shr     eax, 1
+    WINCALL WideCharToMultiByte, CP_UTF8_, 0, addr g_xlpw, eax, addr g_zippw, 500, 0, 0
+    mov     dword ptr [rbp-32], eax              ; UTF-8 password length
+    lea     rcx, [g_zippw]
+    mov     edx, dword ptr [rbp-32]
+    call    ze_export_all
+    test    eax, eax
+    jnz     gez_fail
+    lea     rax, [g_zipfilter]                   ; save dialog
+    mov     qword ptr [g_pickfilter], rax
+    lea     rcx, [g_imgpath]
+    lea     rdx, [zip_defname]
+    call    gui_wcpy_capped
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, 1
+    call    img_pick
+    test    eax, eax
+    jz      gez_wipe
+    lea     rcx, [g_imgpath]
+    lea     r11, [g_zbuf]
+    mov     rdx, qword ptr [r11]
+    mov     r8, qword ptr [r11+8]
+    call    write_file
+    WINCALL MessageBoxW, qword ptr [rbp-24], addr zip_ok, addr zip_title, 040h
+    jmp     gez_wipe
+gez_fail:
+    WINCALL MessageBoxW, qword ptr [rbp-24], addr zip_fail, addr zip_title, 010h
+gez_wipe:
+    call    ze_free
+    lea     rcx, [g_xlpw]
+    mov     edx, 512
+    call    secure_zero
+    lea     rcx, [g_zippw]
+    mov     edx, 512
+    call    secure_zero
+    mov     dword ptr [g_xlpwlen], 0
+gez_done:
+    FRAME_EPILOG
+    ret
+gui_export_zip endp
 
 ; ges_wipepw - zero the export password buffers
 ges_wipepw proc frame
