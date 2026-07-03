@@ -52,6 +52,7 @@ CP_UTF8_    equ 65001
 
 ZE_CAP      equ 32*1024*1024
 ZE_MAXFILE  equ 512
+ZE_NAMEPOOL equ 256*1024             ; persistent copies of every entry's name
 PBKDF2_ITERS equ 1000
 
 .data?
@@ -63,6 +64,8 @@ g_ze_pwlen  dd ?
 g_ze_cn     dd ?                     ; central-dir record count
 ; cd record = offset(4) csize(4) usize(4) namelen(4) nameptr(8) = 24 bytes
 g_ze_cd     db ZE_MAXFILE*24 dup (?)
+g_ze_names  db ZE_NAMEPOOL dup (?)    ; per-record name copies (nameptr must survive)
+g_ze_np     dd ?                      ; name-pool write cursor
 g_ae_dk     db 80 dup (?)            ; PBKDF2 output (enc32 | auth32 | verify2..)
 g_ze_salt   db 16 dup (?)
 g_ze_rk     db 15*16 dup (?)         ; AES round keys
@@ -169,6 +172,7 @@ ze_reset proc frame
     FRAME_PROLOG 32
     mov     byte ptr [g_xl_err], 0
     mov     dword ptr [g_ze_cn], 0
+    mov     dword ptr [g_ze_np], 0
     mov     rcx, ZE_CAP
     call    mem_alloc
     test    rax, rax
@@ -256,6 +260,32 @@ ze_add_file proc frame
     mov     dword ptr [rbp-32], edx             ; namelen
     mov     qword ptr [rbp-40], r8              ; data
     mov     qword ptr [rbp-48], r9              ; datalen
+    ; ---- copy the name into the persistent pool: the central-dir nameptr must
+    ; stay valid until ze_finish, but callers reuse one name buffer across files
+    ; (e.g. g_zj_fn per attachment), so a stored pointer would alias the last name.
+    mov     eax, dword ptr [rbp-32]             ; namelen
+    mov     r10d, dword ptr [g_ze_np]           ; pool cursor
+    mov     r11d, ZE_NAMEPOOL
+    sub     r11d, r10d                          ; remaining
+    cmp     eax, r11d
+    jbe     zaf_ncap
+    mov     eax, r11d                           ; clamp (pathological only)
+    mov     dword ptr [rbp-32], eax
+zaf_ncap:
+    lea     r11, [g_ze_names]
+    add     r11, r10                            ; dst slot
+    mov     rcx, qword ptr [rbp-24]             ; src name
+    xor     r9d, r9d
+zaf_ncp:
+    cmp     r9d, eax
+    jae     zaf_ncpd
+    mov     r8b, byte ptr [rcx+r9]
+    mov     byte ptr [r11+r9], r8b
+    inc     r9d
+    jmp     zaf_ncp
+zaf_ncpd:
+    mov     qword ptr [rbp-24], r11             ; name -> pooled copy
+    add     dword ptr [g_ze_np], eax            ; advance cursor
     ; record cd offset
     lea     r10, [g_zbuf]
     mov     rax, qword ptr [r10+8]
