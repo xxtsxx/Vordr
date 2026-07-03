@@ -78,6 +78,7 @@ extern xlsx_import:proc                 ; Excel import (xlsximport.asm)
 extern xlsx_decrypt:proc                ; encrypted Excel import (oleagile.asm)
 externdef g_csv_alloc:qword
 extern ze_export_all:proc               ; encrypted-ZIP export (zipexport.asm)
+extern ze_compose:proc                  ; format-dispatching export composer
 extern ze_free:proc
 externdef g_zbuf:qword
 extern xl_build_xlsx:proc               ; encrypted-Excel export (xlexport.asm / xlcrypt.asm)
@@ -386,6 +387,12 @@ IDC_XP_WARN  equ 723
 IDC_XP_PWL   equ 724
 IDC_XP_PW2L  equ 725
 DLG_IMPPW    equ 730                  ; import-password prompt (single field)
+DLG_EXPORT   equ 750                  ; consolidated export dialog (format + attach)
+IDC_EX_FMTL  equ 751
+IDC_EX_FMT   equ 752                  ; format dropdown button (owner-draw)
+IDC_EX_ATTL  equ 753
+IDC_EX_ATTACH equ 754                 ; include-attachments pill toggle (owner-draw)
+IDC_EX_WARN  equ 755
 SW_HIDE      equ 0
 SW_SHOW      equ 5
 DLG_CREATE   equ 400
@@ -627,6 +634,12 @@ WSTR zip_warn,       <Export EVERY entry - all fields plus attached files and im
 WSTR zip_ok,         <Export complete. The encrypted ZIP contains vordr.json (all fields) and every attachment.>
 WSTR zip_fail,       <The export could not be created.>
 WSTR zip_defname,    <vordr-export.zip>
+WSTR fmt_excel,      <Excel (.xlsx)>
+WSTR fmt_csv,        <CSV (.csv)>
+WSTR fmt_json,       <JSON (.json)>
+WSTR exp_done_ok,    <Export complete. Keep the file safe and delete it when you no longer need it.>
+align 8
+fmt_names dq fmt_excel, fmt_csv, fmt_json
 WSTR pg_on,   <[x] >
 WSTR pg_off,  <[ ] >
 WSTR pg_lbl_up,  <Uppercase>
@@ -867,8 +880,8 @@ g_menu_ids label dword
     dd IDC_V_MBACK, IDC_V_MTITLE, IDC_V_MPOLL, IDC_V_MLENL, IDC_V_MLEN
     dd IDC_V_MCLSL, IDC_V_MCLS, IDC_V_MTPM, IDC_V_MTPML, IDC_V_MTPMINFO
     dd IDC_V_MTHEMEL, IDC_V_MTHEME, IDC_V_MEXPORT
-    dd IDC_V_MIMPORT, IDC_V_MEXPZIP
-MENU_ID_COUNT equ 15
+    dd IDC_V_MIMPORT
+MENU_ID_COUNT equ 14
 
 .data?
 align 8
@@ -911,6 +924,8 @@ g_dirty     dd ?                      ; 1 = inline fields edited since last load
 g_loading   dd ?                      ; 1 = programmatically loading fields (ignore EN_CHANGE)
 g_editmode  dd ?                      ; 1 = detail fields editable (view/edit toggle)
 g_new_pending dd ?                    ; 1 = current entry is a just-added placeholder (delete on Cancel)
+g_exp_format dd ?                     ; export dialog: EXP_EXCEL/EXP_CSV/EXP_JSON
+g_exp_attach dd ?                     ; export dialog: 1 = include attachments
 align 8
 public g_vaulthwnd
 g_vaulthwnd dq ?                      ; the open DLG_VAULT window (0 when not shown)
@@ -7063,8 +7078,6 @@ vp_cmd_disp:
     je      vp_export
     cmp     eax, IDC_V_MIMPORT
     je      vp_import
-    cmp     eax, IDC_V_MEXPZIP
-    je      vp_expzip
     cmp     eax, IDC_V_OVFL
     je      vp_ovfl
     cmp     eax, IDC_V_FAV
@@ -7136,15 +7149,11 @@ vp_theme:
     jmp     vp_handled
 vp_export:
     mov     rcx, qword ptr [rbp-8]
-    call    gui_export_secrets
+    call    gui_export
     jmp     vp_handled
 vp_import:
     mov     rcx, qword ptr [rbp-8]
     call    gui_import
-    jmp     vp_handled
-vp_expzip:
-    mov     rcx, qword ptr [rbp-8]
-    call    gui_export_zip
     jmp     vp_handled
 vp_ovfl:
     cmp     dword ptr [g_cur_idx], 0             ; only with an entry shown
@@ -8243,31 +8252,40 @@ cp_ret:
 create_proc endp
 
 ; =============================================================================
-; gui_export_secrets(rcx = hdlg) - warn, prompt for an export password, pick a
-;   file, then build + agile-encrypt the whole vault into a password-protected
-;   .xlsx.  The vault is already unlocked (settings overlay is open).
+; gui_export(rcx = hdlg) - consolidated export.  Show DLG_EXPORT (format +
+;   attachments), prompt for a password, then ze_compose builds either a
+;   standalone encrypted .xlsx (Excel + no attachments) or an AES-256 encrypted
+;   ZIP (every other combination).  Pick a matching save path and write it.
 ; =============================================================================
-gui_export_secrets proc frame
+gui_export proc frame
     FRAME_PROLOG 48
     mov     qword ptr [rbp-24], rcx
-    WINCALL MessageBoxW, qword ptr [rbp-24], addr xp_mm_warn, addr xp_mm_title, <030h or 1>  ; ICONWARNING|OKCANCEL
-    cmp     eax, 1                               ; IDOK
-    jne     ges_done
+    WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_EXPORT, qword ptr [rbp-24], addr export_proc, 0
+    cmp     eax, 1
+    jne     gx_done
     WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_XLPW, qword ptr [rbp-24], addr xlpw_proc, 0
     cmp     eax, 1
-    jne     ges_done
+    jne     gx_done
+    lea     rcx, [g_xlpw]                        ; wide password + length (bytes)
+    mov     edx, dword ptr [g_xlpwlen]
+    mov     r8d, dword ptr [g_exp_format]
+    mov     r9d, dword ptr [g_exp_attach]
+    call    ze_compose
+    mov     dword ptr [rbp-28], eax              ; 0 = zip, 2 = xlsx, 1 = error
+    cmp     eax, 2
+    je      gx_xlsx
+    cmp     eax, 0
+    je      gx_zip
+    call    ze_free                              ; error: free the (possibly) reset zip buffer
+    call    ges_wipepw
+    WINCALL MessageBoxW, qword ptr [rbp-24], addr xp_mm_fail, addr xp_mm_title, 010h
+    jmp     gx_done
+    ; ---- standalone encrypted .xlsx ----
+gx_xlsx:
     mov     rcx, qword ptr [rbp-24]
     call    gui_xlsx_savepath
     test    eax, eax
-    jz      ges_wipe
-    call    xl_build_xlsx
-    test    eax, eax
-    jnz     ges_bfail
-    lea     rcx, [g_xlpw]
-    mov     edx, dword ptr [g_xlpwlen]
-    call    xl_encrypt
-    test    eax, eax
-    jnz     ges_efail
+    jz      gx_xlsx_cancel
     lea     rcx, [g_xlpath]
     mov     rdx, qword ptr [g_ole_ptr]
     mov     r8, qword ptr [g_ole_len]
@@ -8277,24 +8295,201 @@ gui_export_secrets proc frame
     call    xl_free
     call    ges_wipepw
     cmp     dword ptr [rbp-32], 0
-    jne     ges_showfail
-    WINCALL MessageBoxW, qword ptr [rbp-24], addr xp_mm_ok, addr xp_mm_title, 040h  ; ICONINFORMATION
-    jmp     ges_done
-ges_efail:
-    call    xl_free                              ; encrypt failed -> free the plaintext package
-    jmp     ges_failwipe
-ges_bfail:                                       ; build failed -> already freed
-ges_failwipe:
+    jne     gx_writefail
+    WINCALL MessageBoxW, qword ptr [rbp-24], addr xp_mm_ok, addr xp_mm_title, 040h
+    jmp     gx_done
+gx_xlsx_cancel:
+    call    xl_encrypt_free
+    call    xl_free
     call    ges_wipepw
-ges_showfail:
-    WINCALL MessageBoxW, qword ptr [rbp-24], addr xp_mm_fail, addr xp_mm_title, 010h  ; ICONERROR
-    jmp     ges_done
-ges_wipe:
+    jmp     gx_done
+    ; ---- encrypted ZIP ----
+gx_zip:
+    lea     rax, [g_zipfilter]
+    mov     qword ptr [g_pickfilter], rax
+    lea     rcx, [g_imgpath]
+    lea     rdx, [zip_defname]
+    call    gui_wcpy_capped
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, 1
+    call    img_pick
+    test    eax, eax
+    jz      gx_zip_cancel
+    lea     rcx, [g_imgpath]
+    lea     r11, [g_zbuf]
+    mov     rdx, qword ptr [r11]
+    mov     r8, qword ptr [r11+8]
+    call    write_file
+    mov     dword ptr [rbp-32], eax
+    call    ze_free
     call    ges_wipepw
-ges_done:
+    cmp     dword ptr [rbp-32], 0
+    jne     gx_writefail
+    WINCALL MessageBoxW, qword ptr [rbp-24], addr exp_done_ok, addr zip_title, 040h
+    jmp     gx_done
+gx_zip_cancel:
+    call    ze_free
+    call    ges_wipepw
+    jmp     gx_done
+gx_writefail:
+    WINCALL MessageBoxW, qword ptr [rbp-24], addr xp_mm_fail, addr xp_mm_title, 010h
+gx_done:
     FRAME_EPILOG
     ret
-gui_export_secrets endp
+gui_export endp
+
+; =============================================================================
+; gui_export_fmtpop(rcx = hdlg) - drop a small popup under the format button and
+;   let the user pick Excel / CSV / JSON; update g_exp_format and the caption.
+; =============================================================================
+gui_export_fmtpop proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx              ; hdlg
+    WINCALL CreatePopupMenu
+    mov     qword ptr [rbp-32], rax
+    test    rax, rax
+    jz      fp_done
+    WINCALL AppendMenuW, qword ptr [rbp-32], 0, 1, addr fmt_excel
+    WINCALL AppendMenuW, qword ptr [rbp-32], 0, 2, addr fmt_csv
+    WINCALL AppendMenuW, qword ptr [rbp-32], 0, 3, addr fmt_json
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_EX_FMT
+    mov     qword ptr [rbp-40], rax
+    WINCALL GetWindowRect, qword ptr [rbp-40], addr rbp-72      ; RECT @ [rbp-72..-57]
+    mov     eax, dword ptr [rbp-72]              ; left
+    mov     dword ptr [rbp-48], eax              ; popup x
+    mov     eax, dword ptr [rbp-60]              ; bottom
+    mov     dword ptr [rbp-52], eax              ; popup y
+    WINCALL SetForegroundWindow, qword ptr [rbp-24]
+    WINCALL TrackPopupMenu, qword ptr [rbp-32], TPM_RETURNCMD or TPM_LEFTALIGN, \
+            dword ptr [rbp-48], dword ptr [rbp-52], 0, qword ptr [rbp-24], 0
+    mov     dword ptr [rbp-44], eax              ; choice (1..3, 0 = none)
+    WINCALL DestroyMenu, qword ptr [rbp-32]
+    cmp     dword ptr [rbp-44], 0
+    je      fp_done
+    mov     eax, dword ptr [rbp-44]
+    dec     eax
+    mov     dword ptr [g_exp_format], eax        ; 0 = Excel, 1 = CSV, 2 = JSON
+    lea     r10, [fmt_names]
+    mov     r11, qword ptr [r10+rax*8]
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_EX_FMT, r11
+fp_done:
+    FRAME_EPILOG
+    ret
+gui_export_fmtpop endp
+
+; =============================================================================
+; export_proc - DLG_EXPORT dialog: format dropdown + attachments toggle + a
+;   bottom warning.  Returns 1 (Continue) with g_exp_format/g_exp_attach set, or
+;   0 (Cancel).
+; =============================================================================
+export_proc proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 64
+    mov     qword ptr [rbp-8], rcx
+    cmp     rdx, WM_INITDIALOG
+    je      ep_init
+    cmp     rdx, WM_COMMAND
+    je      ep_cmd
+    cmp     rdx, WM_CTLCOLORSTATIC
+    je      ep_col
+    cmp     rdx, WM_CTLCOLORBTN
+    je      ep_col
+    cmp     rdx, WM_CTLCOLORDLG
+    je      ep_col
+    cmp     rdx, WM_PAINT
+    je      ep_paint
+    cmp     rdx, WM_ERASEBKGND
+    je      ep_erase
+    cmp     rdx, WM_DRAWITEM
+    je      ep_draw
+    cmp     rdx, WM_TIMER
+    je      ep_timer
+    xor     eax, eax
+    jmp     ep_ret
+ep_col:
+    call    theme_ctlcolor
+    jmp     ep_ret
+ep_paint:
+    mov     rcx, qword ptr [rbp-8]
+    call    theme_paint
+    jmp     ep_ret
+ep_erase:
+    mov     rcx, r8
+    mov     rdx, qword ptr [rbp-8]
+    call    theme_erase
+    jmp     ep_ret
+ep_draw:
+    mov     r10, r9
+    mov     eax, dword ptr [r10+4]               ; DRAWITEMSTRUCT.CtlID
+    cmp     eax, IDC_EX_ATTACH
+    jne     ep_draw_def
+    mov     rcx, r9                              ; attachments = Fluent pill toggle
+    mov     edx, dword ptr [g_exp_attach]
+    call    theme_toggle
+    jmp     ep_ret
+ep_draw_def:
+    mov     rcx, r9
+    call    theme_drawitem
+    jmp     ep_ret
+ep_timer:
+    cmp     r8d, THEME_TIMER
+    jne     ep_unh
+    mov     rcx, qword ptr [rbp-8]
+    call    theme_tick
+    mov     eax, 1
+    jmp     ep_ret
+ep_unh:
+    xor     eax, eax
+    jmp     ep_ret
+ep_init:
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDOK
+    call    theme_attach
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_set_winicon
+    mov     dword ptr [g_exp_format], EXP_EXCEL
+    mov     dword ptr [g_exp_attach], 0
+    WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_EX_FMT, addr fmt_excel
+    mov     eax, 1
+    jmp     ep_ret
+ep_cmd:
+    movzx   eax, r8w
+    cmp     eax, IDOK
+    je      ep_ok
+    cmp     eax, IDCANCEL
+    je      ep_cancel
+    cmp     eax, IDC_EX_FMT
+    je      ep_fmt
+    cmp     eax, IDC_EX_ATTACH
+    je      ep_attach
+    xor     eax, eax
+    jmp     ep_ret
+ep_fmt:
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_export_fmtpop
+    mov     eax, 1
+    jmp     ep_ret
+ep_attach:
+    mov     eax, dword ptr [g_exp_attach]
+    xor     eax, 1
+    mov     dword ptr [g_exp_attach], eax
+    WINCALL GetDlgItem, qword ptr [rbp-8], IDC_EX_ATTACH
+    WINCALL InvalidateRect, rax, 0, 1
+    mov     eax, 1
+    jmp     ep_ret
+ep_ok:
+    WINCALL EndDialog, qword ptr [rbp-8], 1
+    mov     eax, 1
+    jmp     ep_ret
+ep_cancel:
+    WINCALL EndDialog, qword ptr [rbp-8], 0
+    mov     eax, 1
+ep_ret:
+    mov     rsp, rbp
+    pop     rbp
+    ret
+export_proc endp
 
 ; gui_wstrcpy(rcx=dst, rdx=src wide) -> rax = ptr to the terminating NUL in dst.  Leaf.
 gui_wstrcpy proc
@@ -8471,63 +8666,6 @@ gim_ret:
     FRAME_EPILOG
     ret
 gui_import endp
-
-; =============================================================================
-; gui_export_zip(rcx = hdlg) - warn, prompt for a password, export every entry
-;   (all fields as vordr.json + every attachment) into an AES-256 (WinZip AE-2)
-;   encrypted ZIP, then pick a save path and write it.
-; =============================================================================
-public gui_export_zip
-gui_export_zip proc frame
-    FRAME_PROLOG 64
-    mov     qword ptr [rbp-24], rcx
-    WINCALL MessageBoxW, qword ptr [rbp-24], addr zip_warn, addr zip_title, <030h or 1>
-    cmp     eax, 1
-    jne     gez_done
-    WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_XLPW, qword ptr [rbp-24], addr xlpw_proc, 0
-    cmp     eax, 1
-    jne     gez_done
-    mov     eax, dword ptr [g_xlpwlen]           ; wide chars = bytes/2
-    shr     eax, 1
-    WINCALL WideCharToMultiByte, CP_UTF8_, 0, addr g_xlpw, eax, addr g_zippw, 500, 0, 0
-    mov     dword ptr [rbp-32], eax              ; UTF-8 password length
-    lea     rcx, [g_zippw]
-    mov     edx, dword ptr [rbp-32]
-    call    ze_export_all
-    test    eax, eax
-    jnz     gez_fail
-    lea     rax, [g_zipfilter]                   ; save dialog
-    mov     qword ptr [g_pickfilter], rax
-    lea     rcx, [g_imgpath]
-    lea     rdx, [zip_defname]
-    call    gui_wcpy_capped
-    mov     rcx, qword ptr [rbp-24]
-    mov     edx, 1
-    call    img_pick
-    test    eax, eax
-    jz      gez_wipe
-    lea     rcx, [g_imgpath]
-    lea     r11, [g_zbuf]
-    mov     rdx, qword ptr [r11]
-    mov     r8, qword ptr [r11+8]
-    call    write_file
-    WINCALL MessageBoxW, qword ptr [rbp-24], addr zip_ok, addr zip_title, 040h
-    jmp     gez_wipe
-gez_fail:
-    WINCALL MessageBoxW, qword ptr [rbp-24], addr zip_fail, addr zip_title, 010h
-gez_wipe:
-    call    ze_free
-    lea     rcx, [g_xlpw]
-    mov     edx, 512
-    call    secure_zero
-    lea     rcx, [g_zippw]
-    mov     edx, 512
-    call    secure_zero
-    mov     dword ptr [g_xlpwlen], 0
-gez_done:
-    FRAME_EPILOG
-    ret
-gui_export_zip endp
 
 ; gui_pg_toggle_text(rcx=hdlg, edx=ctlid, r8d=state, r9=base wide) - set a toggle
 ;   button's caption to "[x] "/"[ ] " + base.
