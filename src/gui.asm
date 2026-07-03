@@ -75,6 +75,7 @@ extern write_file:proc
 extern csv_to_wide:proc                 ; CSV import (csvimport.asm)
 extern csv_import_buffer:proc
 extern xlsx_import:proc                 ; Excel import (xlsximport.asm)
+extern xlsx_decrypt:proc                ; encrypted Excel import (oleagile.asm)
 externdef g_csv_alloc:qword
 extern ze_export_all:proc               ; encrypted-ZIP export (zipexport.asm)
 extern ze_free:proc
@@ -608,7 +609,7 @@ WSTR imp_xls_pre,    <Imported >
 WSTR imp_xls_post,   < entries from the Excel workbook.>
 WSTR imp_xls_none,   <No importable entries were found in that workbook.>
 WSTR imp_xls_bad,    <That file is not a readable .xlsx workbook.>
-WSTR imp_xls_enc,    <That workbook is encrypted. Opening password-protected Excel files is not supported yet - save it without a password and try again.>
+WSTR imp_xls_wrongpw,<Could not open the workbook - the password was incorrect.>
 WSTR zip_title,      <Export to encrypted ZIP>
 WSTR zip_warn,       <Export EVERY entry - all fields plus attached files and images - into one AES-256 encrypted ZIP, protected only by the password you set next? Store it safely and delete it when done.>
 WSTR zip_ok,         <Export complete. The encrypted ZIP contains vordr.json (all fields) and every attachment.>
@@ -7986,8 +7987,9 @@ gui_import_csv endp
 ; =============================================================================
 ; gui_import_xlsx(rcx = hdlg) -> eax = entries imported.  Pick an .xlsx file,
 ;   parse the first worksheet (header row -> field types), append every data
-;   row as a new entry, reseal and refresh.  Encrypted (password-protected)
-;   workbooks are detected (xlsx_import returns -2) and reported.
+;   row as a new entry, reseal and refresh.  Password-protected (agile-encrypted)
+;   workbooks are detected (xlsx_import returns -2): we prompt for the workbook
+;   password and decrypt via xlsx_decrypt before importing.
 ; =============================================================================
 public gui_import_xlsx
 gui_import_xlsx proc frame
@@ -8038,7 +8040,29 @@ gix_ok:
     WINCALL gui_msgbox, qword ptr [rbp-24], addr g_imp_msgw, addr imp_xls_title, 040h
     jmp     gix_done
 gix_enc:
-    WINCALL gui_msgbox, qword ptr [rbp-24], addr imp_xls_enc, addr imp_xls_title, 030h
+    ; encrypted workbook: prompt for its password, then decrypt + import
+    WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_XLPW, qword ptr [rbp-24], addr xlpw_proc, 0
+    cmp     eax, 1
+    jne     gix_done
+    mov     rcx, qword ptr [rbp-32]             ; raw
+    mov     edx, dword ptr [rbp-40]             ; rawlen
+    lea     r8, [g_xlpw]                        ; UTF-16 password
+    mov     r9d, dword ptr [g_xlpwlen]          ; password bytes
+    call    xlsx_decrypt
+    mov     dword ptr [rbp-64], eax
+    lea     rcx, [g_xlpw]                       ; wipe the password
+    mov     edx, 512
+    call    secure_zero
+    mov     dword ptr [g_xlpwlen], 0
+    cmp     dword ptr [rbp-64], -3
+    je      gix_wrongpw
+    cmp     dword ptr [rbp-64], 0
+    jl      gix_bad
+    jg      gix_ok
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr imp_xls_none, addr imp_xls_title, 030h
+    jmp     gix_done
+gix_wrongpw:
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr imp_xls_wrongpw, addr imp_xls_title, 030h
     jmp     gix_done
 gix_bad:
     WINCALL gui_msgbox, qword ptr [rbp-24], addr imp_xls_bad, addr imp_xls_title, 030h

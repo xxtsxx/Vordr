@@ -62,6 +62,7 @@ extern print_err:proc
 extern vault_unlock:proc
 extern vault_reseal:proc
 extern xlsx_import:proc
+extern xlsx_decrypt:proc
 
 CP_UTF8              equ 65001
 WC_ERR_INVALID_CHARS equ 80h
@@ -161,6 +162,8 @@ WSTR w_pvtest,   <pvtest>
 WSTR w_genpw,    <genpw>
 WSTR w_seedtest, <seedtest>
 WSTR w_xitest,   <xitest>
+WSTR w_xdtest,   <xdtest>
+WSTR wpw_test,   <VordrTest123>
 WSTR ext_pdf,    <.pdf>
 WSTR w_pvtmp,    <pvtmp.pdf>
 ifdef DBG_TRACE
@@ -196,12 +199,13 @@ cmd_table label CMDENT
     CMDENT { w_genpw,     cmd_genpw,     0, 0 }   ; print one sample of each generator style
     CMDENT { w_seedtest,  cmd_seedtest,  1, 0 }   ; bulk-fill a test vault with 5000 entries
     CMDENT { w_xitest,    cmd_xitest,    2, 0 }   ; headless .xlsx import probe
+    CMDENT { w_xdtest,    cmd_xdtest,    2, 0 }   ; headless encrypted .xlsx import probe
 ifdef DBG_TRACE
     CMDENT { w_redteam,   cmd_redteam,   1, 0 }   ; fault-injection self-test (dbg)
     CMDENT { w_tpmtest,   cmd_tpmtest,   0, 0 }   ; TPM round-trip probe (dbg)
-CMD_COUNT equ 10
+CMD_COUNT equ 11
 else
-CMD_COUNT equ 8
+CMD_COUNT equ 9
 endif
 
 .data?
@@ -1006,6 +1010,54 @@ xit_fail:
     FRAME_EPILOG
     ret
 cmd_xitest endp
+
+; cmd_xdtest - headless encrypted-.xlsx import probe: unlock the vault at argv[2]
+;   with the fixed test password, decrypt+import the workbook at argv[3] using the
+;   fixed test workbook password, reseal.  exit = entries imported.
+LANDING_PAD
+cmd_xdtest proc frame
+    FRAME_PROLOG 128
+    lea     r10, [g_argv]
+    mov     rax, qword ptr [r10+16]
+    mov     qword ptr [g_cfg_in], rax
+    lea     r10, [seed_pw]
+    lea     r11, [g_cfg_pass]
+    xor     ecx, ecx
+xdt_cp:
+    mov     al, byte ptr [r10+rcx]
+    mov     byte ptr [r11+rcx], al
+    test    al, al
+    jz      xdt_cpd
+    inc     ecx
+    cmp     ecx, 32
+    jb      xdt_cp
+xdt_cpd:
+    mov     dword ptr [g_cfg_passlen], 9
+    call    vault_unlock
+    test    eax, eax
+    jnz     xdt_fail
+    lea     r10, [g_argv]
+    mov     rcx, qword ptr [r10+24]
+    lea     rdx, [rbp-24]
+    lea     r8, [rbp-32]
+    call    read_file
+    test    eax, eax
+    jnz     xdt_fail
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-32]
+    lea     r8, [wpw_test]
+    mov     r9d, 24                             ; "VordrTest123" = 12 chars * 2
+    call    xlsx_decrypt
+    mov     dword ptr [rbp-40], eax
+    call    vault_reseal
+    mov     eax, dword ptr [rbp-40]
+    FRAME_EPILOG
+    ret
+xdt_fail:
+    mov     eax, 0E0C9h
+    FRAME_EPILOG
+    ret
+cmd_xdtest endp
 
 
 
