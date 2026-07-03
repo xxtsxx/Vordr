@@ -350,6 +350,27 @@ IDC_V_COLORPW equ 244                 ; overlay: colored revealed secret (owner-
 IDC_V_MEXPORT equ 245                 ; "Export all secrets to Excel" button (settings)
 IDC_V_MIMPCSV equ 246                 ; "Import from CSV" button (settings)
 IDC_V_MEXPZIP equ 247                 ; "Export to encrypted ZIP" button (settings)
+DLG_PWGEN     equ 760                 ; password-generator window
+IDC_PG_OUT    equ 761
+IDC_PG_REGEN  equ 762
+IDC_PG_BITS   equ 763
+IDC_PG_LENL   equ 764
+IDC_PG_LEN    equ 765
+IDC_PG_LENVAL equ 766
+IDC_PG_STYLE  equ 767
+IDC_PG_UP     equ 768
+IDC_PG_LO     equ 769
+IDC_PG_DI     equ 770
+IDC_PG_SY     equ 771
+IDC_PG_AMB    equ 772
+PWCLASS_U     equ 1
+PWCLASS_L     equ 2
+PWCLASS_D     equ 4
+PWCLASS_S     equ 8
+TBM_GETPOS    equ 400h
+TBM_SETPOS    equ 405h
+TBM_SETRANGE  equ 406h
+WM_HSCROLL_   equ 114h
 DLG_XLPW     equ 720                  ; export-password prompt dialog
 IDC_XP_PW    equ 721
 IDC_XP_PW2   equ 722
@@ -585,6 +606,22 @@ WSTR zip_warn,       <Export EVERY entry - all fields plus attached files and im
 WSTR zip_ok,         <Export complete. The encrypted ZIP contains vordr.json (all fields) and every attachment.>
 WSTR zip_fail,       <The export could not be created.>
 WSTR zip_defname,    <vordr-export.zip>
+WSTR pg_on,   <[x] >
+WSTR pg_off,  <[ ] >
+WSTR pg_lbl_up,  <Uppercase>
+WSTR pg_lbl_lo,  <Lowercase>
+WSTR pg_lbl_di,  <Digits>
+WSTR pg_lbl_sy,  <Symbols>
+WSTR pg_lbl_amb, <Avoid ambiguous>
+WSTR pg_style_pre, <Style: >
+WSTR pg_sn0, <Random>
+WSTR pg_sn1, <Passphrase>
+WSTR pg_sn2, <Pronounceable>
+WSTR pg_sn3, <PIN>
+WSTR pg_sn4, <Hex>
+WSTR pg_bits_suf, < bits of entropy>
+align 8
+pg_snames dq pg_sn0, pg_sn1, pg_sn2, pg_sn3, pg_sn4
 WSTR xp_mm_empty,    <Please enter an export password.>
 WSTR xp_mm_mismatch, <The two passwords do not match. Please re-enter them.>
 WSTR xp_mm_ok,       <All secrets were exported to the encrypted Excel file.>
@@ -894,6 +931,12 @@ g_sub_w       dw 512 dup (?)               ; subtitle scratch (wide)
 g_cmpbuf      db 256 dup (?)               ; title-A copy for WM_COMPAREITEM
 g_imp_msgw    dw 160 dup (?)               ; CSV-import result message scratch (wide)
 g_zippw       db 512 dup (?)               ; UTF-8 export-zip password (wiped after use)
+g_pg_len      dd ?                         ; password-generator: length
+g_pg_style    dd ?                         ;   PWS_* style
+g_pg_opt      dd ?                         ;   class mask + PWO_* flags
+g_pg_target   dd ?                         ;   secret row to fill on "Use" (-1 = none)
+g_pg_bits     dd ?                         ;   last entropy estimate
+g_pg_tmpw     dw 128 dup (?)               ;   scratch for composed control text
 align 4
 g_tilecolor   dd ?                         ; fill color for the next tile draw
 align 2
@@ -6906,9 +6949,13 @@ vpd_copy:
     call    gui_row_copy
     jmp     vp_handled
 vpd_gen:
-    mov     edx, eax
-    mov     rcx, qword ptr [rbp-8]
-    call    gui_gen_menu
+    mov     dword ptr [g_pg_target], eax        ; clicked secret row
+    cmp     dword ptr [g_pg_len], 0              ; first open -> sticky defaults
+    jne     @F
+    mov     dword ptr [g_pg_len], 16
+    mov     dword ptr [g_pg_style], 0
+    mov     dword ptr [g_pg_opt], PWCLASS_U or PWCLASS_L or PWCLASS_D
+@@: WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_PWGEN, qword ptr [rbp-8], addr pwgen_proc, 0
     jmp     vp_handled
 vpd_reveal:
     mov     edx, eax
@@ -7954,6 +8001,342 @@ gez_done:
     ret
 gui_export_zip endp
 
+; gui_pg_toggle_text(rcx=hdlg, edx=ctlid, r8d=state, r9=base wide) - set a toggle
+;   button's caption to "[x] "/"[ ] " + base.
+gui_pg_toggle_text proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-28], edx
+    mov     qword ptr [rbp-40], r9
+    lea     rcx, [g_pg_tmpw]
+    lea     rdx, [pg_off]
+    cmp     r8d, 0
+    je      @F
+    lea     rdx, [pg_on]
+@@: call    gui_wstrcpy
+    mov     rcx, rax
+    mov     rdx, qword ptr [rbp-40]
+    call    gui_wstrcpy
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], dword ptr [rbp-28], addr g_pg_tmpw
+    FRAME_EPILOG
+    ret
+gui_pg_toggle_text endp
+
+; gui_pg_sync(rcx=hdlg) - refresh all toggle captions, the style button and the
+;   length readout from g_pg_opt / g_pg_style / g_pg_len.
+gui_pg_sync proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    xor     r8d, r8d
+    test    dword ptr [g_pg_opt], PWCLASS_U
+    setnz   r8b
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_PG_UP
+    lea     r9, [pg_lbl_up]
+    call    gui_pg_toggle_text
+    xor     r8d, r8d
+    test    dword ptr [g_pg_opt], PWCLASS_L
+    setnz   r8b
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_PG_LO
+    lea     r9, [pg_lbl_lo]
+    call    gui_pg_toggle_text
+    xor     r8d, r8d
+    test    dword ptr [g_pg_opt], PWCLASS_D
+    setnz   r8b
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_PG_DI
+    lea     r9, [pg_lbl_di]
+    call    gui_pg_toggle_text
+    xor     r8d, r8d
+    test    dword ptr [g_pg_opt], PWCLASS_S
+    setnz   r8b
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_PG_SY
+    lea     r9, [pg_lbl_sy]
+    call    gui_pg_toggle_text
+    xor     r8d, r8d
+    test    dword ptr [g_pg_opt], PWO_NOAMBIG
+    setnz   r8b
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_PG_AMB
+    lea     r9, [pg_lbl_amb]
+    call    gui_pg_toggle_text
+    ; style button
+    lea     rcx, [g_pg_tmpw]
+    lea     rdx, [pg_style_pre]
+    call    gui_wstrcpy
+    mov     rcx, rax
+    mov     eax, dword ptr [g_pg_style]
+    lea     r10, [pg_snames]
+    mov     rdx, qword ptr [r10+rax*8]
+    call    gui_wstrcpy
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_PG_STYLE, addr g_pg_tmpw
+    ; length readout
+    mov     ecx, dword ptr [g_pg_len]
+    lea     rdx, [g_pg_tmpw]
+    call    gui_u32w
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_PG_LENVAL, addr g_pg_tmpw
+    FRAME_EPILOG
+    ret
+gui_pg_sync endp
+
+; gui_pg_regen(rcx=hdlg) - generate a fresh password into g_genout/g_genout_w and
+;   show it + the entropy estimate.
+gui_pg_regen proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    lea     rcx, [g_genout]
+    mov     edx, dword ptr [g_pg_len]
+    mov     r8d, dword ptr [g_pg_style]
+    mov     r9d, dword ptr [g_pg_opt]
+    call    pwgen_ex
+    mov     dword ptr [g_pg_bits], eax
+    test    eax, eax
+    jnz     pgr_ok
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_PG_OUT, 0
+    jmp     pgr_bits
+pgr_ok:
+    lea     r10, [g_genout]
+    xor     ecx, ecx
+pgr_sl:
+    cmp     byte ptr [r10+rcx], 0
+    je      pgr_sld
+    inc     ecx
+    cmp     ecx, 258
+    jb      pgr_sl
+pgr_sld:
+    mov     dword ptr [rbp-28], ecx
+    lea     rcx, [g_genout]
+    mov     edx, dword ptr [rbp-28]
+    lea     r8, [g_genout_w]
+    mov     r9d, 258
+    call    gui_towide
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_PG_OUT, addr g_genout_w
+pgr_bits:
+    mov     ecx, dword ptr [g_pg_bits]
+    lea     rdx, [g_pg_tmpw]
+    call    gui_u32w
+    mov     rcx, rax
+    lea     rdx, [pg_bits_suf]
+    call    gui_wstrcpy
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_PG_BITS, addr g_pg_tmpw
+    FRAME_EPILOG
+    ret
+gui_pg_regen endp
+
+; gui_pg_apply() - write the current password into the target secret row on the
+;   main vault window (g_vaulthwnd), grade it and mark dirty.
+gui_pg_apply proc frame
+    FRAME_PROLOG 48
+    cmp     dword ptr [g_pg_target], 0
+    jl      pga_done
+    mov     edx, VF_SECRET                       ; resolve the secret row afresh
+    call    gui_row_of_kind
+    cmp     eax, 0
+    jl      pga_have
+    mov     dword ptr [g_pg_target], eax
+pga_have:
+    lea     r10, [g_genout]
+    xor     ecx, ecx
+pga_sl:
+    cmp     byte ptr [r10+rcx], 0
+    je      pga_sld
+    inc     ecx
+    cmp     ecx, 258
+    jb      pga_sl
+pga_sld:
+    mov     dword ptr [rbp-28], ecx
+    lea     rcx, [g_genout]
+    mov     edx, dword ptr [rbp-28]
+    call    gui_pw_grade
+    shl     eax, FDF_PWLVL_SHIFT
+    mov     ecx, dword ptr [g_pg_target]
+    imul    ecx, ecx, DESCSZ
+    lea     r11, [g_fields]
+    add     r11, rcx
+    mov     edx, dword ptr [r11+FD_FLAGS]
+    and     edx, NOT FDF_PWLVL_MASK
+    or      edx, eax
+    mov     dword ptr [r11+FD_FLAGS], edx
+    mov     ecx, dword ptr [g_pg_target]
+    mov     edx, DS_VALUE
+    call    dynid
+    WINCALL SetDlgItemTextW, qword ptr [g_vaulthwnd], eax, addr g_genout_w
+    mov     dword ptr [g_dirty], 1
+    mov     ecx, dword ptr [g_pg_target]         ; repaint the strength badge
+    mov     edx, DS_SBADGE
+    call    dynid
+    mov     rcx, qword ptr [g_vaulthwnd]
+    mov     edx, eax
+    call    GetDlgItem
+    WINCALL InvalidateRect, rax, 0, 1
+pga_done:
+    FRAME_EPILOG
+    ret
+gui_pg_apply endp
+
+; =============================================================================
+; pwgen_proc - DLG_PWGEN dialog procedure (password generator window).
+; =============================================================================
+pwgen_proc proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 64
+    mov     qword ptr [rbp-8], rcx
+    cmp     rdx, WM_INITDIALOG
+    je      pp_init
+    cmp     rdx, WM_COMMAND
+    je      pp_cmd
+    cmp     rdx, WM_HSCROLL_
+    je      pp_hscroll
+    cmp     rdx, WM_CTLCOLORSTATIC
+    je      pp_col
+    cmp     rdx, WM_CTLCOLOREDIT
+    je      pp_col
+    cmp     rdx, WM_CTLCOLORBTN
+    je      pp_col
+    cmp     rdx, WM_CTLCOLORDLG
+    je      pp_col
+    cmp     rdx, WM_PAINT
+    je      pp_paint
+    cmp     rdx, WM_ERASEBKGND
+    je      pp_erase
+    cmp     rdx, WM_DRAWITEM
+    je      pp_draw
+    cmp     rdx, WM_TIMER
+    je      pp_timer
+    xor     eax, eax
+    jmp     pp_ret
+pp_col:
+    call    theme_ctlcolor
+    jmp     pp_ret
+pp_paint:
+    mov     rcx, qword ptr [rbp-8]
+    call    theme_paint
+    jmp     pp_ret
+pp_erase:
+    mov     rcx, r8
+    mov     rdx, qword ptr [rbp-8]
+    call    theme_erase
+    jmp     pp_ret
+pp_draw:
+    mov     rcx, r9
+    call    theme_drawitem
+    jmp     pp_ret
+pp_timer:
+    cmp     r8d, THEME_TIMER
+    jne     pp_unh
+    mov     rcx, qword ptr [rbp-8]
+    call    theme_tick
+    mov     eax, 1
+    jmp     pp_ret
+pp_unh:
+    xor     eax, eax
+    jmp     pp_ret
+pp_init:
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDOK
+    call    theme_attach
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_PG_LEN, TBM_SETRANGE, 1, 400006h
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_PG_LEN, TBM_SETPOS, 1, dword ptr [g_pg_len]
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_pg_sync
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_pg_regen
+    mov     eax, 1
+    jmp     pp_ret
+pp_hscroll:
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_PG_LEN, TBM_GETPOS, 0, 0
+    mov     dword ptr [g_pg_len], eax
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_pg_sync
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_pg_regen
+    mov     eax, 1
+    jmp     pp_ret
+pp_cmd:
+    movzx   eax, r8w
+    cmp     eax, IDOK
+    je      pp_use
+    cmp     eax, IDCANCEL
+    je      pp_cancel
+    cmp     eax, IDC_PG_REGEN
+    je      pp_regen
+    cmp     eax, IDC_PG_STYLE
+    je      pp_style
+    cmp     eax, IDC_PG_UP
+    je      pp_tup
+    cmp     eax, IDC_PG_LO
+    je      pp_tlo
+    cmp     eax, IDC_PG_DI
+    je      pp_tdi
+    cmp     eax, IDC_PG_SY
+    je      pp_tsy
+    cmp     eax, IDC_PG_AMB
+    je      pp_tamb
+    xor     eax, eax
+    jmp     pp_ret
+pp_regen:
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_pg_regen
+    mov     eax, 1
+    jmp     pp_ret
+pp_style:
+    mov     eax, dword ptr [g_pg_style]
+    inc     eax
+    cmp     eax, 5
+    jb      @F
+    xor     eax, eax
+@@: mov     dword ptr [g_pg_style], eax
+    jmp     pp_syncgen
+pp_tup:
+    xor     dword ptr [g_pg_opt], PWCLASS_U
+    jmp     pp_syncgen
+pp_tlo:
+    xor     dword ptr [g_pg_opt], PWCLASS_L
+    jmp     pp_syncgen
+pp_tdi:
+    xor     dword ptr [g_pg_opt], PWCLASS_D
+    jmp     pp_syncgen
+pp_tsy:
+    xor     dword ptr [g_pg_opt], PWCLASS_S
+    jmp     pp_syncgen
+pp_tamb:
+    xor     dword ptr [g_pg_opt], PWO_NOAMBIG
+pp_syncgen:
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_pg_sync
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_pg_regen
+    mov     eax, 1
+    jmp     pp_ret
+pp_use:
+    call    gui_pg_apply
+    lea     rcx, [g_genout]                      ; wipe plaintext scratch
+    mov     edx, 260
+    call    secure_zero
+    lea     rcx, [g_genout_w]
+    mov     edx, 520
+    call    secure_zero
+    WINCALL EndDialog, qword ptr [rbp-8], 1
+    mov     eax, 1
+    jmp     pp_ret
+pp_cancel:
+    lea     rcx, [g_genout]
+    mov     edx, 260
+    call    secure_zero
+    lea     rcx, [g_genout_w]
+    mov     edx, 520
+    call    secure_zero
+    WINCALL EndDialog, qword ptr [rbp-8], 0
+    mov     eax, 1
+pp_ret:
+    mov     rsp, rbp
+    pop     rbp
+    ret
+pwgen_proc endp
+
 ; ges_wipepw - zero the export password buffers
 ges_wipepw proc frame
     FRAME_PROLOG 32
@@ -8704,7 +9087,7 @@ gui_main proc frame
     WINCALL GetModuleHandleW, 0
     mov     qword ptr [g_hinst], rax
     mov     dword ptr [rbp-24], 8           ; INITCOMMONCONTROLSEX.dwSize
-    mov     dword ptr [rbp-20], 4000h       ; ICC_STANDARD_CLASSES (edit cue banners)
+    mov     dword ptr [rbp-20], 4004h       ; ICC_STANDARD_CLASSES | ICC_BAR_CLASSES (trackbar)
     WINCALL InitCommonControlsEx, addr rbp-24
     call    theme_boot
     call    tpm_available
