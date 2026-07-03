@@ -74,6 +74,7 @@ extern read_file:proc
 extern write_file:proc
 extern csv_to_wide:proc                 ; CSV import (csvimport.asm)
 extern csv_import_buffer:proc
+extern xlsx_import:proc                 ; Excel import (xlsximport.asm)
 externdef g_csv_alloc:qword
 extern ze_export_all:proc               ; encrypted-ZIP export (zipexport.asm)
 extern ze_free:proc
@@ -350,6 +351,7 @@ IDC_V_COLORPW equ 244                 ; overlay: colored revealed secret (owner-
 IDC_V_MEXPORT equ 245                 ; "Export all secrets to Excel" button (settings)
 IDC_V_MIMPCSV equ 246                 ; "Import from CSV" button (settings)
 IDC_V_MEXPZIP equ 247                 ; "Export to encrypted ZIP" button (settings)
+IDC_V_MIMPXLS equ 248                 ; "Import from Excel" button (settings)
 DLG_PWGEN     equ 760                 ; password-generator window
 IDC_PG_OUT    equ 761
 IDC_PG_REGEN  equ 762
@@ -601,6 +603,12 @@ WSTR imp_csv_pre,    <Imported >
 WSTR imp_csv_post,   < entries from the CSV file.>
 WSTR imp_csv_none,   <No importable entries were found in that CSV file.>
 WSTR imp_csv_rderr,  <Could not read the selected file.>
+WSTR imp_xls_title,  <Import from Excel>
+WSTR imp_xls_pre,    <Imported >
+WSTR imp_xls_post,   < entries from the Excel workbook.>
+WSTR imp_xls_none,   <No importable entries were found in that workbook.>
+WSTR imp_xls_bad,    <That file is not a readable .xlsx workbook.>
+WSTR imp_xls_enc,    <That workbook is encrypted. Opening password-protected Excel files is not supported yet - save it without a password and try again.>
 WSTR zip_title,      <Export to encrypted ZIP>
 WSTR zip_warn,       <Export EVERY entry - all fields plus attached files and images - into one AES-256 encrypted ZIP, protected only by the password you set next? Store it safely and delete it when done.>
 WSTR zip_ok,         <Export complete. The encrypted ZIP contains vordr.json (all fields) and every attachment.>
@@ -813,6 +821,11 @@ g_csvfilter label word          ; "CSV files\0*.csv\0All files\0*.*\0\0"
 g_zipfilter label word          ; "ZIP archive\0*.zip\0\0"
     dw 'Z','I','P',' ','a','r','c','h','i','v','e',0
     dw '*','.','z','i','p',0,0
+g_xlsfilter label word          ; "Excel workbooks\0*.xlsx\0All files\0*.*\0\0"
+    dw 'E','x','c','e','l',' ','w','o','r','k','b','o','o','k','s',0
+    dw '*','.','x','l','s','x',0
+    dw 'A','l','l',' ','f','i','l','e','s',0
+    dw '*','.','*',0,0
 g_empty_w label word
     dw 0                                          ; empty wide string (default field value)
 pm_custom label word
@@ -827,8 +840,8 @@ g_menu_ids label dword
     dd IDC_V_MBACK, IDC_V_MTITLE, IDC_V_MPOLL, IDC_V_MLENL, IDC_V_MLEN
     dd IDC_V_MCLSL, IDC_V_MCLS, IDC_V_MTPM, IDC_V_MTPML, IDC_V_MTPMINFO
     dd IDC_V_MTHEMEL, IDC_V_MTHEME, IDC_V_MLAYOUTL, IDC_V_MLAYOUT, IDC_V_MEXPORT
-    dd IDC_V_MIMPCSV, IDC_V_MEXPZIP
-MENU_ID_COUNT equ 17
+    dd IDC_V_MIMPCSV, IDC_V_MEXPZIP, IDC_V_MIMPXLS
+MENU_ID_COUNT equ 18
 
 .data?
 align 8
@@ -6766,6 +6779,8 @@ vp_cmd_disp:
     je      vp_impcsv
     cmp     eax, IDC_V_MEXPZIP
     je      vp_expzip
+    cmp     eax, IDC_V_MIMPXLS
+    je      vp_impxls
     cmp     eax, IDC_V_OVFL
     je      vp_ovfl
     cmp     eax, IDC_V_FAV
@@ -6851,6 +6866,10 @@ vp_impcsv:
 vp_expzip:
     mov     rcx, qword ptr [rbp-8]
     call    gui_export_zip
+    jmp     vp_handled
+vp_impxls:
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_import_xlsx
     jmp     vp_handled
 vp_ovfl:
     cmp     dword ptr [g_cur_idx], 0             ; only with an entry shown
@@ -7963,6 +7982,77 @@ gic_done:
     FRAME_EPILOG
     ret
 gui_import_csv endp
+
+; =============================================================================
+; gui_import_xlsx(rcx = hdlg) -> eax = entries imported.  Pick an .xlsx file,
+;   parse the first worksheet (header row -> field types), append every data
+;   row as a new entry, reseal and refresh.  Encrypted (password-protected)
+;   workbooks are detected (xlsx_import returns -2) and reported.
+; =============================================================================
+public gui_import_xlsx
+gui_import_xlsx proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx             ; hdlg
+    mov     dword ptr [rbp-64], 0               ; imported count
+    mov     qword ptr [rbp-32], 0               ; raw ptr (0 = not allocated)
+    lea     rax, [g_xlsfilter]
+    mov     qword ptr [g_pickfilter], rax
+    mov     rcx, qword ptr [rbp-24]
+    xor     edx, edx
+    call    img_pick
+    test    eax, eax
+    jz      gix_done
+    lea     rcx, [g_imgpath]
+    lea     rdx, [rbp-32]                       ; *raw
+    lea     r8, [rbp-40]                        ; *rawlen
+    call    read_file
+    test    eax, eax
+    jz      gix_read_ok
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr imp_xls_bad, addr imp_xls_title, 030h
+    jmp     gix_done
+gix_read_ok:
+    mov     rcx, qword ptr [rbp-32]
+    mov     edx, dword ptr [rbp-40]
+    call    xlsx_import
+    mov     dword ptr [rbp-64], eax
+    cmp     eax, -2
+    je      gix_enc
+    cmp     eax, 0
+    jl      gix_bad
+    jg      gix_ok
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr imp_xls_none, addr imp_xls_title, 030h
+    jmp     gix_done
+gix_ok:
+    call    vault_reseal
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_poplist
+    lea     rcx, [g_imp_msgw]                   ; "Imported N entries from the Excel workbook."
+    lea     rdx, [imp_xls_pre]
+    call    gui_wstrcpy
+    mov     ecx, dword ptr [rbp-64]
+    mov     rdx, rax
+    call    gui_u32w
+    mov     rcx, rax
+    lea     rdx, [imp_xls_post]
+    call    gui_wstrcpy
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr g_imp_msgw, addr imp_xls_title, 040h
+    jmp     gix_done
+gix_enc:
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr imp_xls_enc, addr imp_xls_title, 030h
+    jmp     gix_done
+gix_bad:
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr imp_xls_bad, addr imp_xls_title, 030h
+gix_done:
+    mov     rcx, qword ptr [rbp-32]             ; free the raw workbook bytes if read
+    test    rcx, rcx
+    jz      gix_ret
+    mov     rdx, qword ptr [rbp-40]
+    call    mem_free
+gix_ret:
+    mov     eax, dword ptr [rbp-64]
+    FRAME_EPILOG
+    ret
+gui_import_xlsx endp
 
 ; =============================================================================
 ; gui_export_zip(rcx = hdlg) - warn, prompt for a password, export every entry
