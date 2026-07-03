@@ -7307,7 +7307,7 @@ vp_add:
     ; (edits are only persisted by an explicit Save)
     mov     dword ptr [g_dirty], 0
 va_build:
-    ; new record = Title "New entry" + empty Username + empty Password
+    ; new record = Title "New entry" + empty Username + Password + Notes (last)
     lea     r10, [g_field_list]
     mov     qword ptr [r10+0], VF_TITLE
     mov     qword ptr [r10+8], 0
@@ -7321,7 +7321,11 @@ va_build:
     mov     qword ptr [r10+56], 0
     lea     rax, [g_empty_w]
     mov     qword ptr [r10+64], rax
-    mov     dword ptr [g_field_n], 3
+    mov     qword ptr [r10+72], VF_NOTES
+    mov     qword ptr [r10+80], 0
+    lea     rax, [g_empty_w]
+    mov     qword ptr [r10+88], rax
+    mov     dword ptr [g_field_n], 4
     call    vault_build_entry
     test    eax, eax
     jnz     vp_handled
