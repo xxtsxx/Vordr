@@ -678,6 +678,8 @@ align 8
 layout_names dq ln_comfy, ln_compact, ln_spacious
 layout_gaps  dd 7, 3, 14                          ; inter-card gap (DLU) per layout
 lay_band     dd 14, 0, 18                         ; label band: card(top) vs 0=flat(left)
+lay_itemh    dd 42, 30, 58                         ; list-item pixel height per layout
+                                                  ; (comfortable / compact / spacious)
 GUI_LAYOUT_COUNT equ 3
 pref_scheme dw 'u','i','_','s','c','h','e','m','e',0
 pref_layout dw 'u','i','_','l','a','y','o','u','t',0
@@ -1808,8 +1810,13 @@ gui_draw_listitem proc frame
     mov     dword ptr [rbp-144], eax           ; rect R
     mov     eax, dword ptr [rbp-48]
     add     eax, 22
-    mov     dword ptr [rbp-140], eax           ; rect B
-    mov     ecx, dword ptr [rbp-80]
+    mov     dword ptr [rbp-140], eax           ; rect B (top line)
+    cmp     dword ptr [g_layout], 1            ; compact: one line, vertically centered
+    jne     @F
+    mov     eax, dword ptr [rbp-64]
+    sub     eax, 2
+    mov     dword ptr [rbp-140], eax
+@@: mov     ecx, dword ptr [rbp-80]
     lea     rdx, [rbp-136]
     call    vault_title_at                     ; rax=ptr, [rbp-136]=len
     mov     rcx, rax
@@ -1818,6 +1825,8 @@ gui_draw_listitem proc frame
     mov     r9d, EBUF*2-1
     call    gui_towide
     WINCALL DrawTextW, qword ptr [rbp-32], addr g_conv_w, -1, addr rbp-152, 8024h
+    cmp     dword ptr [g_layout], 1            ; compact: no subtitle
+    je      gli_subdone
     ; subtitle (subfont, dim)
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_subfont]
     WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_textdim]
@@ -1830,6 +1839,7 @@ gui_draw_listitem proc frame
     sub     eax, 2
     mov     dword ptr [rbp-140], eax           ; rect B
     WINCALL DrawTextW, qword ptr [rbp-32], addr g_sub_w, -1, addr rbp-152, 8024h
+gli_subdone:
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-104]   ; restore font
     ; favorite marker: a small gold star on the card's right edge
     mov     ecx, dword ptr [rbp-80]
@@ -6117,7 +6127,14 @@ gui_apply_layout proc frame
     mov     rax, qword ptr [r10+rax*8]
     mov     qword ptr [rbp-32], rax
     WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_MLAYOUT, qword ptr [rbp-32]
-    cmp     dword ptr [g_menu_open], 0           ; settings open: rows are hidden, don't
+    mov     rcx, qword ptr [rbp-24]              ; re-populate so items re-measure at
+    call    gui_poplist                          ;   the new per-layout height
+    cmp     dword ptr [g_cur_idx], 0
+    jl      @F
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, dword ptr [g_cur_idx]
+    call    gui_lb_selbydata
+@@: cmp     dword ptr [g_menu_open], 0           ; settings open: rows are hidden, don't
     jne     gal_paint                            ;   re-show them (re-lays out on close)
     cmp     dword ptr [g_cur_idx], 0
     jl      gal_paint
@@ -6523,8 +6540,11 @@ vp_tdraw_list:
     mov     eax, 1
     jmp     vp_ret
 vp_measure:
-    mov     r10, r9                          ; MEASUREITEMSTRUCT.itemHeight = 42
-    mov     dword ptr [r10+16], 42
+    mov     r10, r9                          ; MEASUREITEMSTRUCT.itemHeight per layout
+    mov     eax, dword ptr [g_layout]
+    lea     r11, [lay_itemh]
+    mov     eax, dword ptr [r11+rax*4]
+    mov     dword ptr [r10+16], eax
     mov     eax, 1
     jmp     vp_ret
 vp_compare:
