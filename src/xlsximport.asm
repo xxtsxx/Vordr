@@ -1,19 +1,23 @@
 ; =============================================================================
-; xlsximport.asm - import entries from an unencrypted .xlsx workbook.
-;
-; STATUS: WORK IN PROGRESS - deliberately NOT in build.cmd yet.  The zip reader
-; + inflate + first-cell parse are validated working (extraction is byte-exact
-; vs. the real sheet1.xml; the first cell resolves to column 0 correctly), but
-; full row/column parsing has a bug (a header row yields an inflated column
-; count) still to be root-caused before this is wired into the GUI.  The
-; encrypted-.xlsx path (agile decrypt) is also still to be written.
+; xlsximport.asm - import entries from an .xlsx workbook.
 ;
 ;   xlsx_import(rcx=raw, edx=rawlen) -> eax = entries imported,
-;                                       -1 error, -2 encrypted (unsupported here)
+;                                       -1 error, -2 encrypted (needs a password)
 ;
 ; Reads the .xlsx (a zip): inflates xl/sharedStrings.xml + the first worksheet,
 ; parses rows/cells (shared / inline / value strings, XML-unescaped), maps the
-; header columns to fields via csv_hdr_type, and appends entries.
+; header columns to fields via csv_hdr_type, and appends entries.  Validated
+; end-to-end against an openpyxl-produced workbook (correct titles, field-type
+; mapping, and XML entity unescaping).
+;
+; NOTE ON LOCAL LAYOUT: the qword pointer slots and the dword counters must not
+; share any bytes.  An earlier bug placed a dword counter at [rbp-52] under a
+; qword pointer at [rbp-56] (and a dword row index at [rbp-28] under the qword
+; `cur` at [rbp-32]); writing the pointer clobbered the counter with a stack/
+; heap address's high bits.  All locals here use 8-byte spacing to avoid that.
+;
+; The encrypted-.xlsx (agile / OLE2 compound file) path is detected and returned
+; as -2 so the GUI can prompt for the workbook password.
 ; =============================================================================
 
 include macros.inc
@@ -257,13 +261,17 @@ xi_unesc endp
 
 ; xi_ttext(rcx=from, rdx=to, r8=dst, r9d=dstcap) -> eax = len.  Concatenate the
 ;   unescaped text of every <t>...</t> in [from,to].
+; Local layout uses 8-byte spacing so the qword pointer slots never overlap the
+; dword counters (an earlier -52/-56 overlap let a pointer write clobber `total`).
+;   [rbp-24] cur (q)  [rbp-32] to (q)  [rbp-40] dst (q)  [rbp-48] cap (d)
+;   [rbp-56] total (d)  [rbp-64] textstart (q)  [rbp-72] close ptr (q)
 xi_ttext proc frame
-    FRAME_PROLOG 64
+    FRAME_PROLOG 96
     mov     qword ptr [rbp-24], rcx             ; cur
     mov     qword ptr [rbp-32], rdx             ; to
     mov     qword ptr [rbp-40], r8              ; dst
     mov     dword ptr [rbp-48], r9d             ; cap
-    mov     dword ptr [rbp-52], 0               ; total
+    mov     dword ptr [rbp-56], 0               ; total
 xt_lp:
     mov     rcx, qword ptr [rbp-24]
     mov     rdx, qword ptr [rbp-32]
@@ -293,7 +301,7 @@ xt_gt:
     jmp     xt_gt
 xt_gtf:
     lea     rcx, [r10+1]                        ; text start
-    mov     qword ptr [rbp-56], rcx
+    mov     qword ptr [rbp-64], rcx
     mov     rdx, qword ptr [rbp-32]
     lea     r8, [t_close]
     mov     r9d, 4
@@ -301,22 +309,22 @@ xt_gtf:
     test    rax, rax
     jz      xt_done
     ; unescape [textstart, rax) into dst+total
-    mov     rcx, qword ptr [rbp-56]
+    mov     rcx, qword ptr [rbp-64]
     mov     rdx, rax
     mov     r8, qword ptr [rbp-40]
     mov     r9d, dword ptr [rbp-48]
-    mov     r11d, dword ptr [rbp-52]
+    mov     r11d, dword ptr [rbp-56]
     add     r8, r11
     sub     r9d, r11d
-    mov     qword ptr [rbp-64], rax             ; save close ptr
+    mov     qword ptr [rbp-72], rax             ; save close ptr
     call    xi_unesc
-    add     dword ptr [rbp-52], eax
-    mov     rax, qword ptr [rbp-64]
+    add     dword ptr [rbp-56], eax
+    mov     rax, qword ptr [rbp-72]
     lea     rcx, [rax+4]                        ; past "</t>"
     mov     qword ptr [rbp-24], rcx
     jmp     xt_lp
 xt_done:
-    mov     eax, dword ptr [rbp-52]
+    mov     eax, dword ptr [rbp-56]
     FRAME_EPILOG
     ret
 xi_ttext endp
@@ -744,10 +752,13 @@ g_xi_rawlen  dd ?
 
 ; xi_import_sheet() -> eax = imported count.  Parse rows: row 0 = header (map
 ;   columns), rows 1+ = entries.
+; [rbp-120] holds the row index as its own dword slot: it must NOT share bytes
+; with the qword `cur` at [rbp-32] (whose high half is [rbp-28]), or advancing
+; `cur` would overwrite the row index with a pointer's high bits.
 xi_import_sheet proc frame
     FRAME_PROLOG 176                            ; locals above the 5/6-arg outgoing slots
     mov     dword ptr [rbp-24], 0               ; imported
-    mov     dword ptr [rbp-28], 0               ; row index (0 = header)
+    mov     dword ptr [rbp-120], 0              ; row index (0 = header)
     mov     dword ptr [g_xl_ncol], 0
     lea     r10, [g_sheet_buf]
     mov     rax, qword ptr [r10]
@@ -865,7 +876,7 @@ xis_cendp:
     mov     dword ptr [rbp-64], 1               ; row not empty
     jmp     xis_clp
 xis_rowdone:
-    cmp     dword ptr [rbp-28], 0
+    cmp     dword ptr [rbp-120], 0
     jne     xis_datarow
     ; header row: map each non-empty column via csv_hdr_type (wide)
     mov     dword ptr [rbp-116], 0
@@ -918,7 +929,7 @@ xis_datarow:
     jz      xis_advrow
     inc     dword ptr [rbp-24]
 xis_advrow:
-    inc     dword ptr [rbp-28]
+    inc     dword ptr [rbp-120]
     jmp     xis_rlp
 xis_done:
     mov     eax, dword ptr [rbp-24]
