@@ -5,11 +5,14 @@
 ;   csv_import_buffer(rcx=wide ptr, edx=wchar count) -> eax = entries imported
 ;   gui_import_csv(rcx=hdlg) -> eax = entries imported (drives dialog + reseal)
 ;
-; The parser is RFC-4180-ish: comma-separated, optional double-quoting with ""
-; escaping, CR/CRLF/LF row breaks, embedded newlines inside quotes.  The header
-; row maps columns to fields by keyword (Chrome / Firefox / Bitwarden / LastPass
-; / KeePass exports all work).  Values are compacted and NUL-terminated in place
-; in the wide working buffer, then handed to vault_build_entry which copies them.
+; The parser is RFC-4180-ish: optional double-quoting with "" escaping,
+; CR/CRLF/LF row breaks, embedded newlines inside quotes.  The field delimiter is
+; auto-detected from the header line (comma, semicolon, tab, pipe, or space), so
+; comma / semicolon (EU Excel) / tab (TSV) / pipe / whitespace files all import.
+; The header row maps columns to fields by keyword (Chrome / Firefox / Bitwarden
+; / LastPass / KeePass exports all work).  Values are compacted and NUL-
+; terminated in place in the wide working buffer, then handed to
+; vault_build_entry which copies them.
 ; =============================================================================
 
 include macros.inc
@@ -54,6 +57,7 @@ align 8
 g_csv_cur       dq ?                     ; parse cursor (wide ptr)
 g_csv_end       dq ?                     ; end of the wide buffer
 g_csv_eol       dd ?                     ; last cell ended a row (1) / not (0)
+g_csv_delim     dd ?                     ; detected field delimiter (wide char)
 g_csv_ncol      dd ?                     ; columns seen in the header
 CSV_MAXCOL      equ 64
 g_csv_coltype   dd CSV_MAXCOL dup (?)    ; column index -> VF_* (0 = ignore)
@@ -148,13 +152,119 @@ csv_hdr_type proc frame
 csv_hdr_type endp
 
 ; =============================================================================
+; csv_detect_delim() - inspect the first line of [g_csv_cur, g_csv_end) and set
+;   g_csv_delim to the most likely field delimiter.  Counts candidate delimiters
+;   OUTSIDE quotes on the header line: the strong delimiters (comma, semicolon,
+;   tab, pipe) win by frequency with comma breaking ties; space is chosen only
+;   when no strong delimiter appears (so a comma file with spaces inside values
+;   is never mistaken for whitespace-delimited).  Defaults to comma.
+; =============================================================================
+csv_detect_delim proc frame
+    FRAME_PROLOG 64
+    mov     dword ptr [rbp-24], 0               ; comma count
+    mov     dword ptr [rbp-28], 0               ; semicolon
+    mov     dword ptr [rbp-32], 0               ; tab
+    mov     dword ptr [rbp-36], 0               ; pipe
+    mov     dword ptr [rbp-40], 0               ; space
+    mov     r10, qword ptr [g_csv_cur]
+    mov     r11, qword ptr [g_csv_end]
+    xor     r8d, r8d                            ; inside quotes?
+dd_scan:
+    cmp     r10, r11
+    jae     dd_pick
+    movzx   eax, word ptr [r10]
+    cmp     eax, 0Dh
+    je      dd_pick
+    cmp     eax, 0Ah
+    je      dd_pick
+    cmp     eax, '"'
+    jne     dd_nq
+    xor     r8d, 1
+    jmp     dd_nx
+dd_nq:
+    test    r8d, r8d
+    jnz     dd_nx
+    cmp     eax, ','
+    jne     @F
+    inc     dword ptr [rbp-24]
+    jmp     dd_nx
+@@:
+    cmp     eax, ';'
+    jne     @F
+    inc     dword ptr [rbp-28]
+    jmp     dd_nx
+@@:
+    cmp     eax, 09h
+    jne     @F
+    inc     dword ptr [rbp-32]
+    jmp     dd_nx
+@@:
+    cmp     eax, '|'
+    jne     @F
+    inc     dword ptr [rbp-36]
+    jmp     dd_nx
+@@:
+    cmp     eax, ' '
+    jne     dd_nx
+    inc     dword ptr [rbp-40]
+dd_nx:
+    add     r10, 2
+    jmp     dd_scan
+dd_pick:
+    mov     eax, ','                            ; strongest of , ; TAB | (comma wins ties)
+    mov     ecx, dword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-28]
+    cmp     edx, ecx
+    jbe     @F
+    mov     ecx, edx
+    mov     eax, ';'
+@@:
+    mov     edx, dword ptr [rbp-32]
+    cmp     edx, ecx
+    jbe     @F
+    mov     ecx, edx
+    mov     eax, 09h
+@@:
+    mov     edx, dword ptr [rbp-36]
+    cmp     edx, ecx
+    jbe     @F
+    mov     ecx, edx
+    mov     eax, '|'
+@@:
+    test    ecx, ecx
+    jnz     dd_set                              ; a strong delimiter is present
+    cmp     dword ptr [rbp-40], 0               ; else fall back to space if any
+    je      dd_comma
+    mov     eax, ' '
+    jmp     dd_set
+dd_comma:
+    mov     eax, ','
+dd_set:
+    mov     dword ptr [g_csv_delim], eax
+    FRAME_EPILOG
+    ret
+csv_detect_delim endp
+
+; =============================================================================
 ; csv_cell() -> rax = ptr to the NUL-terminated (compacted) cell value.
-;   Advances g_csv_cur past the delimiter and sets g_csv_eol (1 if the cell
-;   ended the row or the buffer).  Uses g_csv_cur / g_csv_end.  Leaf.
+;   Advances g_csv_cur past the delimiter (g_csv_delim) and sets g_csv_eol (1 if
+;   the cell ended the row or the buffer).  Uses g_csv_cur / g_csv_end.  Leaf.
 ; =============================================================================
 csv_cell proc
     mov     r10, qword ptr [g_csv_cur]          ; read ptr
     mov     r11, qword ptr [g_csv_end]
+    ; whitespace tokenization: when space is the delimiter, skip leading spaces so
+    ; a run of spaces collapses to one separator and no empty cells are produced.
+    cmp     dword ptr [g_csv_delim], ' '
+    jne     cc_nolead
+cc_lead:
+    cmp     r10, r11
+    jae     cc_nolead
+    cmp     word ptr [r10], ' '
+    jne     cc_nolead
+    add     r10, 2
+    jmp     cc_lead
+cc_nolead:
     mov     rax, r10                            ; cell start (default)
     xor     r8d, r8d                            ; quoted?
     cmp     r10, r11
@@ -196,7 +306,7 @@ cc_qcopy:
     add     r10, 2
     jmp     cc_loop
 cc_plain:
-    cmp     ecx, ','
+    cmp     ecx, dword ptr [g_csv_delim]
     je      cc_comma
     cmp     ecx, 0Dh
     je      cc_cr
@@ -244,6 +354,7 @@ csv_import_buffer proc frame
     add     rax, rcx
     mov     qword ptr [g_csv_end], rax
     mov     dword ptr [rbp-24], 0               ; imported count
+    call    csv_detect_delim                    ; sniff the field delimiter first
     ; ---- header row -> coltype[] ----
     mov     dword ptr [rbp-28], 0               ; col
 cib_hdr:
