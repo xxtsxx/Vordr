@@ -5418,7 +5418,10 @@ gui_overflow_menu endp
 gui_gen_menu proc frame
     FRAME_PROLOG 96
     mov     qword ptr [rbp-24], rcx           ; hdlg
-    mov     dword ptr [rbp-28], edx           ; row (clicked)
+    ; target row lives at [rbp-48]: it must survive the TrackPopupMenu call
+    ; (whose 6th/7th arg slots land on [rbp-72]/[rbp-64]) and must not share
+    ; bytes with the qword menu handle at [rbp-32].
+    mov     dword ptr [rbp-48], edx           ; row (clicked)
     WINCALL CreatePopupMenu
     mov     qword ptr [rbp-32], rax
     test    rax, rax
@@ -5454,7 +5457,7 @@ ggm_show:
     call    gui_row_of_kind
     cmp     eax, 0
     jl      @F
-    mov     dword ptr [rbp-28], eax
+    mov     dword ptr [rbp-48], eax
 @@:
     mov     eax, dword ptr [rbp-40]           ; preset = gen_presets[choice-1]
     dec     eax
@@ -5482,7 +5485,7 @@ ggm_lend:
     mov     edx, dword ptr [rbp-44]
     call    gui_pw_grade
     shl     eax, FDF_PWLVL_SHIFT
-    mov     ecx, dword ptr [rbp-28]
+    mov     ecx, dword ptr [rbp-48]
     imul    ecx, ecx, DESCSZ
     lea     r11, [g_fields]
     add     r11, rcx
@@ -5495,7 +5498,7 @@ ggm_lend:
     lea     r8, [g_genout_w]
     mov     r9d, 258
     call    gui_towide
-    mov     ecx, dword ptr [rbp-28]
+    mov     ecx, dword ptr [rbp-48]
     mov     edx, DS_VALUE
     call    dynid
     WINCALL SetDlgItemTextW, qword ptr [rbp-24], eax, addr g_genout_w
@@ -5518,7 +5521,7 @@ ggm_wipe2:
     jmp     ggm_wipe2
 ggm_wiped2:
     mov     dword ptr [g_dirty], 1
-    mov     ecx, dword ptr [rbp-28]           ; repaint the strength badge
+    mov     ecx, dword ptr [rbp-48]           ; repaint the strength badge
     mov     edx, DS_SBADGE
     call    dynid
     mov     rcx, qword ptr [rbp-24]
@@ -5838,17 +5841,19 @@ gui_draw_pwlegend proc frame
 lg_loop:
     cmp     ecx, 4
     jae     lg_done
-    mov     dword ptr [rbp-76], ecx
+    ; NB: keep the loop index at [rbp-68] - it must not share bytes with the
+    ; qword token pointer at [rbp-80], whose high half would clobber it.
+    mov     dword ptr [rbp-68], ecx           ; token index
     call    gui_class_color                   ; ecx = class
     WINCALL SetTextColor, qword ptr [rbp-32], eax
-    mov     ecx, dword ptr [rbp-76]           ; token text ptr
+    mov     ecx, dword ptr [rbp-68]
     lea     r10, [lg_ptrs]
-    mov     r8, qword ptr [r10+rcx*8]
+    mov     r8, qword ptr [r10+rcx*8]         ; token text ptr
     mov     qword ptr [rbp-80], r8
     WINCALL TextOutW, qword ptr [rbp-32], dword ptr [rbp-72], dword ptr [rbp-44], \
             qword ptr [rbp-80], 3
     add     dword ptr [rbp-72], 74
-    mov     ecx, dword ptr [rbp-76]
+    mov     ecx, dword ptr [rbp-68]
     inc     ecx
     jmp     lg_loop
 lg_done:
@@ -5944,8 +5949,7 @@ gui_colorpw_hide endp
 gui_colorpw_show proc frame
     FRAME_PROLOG 128
     mov     qword ptr [rbp-24], rcx
-    mov     dword ptr [rbp-28], edx
-    mov     dword ptr [g_colorpw_row], edx
+    mov     dword ptr [g_colorpw_row], edx     ; row (the only copy we need)
     mov     ecx, edx
     mov     edx, DS_VALUE
     call    gui_row_handle                    ; -> rax = value edit hwnd
