@@ -354,9 +354,8 @@ IDC_V_MLAYOUT equ 242                 ; layout cycle button (settings)
 IDC_V_MLAYOUTL equ 243                ; "Layout" label
 IDC_V_COLORPW equ 244                 ; overlay: colored revealed secret (owner-draw)
 IDC_V_MEXPORT equ 245                 ; "Export all secrets to Excel" button (settings)
-IDC_V_MIMPCSV equ 246                 ; "Import from CSV" button (settings)
+IDC_V_MIMPORT equ 246                 ; "Import..." button (auto-detects CSV / xlsx)
 IDC_V_MEXPZIP equ 247                 ; "Export to encrypted ZIP" button (settings)
-IDC_V_MIMPXLS equ 248                 ; "Import from Excel" button (settings)
 DLG_PWGEN     equ 760                 ; password-generator window
 IDC_PG_OUT    equ 761
 IDC_PG_REGEN  equ 762
@@ -615,6 +614,11 @@ WSTR imp_xls_post,   < entries from the Excel workbook.>
 WSTR imp_xls_none,   <No importable entries were found in that workbook.>
 WSTR imp_xls_bad,    <That file is not a readable .xlsx workbook.>
 WSTR imp_xls_wrongpw,<Could not open the workbook - the password was incorrect.>
+WSTR imp_g_title,    <Import>
+WSTR imp_g_pre,      <Imported >
+WSTR imp_g_post,     < entries.>
+WSTR imp_g_none,     <No importable entries were found in that file.>
+WSTR imp_g_bad,      <That file could not be read as a CSV or Excel workbook.>
 WSTR zip_title,      <Export to encrypted ZIP>
 WSTR zip_warn,       <Export EVERY entry - all fields plus attached files and images - into one AES-256 encrypted ZIP, protected only by the password you set next? Store it safely and delete it when done.>
 WSTR zip_ok,         <Export complete. The encrypted ZIP contains vordr.json (all fields) and every attachment.>
@@ -835,6 +839,11 @@ g_xlsfilter label word          ; "Excel workbooks\0*.xlsx\0All files\0*.*\0\0"
     dw '*','.','x','l','s','x',0
     dw 'A','l','l',' ','f','i','l','e','s',0
     dw '*','.','*',0,0
+g_impfilter label word          ; "Spreadsheets & CSV\0*.csv;*.xlsx\0All files\0*.*\0\0"
+    dw 'S','p','r','e','a','d','s','h','e','e','t','s',' ','&',' ','C','S','V',0
+    dw '*','.','c','s','v',';','*','.','x','l','s','x',0
+    dw 'A','l','l',' ','f','i','l','e','s',0
+    dw '*','.','*',0,0
 g_empty_w label word
     dw 0                                          ; empty wide string (default field value)
 pm_custom label word
@@ -849,8 +858,8 @@ g_menu_ids label dword
     dd IDC_V_MBACK, IDC_V_MTITLE, IDC_V_MPOLL, IDC_V_MLENL, IDC_V_MLEN
     dd IDC_V_MCLSL, IDC_V_MCLS, IDC_V_MTPM, IDC_V_MTPML, IDC_V_MTPMINFO
     dd IDC_V_MTHEMEL, IDC_V_MTHEME, IDC_V_MLAYOUTL, IDC_V_MLAYOUT, IDC_V_MEXPORT
-    dd IDC_V_MIMPCSV, IDC_V_MEXPZIP, IDC_V_MIMPXLS
-MENU_ID_COUNT equ 18
+    dd IDC_V_MIMPORT, IDC_V_MEXPZIP
+MENU_ID_COUNT equ 17
 
 .data?
 align 8
@@ -6788,12 +6797,10 @@ vp_cmd_disp:
     je      vp_layout
     cmp     eax, IDC_V_MEXPORT
     je      vp_export
-    cmp     eax, IDC_V_MIMPCSV
-    je      vp_impcsv
+    cmp     eax, IDC_V_MIMPORT
+    je      vp_import
     cmp     eax, IDC_V_MEXPZIP
     je      vp_expzip
-    cmp     eax, IDC_V_MIMPXLS
-    je      vp_impxls
     cmp     eax, IDC_V_OVFL
     je      vp_ovfl
     cmp     eax, IDC_V_FAV
@@ -6872,17 +6879,13 @@ vp_export:
     mov     rcx, qword ptr [rbp-8]
     call    gui_export_secrets
     jmp     vp_handled
-vp_impcsv:
+vp_import:
     mov     rcx, qword ptr [rbp-8]
-    call    gui_import_csv
+    call    gui_import
     jmp     vp_handled
 vp_expzip:
     mov     rcx, qword ptr [rbp-8]
     call    gui_export_zip
-    jmp     vp_handled
-vp_impxls:
-    mov     rcx, qword ptr [rbp-8]
-    call    gui_import_xlsx
     jmp     vp_handled
 vp_ovfl:
     cmp     dword ptr [g_cur_idx], 0             ; only with an entry shown
@@ -8031,168 +8034,134 @@ gu32_wl:
 gui_u32w endp
 
 ; =============================================================================
-; gui_import_csv(rcx = hdlg) -> eax = entries imported.  Pick a CSV file, decode
-;   it (UTF-8 / UTF-16), append every row as a new entry, reseal and refresh.
+; gui_import(rcx = hdlg) -> eax = entries imported.  Pick any supported file and
+;   auto-detect its format from the leading bytes: "PK" -> unencrypted .xlsx;
+;   OLE2 magic (D0 CF 11 E0) -> encrypted .xlsx (prompt for the workbook
+;   password); otherwise CSV (delimiter auto-detected).  Appends every row/entry,
+;   reseals and refreshes.
 ; =============================================================================
-public gui_import_csv
-gui_import_csv proc frame
-    FRAME_PROLOG 112
-    mov     qword ptr [rbp-24], rcx
+public gui_import
+gui_import proc frame
+    FRAME_PROLOG 128
+    mov     qword ptr [rbp-24], rcx             ; hdlg
     mov     dword ptr [rbp-64], 0               ; imported count
-    lea     rax, [g_csvfilter]
+    mov     qword ptr [rbp-32], 0               ; raw ptr (0 = not allocated)
+    lea     rax, [g_impfilter]
     mov     qword ptr [g_pickfilter], rax
     mov     rcx, qword ptr [rbp-24]
     xor     edx, edx
     call    img_pick
     test    eax, eax
-    jz      gic_done
+    jz      gim_done
     lea     rcx, [g_imgpath]
     lea     rdx, [rbp-32]                       ; *raw
     lea     r8, [rbp-40]                        ; *rawlen
     call    read_file
     test    eax, eax
-    jz      gic_read_ok
-    WINCALL gui_msgbox, qword ptr [rbp-24], addr imp_csv_rderr, addr imp_csv_title, 030h
-    jmp     gic_done
-gic_read_ok:
+    jz      gim_read_ok
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr imp_g_bad, addr imp_g_title, 030h
+    jmp     gim_done
+gim_read_ok:
+    ; ---- auto-detect the format from the leading bytes ----
+    mov     r10, qword ptr [rbp-32]             ; raw
+    cmp     dword ptr [rbp-40], 4
+    jb      gim_csv                             ; too short for zip/OLE2 -> CSV/text
+    movzx   eax, byte ptr [r10]
+    cmp     eax, 'P'                            ; "PK" -> zip -> .xlsx
+    jne     gim_chk_ole
+    cmp     byte ptr [r10+1], 'K'
+    jne     gim_chk_ole
+    mov     rcx, qword ptr [rbp-32]
+    mov     edx, dword ptr [rbp-40]
+    call    xlsx_import
+    mov     dword ptr [rbp-64], eax
+    jmp     gim_result
+gim_chk_ole:
+    cmp     eax, 0D0h                           ; D0 CF 11 E0 -> OLE2 -> encrypted .xlsx
+    jne     gim_csv
+    cmp     byte ptr [r10+1], 0CFh
+    jne     gim_csv
+    cmp     byte ptr [r10+2], 011h
+    jne     gim_csv
+    cmp     byte ptr [r10+3], 0E0h
+    jne     gim_csv
+    WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_IMPPW, qword ptr [rbp-24], addr imppw_proc, 0
+    cmp     eax, 1
+    jne     gim_done
+    mov     rcx, qword ptr [rbp-32]
+    mov     edx, dword ptr [rbp-40]
+    lea     r8, [g_xlpw]                        ; UTF-16 workbook password
+    mov     r9d, dword ptr [g_xlpwlen]
+    call    xlsx_decrypt
+    mov     dword ptr [rbp-64], eax
+    lea     rcx, [g_xlpw]                       ; wipe the workbook password
+    mov     edx, 512
+    call    secure_zero
+    mov     dword ptr [g_xlpwlen], 0
+    jmp     gim_result
+gim_csv:
     mov     rcx, qword ptr [rbp-32]
     mov     edx, dword ptr [rbp-40]
     lea     r8, [rbp-48]                        ; *wptr
     lea     r9, [rbp-56]                        ; *wcount
     call    csv_to_wide
     test    eax, eax
-    jnz     gic_freeraw
+    jnz     gim_result                          ; decode failed -> count stays 0
     mov     rcx, qword ptr [rbp-48]
     mov     edx, dword ptr [rbp-56]
     call    csv_import_buffer
     mov     dword ptr [rbp-64], eax
-    ; free the wide buffer if csv_to_wide allocated one (UTF-8 path)
-    cmp     qword ptr [g_csv_alloc], 0
-    je      gic_freeraw
+    cmp     qword ptr [g_csv_alloc], 0          ; free the wide buffer if allocated
+    je      gim_result
     mov     rcx, qword ptr [rbp-48]
     mov     rdx, qword ptr [g_csv_alloc]
     call    mem_free
-gic_freeraw:
-    mov     rcx, qword ptr [rbp-32]             ; wipe + free the raw CSV (plaintext)
-    mov     rdx, qword ptr [rbp-40]
-    call    mem_free
-    cmp     dword ptr [rbp-64], 0
-    jle     gic_none
-    call    vault_reseal
-    mov     rcx, qword ptr [rbp-24]
-    call    gui_poplist
-    lea     rcx, [g_imp_msgw]                   ; "Imported N entries from the CSV file."
-    lea     rdx, [imp_csv_pre]
-    call    gui_wstrcpy
-    mov     ecx, dword ptr [rbp-64]
-    mov     rdx, rax
-    call    gui_u32w
-    mov     rcx, rax
-    lea     rdx, [imp_csv_post]
-    call    gui_wstrcpy
-    WINCALL gui_msgbox, qword ptr [rbp-24], addr g_imp_msgw, addr imp_csv_title, 040h
-    jmp     gic_done
-gic_none:
-    WINCALL gui_msgbox, qword ptr [rbp-24], addr imp_csv_none, addr imp_csv_title, 030h
-gic_done:
-    mov     eax, dword ptr [rbp-64]
-    FRAME_EPILOG
-    ret
-gui_import_csv endp
-
-; =============================================================================
-; gui_import_xlsx(rcx = hdlg) -> eax = entries imported.  Pick an .xlsx file,
-;   parse the first worksheet (header row -> field types), append every data
-;   row as a new entry, reseal and refresh.  Password-protected (agile-encrypted)
-;   workbooks are detected (xlsx_import returns -2): we prompt for the workbook
-;   password and decrypt via xlsx_decrypt before importing.
-; =============================================================================
-public gui_import_xlsx
-gui_import_xlsx proc frame
-    FRAME_PROLOG 96
-    mov     qword ptr [rbp-24], rcx             ; hdlg
-    mov     dword ptr [rbp-64], 0               ; imported count
-    mov     qword ptr [rbp-32], 0               ; raw ptr (0 = not allocated)
-    lea     rax, [g_xlsfilter]
-    mov     qword ptr [g_pickfilter], rax
-    mov     rcx, qword ptr [rbp-24]
-    xor     edx, edx
-    call    img_pick
-    test    eax, eax
-    jz      gix_done
-    lea     rcx, [g_imgpath]
-    lea     rdx, [rbp-32]                       ; *raw
-    lea     r8, [rbp-40]                        ; *rawlen
-    call    read_file
-    test    eax, eax
-    jz      gix_read_ok
-    WINCALL gui_msgbox, qword ptr [rbp-24], addr imp_xls_bad, addr imp_xls_title, 030h
-    jmp     gix_done
-gix_read_ok:
-    mov     rcx, qword ptr [rbp-32]
-    mov     edx, dword ptr [rbp-40]
-    call    xlsx_import
-    mov     dword ptr [rbp-64], eax
-    cmp     eax, -2
-    je      gix_enc
-    cmp     eax, 0
-    jl      gix_bad
-    jg      gix_ok
-    WINCALL gui_msgbox, qword ptr [rbp-24], addr imp_xls_none, addr imp_xls_title, 030h
-    jmp     gix_done
-gix_ok:
-    call    vault_reseal
-    mov     rcx, qword ptr [rbp-24]
-    call    gui_poplist
-    lea     rcx, [g_imp_msgw]                   ; "Imported N entries from the Excel workbook."
-    lea     rdx, [imp_xls_pre]
-    call    gui_wstrcpy
-    mov     ecx, dword ptr [rbp-64]
-    mov     rdx, rax
-    call    gui_u32w
-    mov     rcx, rax
-    lea     rdx, [imp_xls_post]
-    call    gui_wstrcpy
-    WINCALL gui_msgbox, qword ptr [rbp-24], addr g_imp_msgw, addr imp_xls_title, 040h
-    jmp     gix_done
-gix_enc:
-    ; encrypted workbook: prompt for its password, then decrypt + import
-    WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_IMPPW, qword ptr [rbp-24], addr imppw_proc, 0
-    cmp     eax, 1
-    jne     gix_done
-    mov     rcx, qword ptr [rbp-32]             ; raw
-    mov     edx, dword ptr [rbp-40]             ; rawlen
-    lea     r8, [g_xlpw]                        ; UTF-16 password
-    mov     r9d, dword ptr [g_xlpwlen]          ; password bytes
-    call    xlsx_decrypt
-    mov     dword ptr [rbp-64], eax
-    lea     rcx, [g_xlpw]                       ; wipe the password
-    mov     edx, 512
-    call    secure_zero
-    mov     dword ptr [g_xlpwlen], 0
-    cmp     dword ptr [rbp-64], -3
-    je      gix_wrongpw
-    cmp     dword ptr [rbp-64], 0
-    jl      gix_bad
-    jg      gix_ok
-    WINCALL gui_msgbox, qword ptr [rbp-24], addr imp_xls_none, addr imp_xls_title, 030h
-    jmp     gix_done
-gix_wrongpw:
-    WINCALL gui_msgbox, qword ptr [rbp-24], addr imp_xls_wrongpw, addr imp_xls_title, 030h
-    jmp     gix_done
-gix_bad:
-    WINCALL gui_msgbox, qword ptr [rbp-24], addr imp_xls_bad, addr imp_xls_title, 030h
-gix_done:
-    mov     rcx, qword ptr [rbp-32]             ; free the raw workbook bytes if read
+gim_result:
+    mov     rcx, qword ptr [rbp-32]             ; wipe + free the raw file (plaintext)
     test    rcx, rcx
-    jz      gix_ret
+    jz      gim_interpret
     mov     rdx, qword ptr [rbp-40]
     call    mem_free
-gix_ret:
+    mov     qword ptr [rbp-32], 0
+gim_interpret:
+    cmp     dword ptr [rbp-64], -3
+    je      gim_wrongpw
+    cmp     dword ptr [rbp-64], 0
+    jl      gim_bad
+    jg      gim_ok
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr imp_g_none, addr imp_g_title, 030h
+    jmp     gim_done
+gim_ok:
+    call    vault_reseal
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_poplist
+    lea     rcx, [g_imp_msgw]                   ; "Imported N entries."
+    lea     rdx, [imp_g_pre]
+    call    gui_wstrcpy
+    mov     ecx, dword ptr [rbp-64]
+    mov     rdx, rax
+    call    gui_u32w
+    mov     rcx, rax
+    lea     rdx, [imp_g_post]
+    call    gui_wstrcpy
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr g_imp_msgw, addr imp_g_title, 040h
+    jmp     gim_done
+gim_wrongpw:
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr imp_xls_wrongpw, addr imp_g_title, 030h
+    jmp     gim_done
+gim_bad:
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr imp_g_bad, addr imp_g_title, 030h
+gim_done:
+    mov     rcx, qword ptr [rbp-32]             ; free raw if still allocated (cancel path)
+    test    rcx, rcx
+    jz      gim_ret
+    mov     rdx, qword ptr [rbp-40]
+    call    mem_free
+gim_ret:
     mov     eax, dword ptr [rbp-64]
     FRAME_EPILOG
     ret
-gui_import_xlsx endp
+gui_import endp
 
 ; =============================================================================
 ; gui_export_zip(rcx = hdlg) - warn, prompt for a password, export every entry

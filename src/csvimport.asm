@@ -3,7 +3,7 @@
 ;
 ;   csv_to_wide(rcx=raw, edx=rawlen, r8=*outwptr, r9=*outwcount) -> eax 0/err
 ;   csv_import_buffer(rcx=wide ptr, edx=wchar count) -> eax = entries imported
-;   gui_import_csv(rcx=hdlg) -> eax = entries imported (drives dialog + reseal)
+;   (driven by the GUI's unified gui_import, which auto-detects CSV vs .xlsx)
 ;
 ; The parser is RFC-4180-ish: optional double-quoting with "" escaping,
 ; CR/CRLF/LF row breaks, embedded newlines inside quotes.  The field delimiter is
