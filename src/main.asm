@@ -68,6 +68,7 @@ extern csv_import_buffer:proc
 extern mem_free:proc
 externdef g_csv_alloc:qword
 ; --- xetest verb: headless export composer probe ------------------------------
+extern do_attgen:proc
 extern write_file:proc
 extern ze_compose:proc
 extern ze_free:proc
@@ -178,6 +179,7 @@ WSTR w_xitest,   <xitest>
 WSTR w_xdtest,   <xdtest>
 WSTR w_citest,   <citest>
 WSTR w_xetest,   <xetest>
+WSTR w_atgen,    <atgen>
 WSTR wpw_test,   <VordrTest123>
 WSTR wpw_exp,    <VordrExp1234>
 WSTR ext_pdf,    <.pdf>
@@ -218,12 +220,13 @@ cmd_table label CMDENT
     CMDENT { w_xdtest,    cmd_xdtest,    2, 0 }   ; headless encrypted .xlsx import probe
     CMDENT { w_citest,    cmd_citest,    2, 0 }   ; headless .csv import probe
     CMDENT { w_xetest,    cmd_xetest,    4, 0 }   ; headless export probe: <vault> <out> <fmt> <attach>
+    CMDENT { w_atgen,     cmd_atgen,     1, 0 }   ; headless attachment-export probe: <out.zip>
 ifdef DBG_TRACE
     CMDENT { w_redteam,   cmd_redteam,   1, 0 }   ; fault-injection self-test (dbg)
     CMDENT { w_tpmtest,   cmd_tpmtest,   0, 0 }   ; TPM round-trip probe (dbg)
-CMD_COUNT equ 13
+CMD_COUNT equ 14
 else
-CMD_COUNT equ 11
+CMD_COUNT equ 12
 endif
 
 .data?
@@ -1221,6 +1224,41 @@ xet_fail:
     FRAME_EPILOG
     ret
 cmd_xetest endp
+
+; cmd_atgen - headless attachment-export probe.  Build an in-memory vault with a
+;   single entry carrying one staged attachment, JSON-export it WITH attachments
+;   into the AES-256 ZIP, and write the archive to argv[2].  exit 0 = OK.  Pairs
+;   with a Python check that the zip contains both vordr.json and the attachment.
+LANDING_PAD
+cmd_atgen proc frame
+    FRAME_PROLOG 48
+    call    do_attgen
+    test    eax, eax
+    jnz     atg_fail
+    lea     rcx, [wpw_exp]
+    mov     edx, 24                              ; "VordrExp1234" = 12 chars * 2
+    mov     r8d, EXP_JSON
+    mov     r9d, 1                               ; include attachments
+    call    ze_compose
+    test    eax, eax                             ; 0 = zip in g_zbuf
+    jnz     atg_fail
+    lea     r10, [g_argv]
+    mov     rcx, qword ptr [r10+16]              ; argv[2] = out path
+    lea     r11, [g_zbuf]
+    mov     rdx, qword ptr [r11]
+    mov     r8, qword ptr [r11+8]
+    call    write_file
+    mov     dword ptr [rbp-24], eax
+    call    ze_free
+    mov     eax, dword ptr [rbp-24]
+    FRAME_EPILOG
+    ret
+atg_fail:
+    call    ze_free
+    mov     eax, 0E0CDh
+    FRAME_EPILOG
+    ret
+cmd_atgen endp
 
 
 
