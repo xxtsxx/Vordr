@@ -4573,6 +4573,8 @@ iv_init:
     mov     rcx, qword ptr [rbp-8]
     mov     edx, IDC_IV_EXPORT
     call    theme_attach
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_set_winicon
     cmp     dword ptr [g_iv_isfile], 0
     je      iv_init_done
     mov     rcx, qword ptr [rbp-8]
@@ -6304,6 +6306,8 @@ pr_init:
     mov     rcx, qword ptr [rbp-8]
     mov     edx, IDOK
     call    theme_attach
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_set_winicon
     WINCALL SetForegroundWindow, qword ptr [rbp-8]
     mov     eax, 1
     jmp     pr_ret
@@ -8754,6 +8758,8 @@ pp_init:
     mov     rcx, qword ptr [rbp-8]
     mov     edx, IDOK
     call    theme_attach
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_set_winicon
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_PG_LEN, TBM_SETRANGE, 1, 400006h
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_PG_LEN, TBM_SETPOS, 1, dword ptr [g_pg_len]
     mov     rcx, qword ptr [rbp-8]
@@ -9031,6 +9037,8 @@ xpp_init:
     mov     rcx, qword ptr [rbp-8]
     mov     edx, IDOK
     call    theme_attach
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_set_winicon
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_XP_PW, EM_SETCUEBANNER, 1, addr cue_xppw
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_XP_PW2, EM_SETCUEBANNER, 1, addr cue_xppw2
     mov     dword ptr [g_uline_ctl], 0          ; start with default (accent) underlines
@@ -9194,6 +9202,8 @@ ipp_init:
     mov     rcx, qword ptr [rbp-8]
     mov     edx, IDOK
     call    theme_attach
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_set_winicon
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_XP_PW, EM_SETCUEBANNER, 1, addr cue_ippw
     mov     eax, 1
     jmp     ipp_ret
@@ -9410,6 +9420,8 @@ ic_init:
     mov     rcx, qword ptr [rbp-8]
     mov     edx, IDOK
     call    theme_attach
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_set_winicon
     cmp     dword ptr [g_icon_set], 0           ; seed the working selection
     je      ic_initdef
     mov     eax, dword ptr [g_icon_glyph]
@@ -9812,6 +9824,8 @@ mp_init:
     mov     rcx, qword ptr [rbp-8]
     mov     edx, IDC_M_OK
     call    theme_attach                     ; OK / Yes = accent primary
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_set_winicon
     sub     rsp, 32
     mov     rcx, qword ptr [rbp-8]
     mov     rdx, qword ptr [g_msg_title]
@@ -9957,6 +9971,8 @@ ap_init:
     mov     rcx, qword ptr [rbp-8]
     mov     edx, IDC_A_OK
     call    theme_attach                     ; OK = accent primary
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_set_winicon
     sub     rsp, 48                           ; load the app icon (the logo) at 72px
     mov     rcx, qword ptr [g_hinst]
     mov     edx, 1
