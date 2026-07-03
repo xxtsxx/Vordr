@@ -1205,6 +1205,21 @@ gui_wipepw proc frame
     ret
 gui_wipepw endp
 
+; gui_set_winicon(rcx=hwnd) - give a top-level window the Vordr shield in its
+;   title bar (small 16x16 for the caption, default size for Alt-Tab).
+gui_set_winicon proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    WINCALL LoadImageW, qword ptr [g_hinst], 1, 1, 16, 16, 0
+    mov     qword ptr [rbp-32], rax
+    WINCALL SendMessageW, qword ptr [rbp-24], 80h, 0, qword ptr [rbp-32]   ; WM_SETICON ICON_SMALL
+    WINCALL LoadIconW, qword ptr [g_hinst], 1
+    mov     qword ptr [rbp-32], rax
+    WINCALL SendMessageW, qword ptr [rbp-24], 80h, 1, qword ptr [rbp-32]   ; WM_SETICON ICON_BIG
+    FRAME_EPILOG
+    ret
+gui_set_winicon endp
+
 ; =============================================================================
 ; unlock_proc - DLG_UNLOCK dialog procedure (raw frame; OS callback).
 ; rcx=hdlg rdx=msg r8=wParam r9=lParam -> rax = BOOL handled
@@ -1268,6 +1283,8 @@ up_init:
     mov     rcx, qword ptr [rbp-8]
     mov     edx, IDC_U_UNLOCK
     call    theme_attach
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_set_winicon
     ; cue-banner label shown inside the (borderless) password box
     sub     rsp, 48
     mov     rcx, qword ptr [rbp-8]
@@ -6964,6 +6981,8 @@ vp_t_search:
 vp_init:
     mov     rax, qword ptr [rbp-8]            ; remember the window for the tray toggle
     mov     qword ptr [g_vaulthwnd], rax
+    mov     rcx, qword ptr [rbp-8]           ; Vordr shield in the title bar
+    call    gui_set_winicon
     call    gui_make_listfonts               ; entry-list icon/title/subtitle fonts
     mov     rcx, qword ptr [rbp-8]
     mov     edx, IDC_V_SAVE                   ; Save is the accent/primary (default) button
@@ -8133,6 +8152,8 @@ cp_init:
     mov     rcx, qword ptr [rbp-8]
     mov     edx, IDOK
     call    theme_attach
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_set_winicon
     call    gui_pwbars_init                  ; build the colour-line brushes
     ; placeholder cue text inside the two password boxes
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_C_PW, EM_SETCUEBANNER, 1, addr cue_pw
