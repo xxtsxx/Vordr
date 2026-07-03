@@ -910,6 +910,7 @@ g_cur_idx   dd ?                      ; entry currently shown/edited inline (-1=
 g_dirty     dd ?                      ; 1 = inline fields edited since last load/save
 g_loading   dd ?                      ; 1 = programmatically loading fields (ignore EN_CHANGE)
 g_editmode  dd ?                      ; 1 = detail fields editable (view/edit toggle)
+g_new_pending dd ?                    ; 1 = current entry is a just-added placeholder (delete on Cancel)
 align 8
 public g_vaulthwnd
 g_vaulthwnd dq ?                      ; the open DLG_VAULT window (0 when not shown)
@@ -2665,6 +2666,7 @@ gui_showdetail proc frame
     mov     dword ptr [g_revealed], 0
     mov     dword ptr [g_cur_idx], edx
     mov     dword ptr [g_dirty], 0
+    mov     dword ptr [g_new_pending], 0      ; navigating to an entry clears the "just-added" flag
     mov     dword ptr [g_loading], 1          ; suppress EN_CHANGE dirty while loading
     mov     dword ptr [g_totp_on], 0
     mov     dword ptr [g_totp_row], -1
@@ -7343,6 +7345,7 @@ va_build:
     mov     rcx, qword ptr [rbp-8]
     mov     edx, dword ptr [g_cur_idx]
     call    gui_showdetail
+    mov     dword ptr [g_new_pending], 1     ; mark as a placeholder: Cancel deletes it
     mov     rcx, qword ptr [rbp-8]            ; new entry opens straight into edit mode
     mov     edx, 1
     call    gui_set_editmode
@@ -7378,6 +7381,8 @@ ve_save:
     ; Cancel / pencil-off: discard any unsaved inline edits (edits are only
     ; persisted by an explicit Save) and return to view mode.
     mov     dword ptr [g_dirty], 0
+    cmp     dword ptr [g_new_pending], 0     ; cancelling a just-added placeholder?
+    jne     ve_discard_new                   ;   -> delete it instead of reloading
     cmp     dword ptr [g_cur_idx], 0
     jl      ve_view
     mov     rcx, qword ptr [rbp-8]           ; reload the entry from the vault (drops edits)
@@ -7385,6 +7390,29 @@ ve_save:
     call    gui_showdetail
 ve_view:
     mov     rcx, qword ptr [rbp-8]           ; ...then apply view-mode read-only + layout
+    xor     edx, edx
+    call    gui_set_editmode
+    jmp     vp_handled
+ve_discard_new:
+    ; the user cancelled straight out of a freshly-added entry: delete the
+    ; "New entry" placeholder rather than leaving an empty record behind.
+    mov     dword ptr [g_new_pending], 0
+    mov     ecx, dword ptr [g_cur_idx]
+    call    vault_remove_at
+    call    vault_reseal
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_poplist
+    WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_TITLE, 0
+    mov     rcx, qword ptr [rbp-8]           ; tear down the detail rows
+    call    gui_rows_clear
+    mov     dword ptr [g_totp_on], 0         ; stop any live auth-code refresh
+    sub     rsp, 32
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, TOTP_TIMER
+    call    KillTimer
+    add     rsp, 32
+    mov     dword ptr [g_cur_idx], -1
+    mov     rcx, qword ptr [rbp-8]           ; back to view mode
     xor     edx, edx
     call    gui_set_editmode
     jmp     vp_handled
@@ -7408,6 +7436,7 @@ vp_save_real:
     je      vp_handled
     cmp     dword ptr [g_cur_idx], 0
     jl      vp_handled
+    mov     dword ptr [g_new_pending], 0     ; an explicit Save keeps the entry
     mov     rcx, qword ptr [rbp-8]
     call    gui_commit
     cmp     dword ptr [g_cur_idx], 0
