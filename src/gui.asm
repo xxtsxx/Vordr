@@ -662,7 +662,7 @@ wb_close label word
 wb_add label word
     dw 002Bh, 0                                  ; +  (add)
 wb_edit label word
-    dw 270Eh, 0                                  ; pencil (edit)
+    dw 0E70Fh, 0                                 ; Segoe Fluent Icons: Edit (pencil)
 wb_save label word
     dw 2713h, 0                                  ; check mark (save / leave edit mode)
 wb_rem label word
