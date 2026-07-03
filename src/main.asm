@@ -63,6 +63,10 @@ extern vault_unlock:proc
 extern vault_reseal:proc
 extern xlsx_import:proc
 extern xlsx_decrypt:proc
+extern csv_to_wide:proc
+extern csv_import_buffer:proc
+extern mem_free:proc
+externdef g_csv_alloc:qword
 
 CP_UTF8              equ 65001
 WC_ERR_INVALID_CHARS equ 80h
@@ -163,6 +167,7 @@ WSTR w_genpw,    <genpw>
 WSTR w_seedtest, <seedtest>
 WSTR w_xitest,   <xitest>
 WSTR w_xdtest,   <xdtest>
+WSTR w_citest,   <citest>
 WSTR wpw_test,   <VordrTest123>
 WSTR ext_pdf,    <.pdf>
 WSTR w_pvtmp,    <pvtmp.pdf>
@@ -200,12 +205,13 @@ cmd_table label CMDENT
     CMDENT { w_seedtest,  cmd_seedtest,  1, 0 }   ; bulk-fill a test vault with 5000 entries
     CMDENT { w_xitest,    cmd_xitest,    2, 0 }   ; headless .xlsx import probe
     CMDENT { w_xdtest,    cmd_xdtest,    2, 0 }   ; headless encrypted .xlsx import probe
+    CMDENT { w_citest,    cmd_citest,    2, 0 }   ; headless .csv import probe
 ifdef DBG_TRACE
     CMDENT { w_redteam,   cmd_redteam,   1, 0 }   ; fault-injection self-test (dbg)
     CMDENT { w_tpmtest,   cmd_tpmtest,   0, 0 }   ; TPM round-trip probe (dbg)
-CMD_COUNT equ 11
+CMD_COUNT equ 12
 else
-CMD_COUNT equ 9
+CMD_COUNT equ 10
 endif
 
 .data?
@@ -1058,6 +1064,68 @@ xdt_fail:
     FRAME_EPILOG
     ret
 cmd_xdtest endp
+
+; cmd_citest - headless .csv import probe: unlock the vault at argv[2] with the
+;   fixed test password, import the CSV at argv[3], reseal.  exit = entries.
+LANDING_PAD
+cmd_citest proc frame
+    FRAME_PROLOG 128
+    mov     dword ptr [rbp-56], 0              ; imported count (0 on any early bail)
+    lea     r10, [g_argv]
+    mov     rax, qword ptr [r10+16]
+    mov     qword ptr [g_cfg_in], rax
+    lea     r10, [seed_pw]
+    lea     r11, [g_cfg_pass]
+    xor     ecx, ecx
+cit_cp:
+    mov     al, byte ptr [r10+rcx]
+    mov     byte ptr [r11+rcx], al
+    test    al, al
+    jz      cit_cpd
+    inc     ecx
+    cmp     ecx, 32
+    jb      cit_cp
+cit_cpd:
+    mov     dword ptr [g_cfg_passlen], 9
+    call    vault_unlock
+    test    eax, eax
+    jnz     cit_fail
+    lea     r10, [g_argv]
+    mov     rcx, qword ptr [r10+24]
+    lea     rdx, [rbp-24]                      ; *raw
+    lea     r8, [rbp-32]                       ; *rawlen
+    call    read_file
+    test    eax, eax
+    jnz     cit_fail
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-32]
+    lea     r8, [rbp-40]                       ; *wptr
+    lea     r9, [rbp-48]                       ; *wcount
+    call    csv_to_wide
+    test    eax, eax
+    jnz     cit_freeraw
+    mov     rcx, qword ptr [rbp-40]
+    mov     edx, dword ptr [rbp-48]
+    call    csv_import_buffer
+    mov     dword ptr [rbp-56], eax
+    cmp     qword ptr [g_csv_alloc], 0
+    je      cit_freeraw
+    mov     rcx, qword ptr [rbp-40]
+    mov     rdx, qword ptr [g_csv_alloc]
+    call    mem_free
+cit_freeraw:
+    mov     rcx, qword ptr [rbp-24]
+    mov     rdx, qword ptr [rbp-32]
+    call    mem_free
+    call    vault_reseal
+    mov     eax, dword ptr [rbp-56]
+    FRAME_EPILOG
+    ret
+cit_fail:
+    mov     eax, 0E0CAh
+    FRAME_EPILOG
+    ret
+cmd_citest endp
 
 
 
