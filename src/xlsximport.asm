@@ -605,11 +605,11 @@ zip_extract proc frame
     mov     qword ptr [r8], 0
     mov     rax, qword ptr [g_xi_raw]
     mov     qword ptr [rbp-48], rax             ; raw
-    mov     eax, dword ptr [g_xi_rawlen]
-    mov     dword ptr [rbp-52], eax             ; rawlen
-    ; find EOCD: scan back for 06054b50
+    ; find EOCD: scan back for 06054b50 from raw + rawlen - 22.  rawlen is used
+    ; only here, so keep it in a register - a dword local at [rbp-52] would sit
+    ; under the qword cd-cursor at [rbp-56] and be clobbered when it is written.
     mov     r10, qword ptr [rbp-48]
-    mov     eax, dword ptr [rbp-52]
+    mov     eax, dword ptr [g_xi_rawlen]
     lea     r11, [r10+rax]
     sub     r11, 22                             ; earliest EOCD start
 ze_scan:
