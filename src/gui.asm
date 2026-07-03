@@ -380,6 +380,7 @@ IDC_XP_PW2   equ 722
 IDC_XP_WARN  equ 723
 IDC_XP_PWL   equ 724
 IDC_XP_PW2L  equ 725
+DLG_IMPPW    equ 730                  ; import-password prompt (single field)
 SW_HIDE      equ 0
 SW_SHOW      equ 5
 DLG_CREATE   equ 400
@@ -637,6 +638,9 @@ WSTR xp_mm_ok,       <All secrets were exported to the encrypted Excel file.>
 WSTR xp_mm_fail,     <The export could not be completed.>
 WSTR cue_xppw,       <Export password>
 WSTR cue_xppw2,      <Confirm password>
+WSTR cue_ippw,       <Workbook password>
+WSTR imp_pw_title,   <Import from Excel>
+WSTR imp_pw_empty,   <Please enter the workbook password.>
 ; burger / close glyphs for the settings button (wide)
 wb_menu label word
     dw 2630h, 0                                  ; trigram for heaven (hamburger)
@@ -8045,7 +8049,7 @@ gix_ok:
     jmp     gix_done
 gix_enc:
     ; encrypted workbook: prompt for its password, then decrypt + import
-    WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_XLPW, qword ptr [rbp-24], addr xlpw_proc, 0
+    WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_IMPPW, qword ptr [rbp-24], addr imppw_proc, 0
     cmp     eax, 1
     jne     gix_done
     mov     rcx, qword ptr [rbp-32]             ; raw
@@ -8720,6 +8724,104 @@ xpp_ret:
     pop     rbp
     ret
 xlpw_proc endp
+
+; =============================================================================
+; imppw_proc - DLG_IMPPW dialog procedure: prompt for an existing workbook
+;   password (single field, no confirm, no policy check) to open an encrypted
+;   .xlsx for import.  Fills g_xlpw / g_xlpwlen.  Raw frame.
+; =============================================================================
+imppw_proc proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 64
+    mov     qword ptr [rbp-8], rcx
+    cmp     rdx, WM_INITDIALOG
+    je      ipp_init
+    cmp     rdx, WM_COMMAND
+    je      ipp_cmd
+    cmp     rdx, WM_CTLCOLORSTATIC
+    je      ipp_col
+    cmp     rdx, WM_CTLCOLOREDIT
+    je      ipp_col
+    cmp     rdx, WM_CTLCOLORBTN
+    je      ipp_col
+    cmp     rdx, WM_CTLCOLORDLG
+    je      ipp_col
+    cmp     rdx, WM_PAINT
+    je      ipp_paint
+    cmp     rdx, WM_ERASEBKGND
+    je      ipp_erase
+    cmp     rdx, WM_DRAWITEM
+    je      ipp_draw
+    cmp     rdx, WM_TIMER
+    je      ipp_timer
+    xor     eax, eax
+    jmp     ipp_ret
+ipp_col:
+    call    theme_ctlcolor
+    jmp     ipp_ret
+ipp_paint:
+    mov     rcx, qword ptr [rbp-8]
+    call    theme_paint
+    jmp     ipp_ret
+ipp_erase:
+    mov     rcx, r8
+    mov     rdx, qword ptr [rbp-8]
+    call    theme_erase
+    jmp     ipp_ret
+ipp_draw:
+    mov     rcx, r9
+    call    theme_drawitem
+    jmp     ipp_ret
+ipp_timer:
+    cmp     r8d, THEME_TIMER
+    jne     ipp_unh
+    mov     rcx, qword ptr [rbp-8]
+    call    theme_tick
+    mov     eax, 1
+    jmp     ipp_ret
+ipp_unh:
+    xor     eax, eax
+    jmp     ipp_ret
+ipp_init:
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDOK
+    call    theme_attach
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_XP_PW, EM_SETCUEBANNER, 1, addr cue_ippw
+    mov     eax, 1
+    jmp     ipp_ret
+ipp_cmd:
+    movzx   eax, r8w
+    cmp     eax, IDOK
+    je      ipp_ok
+    cmp     eax, IDCANCEL
+    je      ipp_cancel
+    xor     eax, eax
+    jmp     ipp_ret
+ipp_ok:
+    WINCALL GetDlgItemTextW, qword ptr [rbp-8], IDC_XP_PW, addr g_xlpw, 255
+    test    eax, eax
+    jz      ipp_empty
+    shl     eax, 1                               ; bytes = chars * 2
+    mov     dword ptr [g_xlpwlen], eax
+    WINCALL EndDialog, qword ptr [rbp-8], 1
+    mov     eax, 1
+    jmp     ipp_ret
+ipp_empty:
+    WINCALL MessageBoxW, qword ptr [rbp-8], addr imp_pw_empty, addr imp_pw_title, 030h
+    mov     eax, 1
+    jmp     ipp_ret
+ipp_cancel:
+    lea     rcx, [g_xlpw]                        ; wipe on cancel
+    mov     edx, 512
+    call    secure_zero
+    WINCALL EndDialog, qword ptr [rbp-8], 0
+    mov     eax, 1
+ipp_ret:
+    mov     rsp, rbp
+    pop     rbp
+    ret
+imppw_proc endp
 
 ; gui_resolve_vault() - decide which vault to mount at startup.
 ;   Path:  HKLM (if set) > HKCU (if set) > default Documents\vault.vordr.
