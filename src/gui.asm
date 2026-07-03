@@ -350,8 +350,6 @@ IDC_V_MTPMINFO equ 226
 IDC_V_MTPML  equ 228                  ; "TPM Unlock" label beside the toggle
 IDC_V_MTHEME equ 240                  ; color-scheme cycle button (settings)
 IDC_V_MTHEMEL equ 241                 ; "Color scheme" label
-IDC_V_MLAYOUT equ 242                 ; layout cycle button (settings)
-IDC_V_MLAYOUTL equ 243                ; "Layout" label
 IDC_V_COLORPW equ 244                 ; overlay: colored revealed secret (owner-draw)
 IDC_V_MEXPORT equ 245                 ; "Export all secrets to Excel" button (settings)
 IDC_V_MIMPORT equ 246                 ; "Import..." button (auto-detects CSV / xlsx)
@@ -697,16 +695,9 @@ sn_rose dw 'R','o','s','e',0
 align 8
 scheme_names dq sn_dark, sn_light, sn_mid, sn_contrast, sn_solar, sn_sepia, sn_nord, sn_rose
 GUI_SCHEME_COUNT equ 8
-ln_comfy dw 'C','o','m','f','o','r','t','a','b','l','e',0
-ln_compact dw 'C','o','m','p','a','c','t',0
-ln_spacious dw 'S','p','a','c','i','o','u','s',0
-align 8
-layout_names dq ln_comfy, ln_compact, ln_spacious
 layout_gaps  dd 7, 3, 14                          ; inter-card gap (DLU) per layout
 lay_band     dd 14, 0, 18                         ; label band: card(top) vs 0=flat(left)
-lay_itemh    dd 42, 30, 58                         ; list-item pixel height per layout
-                                                  ; (comfortable / compact / spacious)
-GUI_LAYOUT_COUNT equ 3
+lay_itemh    dd 42, 30, 58                         ; list-item pixel height (index 0 used)
 pref_scheme dw 'u','i','_','s','c','h','e','m','e',0
 pref_layout dw 'u','i','_','l','a','y','o','u','t',0
 gm_l1 dw 'S','t','r','o','n','g',' ','r','a','n','d','o','m',' ','2','0',0
@@ -875,9 +866,9 @@ VAULT_ID_COUNT equ 8
 g_menu_ids label dword
     dd IDC_V_MBACK, IDC_V_MTITLE, IDC_V_MPOLL, IDC_V_MLENL, IDC_V_MLEN
     dd IDC_V_MCLSL, IDC_V_MCLS, IDC_V_MTPM, IDC_V_MTPML, IDC_V_MTPMINFO
-    dd IDC_V_MTHEMEL, IDC_V_MTHEME, IDC_V_MLAYOUTL, IDC_V_MLAYOUT, IDC_V_MEXPORT
+    dd IDC_V_MTHEMEL, IDC_V_MTHEME, IDC_V_MEXPORT
     dd IDC_V_MIMPORT, IDC_V_MEXPZIP
-MENU_ID_COUNT equ 17
+MENU_ID_COUNT equ 15
 
 .data?
 align 8
@@ -6428,11 +6419,7 @@ gui_apply_scheme endp
 gui_apply_layout proc frame
     FRAME_PROLOG 48
     mov     qword ptr [rbp-24], rcx
-    mov     eax, dword ptr [g_layout]
-    lea     r10, [layout_names]
-    mov     rax, qword ptr [r10+rax*8]
-    mov     qword ptr [rbp-32], rax
-    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_MLAYOUT, qword ptr [rbp-32]
+    mov     dword ptr [g_layout], 0             ; Comfortable is the only layout
     mov     rcx, qword ptr [rbp-24]              ; re-populate so items re-measure at
     call    gui_poplist                          ;   the new per-layout height
     cmp     dword ptr [g_cur_idx], 0
@@ -6469,10 +6456,7 @@ gui_load_prefs proc frame
     jae     glp_layout
     mov     dword ptr [g_scheme], eax
 glp_layout:
-    WINCALL cfg_get_dword, addr pref_layout, 0, 0
-    cmp     eax, GUI_LAYOUT_COUNT
-    jae     glp_done
-    mov     dword ptr [g_layout], eax
+    mov     dword ptr [g_layout], 0             ; Comfortable is the only layout
 glp_done:
     FRAME_EPILOG
     ret
@@ -7073,8 +7057,6 @@ vp_cmd_disp:
     je      vp_menu
     cmp     eax, IDC_V_MTHEME
     je      vp_theme
-    cmp     eax, IDC_V_MLAYOUT
-    je      vp_layout
     cmp     eax, IDC_V_MEXPORT
     je      vp_export
     cmp     eax, IDC_V_MIMPORT
@@ -7144,17 +7126,6 @@ vp_theme:
 @@: mov     dword ptr [g_scheme], eax
     mov     rcx, qword ptr [rbp-8]
     call    gui_apply_scheme
-    call    gui_save_prefs
-    jmp     vp_handled
-vp_layout:
-    mov     eax, dword ptr [g_layout]            ; cycle layout density
-    inc     eax
-    cmp     eax, GUI_LAYOUT_COUNT
-    jb      @F
-    xor     eax, eax
-@@: mov     dword ptr [g_layout], eax
-    mov     rcx, qword ptr [rbp-8]
-    call    gui_apply_layout
     call    gui_save_prefs
     jmp     vp_handled
 vp_export:
