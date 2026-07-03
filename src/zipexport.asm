@@ -54,6 +54,7 @@ ZE_CAP      equ 32*1024*1024
 ZE_MAXFILE  equ 512
 ZE_NAMEPOOL equ 512*1024             ; persistent copies of every entry's name
 ZJ_PFX_MAX  equ 200                  ; max bytes of a title used as a folder name
+CSV_ATT_CAP equ 4096                 ; max bytes for one row's joined attachment paths
 PBKDF2_ITERS equ 1000
 
 .data?
@@ -457,7 +458,7 @@ zj_jsonname db "vordr.json"
 zj_defname  db "attachment.bin"
 zj_csvname  db "vordr.csv"
 zj_xlsxname db "vordr.xlsx"
-csv_hdr   db "title,username,password,url,notes,totp",13,10,0
+csv_hdr   db "title,username,password,url,notes,totp,attachments",13,10,0
 csv_kinds db VF_TITLE, VF_USERNAME, VF_SECRET, VF_URL, VF_NOTES, VF_TOTP
 hexdig    db "0123456789abcdef"
 
@@ -465,9 +466,11 @@ hexdig    db "0123456789abcdef"
 g_json      dq 3 dup (?)             ; {ptr,len,cap} for the fields JSON
 g_csvbuf    dq 3 dup (?)             ; {ptr,len,cap} for the CSV text
 g_ze_u8pw   db 512 dup (?)           ; wide->UTF-8 export password scratch
+g_ze_u8len  dd ?                      ; UTF-8 password length (stable copy for re-assert)
 g_zj_fld    db 40 dup (?)            ; vault_field_get out struct
 g_zj_fn     db 512 dup (?)           ; attachment filename (UTF-8)
 g_zj_path   db 768 dup (?)           ; "<title-folder>/<filename>" zip path
+g_csv_att   db CSV_ATT_CAP dup (?)   ; one row's '|'-joined attachment paths (CSV)
 
 .code
 
@@ -620,11 +623,9 @@ zbj_flp:
     call    vault_field_get
     test    eax, eax
     jz      zbj_fnext
-    mov     eax, dword ptr [g_zj_fld]
-    cmp     eax, VF_IMAGE_
-    je      zbj_fnext
-    cmp     eax, VF_FILE_
-    je      zbj_fnext
+    ; image/file fields are emitted too, but their value carries the ZIP path
+    ; (<title>/<filename>) that ze_add_attachments uses - so import can reconnect
+    ; each attachment to its record.
     cmp     dword ptr [rbp-52], 0
     jne     zbj_ffirst
     lea     rcx, [g_json]
@@ -648,10 +649,27 @@ zbj_ffirst:
     lea     rcx, [g_json]
     lea     rdx, [zj_fvalue]
     call    buf_putcstr
+    ; value: attachment fields -> the ZIP path, everything else -> the raw value
+    mov     eax, dword ptr [g_zj_fld]
+    cmp     eax, VF_IMAGE_
+    je      zbj_attval
+    cmp     eax, VF_FILE_
+    je      zbj_attval
     lea     rcx, [g_json]
     mov     rdx, qword ptr [g_zj_fld+24]
     mov     r8, qword ptr [g_zj_fld+32]
     call    json_str
+    jmp     zbj_valdone
+zbj_attval:
+    mov     ecx, dword ptr [rbp-28]             ; entry
+    mov     rdx, qword ptr [g_zj_fld+24]        ; value ptr
+    mov     r8d, dword ptr [g_zj_fld+32]        ; value len
+    call    ze_att_zippath                      ; eax = pathlen, path in g_zj_path
+    lea     rcx, [g_json]
+    lea     rdx, [g_zj_path]
+    mov     r8d, eax
+    call    json_str
+zbj_valdone:
     lea     rcx, [g_json]
     mov     dl, '}'
     call    buf_putb
@@ -744,14 +762,84 @@ ps_ret:
 ze_pathsan endp
 
 ; =============================================================================
+; ze_att_zippath(ecx = entry index, rdx = attachment value ptr, r8d = value len)
+;   -> eax = path byte length; the path "<sanitized title>/<filename>" is written
+;   into g_zj_path.  The serialized value is {AttachRef[68], filename wide}; the
+;   filename lives at value+68 (default "attachment.bin" when absent).  This is
+;   THE single source of the export path so the JSON/CSV references and the actual
+;   ZIP member name always agree.
+; =============================================================================
+public ze_att_zippath
+ze_att_zippath proc frame
+    FRAME_PROLOG 128
+    mov     dword ptr [rbp-24], ecx             ; entry
+    mov     qword ptr [rbp-32], rdx             ; value ptr
+    mov     dword ptr [rbp-40], r8d             ; value len
+    ; ---- filename (wide) at value+68 -> UTF-8 g_zj_fn (default if none) ----
+    cmp     dword ptr [rbp-40], 68
+    jbe     azp_def
+    mov     r11, qword ptr [rbp-32]
+    lea     rax, [r11+68]
+    mov     qword ptr [rbp-72], rax
+    WINCALL WideCharToMultiByte, CP_UTF8_, 0, qword ptr [rbp-72], -1, addr g_zj_fn, 500, 0, 0
+    dec     eax                                  ; strip the terminating NUL
+    cmp     eax, 0
+    jg      azp_havefn
+azp_def:
+    lea     r10, [zj_defname]
+    lea     r11, [g_zj_fn]
+    xor     r8d, r8d
+azp_dcp:
+    mov     al, byte ptr [r10+r8]
+    mov     byte ptr [r11+r8], al
+    inc     r8d
+    cmp     r8d, 14
+    jb      azp_dcp
+    mov     eax, 14
+azp_havefn:
+    mov     dword ptr [rbp-48], eax             ; fnlen
+    ; ---- sanitized title folder + '/' into g_zj_path ----
+    mov     ecx, dword ptr [rbp-24]
+    lea     rdx, [rbp-64]                        ; &titlelen
+    call    vault_title_at                      ; rax = title ptr (UTF-8)
+    mov     rcx, rax
+    mov     edx, dword ptr [rbp-64]
+    lea     r8, [g_zj_path]
+    call    ze_pathsan                          ; eax = folder-name length
+    lea     r10, [g_zj_path]
+    mov     byte ptr [r10+rax], '/'
+    inc     eax
+    mov     dword ptr [rbp-56], eax             ; prefix length
+    ; ---- append the filename bytes ----
+    lea     r10, [g_zj_path]
+    add     r10, rax
+    lea     r11, [g_zj_fn]
+    mov     ecx, dword ptr [rbp-48]             ; fnlen
+    xor     r8d, r8d
+azp_cp:
+    cmp     r8d, ecx
+    jae     azp_cpd
+    mov     al, byte ptr [r11+r8]
+    mov     byte ptr [r10+r8], al
+    inc     r8d
+    jmp     azp_cp
+azp_cpd:
+    mov     eax, dword ptr [rbp-56]
+    add     eax, dword ptr [rbp-48]             ; pathlen = prefix + fnlen
+    FRAME_EPILOG
+    ret
+ze_att_zippath endp
+
+; =============================================================================
 ; ze_add_attachments() -> eax 0/err.  Append every image/file attachment in the
 ;   vault to the open archive (ze_reset + ze_set_pw must precede).  Each blob is
 ;   decrypted to plaintext and added as "<secret title>/<filename>" (so all of a
-;   record's attachments land in one folder), then wiped + freed.
+;   record's attachments land in one folder), then wiped + freed.  The same path
+;   is recorded in the data file by ze_build_json / ze_build_csv (ze_att_zippath).
 ; =============================================================================
 public ze_add_attachments
 ze_add_attachments proc frame
-    FRAME_PROLOG 192
+    FRAME_PROLOG 144
     call    vault_count
     mov     dword ptr [rbp-40], eax             ; n
     mov     dword ptr [rbp-44], 0               ; e
@@ -780,69 +868,23 @@ zea_flp:
     je      zea_att
     jmp     zea_fnext
 zea_att:
-    ; the serialized value is {AttachRef[68], filename wide} - AttachRef at +0,
-    ; filename at +68 (this matches the GUI's own read path in gui_showdetail).
+    ; the serialized value is {AttachRef[68], filename wide} - AttachRef at +0.
     mov     r11, qword ptr [g_zj_fld+24]        ; value ptr
     mov     qword ptr [rbp-64], r11
-    mov     rax, qword ptr [g_zj_fld+32]        ; value len (>68 => a filename follows)
-    mov     qword ptr [rbp-96], rax
+    mov     eax, dword ptr [g_zj_fld+32]        ; value len
+    mov     dword ptr [rbp-96], eax
     mov     rcx, r11                             ; AttachRef = value + 0
     lea     rdx, [rbp-72]                        ; &outlen
     call    attach_open
     test    rax, rax
     jz      zea_fnext
     mov     qword ptr [rbp-80], rax             ; plaintext ptr
-    ; filename (wide) at value+68 -> UTF-8 g_zj_fn (default if none stored)
-    cmp     qword ptr [rbp-96], 68
-    jbe     zea_defname
-    mov     r11, qword ptr [rbp-64]
-    lea     rax, [r11+68]
-    mov     qword ptr [rbp-88], rax
-    WINCALL WideCharToMultiByte, CP_UTF8_, 0, qword ptr [rbp-88], -1, addr g_zj_fn, 500, 0, 0
-    dec     eax                                  ; strip the terminating NUL
-    cmp     eax, 0
-    jg      zea_havefn
-zea_defname:
-    lea     r10, [zj_defname]                    ; empty/absent name -> default
-    lea     r11, [g_zj_fn]
-    xor     r8d, r8d
-zea_dcp:
-    mov     al, byte ptr [r10+r8]
-    mov     byte ptr [r11+r8], al
-    inc     r8d
-    cmp     r8d, 14
-    jb      zea_dcp
-    mov     eax, 14
-zea_havefn:
-    mov     dword ptr [rbp-56], eax             ; fnlen
-    ; ---- build g_zj_path = "<sanitized title>/" + g_zj_fn ----
-    mov     ecx, dword ptr [rbp-44]             ; entry index
-    lea     rdx, [rbp-104]                      ; &titlelen
-    call    vault_title_at                      ; rax = title ptr (UTF-8)
-    mov     rcx, rax
-    mov     edx, dword ptr [rbp-104]            ; title len
-    lea     r8, [g_zj_path]
-    call    ze_pathsan                          ; eax = folder-name length
-    lea     r10, [g_zj_path]
-    mov     byte ptr [r10+rax], '/'             ; folder separator
-    inc     eax
-    mov     r9d, eax                            ; prefix length (folder + '/')
-    lea     r10, [g_zj_path]                    ; append the filename bytes
-    add     r10, r9
-    lea     r11, [g_zj_fn]
-    mov     ecx, dword ptr [rbp-56]             ; fnlen
-    xor     r8d, r8d
-zea_cpname:
-    cmp     r8d, ecx
-    jae     zea_cpdone
-    mov     al, byte ptr [r11+r8]
-    mov     byte ptr [r10+r8], al
-    inc     r8d
-    jmp     zea_cpname
-zea_cpdone:
-    add     r9d, ecx                            ; total path length
+    mov     ecx, dword ptr [rbp-44]             ; build "<title>/<filename>"
+    mov     rdx, qword ptr [rbp-64]
+    mov     r8d, dword ptr [rbp-96]
+    call    ze_att_zippath                      ; eax = pathlen (path in g_zj_path)
     lea     rcx, [g_zj_path]
-    mov     edx, r9d
+    mov     edx, eax
     mov     r8, qword ptr [rbp-80]
     mov     r9, qword ptr [rbp-72]
     call    ze_add_file
@@ -1014,9 +1056,85 @@ cf_none:
 ze_csv_field endp
 
 ; =============================================================================
+; ze_csv_attcell(ecx = entry) -> eax = byte length in g_csv_att.  Builds a single
+;   CSV cell value = every image/file attachment's ZIP path for the entry, joined
+;   with '|' (empty when the entry has no attachments).  Capped at CSV_ATT_CAP.
+; =============================================================================
+ze_csv_attcell proc frame
+    FRAME_PROLOG 64
+    mov     dword ptr [rbp-24], ecx             ; entry
+    mov     dword ptr [rbp-28], 0               ; out length
+    mov     ecx, dword ptr [rbp-24]
+    call    vault_field_count
+    mov     dword ptr [rbp-32], eax             ; fc
+    mov     dword ptr [rbp-36], 0               ; f
+    mov     dword ptr [rbp-40], 0               ; attachments emitted so far
+cac_lp:
+    mov     eax, dword ptr [rbp-36]
+    cmp     eax, dword ptr [rbp-32]
+    jae     cac_done
+    mov     ecx, dword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-36]
+    lea     r8, [g_zj_fld]
+    call    vault_field_get
+    test    eax, eax
+    jz      cac_next
+    mov     eax, dword ptr [g_zj_fld]
+    cmp     eax, VF_IMAGE_
+    je      cac_att
+    cmp     eax, VF_FILE_
+    je      cac_att
+    jmp     cac_next
+cac_att:
+    cmp     dword ptr [rbp-40], 0               ; '|' separator between attachments
+    je      cac_nosep
+    mov     eax, dword ptr [rbp-28]
+    cmp     eax, CSV_ATT_CAP-1
+    jae     cac_next                            ; full -> stop appending
+    lea     r10, [g_csv_att]
+    mov     byte ptr [r10+rax], '|'
+    inc     dword ptr [rbp-28]
+cac_nosep:
+    inc     dword ptr [rbp-40]
+    mov     ecx, dword ptr [rbp-24]             ; build "<title>/<filename>"
+    mov     rdx, qword ptr [g_zj_fld+24]
+    mov     r8d, dword ptr [g_zj_fld+32]
+    call    ze_att_zippath                      ; eax = pathlen, path in g_zj_path
+    mov     ecx, dword ptr [rbp-28]             ; dst offset
+    mov     edx, eax                            ; pathlen
+    mov     r9d, CSV_ATT_CAP                    ; clamp to remaining capacity
+    sub     r9d, ecx
+    cmp     edx, r9d
+    jbe     cac_cpok
+    mov     edx, r9d
+cac_cpok:
+    lea     r10, [g_csv_att]
+    add     r10, rcx
+    lea     r11, [g_zj_path]
+    xor     r8d, r8d
+cac_cp:
+    cmp     r8d, edx
+    jae     cac_cpd
+    mov     al, byte ptr [r11+r8]
+    mov     byte ptr [r10+r8], al
+    inc     r8d
+    jmp     cac_cp
+cac_cpd:
+    add     dword ptr [rbp-28], edx
+cac_next:
+    inc     dword ptr [rbp-36]
+    jmp     cac_lp
+cac_done:
+    mov     eax, dword ptr [rbp-28]
+    FRAME_EPILOG
+    ret
+ze_csv_attcell endp
+
+; =============================================================================
 ; ze_build_csv() -> eax 0/err.  Builds g_csvbuf: a UTF-8 CSV (BOM + header row)
-;   with one row per entry and the canonical columns title,username,password,
-;   url,notes,totp.  Round-trips through the CSV importer's header keywords.
+;   with one row per entry and the columns title,username,password,url,notes,totp,
+;   attachments (the last = '|'-joined ZIP paths).  The text columns round-trip
+;   through the CSV importer's header keywords.
 ; =============================================================================
 public ze_build_csv
 ze_build_csv proc frame
@@ -1073,6 +1191,18 @@ bc_ncol:
     inc     dword ptr [rbp-32]
     jmp     bc_clp
 bc_erow:
+    lea     rcx, [g_csvbuf]                     ; 7th column: attachments
+    mov     dl, ','
+    call    buf_putb
+    mov     ecx, dword ptr [rbp-28]             ; entry
+    call    ze_csv_attcell                      ; eax = len, cell in g_csv_att
+    test    eax, eax
+    jz      bc_crlf
+    mov     r8, rax
+    lea     rdx, [g_csv_att]
+    lea     rcx, [g_csvbuf]
+    call    ze_csv_cell
+bc_crlf:
     lea     rcx, [g_csvbuf]                     ; CRLF row terminator
     mov     dl, 13
     call    buf_putb
@@ -1102,6 +1232,17 @@ ze_build_csv endp
 ;   other combination (CSV, JSON, or any format WITH attachments) is wrapped in
 ;   the AES-256 encrypted ZIP (0).
 ; =============================================================================
+; zc_reassert_pw - restore g_ze_pw / g_ze_pwlen from the stable UTF-8 copy.  The
+;   data-file builders (ze_build_json / ze_build_csv) walk every entry/field and
+;   have, in some layouts, clobbered the export password length before the KDF
+;   consumes it; g_ze_u8len is captured up front and used to re-assert it right
+;   before each ze_add_file.  Tail-calls the leaf ze_set_pw.
+zc_reassert_pw proc
+    lea     rcx, [g_ze_u8pw]
+    mov     edx, dword ptr [g_ze_u8len]
+    jmp     ze_set_pw
+zc_reassert_pw endp
+
 public ze_compose
 ze_compose proc frame
     FRAME_PROLOG 96
@@ -1136,6 +1277,7 @@ comp_zip:
     shr     eax, 1                              ; wide chars
     WINCALL WideCharToMultiByte, CP_UTF8_, 0, qword ptr [rbp-24], eax, addr g_ze_u8pw, 500, 0, 0
     mov     dword ptr [rbp-44], eax             ; UTF-8 length
+    mov     dword ptr [g_ze_u8len], eax         ; stable copy (see the re-assert note below)
     call    ze_reset
     test    eax, eax
     jnz     comp_err
@@ -1151,6 +1293,7 @@ comp_zip:
     call    xl_build_xlsx
     test    eax, eax
     jnz     comp_ziperr
+    call    zc_reassert_pw
     lea     rcx, [zj_xlsxname]
     mov     edx, 10
     mov     r8, qword ptr [g_xlsx_ptr]
@@ -1162,6 +1305,7 @@ comp_json:
     call    ze_build_json
     test    eax, eax
     jnz     comp_ziperr
+    call    zc_reassert_pw
     lea     rcx, [zj_jsonname]
     mov     edx, 10
     lea     r10, [g_json]
@@ -1177,6 +1321,7 @@ comp_csv:
     call    ze_build_csv
     test    eax, eax
     jnz     comp_ziperr
+    call    zc_reassert_pw
     lea     rcx, [zj_csvname]
     mov     edx, 9
     lea     r10, [g_csvbuf]
