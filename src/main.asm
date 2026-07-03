@@ -1181,7 +1181,7 @@ xet_cpd:
     mov     dword ptr [rbp-28], eax              ; attach
     ; --- compose ---
     lea     rcx, [wpw_exp]
-    mov     edx, 24                              ; "VordrExp123!" = 12 chars * 2
+    mov     edx, 24                              ; "VordrExp1234" = 12 chars * 2
     mov     r8d, dword ptr [rbp-24]
     mov     r9d, dword ptr [rbp-28]
     call    ze_compose
