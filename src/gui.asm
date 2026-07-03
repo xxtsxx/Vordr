@@ -4516,7 +4516,7 @@ grl_lbl_done:
     mov     dword ptr [rbp-76], 150             ; flat default
 @@: cmp     dword ptr [r10+FD_KIND], VF_SECRET
     jne     grl_valpos
-    mov     dword ptr [rbp-76], 196             ; card secret (badge moved to the top-right)
+    mov     dword ptr [rbp-76], 140             ; card secret: short, so reveal/copy sit close
     cmp     dword ptr [rbp-68], 0
     jne     grl_valpos
     mov     dword ptr [rbp-76], 130             ; flat secret
@@ -4535,11 +4535,16 @@ grl_val_flat:
     mov     r9d, dword ptr [rbp-60]
     WINCALL move_ctl, rcx, rdx, r8d, r9d, dword ptr [rbp-76], dword ptr [rbp-48]
 grl_val_done:
-    ; reveal (384, content_y, 12, 12) - right-aligned on the value line
+    ; reveal on the value line: right up against the password (secret); the TOTP
+    ; key reveal stays at the right edge
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_REVEAL*8]
     mov     r8d, 384
+    cmp     dword ptr [r10+FD_KIND], VF_SECRET
+    jne     @F
+    mov     r8d, 320
+@@:
     mov     r9d, dword ptr [rbp-60]
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 12, 12
     ; copy: secret -> right cluster (352,y); totp -> next to the live code (318,y+14)
@@ -4548,7 +4553,7 @@ grl_val_done:
     je      grl_copytotp
     mov     rcx, qword ptr [rbp-24]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_COPY*8]
-    mov     r8d, 400
+    mov     r8d, 336                             ; right of the reveal, next to the password
     mov     r9d, dword ptr [rbp-60]
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 12, 12
     jmp     grl_copydone
