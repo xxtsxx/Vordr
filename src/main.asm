@@ -58,6 +58,10 @@ extern print_a:proc
 extern pwgen_ex:proc                    ; styled password generator (pwgen.asm)
 extern do_seed:proc                     ; bulk test-vault seeder (vault.asm)
 extern print_err:proc
+; --- xitest verb: headless .xlsx import probe (mirrors imgtest/pvtest) --------
+extern vault_unlock:proc
+extern vault_reseal:proc
+extern xlsx_import:proc
 
 CP_UTF8              equ 65001
 WC_ERR_INVALID_CHARS equ 80h
@@ -156,6 +160,7 @@ WSTR w_thumbtest,<thumbtest>
 WSTR w_pvtest,   <pvtest>
 WSTR w_genpw,    <genpw>
 WSTR w_seedtest, <seedtest>
+WSTR w_xitest,   <xitest>
 WSTR ext_pdf,    <.pdf>
 WSTR w_pvtmp,    <pvtmp.pdf>
 ifdef DBG_TRACE
@@ -190,12 +195,13 @@ cmd_table label CMDENT
     CMDENT { w_pvtest,    cmd_pvtest,    1, 0 }   ; preview-handler probe (.pdf): exit 0 ok
     CMDENT { w_genpw,     cmd_genpw,     0, 0 }   ; print one sample of each generator style
     CMDENT { w_seedtest,  cmd_seedtest,  1, 0 }   ; bulk-fill a test vault with 5000 entries
+    CMDENT { w_xitest,    cmd_xitest,    2, 0 }   ; headless .xlsx import probe
 ifdef DBG_TRACE
     CMDENT { w_redteam,   cmd_redteam,   1, 0 }   ; fault-injection self-test (dbg)
     CMDENT { w_tpmtest,   cmd_tpmtest,   0, 0 }   ; TPM round-trip probe (dbg)
-CMD_COUNT equ 9
+CMD_COUNT equ 10
 else
-CMD_COUNT equ 7
+CMD_COUNT equ 8
 endif
 
 .data?
@@ -945,6 +951,61 @@ cst_fail:
     FRAME_EPILOG
     ret
 cmd_seedtest endp
+
+; cmd_xitest - headless .xlsx import probe: unlock the vault at argv[2] with the
+;   fixed test password, import the workbook at argv[3], reseal.  exit = number
+;   of entries imported (or 0xE0xx on error).  Pairs with seedtest for a
+;   scriptable round-trip test of the Excel importer.
+LANDING_PAD
+cmd_xitest proc frame
+    FRAME_PROLOG 128
+    lea     r10, [g_argv]
+    mov     rax, qword ptr [r10+16]
+    mov     qword ptr [g_cfg_in], rax
+    lea     r10, [seed_pw]
+    lea     r11, [g_cfg_pass]
+    xor     ecx, ecx
+xit_cp:
+    mov     al, byte ptr [r10+rcx]
+    mov     byte ptr [r11+rcx], al
+    test    al, al
+    jz      xit_cpd
+    inc     ecx
+    cmp     ecx, 32
+    jb      xit_cp
+xit_cpd:
+    mov     dword ptr [g_cfg_passlen], 9
+    call    vault_unlock
+    test    eax, eax
+    jnz     xit_fail
+    lea     r10, [g_argv]
+    mov     rcx, qword ptr [r10+24]
+    lea     rdx, [rbp-24]
+    lea     r8, [rbp-32]
+    call    read_file
+    test    eax, eax
+    jnz     xit_fail
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-32]
+    call    xlsx_import
+    mov     dword ptr [rbp-40], eax
+    cmp     eax, 0
+    jl      xit_reterr
+    call    vault_reseal
+    mov     eax, dword ptr [rbp-40]
+    FRAME_EPILOG
+    ret
+xit_reterr:
+    mov     eax, dword ptr [rbp-40]
+    and     eax, 0FFFFh
+    or      eax, 0E0A0h
+    FRAME_EPILOG
+    ret
+xit_fail:
+    mov     eax, 0E0C8h
+    FRAME_EPILOG
+    ret
+cmd_xitest endp
 
 
 
