@@ -356,6 +356,10 @@ IDC_V_COLORPW equ 244                 ; overlay: colored revealed secret (owner-
 IDC_V_MEXPORT equ 245                 ; "Export all secrets to Excel" button (settings)
 IDC_V_MIMPORT equ 246                 ; "Import..." button (auto-detects CSV / xlsx)
 IDC_V_MEXPZIP equ 247                 ; "Export to encrypted ZIP" button (settings)
+DLG_ICON      equ 740                 ; icon picker (glyph grid + colour swatches)
+IDC_I_PREV    equ 850                 ; icon picker: live preview tile
+IDC_IG_BASE   equ 800                 ; icon picker: glyph buttons (18)
+IDC_IC_BASE   equ 830                 ; icon picker: colour swatches (12)
 DLG_PWGEN     equ 760                 ; password-generator window
 IDC_PG_OUT    equ 761
 IDC_PG_REGEN  equ 762
@@ -784,6 +788,17 @@ align 4
 g_tilepal label dword                         ; 8 tile colours (COLORREF 0x00BBGGRR)
     dd 000C06020h, 00050A028h, 0001E78E6h, 000C85A96h
     dd 000AAAA1Eh, 0004646D2h, 0009650DCh, 000826450h
+; icon picker: 18 curated Segoe Fluent glyphs (codepoints) + 12 tile colours
+GLYPHPAL_N equ 18
+g_glyphpal label dword
+    dd 0E72Eh, 0E774h, 0E77Bh, 0E715h, 0E716h, 0E7BFh   ; lock globe contact mail people shop
+    dd 0E7FCh, 0E714h, 0E753h, 0E717h, 0E8C1h, 0E8A5h   ; game media cloud phone key document
+    dd 0E734h, 0EB51h, 0E80Fh, 0E713h, 0E8F1h, 0E787h   ; star heart home settings library calendar
+GLYPHCOL_N equ 12
+g_glyphpal_col label dword
+    dd 000C06020h, 00050A028h, 0001E78E6h, 000C85A96h
+    dd 000AAAA1Eh, 0004646D2h, 0009650DCh, 000826450h
+    dd 0003030D0h, 0002EA02Eh, 000208CE6h, 000909090h  ; red green amber grey
 name_default_att label word
     dw 'v','o','r','d','r','_','a','t','t','a','c','h','.','b','i','n', 0
 cap_paste label word
@@ -942,6 +957,14 @@ g_fields      db MAXROWS*DESCSZ dup (?)   ; row descriptors
 g_gatherblob  db 32*ARFBLOB dup (?)        ; per-field attachment blobs held across reorder
 g_field_count dd ?                        ; live row count
 g_fav_state   dd ?                         ; current entry is a favorite (0/1)
+g_icon_set    dd ?                         ; current entry has a custom icon override (0/1)
+g_icon_glyph  dd ?                         ; override glyph codepoint (when g_icon_set)
+g_icon_color  dd ?                         ; override tile COLORREF   (when g_icon_set)
+g_ovr_glyph   dd ?                         ; scratch: gui_entry_icon result glyph
+g_ovr_color   dd ?                         ; scratch: gui_entry_icon result color
+g_icon_valw   dw 20 dup (?)                ; scratch wide "GGGGCCCCCCCC" for saving
+g_pick_glyph  dd ?                         ; icon picker working selection (glyph)
+g_pick_color  dd ?                         ; icon picker working selection (color)
 g_layout      dd ?                         ; UI layout/density index (0 comfortable)
 g_colorpw_row dd ?                         ; row whose revealed secret is colored (-1=none)
 g_rowpw_w     dw 512 dup (?)               ; revealed secret text for the color overlay
@@ -1606,9 +1629,112 @@ geg_kwtab label qword
     dd 0, 0
 .code
 
+; gui_hexparse(rcx=ascii ptr, edx=ndigits) -> eax = value.  Leaf.
+gui_hexparse proc
+    xor     eax, eax
+    xor     r9d, r9d
+hxp_lp:
+    cmp     r9d, edx
+    jae     hxp_done
+    movzx   r8d, byte ptr [rcx+r9]
+    cmp     r8d, '0'
+    jb      hxp_done
+    cmp     r8d, '9'
+    jbe     hxp_dig
+    or      r8d, 20h
+    sub     r8d, 'a'-10
+    jmp     hxp_add
+hxp_dig:
+    sub     r8d, '0'
+hxp_add:
+    shl     eax, 4
+    or      eax, r8d
+    inc     r9d
+    jmp     hxp_lp
+hxp_done:
+    ret
+gui_hexparse endp
+
+; gui_entry_icon(ecx=idx) -> eax = 1 if the entry has a VF_ICON override (sets
+;   g_ovr_glyph / g_ovr_color), else 0.
+gui_entry_icon proc frame
+    FRAME_PROLOG 64
+    mov     edx, VF_ICON
+    lea     r8, [rbp-24]                        ; &len
+    call    vault_field_at                      ; rcx = idx
+    test    rax, rax
+    jz      gei_no
+    mov     qword ptr [rbp-40], rax             ; value ptr (UTF-8 hex)
+    cmp     dword ptr [rbp-24], 12
+    jb      gei_no
+    mov     rcx, rax
+    mov     edx, 4
+    call    gui_hexparse
+    mov     dword ptr [g_ovr_glyph], eax
+    mov     rcx, qword ptr [rbp-40]
+    add     rcx, 4
+    mov     edx, 8
+    call    gui_hexparse
+    mov     dword ptr [g_ovr_color], eax
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gei_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gui_entry_icon endp
+
+; gie_write(eax=value, r11d=ndigits, r10=dst) - append ndigits uppercase hex
+;   (MSB first) as wide chars, advance r10.  Clobbers ecx/r8.  Leaf.
+gie_write proc
+    mov     ecx, r11d
+    dec     ecx
+    shl     ecx, 2                              ; top-nibble bit offset
+gw_lp:
+    mov     r8d, eax
+    shr     r8d, cl
+    and     r8d, 0Fh
+    cmp     r8d, 10
+    jb      gw_dig
+    add     r8d, 'A'-10
+    jmp     gw_put
+gw_dig:
+    add     r8d, '0'
+gw_put:
+    mov     word ptr [r10], r8w
+    add     r10, 2
+    sub     ecx, 4
+    jns     gw_lp
+    ret
+gie_write endp
+
+; gui_icon_encode() - render g_icon_glyph + g_icon_color into g_icon_valw as a
+;   NUL-terminated wide "GGGGCCCCCCCC" (4 glyph hex + 8 colour hex).
+gui_icon_encode proc frame
+    FRAME_PROLOG 32
+    lea     r10, [g_icon_valw]
+    mov     eax, dword ptr [g_icon_glyph]
+    mov     r11d, 4
+    call    gie_write
+    mov     eax, dword ptr [g_icon_color]
+    mov     r11d, 8
+    call    gie_write
+    mov     word ptr [r10], 0
+    FRAME_EPILOG
+    ret
+gui_icon_encode endp
+
 gui_entry_glyph proc frame
     FRAME_PROLOG 112
     mov     dword ptr [rbp-24], ecx
+    call    gui_entry_icon                      ; user override wins
+    test    eax, eax
+    jz      geg_auto
+    mov     eax, dword ptr [g_ovr_glyph]
+    FRAME_EPILOG
+    ret
+geg_auto:
     ; brand/keyword match on the title first
     mov     ecx, dword ptr [rbp-24]
     lea     rdx, [rbp-96]
@@ -1678,9 +1804,19 @@ geg_deflt:
     ret
 gui_entry_glyph endp
 
-; gui_entry_color(ecx=idx) -> eax = a stable tile color from the title hash.
+; gui_entry_color(ecx=idx) -> eax = tile color: the VF_ICON override if set,
+;   else a stable colour from the title hash.
 gui_entry_color proc frame
-    FRAME_PROLOG 48
+    FRAME_PROLOG 64
+    mov     dword ptr [rbp-40], ecx             ; save idx across the override probe
+    call    gui_entry_icon
+    test    eax, eax
+    jz      gec_auto
+    mov     eax, dword ptr [g_ovr_color]
+    FRAME_EPILOG
+    ret
+gec_auto:
+    mov     ecx, dword ptr [rbp-40]
     lea     rdx, [rbp-24]
     call    vault_title_at                      ; rax=ptr, [rbp-24]=len
     mov     r8, qword ptr [rbp-24]
@@ -2458,6 +2594,16 @@ gui_showdetail proc frame
     mov     ecx, dword ptr [rbp-32]           ; favorite state for this entry
     call    gui_entry_is_fav
     mov     dword ptr [g_fav_state], eax
+    mov     ecx, dword ptr [rbp-32]           ; custom icon override for this entry
+    call    gui_entry_icon
+    mov     dword ptr [g_icon_set], eax
+    test    eax, eax
+    jz      gsd_noicon
+    mov     eax, dword ptr [g_ovr_glyph]
+    mov     dword ptr [g_icon_glyph], eax
+    mov     eax, dword ptr [g_ovr_color]
+    mov     dword ptr [g_icon_color], eax
+gsd_noicon:
     ; stop any prior live-code timer and tear down old rows
     sub     rsp, 32
     mov     rcx, qword ptr [rbp-24]
@@ -2493,6 +2639,8 @@ gsd_floop:
     cmp     eax, VF_TITLE
     je      gsd_fnext
     cmp     eax, VF_FAV                          ; reserved favorite marker: not a row
+    je      gsd_fnext
+    cmp     eax, VF_ICON                         ; reserved icon override: not a row
     je      gsd_fnext
     mov     rcx, qword ptr [rbp-24]
     mov     edx, eax
@@ -2992,6 +3140,20 @@ gg_done:
     mov     qword ptr [r11+16], rax              ; value "1"
     inc     dword ptr [rbp-32]
 gg_favdone:
+    ; append the custom icon override when set
+    cmp     dword ptr [g_icon_set], 0
+    je      gg_icondone
+    call    gui_icon_encode
+    mov     eax, dword ptr [rbp-32]
+    imul    eax, eax, 24
+    lea     r11, [g_field_list]
+    add     r11, rax
+    mov     qword ptr [r11+0], VF_ICON
+    mov     qword ptr [r11+8], 0                 ; no label
+    lea     rax, [g_icon_valw]
+    mov     qword ptr [r11+16], rax
+    inc     dword ptr [rbp-32]
+gg_icondone:
     mov     eax, dword ptr [rbp-32]
     mov     dword ptr [g_field_n], eax
     FRAME_EPILOG
@@ -5017,6 +5179,8 @@ grb_loop:
     and     eax, NOT VFL_RAW                    ; clean base kind
     cmp     eax, VF_FAV                         ; reserved favorite marker: not a row
     je      grb_next
+    cmp     eax, VF_ICON                        ; reserved icon override: not a row
+    je      grb_next
     mov     rcx, qword ptr [rbp-24]
     mov     edx, eax
     call    gui_row_add
@@ -6818,6 +6982,8 @@ vp_cmd_disp:
     je      vp_ovfl
     cmp     eax, IDC_V_FAV
     je      vp_fav
+    cmp     eax, IDC_V_HEADER                    ; click the entry icon -> icon picker
+    je      vp_iconpick
     cmp     eax, IDC_V_MTPMINFO
     je      vp_tpminfo
     cmp     eax, IDC_V_MTPM
@@ -6905,6 +7071,28 @@ vp_ovfl:
     jl      vp_handled
     mov     rcx, qword ptr [rbp-8]
     call    gui_overflow_menu
+    jmp     vp_handled
+vp_iconpick:
+    cmp     dword ptr [g_cur_idx], 0             ; only with an entry shown
+    jl      vp_handled
+    WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_ICON, qword ptr [rbp-8], addr icon_proc, 0
+    cmp     eax, 1
+    jne     vp_handled
+    mov     rcx, qword ptr [rbp-8]               ; persist immediately (like favorites)
+    call    gui_commit
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_show_times
+    mov     rcx, qword ptr [rbp-8]               ; refresh the list (icon changed there too)
+    call    gui_poplist
+    mov     rcx, qword ptr [rbp-8]               ; repaint the detail header
+    mov     edx, IDC_V_HEADER
+    call    GetDlgItem
+    sub     rsp, 32
+    mov     rcx, rax
+    xor     edx, edx
+    mov     r8d, 1
+    call    InvalidateRect
+    add     rsp, 32
     jmp     vp_handled
 vp_fav:
     cmp     dword ptr [g_cur_idx], 0             ; only with an entry shown
@@ -8945,6 +9133,287 @@ ipp_ret:
     pop     rbp
     ret
 imppw_proc endp
+
+; =============================================================================
+; Icon picker (DLG_ICON): a glyph grid + colour swatches + live preview.  On OK
+; it writes the chosen glyph/colour into g_icon_glyph / g_icon_color and sets
+; g_icon_set; the caller persists via gui_commit.
+; =============================================================================
+; ic_glyph_btn(rcx=DRAWITEMSTRUCT, r8d=index) - draw one glyph palette button.
+ic_glyph_btn proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-32], r8d
+    mov     r10, rcx
+    mov     rax, qword ptr [r10+32]
+    mov     qword ptr [rbp-40], rax            ; hdc
+    WINCALL CreateSolidBrush, dword ptr [g_col_panel]
+    mov     qword ptr [rbp-48], rax
+    mov     r10, qword ptr [rbp-24]
+    lea     rdx, [r10+40]
+    WINCALL FillRect, qword ptr [rbp-40], rdx, qword ptr [rbp-48]
+    WINCALL DeleteObject, qword ptr [rbp-48]
+    mov     eax, dword ptr [rbp-32]
+    lea     r10, [g_glyphpal]
+    mov     eax, dword ptr [r10+rax*4]
+    cmp     eax, dword ptr [g_pick_glyph]
+    jne     igb_noborder
+    WINCALL CreateSolidBrush, dword ptr [g_col_text]
+    mov     qword ptr [rbp-48], rax
+    mov     r10, qword ptr [rbp-24]
+    lea     rdx, [r10+40]
+    WINCALL FrameRect, qword ptr [rbp-40], rdx, qword ptr [rbp-48]
+    WINCALL DeleteObject, qword ptr [rbp-48]
+igb_noborder:
+    mov     eax, dword ptr [rbp-32]            ; reload the glyph (avoid a stack slot)
+    lea     r10, [g_glyphpal]
+    mov     eax, dword ptr [r10+rax*4]
+    mov     word ptr [g_glyph_w], ax
+    mov     word ptr [g_glyph_w+2], 0
+    WINCALL SelectObject, qword ptr [rbp-40], qword ptr [g_iconfont]
+    mov     qword ptr [rbp-56], rax
+    WINCALL SetTextColor, qword ptr [rbp-40], dword ptr [g_col_text]
+    WINCALL SetBkMode, qword ptr [rbp-40], 1
+    mov     r10, qword ptr [rbp-24]
+    mov     eax, dword ptr [r10+40]
+    mov     dword ptr [rbp-72], eax
+    mov     eax, dword ptr [r10+44]
+    mov     dword ptr [rbp-68], eax
+    mov     eax, dword ptr [r10+48]
+    mov     dword ptr [rbp-64], eax
+    mov     eax, dword ptr [r10+52]
+    mov     dword ptr [rbp-60], eax
+    WINCALL DrawTextW, qword ptr [rbp-40], addr g_glyph_w, -1, addr rbp-72, 25h
+    WINCALL SelectObject, qword ptr [rbp-40], qword ptr [rbp-56]
+    FRAME_EPILOG
+    ret
+ic_glyph_btn endp
+
+; ic_color_btn(rcx=DRAWITEMSTRUCT, r8d=index) - draw one colour swatch button.
+ic_color_btn proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-32], r8d
+    mov     r10, rcx
+    mov     rax, qword ptr [r10+32]
+    mov     qword ptr [rbp-40], rax            ; hdc
+    mov     eax, dword ptr [rbp-32]
+    lea     r10, [g_glyphpal_col]
+    mov     eax, dword ptr [r10+rax*4]
+    mov     dword ptr [rbp-48], eax            ; this colour
+    WINCALL CreateSolidBrush, dword ptr [rbp-48]
+    mov     qword ptr [rbp-56], rax
+    mov     r10, qword ptr [rbp-24]
+    lea     rdx, [r10+40]
+    WINCALL FillRect, qword ptr [rbp-40], rdx, qword ptr [rbp-56]
+    WINCALL DeleteObject, qword ptr [rbp-56]
+    mov     eax, dword ptr [rbp-48]
+    cmp     eax, dword ptr [g_pick_color]
+    jne     icb_done
+    WINCALL CreateSolidBrush, dword ptr [g_col_text]
+    mov     qword ptr [rbp-56], rax
+    mov     r10, qword ptr [rbp-24]
+    lea     rdx, [r10+40]
+    WINCALL FrameRect, qword ptr [rbp-40], rdx, qword ptr [rbp-56]
+    WINCALL DeleteObject, qword ptr [rbp-56]
+icb_done:
+    FRAME_EPILOG
+    ret
+ic_color_btn endp
+
+; ic_prev_btn(rcx=DRAWITEMSTRUCT) - draw the live preview tile.
+ic_prev_btn proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    mov     r10, rcx
+    mov     rax, qword ptr [r10+32]
+    mov     qword ptr [rbp-40], rax            ; hdc
+    WINCALL CreateSolidBrush, dword ptr [g_col_bg]
+    mov     qword ptr [rbp-48], rax
+    mov     r10, qword ptr [rbp-24]
+    lea     rdx, [r10+40]
+    WINCALL FillRect, qword ptr [rbp-40], rdx, qword ptr [rbp-48]
+    WINCALL DeleteObject, qword ptr [rbp-48]
+    mov     eax, dword ptr [g_pick_color]
+    mov     dword ptr [g_tilecolor], eax
+    mov     eax, dword ptr [g_pick_glyph]
+    mov     word ptr [g_glyph_w], ax
+    mov     word ptr [g_glyph_w+2], 0
+    mov     rcx, qword ptr [rbp-40]
+    mov     r10, qword ptr [rbp-24]
+    mov     edx, dword ptr [r10+40]            ; L
+    mov     r8d, dword ptr [r10+44]            ; T
+    mov     r9d, dword ptr [r10+52]
+    sub     r9d, dword ptr [r10+44]            ; size = B - T
+    call    gui_draw_tile
+    FRAME_EPILOG
+    ret
+ic_prev_btn endp
+
+; ic_refresh(rcx=hwnd) - repaint the whole picker (grid highlights + preview).
+ic_refresh proc
+    sub     rsp, 40
+    xor     edx, edx
+    xor     r8, r8
+    mov     r9d, 85h                            ; RDW_INVALIDATE|RDW_ERASE|RDW_ALLCHILDREN
+    call    RedrawWindow
+    add     rsp, 40
+    ret
+ic_refresh endp
+
+icon_proc proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 64
+    mov     qword ptr [rbp-8], rcx
+    cmp     rdx, WM_INITDIALOG
+    je      ic_init
+    cmp     rdx, WM_COMMAND
+    je      ic_cmd
+    cmp     rdx, WM_DRAWITEM
+    je      ic_draw
+    cmp     rdx, WM_CTLCOLORSTATIC
+    je      ic_col
+    cmp     rdx, WM_CTLCOLOREDIT
+    je      ic_col
+    cmp     rdx, WM_CTLCOLORBTN
+    je      ic_col
+    cmp     rdx, WM_CTLCOLORDLG
+    je      ic_col
+    cmp     rdx, WM_PAINT
+    je      ic_paint
+    cmp     rdx, WM_ERASEBKGND
+    je      ic_erase
+    cmp     rdx, WM_TIMER
+    je      ic_timer
+    xor     eax, eax
+    jmp     ic_ret
+ic_col:
+    call    theme_ctlcolor
+    jmp     ic_ret
+ic_paint:
+    mov     rcx, qword ptr [rbp-8]
+    call    theme_paint
+    jmp     ic_ret
+ic_erase:
+    mov     rcx, r8
+    mov     rdx, qword ptr [rbp-8]
+    call    theme_erase
+    jmp     ic_ret
+ic_timer:
+    cmp     r8d, THEME_TIMER
+    jne     ic_unh
+    mov     rcx, qword ptr [rbp-8]
+    call    theme_tick
+    mov     eax, 1
+    jmp     ic_ret
+ic_unh:
+    xor     eax, eax
+    jmp     ic_ret
+ic_init:
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDOK
+    call    theme_attach
+    cmp     dword ptr [g_icon_set], 0           ; seed the working selection
+    je      ic_initdef
+    mov     eax, dword ptr [g_icon_glyph]
+    mov     dword ptr [g_pick_glyph], eax
+    mov     eax, dword ptr [g_icon_color]
+    mov     dword ptr [g_pick_color], eax
+    mov     eax, 1
+    jmp     ic_ret
+ic_initdef:
+    mov     eax, dword ptr [g_glyphpal]
+    mov     dword ptr [g_pick_glyph], eax
+    mov     eax, dword ptr [g_glyphpal_col]
+    mov     dword ptr [g_pick_color], eax
+    mov     eax, 1
+    jmp     ic_ret
+ic_draw:
+    mov     eax, r8d                            ; ctl id
+    cmp     eax, IDC_I_PREV
+    je      ic_dprev
+    cmp     eax, IDC_IG_BASE
+    jb      ic_dtheme
+    cmp     eax, IDC_IG_BASE + GLYPHPAL_N
+    jb      ic_dglyph
+    cmp     eax, IDC_IC_BASE
+    jb      ic_dtheme
+    cmp     eax, IDC_IC_BASE + GLYPHCOL_N
+    jb      ic_dcolor
+ic_dtheme:
+    mov     rcx, r9
+    call    theme_drawitem
+    mov     eax, 1
+    jmp     ic_ret
+ic_dglyph:
+    sub     r8d, IDC_IG_BASE
+    mov     rcx, r9
+    call    ic_glyph_btn
+    mov     eax, 1
+    jmp     ic_ret
+ic_dcolor:
+    sub     r8d, IDC_IC_BASE
+    mov     rcx, r9
+    call    ic_color_btn
+    mov     eax, 1
+    jmp     ic_ret
+ic_dprev:
+    mov     rcx, r9
+    call    ic_prev_btn
+    mov     eax, 1
+    jmp     ic_ret
+ic_cmd:
+    movzx   eax, r8w
+    cmp     eax, IDOK
+    je      ic_ok
+    cmp     eax, IDCANCEL
+    je      ic_cancel
+    cmp     eax, IDC_IG_BASE
+    jb      ic_unh
+    cmp     eax, IDC_IG_BASE + GLYPHPAL_N
+    jb      ic_pickg
+    cmp     eax, IDC_IC_BASE
+    jb      ic_unh
+    cmp     eax, IDC_IC_BASE + GLYPHCOL_N
+    jb      ic_pickc
+    xor     eax, eax
+    jmp     ic_ret
+ic_pickg:
+    sub     eax, IDC_IG_BASE
+    lea     r10, [g_glyphpal]
+    mov     eax, dword ptr [r10+rax*4]
+    mov     dword ptr [g_pick_glyph], eax
+    mov     rcx, qword ptr [rbp-8]
+    call    ic_refresh
+    mov     eax, 1
+    jmp     ic_ret
+ic_pickc:
+    sub     eax, IDC_IC_BASE
+    lea     r10, [g_glyphpal_col]
+    mov     eax, dword ptr [r10+rax*4]
+    mov     dword ptr [g_pick_color], eax
+    mov     rcx, qword ptr [rbp-8]
+    call    ic_refresh
+    mov     eax, 1
+    jmp     ic_ret
+ic_ok:
+    mov     eax, dword ptr [g_pick_glyph]
+    mov     dword ptr [g_icon_glyph], eax
+    mov     eax, dword ptr [g_pick_color]
+    mov     dword ptr [g_icon_color], eax
+    mov     dword ptr [g_icon_set], 1
+    WINCALL EndDialog, qword ptr [rbp-8], 1
+    mov     eax, 1
+    jmp     ic_ret
+ic_cancel:
+    WINCALL EndDialog, qword ptr [rbp-8], 0
+    mov     eax, 1
+ic_ret:
+    mov     rsp, rbp
+    pop     rbp
+    ret
+icon_proc endp
 
 ; gui_resolve_vault() - decide which vault to mount at startup.
 ;   Path:  HKLM (if set) > HKCU (if set) > default Documents\vault.vordr.
