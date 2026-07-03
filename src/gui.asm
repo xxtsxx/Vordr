@@ -473,6 +473,7 @@ IDC_V_SAVE   equ 231          ; "Save" button (edit mode, accent/primary)
 IDC_V_SEARCH equ 232          ; search/filter box under the entry list
 IDC_V_HEADER equ 233          ; detail-pane header (icon tile + title, view mode)
 IDC_V_TITLELBL equ 234        ; "Title" static label (edit mode only)
+IDC_V_ICON   equ 249          ; edit-mode icon tile before the title (opens picker)
 IDC_V_OVFL   equ 235          ; header overflow (...) menu button
 IDC_V_TIMES  equ 236          ; created/modified timestamps line (below the last row)
 IDC_V_FAV    equ 237          ; header favorite (star) toggle
@@ -789,11 +790,13 @@ g_tilepal label dword                         ; 8 tile colours (COLORREF 0x00BBG
     dd 000C06020h, 00050A028h, 0001E78E6h, 000C85A96h
     dd 000AAAA1Eh, 0004646D2h, 0009650DCh, 000826450h
 ; icon picker: 18 curated Segoe Fluent glyphs (codepoints) + 12 tile colours
-GLYPHPAL_N equ 18
+GLYPHPAL_N equ 30
 g_glyphpal label dword
     dd 0E72Eh, 0E774h, 0E77Bh, 0E715h, 0E716h, 0E7BFh   ; lock globe contact mail people shop
     dd 0E7FCh, 0E714h, 0E753h, 0E717h, 0E8C1h, 0E8A5h   ; game media cloud phone key document
     dd 0E734h, 0EB51h, 0E80Fh, 0E713h, 0E8F1h, 0E787h   ; star heart home settings library calendar
+    dd 0E70Fh, 0E722h, 0E8C8h, 0E706h, 0E790h, 0E838h   ; edit camera copy brightness colour folder
+    dd 0E7C3h, 0E946h, 0E767h, 0E72Ch, 0E8A9h, 0E8B7h   ; page info volume refresh view tag
 GLYPHCOL_N equ 12
 g_glyphpal_col label dword
     dd 000C06020h, 00050A028h, 0001E78E6h, 000C85A96h
@@ -2111,6 +2114,50 @@ gdh_done:
     ret
 gui_draw_header endp
 
+; gui_draw_iconbtn(rcx=lpdis) - draw the edit-mode icon button as a mini tile
+;   showing the current entry's effective glyph + colour (the working override
+;   if the user picked one, else the auto-derived icon).
+gui_draw_iconbtn proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    mov     r10, rcx
+    mov     rax, qword ptr [r10+32]
+    mov     qword ptr [rbp-40], rax            ; hdc
+    WINCALL CreateSolidBrush, dword ptr [g_col_bg]
+    mov     qword ptr [rbp-48], rax
+    mov     r10, qword ptr [rbp-24]
+    lea     rdx, [r10+40]
+    WINCALL FillRect, qword ptr [rbp-40], rdx, qword ptr [rbp-48]
+    WINCALL DeleteObject, qword ptr [rbp-48]
+    cmp     dword ptr [g_cur_idx], 0
+    jl      gib_done
+    cmp     dword ptr [g_icon_set], 0
+    je      gib_auto
+    mov     eax, dword ptr [g_icon_color]
+    mov     dword ptr [g_tilecolor], eax
+    mov     eax, dword ptr [g_icon_glyph]
+    jmp     gib_glyph
+gib_auto:
+    mov     ecx, dword ptr [g_cur_idx]
+    call    gui_entry_color
+    mov     dword ptr [g_tilecolor], eax
+    mov     ecx, dword ptr [g_cur_idx]
+    call    gui_entry_glyph
+gib_glyph:
+    mov     word ptr [g_glyph_w], ax
+    mov     word ptr [g_glyph_w+2], 0
+    mov     rcx, qword ptr [rbp-40]
+    mov     r10, qword ptr [rbp-24]
+    mov     edx, dword ptr [r10+40]            ; L
+    mov     r8d, dword ptr [r10+44]            ; T
+    mov     r9d, dword ptr [r10+52]
+    sub     r9d, dword ptr [r10+44]            ; size = B - T
+    call    gui_draw_tile
+gib_done:
+    FRAME_EPILOG
+    ret
+gui_draw_iconbtn endp
+
 ; gui_pw_grade(rcx=ptr utf8, edx=len) -> eax = strength 0 weak /1 fair /2 good /3 strong.
 ;   Self-contained: character-class count + length.  Leaf.
 gui_pw_grade proc frame
@@ -3278,8 +3325,8 @@ sem_addcmd:
     mov     rcx, rax
     mov     edx, dword ptr [rbp-52]
     call    ShowWindow
-    mov     rcx, qword ptr [rbp-24]
-    mov     edx, IDC_V_TITLELBL
+    mov     rcx, qword ptr [rbp-24]           ; edit-mode icon button (before the title)
+    mov     edx, IDC_V_ICON
     call    GetDlgItem
     mov     rcx, rax
     mov     edx, dword ptr [rbp-52]
@@ -6788,6 +6835,8 @@ vp_tdraw:
     je      vp_tdraw_list
     cmp     eax, IDC_V_HEADER                 ; detail-pane header (tile + title)
     je      vp_tdraw_header
+    cmp     eax, IDC_V_ICON                   ; edit-mode icon tile before the title
+    je      vp_tdraw_icon
     cmp     eax, IDC_V_COLORPW                ; revealed-secret colour overlay
     je      vp_tdraw_colorpw
     cmp     eax, IDC_DYN_BASE                 ; a runtime row's TOTP drain bar?
@@ -6809,6 +6858,11 @@ vp_tdraw:
 vp_tdraw_header:
     mov     rcx, r9
     call    gui_draw_header
+    mov     eax, 1
+    jmp     vp_ret
+vp_tdraw_icon:
+    mov     rcx, r9
+    call    gui_draw_iconbtn
     mov     eax, 1
     jmp     vp_ret
 vp_tdraw_colorpw:
@@ -6984,6 +7038,8 @@ vp_cmd_disp:
     je      vp_fav
     cmp     eax, IDC_V_HEADER                    ; click the entry icon -> icon picker
     je      vp_iconpick
+    cmp     eax, IDC_V_ICON                      ; edit-mode icon button -> picker
+    je      vp_iconpick
     cmp     eax, IDC_V_MTPMINFO
     je      vp_tpminfo
     cmp     eax, IDC_V_MTPM
@@ -7078,13 +7134,16 @@ vp_iconpick:
     WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_ICON, qword ptr [rbp-8], addr icon_proc, 0
     cmp     eax, 1
     jne     vp_handled
-    mov     rcx, qword ptr [rbp-8]               ; persist immediately (like favorites)
-    call    gui_commit
-    mov     rcx, qword ptr [rbp-8]
-    call    gui_show_times
-    mov     rcx, qword ptr [rbp-8]               ; refresh the list (icon changed there too)
-    call    gui_poplist
-    mov     rcx, qword ptr [rbp-8]               ; repaint the detail header
+    mov     rcx, qword ptr [rbp-8]               ; repaint the edit-mode icon button
+    mov     edx, IDC_V_ICON
+    call    GetDlgItem
+    sub     rsp, 32
+    mov     rcx, rax
+    xor     edx, edx
+    mov     r8d, 1
+    call    InvalidateRect
+    add     rsp, 32
+    mov     rcx, qword ptr [rbp-8]               ; and the (view-mode) header tile
     mov     edx, IDC_V_HEADER
     call    GetDlgItem
     sub     rsp, 32
@@ -7093,6 +7152,17 @@ vp_iconpick:
     mov     r8d, 1
     call    InvalidateRect
     add     rsp, 32
+    cmp     dword ptr [g_editmode], 0            ; edit mode: apply on Save, just mark dirty
+    je      vp_iconview
+    mov     dword ptr [g_dirty], 1
+    jmp     vp_handled
+vp_iconview:
+    mov     rcx, qword ptr [rbp-8]               ; view mode: persist now (like favorites)
+    call    gui_commit
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_show_times
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_poplist
     jmp     vp_handled
 vp_fav:
     cmp     dword ptr [g_cur_idx], 0             ; only with an entry shown
