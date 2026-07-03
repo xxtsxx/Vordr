@@ -117,6 +117,10 @@ extern check_password_policy:proc
 externdef g_use_tpm:dword
 externdef g_cfg_pwminlen:dword
 externdef g_cfg_pwminclasses:dword
+externdef g_uline_ctl:dword             ; theme focus-underline colour overrides
+externdef g_uline_br:qword
+externdef g_uline_ctl2:dword
+externdef g_uline_br2:qword
 externdef g_cfg_in:qword
 externdef g_cfg_pass:byte
 externdef g_cfg_title:qword
@@ -7543,6 +7547,110 @@ ps_done:
     ret
 gui_pw_strength endp
 
+; gui_pw_level(rcx = wide password ptr) -> eax = strength 0..3 using the SAME
+;   thresholds as vault creation: 0 = below the vault policy (min length / char
+;   classes), 2 = compliant, 3 = >= min+8 chars AND all four character classes.
+;   Consumes the buffer via password_to_utf8 (which wipes it).
+gui_pw_level proc frame
+    FRAME_PROLOG 48
+    call    password_to_utf8                    ; -> g_cfg_pass; wipes the wide src
+    test    eax, eax
+    jz      gpl_bad
+    call    pw_metrics                          ; eax = code points, edx = classes
+    mov     dword ptr [rbp-24], eax
+    mov     dword ptr [rbp-32], edx
+    call    gui_wipepw                          ; scrub the utf-8 copy
+    mov     eax, dword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-32]
+    cmp     eax, dword ptr [g_cfg_pwminlen]
+    jb      gpl_bad
+    cmp     edx, dword ptr [g_cfg_pwminclasses]
+    jb      gpl_bad
+    mov     r8d, dword ptr [g_cfg_pwminlen]
+    add     r8d, 8
+    cmp     eax, r8d                            ; >= min+8 chars AND all 4 types -> strong
+    jb      gpl_mid
+    cmp     edx, 4
+    jne     gpl_mid
+    mov     eax, 3
+    FRAME_EPILOG
+    ret
+gpl_mid:
+    mov     eax, 2
+    FRAME_EPILOG
+    ret
+gpl_bad:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gui_pw_level endp
+
+; gui_xlpw_strength(rcx = hdlg) - recompute the export password strength and the
+;   confirm match, and colour each field's own focus underline instead of a
+;   separate bar: main field red/light-green/deep-green by strength, confirm
+;   field deep-green (match) / red (mismatch).  Then repaint the dialog frame.
+gui_xlpw_strength proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx             ; hdlg
+    call    gui_pwbars_init                     ; make sure the strength brushes exist
+    WINCALL GetDlgItemTextW, qword ptr [rbp-24], IDC_XP_PW, addr g_pwbuf, 1024
+    mov     dword ptr [rbp-32], eax             ; password length (chars)
+    WINCALL GetDlgItemTextW, qword ptr [rbp-24], IDC_XP_PW2, addr g_pw2buf, 1024
+    mov     dword ptr [rbp-36], eax             ; confirm length
+    ; ---- confirm match (before password_to_utf8 wipes g_pwbuf) ----
+    mov     dword ptr [rbp-40], 0
+    cmp     dword ptr [rbp-36], 0
+    je      xs_nomatch
+    call    gui_pw_match
+    test    eax, eax
+    jz      xs_nomatch
+    mov     dword ptr [rbp-40], 1
+xs_nomatch:
+    ; ---- strength level of the main password ----
+    mov     dword ptr [rbp-44], 0
+    cmp     dword ptr [rbp-32], 0
+    je      xs_setpw
+    lea     rcx, [g_pwbuf]
+    call    gui_pw_level                        ; eax = 0..3 (wipes g_pwbuf)
+    mov     dword ptr [rbp-44], eax
+xs_setpw:
+    mov     dword ptr [g_uline_ctl], IDC_XP_PW
+    cmp     dword ptr [rbp-32], 0               ; empty field -> default accent underline
+    je      xs_pwdef
+    mov     eax, dword ptr [rbp-44]
+    lea     r10, [g_br_red]                     ; contiguous red/amber/lgreen/dgreen
+    mov     rax, qword ptr [r10+rax*8]
+    mov     qword ptr [g_uline_br], rax
+    jmp     xs_confirm
+xs_pwdef:
+    mov     qword ptr [g_uline_br], 0
+xs_confirm:
+    mov     dword ptr [g_uline_ctl2], IDC_XP_PW2
+    cmp     dword ptr [rbp-36], 0               ; empty confirm -> default accent
+    je      xs_cfdef
+    cmp     dword ptr [rbp-40], 0
+    je      xs_cfbad
+    mov     rax, qword ptr [g_br_dgreen]
+    mov     qword ptr [g_uline_br2], rax
+    jmp     xs_wipe
+xs_cfbad:
+    mov     rax, qword ptr [g_br_red]
+    mov     qword ptr [g_uline_br2], rax
+    jmp     xs_wipe
+xs_cfdef:
+    mov     qword ptr [g_uline_br2], 0
+xs_wipe:
+    lea     rcx, [g_pwbuf]                      ; scrub both wide buffers
+    mov     edx, 2048
+    call    secure_zero
+    lea     rcx, [g_pw2buf]
+    mov     edx, 2048
+    call    secure_zero
+    WINCALL InvalidateRect, qword ptr [rbp-24], 0, 1
+    FRAME_EPILOG
+    ret
+gui_xlpw_strength endp
+
 ; gui_pwbars_init() - build the four strength/match line brushes once.
 gui_pwbars_init proc frame
     FRAME_PROLOG 32
@@ -8659,15 +8767,40 @@ xpp_init:
     call    theme_attach
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_XP_PW, EM_SETCUEBANNER, 1, addr cue_xppw
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_XP_PW2, EM_SETCUEBANNER, 1, addr cue_xppw2
+    mov     dword ptr [g_uline_ctl], 0          ; start with default (accent) underlines
+    mov     dword ptr [g_uline_ctl2], 0
+    mov     qword ptr [g_uline_br], 0
+    mov     qword ptr [g_uline_br2], 0
     mov     eax, 1
     jmp     xpp_ret
 xpp_cmd:
     movzx   eax, r8w
+    mov     r10d, r8d
+    shr     r10d, 16                            ; HIWORD(wParam) = notification code
+    cmp     r10d, EN_SETFOCUS                   ; focus moved -> repaint underlines
+    je      xpp_refocus
+    cmp     r10d, EN_KILLFOCUS
+    je      xpp_refocus
     cmp     eax, IDOK
     je      xpp_ok
     cmp     eax, IDCANCEL
     je      xpp_cancel
+    cmp     eax, IDC_XP_PW
+    je      xpp_pwchg
+    cmp     eax, IDC_XP_PW2
+    je      xpp_pwchg
     xor     eax, eax
+    jmp     xpp_ret
+xpp_refocus:
+    WINCALL InvalidateRect, qword ptr [rbp-8], 0, 1
+    mov     eax, 1
+    jmp     xpp_ret
+xpp_pwchg:
+    cmp     r10d, EN_CHANGE
+    jne     xpp_unh
+    mov     rcx, qword ptr [rbp-8]              ; a password box changed -> recolour
+    call    gui_xlpw_strength
+    mov     eax, 1
     jmp     xpp_ret
 xpp_ok:
     WINCALL GetDlgItemTextW, qword ptr [rbp-8], IDC_XP_PW, addr g_xlpw, 255
@@ -8699,6 +8832,10 @@ xpp_polok:
     lea     rcx, [g_xlpw2]                       ; wipe the confirm copy
     mov     edx, 512
     call    secure_zero
+    mov     dword ptr [g_uline_ctl], 0           ; drop the underline overrides
+    mov     dword ptr [g_uline_ctl2], 0
+    mov     qword ptr [g_uline_br], 0
+    mov     qword ptr [g_uline_br2], 0
     WINCALL EndDialog, qword ptr [rbp-8], 1
     mov     eax, 1
     jmp     xpp_ret
@@ -8717,6 +8854,10 @@ xpp_cancel:
     lea     rcx, [g_xlpw2]
     mov     edx, 512
     call    secure_zero
+    mov     dword ptr [g_uline_ctl], 0           ; drop the underline overrides
+    mov     dword ptr [g_uline_ctl2], 0
+    mov     qword ptr [g_uline_br], 0
+    mov     qword ptr [g_uline_br2], 0
     WINCALL EndDialog, qword ptr [rbp-8], 0
     mov     eax, 1
 xpp_ret:
