@@ -1128,6 +1128,83 @@ ds_oom:
 do_seed endp
 
 ; ===========================================================================
+; do_attgen() -> eax 0/err.  Build an in-memory vault body holding a single
+;   entry with one image/file attachment (staged pending), for headless export
+;   testing.  No key derivation / seal - just enough state for ze_compose to walk
+;   the body and attach_open the pending blob.
+; ===========================================================================
+.const
+ag_title dw 'A','t','t','a','c','h','T','e','s','t',0
+ag_fname dw 'h','e','l','l','o','.','t','x','t',0        ; 10 wide chars incl NUL
+ag_plain db "HELLO-ATTACHMENT-PAYLOAD-0123456789"        ; 35 plaintext bytes
+AG_PLAIN_LEN equ 35
+AG_FNAME_BYTES equ 20                                     ; 10 wide chars * 2
+.data?
+ag_ref  db ARF_SIZE dup (?)
+ag_blob db 4 + ARF_SIZE + AG_FNAME_BYTES dup (?)          ; {u32 rawlen, AttachRef, filename}
+.code
+public do_attgen
+do_attgen proc frame
+    FRAME_PROLOG 48
+    call    attach_reset                        ; clear any pending attachments
+    mov     rcx, VAULT_BODY_MAX
+    call    secmem_alloc
+    test    rax, rax
+    jz      ag_oom
+    mov     qword ptr [g_body_ptr], rax
+    mov     dword ptr [rax], 0                   ; entry_count = 0
+    mov     qword ptr [g_body_len], 4
+    lea     rcx, [ag_plain]                      ; stage the attachment plaintext
+    mov     edx, AG_PLAIN_LEN
+    lea     r8, [ag_ref]
+    call    attach_stage
+    test    eax, eax
+    jnz     ag_err
+    ; ag_blob = {u32 rawlen, AttachRef[68], filename wide}
+    mov     dword ptr [ag_blob], ARF_SIZE + AG_FNAME_BYTES
+    lea     r10, [ag_blob+4]
+    lea     r11, [ag_ref]
+    xor     r8d, r8d
+ag_cpref:
+    mov     al, byte ptr [r11+r8]
+    mov     byte ptr [r10+r8], al
+    inc     r8d
+    cmp     r8d, ARF_SIZE
+    jb      ag_cpref
+    lea     r10, [ag_blob+4+ARF_SIZE]
+    lea     r11, [ag_fname]
+    xor     r8d, r8d
+ag_cpfn:
+    mov     ax, word ptr [r11+r8*2]
+    mov     word ptr [r10+r8*2], ax
+    inc     r8d
+    cmp     r8d, 10
+    jb      ag_cpfn
+    ; g_field_list: [0]=title, [1]=raw image attachment
+    lea     r10, [g_field_list]
+    mov     qword ptr [r10+0], VF_TITLE
+    mov     qword ptr [r10+8], 0
+    lea     rax, [ag_title]
+    mov     qword ptr [r10+16], rax
+    mov     qword ptr [r10+24], VF_IMAGE or VFL_RAW
+    mov     qword ptr [r10+32], 0
+    lea     rax, [ag_blob]
+    mov     qword ptr [r10+40], rax
+    mov     dword ptr [g_field_n], 2
+    call    vault_build_entry
+    FRAME_EPILOG
+    ret
+ag_err:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+ag_oom:
+    mov     eax, EXIT_OOM
+    FRAME_EPILOG
+    ret
+do_attgen endp
+
+; ===========================================================================
 ; do_add - unlock, append one entry from --title/--user/--secret/--url/--notes,
 ;   reseal + write.
 ; ===========================================================================

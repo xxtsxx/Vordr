@@ -684,23 +684,30 @@ zea_flp:
     je      zea_att
     jmp     zea_fnext
 zea_att:
-    mov     r11, qword ptr [g_zj_fld+24]        ; raw value ptr
+    ; the serialized value is {AttachRef[68], filename wide} - AttachRef at +0,
+    ; filename at +68 (this matches the GUI's own read path in gui_showdetail).
+    mov     r11, qword ptr [g_zj_fld+24]        ; value ptr
     mov     qword ptr [rbp-64], r11
-    lea     rcx, [r11+4]                         ; AttachRef
+    mov     rax, qword ptr [g_zj_fld+32]        ; value len (>68 => a filename follows)
+    mov     qword ptr [rbp-96], rax
+    mov     rcx, r11                             ; AttachRef = value + 0
     lea     rdx, [rbp-72]                        ; &outlen
     call    attach_open
     test    rax, rax
     jz      zea_fnext
     mov     qword ptr [rbp-80], rax             ; plaintext ptr
-    ; filename (wide) at valptr+72 -> UTF-8 g_zj_fn
+    ; filename (wide) at value+68 -> UTF-8 g_zj_fn (default if none stored)
+    cmp     qword ptr [rbp-96], 68
+    jbe     zea_defname
     mov     r11, qword ptr [rbp-64]
-    lea     rax, [r11+72]
+    lea     rax, [r11+68]
     mov     qword ptr [rbp-88], rax
     WINCALL WideCharToMultiByte, CP_UTF8_, 0, qword ptr [rbp-88], -1, addr g_zj_fn, 500, 0, 0
     dec     eax                                  ; strip the terminating NUL
     cmp     eax, 0
     jg      zea_havefn
-    lea     r10, [zj_defname]                    ; empty name -> default
+zea_defname:
+    lea     r10, [zj_defname]                    ; empty/absent name -> default
     lea     r11, [g_zj_fn]
     xor     r8d, r8d
 zea_dcp:
