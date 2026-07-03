@@ -117,6 +117,7 @@ HDRK macro kw, ty
 skip:
 endm
 
+public csv_hdr_type
 csv_hdr_type proc frame
     FRAME_PROLOG 32
     mov     qword ptr [rbp-24], rcx
