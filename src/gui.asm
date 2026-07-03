@@ -4501,7 +4501,7 @@ grl_offdone:
     mov     r8d, 176                             ; content column (chevrons live to the left)
     mov     r9d, dword ptr [rbp-40]
     add     r9d, 3
-    WINCALL move_ctl, rcx, rdx, r8d, r9d, 150, 10   ; narrow: clears the top-right cluster
+    WINCALL move_ctl, rcx, rdx, r8d, r9d, 120, 10   ; narrow: clears the top-right cluster
     jmp     grl_lbl_done
 grl_lbl_flat:
     mov     r8d, 158
@@ -4516,7 +4516,7 @@ grl_lbl_done:
     mov     dword ptr [rbp-76], 150             ; flat default
 @@: cmp     dword ptr [r10+FD_KIND], VF_SECRET
     jne     grl_valpos
-    mov     dword ptr [rbp-76], 164             ; card secret (icons sit to its left)
+    mov     dword ptr [rbp-76], 196             ; card secret (controls are on the top row)
     cmp     dword ptr [rbp-68], 0
     jne     grl_valpos
     mov     dword ptr [rbp-76], 130             ; flat secret
@@ -4527,14 +4527,6 @@ grl_valpos:
     cmp     dword ptr [rbp-68], 0
     je      grl_val_flat
     mov     r8d, 176                             ; content column (shifted for chevrons)
-    mov     eax, dword ptr [r10+FD_KIND]         ; secret/TOTP: indent for left-side icons
-    cmp     eax, VF_SECRET
-    je      grl_val_indent
-    cmp     eax, VF_TOTP
-    jne     grl_val_x
-grl_val_indent:
-    mov     r8d, 208
-grl_val_x:
     mov     r9d, dword ptr [rbp-60]
     WINCALL move_ctl, rcx, rdx, r8d, r9d, dword ptr [rbp-76], dword ptr [rbp-48]
     jmp     grl_val_done
@@ -4543,13 +4535,13 @@ grl_val_flat:
     mov     r9d, dword ptr [rbp-60]
     WINCALL move_ctl, rcx, rdx, r8d, r9d, dword ptr [rbp-76], dword ptr [rbp-48]
 grl_val_done:
-    ; reveal to the LEFT of the value (secret password / TOTP key), at the content
-    ; column; the value is indented past it
+    ; top-right cluster on the label row: Reveal | Copy | Generate | Trash
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_REVEAL*8]
-    mov     r8d, 176
-    mov     r9d, dword ptr [rbp-60]
+    mov     r8d, 344
+    mov     r9d, dword ptr [rbp-40]
+    add     r9d, 4
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 12, 12
     ; copy: secret -> right cluster (352,y); totp -> next to the live code (318,y+14)
     mov     r10, qword ptr [rbp-32]
@@ -4557,31 +4549,32 @@ grl_val_done:
     je      grl_copytotp
     mov     rcx, qword ptr [rbp-24]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_COPY*8]
-    mov     r8d, 192                             ; right of the reveal, both left of the value
-    mov     r9d, dword ptr [rbp-60]
+    mov     r8d, 360                             ; top-right cluster, right of the reveal
+    mov     r9d, dword ptr [rbp-40]
+    add     r9d, 4
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 12, 12
     jmp     grl_copydone
 grl_copytotp:
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_COPY*8]
-    mov     r8d, 176                             ; to the LEFT of the live code
-    mov     r9d, dword ptr [rbp-60]
-    add     r9d, dword ptr [rbp-56]
-    WINCALL move_ctl, rcx, rdx, r8d, r9d, 16, 11
+    mov     r8d, 360                             ; top-right cluster (token copy)
+    mov     r9d, dword ptr [rbp-40]
+    add     r9d, 4
+    WINCALL move_ctl, rcx, rdx, r8d, r9d, 12, 12
 grl_copydone:
     ; totp code (206, y+off, 110, 11) + bar (206, y+off+11, 110, 2)
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_TCODE*8]
-    mov     r8d, 208                             ; indented past the copy on its left
+    mov     r8d, 176
     mov     r9d, dword ptr [rbp-60]
     add     r9d, dword ptr [rbp-56]
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 84, 11
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_TBAR*8]
-    mov     r8d, 208
+    mov     r8d, 176
     mov     r9d, dword ptr [rbp-60]
     add     r9d, dword ptr [rbp-56]
     add     r9d, 11
@@ -4608,7 +4601,7 @@ grl_copydone:
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_DEL*8]
-    mov     r8d, 398                             ; trash: tile's top-right corner
+    mov     r8d, 394                             ; trash: far right of the cluster
     mov     r9d, dword ptr [rbp-40]
     add     r9d, 4
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 12, 11
@@ -4631,7 +4624,7 @@ grl_copydone:
     jne     grl_sbadge_done
     mov     rcx, qword ptr [rbp-24]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_SBADGE*8]
-    mov     r8d, 332
+    mov     r8d, 300                             ; view mode: left of the reveal/copy cluster
     mov     r9d, dword ptr [rbp-40]
     add     r9d, 4
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 40, 11
@@ -4641,11 +4634,11 @@ grl_copydone:
     mov     rcx, qword ptr [r10+FD_HANDLES+DS_SBADGE*8]
     mov     edx, eax
     call    ShowWindow
-    ; generate button: top-right, just left of the trash (edit mode only)
+    ; generate button: top-right cluster, just left of the trash (edit mode only)
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_GEN*8]
-    mov     r8d, 380
+    mov     r8d, 378
     mov     r9d, dword ptr [rbp-40]
     add     r9d, 4
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 12, 12
