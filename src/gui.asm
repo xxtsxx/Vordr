@@ -793,10 +793,10 @@ g_tilepal label dword                         ; 8 tile colours (COLORREF 0x00BBG
 GLYPHPAL_N equ 30
 g_glyphpal label dword
     dd 0E72Eh, 0E774h, 0E77Bh, 0E715h, 0E716h, 0E7BFh   ; lock globe contact mail people shop
-    dd 0E7FCh, 0E714h, 0E753h, 0E717h, 0E8C1h, 0E8A5h   ; game media cloud phone key document
+    dd 0E7FCh, 0E714h, 0E753h, 0E717h, 0E8D7h, 0E8A5h   ; game media cloud phone key document
     dd 0E734h, 0EB51h, 0E80Fh, 0E713h, 0E8F1h, 0E787h   ; star heart home settings library calendar
     dd 0E70Fh, 0E722h, 0E8C8h, 0E706h, 0E790h, 0E838h   ; edit camera copy brightness colour folder
-    dd 0E7C3h, 0E946h, 0E767h, 0E72Ch, 0E8A9h, 0E8B7h   ; page info volume refresh view tag
+    dd 0E7C1h, 0E946h, 0E767h, 0E72Ch, 0E8A9h, 0E8B7h   ; flag info volume refresh view tag
 GLYPHCOL_N equ 12
 g_glyphpal_col label dword
     dd 000C06020h, 00050A028h, 0001E78E6h, 000C85A96h
@@ -2118,7 +2118,7 @@ gui_draw_header endp
 ;   showing the current entry's effective glyph + colour (the working override
 ;   if the user picked one, else the auto-derived icon).
 gui_draw_iconbtn proc frame
-    FRAME_PROLOG 64
+    FRAME_PROLOG 96
     mov     qword ptr [rbp-24], rcx
     mov     r10, rcx
     mov     rax, qword ptr [r10+32]
@@ -2153,6 +2153,32 @@ gib_glyph:
     mov     r9d, dword ptr [r10+52]
     sub     r9d, dword ptr [r10+44]            ; size = B - T
     call    gui_draw_tile
+    ; edit hint: a tiny pencil in the bottom-right corner (this button is edit-mode only)
+    mov     word ptr [g_glyph_w], 0E70Fh
+    mov     word ptr [g_glyph_w+2], 0
+    WINCALL SelectObject, qword ptr [rbp-40], qword ptr [g_chevfont]
+    mov     qword ptr [rbp-80], rax            ; old font
+    WINCALL SetTextColor, qword ptr [rbp-40], dword ptr [g_col_text]
+    WINCALL SetBkMode, qword ptr [rbp-40], 1
+    mov     r10, qword ptr [rbp-24]
+    mov     r9d, dword ptr [r10+52]
+    sub     r9d, dword ptr [r10+44]            ; tile size
+    mov     eax, dword ptr [r10+40]           ; pencil rect: bottom-right corner of the tile
+    add     eax, r9d
+    sub     eax, 9
+    mov     dword ptr [rbp-72], eax            ; L
+    mov     eax, dword ptr [r10+44]
+    add     eax, r9d
+    sub     eax, 9
+    mov     dword ptr [rbp-68], eax            ; T
+    mov     eax, dword ptr [r10+40]
+    add     eax, r9d
+    mov     dword ptr [rbp-64], eax            ; R
+    mov     eax, dword ptr [r10+44]
+    add     eax, r9d
+    mov     dword ptr [rbp-60], eax            ; B
+    WINCALL DrawTextW, qword ptr [rbp-40], addr g_glyph_w, -1, addr rbp-72, 25h
+    WINCALL SelectObject, qword ptr [rbp-40], qword ptr [rbp-80]
 gib_done:
     FRAME_EPILOG
     ret
@@ -7036,8 +7062,6 @@ vp_cmd_disp:
     je      vp_ovfl
     cmp     eax, IDC_V_FAV
     je      vp_fav
-    cmp     eax, IDC_V_HEADER                    ; click the entry icon -> icon picker
-    je      vp_iconpick
     cmp     eax, IDC_V_ICON                      ; edit-mode icon button -> picker
     je      vp_iconpick
     cmp     eax, IDC_V_MTPMINFO
@@ -7129,12 +7153,12 @@ vp_ovfl:
     call    gui_overflow_menu
     jmp     vp_handled
 vp_iconpick:
-    cmp     dword ptr [g_cur_idx], 0             ; only with an entry shown
+    cmp     dword ptr [g_cur_idx], 0             ; only with an entry shown (edit mode only)
     jl      vp_handled
     WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_ICON, qword ptr [rbp-8], addr icon_proc, 0
     cmp     eax, 1
     jne     vp_handled
-    mov     rcx, qword ptr [rbp-8]               ; repaint the edit-mode icon button
+    mov     rcx, qword ptr [rbp-8]               ; repaint the icon button with the new glyph
     mov     edx, IDC_V_ICON
     call    GetDlgItem
     sub     rsp, 32
@@ -7143,26 +7167,7 @@ vp_iconpick:
     mov     r8d, 1
     call    InvalidateRect
     add     rsp, 32
-    mov     rcx, qword ptr [rbp-8]               ; and the (view-mode) header tile
-    mov     edx, IDC_V_HEADER
-    call    GetDlgItem
-    sub     rsp, 32
-    mov     rcx, rax
-    xor     edx, edx
-    mov     r8d, 1
-    call    InvalidateRect
-    add     rsp, 32
-    cmp     dword ptr [g_editmode], 0            ; edit mode: apply on Save, just mark dirty
-    je      vp_iconview
-    mov     dword ptr [g_dirty], 1
-    jmp     vp_handled
-vp_iconview:
-    mov     rcx, qword ptr [rbp-8]               ; view mode: persist now (like favorites)
-    call    gui_commit
-    mov     rcx, qword ptr [rbp-8]
-    call    gui_show_times
-    mov     rcx, qword ptr [rbp-8]
-    call    gui_poplist
+    mov     dword ptr [g_dirty], 1               ; applied on Save
     jmp     vp_handled
 vp_fav:
     cmp     dword ptr [g_cur_idx], 0             ; only with an entry shown
