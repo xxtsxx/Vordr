@@ -7076,9 +7076,13 @@ vp_cmd_disp:
     cmp     eax, IDC_V_MTPM
     je      vp_mtpm
     cmp     eax, IDCANCEL
-    je      vp_lock
+    je      vp_esc
     xor     eax, eax
     jmp     vp_ret
+vp_esc:
+    cmp     dword ptr [g_new_pending], 0     ; Escape on a just-added placeholder
+    jne     ve_discard_new                   ;   discards it rather than locking
+    jmp     vp_lock
 vp_mtpm:
     cmp     dword ptr [g_tpm_present], 0       ; disabled with no TPM hardware
     je      vp_handled
