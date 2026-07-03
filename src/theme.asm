@@ -194,6 +194,14 @@ public g_font_totp
 g_font_totp dq 0                            ; slightly larger font for the TOTP code
 g_frame_hdc dq 0                            ; EnumChildWindows frame-draw context
 g_frame_par dq 0
+; Optional per-control focus-underline colour override (used by the export
+; password dialog to show strength/match in the field's own underline instead
+; of a separate bar).  ctl = control id to recolour, br = HBRUSH (0 = default).
+public g_uline_ctl, g_uline_br, g_uline_ctl2, g_uline_br2
+g_uline_ctl  dd 0
+g_uline_br   dq 0
+g_uline_ctl2 dd 0
+g_uline_br2  dq 0
 
 td_dark label word                      ; control theme class for dark scrollbars
     dw 'D','a','r','k','M','o','d','e','_','E','x','p','l','o','r','e','r', 0
@@ -992,6 +1000,7 @@ frame_cb proc
     jne     fc_skip
     mov     rcx, qword ptr [rbp-8]            ; row-card edits (id >= 3000) sit on filled
     call    GetDlgCtrlID                      ;   panels -> no underline (clean cards)
+    mov     dword ptr [rbp-80], eax           ; remember this control's id
     cmp     eax, 3000                         ; IDC_DYN_BASE
     jae     fc_skip
     mov     rcx, qword ptr [rbp-8]
@@ -1021,8 +1030,22 @@ frame_cb proc
 fc_focus:
     mov     eax, dword ptr [rbp-28]
     add     eax, 2
-    mov     dword ptr [rbp-60], eax           ; 2px accent
-    mov     r8, qword ptr [g_br_accent]
+    mov     dword ptr [rbp-60], eax           ; 2px
+    mov     r8, qword ptr [g_br_accent]       ; default accent
+    ; per-control colour override (strength / match underline)?
+    mov     ecx, dword ptr [rbp-80]
+    cmp     ecx, dword ptr [g_uline_ctl]
+    jne     fc_ov2
+    cmp     qword ptr [g_uline_br], 0
+    je      fc_fill
+    mov     r8, qword ptr [g_uline_br]
+    jmp     fc_fill
+fc_ov2:
+    cmp     ecx, dword ptr [g_uline_ctl2]
+    jne     fc_fill
+    cmp     qword ptr [g_uline_br2], 0
+    je      fc_fill
+    mov     r8, qword ptr [g_uline_br2]
 fc_fill:
     mov     rcx, qword ptr [g_frame_hdc]
     lea     rdx, [rbp-72]
