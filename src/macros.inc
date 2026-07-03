@@ -102,6 +102,8 @@ VF_TEXT             equ 8          ; generic single-line text (custom fields)
 VF_IMAGE            equ 9          ; raw encoded image bytes (PNG/JPEG/BMP)
 VF_FILE             equ 10         ; generic file attachment (any bytes + filename)
 VF_FAV              equ 11         ; reserved marker: entry is a favorite (value "1")
+VF_ICON             equ 12         ; reserved: custom icon override, value = 12 hex
+                                   ;   chars "GGGGCCCCCCCC" (glyph codepoint + COLORREF)
 ; A stored field type carries the base kind in its low byte; VF_LABELED in the
 ; high byte marks a field whose value bytes are prefixed with a custom label:
 ;   labeled: bytes = u16 labellen | label_utf8 | value_utf8
