@@ -1136,13 +1136,39 @@ do_seed endp
 .const
 ag_title dw 'A','t','t','a','c','h','T','e','s','t',0
 ag_fname dw 'h','e','l','l','o','.','t','x','t',0        ; 10 wide chars incl NUL
+ag_fnam2 dw 'w','o','r','l','d','.','d','a','t',0        ; 10 wide chars incl NUL
 ag_plain db "HELLO-ATTACHMENT-PAYLOAD-0123456789"        ; 35 plaintext bytes
 AG_PLAIN_LEN equ 35
+ag_plai2 db "WORLD-SECOND-ATTACHMENT-9876543210"         ; 34 plaintext bytes
+AG_PLAI2_LEN equ 34
 AG_FNAME_BYTES equ 20                                     ; 10 wide chars * 2
 .data?
 ag_ref  db ARF_SIZE dup (?)
+ag_ref2 db ARF_SIZE dup (?)
 ag_blob db 4 + ARF_SIZE + AG_FNAME_BYTES dup (?)          ; {u32 rawlen, AttachRef, filename}
+ag_blb2 db 4 + ARF_SIZE + AG_FNAME_BYTES dup (?)
 .code
+; ag_mkblob(rcx = AttachRef ptr, rdx = wide filename ptr, r8 = dst blob ptr) -
+;   dst = {u32 rawlen=68+20, AttachRef[68], filename[10 wide]}.  Leaf.
+ag_mkblob proc
+    mov     dword ptr [r8], ARF_SIZE + AG_FNAME_BYTES
+    xor     r9d, r9d
+amk_ref:
+    mov     al, byte ptr [rcx+r9]
+    mov     byte ptr [r8+4+r9], al
+    inc     r9d
+    cmp     r9d, ARF_SIZE
+    jb      amk_ref
+    xor     r9d, r9d
+amk_fn:
+    mov     ax, word ptr [rdx+r9*2]
+    mov     word ptr [r8+4+ARF_SIZE+r9*2], ax
+    inc     r9d
+    cmp     r9d, 10
+    jb      amk_fn
+    ret
+ag_mkblob endp
+
 public do_attgen
 do_attgen proc frame
     FRAME_PROLOG 48
@@ -1154,33 +1180,27 @@ do_attgen proc frame
     mov     qword ptr [g_body_ptr], rax
     mov     dword ptr [rax], 0                   ; entry_count = 0
     mov     qword ptr [g_body_len], 4
-    lea     rcx, [ag_plain]                      ; stage the attachment plaintext
+    lea     rcx, [ag_plain]                      ; stage attachment #1
     mov     edx, AG_PLAIN_LEN
     lea     r8, [ag_ref]
     call    attach_stage
     test    eax, eax
     jnz     ag_err
-    ; ag_blob = {u32 rawlen, AttachRef[68], filename wide}
-    mov     dword ptr [ag_blob], ARF_SIZE + AG_FNAME_BYTES
-    lea     r10, [ag_blob+4]
-    lea     r11, [ag_ref]
-    xor     r8d, r8d
-ag_cpref:
-    mov     al, byte ptr [r11+r8]
-    mov     byte ptr [r10+r8], al
-    inc     r8d
-    cmp     r8d, ARF_SIZE
-    jb      ag_cpref
-    lea     r10, [ag_blob+4+ARF_SIZE]
-    lea     r11, [ag_fname]
-    xor     r8d, r8d
-ag_cpfn:
-    mov     ax, word ptr [r11+r8*2]
-    mov     word ptr [r10+r8*2], ax
-    inc     r8d
-    cmp     r8d, 10
-    jb      ag_cpfn
-    ; g_field_list: [0]=title, [1]=raw image attachment
+    lea     rcx, [ag_plai2]                      ; stage attachment #2
+    mov     edx, AG_PLAI2_LEN
+    lea     r8, [ag_ref2]
+    call    attach_stage
+    test    eax, eax
+    jnz     ag_err
+    lea     rcx, [ag_ref]                        ; blobs = {u32 len, ref, filename}
+    lea     rdx, [ag_fname]
+    lea     r8, [ag_blob]
+    call    ag_mkblob
+    lea     rcx, [ag_ref2]
+    lea     rdx, [ag_fnam2]
+    lea     r8, [ag_blb2]
+    call    ag_mkblob
+    ; g_field_list: [0]=title, [1]=image (hello.txt), [2]=file (world.dat)
     lea     r10, [g_field_list]
     mov     qword ptr [r10+0], VF_TITLE
     mov     qword ptr [r10+8], 0
@@ -1190,7 +1210,11 @@ ag_cpfn:
     mov     qword ptr [r10+32], 0
     lea     rax, [ag_blob]
     mov     qword ptr [r10+40], rax
-    mov     dword ptr [g_field_n], 2
+    mov     qword ptr [r10+48], VF_FILE or VFL_RAW
+    mov     qword ptr [r10+56], 0
+    lea     rax, [ag_blb2]
+    mov     qword ptr [r10+64], rax
+    mov     dword ptr [g_field_n], 3
     call    vault_build_entry
     FRAME_EPILOG
     ret
