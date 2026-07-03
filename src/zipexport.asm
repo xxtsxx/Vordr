@@ -52,7 +52,8 @@ CP_UTF8_    equ 65001
 
 ZE_CAP      equ 32*1024*1024
 ZE_MAXFILE  equ 512
-ZE_NAMEPOOL equ 256*1024             ; persistent copies of every entry's name
+ZE_NAMEPOOL equ 512*1024             ; persistent copies of every entry's name
+ZJ_PFX_MAX  equ 200                  ; max bytes of a title used as a folder name
 PBKDF2_ITERS equ 1000
 
 .data?
@@ -466,6 +467,7 @@ g_csvbuf    dq 3 dup (?)             ; {ptr,len,cap} for the CSV text
 g_ze_u8pw   db 512 dup (?)           ; wide->UTF-8 export password scratch
 g_zj_fld    db 40 dup (?)            ; vault_field_get out struct
 g_zj_fn     db 512 dup (?)           ; attachment filename (UTF-8)
+g_zj_path   db 768 dup (?)           ; "<title-folder>/<filename>" zip path
 
 .code
 
@@ -679,13 +681,77 @@ zbj_err:
 ze_build_json endp
 
 ; =============================================================================
+; ze_pathsan(rcx = src, edx = srclen, r8 = dst) -> eax = dst length.  Copy src
+;   into dst as a path-safe folder name: bytes that are path-reserved (/ \ : * ?
+;   " < > |) or control (<0x20) become '_', capped at ZJ_PFX_MAX, trailing dots
+;   and spaces trimmed, empty -> "_".  Byte-wise, so UTF-8 (>=0x80) is preserved.
+; =============================================================================
+ze_pathsan proc
+    cmp     edx, ZJ_PFX_MAX
+    jbe     ps_cap
+    mov     edx, ZJ_PFX_MAX
+ps_cap:
+    xor     r9d, r9d                             ; i
+ps_lp:
+    cmp     r9d, edx
+    jae     ps_done
+    movzx   eax, byte ptr [rcx+r9]
+    cmp     eax, 20h
+    jb      ps_bad
+    cmp     eax, '/'
+    je      ps_bad
+    cmp     eax, '\'
+    je      ps_bad
+    cmp     eax, ':'
+    je      ps_bad
+    cmp     eax, '*'
+    je      ps_bad
+    cmp     eax, '?'
+    je      ps_bad
+    cmp     eax, '"'
+    je      ps_bad
+    cmp     eax, '<'
+    je      ps_bad
+    cmp     eax, '>'
+    je      ps_bad
+    cmp     eax, '|'
+    je      ps_bad
+    jmp     ps_put
+ps_bad:
+    mov     eax, '_'
+ps_put:
+    mov     byte ptr [r8+r9], al
+    inc     r9d
+    jmp     ps_lp
+ps_done:
+    test    r9d, r9d                             ; trim trailing '.' / ' '
+    jz      ps_empty
+    movzx   eax, byte ptr [r8+r9-1]
+    cmp     eax, '.'
+    je      ps_trimdec
+    cmp     eax, ' '
+    je      ps_trimdec
+    jmp     ps_ret
+ps_trimdec:
+    dec     r9d
+    jmp     ps_done
+ps_empty:
+    mov     byte ptr [r8], '_'
+    mov     r9d, 1
+ps_ret:
+    mov     eax, r9d
+    ret
+ze_pathsan endp
+
+; =============================================================================
 ; ze_add_attachments() -> eax 0/err.  Append every image/file attachment in the
 ;   vault to the open archive (ze_reset + ze_set_pw must precede).  Each blob is
-;   decrypted to plaintext, added under its stored filename, then wiped + freed.
+;   decrypted to plaintext and added as "<secret title>/<filename>" (so all of a
+;   record's attachments land in one folder), then wiped + freed.
 ; =============================================================================
 public ze_add_attachments
 ze_add_attachments proc frame
-    FRAME_PROLOG 144
+    FRAME_PROLOG 192
     call    vault_count
     mov     dword ptr [rbp-40], eax             ; n
     mov     dword ptr [rbp-44], 0               ; e
@@ -749,8 +815,34 @@ zea_dcp:
     mov     eax, 14
 zea_havefn:
     mov     dword ptr [rbp-56], eax             ; fnlen
-    lea     rcx, [g_zj_fn]
-    mov     edx, dword ptr [rbp-56]
+    ; ---- build g_zj_path = "<sanitized title>/" + g_zj_fn ----
+    mov     ecx, dword ptr [rbp-44]             ; entry index
+    lea     rdx, [rbp-104]                      ; &titlelen
+    call    vault_title_at                      ; rax = title ptr (UTF-8)
+    mov     rcx, rax
+    mov     edx, dword ptr [rbp-104]            ; title len
+    lea     r8, [g_zj_path]
+    call    ze_pathsan                          ; eax = folder-name length
+    lea     r10, [g_zj_path]
+    mov     byte ptr [r10+rax], '/'             ; folder separator
+    inc     eax
+    mov     r9d, eax                            ; prefix length (folder + '/')
+    lea     r10, [g_zj_path]                    ; append the filename bytes
+    add     r10, r9
+    lea     r11, [g_zj_fn]
+    mov     ecx, dword ptr [rbp-56]             ; fnlen
+    xor     r8d, r8d
+zea_cpname:
+    cmp     r8d, ecx
+    jae     zea_cpdone
+    mov     al, byte ptr [r11+r8]
+    mov     byte ptr [r10+r8], al
+    inc     r8d
+    jmp     zea_cpname
+zea_cpdone:
+    add     r9d, ecx                            ; total path length
+    lea     rcx, [g_zj_path]
+    mov     edx, r9d
     mov     r8, qword ptr [rbp-80]
     mov     r9, qword ptr [rbp-72]
     call    ze_add_file
