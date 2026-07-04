@@ -22,6 +22,7 @@ extern secure_zero:proc
 extern pbkdf2_ae:proc                    ; PBKDF2-HMAC-SHA1 1000 iters -> g_ae_dk
 extern aes_expand_key:proc
 extern aes_ctr_xor:proc
+extern hmac_sha1:proc
 extern MultiByteToWideChar:proc
 extern WideCharToMultiByte:proc
 extern attach_reset:proc
@@ -211,6 +212,24 @@ zi_decrypt proc frame
     mov     al, byte ptr [r10+65]
     cmp     al, byte ptr [r11+17]
     jne     zd_wrongpw
+    ; ---- HMAC-SHA1(dk[32..64], ciphertext)[:10] vs the stored 10-byte tag ----
+    mov     rax, qword ptr [rbp-40]             ; auth tag = cipher + usize
+    mov     ecx, dword ptr [rbp-32]             ; usize (zero-extended)
+    add     rax, rcx
+    mov     qword ptr [rbp-56], rax             ; auth tag ptr (into raw)
+    WINCALL hmac_sha1, addr g_ae_dk+32, 32, qword ptr [rbp-40], dword ptr [rbp-32], addr g_zi_auth
+    lea     r10, [g_zi_auth]
+    mov     r11, qword ptr [rbp-56]
+    xor     ecx, ecx
+zd_authcmp:
+    cmp     ecx, 10
+    jae     zd_authok
+    mov     al, byte ptr [r10+rcx]
+    cmp     al, byte ptr [r11+rcx]
+    jne     zd_corrupt
+    inc     ecx
+    jmp     zd_authcmp
+zd_authok:
     ; ---- AES-256-CTR decrypt in place ----
     lea     rcx, [g_ae_dk]
     mov     rdx, 32
@@ -228,6 +247,10 @@ zi_decrypt proc frame
     ret
 zd_wrongpw:
     mov     eax, -3
+    FRAME_EPILOG
+    ret
+zd_corrupt:
+    mov     eax, -1
     FRAME_EPILOG
     ret
 zi_decrypt endp
