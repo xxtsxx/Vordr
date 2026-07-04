@@ -1,22 +1,25 @@
 ; =============================================================================
-; theme.asm - Vordr dark theme + procedurally generated animated background.
+; theme.asm - Vordr dark theme (flat dark background + owner-drawn controls).
 ;
-; Nothing here is an embedded image: the background is a deep "aurora" field
-; computed on the fly from a tiny sine LUT (itself computed at startup) using a
-; cheap separable model (per-column + per-row + per-diagonal sine bands).  The
-; renderer's internal resolution and animation are scaled to the machine via
-; theme_detect (CPU cores / AC vs battery), so a strong desktop gets a smooth
-; full-resolution animation while a thin laptop falls back to a quiet static
-; gradient.  Everything degrades, fail-closed, to a flat dark fill.
+; The window background is a solid dark fill: theme_erase paints the dark
+; background brush on WM_ERASEBKGND, and theme_paint returns "unhandled" so the
+; default paint uses it.  Brushes/pens/fonts are (re)built by theme_rebrush from
+; the active colour scheme (theme_set_scheme, cycled by the settings menu).
+;
+; NOTE: a procedural "aurora" animation path also lives here (bg_render + sin_lut
+; into a DIB, driven by a WM_TIMER through theme_tick, blitted by theme_paint).
+; It is currently INACTIVE: the DIB is never created (g_bits stays 0), so both
+; theme_tick and theme_paint short-circuit to the flat fill.  It is retained,
+; guarded and harmless, pending a decision to either wire it up or remove it.
 ;
 ; All procs touch only volatile registers (rax/rcx/rdx/r8-r11) so they unwind
 ; cleanly back through the OS dialog callbacks without saving rbx/rsi/rdi/r12-15.
 ;
 ; Public surface (called from gui.asm dialog procs):
-;   theme_boot                      - one-time: detect caps, build LUT + brushes
+;   theme_boot                      - one-time: build the colour scheme + brushes
 ;   theme_attach(hwnd, defid)       - per dialog: dark titlebar, bg, anim timer
-;   theme_paint(hwnd)  -> 1         - WM_PAINT: blit the background
-;   theme_erase        -> 1         - WM_ERASEBKGND: suppress the default erase
+;   theme_paint(hwnd)               - WM_PAINT: flat fill / sidebar card
+;   theme_erase        -> 1         - WM_ERASEBKGND: paint the dark background
 ;   theme_tick(hwnd)               - WM_TIMER(THEME_TIMER): advance + invalidate
 ;   theme_ctlcolor(hwnd,msg,hdc,hctl) -> HBRUSH  - WM_CTLCOLOR* dark colours
 ;   theme_drawitem(lpdis) -> 1      - WM_DRAWITEM: owner-draw buttons/groupboxes
@@ -87,8 +90,6 @@ WIN_ALPHA           equ 255                  ; 100% (fully opaque)
 DWMWA_DARK          equ 20
 DWMWA_CORNER        equ 33                   ; DWMWA_WINDOW_CORNER_PREFERENCE
 DWMWCP_ROUND        equ 2                    ; rounded corners (Fluent)
-BI_RGB              equ 0
-DIB_RGB_COLORS      equ 0
 SRCCOPY             equ 0CC0020h
 HALFTONE            equ 4
 NULL_BRUSH          equ 5
@@ -99,7 +100,6 @@ BS_TYPEMASK         equ 0Fh
 BS_GROUPBOX         equ 7
 ODS_SELECTED        equ 1
 ODS_DISABLED        equ 4
-ODS_DEFAULT         equ 20h
 BKMODE_TRANSP       equ 1
 DT_CFLAGS           equ 25h                 ; DT_CENTER|DT_VCENTER|DT_SINGLELINE
 DT_LFLAGS           equ 24h                 ; DT_LEFT|DT_VCENTER|DT_SINGLELINE
@@ -119,31 +119,17 @@ FKY equ 6                                ; fine filament freqs (shimmer texture)
 FKX equ 3
 
 ; internal-resolution caps per tier
-CAP2_W equ 480
-CAP2_H equ 320
-CAP1_W equ 320
-CAP1_H equ 214
-CAP0_W equ 208
-CAP0_H equ 140
 BW_MAX equ 480
 BH_MAX equ 320
 
 .data
 align 8
 ; IID_IDXGIFactory1 {770aae78-f26f-4dba-a829-253c83d1b387}
-iid_factory1 label byte
-    dd      0770aae78h
-    dw      0f26fh
-    dw      04dbah
-    db      0a8h, 029h, 025h, 03ch, 083h, 0d1h, 0b3h, 087h
-g_tier      dd 2
-g_anim      dd 0
 g_overlay   dd 0
 g_phase     dd 0
 g_bw        dd 0
 g_bh        dd 0
 g_memdc     dq 0
-g_hbm       dq 0
 g_bits      dq 0
 ; ---- runtime-selectable colour scheme -------------------------------------
 ; g_col_* are 13 consecutive dwords (order matches each schemes[] row).
@@ -223,132 +209,8 @@ g_clsbuf    dw 16 dup (?)               ; control class name (Static vs Edit)
 
 .code
 
-; =============================================================================
-; theme_lut_init - fill sin_lut[256] with a raised parabolic sine (0..255),
-;   computed (not embedded) via s = 4p(1-|p|), p in [-1,1).  Leaf, volatiles.
-; =============================================================================
-theme_lut_init proc
-    lea     r10, [sin_lut]
-    xor     r8d, r8d                        ; i
-tl_loop:
-    mov     eax, r8d
-    shl     eax, 3
-    sub     eax, 1024                        ; P = i*8 - 1024
-    mov     r9d, eax                         ; P
-    mov     ecx, eax
-    sar     ecx, 31
-    xor     eax, ecx
-    sub     eax, ecx                         ; |P|
-    mov     edx, 1024
-    sub     edx, eax                         ; t = 1024 - |P|
-    mov     eax, r9d
-    imul    eax, edx                         ; sq = P * t
-    imul    eax, 127
-    sar     eax, 18
-    add     eax, 128                         ; -> [1,255]
-    mov     byte ptr [r10 + r8], al
-    inc     r8d
-    cmp     r8d, 256
-    jb      tl_loop
-    ret
-theme_lut_init endp
 
-; =============================================================================
-; theme_gpu_vram -> eax = dedicated VRAM of the strongest adapter, in MiB
-;   (0 if DXGI is unavailable).  Enumerates real (non-software) adapters via
-;   DXGI and reports the largest DedicatedVideoMemory - the signal for "is there
-;   a discrete graphics card here?".
-; =============================================================================
-theme_gpu_vram proc frame
-    FRAME_PROLOG 416
-    ; [rbp-24] factory  [rbp-32] adapter  [rbp-40] index  [rbp-48] maxvram
-    ; DXGI_ADAPTER_DESC1 @ [rbp-384]  (VideoMem @ +272, Flags @ +304)
-    mov     qword ptr [rbp-48], 0
-    mov     qword ptr [rbp-24], 0
-    WINCALL CreateDXGIFactory1, addr iid_factory1, addr rbp-24
-    test    eax, eax
-    jnz     gv_none
-    cmp     qword ptr [rbp-24], 0
-    je      gv_none
-    mov     dword ptr [rbp-40], 0
-gv_loop:
-    mov     rcx, qword ptr [rbp-24]          ; factory (this)
-    mov     r11, qword ptr [rcx]
-    mov     edx, dword ptr [rbp-40]          ; adapter index
-    lea     r8, [rbp-32]                     ; &adapter
-    call    qword ptr [r11+96]               ; IDXGIFactory1::EnumAdapters1
-    test    eax, eax
-    jnz     gv_endfactory                    ; DXGI_ERROR_NOT_FOUND -> done
-    mov     rcx, qword ptr [rbp-32]          ; adapter (this)
-    mov     r11, qword ptr [rcx]
-    lea     rdx, [rbp-384]                   ; &desc
-    call    qword ptr [r11+80]               ; IDXGIAdapter1::GetDesc1
-    mov     eax, dword ptr [rbp-384+304]     ; Flags
-    test    eax, 2                            ; DXGI_ADAPTER_FLAG_SOFTWARE
-    jnz     gv_rel
-    mov     rax, qword ptr [rbp-384+272]     ; DedicatedVideoMemory
-    cmp     rax, qword ptr [rbp-48]
-    jbe     gv_rel
-    mov     qword ptr [rbp-48], rax
-gv_rel:
-    mov     rcx, qword ptr [rbp-32]          ; adapter->Release
-    mov     r11, qword ptr [rcx]
-    call    qword ptr [r11+16]
-    inc     dword ptr [rbp-40]
-    cmp     dword ptr [rbp-40], 64
-    jb      gv_loop
-gv_endfactory:
-    mov     rcx, qword ptr [rbp-24]          ; factory->Release
-    mov     r11, qword ptr [rcx]
-    call    qword ptr [r11+16]
-    mov     rax, qword ptr [rbp-48]
-    shr     rax, 20                           ; bytes -> MiB
-    FRAME_EPILOG
-    ret
-gv_none:
-    xor     eax, eax
-    FRAME_EPILOG
-    ret
-theme_gpu_vram endp
 
-; =============================================================================
-; theme_detect - choose g_tier / g_anim from the GPU, CPU cores and power.
-;   tier 2 (rich)  : a discrete GPU (>=1.5 GiB VRAM) OR a roomy CPU (>4 cores)
-;   tier 1 (modest): otherwise, or on battery
-;   tier 0 (static): reserved (very constrained machines fall here via caps)
-; =============================================================================
-theme_detect proc frame
-    FRAME_PROLOG 96
-    ; locals: SYSTEM_INFO @ [rbp-56], SYSTEM_POWER_STATUS @ [rbp-72]
-    mov     dword ptr [g_tier], 2
-    lea     rcx, [rbp-56]
-    call    GetSystemInfo
-    call    theme_gpu_vram                   ; eax = VRAM MiB (0 if unknown)
-    mov     r9d, eax                          ; vram
-    mov     r8d, dword ptr [rbp-56+32]        ; dwNumberOfProcessors
-    cmp     r9d, 1536                         ; >= 1.5 GiB -> discrete GPU
-    jae     td_tier2
-    cmp     r8d, 4                            ; or a roomy CPU
-    ja      td_tier2
-    mov     dword ptr [g_tier], 1
-td_tier2:
-    lea     rcx, [rbp-72]
-    call    GetSystemPowerStatus
-    movzx   eax, byte ptr [rbp-72]           ; ACLineStatus (0 = on battery)
-    cmp     al, 0
-    jne     td_power_ok
-    cmp     dword ptr [g_tier], 1
-    jbe     td_power_ok
-    mov     dword ptr [g_tier], 1
-td_power_ok:
-    mov     dword ptr [g_anim], 0
-    cmp     dword ptr [g_tier], 1
-    jb      td_done
-    mov     dword ptr [g_anim], 1
-td_done:
-    FRAME_EPILOG
-    ret
-theme_detect endp
 
 ; =============================================================================
 ; theme_boot - one-time initialisation.
@@ -686,83 +548,6 @@ br_done:
     ret
 bg_render endp
 
-; =============================================================================
-; bg_ensure(ecx=w, edx=h) - (re)create the DIB at the internal resolution.
-; =============================================================================
-bg_ensure proc frame
-    FRAME_PROLOG 128
-    ; [rbp-24] w  [rbp-32] h  BITMAPINFOHEADER @ [rbp-80] (40)  [rbp-88] bits
-    mov     dword ptr [rbp-24], ecx
-    mov     dword ptr [rbp-32], edx
-    mov     eax, dword ptr [rbp-24]
-    cmp     eax, dword ptr [g_bw]
-    jne     be_make
-    mov     eax, dword ptr [rbp-32]
-    cmp     eax, dword ptr [g_bh]
-    jne     be_make
-    cmp     qword ptr [g_bits], 0
-    je      be_make
-    jmp     be_render
-be_make:
-    cmp     qword ptr [g_hbm], 0
-    je      be_nofree1
-    WINCALL DeleteObject, qword ptr [g_hbm]
-    mov     qword ptr [g_hbm], 0
-be_nofree1:
-    cmp     qword ptr [g_memdc], 0
-    je      be_nofree2
-    WINCALL DeleteDC, qword ptr [g_memdc]
-    mov     qword ptr [g_memdc], 0
-be_nofree2:
-    ; zero the BITMAPINFOHEADER (10 dwords) then set fields
-    xor     eax, eax
-    mov     dword ptr [rbp-80], eax
-    mov     dword ptr [rbp-76], eax
-    mov     dword ptr [rbp-72], eax
-    mov     dword ptr [rbp-68], eax
-    mov     dword ptr [rbp-64], eax
-    mov     dword ptr [rbp-60], eax
-    mov     dword ptr [rbp-56], eax
-    mov     dword ptr [rbp-52], eax
-    mov     dword ptr [rbp-48], eax
-    mov     dword ptr [rbp-44], eax
-    mov     dword ptr [rbp-80], 40            ; biSize
-    mov     eax, dword ptr [rbp-24]
-    mov     dword ptr [rbp-76], eax           ; biWidth
-    mov     eax, dword ptr [rbp-32]
-    neg     eax
-    mov     dword ptr [rbp-72], eax           ; biHeight (top-down)
-    mov     word ptr [rbp-68], 1              ; biPlanes
-    mov     word ptr [rbp-66], 32             ; biBitCount
-    mov     dword ptr [rbp-64], BI_RGB        ; biCompression
-    WINCALL CreateDIBSection, 0, addr rbp-80, DIB_RGB_COLORS, addr rbp-88, 0, 0
-    test    rax, rax
-    jz      be_fail
-    mov     qword ptr [g_hbm], rax
-    mov     rax, qword ptr [rbp-88]
-    mov     qword ptr [g_bits], rax
-    WINCALL CreateCompatibleDC, 0
-    test    rax, rax
-    jz      be_fail
-    mov     qword ptr [g_memdc], rax
-    WINCALL SelectObject, qword ptr [g_memdc], qword ptr [g_hbm]
-    mov     eax, dword ptr [rbp-24]
-    mov     dword ptr [g_bw], eax
-    mov     eax, dword ptr [rbp-32]
-    mov     dword ptr [g_bh], eax
-be_render:
-    call    bg_render
-    mov     eax, 1
-    FRAME_EPILOG
-    ret
-be_fail:
-    mov     qword ptr [g_bits], 0
-    mov     dword ptr [g_bw], 0
-    mov     dword ptr [g_bh], 0
-    xor     eax, eax
-    FRAME_EPILOG
-    ret
-bg_ensure endp
 
 ; theme_dark_cb(rcx=hwnd, rdx=lparam) -> BOOL - give each control the explorer
 ;   theme so its scrollbars/borders match the scheme: DarkMode_Explorer for dark

@@ -4,7 +4,6 @@
 ;   con_init      : caches stdout/stderr handles, switches console to UTF-8
 ;   print_a       : rcx = ASCII ptr, edx = len      -> stdout
 ;   print_err     : rcx = ASCII ptr, edx = len      -> stderr
-;   print_wz      : rcx = UTF-16Z ptr               -> stdout (as UTF-8)
 ;   print_hex     : rcx = byte ptr, edx = len(<=64) -> stdout (lowercase hex)
 ;   print_u64     : rcx = value                     -> stdout (decimal)
 ;
@@ -41,7 +40,6 @@ g_pre_err_redir dd 0
 
 .data?
 ; static UTF-8 conversion buffer: worst case 3 bytes per UTF-16 unit
-g_conv_buf  db (MAX_PATH_CHARS*3) dup (?)
 
 .const
 hexdigits   db "0123456789abcdef"
@@ -168,27 +166,6 @@ print_err proc frame
     ret
 print_err endp
 
-; =============================================================================
-; print_wz - print a NUL-terminated UTF-16 string (e.g. a filename) as UTF-8.
-; Conversion is bounded by the static buffer; oversized input is truncated
-; by WideCharToMultiByte failing, in which case nothing is printed.
-; =============================================================================
-public print_wz
-print_wz proc frame
-    FRAME_PROLOG 32 + 32                ; shadow + 4 stack args for WC2MB
-    ; WideCharToMultiByte(CP_UTF8, 0, src, -1, g_conv_buf, cap, NULL, NULL)
-    WINCALL WideCharToMultiByte, CP_UTF8, 0, rcx, -1, addr g_conv_buf, MAX_PATH_CHARS*3, 0, 0
-    test    eax, eax                    ; 0 = conversion failed
-    jz      pw_done
-    dec     eax                         ; drop the terminating NUL
-    jz      pw_done
-    lea     rcx, [g_conv_buf]
-    mov     edx, eax
-    call    print_a
-pw_done:
-    FRAME_EPILOG
-    ret
-print_wz endp
 
 ; =============================================================================
 ; print_hex - rcx = bytes, edx = len (bounded to 64): lowercase hex to stdout
@@ -251,30 +228,5 @@ pu_loop:
     ret
 print_u64 endp
 
-; =============================================================================
-; print_u64e - rcx = unsigned 64-bit value, printed in decimal to STDERR
-; =============================================================================
-public print_u64e
-print_u64e proc frame
-    FRAME_PROLOG 32 + 32
-    lea     r10, [rsp+32+24]
-    mov     rax, rcx
-    mov     r8, 10
-    xor     r11d, r11d
-pue_loop:
-    xor     edx, edx
-    div     r8
-    add     dl, '0'
-    dec     r10
-    mov     byte ptr [r10], dl
-    inc     r11d
-    test    rax, rax
-    jnz     pue_loop
-    mov     rcx, r10
-    mov     edx, r11d
-    call    print_err
-    FRAME_EPILOG
-    ret
-print_u64e endp
 
 end

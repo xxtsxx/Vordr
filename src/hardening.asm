@@ -5,7 +5,6 @@
 ;   iat_lockdown      : make our IAT pages read-only ("full RELRO" equivalent)
 ;   secure_zero       : forced, non-elidable memory wipe
 ;   tagged_alloc      : heap allocator with temporal tag + canaries
-;   tagged_free       : verifying, poisoning free
 ;   ct_memcmp         : constant-time comparison (timing safe)
 ; =============================================================================
 
@@ -300,40 +299,5 @@ tc_fail:
     FASTFAIL FF_HEAP_TAG
 tagged_check endp
 
-; =============================================================================
-; tagged_free(rcx = user ptr, rdx = 1 to securely wipe user data first)
-; Verifies block integrity, optionally wipes, poisons the header (so a
-; double free / stale pointer fastfails), bumps generation, releases pages.
-; =============================================================================
-public tagged_free
-tagged_free proc frame
-    FRAME_PROLOG 48
-    ; locals: [rbp-24] user ptr, [rbp-32] wipe flag
-
-    mov     qword ptr [rbp-24], rcx
-    mov     qword ptr [rbp-32], rdx
-    call    tagged_check                            ; fastfails if invalid
-
-    mov     rcx, qword ptr [rbp-24]
-    lea     r10, [rcx - sizeof HEAPBLK]
-
-    xIF qword ptr [rbp-32], ne, 0               ; wipe flag set?
-        mov     rdx, qword ptr [r10].HEAPBLK.blksize
-        call    secure_zero                         ; rcx still = user ptr
-    xENDIF
-    ; ---- poison header so any reuse of the stale pointer is caught ---------
-    mov     rcx, qword ptr [rbp-24]
-    lea     r10, [rcx - sizeof HEAPBLK]
-    mov     dword ptr [r10].HEAPBLK.magic, 0DDDDDDDDh
-    mov     rax, 0DDDDDDDDDDDDDDDDh
-    mov     qword ptr [r10].HEAPBLK.tag, rax
-    mov     qword ptr [r10].HEAPBLK.canary, 0
-    lock inc dword ptr [g_heap_gen]                 ; bump global generation
-
-    WINCALL VirtualFree, r10, 0, MEM_RELEASE        ; release the pages
-
-    FRAME_EPILOG
-    ret
-tagged_free endp
 
 end

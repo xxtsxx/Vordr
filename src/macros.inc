@@ -26,7 +26,6 @@ EXIT_SELFTEST       equ 7
 EXIT_NOSPACE        equ 8          ; insufficient free disk space (pre-flight)
 EXIT_LOCKED         equ 9          ; vault is locked / wrong master password
 
-DISK_MARGIN         equ 100000h    ; 1 MiB slack added to free-space estimates
 
 ; ---------------------------------------------------------------------------
 ; __fastfail codes (int 29h, rcx = code).  2/10 are the documented Windows
@@ -60,8 +59,6 @@ MIN_PASSWORD_BYTES  equ 1
 
 ARGON2_MIN_T        equ 1
 ARGON2_MAX_T        equ 16
-ARGON2_MIN_M_KIB    equ 8192       ; 8 MiB
-ARGON2_MAX_M_KIB    equ 4194304    ; 4 GiB
 ARGON2_DEF_T        equ 3
 ARGON2_DEF_M_KIB    equ 524288     ; 512 MiB (tuned for ~600-700ms with AVX2)
 
@@ -87,8 +84,6 @@ VAULT_HDR struct
     salt        db 32 dup (?)      ; CSPRNG salt
     nonce       db 12 dup (?)      ; GCM nonce
 VAULT_HDR ends
-VAULT_KCV_OFFSET    equ (sizeof VAULT_HDR)               ; 64
-VAULT_HDR_BYTES     equ (sizeof VAULT_HDR) + KCV_LEN     ; 80 (full header = AAD)
 
 ; Entry record TLV field type tags (UTF-8 values, every length BOUND_CHECKed)
 VF_TITLE            equ 1
@@ -96,7 +91,6 @@ VF_USERNAME         equ 2
 VF_SECRET           equ 3
 VF_URL              equ 4
 VF_NOTES            equ 5
-VF_TAGS             equ 6
 VF_TOTP             equ 7          ; base32 TOTP secret (RFC 6238)
 VF_TEXT             equ 8          ; generic single-line text (custom fields)
 VF_IMAGE            equ 9          ; raw encoded image bytes (PNG/JPEG/BMP)
@@ -130,9 +124,6 @@ MAX_LABEL_BYTES     equ 128        ; bound on a single field's custom label
 ; GUI->vault_build_entry descriptor marker (in the g_field_list type qword, never
 ; stored): the value pointer is a raw binary blob {u32 len, bytes}, not wide text.
 VFL_RAW             equ 40000000h
-VAULT_ID_LEN        equ 16         ; per-entry random id
-MAX_ENTRY_BYTES     equ 65536      ; bound on a single serialized entry
-MAX_FIELD_BYTES     equ 16384      ; bound on a single TLV field
 
 ; ---------------------------------------------------------------------------
 ; Struct type magics (TYPE_CHECK targets)

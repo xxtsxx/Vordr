@@ -8,7 +8,6 @@
 ;   sha1_init(rcx=ctx)
 ;   sha1_update(rcx=ctx, rdx=data, r8=len)
 ;   sha1_final(rcx=ctx, rdx=out20)
-;   sha1_hash(rcx=data, rdx=len, r8=out20)
 ;   hmac_sha1(rcx=key, rdx=keylen, r8=msg, r9=msglen, [rbp+48]=out20)
 ;
 ; ctx is SHA1_CTX_SIZE bytes supplied by the caller.
@@ -272,26 +271,6 @@ sf_out:
     ret
 sha1_final endp
 
-; sha1_hash(rcx=data, rdx=len, r8=out20) - one-shot
-public sha1_hash
-sha1_hash proc frame
-    FRAME_PROLOG 176
-    ; ctx=[rbp-112] (clear of canary)  [rbp-120]=out [rbp-128]=data [rbp-136]=len
-    mov     qword ptr [rbp-120], r8
-    mov     qword ptr [rbp-128], rcx
-    mov     qword ptr [rbp-136], rdx
-    lea     rcx, [rbp-112]
-    call    sha1_init
-    lea     rcx, [rbp-112]
-    mov     rdx, qword ptr [rbp-128]
-    mov     r8, qword ptr [rbp-136]
-    call    sha1_update
-    lea     rcx, [rbp-112]
-    mov     rdx, qword ptr [rbp-120]
-    call    sha1_final
-    FRAME_EPILOG
-    ret
-sha1_hash endp
 
 ; =============================================================================
 ; hmac_sha1(rcx=key, rdx=keylen, r8=msg, r9=msglen, [rbp+48]=out20)

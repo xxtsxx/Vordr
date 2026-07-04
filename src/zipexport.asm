@@ -46,7 +46,6 @@ extern g_xlsx_len:qword
 
 VF_IMAGE_   equ 9
 VF_FILE_    equ 10
-VFL_RAW_    equ 40000000h
 JSON_CAP    equ 16*1024*1024
 CP_UTF8_    equ 65001
 
