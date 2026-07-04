@@ -79,6 +79,7 @@ extern xlsx_decrypt:proc                ; encrypted Excel import (oleagile.asm)
 externdef g_csv_alloc:qword
 extern ze_export_all:proc               ; encrypted-ZIP export (zipexport.asm)
 extern ze_compose:proc                  ; format-dispatching export composer
+extern zi_import:proc                   ; encrypted-ZIP import (zipimport.asm)
 extern ze_free:proc
 externdef g_zbuf:qword
 extern xl_build_xlsx:proc               ; encrypted-Excel export (xlexport.asm / xlcrypt.asm)
@@ -861,9 +862,9 @@ g_xlsfilter label word          ; "Excel workbooks\0*.xlsx\0All files\0*.*\0\0"
     dw '*','.','x','l','s','x',0
     dw 'A','l','l',' ','f','i','l','e','s',0
     dw '*','.','*',0,0
-g_impfilter label word          ; "Spreadsheets & CSV\0*.csv;*.xlsx\0All files\0*.*\0\0"
-    dw 'S','p','r','e','a','d','s','h','e','e','t','s',' ','&',' ','C','S','V',0
-    dw '*','.','c','s','v',';','*','.','x','l','s','x',0
+g_impfilter label word          ; "Vordr / spreadsheet / CSV\0*.zip;*.csv;*.xlsx\0All files\0*.*\0\0"
+    dw 'V','o','r','d','r',' ','/',' ','s','p','r','e','a','d','s','h','e','e','t',' ','/',' ','C','S','V',0
+    dw '*','.','z','i','p',';','*','.','c','s','v',';','*','.','x','l','s','x',0
     dw 'A','l','l',' ','f','i','l','e','s',0
     dw '*','.','*',0,0
 g_empty_w label word
@@ -8571,14 +8572,31 @@ gim_read_ok:
     cmp     dword ptr [rbp-40], 4
     jb      gim_csv                             ; too short for zip/OLE2 -> CSV/text
     movzx   eax, byte ptr [r10]
-    cmp     eax, 'P'                            ; "PK" -> zip -> .xlsx
+    cmp     eax, 'P'                            ; "PK" -> zip
     jne     gim_chk_ole
     cmp     byte ptr [r10+1], 'K'
     jne     gim_chk_ole
-    mov     rcx, qword ptr [rbp-32]
+    cmp     word ptr [r10+8], 99                ; method 99 = WinZip AES -> Vordr zip
+    je      gim_vzip
+    mov     rcx, qword ptr [rbp-32]             ; else a plain .xlsx
     mov     edx, dword ptr [rbp-40]
     call    xlsx_import
     mov     dword ptr [rbp-64], eax
+    jmp     gim_result
+gim_vzip:
+    WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_IMPPW, qword ptr [rbp-24], addr imppw_proc, 0
+    cmp     eax, 1
+    jne     gim_done
+    mov     rcx, qword ptr [rbp-32]             ; raw zip
+    mov     edx, dword ptr [rbp-40]
+    lea     r8, [g_xlpw]                        ; UTF-16 export password
+    mov     r9d, dword ptr [g_xlpwlen]          ; bytes
+    call    zi_import
+    mov     dword ptr [rbp-64], eax
+    lea     rcx, [g_xlpw]                       ; wipe the password
+    mov     edx, 512
+    call    secure_zero
+    mov     dword ptr [g_xlpwlen], 0
     jmp     gim_result
 gim_chk_ole:
     cmp     eax, 0D0h                           ; D0 CF 11 E0 -> OLE2 -> encrypted .xlsx
