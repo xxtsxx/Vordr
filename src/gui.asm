@@ -1242,9 +1242,11 @@ gp_loop:
     jz      gp_next
 gp_show:
     ; owner-draw list: the item data IS the vault index; WM_COMPAREITEM sorts by
-    ; title, WM_DRAWITEM renders the icon card.
+    ; title, WM_DRAWITEM renders the icon card.  Pass the index as a DWORD so the
+    ; 64-bit LPARAM is zero-extended (the slot is a dword; a qword read would take
+    ; the uninitialized 4 bytes above it into the stored item data).
     WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_ADDSTRING, 0, \
-            qword ptr [rbp-40]
+            dword ptr [rbp-40]
 gp_next:
     inc     dword ptr [rbp-40]
     jmp     gp_loop
