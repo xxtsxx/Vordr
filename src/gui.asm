@@ -420,10 +420,16 @@ FD_Y        equ 8              ; dd  row top in DLU (within the detail pane)
 FD_H        equ 12             ; dd  row height in DLU
 FD_HANDLES  equ 16             ; q[DYN_SLOTS]  control hwnd per slot (0 = absent)
 FD_ARF      equ 144            ; {u32 len, AttachRef[68], filename wide}  attachment value blob
-IMG_BLOBCAP equ 328            ; 4 + 68 + up to 256 bytes of wide filename
 FD_RSVD     equ 472            ; q  reserved (kept for 16-byte DESCSZ alignment)
 ARFBLOB     equ 328            ; size of the {u32 len,AttachRef,filename} attachment blob
 DESCSZ      equ 480            ; 16 + 16 handles*8 + 328 arf blob + 8 reserved (16-aligned)
+; The attachments tile aggregates every VF_FILE/VF_IMAGE field of the open entry
+; into one row backed by g_tilefiles (see the tf_* helpers).  Each file entry is
+; {AttachRef[68], filename wide (NUL-terminated, <=129 wchars)}.
+MAX_TFILES  equ 24             ; <= MAX_FIELDS minus the other fields of an entry
+TFILE_ENTRY equ 328
+TFILE_NAME  equ 68             ; filename offset within a tile-file entry
+MAX_FIELDS  equ 32             ; g_field_list capacity (matches main.asm)
 MAXROWS     equ 24
 FDF_LABELED equ 1               ; FD_FLAGS bit0 = carries a custom label
 FDF_REVEALED equ 2              ; FD_FLAGS bit1 = value currently unmasked
@@ -450,6 +456,8 @@ DS_EXPORT   equ 12              ; attachment: save the file to disk
 DS_OPEN     equ 13              ; attachment: open the file in the default app
 DS_SBADGE   equ 14              ; secret: password-strength badge (owner-draw, view mode)
 DS_GEN      equ 15              ; secret: generate-password button (edit mode)
+TAG_XW      equ 16              ; width (px) of a tag's edit-mode 'x' delete hotspot
+DT_NAMEFLAGS equ 8024h          ; DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS
 IDC_V_ADDFIELD equ 230          ; "+ Add field" button (edit mode)
 IDC_V_SAVE   equ 231          ; "Save" button (edit mode, accent/primary)
 IDC_V_SEARCH equ 232          ; search/filter box under the entry list
@@ -691,6 +699,8 @@ kl_file label word
     dw 'F','i','l','e', 0
 cap_choose label word
     dw 'C','h','o','o','s','e', 0
+tag_xw label word
+    dw 0D7h, 0                             ; multiplication sign, used as the tag 'x'
 cap_open label word
     dw 'O','p','e','n', 0
 cap_save label word
@@ -851,7 +861,6 @@ g_phon_w    dw 6144 dup (?)          ; phonetic spelling text (wiped on close)
 align 8
 ; --- modular field-row model (runtime detail form) ---
 g_fields      db MAXROWS*DESCSZ dup (?)   ; row descriptors
-g_gatherblob  db 32*ARFBLOB dup (?)        ; per-field attachment blobs held across reorder
 g_field_count dd ?                        ; live row count
 g_fav_state   dd ?                         ; current entry is a favorite (0/1)
 g_icon_set    dd ?                         ; current entry has a custom icon override (0/1)
@@ -894,7 +903,12 @@ align 2
 g_glyph_w     dw 2 dup (?)                 ; one glyph char + NUL
 align 8
 g_imgstageref db 68 dup (?)               ; scratch AttachRef from attach_stage
-g_imgblob     db IMG_BLOBCAP dup (?)       ; scratch {AttachRef, filename wide} value blob
+align 8
+g_tilefiles   db MAX_TFILES*TFILE_ENTRY dup (?)  ; the attachments tile's file list
+g_tilefile_n  dd ?                               ; number of files in the tile
+align 8
+g_field_list2 dq 3*MAX_FIELDS dup (?)            ; commit scratch: expanded field list
+g_tileblob    db MAX_TFILES*336 dup (?)          ; per-file {u32 len, AttachRef, name}
 align 2
 g_imgfn_w     dw 200 dup (?)               ; current image's filename (wide) to store
 g_imgbuf      dq ?                         ; imported file bytes (mem_alloc'd)
@@ -2212,6 +2226,112 @@ gds_have:
     ret
 gui_draw_sbadge endp
 
+; gui_draw_taglist(rcx=lpdis) - paint the attachments tile: one rounded chip per
+;   file in g_tilefiles (filename, left-aligned, ellipsized).  In edit mode each
+;   chip shows an 'x' delete hotspot (TAG_XW px) on its right.  Chip height =
+;   clientH / count, matching gui_tag_hit's inverse mapping.
+gui_draw_taglist proc frame
+    FRAME_PROLOG 224
+    mov     qword ptr [rbp-24], rcx
+    mov     r10, rcx
+    mov     rax, qword ptr [r10+32]
+    mov     qword ptr [rbp-32], rax            ; hdc
+    mov     eax, dword ptr [r10+40]
+    mov     dword ptr [rbp-40], eax            ; L
+    mov     eax, dword ptr [r10+44]
+    mov     dword ptr [rbp-48], eax            ; T
+    mov     eax, dword ptr [r10+48]
+    mov     dword ptr [rbp-56], eax            ; R
+    mov     eax, dword ptr [r10+52]
+    mov     dword ptr [rbp-64], eax            ; B
+    ; clear the whole item rect to the dialog base
+    WINCALL CreateSolidBrush, dword ptr [g_col_bg]
+    mov     qword ptr [rbp-112], rax
+    mov     r10, qword ptr [rbp-24]
+    lea     rdx, [r10+40]
+    WINCALL FillRect, qword ptr [rbp-32], rdx, qword ptr [rbp-112]
+    WINCALL DeleteObject, qword ptr [rbp-112]
+    mov     eax, dword ptr [g_tilefile_n]
+    mov     dword ptr [rbp-72], eax
+    test    eax, eax
+    jz      gtl_done
+    mov     eax, dword ptr [rbp-64]            ; chipH = (B - T) / n
+    sub     eax, dword ptr [rbp-48]
+    cdq
+    idiv    dword ptr [rbp-72]
+    mov     dword ptr [rbp-88], eax
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_subfont]
+    mov     qword ptr [rbp-120], rax           ; old font
+    WINCALL SetBkMode, qword ptr [rbp-32], 1
+    mov     dword ptr [rbp-80], 0              ; i
+gtl_loop:
+    mov     eax, dword ptr [rbp-80]
+    cmp     eax, dword ptr [rbp-72]
+    jae     gtl_restore
+    mov     eax, dword ptr [rbp-80]           ; top = T + i*chipH
+    imul    eax, dword ptr [rbp-88]
+    add     eax, dword ptr [rbp-48]
+    mov     dword ptr [rbp-96], eax
+    add     eax, dword ptr [rbp-88]           ; bot = top + chipH - 2 (gap)
+    sub     eax, 2
+    mov     dword ptr [rbp-104], eax
+    mov     eax, dword ptr [rbp-56]           ; chip right = R - 2
+    sub     eax, 2
+    mov     dword ptr [rbp-152], eax
+    ; rounded chip fill (panel), NULL pen
+    WINCALL CreateSolidBrush, dword ptr [g_col_panel]
+    mov     qword ptr [rbp-128], rax
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-128]
+    mov     qword ptr [rbp-136], rax          ; old brush
+    WINCALL GetStockObject, 8                 ; NULL_PEN
+    WINCALL SelectObject, qword ptr [rbp-32], rax
+    mov     qword ptr [rbp-144], rax          ; old pen
+    WINCALL RoundRect, qword ptr [rbp-32], dword ptr [rbp-40], dword ptr [rbp-96], \
+            dword ptr [rbp-152], dword ptr [rbp-104], 8, 8
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-136]
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-144]
+    WINCALL DeleteObject, qword ptr [rbp-128]
+    ; filename (left, vcenter, ellipsized) padded, leaving room for the x
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_text]
+    mov     eax, dword ptr [rbp-40]
+    add     eax, 8
+    mov     dword ptr [rbp-176], eax          ; rc.left = L + 8
+    mov     eax, dword ptr [rbp-96]
+    mov     dword ptr [rbp-172], eax          ; rc.top
+    mov     eax, dword ptr [rbp-56]
+    sub     eax, 2 + TAG_XW
+    mov     dword ptr [rbp-168], eax          ; rc.right = R - 2 - TAG_XW
+    mov     eax, dword ptr [rbp-104]
+    mov     dword ptr [rbp-164], eax          ; rc.bottom
+    mov     ecx, dword ptr [rbp-80]
+    call    tf_entry
+    add     rax, TFILE_NAME
+    WINCALL DrawTextW, qword ptr [rbp-32], rax, -1, addr rbp-176, DT_NAMEFLAGS
+    ; edit mode: 'x' delete hotspot on the right
+    cmp     dword ptr [g_editmode], 0
+    je      gtl_next
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_textdim]
+    mov     eax, dword ptr [rbp-56]
+    sub     eax, 2 + TAG_XW
+    mov     dword ptr [rbp-176], eax          ; rc.left = R - 2 - TAG_XW
+    mov     eax, dword ptr [rbp-96]
+    mov     dword ptr [rbp-172], eax
+    mov     eax, dword ptr [rbp-56]
+    sub     eax, 2
+    mov     dword ptr [rbp-168], eax          ; rc.right = R - 2
+    mov     eax, dword ptr [rbp-104]
+    mov     dword ptr [rbp-164], eax
+    WINCALL DrawTextW, qword ptr [rbp-32], addr tag_xw, -1, addr rbp-176, DT_IMGFLAGS
+gtl_next:
+    inc     dword ptr [rbp-80]
+    jmp     gtl_loop
+gtl_restore:
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-120]
+gtl_done:
+    FRAME_EPILOG
+    ret
+gui_draw_taglist endp
+
 ; gui_draw_field_cards(rcx=hdc, rdx=hdlg) - fill a COL_PANEL rounded card behind
 ;   every field row (label+value edits already paint COL_PANEL, so they blend).
 gui_draw_field_cards proc frame
@@ -2543,6 +2663,7 @@ gsd_noicon:
     add     rsp, 32
     mov     rcx, qword ptr [rbp-24]
     call    gui_rows_clear
+    call    tf_reset                             ; start the attachments tile empty
     ; Title (fixed control)
     mov     ecx, dword ptr [rbp-32]
     mov     edx, VF_TITLE
@@ -2573,6 +2694,10 @@ gsd_floop:
     je      gsd_fnext
     cmp     eax, VF_ICON                         ; reserved icon override: not a row
     je      gsd_fnext
+    cmp     eax, VF_IMAGE                        ; attachments collapse into one tile
+    je      gsd_attach
+    cmp     eax, VF_FILE
+    je      gsd_attach
     mov     rcx, qword ptr [rbp-24]
     mov     edx, eax
     call    gui_row_add                          ; eax = row (-1 if full)
@@ -2597,11 +2722,6 @@ gsd_floop:
     add     r10, rax
     or      dword ptr [r10+FD_FLAGS], FDF_LABELED
 gsd_setval:
-    ; attachment field: value is {AttachRef, filename} -> store blob + show name
-    cmp     dword ptr [rbp-96], VF_IMAGE
-    je      gsd_fileload
-    cmp     dword ptr [rbp-96], VF_FILE
-    je      gsd_fileload
     mov     ecx, dword ptr [rbp-44]
     mov     edx, DS_VALUE
     call    dynid
@@ -2639,21 +2759,22 @@ gsd_mask:
     WINCALL SendDlgItemMessageW, qword ptr [rbp-24], dword ptr [rbp-56], \
             EM_SETPASSWORDCHAR, SECRET_MASK, 0
     jmp     gsd_fnext
-gsd_fileload:
-    mov     ecx, dword ptr [rbp-44]
-    mov     rdx, qword ptr [rbp-72]             ; {AttachRef, filename}
-    mov     r8d, dword ptr [rbp-64]
-    call    gui_img_setblob
-    ; show the filename in the read-only DS_VALUE edit
-    mov     eax, dword ptr [rbp-64]
+gsd_attach:
+    ; append this file to the attachments tile; create the tile row only once
+    mov     eax, dword ptr [rbp-64]             ; vallen
     cmp     eax, 68
-    jbe     gsd_fnext
-    mov     ecx, dword ptr [rbp-44]
-    mov     edx, DS_VALUE
-    call    dynid
-    mov     r8, qword ptr [rbp-72]
-    add     r8, 68                             ; filename (wide)
-    WINCALL SetDlgItemTextW, qword ptr [rbp-24], eax, r8
+    jb      gsd_attach_row                      ; malformed value -> skip the file
+    mov     rcx, qword ptr [rbp-72]             ; valptr -> AttachRef
+    lea     rdx, [rcx+68]                       ; filename wide (at value+68)
+    call    tf_append
+gsd_attach_row:
+    call    tf_find_row
+    cmp     eax, -1
+    jne     gsd_fnext                           ; tile row already created
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, VF_FILE
+    call    gui_row_add
+    jmp     gsd_fnext
 gsd_fnext:
     inc     dword ptr [rbp-40]
     jmp     gsd_floop
@@ -2913,43 +3034,22 @@ gg_next:
     inc     dword ptr [rbp-28]
     jmp     gg_row
 gg_image:
-    ; image/file row: emit the AttachRef as a VFL_RAW binary value (skip if empty)
-    mov     eax, dword ptr [rbp-28]
-    imul    eax, eax, DESCSZ
-    lea     r10, [g_fields]
-    add     r10, rax
-    test    dword ptr [r10+FD_FLAGS], FDF_HASIMG
-    jz      gg_imgskip
-    mov     eax, dword ptr [r10+FD_ARF]          ; blob length prefix; sanity-check
-    cmp     eax, 324                             ; AttachRef+filename must fit FD_ARF region
-    ja      gg_imgskip                           ; corrupt/oversize -> drop safely (no crash)
-    ; copy the blob into g_gatherblob[k] so it survives rows_clear/rebuild on reorder
-    mov     ecx, dword ptr [rbp-32]
-    imul    ecx, ecx, ARFBLOB
-    lea     r11, [g_gatherblob]
-    add     r11, rcx                             ; dst = &g_gatherblob[k]
-    lea     rax, [r10+FD_ARF]                    ; src
-    xor     r8d, r8d
-gg_imgcpy:
-    cmp     r8d, ARFBLOB
-    jae     gg_imgcpd
-    mov     r9b, byte ptr [rax+r8]
-    mov     byte ptr [r11+r8], r9b
-    inc     r8d
-    jmp     gg_imgcpy
-gg_imgcpd:
+    ; the attachments tile emits ONE placeholder entry (a bare VF_FILE, no VFL_RAW);
+    ; its files live in g_tilefiles and gui_commit expands the placeholder into one
+    ; VFL_RAW field per file.  An empty tile is dropped (row unchanged -> disappears).
+    cmp     dword ptr [g_tilefile_n], 0
+    je      gg_imgskip
     mov     ecx, dword ptr [rbp-32]
     imul    ecx, ecx, 24
     lea     rax, [g_field_list]
     add     rax, rcx                             ; &list[k]
-    mov     r9d, dword ptr [r10+FD_KIND]         ; VF_IMAGE or VF_FILE
-    or      r9d, VFL_RAW
-    mov     qword ptr [rax+0], r9
-    mov     qword ptr [rax+16], r11              ; value -> the side-buffer copy
+    mov     qword ptr [rax+0], VF_FILE           ; base kind = tile marker
     mov     qword ptr [rax+8], 0
-    jmp     gg_label
+    lea     r11, [g_empty_w]
+    mov     qword ptr [rax+16], r11
+    jmp     gg_next
 gg_imgskip:
-    inc     dword ptr [rbp-28]                   ; drop empty image rows (k unchanged)
+    inc     dword ptr [rbp-28]                   ; drop the empty tile row (k unchanged)
     jmp     gg_row
 gg_done:
     ; append the reserved favorite marker field when set
@@ -2985,6 +3085,93 @@ gg_icondone:
     ret
 gui_gather endp
 
+; gui_tile_expand() - replace the single VF_FILE tile placeholder in g_field_list with
+;   one VFL_RAW field per file in g_tilefiles (value = {u32 len, AttachRef, filename}
+;   built into g_tileblob).  Order is preserved; other fields copy through unchanged.
+;   Called by gui_commit only - the reorder path keeps the tile as one placeholder.
+gui_tile_expand proc frame
+    FRAME_PROLOG 64
+    mov     dword ptr [rbp-24], 0               ; src
+    mov     dword ptr [rbp-32], 0               ; dst
+gte_src:
+    mov     eax, dword ptr [rbp-24]
+    cmp     eax, dword ptr [g_field_n]
+    jae     gte_finish
+    imul    eax, eax, 24
+    lea     r10, [g_field_list]
+    add     r10, rax
+    mov     rcx, qword ptr [r10]                ; entry kind
+    cmp     rcx, VF_FILE                        ; the tile placeholder (bare VF_FILE)?
+    je      gte_expand
+    mov     eax, dword ptr [rbp-32]             ; copy this entry through
+    cmp     eax, MAX_FIELDS
+    jae     gte_srcnext
+    imul    eax, eax, 24
+    lea     r11, [g_field_list2]
+    add     r11, rax
+    mov     rax, qword ptr [r10+0]
+    mov     qword ptr [r11+0], rax
+    mov     rax, qword ptr [r10+8]
+    mov     qword ptr [r11+8], rax
+    mov     rax, qword ptr [r10+16]
+    mov     qword ptr [r11+16], rax
+    inc     dword ptr [rbp-32]
+gte_srcnext:
+    inc     dword ptr [rbp-24]
+    jmp     gte_src
+gte_expand:
+    mov     dword ptr [rbp-40], 0               ; i
+gte_i:
+    mov     eax, dword ptr [rbp-40]
+    cmp     eax, dword ptr [g_tilefile_n]
+    jae     gte_srcnext
+    mov     eax, dword ptr [rbp-32]
+    cmp     eax, MAX_FIELDS
+    jae     gte_srcnext                         ; no field slots left -> stop
+    mov     eax, dword ptr [rbp-40]             ; blob = g_tileblob + i*336
+    imul    eax, eax, 336
+    lea     r11, [g_tileblob]
+    add     r11, rax
+    mov     qword ptr [rbp-56], r11
+    mov     ecx, dword ptr [rbp-40]
+    call    tf_entry
+    mov     qword ptr [rbp-48], rax             ; entry ptr
+    mov     rcx, qword ptr [rbp-56]             ; AttachRef -> blob+4
+    add     rcx, 4
+    mov     rdx, qword ptr [rbp-48]
+    mov     r8, 68
+    call    gui_bcpy
+    mov     rcx, qword ptr [rbp-56]             ; filename -> blob+4+68
+    add     rcx, 4+68
+    mov     rdx, qword ptr [rbp-48]
+    add     rdx, TFILE_NAME
+    call    gui_wcpy_capped                     ; eax = name bytes incl NUL
+    add     eax, 68                             ; len = 68 + name bytes
+    mov     r10, qword ptr [rbp-56]
+    mov     dword ptr [r10], eax                ; u32 len at blob+0
+    mov     eax, dword ptr [rbp-32]             ; g_field_list2[dst]
+    imul    eax, eax, 24
+    lea     r11, [g_field_list2]
+    add     r11, rax
+    mov     qword ptr [r11+0], VF_FILE or VFL_RAW
+    mov     qword ptr [r11+8], 0
+    mov     rax, qword ptr [rbp-56]
+    mov     qword ptr [r11+16], rax
+    inc     dword ptr [rbp-32]
+    inc     dword ptr [rbp-40]
+    jmp     gte_i
+gte_finish:
+    mov     eax, dword ptr [rbp-32]
+    mov     dword ptr [g_field_n], eax
+    imul    eax, eax, 24
+    lea     rcx, [g_field_list]
+    lea     rdx, [g_field_list2]
+    mov     r8d, eax
+    call    gui_bcpy
+    FRAME_EPILOG
+    ret
+gui_tile_expand endp
+
 ; gui_commit(rcx = hdlg) - gather Title + rows into g_field_list and write the
 ;   record back (remove the old entry, rebuild via vault_build_entry, reseal).
 ;   Reselects the entry.  Refuses to save an empty title (keeps the old entry).
@@ -2995,6 +3182,7 @@ gui_commit proc frame
     jl      gco_done                          ; nothing selected
     mov     rcx, qword ptr [rbp-24]
     call    gui_gather
+    call    gui_tile_expand                   ; tile placeholder -> one field per file
     mov     r10, qword ptr [g_field_list+16]  ; title value ptr
     test    r10, r10
     jz      gco_notitle
@@ -3394,16 +3582,18 @@ gra_zero:
             ES_AUTOHSCROLL_ or WS_TABSTOP_
     jmp     gra_reorder
 gra_file:
-    ; attachment row: read-only filename + Choose/Open/Save (no in-app preview)
-    WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_VALUE, addr cls_edit, 0, \
-            ES_AUTOHSCROLL_ or ES_READONLY_
+    ; attachments tile: owner-draw tag list (DS_VALUE, click = open/remove) + a
+    ; Choose button pinned top-right.  Up/Down reposition the tile; NO trashcan -
+    ; the tile is removed automatically when its last file is deleted.
+    WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_VALUE, addr cls_button, 0, \
+            BS_OWNERDRAW_ or WS_TABSTOP_
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_IMPORT, addr cls_button, addr cap_choose, \
             BS_OWNERDRAW_ or WS_TABSTOP_
-    WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_OPEN, addr cls_button, addr cap_open, \
-            BS_OWNERDRAW_ or WS_TABSTOP_
-    WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_EXPORT, addr cls_button, addr cap_save, \
-            BS_OWNERDRAW_ or WS_TABSTOP_
-    jmp     gra_reorder
+    WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_UP, addr cls_button, addr wb_up, \
+            BS_OWNERDRAW_
+    WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_DOWN, addr cls_button, addr wb_down, \
+            BS_OWNERDRAW_
+    jmp     gra_finish
 gra_secret:
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_VALUE, addr cls_edit, 0, \
             ES_PASSWORD_ or ES_AUTOHSCROLL_ or WS_TABSTOP_
@@ -3438,6 +3628,7 @@ gra_reorder:
             BS_OWNERDRAW_
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_DEL, addr cls_button, addr wb_rem, \
             BS_OWNERDRAW_
+gra_finish:
     inc     dword ptr [g_field_count]
     mov     eax, dword ptr [rbp-40]
     FRAME_EPILOG
@@ -3475,31 +3666,110 @@ gui_desc proc
     ret
 gui_desc endp
 
-; gui_img_setblob(ecx=row, rdx=blob ptr, r8d=blob len) - copy the attachment value
-;   blob ({AttachRef[68], filename wide}) into FD_ARF (length-prefixed for VFL_RAW)
-;   and mark FDF_HASIMG.
-gui_img_setblob proc frame
-    FRAME_PROLOG 64
-    mov     dword ptr [rbp-24], ecx
+; -----------------------------------------------------------------------------
+; tf_* - the attachments tile's file list (g_tilefiles / g_tilefile_n).  Each
+;   entry is {AttachRef[68], filename wide (NUL-terminated)}.  One tile per entry.
+; -----------------------------------------------------------------------------
+; tf_reset() - empty the list.  Leaf.
+tf_reset proc
+    mov     dword ptr [g_tilefile_n], 0
+    ret
+tf_reset endp
+
+; tf_entry(ecx = index) -> rax = &g_tilefiles[index].  Leaf.
+tf_entry proc
+    mov     eax, ecx
+    imul    eax, eax, TFILE_ENTRY
+    lea     rdx, [g_tilefiles]
+    add     rax, rdx
+    ret
+tf_entry endp
+
+; tf_append(rcx = AttachRef[68], rdx = filename wide) -> eax = 0 ok / 1 full.
+tf_append proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
     mov     qword ptr [rbp-32], rdx
-    cmp     r8d, IMG_BLOBCAP-4
-    jbe     @F
-    mov     r8d, IMG_BLOBCAP-4
-@@: mov     dword ptr [rbp-44], r8d
-    call    gui_desc
-    mov     qword ptr [rbp-40], rax
-    mov     r10, qword ptr [rbp-40]
-    mov     eax, dword ptr [rbp-44]
-    mov     dword ptr [r10+FD_ARF], eax
-    lea     rcx, [r10+FD_ARF+4]
-    mov     rdx, qword ptr [rbp-32]
-    mov     r8d, dword ptr [rbp-44]
+    mov     eax, dword ptr [g_tilefile_n]
+    cmp     eax, MAX_TFILES
+    jae     tfa_full
+    mov     ecx, eax
+    call    tf_entry
+    mov     qword ptr [rbp-40], rax             ; dst entry
+    mov     rcx, rax                            ; copy the 68-byte AttachRef
+    mov     rdx, qword ptr [rbp-24]
+    mov     r8, 68
     call    gui_bcpy
-    mov     r10, qword ptr [rbp-40]
-    or      dword ptr [r10+FD_FLAGS], FDF_HASIMG
+    mov     rcx, qword ptr [rbp-40]             ; copy the filename (capped, NUL-term)
+    add     rcx, TFILE_NAME
+    mov     rdx, qword ptr [rbp-32]
+    call    gui_wcpy_capped
+    inc     dword ptr [g_tilefile_n]
+    xor     eax, eax
     FRAME_EPILOG
     ret
-gui_img_setblob endp
+tfa_full:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+tf_append endp
+
+; tf_remove(ecx = index) - drop entry [index], shifting the tail down.
+tf_remove proc frame
+    FRAME_PROLOG 48
+    mov     dword ptr [rbp-24], ecx
+    cmp     ecx, dword ptr [g_tilefile_n]
+    jae     tfr_done                            ; out of range
+tfr_shift:
+    mov     ecx, dword ptr [rbp-24]
+    inc     ecx
+    cmp     ecx, dword ptr [g_tilefile_n]
+    jae     tfr_dec
+    mov     ecx, dword ptr [rbp-24]             ; dst = [i]
+    call    tf_entry
+    mov     qword ptr [rbp-32], rax
+    mov     ecx, dword ptr [rbp-24]             ; src = [i+1]
+    inc     ecx
+    call    tf_entry
+    mov     rcx, qword ptr [rbp-32]
+    mov     rdx, rax
+    mov     r8, TFILE_ENTRY
+    call    gui_bcpy
+    inc     dword ptr [rbp-24]
+    jmp     tfr_shift
+tfr_dec:
+    dec     dword ptr [g_tilefile_n]
+tfr_done:
+    FRAME_EPILOG
+    ret
+tf_remove endp
+
+; tf_find_row() -> eax = row index of the attachments tile (VF_FILE/VF_IMAGE) or -1.
+tf_find_row proc frame
+    FRAME_PROLOG 32
+    mov     dword ptr [rbp-24], 0
+tff_l:
+    mov     eax, dword ptr [rbp-24]
+    cmp     eax, dword ptr [g_field_count]
+    jae     tff_none
+    mov     ecx, eax
+    call    gui_desc
+    mov     ecx, dword ptr [rax+FD_KIND]
+    cmp     ecx, VF_FILE
+    je      tff_hit
+    cmp     ecx, VF_IMAGE
+    je      tff_hit
+    inc     dword ptr [rbp-24]
+    jmp     tff_l
+tff_hit:
+    mov     eax, dword ptr [rbp-24]
+    FRAME_EPILOG
+    ret
+tff_none:
+    mov     eax, -1
+    FRAME_EPILOG
+    ret
+tf_find_row endp
 
 ; gui_wcpy_capped(rcx=dst, rdx=src wide) -> eax = bytes copied incl NUL.  Leaf.
 gui_wcpy_capped proc
@@ -3519,41 +3789,6 @@ gwc_done:
     shl     eax, 1
     ret
 gui_wcpy_capped endp
-
-; gui_img_setbytes(rcx=hdlg, edx=row, r8=bytes, r9=len) - encrypt+stage the file
-;   bytes as a new attachment (filename in g_imgfn_w), store the value blob on the
-;   row, mark the entry dirty.
-gui_img_setbytes proc frame
-    FRAME_PROLOG 80
-    mov     qword ptr [rbp-24], rcx
-    mov     dword ptr [rbp-32], edx
-    mov     qword ptr [rbp-40], r8
-    mov     qword ptr [rbp-48], r9
-    mov     rcx, r8
-    mov     rdx, r9
-    lea     r8, [g_imgstageref]
-    call    attach_stage
-    test    eax, eax
-    jnz     gsb_done
-    ; build g_imgblob = AttachRef(68) | filename wide
-    lea     rcx, [g_imgblob]
-    lea     rdx, [g_imgstageref]
-    mov     r8, 68
-    call    gui_bcpy
-    lea     rcx, [g_imgblob+68]
-    lea     rdx, [g_imgfn_w]
-    call    gui_wcpy_capped
-    add     eax, 68
-    mov     dword ptr [rbp-56], eax             ; blob len
-    mov     ecx, dword ptr [rbp-32]
-    lea     rdx, [g_imgblob]
-    mov     r8d, dword ptr [rbp-56]
-    call    gui_img_setblob
-    mov     dword ptr [g_dirty], 1
-gsb_done:
-    FRAME_EPILOG
-    ret
-gui_img_setbytes endp
 
 ; img_pick(rcx=hdlg, edx=save?) -> eax = 1 if a path was chosen into g_imgpath.
 img_pick proc frame
@@ -3628,139 +3863,108 @@ gui_basename endp
 ; Generic file attachments (VF_FILE)
 ; =============================================================================
 
-; gui_make_temp_path(rcx=desc) - build g_tmpfile = %TEMP%\<stored filename>.
-gui_make_temp_path proc frame
+; gui_tile_make_temp(ecx = file index) - build g_tmpfile = %TEMP%\<filename>.
+gui_tile_make_temp proc frame
+    FRAME_PROLOG 48
+    mov     dword ptr [rbp-24], ecx
+    WINCALL GetTempPathW, 512, addr g_tmpfile
+    mov     dword ptr [rbp-32], eax                  ; base length incl trailing '\'
+    mov     ecx, dword ptr [rbp-24]
+    call    tf_entry
+    add     rax, TFILE_NAME
+    mov     qword ptr [rbp-40], rax                  ; filename ptr
+    mov     eax, dword ptr [rbp-32]
+    lea     rcx, [g_tmpfile]
+    lea     rcx, [rcx+rax*2]                         ; dst = g_tmpfile + baselen
+    mov     rdx, qword ptr [rbp-40]
+    movzx   eax, word ptr [rdx]                      ; empty name -> default
+    test    eax, eax
+    jnz     @F
+    lea     rdx, [name_default_att]
+@@: call    gui_wcpy_capped
+    FRAME_EPILOG
+    ret
+gui_tile_make_temp endp
+
+; gui_tile_relayout(rcx = hdlg, edx = row) - re-flow the form and repaint the tile's
+;   tag-list control after the file count changed.
+gui_tile_relayout proc frame
     FRAME_PROLOG 48
     mov     qword ptr [rbp-24], rcx
-    WINCALL GetTempPathW, 512, addr g_tmpfile
-    mov     dword ptr [rbp-32], eax                  ; length incl trailing '\'
-    mov     r10, qword ptr [rbp-24]
-    mov     eax, dword ptr [r10+FD_ARF]
-    cmp     eax, 68
-    jbe     gmt_default
-    mov     eax, dword ptr [rbp-32]
-    lea     rcx, [g_tmpfile]
-    lea     rcx, [rcx+rax*2]
-    mov     r10, qword ptr [rbp-24]
-    lea     rdx, [r10+FD_ARF+4+68]
-    call    gui_wcpy_capped
+    mov     dword ptr [rbp-32], edx
+    call    gui_rows_layout                          ; rcx = hdlg (already)
+    mov     ecx, dword ptr [rbp-32]
+    mov     edx, DS_VALUE
+    call    dynid
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, eax
+    call    GetDlgItem
+    WINCALL InvalidateRect, rax, 0, 1
     FRAME_EPILOG
     ret
-gmt_default:
-    mov     eax, dword ptr [rbp-32]
-    lea     rcx, [g_tmpfile]
-    lea     rcx, [rcx+rax*2]
-    lea     rdx, [name_default_att]
-    call    gui_wcpy_capped
-    FRAME_EPILOG
-    ret
-gui_make_temp_path endp
+gui_tile_relayout endp
 
-; gui_file_import(rcx=hdlg, edx=row) - pick any file and store it as an attachment.
-gui_file_import proc frame
+; gui_tile_choose(rcx = hdlg, edx = row) - pick a file, encrypt+stage it, and
+;   append it to the attachments tile's file list; then re-flow.
+gui_tile_choose proc frame
     FRAME_PROLOG 48
     mov     qword ptr [rbp-24], rcx
     mov     dword ptr [rbp-32], edx
     lea     rax, [g_allfilter]
     mov     qword ptr [g_pickfilter], rax
     mov     rcx, qword ptr [rbp-24]
-    xor     edx, edx
+    xor     edx, edx                                 ; open dialog
     call    img_pick
     test    eax, eax
-    jz      gfi_done
+    jz      gtc_done
     lea     rcx, [g_imgpath]
     lea     rdx, [g_imgbuf]
     lea     r8, [g_imgbuflen]
     call    read_file
     test    eax, eax
-    jnz     gfi_done
+    jnz     gtc_done
     lea     rcx, [g_imgpath]
     call    gui_basename                             ; -> g_imgfn_w
-    mov     rcx, qword ptr [rbp-24]
-    mov     edx, dword ptr [rbp-32]
-    mov     r8, qword ptr [g_imgbuf]
-    mov     r9, qword ptr [g_imgbuflen]
-    call    gui_img_setbytes
+    mov     rcx, qword ptr [g_imgbuf]                 ; encrypt+stage -> g_imgstageref
+    mov     rdx, qword ptr [g_imgbuflen]
+    lea     r8, [g_imgstageref]
+    call    attach_stage
+    test    eax, eax
+    jnz     gtc_free
+    lea     rcx, [g_imgstageref]                     ; append {ref, filename}
+    lea     rdx, [g_imgfn_w]
+    call    tf_append
+    mov     dword ptr [g_dirty], 1
+gtc_free:
     mov     rcx, qword ptr [g_imgbuf]
     mov     rdx, qword ptr [g_imgbuflen]
     call    mem_free
     mov     qword ptr [g_imgbuf], 0
-    ; show the filename in the read-only edit
-    mov     ecx, dword ptr [rbp-32]
-    mov     edx, DS_VALUE
-    call    dynid
-    WINCALL SetDlgItemTextW, qword ptr [rbp-24], eax, addr g_imgfn_w
-gfi_done:
-    FRAME_EPILOG
-    ret
-gui_file_import endp
-
-; gui_file_export(rcx=hdlg, edx=row) - save the attachment to a chosen file.
-gui_file_export proc frame
-    FRAME_PROLOG 80
-    mov     qword ptr [rbp-24], rcx
-    mov     dword ptr [rbp-32], edx
-    mov     ecx, edx
-    call    gui_desc
-    test    dword ptr [rax+FD_FLAGS], FDF_HASIMG
-    jz      gfe2_done
-    mov     qword ptr [rbp-40], rax
-    mov     eax, dword ptr [rax+FD_ARF]
-    cmp     eax, 68
-    jbe     gfe2_nofn
-    mov     r10, qword ptr [rbp-40]
-    lea     rcx, [g_imgpath]
-    lea     rdx, [r10+FD_ARF+4+68]
-    call    gui_wcpy_capped
-    jmp     gfe2_pick
-gfe2_nofn:
-    mov     word ptr [g_imgpath], 0
-gfe2_pick:
-    lea     rax, [g_allfilter]
-    mov     qword ptr [g_pickfilter], rax
     mov     rcx, qword ptr [rbp-24]
-    mov     edx, 1
-    call    img_pick
-    test    eax, eax
-    jz      gfe2_done
-    mov     r10, qword ptr [rbp-40]
-    lea     rcx, [r10+FD_ARF+4]
-    lea     rdx, [rbp-48]
-    call    attach_open
-    test    rax, rax
-    jz      gfe2_done
-    mov     qword ptr [rbp-56], rax
-    lea     rcx, [g_imgpath]
-    mov     rdx, rax
-    mov     r8, qword ptr [rbp-48]
-    call    write_file
-    mov     rcx, qword ptr [rbp-56]
-    mov     rdx, qword ptr [rbp-48]
-    call    mem_free
-gfe2_done:
+    mov     edx, dword ptr [rbp-32]
+    call    gui_tile_relayout
+gtc_done:
     FRAME_EPILOG
     ret
-gui_file_export endp
+gui_tile_choose endp
 
-; gui_file_open(rcx=hdlg, edx=row) - decrypt to a temp file and open it in the
-;   system default app (the temp holds plaintext until the OS cleans %TEMP%).
-gui_file_open proc frame
-    FRAME_PROLOG 64
-    mov     qword ptr [rbp-24], rcx
-    mov     dword ptr [rbp-32], edx
-    mov     ecx, edx
-    call    gui_desc
-    test    dword ptr [rax+FD_FLAGS], FDF_HASIMG
-    jz      gfo_done
-    mov     qword ptr [rbp-40], rax
-    lea     rcx, [rax+FD_ARF+4]
-    lea     rdx, [rbp-48]
+; gui_tag_open(ecx = file index) - decrypt g_tilefiles[i] to a %TEMP% file and open
+;   it in the system default app (plaintext lingers in %TEMP% until the OS cleans it).
+gui_tag_open proc frame
+    FRAME_PROLOG 96                             ; room for ShellExecuteW's 6-arg spill
+    mov     dword ptr [rbp-32], ecx
+    cmp     ecx, dword ptr [g_tilefile_n]
+    jae     gto_done
+    mov     ecx, dword ptr [rbp-32]
+    call    tf_entry                                 ; rax = &entry (AttachRef @ +0)
+    mov     rcx, rax
+    lea     rdx, [rbp-48]                            ; &len
     call    attach_open
     test    rax, rax
-    jz      gfo_done
-    mov     qword ptr [rbp-56], rax
-    mov     rcx, qword ptr [rbp-40]
-    call    gui_make_temp_path
+    jz      gto_done
+    mov     qword ptr [rbp-56], rax                  ; plaintext
+    mov     ecx, dword ptr [rbp-32]
+    call    gui_tile_make_temp                       ; -> g_tmpfile
     lea     rcx, [g_tmpfile]
     mov     rdx, qword ptr [rbp-56]
     mov     r8, qword ptr [rbp-48]
@@ -3769,10 +3973,132 @@ gui_file_open proc frame
     mov     rdx, qword ptr [rbp-48]
     call    mem_free
     WINCALL ShellExecuteW, 0, addr verb_open, addr g_tmpfile, 0, 0, 1
-gfo_done:
+gto_done:
     FRAME_EPILOG
     ret
-gui_file_open endp
+gui_tag_open endp
+
+; gui_tag_click(rcx = hdlg, edx = row) - a tag-list chip was clicked.  Map the cursor
+;   to a chip index; in edit mode a hit on the right-side 'x' removes that file (and
+;   deletes the whole tile when the last file goes), otherwise the file is opened.
+gui_tag_click proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-32], edx
+    cmp     dword ptr [g_tilefile_n], 0
+    je      gtk_done
+    mov     ecx, dword ptr [rbp-32]                  ; tag-list control hwnd
+    mov     edx, DS_VALUE
+    call    dynid
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, eax
+    call    GetDlgItem
+    mov     qword ptr [rbp-40], rax
+    test    rax, rax
+    jz      gtk_done
+    lea     rcx, [rbp-56]                            ; POINT: x @ -56, y @ -52
+    call    GetCursorPos
+    mov     rcx, qword ptr [rbp-40]
+    lea     rdx, [rbp-56]
+    call    ScreenToClient
+    mov     rcx, qword ptr [rbp-40]                  ; RECT: l -72,t -68,r -64,b -60
+    lea     rdx, [rbp-72]
+    call    GetClientRect
+    mov     ecx, dword ptr [rbp-60]                  ; clientH
+    test    ecx, ecx
+    jz      gtk_done
+    mov     eax, dword ptr [rbp-52]                  ; chip = pt.y * n / clientH
+    imul    eax, dword ptr [g_tilefile_n]
+    cdq
+    idiv    ecx
+    cmp     eax, 0
+    jl      gtk_done
+    cmp     eax, dword ptr [g_tilefile_n]
+    jae     gtk_done
+    mov     dword ptr [rbp-76], eax                  ; chip index
+    cmp     dword ptr [g_editmode], 0                ; x-hotspot only in edit mode
+    je      gtk_open
+    mov     eax, dword ptr [rbp-64]                  ; clientW - 2 - TAG_XW
+    sub     eax, 2 + TAG_XW
+    cmp     dword ptr [rbp-56], eax                  ; pt.x
+    jl      gtk_open
+    mov     ecx, dword ptr [rbp-76]                  ; remove this file
+    call    tf_remove
+    mov     dword ptr [g_dirty], 1
+    cmp     dword ptr [g_tilefile_n], 0              ; last file gone -> drop the tile
+    jne     gtk_relayout
+    mov     rcx, qword ptr [rbp-24]                  ; gather+rebuild: gg_image skips the
+    call    gui_gather                               ; now-empty tile, so it disappears
+    mov     rcx, qword ptr [rbp-24]                  ; (gui_row_delete can't be used - the
+    call    gui_rebuild_rows                         ;  skipped tile breaks its row->k map)
+    jmp     gtk_done
+gtk_relayout:
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-32]
+    call    gui_tile_relayout
+    jmp     gtk_done
+gtk_open:
+    mov     ecx, dword ptr [rbp-76]
+    call    gui_tag_open
+gtk_done:
+    FRAME_EPILOG
+    ret
+gui_tag_click endp
+
+; gui_tile_palette_add(rcx = hdlg) - the palette's Image/File tile: pick a file and
+;   append it to the attachments tile, creating the tile row on the first file (so an
+;   empty tile is never left behind if the user cancels the picker).
+gui_tile_palette_add proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    lea     rax, [g_allfilter]
+    mov     qword ptr [g_pickfilter], rax
+    mov     rcx, qword ptr [rbp-24]
+    xor     edx, edx
+    call    img_pick
+    test    eax, eax
+    jz      gtpa_done
+    lea     rcx, [g_imgpath]
+    lea     rdx, [g_imgbuf]
+    lea     r8, [g_imgbuflen]
+    call    read_file
+    test    eax, eax
+    jnz     gtpa_done
+    lea     rcx, [g_imgpath]
+    call    gui_basename                         ; -> g_imgfn_w
+    mov     rcx, qword ptr [g_imgbuf]
+    mov     rdx, qword ptr [g_imgbuflen]
+    lea     r8, [g_imgstageref]
+    call    attach_stage
+    test    eax, eax
+    jnz     gtpa_free
+    lea     rcx, [g_imgstageref]
+    lea     rdx, [g_imgfn_w]
+    call    tf_append
+    mov     dword ptr [g_dirty], 1
+gtpa_free:
+    mov     rcx, qword ptr [g_imgbuf]
+    mov     rdx, qword ptr [g_imgbuflen]
+    call    mem_free
+    mov     qword ptr [g_imgbuf], 0
+    call    tf_find_row                          ; already have a tile?
+    cmp     eax, -1
+    jne     gtpa_relayout
+    cmp     dword ptr [g_tilefile_n], 0          ; nothing added -> no tile
+    je      gtpa_done
+    mov     rcx, qword ptr [rbp-24]              ; first file: create the tile row
+    mov     edx, VF_FILE
+    call    gui_addfield_one                     ; enters edit mode + relayouts
+    jmp     gtpa_done
+gtpa_relayout:
+    mov     dword ptr [rbp-32], eax
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-32]
+    call    gui_tile_relayout
+gtpa_done:
+    FRAME_EPILOG
+    ret
+gui_tile_palette_add endp
 
 ; move_ctl(rcx=hdlg, rdx=hwnd, r8d=dlux, r9d=dluy, [+48]=dluw, [+56]=dluh)
 ;   Map the DLU rect to pixels and MoveWindow the control.  No-op if hwnd=0.
@@ -3843,12 +4169,18 @@ grl_row:
     mov     dword ptr [rbp-48], 40
     jmp     grl_setyh
 grl_chkimg:
-    cmp     eax, VF_IMAGE                        ; images + files share one attachment
-    je      grl_attach_h                         ; row: filename + Choose/Open/Save
+    cmp     eax, VF_IMAGE                        ; attachments tile: height grows with
+    je      grl_attach_h                         ; the number of files (tag list)
     cmp     eax, VF_FILE
     jne     grl_chktotp
 grl_attach_h:
-    mov     dword ptr [rbp-44], 64
+    mov     eax, dword ptr [g_tilefile_n]
+    test    eax, eax
+    jnz     @F
+    mov     eax, 1                               ; keep a minimum height
+@@: imul    eax, eax, 15                         ; per-tag chip height (DLU)
+    add     eax, 36                              ; label band + Choose row + padding
+    mov     dword ptr [rbp-44], eax
     jmp     grl_setyh
 grl_chktotp:
     cmp     eax, VF_TOTP
@@ -4046,9 +4378,8 @@ grl_sbadge_done:
     mov     edx, dword ptr [rbp-52]
     call    ShowWindow
 grl_totptog_done:
-    ; attachment row (image or file): read-only filename + Choose/Open/Save.
-    ; Choose is edit-mode only; Open/Save stay visible so a stored file is always
-    ; downloadable.  No thumbnail or in-app preview.
+    ; attachments tile: Choose pinned top-right (edit mode only); an owner-draw
+    ; tag-list control fills the body beneath it, sized to the file count.
     mov     r10, qword ptr [rbp-32]
     mov     eax, dword ptr [r10+FD_KIND]
     cmp     eax, VF_IMAGE
@@ -4057,32 +4388,25 @@ grl_totptog_done:
     je      grl_attach
     jmp     grl_advance
 grl_attach:
-    mov     rcx, qword ptr [rbp-24]                  ; filename (164,content_y,100,11)
+    mov     rcx, qword ptr [rbp-24]                  ; Choose (266,content_y,44,14)
+    mov     r10, qword ptr [rbp-32]
+    mov     rdx, qword ptr [r10+FD_HANDLES+DS_IMPORT*8]
+    mov     r8d, 266
+    mov     r9d, dword ptr [rbp-60]
+    WINCALL move_ctl, rcx, rdx, r8d, r9d, 44, 14
+    mov     eax, dword ptr [g_tilefile_n]            ; tag-list height = n * chip
+    test    eax, eax
+    jnz     @F
+    mov     eax, 1
+@@: imul    eax, eax, 15
+    mov     dword ptr [rbp-56], eax
+    mov     rcx, qword ptr [rbp-24]                  ; tag list (164,content_y+16,146,h)
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_VALUE*8]
     mov     r8d, 164
     mov     r9d, dword ptr [rbp-60]
-    WINCALL move_ctl, rcx, rdx, r8d, r9d, 100, 11
-    mov     rcx, qword ptr [rbp-24]                  ; Choose (270,content_y,40,14)
-    mov     r10, qword ptr [rbp-32]
-    mov     rdx, qword ptr [r10+FD_HANDLES+DS_IMPORT*8]
-    mov     r8d, 270
-    mov     r9d, dword ptr [rbp-60]
-    WINCALL move_ctl, rcx, rdx, r8d, r9d, 40, 14
-    mov     rcx, qword ptr [rbp-24]                  ; Open (270,content_y+16,40,14)
-    mov     r10, qword ptr [rbp-32]
-    mov     rdx, qword ptr [r10+FD_HANDLES+DS_OPEN*8]
-    mov     r8d, 270
-    mov     r9d, dword ptr [rbp-60]
     add     r9d, 16
-    WINCALL move_ctl, rcx, rdx, r8d, r9d, 40, 14
-    mov     rcx, qword ptr [rbp-24]                  ; Save (270,content_y+32,40,14)
-    mov     r10, qword ptr [rbp-32]
-    mov     rdx, qword ptr [r10+FD_HANDLES+DS_EXPORT*8]
-    mov     r8d, 270
-    mov     r9d, dword ptr [rbp-60]
-    add     r9d, 32
-    WINCALL move_ctl, rcx, rdx, r8d, r9d, 40, 14
+    WINCALL move_ctl, rcx, rdx, r8d, r9d, 146, dword ptr [rbp-56]
     mov     r10, qword ptr [rbp-32]                  ; Choose: edit mode only
     mov     rcx, qword ptr [r10+FD_HANDLES+DS_IMPORT*8]
     mov     edx, dword ptr [rbp-52]
@@ -4385,8 +4709,8 @@ grb_loop:
     add     r10, rax
     or      dword ptr [r10+FD_FLAGS], FDF_LABELED
 grb_setval:
-    test    dword ptr [rbp-64], VFL_RAW        ; image/file value is a binary attachment blob
-    jnz     grb_rawval
+    ; (the attachments tile rebuilds as a bare VF_FILE placeholder; its tags repaint
+    ;  from g_tilefiles, so there is no per-value restore here)
     mov     r10, qword ptr [rbp-40]
     mov     rax, qword ptr [r10+16]
     mov     qword ptr [rbp-56], rax
@@ -4410,27 +4734,6 @@ grb_mask:
     WINCALL SendDlgItemMessageW, qword ptr [rbp-24], dword ptr [rbp-48], \
             EM_SETPASSWORDCHAR, SECRET_MASK, 0
     jmp     grb_next
-grb_rawval:
-    ; restore an attachment (image or file) from the gather side-buffer
-    mov     r10, qword ptr [rbp-40]            ; &list[k]
-    mov     r11, qword ptr [r10+16]            ; &g_gatherblob[k] = {u32 len, AttachRef, filename}
-    mov     eax, dword ptr [r11]               ; len
-    mov     dword ptr [rbp-48], eax
-    lea     rax, [r11+4]                       ; {AttachRef, filename}
-    mov     qword ptr [rbp-56], rax
-    mov     ecx, dword ptr [rbp-44]            ; row
-    mov     rdx, rax
-    mov     r8d, dword ptr [rbp-48]
-    call    gui_img_setblob
-    mov     eax, dword ptr [rbp-48]            ; show filename (if present)
-    cmp     eax, 68
-    jbe     grb_next
-    mov     ecx, dword ptr [rbp-44]
-    mov     edx, DS_VALUE
-    call    dynid
-    mov     r8, qword ptr [rbp-56]
-    add     r8, 68                             ; filename wide
-    WINCALL SetDlgItemTextW, qword ptr [rbp-24], eax, r8
 grb_next:
     inc     dword ptr [rbp-32]
     jmp     grb_loop
@@ -4686,18 +4989,19 @@ gui_palette_add proc frame
     jne     @F
     mov     edx, VF_TOTP
     jmp     gpa_go
-@@: cmp     ecx, 8
-    jne     @F
-    mov     edx, VF_IMAGE
-    jmp     gpa_go
-@@: cmp     ecx, 9
-    jne     @F
-    mov     edx, VF_FILE
-    jmp     gpa_go
-@@: mov     edx, VF_TEXT                        ; 7 = custom (empty label)
+@@: cmp     ecx, 8                              ; Image and File both add to the one
+    je      gpa_attach                          ; attachments tile (pick files -> tags)
+    cmp     ecx, 9
+    je      gpa_attach
+    mov     edx, VF_TEXT                        ; 7 = custom (empty label)
 gpa_go:
     mov     rcx, qword ptr [rbp-24]
     call    gui_addfield_one
+    FRAME_EPILOG
+    ret
+gpa_attach:
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_tile_palette_add
     FRAME_EPILOG
     ret
 gui_palette_add endp
@@ -5847,6 +6151,8 @@ vp_tdraw:
     je      vp_tdraw_totp
     cmp     edx, DS_SBADGE
     je      vp_tdraw_sbadge
+    cmp     edx, DS_VALUE                    ; attachment tile's owner-draw tag list
+    je      vp_tdraw_taglist
     cmp     edx, DS_UP
     je      vp_tdraw_chev
     cmp     edx, DS_DOWN
@@ -5870,6 +6176,11 @@ vp_tdraw_colorpw:
 vp_tdraw_sbadge:
     mov     rcx, r9
     call    gui_draw_sbadge
+    mov     eax, 1
+    jmp     vp_ret
+vp_tdraw_taglist:
+    mov     rcx, r9
+    call    gui_draw_taglist
     mov     eax, 1
     jmp     vp_ret
 vp_tdraw_chev:
@@ -6180,28 +6491,22 @@ vp_dyn:
     je      vpd_copy
     cmp     ecx, DS_IMPORT
     je      vpd_import
-    cmp     ecx, DS_OPEN
-    je      vpd_open
-    cmp     ecx, DS_EXPORT
-    je      vpd_export
+    cmp     ecx, DS_VALUE                       ; attachments tile: click a tag
+    je      vpd_tagclick
     cmp     ecx, DS_GEN
     je      vpd_gen
     jmp     vp_handled
 vpd_import:
-    ; choose any file to attach (images and files are handled identically)
+    ; Choose: append one or more files to the attachments tile
     mov     edx, eax                            ; row
     mov     rcx, qword ptr [rbp-8]
-    call    gui_file_import
+    call    gui_tile_choose
     jmp     vp_handled
-vpd_open:
-    mov     edx, eax
+vpd_tagclick:
+    ; a tag was clicked: open that file, or (edit mode) remove it via the x
+    mov     edx, eax                            ; row
     mov     rcx, qword ptr [rbp-8]
-    call    gui_file_open
-    jmp     vp_handled
-vpd_export:
-    mov     edx, eax
-    mov     rcx, qword ptr [rbp-8]
-    call    gui_file_export
+    call    gui_tag_click
     jmp     vp_handled
 vpd_copy:
     mov     edx, eax
