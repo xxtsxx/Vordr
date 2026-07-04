@@ -37,15 +37,6 @@ extern secure_zero:proc
 extern run_selftest:proc
 extern log_result:proc
 extern do_bench:proc                    ; benchmark (bench.asm)
-extern img_startup:proc                 ; GDI+ diagnostics (img.asm)
-extern img_load:proc
-extern img_dims:proc
-extern img_free:proc
-extern shell_thumb:proc
-extern DeleteObject:proc
-extern preview_open:proc
-extern preview_close:proc
-externdef g_pv_stage:dword
 extern read_file:proc
 ifdef DBG_TRACE
 extern cmd_redteam:proc                 ; fault-injection self-test (redteam.asm)
@@ -57,7 +48,7 @@ extern print_a:proc
 extern pwgen_ex:proc                    ; styled password generator (pwgen.asm)
 extern do_seed:proc                     ; bulk test-vault seeder (vault.asm)
 extern print_err:proc
-; --- xitest verb: headless .xlsx import probe (mirrors imgtest/pvtest) --------
+; --- xitest verb: headless .xlsx import probe --------------------------------
 extern vault_unlock:proc
 extern vault_reseal:proc
 extern xlsx_import:proc
@@ -126,8 +117,6 @@ g_field_list        dq 3*MAX_FIELDS dup (0)
 public g_cfg_pass, g_positionals, g_poscount
 g_argv          dq MAX_ARGS dup (?)
 g_argbuf        dw ARGBUF_CHARS dup (?)
-g_it_buf        dq ?                     ; imgtest: file buffer
-g_it_len        dq ?
 g_gen_buf       db 160 dup (?)           ; genpw: sample output buffer
 g_cfg_pass      db MAX_PASSWORD_BYTES+1 dup (?)
 g_positionals   dq MAX_ARGS dup (?)  ; -> UTF-16 positional argument strings
@@ -170,9 +159,6 @@ seed_pw   db "vordrtest", 0
 
 WSTR w_selftest, <selftest>
 WSTR w_bench,    <bench>
-WSTR w_imgtest,  <imgtest>
-WSTR w_thumbtest,<thumbtest>
-WSTR w_pvtest,   <pvtest>
 WSTR w_genpw,    <genpw>
 WSTR w_seedtest, <seedtest>
 WSTR w_xitest,   <xitest>
@@ -183,8 +169,6 @@ WSTR w_atgen,    <atgen>
 WSTR w_zitest,   <zitest>
 WSTR wpw_test,   <VordrTest123>
 WSTR wpw_exp,    <VordrExp1234>
-WSTR ext_pdf,    <.pdf>
-WSTR w_pvtmp,    <pvtmp.pdf>
 ifdef DBG_TRACE
 WSTR w_redteam,  <redteam>
 WSTR w_tpmtest,  <tpmtest>
@@ -212,9 +196,6 @@ CMDENT ends
 cmd_table label CMDENT
     CMDENT { w_selftest,  cmd_selftest,  0, 0 }
     CMDENT { w_bench,     cmd_bench,     0, 0 }
-    CMDENT { w_imgtest,   cmd_imgtest,   1, 0 }   ; decode probe: exit=(w<<16)|h
-    CMDENT { w_thumbtest, cmd_thumbtest, 1, 0 }   ; shell-thumbnail probe: exit 0 ok
-    CMDENT { w_pvtest,    cmd_pvtest,    1, 0 }   ; preview-handler probe (.pdf): exit 0 ok
     CMDENT { w_genpw,     cmd_genpw,     0, 0 }   ; print one sample of each generator style
     CMDENT { w_seedtest,  cmd_seedtest,  1, 0 }   ; bulk-fill a test vault with 5000 entries
     CMDENT { w_xitest,    cmd_xitest,    2, 0 }   ; headless .xlsx import probe
@@ -226,9 +207,9 @@ cmd_table label CMDENT
 ifdef DBG_TRACE
     CMDENT { w_redteam,   cmd_redteam,   1, 0 }   ; fault-injection self-test (dbg)
     CMDENT { w_tpmtest,   cmd_tpmtest,   0, 0 }   ; TPM round-trip probe (dbg)
-CMD_COUNT equ 15
+CMD_COUNT equ 12
 else
-CMD_COUNT equ 13
+CMD_COUNT equ 10
 endif
 
 .data?
@@ -1312,114 +1293,6 @@ zit_fail:
     FRAME_EPILOG
     ret
 cmd_zitest endp
-
-
-
-; cmd_imgtest - decode argv[2] as an image and return exit=(width<<16)|height,
-;   or 0xE00n on failure.  A headless probe for the GDI+ decode path.
-LANDING_PAD
-cmd_imgtest proc frame
-    FRAME_PROLOG 64
-    call    img_startup
-    test    eax, eax
-    jz      cit_start
-    lea     r10, [g_argv]
-    mov     rcx, qword ptr [r10+16]         ; argv[2] = image path
-    lea     rdx, [g_it_buf]
-    lea     r8, [g_it_len]
-    call    read_file
-    test    eax, eax
-    jnz     cit_read
-    mov     rcx, qword ptr [g_it_buf]
-    mov     rdx, qword ptr [g_it_len]
-    call    img_load
-    test    rax, rax
-    jz      cit_load
-    mov     qword ptr [rbp-24], rax
-    mov     rcx, rax
-    lea     rdx, [rbp-40]                    ; &w
-    lea     r8, [rbp-44]                     ; &h
-    call    img_dims
-    mov     rcx, qword ptr [rbp-24]
-    call    img_free
-    mov     eax, dword ptr [rbp-40]
-    shl     eax, 16
-    mov     ecx, dword ptr [rbp-44]
-    and     ecx, 0FFFFh
-    or      eax, ecx
-    FRAME_EPILOG
-    ret
-cit_start:
-    mov     eax, 0E001h
-    FRAME_EPILOG
-    ret
-cit_read:
-    mov     eax, 0E002h
-    FRAME_EPILOG
-    ret
-cit_load:
-    mov     eax, 0E003h
-    FRAME_EPILOG
-    ret
-cmd_imgtest endp
-
-; cmd_thumbtest - fetch the shell thumbnail for argv[2]; exit 0 if an HBITMAP came
-;   back, 0xE010 if none.  Probes the shell COM path headlessly.
-LANDING_PAD
-cmd_thumbtest proc frame
-    FRAME_PROLOG 48
-    lea     r10, [g_argv]
-    mov     rcx, qword ptr [r10+16]
-    mov     edx, 256
-    mov     r8d, 256
-    call    shell_thumb
-    test    rax, rax
-    jz      ctt_none
-    mov     rcx, rax
-    call    DeleteObject
-    xor     eax, eax
-    FRAME_EPILOG
-    ret
-ctt_none:
-    mov     eax, 0E010h
-    FRAME_EPILOG
-    ret
-cmd_thumbtest endp
-
-; cmd_pvtest - create + stream-initialize the preview handler for argv[2] (as a
-;   .pdf); exit 0 if the handler instantiated + initialized, 0xE02n otherwise.
-LANDING_PAD
-cmd_pvtest proc frame
-    FRAME_PROLOG 48
-    lea     r10, [g_argv]
-    mov     rcx, qword ptr [r10+16]
-    lea     rdx, [g_it_buf]
-    lea     r8, [g_it_len]
-    call    read_file
-    test    eax, eax
-    jnz     cpv_read
-    lea     rcx, [ext_pdf]
-    mov     rdx, qword ptr [g_it_buf]
-    mov     r8, qword ptr [g_it_len]
-    lea     r9, [w_pvtmp]
-    call    preview_open
-    test    rax, rax
-    jz      cpv_open
-    mov     rcx, rax
-    call    preview_close
-    xor     eax, eax
-    FRAME_EPILOG
-    ret
-cpv_read:
-    mov     eax, 0E020h
-    FRAME_EPILOG
-    ret
-cpv_open:
-    mov     eax, dword ptr [g_pv_stage]         ; 0..4 = last successful step
-    add     eax, 0E100h
-    FRAME_EPILOG
-    ret
-cmd_pvtest endp
 
 ; =============================================================================
 ; is_cli_command -> eax = 1 if argv[1] names a known command verb, else 0.
