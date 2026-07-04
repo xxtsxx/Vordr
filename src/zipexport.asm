@@ -85,6 +85,8 @@ g_pb_t      db 20 dup (?)
 ; pbkdf2_ae(rcx=pw, edx=pwlen, r8=salt, r9d=saltlen) -> g_ae_dk (66 bytes used)
 ;   PBKDF2-HMAC-SHA1, PBKDF2_ITERS iterations, 4 x 20-byte blocks.
 ; =============================================================================
+public pbkdf2_ae
+public g_ae_dk
 pbkdf2_ae proc frame
     FRAME_PROLOG 96
     mov     qword ptr [rbp-24], rcx             ; pw

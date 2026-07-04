@@ -189,10 +189,10 @@ END
 
 DLG_IMPPW DIALOGEX 0, 0, 264, 100
 STYLE DS_CENTER | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
-CAPTION "Vordr - Import from Excel"
+CAPTION "Vordr - Import"
 FONT 9, "Segoe UI"
 BEGIN
-    LTEXT "This Excel workbook is password-protected. Enter the password used to protect it to unlock and import its entries.", IDC_XP_WARN, 16, 12, 232, 32, 0
+    LTEXT "This file is password-protected. Enter the password used to protect it to unlock and import its contents.", IDC_XP_WARN, 16, 12, 232, 32, 0
     EDITTEXT IDC_XP_PW, 16, 52, 232, 12, ES_PASSWORD | ES_AUTOHSCROLL | NOT WS_BORDER, 0
     PUSHBUTTON "Import", IDOK, 134, 74, 54, 18, BS_OWNERDRAW
     PUSHBUTTON "Cancel", IDCANCEL, 194, 74, 54, 18, BS_OWNERDRAW

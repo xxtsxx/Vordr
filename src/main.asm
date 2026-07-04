@@ -69,6 +69,7 @@ extern mem_free:proc
 externdef g_csv_alloc:qword
 ; --- xetest verb: headless export composer probe ------------------------------
 extern do_attgen:proc
+extern zi_import:proc
 extern write_file:proc
 extern ze_compose:proc
 extern ze_free:proc
@@ -180,6 +181,7 @@ WSTR w_xdtest,   <xdtest>
 WSTR w_citest,   <citest>
 WSTR w_xetest,   <xetest>
 WSTR w_atgen,    <atgen>
+WSTR w_zitest,   <zitest>
 WSTR wpw_test,   <VordrTest123>
 WSTR wpw_exp,    <VordrExp1234>
 WSTR ext_pdf,    <.pdf>
@@ -221,12 +223,13 @@ cmd_table label CMDENT
     CMDENT { w_citest,    cmd_citest,    2, 0 }   ; headless .csv import probe
     CMDENT { w_xetest,    cmd_xetest,    4, 0 }   ; headless export probe: <vault> <out> <fmt> <attach>
     CMDENT { w_atgen,     cmd_atgen,     1, 0 }   ; headless attachment-export probe: <out.zip>
+    CMDENT { w_zitest,    cmd_zitest,    2, 0 }   ; headless encrypted-zip import probe
 ifdef DBG_TRACE
     CMDENT { w_redteam,   cmd_redteam,   1, 0 }   ; fault-injection self-test (dbg)
     CMDENT { w_tpmtest,   cmd_tpmtest,   0, 0 }   ; TPM round-trip probe (dbg)
-CMD_COUNT equ 14
+CMD_COUNT equ 15
 else
-CMD_COUNT equ 12
+CMD_COUNT equ 13
 endif
 
 .data?
@@ -1259,6 +1262,57 @@ atg_fail:
     FRAME_EPILOG
     ret
 cmd_atgen endp
+
+; cmd_zitest - headless encrypted-zip import probe.  Unlock the vault at argv[2]
+;   with the fixed test password, import the Vordr .zip at argv[3] using the fixed
+;   export test password, reseal.  exit = entries imported (or 0xE0xx on error).
+LANDING_PAD
+cmd_zitest proc frame
+    FRAME_PROLOG 128
+    lea     r10, [g_argv]
+    mov     rax, qword ptr [r10+16]
+    mov     qword ptr [g_cfg_in], rax
+    lea     r10, [seed_pw]
+    lea     r11, [g_cfg_pass]
+    xor     ecx, ecx
+zit_cp:
+    mov     al, byte ptr [r10+rcx]
+    mov     byte ptr [r11+rcx], al
+    test    al, al
+    jz      zit_cpd
+    inc     ecx
+    cmp     ecx, 32
+    jb      zit_cp
+zit_cpd:
+    mov     dword ptr [g_cfg_passlen], 9
+    call    vault_unlock
+    test    eax, eax
+    jnz     zit_fail
+    lea     r10, [g_argv]
+    mov     rcx, qword ptr [r10+24]              ; argv[3] = zip path
+    lea     rdx, [rbp-24]                        ; *raw
+    lea     r8, [rbp-32]                         ; *rawlen
+    call    read_file
+    test    eax, eax
+    jnz     zit_fail
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-32]
+    lea     r8, [wpw_exp]                        ; UTF-16 export password
+    mov     r9d, 24                              ; "VordrExp1234" = 12 chars * 2
+    call    zi_import
+    mov     dword ptr [rbp-40], eax
+    mov     rcx, qword ptr [rbp-24]              ; free the raw zip
+    mov     rdx, qword ptr [rbp-32]
+    call    mem_free
+    call    vault_reseal
+    mov     eax, dword ptr [rbp-40]
+    FRAME_EPILOG
+    ret
+zit_fail:
+    mov     eax, 0E0CEh
+    FRAME_EPILOG
+    ret
+cmd_zitest endp
 
 
 
