@@ -63,11 +63,6 @@ extern vault_field_get:proc
 extern vault_build_entry:proc
 extern attach_stage:proc
 extern attach_open:proc
-extern img_load:proc
-extern img_free:proc
-extern img_dims:proc
-extern img_draw:proc
-extern img_encode_hbitmap:proc
 extern mem_alloc:proc
 extern mem_free:proc
 extern read_file:proc
@@ -88,16 +83,8 @@ extern xl_encrypt:proc
 extern xl_encrypt_free:proc
 extern g_ole_ptr:qword
 extern g_ole_len:qword
-extern GetClipboardData:proc
-extern IsClipboardFormatAvailable:proc
 extern ShellExecuteW:proc
 extern GetTempPathW:proc
-extern shell_thumb:proc
-extern img_from_hbitmap:proc
-extern preview_open:proc
-extern preview_show:proc
-extern preview_setrect:proc
-extern preview_close:proc
 extern GetClientRect:proc
 extern DeleteFileW:proc
 extern DeleteObject:proc
@@ -411,15 +398,10 @@ IDC_A_ICON   equ 611
 IDC_A_TEXT   equ 612
 IDC_A_OK     equ 613
 STM_SETICON  equ 0170h
-DLG_IMGVIEW  equ 620                  ; enlarge/export image viewer
 DLG_PWREAD   equ 700                  ; "read password" popup (class colors + phonetic)
 IDC_PR_COLOR equ 701
 IDC_PR_LEGEND equ 702
 IDC_PR_PHON  equ 703
-; password character-class colours (COLORREF 0x00BBGGRR)
-IDC_IV_PIC   equ 621
-IDC_IV_EXPORT equ 622
-CF_BITMAP    equ 2
 DT_IMGFLAGS  equ 25h                  ; DT_CENTER|DT_VCENTER|DT_SINGLELINE
 
 OFN_OVERWRITEPROMPT equ 2
@@ -437,15 +419,15 @@ FD_FLAGS    equ 4               ; dd  bit0 = custom label; bits4-5 = pw-strength
 FD_Y        equ 8              ; dd  row top in DLU (within the detail pane)
 FD_H        equ 12             ; dd  row height in DLU
 FD_HANDLES  equ 16             ; q[DYN_SLOTS]  control hwnd per slot (0 = absent)
-FD_ARF      equ 144            ; {u32 len, AttachRef[68], filename wide}  image value blob
+FD_ARF      equ 144            ; {u32 len, AttachRef[68], filename wide}  attachment value blob
 IMG_BLOBCAP equ 328            ; 4 + 68 + up to 256 bytes of wide filename
-FD_IMG      equ 472            ; q  decoded image handle (img_load) for the thumbnail
-ARFBLOB     equ 328            ; FD_IMG-FD_ARF: size of the {u32 len,AttachRef,filename} blob
-DESCSZ      equ 480            ; 16 + 16 handles*8 + 328 arf blob + 8 img (16-aligned)
+FD_RSVD     equ 472            ; q  reserved (kept for 16-byte DESCSZ alignment)
+ARFBLOB     equ 328            ; size of the {u32 len,AttachRef,filename} attachment blob
+DESCSZ      equ 480            ; 16 + 16 handles*8 + 328 arf blob + 8 reserved (16-aligned)
 MAXROWS     equ 24
 FDF_LABELED equ 1               ; FD_FLAGS bit0 = carries a custom label
 FDF_REVEALED equ 2              ; FD_FLAGS bit1 = value currently unmasked
-FDF_HASIMG  equ 4               ; FD_FLAGS bit2 = image row has data in FD_ARF/FD_IMG
+FDF_HASIMG  equ 4               ; FD_FLAGS bit2 = attachment row has a blob in FD_ARF
 FDF_PWLVL_MASK equ 30h          ; FD_FLAGS bits4-5 = secret strength grade 0..3
 FDF_PWLVL_SHIFT equ 4
 ; Runtime control ids: IDC_DYN_BASE + row*DYN_SLOTS + slot (DYN_SLOTS = power of 2).
@@ -462,11 +444,10 @@ DS_DEL      equ 5
 DS_TCODE    equ 6               ; TOTP live-code display
 DS_TBAR     equ 7               ; TOTP drain bar
 DS_COPY     equ 8               ; copy-to-clipboard (secret value / TOTP code)
-DS_THUMB    equ 9               ; image/file thumbnail (owner-draw; click to enlarge)
-DS_IMPORT   equ 10              ; image/file: import/choose from file (edit mode)
-DS_PASTE    equ 11              ; image: paste from clipboard (edit mode)
-DS_EXPORT   equ 12              ; file: save attachment to disk
-DS_OPEN     equ 13              ; file: open attachment in the default app
+                                ; slots 9 and 11 are unused (were thumbnail/paste)
+DS_IMPORT   equ 10              ; attachment: choose a file to attach (edit mode)
+DS_EXPORT   equ 12              ; attachment: save the file to disk
+DS_OPEN     equ 13              ; attachment: open the file in the default app
 DS_SBADGE   equ 14              ; secret: password-strength badge (owner-draw, view mode)
 DS_GEN      equ 15              ; secret: generate-password button (edit mode)
 IDC_V_ADDFIELD equ 230          ; "+ Add field" button (edit mode)
@@ -708,8 +689,6 @@ kl_image label word
     dw 'I','m','a','g','e', 0
 kl_file label word
     dw 'F','i','l','e', 0
-cap_import label word
-    dw 'I','m','p','o','r','t', 0
 cap_choose label word
     dw 'C','h','o','o','s','e', 0
 cap_open label word
@@ -741,8 +720,6 @@ g_glyphpal_col label dword
     dd 0003030D0h, 0002EA02Eh, 000208CE6h, 000909090h  ; red green amber grey
 name_default_att label word
     dw 'v','o','r','d','r','_','a','t','t','a','c','h','.','b','i','n', 0
-cap_paste label word
-    dw 'P','a','s','t','e', 0
 badge_weak label word
     dw 'W','e','a','k', 0
 badge_fair label word
@@ -922,12 +899,8 @@ align 2
 g_imgfn_w     dw 200 dup (?)               ; current image's filename (wide) to store
 g_imgbuf      dq ?                         ; imported file bytes (mem_alloc'd)
 g_imgbuflen   dq ?
-g_iv_img      dq ?                         ; image handle shown in the enlarge dialog
-g_iv_ref      dq ?                         ; AttachRef ptr for the enlarge dialog's Export
-g_iv_isfile   dd ?                         ; 1 = enlarge target is a VF_FILE (try preview)
-g_iv_preview  dq ?                         ; hosted preview handle in the viewer (0=none)
 g_pickfilter  dq ?                         ; OPENFILENAME filter for the next pick (0=image)
-g_tmpfile     dw 1024 dup (?)              ; temp path for file open/preview (wide)
+g_tmpfile     dw 1024 dup (?)              ; temp path for opening an attachment (wide)
 align 2
 g_imgpath     dw 1024 dup (?)             ; import/export file path (wide)
 g_valblob   dw 32768 dup (?)          ; commit scratch: field values, NUL-joined
@@ -992,7 +965,6 @@ gui_status proc frame
     FRAME_EPILOG
     ret
 gui_status endp
-
 
 ; =============================================================================
 ; gui_unlock(rcx = hdlg) - validate inputs, (create then) unlock the vault.
@@ -2625,9 +2597,9 @@ gsd_floop:
     add     r10, rax
     or      dword ptr [r10+FD_FLAGS], FDF_LABELED
 gsd_setval:
-    ; image/file field: value is {AttachRef, filename} -> load ref + preview
+    ; attachment field: value is {AttachRef, filename} -> store blob + show name
     cmp     dword ptr [rbp-96], VF_IMAGE
-    je      gsd_imgload
+    je      gsd_fileload
     cmp     dword ptr [rbp-96], VF_FILE
     je      gsd_fileload
     mov     ecx, dword ptr [rbp-44]
@@ -2667,14 +2639,6 @@ gsd_mask:
     WINCALL SendDlgItemMessageW, qword ptr [rbp-24], dword ptr [rbp-56], \
             EM_SETPASSWORDCHAR, SECRET_MASK, 0
     jmp     gsd_fnext
-gsd_imgload:
-    mov     ecx, dword ptr [rbp-44]
-    mov     rdx, qword ptr [rbp-72]             ; out.valptr = {AttachRef, filename}
-    mov     r8d, dword ptr [rbp-64]             ; out.vallen
-    call    gui_img_setblob
-    mov     ecx, dword ptr [rbp-44]
-    call    gui_img_decode
-    jmp     gsd_fnext
 gsd_fileload:
     mov     ecx, dword ptr [rbp-44]
     mov     rdx, qword ptr [rbp-72]             ; {AttachRef, filename}
@@ -2683,16 +2647,13 @@ gsd_fileload:
     ; show the filename in the read-only DS_VALUE edit
     mov     eax, dword ptr [rbp-64]
     cmp     eax, 68
-    jbe     gsd_filethumb
+    jbe     gsd_fnext
     mov     ecx, dword ptr [rbp-44]
     mov     edx, DS_VALUE
     call    dynid
     mov     r8, qword ptr [rbp-72]
     add     r8, 68                             ; filename (wide)
     WINCALL SetDlgItemTextW, qword ptr [rbp-24], eax, r8
-gsd_filethumb:
-    mov     ecx, dword ptr [rbp-44]
-    call    gui_file_preview                   ; shell thumbnail (PDF page / icon)
 gsd_fnext:
     inc     dword ptr [rbp-40]
     jmp     gsd_floop
@@ -2840,10 +2801,6 @@ gcc_done:
     FRAME_EPILOG
     ret
 gui_clipclear endp
-
-
-
-
 
 ; gui_gather(rcx = hdlg) - read Title + every row into the ordered descriptor
 ;   array g_field_list[] (g_field_n) that vault_build_entry consumes.  Values go
@@ -3358,17 +3315,6 @@ grc_slotnext:
     inc     dword ptr [rbp-32]
     jmp     grc_slot
 grc_nextrow:
-    ; free any decoded image handle for this row
-    mov     eax, dword ptr [rbp-24]
-    imul    eax, eax, DESCSZ
-    lea     r10, [g_fields]
-    add     r10, rax
-    mov     rcx, qword ptr [r10+FD_IMG]
-    test    rcx, rcx
-    jz      grc_noimg
-    mov     qword ptr [r10+FD_IMG], 0
-    call    img_free
-grc_noimg:
     inc     dword ptr [rbp-24]
     jmp     grc_row
 grc_done:
@@ -3440,35 +3386,22 @@ gra_zero:
     je      gra_notes
     cmp     eax, VF_TOTP
     je      gra_totp
-    cmp     eax, VF_IMAGE
-    je      gra_image
+    cmp     eax, VF_IMAGE                        ; images and files are both plain,
+    je      gra_file                            ; download-only attachments now
     cmp     eax, VF_FILE
     je      gra_file
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_VALUE, addr cls_edit, 0, \
             ES_AUTOHSCROLL_ or WS_TABSTOP_
     jmp     gra_reorder
 gra_file:
-    ; thumbnail (owner-draw preview) + read-only filename + Choose/Paste/Open/Save
-    WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_THUMB, addr cls_button, 0, \
-            BS_OWNERDRAW_ or WS_TABSTOP_
+    ; attachment row: read-only filename + Choose/Open/Save (no in-app preview)
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_VALUE, addr cls_edit, 0, \
             ES_AUTOHSCROLL_ or ES_READONLY_
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_IMPORT, addr cls_button, addr cap_choose, \
             BS_OWNERDRAW_ or WS_TABSTOP_
-    WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_PASTE, addr cls_button, addr cap_paste, \
-            BS_OWNERDRAW_ or WS_TABSTOP_
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_OPEN, addr cls_button, addr cap_open, \
             BS_OWNERDRAW_ or WS_TABSTOP_
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_EXPORT, addr cls_button, addr cap_save, \
-            BS_OWNERDRAW_ or WS_TABSTOP_
-    jmp     gra_reorder
-gra_image:
-    ; owner-draw thumbnail (also the click-to-enlarge button) + import/paste
-    WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_THUMB, addr cls_button, 0, \
-            BS_OWNERDRAW_ or WS_TABSTOP_
-    WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_IMPORT, addr cls_button, addr cap_import, \
-            BS_OWNERDRAW_ or WS_TABSTOP_
-    WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_PASTE, addr cls_button, addr cap_paste, \
             BS_OWNERDRAW_ or WS_TABSTOP_
     jmp     gra_reorder
 gra_secret:
@@ -3516,7 +3449,7 @@ gra_full:
 gui_row_add endp
 
 ; =============================================================================
-; Image field helpers (attachments + GDI+ thumbnails)
+; Attachment field helpers (store/choose/open/save encrypted file blobs)
 ; =============================================================================
 
 ; gui_bcpy(rcx=dst, rdx=src, r8=len) - byte copy.  Leaf.
@@ -3542,9 +3475,9 @@ gui_desc proc
     ret
 gui_desc endp
 
-; gui_img_setblob(ecx=row, rdx=blob ptr, r8d=blob len) - copy the image value blob
-;   ({AttachRef[68], filename wide}) into FD_ARF (length-prefixed for VFL_RAW),
-;   mark FDF_HASIMG, drop any old decoded image.
+; gui_img_setblob(ecx=row, rdx=blob ptr, r8d=blob len) - copy the attachment value
+;   blob ({AttachRef[68], filename wide}) into FD_ARF (length-prefixed for VFL_RAW)
+;   and mark FDF_HASIMG.
 gui_img_setblob proc frame
     FRAME_PROLOG 64
     mov     dword ptr [rbp-24], ecx
@@ -3555,12 +3488,6 @@ gui_img_setblob proc frame
 @@: mov     dword ptr [rbp-44], r8d
     call    gui_desc
     mov     qword ptr [rbp-40], rax
-    mov     rcx, qword ptr [rax+FD_IMG]
-    test    rcx, rcx
-    jz      gis_copy
-    mov     qword ptr [rax+FD_IMG], 0
-    call    img_free
-gis_copy:
     mov     r10, qword ptr [rbp-40]
     mov     eax, dword ptr [rbp-44]
     mov     dword ptr [r10+FD_ARF], eax
@@ -3573,40 +3500,6 @@ gis_copy:
     FRAME_EPILOG
     ret
 gui_img_setblob endp
-
-; gui_img_decode(ecx=row) - decrypt the row's attachment and img_load a handle
-;   into FD_IMG (freeing any prior).  No-op unless FDF_HASIMG.
-gui_img_decode proc frame
-    FRAME_PROLOG 48
-    call    gui_desc
-    mov     qword ptr [rbp-24], rax
-    test    dword ptr [rax+FD_FLAGS], FDF_HASIMG
-    jz      gid_done
-    mov     rcx, qword ptr [rax+FD_IMG]
-    test    rcx, rcx
-    jz      gid_open
-    mov     qword ptr [rax+FD_IMG], 0
-    call    img_free
-gid_open:
-    mov     r10, qword ptr [rbp-24]
-    lea     rcx, [r10+FD_ARF+4]
-    lea     rdx, [rbp-32]                       ; &ptlen
-    call    attach_open
-    test    rax, rax
-    jz      gid_done
-    mov     qword ptr [rbp-40], rax             ; plaintext
-    mov     rcx, rax
-    mov     rdx, qword ptr [rbp-32]
-    call    img_load
-    mov     r10, qword ptr [rbp-24]
-    mov     qword ptr [r10+FD_IMG], rax
-    mov     rcx, qword ptr [rbp-40]
-    mov     rdx, qword ptr [rbp-32]
-    call    mem_free
-gid_done:
-    FRAME_EPILOG
-    ret
-gui_img_decode endp
 
 ; gui_wcpy_capped(rcx=dst, rdx=src wide) -> eax = bytes copied incl NUL.  Leaf.
 gui_wcpy_capped proc
@@ -3627,9 +3520,9 @@ gwc_done:
     ret
 gui_wcpy_capped endp
 
-; gui_img_setbytes(rcx=hdlg, edx=row, r8=bytes, r9=len) - stage the encoded bytes
-;   as a new attachment (filename in g_imgfn_w), load the thumbnail, mark dirty,
-;   repaint the thumbnail.
+; gui_img_setbytes(rcx=hdlg, edx=row, r8=bytes, r9=len) - encrypt+stage the file
+;   bytes as a new attachment (filename in g_imgfn_w), store the value blob on the
+;   row, mark the entry dirty.
 gui_img_setbytes proc frame
     FRAME_PROLOG 80
     mov     qword ptr [rbp-24], rcx
@@ -3656,23 +3549,7 @@ gui_img_setbytes proc frame
     lea     rdx, [g_imgblob]
     mov     r8d, dword ptr [rbp-56]
     call    gui_img_setblob
-    mov     ecx, dword ptr [rbp-32]
-    call    gui_img_refresh
     mov     dword ptr [g_dirty], 1
-    ; repaint the thumbnail control
-    mov     ecx, dword ptr [rbp-32]
-    mov     edx, DS_THUMB
-    call    dynid
-    mov     dword ptr [rbp-64], eax
-    mov     rcx, qword ptr [rbp-24]
-    mov     edx, dword ptr [rbp-64]
-    call    GetDlgItem
-    sub     rsp, 32
-    mov     rcx, rax
-    xor     edx, edx
-    mov     r8d, 1
-    call    InvalidateRect
-    add     rsp, 32
 gsb_done:
     FRAME_EPILOG
     ret
@@ -3747,294 +3624,9 @@ gb_done:
     ret
 gui_basename endp
 
-; gui_img_import(rcx=hdlg, edx=row) - pick a file, read its bytes, store them.
-gui_img_import proc frame
-    FRAME_PROLOG 48
-    mov     qword ptr [rbp-24], rcx
-    mov     dword ptr [rbp-32], edx
-    mov     qword ptr [g_pickfilter], 0         ; image filter
-    xor     edx, edx                            ; open
-    call    img_pick
-    test    eax, eax
-    jz      gii_done
-    lea     rcx, [g_imgpath]
-    lea     rdx, [g_imgbuf]
-    lea     r8, [g_imgbuflen]
-    call    read_file
-    test    eax, eax
-    jnz     gii_done
-    lea     rcx, [g_imgpath]                    ; remember the original file name
-    call    gui_basename
-    mov     rcx, qword ptr [rbp-24]
-    mov     edx, dword ptr [rbp-32]
-    mov     r8, qword ptr [g_imgbuf]
-    mov     r9, qword ptr [g_imgbuflen]
-    call    gui_img_setbytes
-    mov     rcx, qword ptr [g_imgbuf]
-    mov     rdx, qword ptr [g_imgbuflen]
-    call    mem_free
-    mov     qword ptr [g_imgbuf], 0
-gii_done:
-    FRAME_EPILOG
-    ret
-gui_img_import endp
-
-; gui_img_paste(rcx=hdlg, edx=row) - if the clipboard holds a bitmap, encode it
-;   to PNG and store it.
-gui_img_paste proc frame
-    FRAME_PROLOG 112
-    mov     qword ptr [rbp-24], rcx
-    mov     dword ptr [rbp-32], edx
-    mov     qword ptr [rbp-56], 0               ; png bytes
-    WINCALL IsClipboardFormatAvailable, CF_BITMAP
-    test    eax, eax
-    jz      gip_done
-    WINCALL OpenClipboard, qword ptr [rbp-24]
-    test    eax, eax
-    jz      gip_done
-    WINCALL GetClipboardData, CF_BITMAP
-    mov     qword ptr [rbp-40], rax
-    test    rax, rax
-    jz      gip_close
-    mov     rcx, rax
-    lea     rdx, [rbp-48]                       ; &pnglen
-    call    img_encode_hbitmap
-    mov     qword ptr [rbp-56], rax
-gip_close:
-    WINCALL CloseClipboard
-    cmp     qword ptr [rbp-56], 0
-    je      gip_done
-    ; default filename = <image field label>_<record title>.png
-    mov     ecx, dword ptr [rbp-32]             ; this row's label control
-    mov     edx, DS_LABEL
-    call    dynid
-    mov     dword ptr [rbp-64], eax
-    WINCALL GetDlgItemTextW, qword ptr [rbp-24], dword ptr [rbp-64], addr g_imgfn_w, 60
-    mov     dword ptr [rbp-72], eax             ; pos = label length
-    lea     r10, [g_imgfn_w]                    ; append '_'
-    mov     eax, dword ptr [rbp-72]
-    mov     word ptr [r10+rax*2], '_'
-    inc     dword ptr [rbp-72]
-    lea     r10, [g_imgfn_w]                    ; append record title at pos
-    mov     eax, dword ptr [rbp-72]
-    lea     rdx, [r10+rax*2]
-    mov     qword ptr [rbp-80], rdx
-    WINCALL GetDlgItemTextW, qword ptr [rbp-24], IDC_V_TITLE, qword ptr [rbp-80], 60
-    add     dword ptr [rbp-72], eax             ; pos += title length
-    lea     r10, [g_imgfn_w]                    ; append ".png"
-    mov     eax, dword ptr [rbp-72]
-    lea     r10, [r10+rax*2]
-    lea     r11, [suffix_dotpng]
-    xor     r9d, r9d
-gpn_l:
-    mov     ax, word ptr [r11+r9*2]
-    mov     word ptr [r10+r9*2], ax
-    test    ax, ax
-    jz      gpn_done
-    inc     r9d
-    jmp     gpn_l
-gpn_done:
-    mov     rcx, qword ptr [rbp-24]
-    mov     edx, dword ptr [rbp-32]
-    mov     r8, qword ptr [rbp-56]
-    mov     r9, qword ptr [rbp-48]
-    call    gui_img_setbytes
-    mov     rcx, qword ptr [rbp-56]
-    mov     rdx, qword ptr [rbp-48]
-    call    mem_free
-gip_done:
-    FRAME_EPILOG
-    ret
-gui_img_paste endp
-
-; gui_img_paint(rcx=lpdis, rdx=img handle) - fill the owner-draw rect and draw the
-;   image aspect-fit (or a "(no image)" placeholder).
-gui_img_paint proc frame
-    FRAME_PROLOG 192                            ; each local its own 8-byte slot (no
-    mov     qword ptr [rbp-24], rcx             ;   qword/dword overlap) + 6-arg call
-    mov     qword ptr [rbp-48], rdx             ; img
-    mov     r10, rcx
-    mov     rax, qword ptr [r10+32]
-    mov     qword ptr [rbp-32], rax             ; hdc
-    mov     eax, dword ptr [r10+40]
-    mov     dword ptr [rbp-56], eax             ; L
-    mov     eax, dword ptr [r10+44]
-    mov     dword ptr [rbp-64], eax             ; T
-    mov     eax, dword ptr [r10+48]
-    mov     dword ptr [rbp-72], eax             ; R
-    mov     eax, dword ptr [r10+52]
-    mov     dword ptr [rbp-80], eax             ; B
-    WINCALL GetStockObject, 3                   ; DKGRAY_BRUSH
-    mov     qword ptr [rbp-40], rax             ; brush
-    mov     r10, qword ptr [rbp-24]
-    lea     rdx, [r10+40]
-    WINCALL FillRect, qword ptr [rbp-32], rdx, qword ptr [rbp-40]
-    cmp     qword ptr [rbp-48], 0
-    je      gpt_noimg
-    mov     rcx, qword ptr [rbp-48]
-    lea     rdx, [rbp-88]                       ; &iw
-    lea     r8, [rbp-96]                        ; &ih
-    call    img_dims
-    mov     eax, dword ptr [rbp-88]
-    test    eax, eax
-    jz      gpt_noimg
-    mov     eax, dword ptr [rbp-96]
-    test    eax, eax
-    jz      gpt_noimg
-    mov     eax, dword ptr [rbp-72]             ; R
-    sub     eax, dword ptr [rbp-56]             ; -L
-    sub     eax, 4
-    mov     dword ptr [rbp-104], eax            ; availw
-    mov     eax, dword ptr [rbp-80]             ; B
-    sub     eax, dword ptr [rbp-64]             ; -T
-    sub     eax, 4
-    mov     dword ptr [rbp-112], eax            ; availh
-    mov     eax, dword ptr [rbp-96]             ; ih
-    imul    eax, dword ptr [rbp-104]            ; ih*availw
-    cdq
-    idiv    dword ptr [rbp-88]                  ; /iw
-    mov     dword ptr [rbp-120], eax            ; fh
-    mov     eax, dword ptr [rbp-104]
-    mov     dword ptr [rbp-128], eax            ; fw = availw
-    mov     eax, dword ptr [rbp-120]
-    cmp     eax, dword ptr [rbp-112]
-    jle     gpt_have
-    mov     eax, dword ptr [rbp-112]
-    mov     dword ptr [rbp-120], eax            ; fh = availh
-    mov     eax, dword ptr [rbp-88]             ; iw
-    imul    eax, dword ptr [rbp-112]            ; iw*availh
-    cdq
-    idiv    dword ptr [rbp-96]                  ; /ih
-    mov     dword ptr [rbp-128], eax            ; fw
-gpt_have:
-    mov     eax, dword ptr [rbp-72]             ; R
-    sub     eax, dword ptr [rbp-56]             ; w = R-L
-    sub     eax, dword ptr [rbp-128]            ; -fw
-    sar     eax, 1
-    add     eax, dword ptr [rbp-56]             ; +L
-    mov     dword ptr [rbp-136], eax            ; x
-    mov     eax, dword ptr [rbp-80]             ; B
-    sub     eax, dword ptr [rbp-64]             ; h = B-T
-    sub     eax, dword ptr [rbp-120]            ; -fh
-    sar     eax, 1
-    add     eax, dword ptr [rbp-64]             ; +T
-    mov     dword ptr [rbp-144], eax            ; y
-    WINCALL img_draw, qword ptr [rbp-48], qword ptr [rbp-32], dword ptr [rbp-136], \
-            dword ptr [rbp-144], dword ptr [rbp-128], dword ptr [rbp-120]
-    FRAME_EPILOG
-    ret
-gpt_noimg:
-    WINCALL SetBkMode, qword ptr [rbp-32], 1
-    WINCALL SetTextColor, qword ptr [rbp-32], 00C8C8C8h
-    mov     r10, qword ptr [rbp-24]
-    lea     rdx, [r10+40]
-    WINCALL DrawTextW, qword ptr [rbp-32], addr cap_noimg, -1, rdx, DT_IMGFLAGS
-    FRAME_EPILOG
-    ret
-gui_img_paint endp
-
-; gui_img_drawthumb(rcx=lpdis) - draw a row's thumbnail (decodes row from CtlID).
-gui_img_drawthumb proc frame
-    FRAME_PROLOG 48
-    mov     qword ptr [rbp-24], rcx
-    mov     r10, rcx
-    mov     ecx, dword ptr [r10+4]              ; CtlID
-    sub     ecx, IDC_DYN_BASE
-    shr     ecx, DYN_SLOTS_LOG2                 ; row
-    call    gui_desc
-    mov     rdx, qword ptr [rax+FD_IMG]
-    mov     rcx, qword ptr [rbp-24]
-    call    gui_img_paint
-    FRAME_EPILOG
-    ret
-gui_img_drawthumb endp
-
-; gui_img_enlarge(rcx=hdlg, edx=row) - open the viewer for the row's image.
-gui_img_enlarge proc frame
-    FRAME_PROLOG 48
-    mov     qword ptr [rbp-24], rcx
-    mov     ecx, edx
-    call    gui_desc
-    mov     qword ptr [rbp-32], rax             ; desc
-    test    dword ptr [rax+FD_FLAGS], FDF_HASIMG
-    jz      gie_done                            ; nothing attached
-    mov     r10, qword ptr [rax+FD_IMG]
-    mov     qword ptr [g_iv_img], r10           ; thumbnail (may be 0 for files)
-    lea     rdx, [rax+FD_ARF+4]
-    mov     qword ptr [g_iv_ref], rdx
-    xor     eax, eax
-    mov     r10, qword ptr [rbp-32]
-    cmp     dword ptr [r10+FD_KIND], VF_FILE    ; files try a live preview handler
-    jne     @F
-    mov     eax, 1
-@@: mov     dword ptr [g_iv_isfile], eax
-    WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_IMGVIEW, qword ptr [rbp-24], addr imgview_proc, 0
-gie_done:
-    FRAME_EPILOG
-    ret
-gui_img_enlarge endp
-
-; gui_img_export(rcx=hdlg) - decode the viewer's attachment and save it to a file.
-gui_img_export proc frame
-    FRAME_PROLOG 48
-    mov     qword ptr [rbp-24], rcx
-    ; prefill the save dialog with the stored filename (blob len is at ref-4)
-    mov     r10, qword ptr [g_iv_ref]
-    mov     eax, dword ptr [r10-4]
-    cmp     eax, 68
-    jbe     gxe_nofn
-    lea     rcx, [g_imgpath]
-    lea     rdx, [r10+68]
-    call    gui_wcpy_capped
-    jmp     gxe_pick
-gxe_nofn:
-    mov     word ptr [g_imgpath], 0
-gxe_pick:
-    mov     rcx, qword ptr [rbp-24]
-    mov     edx, 1                              ; save dialog
-    call    img_pick
-    test    eax, eax
-    jz      gxe_done
-    mov     rcx, qword ptr [g_iv_ref]
-    lea     rdx, [rbp-32]                       ; &len
-    call    attach_open
-    test    rax, rax
-    jz      gxe_done
-    mov     qword ptr [rbp-40], rax             ; bytes
-    lea     rcx, [g_imgpath]
-    mov     rdx, rax
-    mov     r8, qword ptr [rbp-32]
-    call    write_file
-    mov     rcx, qword ptr [rbp-40]
-    mov     rdx, qword ptr [rbp-32]
-    call    mem_free
-gxe_done:
-    FRAME_EPILOG
-    ret
-gui_img_export endp
-
 ; =============================================================================
 ; Generic file attachments (VF_FILE)
 ; =============================================================================
-
-; gui_img_refresh(ecx=row) - re-render the row's preview: GDI+ decode for images,
-;   shell thumbnail for files.
-gui_img_refresh proc frame
-    FRAME_PROLOG 32
-    mov     dword ptr [rbp-24], ecx
-    call    gui_desc
-    cmp     dword ptr [rax+FD_KIND], VF_FILE
-    je      gir_file
-    mov     ecx, dword ptr [rbp-24]
-    call    gui_img_decode
-    FRAME_EPILOG
-    ret
-gir_file:
-    mov     ecx, dword ptr [rbp-24]
-    call    gui_file_preview
-    FRAME_EPILOG
-    ret
-gui_img_refresh endp
 
 ; gui_make_temp_path(rcx=desc) - build g_tmpfile = %TEMP%\<stored filename>.
 gui_make_temp_path proc frame
@@ -4063,59 +3655,6 @@ gmt_default:
     FRAME_EPILOG
     ret
 gui_make_temp_path endp
-
-; gui_file_preview(ecx=row) - decrypt the file to a short-lived temp, ask the shell
-;   for its thumbnail (PDF first page / doc preview / icon), wrap it as an image
-;   handle in FD_IMG, then delete the temp.  No-op if nothing decodes.
-gui_file_preview proc frame
-    FRAME_PROLOG 64
-    mov     dword ptr [rbp-32], ecx
-    call    gui_desc
-    mov     qword ptr [rbp-24], rax                  ; desc
-    ; free any prior handle
-    mov     rcx, qword ptr [rax+FD_IMG]
-    test    rcx, rcx
-    jz      gfp_open
-    mov     qword ptr [rax+FD_IMG], 0
-    call    img_free
-gfp_open:
-    mov     r10, qword ptr [rbp-24]
-    test    dword ptr [r10+FD_FLAGS], FDF_HASIMG
-    jz      gfp_done
-    lea     rcx, [r10+FD_ARF+4]                      ; AttachRef
-    lea     rdx, [rbp-40]                            ; &len
-    call    attach_open
-    test    rax, rax
-    jz      gfp_done
-    mov     qword ptr [rbp-48], rax                  ; plaintext
-    mov     rcx, qword ptr [rbp-24]
-    call    gui_make_temp_path
-    lea     rcx, [g_tmpfile]
-    mov     rdx, qword ptr [rbp-48]
-    mov     r8, qword ptr [rbp-40]
-    call    write_file
-    ; scrub + free the plaintext promptly
-    mov     rcx, qword ptr [rbp-48]
-    mov     rdx, qword ptr [rbp-40]
-    call    mem_free
-    ; shell thumbnail (256x256 px) -> HBITMAP
-    lea     rcx, [g_tmpfile]
-    mov     edx, 256
-    mov     r8d, 256
-    call    shell_thumb
-    mov     qword ptr [rbp-56], rax                  ; hbitmap (0 if none)
-    WINCALL DeleteFileW, addr g_tmpfile             ; remove the temp asap
-    cmp     qword ptr [rbp-56], 0
-    je      gfp_done
-    mov     rcx, qword ptr [rbp-56]                  ; wrap HBITMAP as an img handle
-    call    img_from_hbitmap
-    mov     r10, qword ptr [rbp-24]
-    mov     qword ptr [r10+FD_IMG], rax
-    WINCALL DeleteObject, qword ptr [rbp-56]
-gfp_done:
-    FRAME_EPILOG
-    ret
-gui_file_preview endp
 
 ; gui_file_import(rcx=hdlg, edx=row) - pick any file and store it as an attachment.
 gui_file_import proc frame
@@ -4235,188 +3774,6 @@ gfo_done:
     ret
 gui_file_open endp
 
-; gui_ext_of(rcx=wide filename) -> rax = ptr to the last '.' (incl.), or 0.  Leaf.
-gui_ext_of proc
-    mov     r10, rcx
-    xor     rax, rax
-geo_l:
-    mov     dx, word ptr [r10]
-    test    dx, dx
-    jz      geo_done
-    cmp     dx, '.'
-    jne     @F
-    mov     rax, r10
-@@: add     r10, 2
-    jmp     geo_l
-geo_done:
-    ret
-gui_ext_of endp
-
-; gui_iv_preview_setup(rcx=hdlg) -> eax = 1 if a live preview handler was hosted in
-;   IDC_IV_PIC (renders the actual page content), else 0 (fall back to thumbnail).
-gui_iv_preview_setup proc frame
-    FRAME_PROLOG 128
-    ; [rbp-24]=hdlg [rbp-32]=len [rbp-40]=bytes [rbp-48]=ext [rbp-56]=templen
-    ; [rbp-64]=ph [rbp-72]=pichwnd  RECT @ [rbp-96]
-    mov     qword ptr [rbp-24], rcx
-    mov     rcx, qword ptr [g_iv_ref]
-    lea     rdx, [rbp-32]
-    call    attach_open
-    test    rax, rax
-    jz      gps_fail
-    mov     qword ptr [rbp-40], rax
-    mov     rcx, qword ptr [g_iv_ref]
-    add     rcx, 68                             ; filename (wide)
-    call    gui_ext_of
-    test    rax, rax
-    jz      gps_freebytes
-    mov     qword ptr [rbp-48], rax
-    ; temp path = %TEMP%\<filename>
-    WINCALL GetTempPathW, 500, addr g_tmpfile
-    mov     qword ptr [rbp-56], rax
-    lea     rcx, [g_tmpfile]
-    mov     r10, qword ptr [rbp-56]
-    lea     rcx, [rcx+r10*2]
-    mov     rdx, qword ptr [g_iv_ref]
-    add     rdx, 68
-    call    gui_wcpy_capped
-    ; preview_open(ext, bytes, len, temp)
-    mov     rcx, qword ptr [rbp-48]
-    mov     rdx, qword ptr [rbp-40]
-    mov     r8, qword ptr [rbp-32]
-    lea     r9, [g_tmpfile]
-    call    preview_open
-    mov     qword ptr [rbp-64], rax
-    mov     rcx, qword ptr [rbp-40]             ; free the decrypted bytes now
-    mov     rdx, qword ptr [rbp-32]
-    call    mem_free
-    cmp     qword ptr [rbp-64], 0
-    je      gps_fail
-    mov     rax, qword ptr [rbp-64]
-    mov     qword ptr [g_iv_preview], rax
-    ; host it in IDC_IV_PIC at its full client rect
-    mov     rcx, qword ptr [rbp-24]
-    mov     edx, IDC_IV_PIC
-    call    GetDlgItem
-    mov     qword ptr [rbp-72], rax
-    mov     rcx, rax
-    lea     rdx, [rbp-96]
-    call    GetClientRect
-    mov     rcx, qword ptr [g_iv_preview]
-    mov     rdx, qword ptr [rbp-72]
-    lea     r8, [rbp-96]
-    call    preview_show
-    mov     eax, 1
-    FRAME_EPILOG
-    ret
-gps_freebytes:
-    mov     rcx, qword ptr [rbp-40]
-    mov     rdx, qword ptr [rbp-32]
-    call    mem_free
-gps_fail:
-    xor     eax, eax
-    FRAME_EPILOG
-    ret
-gui_iv_preview_setup endp
-
-; imgview_proc - DLG_IMGVIEW procedure (themed; shows g_iv_img, Export/Close).
-imgview_proc proc
-    push    rbp
-    mov     rbp, rsp
-    sub     rsp, 64
-    mov     qword ptr [rbp-8], rcx
-    cmp     rdx, WM_INITDIALOG
-    je      iv_init
-    cmp     rdx, WM_COMMAND
-    je      iv_cmd
-    cmp     rdx, WM_PAINT
-    je      iv_paint
-    cmp     rdx, WM_ERASEBKGND
-    je      iv_erase
-    cmp     rdx, WM_DRAWITEM
-    je      iv_draw
-    cmp     rdx, WM_CTLCOLORBTN
-    je      iv_color
-    cmp     rdx, WM_CTLCOLORDLG
-    je      iv_color
-    cmp     rdx, WM_CTLCOLORSTATIC
-    je      iv_color
-    xor     eax, eax
-    jmp     iv_ret
-iv_color:
-    call    theme_ctlcolor
-    jmp     iv_ret
-iv_init:
-    mov     qword ptr [g_iv_preview], 0
-    mov     rcx, qword ptr [rbp-8]
-    mov     edx, IDC_IV_EXPORT
-    call    theme_attach
-    mov     rcx, qword ptr [rbp-8]
-    call    gui_set_winicon
-    cmp     dword ptr [g_iv_isfile], 0
-    je      iv_init_done
-    mov     rcx, qword ptr [rbp-8]
-    call    gui_iv_preview_setup
-iv_init_done:
-    mov     eax, 1
-    jmp     iv_ret
-iv_paint:
-    mov     rcx, qword ptr [rbp-8]
-    call    theme_paint
-    jmp     iv_ret
-iv_erase:
-    mov     rcx, r8
-    mov     rdx, qword ptr [rbp-8]
-    call    theme_erase
-    jmp     iv_ret
-iv_draw:
-    ; r9 = lpdis; if it is the picture, draw the image, else theme the button
-    mov     r10, r9
-    mov     eax, dword ptr [r10+4]              ; CtlID
-    cmp     eax, IDC_IV_PIC
-    jne     iv_drawbtn
-    cmp     qword ptr [g_iv_preview], 0         ; hosted preview covers the pic -> skip
-    jne     iv_pic_done
-    mov     rcx, r9
-    mov     rdx, qword ptr [g_iv_img]
-    call    gui_img_paint
-iv_pic_done:
-    mov     eax, 1
-    jmp     iv_ret
-iv_drawbtn:
-    mov     rcx, r9
-    call    theme_drawitem
-    jmp     iv_ret
-iv_cmd:
-    movzx   eax, r8w
-    cmp     eax, IDC_IV_EXPORT
-    je      iv_export
-    cmp     eax, IDOK
-    je      iv_close
-    cmp     eax, IDCANCEL
-    je      iv_close
-    xor     eax, eax
-    jmp     iv_ret
-iv_export:
-    mov     rcx, qword ptr [rbp-8]
-    call    gui_img_export
-    mov     eax, 1
-    jmp     iv_ret
-iv_close:
-    cmp     qword ptr [g_iv_preview], 0
-    je      iv_close_end
-    mov     rcx, qword ptr [g_iv_preview]
-    call    preview_close
-    mov     qword ptr [g_iv_preview], 0
-iv_close_end:
-    WINCALL EndDialog, qword ptr [rbp-8], 0
-    mov     eax, 1
-iv_ret:
-    mov     rsp, rbp
-    pop     rbp
-    ret
-imgview_proc endp
-
 ; move_ctl(rcx=hdlg, rdx=hwnd, r8d=dlux, r9d=dluy, [+48]=dluw, [+56]=dluh)
 ;   Map the DLU rect to pixels and MoveWindow the control.  No-op if hwnd=0.
 move_ctl proc frame
@@ -4486,14 +3843,12 @@ grl_row:
     mov     dword ptr [rbp-48], 40
     jmp     grl_setyh
 grl_chkimg:
-    cmp     eax, VF_IMAGE
-    jne     grl_chkfile
-    mov     dword ptr [rbp-44], 74               ; image: thumbnail row
-    jmp     grl_setyh
-grl_chkfile:
+    cmp     eax, VF_IMAGE                        ; images + files share one attachment
+    je      grl_attach_h                         ; row: filename + Choose/Open/Save
     cmp     eax, VF_FILE
     jne     grl_chktotp
-    mov     dword ptr [rbp-44], 88               ; file: thumbnail + name + buttons
+grl_attach_h:
+    mov     dword ptr [rbp-44], 64
     jmp     grl_setyh
 grl_chktotp:
     cmp     eax, VF_TOTP
@@ -4691,53 +4046,22 @@ grl_sbadge_done:
     mov     edx, dword ptr [rbp-52]
     call    ShowWindow
 grl_totptog_done:
-    ; image row: thumbnail (206,y,120,58) + Import/Paste buttons (edit mode only)
+    ; attachment row (image or file): read-only filename + Choose/Open/Save.
+    ; Choose is edit-mode only; Open/Save stay visible so a stored file is always
+    ; downloadable.  No thumbnail or in-app preview.
     mov     r10, qword ptr [rbp-32]
-    cmp     dword ptr [r10+FD_KIND], VF_IMAGE
-    jne     grl_filelayout
-    mov     rcx, qword ptr [rbp-24]
-    mov     rdx, qword ptr [r10+FD_HANDLES+DS_THUMB*8]
-    mov     r8d, 176
-    mov     r9d, dword ptr [rbp-60]
-    WINCALL move_ctl, rcx, rdx, r8d, r9d, 120, 58
-    mov     rcx, qword ptr [rbp-24]
-    mov     r10, qword ptr [rbp-32]
-    mov     rdx, qword ptr [r10+FD_HANDLES+DS_IMPORT*8]
-    mov     r8d, 290
-    mov     r9d, dword ptr [rbp-60]
-    WINCALL move_ctl, rcx, rdx, r8d, r9d, 34, 14
-    mov     rcx, qword ptr [rbp-24]
-    mov     r10, qword ptr [rbp-32]
-    mov     rdx, qword ptr [r10+FD_HANDLES+DS_PASTE*8]
-    mov     r8d, 290
-    mov     r9d, dword ptr [rbp-60]
-    add     r9d, 18
-    WINCALL move_ctl, rcx, rdx, r8d, r9d, 34, 14
-    ; Import/Paste show only in edit mode
-    mov     r10, qword ptr [rbp-32]
-    mov     rcx, qword ptr [r10+FD_HANDLES+DS_IMPORT*8]
-    mov     edx, dword ptr [rbp-52]
-    call    ShowWindow
-    mov     r10, qword ptr [rbp-32]
-    mov     rcx, qword ptr [r10+FD_HANDLES+DS_PASTE*8]
-    mov     edx, dword ptr [rbp-52]
-    call    ShowWindow
+    mov     eax, dword ptr [r10+FD_KIND]
+    cmp     eax, VF_IMAGE
+    je      grl_attach
+    cmp     eax, VF_FILE
+    je      grl_attach
     jmp     grl_advance
-grl_filelayout:
-    mov     r10, qword ptr [rbp-32]
-    cmp     dword ptr [r10+FD_KIND], VF_FILE
-    jne     grl_advance
-    mov     rcx, qword ptr [rbp-24]                  ; thumbnail (164,content_y,100,58)
-    mov     rdx, qword ptr [r10+FD_HANDLES+DS_THUMB*8]
-    mov     r8d, 164
-    mov     r9d, dword ptr [rbp-60]
-    WINCALL move_ctl, rcx, rdx, r8d, r9d, 100, 58
-    mov     rcx, qword ptr [rbp-24]                  ; filename (164,content_y+60,100,11)
+grl_attach:
+    mov     rcx, qword ptr [rbp-24]                  ; filename (164,content_y,100,11)
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_VALUE*8]
     mov     r8d, 164
     mov     r9d, dword ptr [rbp-60]
-    add     r9d, 60
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 100, 11
     mov     rcx, qword ptr [rbp-24]                  ; Choose (270,content_y,40,14)
     mov     r10, qword ptr [rbp-32]
@@ -4745,34 +4069,22 @@ grl_filelayout:
     mov     r8d, 270
     mov     r9d, dword ptr [rbp-60]
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 40, 14
-    mov     rcx, qword ptr [rbp-24]                  ; Paste (270,content_y+16,40,14)
-    mov     r10, qword ptr [rbp-32]
-    mov     rdx, qword ptr [r10+FD_HANDLES+DS_PASTE*8]
-    mov     r8d, 270
-    mov     r9d, dword ptr [rbp-60]
-    add     r9d, 16
-    WINCALL move_ctl, rcx, rdx, r8d, r9d, 40, 14
-    mov     rcx, qword ptr [rbp-24]                  ; Open (270,content_y+32,40,14)
+    mov     rcx, qword ptr [rbp-24]                  ; Open (270,content_y+16,40,14)
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_OPEN*8]
     mov     r8d, 270
     mov     r9d, dword ptr [rbp-60]
-    add     r9d, 32
+    add     r9d, 16
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 40, 14
-    mov     rcx, qword ptr [rbp-24]                  ; Save (270,content_y+48,40,14)
+    mov     rcx, qword ptr [rbp-24]                  ; Save (270,content_y+32,40,14)
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_EXPORT*8]
     mov     r8d, 270
     mov     r9d, dword ptr [rbp-60]
-    add     r9d, 48
+    add     r9d, 32
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 40, 14
-    ; Choose + Paste show only in edit mode
-    mov     r10, qword ptr [rbp-32]
+    mov     r10, qword ptr [rbp-32]                  ; Choose: edit mode only
     mov     rcx, qword ptr [r10+FD_HANDLES+DS_IMPORT*8]
-    mov     edx, dword ptr [rbp-52]
-    call    ShowWindow
-    mov     r10, qword ptr [rbp-32]
-    mov     rcx, qword ptr [r10+FD_HANDLES+DS_PASTE*8]
     mov     edx, dword ptr [rbp-52]
     call    ShowWindow
 grl_advance:
@@ -5099,7 +4411,7 @@ grb_mask:
             EM_SETPASSWORDCHAR, SECRET_MASK, 0
     jmp     grb_next
 grb_rawval:
-    ; restore an image/file attachment from the gather side-buffer + re-decode
+    ; restore an attachment (image or file) from the gather side-buffer
     mov     r10, qword ptr [rbp-40]            ; &list[k]
     mov     r11, qword ptr [r10+16]            ; &g_gatherblob[k] = {u32 len, AttachRef, filename}
     mov     eax, dword ptr [r11]               ; len
@@ -5110,26 +4422,15 @@ grb_rawval:
     mov     rdx, rax
     mov     r8d, dword ptr [rbp-48]
     call    gui_img_setblob
-    mov     eax, dword ptr [rbp-64]
-    and     eax, NOT VFL_RAW
-    cmp     eax, VF_FILE
-    je      grb_filerestore
-    mov     ecx, dword ptr [rbp-44]            ; image: decode the thumbnail
-    call    gui_img_decode
-    jmp     grb_next
-grb_filerestore:
-    mov     eax, dword ptr [rbp-48]            ; file: show filename (if present) + preview
+    mov     eax, dword ptr [rbp-48]            ; show filename (if present)
     cmp     eax, 68
-    jbe     grb_filethumb
+    jbe     grb_next
     mov     ecx, dword ptr [rbp-44]
     mov     edx, DS_VALUE
     call    dynid
     mov     r8, qword ptr [rbp-56]
     add     r8, 68                             ; filename wide
     WINCALL SetDlgItemTextW, qword ptr [rbp-24], eax, r8
-grb_filethumb:
-    mov     ecx, dword ptr [rbp-44]
-    call    gui_file_preview
 grb_next:
     inc     dword ptr [rbp-32]
     jmp     grb_loop
@@ -5476,7 +4777,6 @@ gom_done:
     FRAME_EPILOG
     ret
 gui_overflow_menu endp
-
 
 ; gui_pw_class(ecx = char) -> eax = 0 upper / 1 lower / 2 digit / 3 symbol.  Leaf.
 gui_pw_class proc
@@ -6545,8 +5845,6 @@ vp_tdraw:
     and     edx, DYN_SLOTS-1                  ; slot = (id-base) mod 8
     cmp     edx, DS_TBAR
     je      vp_tdraw_totp
-    cmp     edx, DS_THUMB
-    je      vp_tdraw_thumb
     cmp     edx, DS_SBADGE
     je      vp_tdraw_sbadge
     cmp     edx, DS_UP
@@ -6577,11 +5875,6 @@ vp_tdraw_sbadge:
 vp_tdraw_chev:
     mov     rcx, r9
     call    gui_draw_flatchevron
-    mov     eax, 1
-    jmp     vp_ret
-vp_tdraw_thumb:
-    mov     rcx, r9
-    call    gui_img_drawthumb
     mov     eax, 1
     jmp     vp_ret
 vp_tdraw_toggle:
@@ -6887,10 +6180,6 @@ vp_dyn:
     je      vpd_copy
     cmp     ecx, DS_IMPORT
     je      vpd_import
-    cmp     ecx, DS_PASTE
-    je      vpd_paste
-    cmp     ecx, DS_THUMB
-    je      vpd_thumb
     cmp     ecx, DS_OPEN
     je      vpd_open
     cmp     ecx, DS_EXPORT
@@ -6899,20 +6188,10 @@ vp_dyn:
     je      vpd_gen
     jmp     vp_handled
 vpd_import:
-    ; file rows choose any file; image rows use the image picker
-    mov     dword ptr [rbp-16], eax             ; row
-    mov     ecx, eax
-    call    gui_desc
-    cmp     dword ptr [rax+FD_KIND], VF_FILE
-    jne     vpd_imgimp
-    mov     edx, dword ptr [rbp-16]
+    ; choose any file to attach (images and files are handled identically)
+    mov     edx, eax                            ; row
     mov     rcx, qword ptr [rbp-8]
     call    gui_file_import
-    jmp     vp_handled
-vpd_imgimp:
-    mov     edx, dword ptr [rbp-16]
-    mov     rcx, qword ptr [rbp-8]
-    call    gui_img_import
     jmp     vp_handled
 vpd_open:
     mov     edx, eax
@@ -6923,16 +6202,6 @@ vpd_export:
     mov     edx, eax
     mov     rcx, qword ptr [rbp-8]
     call    gui_file_export
-    jmp     vp_handled
-vpd_paste:
-    mov     edx, eax
-    mov     rcx, qword ptr [rbp-8]
-    call    gui_img_paste
-    jmp     vp_handled
-vpd_thumb:
-    mov     edx, eax
-    mov     rcx, qword ptr [rbp-8]
-    call    gui_img_enlarge
     jmp     vp_handled
 vpd_copy:
     mov     edx, eax
@@ -7182,7 +6451,6 @@ vp_ret:
     pop     rbp
     ret
 vault_proc endp
-
 
 ; =============================================================================
 ; gui_main - GUI front-end: unlock dialog, then the vault dialog, looping back
