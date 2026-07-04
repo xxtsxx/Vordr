@@ -299,7 +299,6 @@ LB_SETCURSEL        equ 186h
 LB_GETCURSEL        equ 188h
 LB_GETCOUNT         equ 18Bh
 LB_GETITEMDATA      equ 199h
-LB_SETITEMDATA      equ 19Ah
 LB_ERR              equ -1
 EM_SETSEL           equ 0B1h
 EM_SETREADONLY      equ 0CFh
@@ -418,10 +417,6 @@ IDC_PR_COLOR equ 701
 IDC_PR_LEGEND equ 702
 IDC_PR_PHON  equ 703
 ; password character-class colours (COLORREF 0x00BBGGRR)
-CLR_CLS_UPPER  equ 00FFC24Ch          ; blue
-CLR_CLS_LOWER  equ 00E8E8E8h          ; near-white
-CLR_CLS_DIGIT  equ 0060D060h          ; green
-CLR_CLS_SYMBOL equ 003C7DFFh          ; orange
 IDC_IV_PIC   equ 621
 IDC_IV_EXPORT equ 622
 CF_BITMAP    equ 2
@@ -490,7 +485,6 @@ FIELD_AREA_BOTTOM equ 292        ; rows may not grow past here (DLU; Add-field i
 WS_CHILD_       equ 40000000h
 WS_VISIBLE_     equ 10000000h
 WS_TABSTOP_     equ 00010000h
-WS_VSCROLL_     equ 00200000h
 ES_AUTOHSCROLL_ equ 0080h
 ES_AUTOVSCROLL_ equ 0040h
 ES_PASSWORD_    equ 0020h
@@ -538,7 +532,6 @@ WSTR t_err,         <Vordr - error>
 WSTR m_nocpu,       <This CPU lacks required features (AES-NI / PCLMULQDQ / SSE4.1) - cannot run.>
 WSTR m_stfail,      <Self-test FAILED - refusing to run. The binary may be corrupt.>
 WSTR t_open,        <Open vault>
-WSTR t_new,         <Create new vault>
 WSTR t_remove,      <Remove this entry?>
 WSTR s_pickvault,   <Select or create a vault file first.>
 WSTR s_nopw,        <Enter the master password.>
@@ -549,21 +542,13 @@ WSTR s_io,          <Cannot read or write that file.>
 WSTR s_createfail,  <Could not create the vault (I/O or out of memory).>
 WSTR s_notitle,     <An entry needs a title.>
 WSTR s_nofieldroom, <No room for more fields on this record - remove one first.>
-WSTR s_full,        <Vault is full.>
 WSTR s_resealfail,  <Saved in memory but writing to disk failed.>
-WSTR s_firstrun,    <No vault yet - set a master password to create your default vault.>
 WSTR t_overwrite,   <Vordr - vault already exists>
 WSTR m_overwrite,   <A vault file already exists at this location. Creating a new vault will PERMANENTLY destroy it and every entry it holds. Overwrite it?>
 WSTR s_kept,        <Existing vault kept. Cancel, or use "Create new..." to choose a different file.>
 WSTR s_pwmismatch,  <The passwords do not match.>
 WSTR s_pwshort,     <Password is too short for the current policy.>
 WSTR s_pwclasses,   <Password needs more character types (lowercase / uppercase / number / symbol).>
-WSTR s_pollocked,   <Password policy is set by your administrator and cannot be changed here.>
-WSTR s_str_short,   <Too short for the policy.>
-WSTR s_str_few,     <Needs more character types for the policy.>
-WSTR s_str_fair,    <Fair - meets the policy.>
-WSTR s_str_good,    <Good - meets the policy.>
-WSTR s_str_strong,  <Strong - meets the policy.>
 WSTR wt_newentry,   <New entry>
 WSTR cue_search,    <Search>
 WSTR t_tpminfo,     <TPM Unlock>
@@ -576,14 +561,6 @@ WSTR req_p2,        < characters and use at least >
 WSTR req_p3,        < of 4 character types - lowercase / uppercase / number / symbol.>
 WSTR wv_pwlen,      <PwMinLen>
 WSTR wv_pwcls,      <PwMinClasses>
-WSTR s_tpmnone,     <No Windows Hello / TPM unlock saved for this vault on this PC.>
-WSTR s_tpmfail,     <Windows Hello / TPM unlock failed - use your master password.>
-WSTR s_tpmsaved,    <This device can now unlock the vault with Windows Hello / TPM.>
-WSTR s_tpmsavefail, <Could not register this device with the TPM.>
-WSTR t_tpm,         <Windows Hello / TPM>
-WSTR m_forgotten,   <Windows Hello / TPM quick-unlock was removed for this device.>
-WSTR m_forget_q,    <Remove Windows Hello / TPM quick-unlock for this vault on this PC? The master password will still work.>
-WSTR t_forget,      <Forget this device>
 ; --- system tray strings ------------------------------------------------------
 WSTR t_about,       <About Vordr>
 WSTR m_about,       <Vordr - a hardened password manager. AES-256-GCM with Argon2id key derivation. Fail-closed and self-tested on every launch. Written in x64 assembly with no runtime dependencies.>
@@ -598,14 +575,6 @@ tray_wt label word
     dw 'V','o','r','d','r', 0
 ; OPENFILENAMEW filter: "Vordr vault\0*.vordr\0All files\0*.*\0\0"
 align 2
-g_filter label word
-    dw 'V','o','r','d','r',' ','v','a','u','l','t',0
-    dw '*','.','v','o','r','d','r',0
-    dw 'A','l','l',' ','f','i','l','e','s',0
-    dw '*','.','*',0
-    dw 0
-g_defext label word
-    dw 'v','o','r','d','r',0
 xlsx_filter label word
     dw 'E','x','c','e','l',' ','W','o','r','k','b','o','o','k',0
     dw '*','.','x','l','s','x',0
@@ -613,17 +582,6 @@ xlsx_filter label word
 xlsx_defext label word
     dw 'x','l','s','x',0
 WSTR xp_mm_title,    <Export all secrets>
-WSTR xp_mm_warn,     <Export ALL secrets (every password and TOTP) into one Excel file, protected only by the password you set next? Keep the file safe and delete it when done.>
-WSTR imp_csv_title,  <Import from CSV>
-WSTR imp_csv_pre,    <Imported >
-WSTR imp_csv_post,   < entries from the CSV file.>
-WSTR imp_csv_none,   <No importable entries were found in that CSV file.>
-WSTR imp_csv_rderr,  <Could not read the selected file.>
-WSTR imp_xls_title,  <Import from Excel>
-WSTR imp_xls_pre,    <Imported >
-WSTR imp_xls_post,   < entries from the Excel workbook.>
-WSTR imp_xls_none,   <No importable entries were found in that workbook.>
-WSTR imp_xls_bad,    <That file is not a readable .xlsx workbook.>
 WSTR imp_xls_wrongpw,<Could not open the workbook - the password was incorrect.>
 WSTR imp_g_title,    <Import>
 WSTR imp_g_pre,      <Imported >
@@ -631,9 +589,6 @@ WSTR imp_g_post,     < entries.>
 WSTR imp_g_none,     <No importable entries were found in that file.>
 WSTR imp_g_bad,      <That file could not be read as a CSV or Excel workbook.>
 WSTR zip_title,      <Export to encrypted ZIP>
-WSTR zip_warn,       <Export EVERY entry - all fields plus attached files and images - into one AES-256 encrypted ZIP, protected only by the password you set next? Store it safely and delete it when done.>
-WSTR zip_ok,         <Export complete. The encrypted ZIP contains vordr.json (all fields) and every attachment.>
-WSTR zip_fail,       <The export could not be created.>
 WSTR zip_defname,    <vordr-export.zip>
 WSTR fmt_excel,      <Excel (.xlsx)>
 WSTR fmt_csv,        <CSV (.csv)>
@@ -675,8 +630,6 @@ wb_add label word
     dw 002Bh, 0                                  ; +  (add)
 wb_edit label word
     dw 0E70Fh, 0                                 ; Segoe Fluent Icons: Edit (pencil)
-wb_save label word
-    dw 2713h, 0                                  ; check mark (save / leave edit mode)
 wb_rem label word
     dw 0E74Dh, 0                                 ; Segoe Fluent Icons: Delete (trashcan)
 ; --- runtime field-row glyphs, window classes, and default labels ---
@@ -714,34 +667,15 @@ lay_band     dd 14, 0, 18                         ; label band: card(top) vs 0=f
 lay_itemh    dd 42, 30, 58                         ; list-item pixel height (index 0 used)
 pref_scheme dw 'u','i','_','s','c','h','e','m','e',0
 pref_layout dw 'u','i','_','l','a','y','o','u','t',0
-gm_l1 dw 'S','t','r','o','n','g',' ','r','a','n','d','o','m',' ','2','0',0
-gm_l2 dw 'A','l','p','h','a','n','u','m','e','r','i','c',' ','2','0',0
-gm_l3 dw 'P','a','s','s','p','h','r','a','s','e',' ','5',' ','w','o','r','d','s',0
-gm_l4 dw 'P','r','o','n','o','u','n','c','e','a','b','l','e',' ','1','6',0
-gm_l5 dw 'P','I','N',' ','8',' ','d','i','g','i','t','s',0
-gm_l6 dw 'H','e','x',' ','3','2',0
 align 8
-gm_labels dq gm_l1, gm_l2, gm_l3, gm_l4, gm_l5, gm_l6
-gen_presets label dword                          ; {n, style, opt} per preset
-    dd 20, PWS_RANDOM,     15 or PWO_NOAMBIG
-    dd 20, PWS_RANDOM,     7 or PWO_NOAMBIG       ; upper+lower+digit, no symbols
-    dd 5,  PWS_PASSPHRASE, PWO_CAP or PWO_DASH or PWO_DIGIT
-    dd 16, PWS_PRONOUNCE,  PWO_CAP or PWO_DIGIT
-    dd 8,  PWS_PIN,        0
-    dd 32, PWS_HEX,        0
-GEN_PRESET_N equ 6
 align 4
 ; class accent colors (index 0 upper / 2 digit / 3 symbol; lowercase uses g_col_text)
 cls_accent_dark  dd 00FFC24Ch, 0, 0060D060h, 003C7DFFh   ; light-blue / green / orange
 cls_accent_light dd 00CC6600h, 0, 00008000h, 000055CCh   ; strong-blue / dk-green / dk-orange
 f_mono label word
     dw 'C','o','n','s','o','l','a','s', 0
-pr_sp2 dw ' ',' ', 0                              ; separators for the phonetic lines
-pr_crlf dw 13,10, 0
 pr_symdef dw 's','y','m','b','o','l', 0
 pr_cap  dw 'C','A','P','-', 0                     ; capital-letter marker
-PH_CELL equ 22                                    ; phonetic cell width (chars)
-PH_COLS equ 3                                     ; phonetic columns
 lg_upper dw 'A','B','C', 0
 lg_lower dw 'a','b','c', 0
 lg_digit dw '1','2','3', 0
@@ -782,8 +716,6 @@ cap_open label word
     dw 'O','p','e','n', 0
 cap_save label word
     dw 'S','a','v','e', 0
-cap_nofile label word
-    dw '(','f','i','l','e',')', 0
 verb_open label word
     dw 'o','p','e','n', 0
 f_iconname label word
@@ -811,8 +743,6 @@ name_default_att label word
     dw 'v','o','r','d','r','_','a','t','t','a','c','h','.','b','i','n', 0
 cap_paste label word
     dw 'P','a','s','t','e', 0
-cap_export label word
-    dw 'E','x','p','o','r','t', 0
 badge_weak label word
     dw 'W','e','a','k', 0
 badge_fair label word
@@ -835,12 +765,8 @@ t_modified label word
     dw ' ',' ',' ',' ','M','o','d','i','f','i','e','d',' ', 0
 cap_noimg label word
     dw '(','n','o',' ','i','m','a','g','e',')', 0
-suffix_imgpng label word
-    dw '_','i','m','a','g','e','.','p','n','g', 0
 suffix_dotpng label word
     dw '.','p','n','g', 0
-sep_underscore label word
-    dw '_', 0
 g_imgfilter label word          ; "Images\0*.png;*.jpg;*.jpeg;*.bmp;*.gif\0All\0*.*\0\0"
     dw 'I','m','a','g','e','s',0
     dw '*','.','p','n','g',';','*','.','j','p','g',';','*','.','j','p','e','g',';','*','.','b','m','p',';','*','.','g','i','f',0
@@ -849,19 +775,9 @@ g_imgfilter label word          ; "Images\0*.png;*.jpg;*.jpeg;*.bmp;*.gif\0All\0
 g_allfilter label word          ; "All files\0*.*\0\0"
     dw 'A','l','l',' ','f','i','l','e','s',0
     dw '*','.','*',0,0
-g_csvfilter label word          ; "CSV files\0*.csv\0All files\0*.*\0\0"
-    dw 'C','S','V',' ','f','i','l','e','s',0
-    dw '*','.','c','s','v',0
-    dw 'A','l','l',' ','f','i','l','e','s',0
-    dw '*','.','*',0,0
 g_zipfilter label word          ; "ZIP archive\0*.zip\0\0"
     dw 'Z','I','P',' ','a','r','c','h','i','v','e',0
     dw '*','.','z','i','p',0,0
-g_xlsfilter label word          ; "Excel workbooks\0*.xlsx\0All files\0*.*\0\0"
-    dw 'E','x','c','e','l',' ','w','o','r','k','b','o','o','k','s',0
-    dw '*','.','x','l','s','x',0
-    dw 'A','l','l',' ','f','i','l','e','s',0
-    dw '*','.','*',0,0
 g_impfilter label word          ; "Vordr / spreadsheet / CSV\0*.zip;*.csv;*.xlsx\0All files\0*.*\0\0"
     dw 'V','o','r','d','r',' ','/',' ','s','p','r','e','a','d','s','h','e','e','t',' ','/',' ','C','S','V',0
     dw '*','.','z','i','p',';','*','.','c','s','v',';','*','.','x','l','s','x',0
@@ -918,7 +834,6 @@ g_numtmp    db 16 dup (?)             ; scratch for uint-to-decimal
 g_vault_lock dd ?                     ; 1 = vault path set by HKLM (locked)
 g_menu_open  dd ?                     ; 1 = settings overlay is showing
 g_revealed  dd ?
-g_tkey_revealed dd ?                  ; 1 if the TOTP key field is unmasked
 g_clip_seq  dd ?                      ; clipboard sequence number at last copy
 g_cur_idx   dd ?                      ; entry currently shown/edited inline (-1=none)
 g_dirty     dd ?                      ; 1 = inline fields edited since last load/save
@@ -942,11 +857,6 @@ g_pwbuf     dw 1024 dup (?)        ; password field (wide; wiped after use)
 g_pw2buf    dw 1024 dup (?)        ; confirm-password field (wide; wiped)
 g_conv_w    dw EBUF*2 dup (?)      ; utf8 -> wide display scratch
 g_secret_w  dw EBUF*2 dup (?)      ; current selected secret (wide) for reveal/copy
-g_e_title   dw 1024 dup (?)
-g_e_user    dw 1024 dup (?)
-g_e_secret  dw EBUF dup (?)
-g_e_url     dw 1024 dup (?)
-g_e_notes   dw EBUF dup (?)
 g_e_totp    dw 256 dup (?)            ; entry-form base32 TOTP key (wide)
 g_totp_on   dd ?                      ; 1 if the selected entry has a TOTP key
 g_totp_secs dd ?                      ; seconds left in the current TOTP window
@@ -955,7 +865,6 @@ g_totp_b32  db 256 dup (?)            ; selected entry's base32 key (utf8)
 g_totp_code6 db 8 dup (?)            ; computed 6-digit code (ascii)
 g_totp_code_w dw 16 dup (?)          ; code as wide, 6 digits no space (for clipboard)
 g_totp_disp_w dw 16 dup (?)          ; code grouped "nnn nnn" wide (on-screen only)
-g_disp_a    db 32 dup (?)            ; "287082  (17s)" display, ascii
 g_times_w   dw 128 dup (?)           ; "Created ... Modified ..." line (wide)
 g_st        dw 8 dup (?)             ; SYSTEMTIME scratch (FileTimeToSystemTime)
 g_genout    db 260 dup (?)           ; generator ASCII output (wiped after use)
@@ -981,7 +890,6 @@ g_colorpw_row dd ?                         ; row whose revealed secret is colore
 g_rowpw_w     dw 512 dup (?)               ; revealed secret text for the color overlay
 g_wordtmp     dw 32 dup (?)                ; one resolved phonetic word (scratch)
 g_content_h   dd ?                        ; field-form content bottom (DLU) after layout
-g_rowkind     dd ?                        ; scratch: kind for a pending add
 g_dlgfont     dq ?                        ; the vault dialog's font (for runtime ctls)
 g_totp_row    dd ?                        ; row index of the TOTP field (-1 = none)
 g_totp_codehwnd dq ?                      ; live-code display control of the TOTP row
@@ -997,7 +905,6 @@ g_phonfont    dq ?                         ; small monospace font for the phonet
 g_sub_w       dw 512 dup (?)               ; subtitle scratch (wide)
 g_cmpbuf      db 256 dup (?)               ; title-A copy for WM_COMPAREITEM
 g_imp_msgw    dw 160 dup (?)               ; CSV-import result message scratch (wide)
-g_zippw       db 512 dup (?)               ; UTF-8 export-zip password (wiped after use)
 g_pg_len      dd ?                         ; password-generator: length
 g_pg_style    dd ?                         ;   PWS_* style
 g_pg_opt      dd ?                         ;   class mask + PWO_* flags
@@ -1086,55 +993,6 @@ gui_status proc frame
     ret
 gui_status endp
 
-; =============================================================================
-; gui_browse(rcx = hdlg, edx = save?) - run the open/save file dialog; on OK
-;   store the path in g_vpath, set g_vpath_set, and show it in IDC_U_PATH.
-; =============================================================================
-gui_browse proc frame
-    FRAME_PROLOG 48
-    mov     qword ptr [rbp-24], rcx         ; hdlg
-    mov     dword ptr [rbp-32], edx         ; save flag
-    ; zero the OPENFILENAMEW
-    lea     rcx, [g_ofn]
-    mov     edx, sizeof OPENFILENAMEW
-    call    secure_zero
-    lea     r10, [g_ofn]
-    mov     dword ptr [r10].OPENFILENAMEW.lStructSize, sizeof OPENFILENAMEW
-    mov     rax, qword ptr [rbp-24]
-    mov     qword ptr [r10].OPENFILENAMEW.hwndOwner, rax
-    lea     rax, [g_filter]
-    mov     qword ptr [r10].OPENFILENAMEW.lpstrFilter, rax
-    lea     rax, [g_vpath]
-    mov     qword ptr [r10].OPENFILENAMEW.lpstrFile, rax
-    mov     dword ptr [r10].OPENFILENAMEW.nMaxFile, 1024
-    lea     rax, [g_defext]
-    mov     qword ptr [r10].OPENFILENAMEW.lpstrDefExt, rax
-    mov     dword ptr [r10].OPENFILENAMEW.nFilterIndex, 1
-    ; the dialog overwrites g_vpath; start it empty so a fresh pick is clean
-    mov     word ptr [g_vpath], 0
-    cmp     dword ptr [rbp-32], 0
-    jne     gb_save
-    lea     rax, [t_open]
-    mov     qword ptr [r10].OPENFILENAMEW.lpstrTitle, rax
-    mov     dword ptr [r10].OPENFILENAMEW.Flags, OFN_FILEMUSTEXIST or OFN_PATHMUSTEXIST or OFN_HIDEREADONLY or OFN_EXPLORER
-    WINCALL GetOpenFileNameW, addr g_ofn
-    jmp     gb_check
-gb_save:
-    lea     rax, [t_new]
-    mov     qword ptr [r10].OPENFILENAMEW.lpstrTitle, rax
-    mov     dword ptr [r10].OPENFILENAMEW.Flags, OFN_OVERWRITEPROMPT or OFN_PATHMUSTEXIST or OFN_HIDEREADONLY or OFN_EXPLORER
-    WINCALL GetSaveFileNameW, addr g_ofn
-gb_check:
-    test    eax, eax
-    jz      gb_done                         ; cancelled
-    mov     dword ptr [g_vpath_set], 1
-    mov     eax, dword ptr [rbp-32]         ; save mode == create-new mode
-    mov     dword ptr [g_create], eax
-    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_U_PATH, addr g_vpath
-gb_done:
-    FRAME_EPILOG
-    ret
-gui_browse endp
 
 ; =============================================================================
 ; gui_unlock(rcx = hdlg) - validate inputs, (create then) unlock the vault.
@@ -2981,100 +2839,9 @@ gcc_done:
     ret
 gui_clipclear endp
 
-; gui_lbsel(rcx = hdlg) -> eax = selected index, or -1 if none.
-gui_lbsel proc frame
-    FRAME_PROLOG 32
-    WINCALL SendDlgItemMessageW, rcx, IDC_V_LIST, LB_GETCURSEL, 0, 0
-    FRAME_EPILOG
-    ret
-gui_lbsel endp
 
-; gui_setcfg() - point g_cfg_title/user/secret/url/notes at the g_e_* buffers,
-;   using 0 for empty fields (so va_field skips them).
-gui_setcfg proc frame
-    FRAME_PROLOG 32
-    lea     rax, [g_e_title]
-    cmp     word ptr [g_e_title], 0
-    jne     @F
-    xor     eax, eax
-@@: mov     qword ptr [g_cfg_title], rax
-    lea     rax, [g_e_user]
-    cmp     word ptr [g_e_user], 0
-    jne     @F
-    xor     eax, eax
-@@: mov     qword ptr [g_cfg_user], rax
-    lea     rax, [g_e_secret]
-    cmp     word ptr [g_e_secret], 0
-    jne     @F
-    xor     eax, eax
-@@: mov     qword ptr [g_cfg_secret], rax
-    lea     rax, [g_e_url]
-    cmp     word ptr [g_e_url], 0
-    jne     @F
-    xor     eax, eax
-@@: mov     qword ptr [g_cfg_url], rax
-    lea     rax, [g_e_notes]
-    cmp     word ptr [g_e_notes], 0
-    jne     @F
-    xor     eax, eax
-@@: mov     qword ptr [g_cfg_notes], rax
-    lea     rax, [g_e_totp]
-    cmp     word ptr [g_e_totp], 0
-    jne     @F
-    xor     eax, eax
-@@: mov     qword ptr [g_cfg_totp], rax
-    FRAME_EPILOG
-    ret
-gui_setcfg endp
 
-; gui_clearcfg() - clear the g_cfg_* field pointers + wipe the g_e_* buffers.
-gui_clearcfg proc frame
-    FRAME_PROLOG 32
-    mov     qword ptr [g_cfg_title], 0
-    mov     qword ptr [g_cfg_user], 0
-    mov     qword ptr [g_cfg_secret], 0
-    mov     qword ptr [g_cfg_url], 0
-    mov     qword ptr [g_cfg_notes], 0
-    mov     qword ptr [g_cfg_totp], 0
-    lea     rcx, [g_e_secret]
-    mov     edx, EBUF*2
-    call    secure_zero
-    lea     rcx, [g_e_totp]
-    mov     edx, 512
-    call    secure_zero
-    FRAME_EPILOG
-    ret
-gui_clearcfg endp
 
-; gui_addsave(rcx = hdlg) - commit the g_e_* fields as a new entry + reseal.
-gui_addsave proc frame
-    FRAME_PROLOG 48
-    mov     qword ptr [rbp-24], rcx
-    call    gui_setcfg
-    call    vault_add_entry                 ; eax = 0 / EXIT_*
-    mov     dword ptr [rbp-32], eax
-    call    gui_clearcfg
-    cmp     dword ptr [rbp-32], 0
-    jne     gas_err
-    call    vault_reseal
-    test    eax, eax
-    jnz     gas_resealerr
-    mov     rcx, qword ptr [rbp-24]
-    call    gui_poplist
-    jmp     gas_done
-gas_err:
-    cmp     dword ptr [rbp-32], EXIT_NOSPACE
-    jne     @F
-    WINCALL gui_msgbox, qword ptr [rbp-24], addr s_full, addr t_err, <MB_OK or MB_ICONERROR>
-    jmp     gas_done
-@@: WINCALL gui_msgbox, qword ptr [rbp-24], addr s_notitle, addr t_err, <MB_OK or MB_ICONERROR>
-    jmp     gas_done
-gas_resealerr:
-    WINCALL gui_msgbox, qword ptr [rbp-24], addr s_resealfail, addr t_err, <MB_OK or MB_ICONERROR>
-gas_done:
-    FRAME_EPILOG
-    ret
-gui_addsave endp
 
 ; gui_gather(rcx = hdlg) - read Title + every row into the ordered descriptor
 ;   array g_field_list[] (g_field_n) that vault_build_entry consumes.  Values go
@@ -5708,125 +5475,6 @@ gom_done:
     ret
 gui_overflow_menu endp
 
-; gui_gen_menu(rcx=hdlg, edx=row) - popup the password-generator presets; on a
-;   choice, generate a fresh password, fill the row's value, and update the badge.
-gui_gen_menu proc frame
-    FRAME_PROLOG 96
-    mov     qword ptr [rbp-24], rcx           ; hdlg
-    ; target row lives at [rbp-48]: it must survive the TrackPopupMenu call
-    ; (whose 6th/7th arg slots land on [rbp-72]/[rbp-64]) and must not share
-    ; bytes with the qword menu handle at [rbp-32].
-    mov     dword ptr [rbp-48], edx           ; row (clicked)
-    WINCALL CreatePopupMenu
-    mov     qword ptr [rbp-32], rax
-    test    rax, rax
-    jz      ggm_done
-    mov     dword ptr [rbp-36], 0             ; i
-ggm_add:
-    mov     eax, dword ptr [rbp-36]
-    cmp     eax, GEN_PRESET_N
-    jae     ggm_show
-    lea     r10, [gm_labels]
-    mov     r11, qword ptr [r10+rax*8]
-    mov     qword ptr [rbp-64], r11           ; label ptr
-    inc     eax
-    mov     dword ptr [rbp-68], eax           ; menu id = i+1
-    WINCALL AppendMenuW, qword ptr [rbp-32], 0, dword ptr [rbp-68], qword ptr [rbp-64]
-    inc     dword ptr [rbp-36]
-    jmp     ggm_add
-ggm_show:
-    lea     rcx, [rbp-56]
-    call    GetCursorPos
-    WINCALL SetForegroundWindow, qword ptr [rbp-24]
-    WINCALL TrackPopupMenu, qword ptr [rbp-32], TPM_RETURNCMD or TPM_LEFTALIGN, \
-            dword ptr [rbp-56], dword ptr [rbp-52], 0, qword ptr [rbp-24], 0
-    mov     dword ptr [rbp-40], eax           ; choice (1..N, 0 = none)
-    WINCALL DestroyMenu, qword ptr [rbp-32]
-    cmp     dword ptr [rbp-40], 0
-    je      ggm_done
-    ; Resolve the target row AFTER the popup: TrackPopupMenu ran a nested modal
-    ; message loop, during which the detail pane may have been rebuilt (list/focus/
-    ; timer) - a row index captured earlier could be stale.  Always fill the first
-    ; secret row, never the username; fall back to the clicked row if none.
-    mov     edx, VF_SECRET
-    call    gui_row_of_kind
-    cmp     eax, 0
-    jl      @F
-    mov     dword ptr [rbp-48], eax
-@@:
-    mov     eax, dword ptr [rbp-40]           ; preset = gen_presets[choice-1]
-    dec     eax
-    imul    eax, eax, 12
-    lea     r10, [gen_presets]
-    add     r10, rax
-    lea     rcx, [g_genout]
-    mov     edx, dword ptr [r10+0]            ; n
-    mov     r8d, dword ptr [r10+4]            ; style
-    mov     r9d, dword ptr [r10+8]            ; opt
-    call    pwgen_ex
-    test    eax, eax
-    jz      ggm_done
-    lea     r10, [g_genout]                   ; strlen -> [rbp-44]
-    xor     ecx, ecx
-ggm_len:
-    cmp     byte ptr [r10+rcx], 0
-    je      ggm_lend
-    inc     ecx
-    cmp     ecx, 258
-    jb      ggm_len
-ggm_lend:
-    mov     dword ptr [rbp-44], ecx
-    lea     rcx, [g_genout]                   ; grade -> FD_FLAGS bits4-5 (badge)
-    mov     edx, dword ptr [rbp-44]
-    call    gui_pw_grade
-    shl     eax, FDF_PWLVL_SHIFT
-    mov     ecx, dword ptr [rbp-48]
-    imul    ecx, ecx, DESCSZ
-    lea     r11, [g_fields]
-    add     r11, rcx
-    mov     edx, dword ptr [r11+FD_FLAGS]
-    and     edx, NOT FDF_PWLVL_MASK
-    or      edx, eax
-    mov     dword ptr [r11+FD_FLAGS], edx
-    lea     rcx, [g_genout]                   ; widen for the edit
-    mov     edx, dword ptr [rbp-44]
-    lea     r8, [g_genout_w]
-    mov     r9d, 258
-    call    gui_towide
-    mov     ecx, dword ptr [rbp-48]
-    mov     edx, DS_VALUE
-    call    dynid
-    WINCALL SetDlgItemTextW, qword ptr [rbp-24], eax, addr g_genout_w
-    lea     r10, [g_genout]                   ; wipe plaintext scratch
-    xor     ecx, ecx
-ggm_wipe:
-    cmp     ecx, 260
-    jae     ggm_wiped
-    mov     byte ptr [r10+rcx], 0
-    inc     ecx
-    jmp     ggm_wipe
-ggm_wiped:
-    lea     r10, [g_genout_w]
-    xor     ecx, ecx
-ggm_wipe2:
-    cmp     ecx, 260
-    jae     ggm_wiped2
-    mov     word ptr [r10+rcx*2], 0
-    inc     ecx
-    jmp     ggm_wipe2
-ggm_wiped2:
-    mov     dword ptr [g_dirty], 1
-    mov     ecx, dword ptr [rbp-48]           ; repaint the strength badge
-    mov     edx, DS_SBADGE
-    call    dynid
-    mov     rcx, qword ptr [rbp-24]
-    mov     edx, eax
-    call    GetDlgItem
-    WINCALL InvalidateRect, rax, 0, 1
-ggm_done:
-    FRAME_EPILOG
-    ret
-gui_gen_menu endp
 
 ; gui_pw_class(ecx = char) -> eax = 0 upper / 1 lower / 2 digit / 3 symbol.  Leaf.
 gui_pw_class proc
@@ -7533,16 +7181,6 @@ vp_ret:
     ret
 vault_proc endp
 
-; gui_clrwbuf(rcx = wide buf, edx = count) - zero `count` wide chars.
-gui_clrwbuf proc frame
-    FRAME_PROLOG 32
-    mov     eax, edx
-    shl     eax, 1
-    mov     edx, eax
-    call    secure_zero
-    FRAME_EPILOG
-    ret
-gui_clrwbuf endp
 
 ; =============================================================================
 ; gui_main - GUI front-end: unlock dialog, then the vault dialog, looping back

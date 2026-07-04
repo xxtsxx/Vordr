@@ -52,7 +52,6 @@ extern cmd_redteam:proc                 ; fault-injection self-test (redteam.asm
 extern cmd_tpmtest:proc                 ; TPM seal/unseal round-trip (tpm.asm)
 endif
 
-ENC_VAR              equ 0FFFFFFFEh  ; CMDENT.pos_args sentinel: variable (>=1)
 extern con_init:proc
 extern print_a:proc
 extern pwgen_ex:proc                    ; styled password generator (pwgen.asm)
