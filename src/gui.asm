@@ -697,14 +697,8 @@ kl_image label word
     dw 'I','m','a','g','e', 0
 kl_file label word
     dw 'F','i','l','e', 0
-cap_choose label word
-    dw 'C','h','o','o','s','e', 0
 tag_xw label word
     dw 0D7h, 0                             ; multiplication sign, used as the tag 'x'
-cap_open label word
-    dw 'O','p','e','n', 0
-cap_save label word
-    dw 'S','a','v','e', 0
 verb_open label word
     dw 'o','p','e','n', 0
 f_iconname label word
@@ -3587,7 +3581,7 @@ gra_file:
     ; the tile is removed automatically when its last file is deleted.
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_VALUE, addr cls_button, 0, \
             BS_OWNERDRAW_ or WS_TABSTOP_
-    WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_IMPORT, addr cls_button, addr cap_choose, \
+    WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_IMPORT, addr cls_button, addr wb_add, \
             BS_OWNERDRAW_ or WS_TABSTOP_
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_UP, addr cls_button, addr wb_up, \
             BS_OWNERDRAW_
@@ -4088,6 +4082,7 @@ gtpa_free:
     je      gtpa_done
     mov     rcx, qword ptr [rbp-24]              ; first file: create the tile row
     mov     edx, VF_FILE
+    xor     r8d, r8d                             ; no preset label (r8 clobbered above)
     call    gui_addfield_one                     ; enters edit mode + relayouts
     jmp     gtpa_done
 gtpa_relayout:
@@ -4179,7 +4174,7 @@ grl_attach_h:
     jnz     @F
     mov     eax, 1                               ; keep a minimum height
 @@: imul    eax, eax, 15                         ; per-tag chip height (DLU)
-    add     eax, 36                              ; label band + Choose row + padding
+    add     eax, 20                              ; label band + padding (+ is in the band)
     mov     dword ptr [rbp-44], eax
     jmp     grl_setyh
 grl_chktotp:
@@ -4388,26 +4383,26 @@ grl_totptog_done:
     je      grl_attach
     jmp     grl_advance
 grl_attach:
-    mov     rcx, qword ptr [rbp-24]                  ; Choose (266,content_y,44,14)
-    mov     r10, qword ptr [rbp-32]
-    mov     rdx, qword ptr [r10+FD_HANDLES+DS_IMPORT*8]
-    mov     r8d, 266
-    mov     r9d, dword ptr [rbp-60]
-    WINCALL move_ctl, rcx, rdx, r8d, r9d, 44, 14
+    mov     rcx, qword ptr [rbp-24]                  ; "+" add button, card top-right
+    mov     r10, qword ptr [rbp-32]                  ; corner (where the trash sits on
+    mov     rdx, qword ptr [r10+FD_HANDLES+DS_IMPORT*8]  ; other rows)
+    mov     r8d, 394
+    mov     r9d, dword ptr [rbp-40]
+    add     r9d, 4
+    WINCALL move_ctl, rcx, rdx, r8d, r9d, 12, 11
     mov     eax, dword ptr [g_tilefile_n]            ; tag-list height = n * chip
     test    eax, eax
     jnz     @F
     mov     eax, 1
 @@: imul    eax, eax, 15
     mov     dword ptr [rbp-56], eax
-    mov     rcx, qword ptr [rbp-24]                  ; tag list (164,content_y+16,146,h)
+    mov     rcx, qword ptr [rbp-24]                  ; tag list (164,content_y,146,h)
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_VALUE*8]
     mov     r8d, 164
     mov     r9d, dword ptr [rbp-60]
-    add     r9d, 16
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 146, dword ptr [rbp-56]
-    mov     r10, qword ptr [rbp-32]                  ; Choose: edit mode only
+    mov     r10, qword ptr [rbp-32]                  ; "+" shows in edit mode only
     mov     rcx, qword ptr [r10+FD_HANDLES+DS_IMPORT*8]
     mov     edx, dword ptr [rbp-52]
     call    ShowWindow
