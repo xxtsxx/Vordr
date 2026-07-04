@@ -603,7 +603,7 @@ theme_attach proc frame
     WINCALL EnumChildWindows, qword ptr [rbp-24], addr theme_dark_cb, 0
     cmp     dword ptr [rbp-32], 0
     je      ta_done
-    WINCALL SendMessageW, qword ptr [rbp-24], DM_SETDEFID, qword ptr [rbp-32], 0
+    WINCALL SendMessageW, qword ptr [rbp-24], DM_SETDEFID, dword ptr [rbp-32], 0
     ; tag the default button so theme_drawitem paints it as the accent primary
     WINCALL GetDlgItem, qword ptr [rbp-24], dword ptr [rbp-32]
     WINCALL SetWindowLongPtrW, rax, GWL_USERDATA, 1
