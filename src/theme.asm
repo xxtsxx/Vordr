@@ -1166,6 +1166,74 @@ tg_tb_draw:
 theme_toggle endp
 
 ; =============================================================================
+; theme_toggle_labeled(rcx=lpdis, edx=on) -> 1 - draw an owner-draw button as a
+;   left-aligned caption plus a Fluent pill toggle at the right edge of its rect.
+;   The pill sub-rect is width 2*height; theme_toggle renders it (rect narrowed
+;   in place, then restored) so the switch matches the settings toggles exactly.
+; =============================================================================
+public theme_toggle_labeled
+theme_toggle_labeled proc frame
+    FRAME_PROLOG 128
+    mov     qword ptr [rbp-24], rcx           ; lpdis
+    mov     dword ptr [rbp-36], edx           ; on
+    mov     r10, rcx
+    mov     rax, qword ptr [r10+32]
+    mov     qword ptr [rbp-32], rax           ; hdc
+    mov     eax, dword ptr [r10+40]
+    mov     dword ptr [rbp-40], eax           ; original left
+    mov     eax, dword ptr [r10+44]
+    mov     dword ptr [rbp-44], eax           ; top
+    mov     eax, dword ptr [r10+48]
+    mov     dword ptr [rbp-48], eax           ; right
+    mov     eax, dword ptr [r10+52]
+    mov     dword ptr [rbp-52], eax           ; bottom
+    mov     eax, dword ptr [r10+16]
+    mov     dword ptr [rbp-56], eax           ; itemState
+    ; pill sub-rect: width = 2*height, hugging the right edge (2px margin)
+    mov     eax, dword ptr [rbp-52]
+    sub     eax, dword ptr [rbp-44]
+    add     eax, eax
+    mov     ecx, dword ptr [rbp-48]
+    sub     ecx, eax
+    sub     ecx, 2
+    mov     dword ptr [rbp-60], ecx           ; pill left
+    ; ---- caption (left, dim if disabled) ----
+    WINCALL SetBkMode, qword ptr [rbp-32], BKMODE_TRANSP
+    mov     ecx, dword ptr [g_col_text]
+    test    dword ptr [rbp-56], ODS_DISABLED
+    jz      @F
+    mov     ecx, dword ptr [g_col_textdim]
+@@: WINCALL SetTextColor, qword ptr [rbp-32], ecx
+    mov     r10, qword ptr [rbp-24]
+    mov     rcx, qword ptr [r10+24]           ; hwndItem
+    WINCALL GetWindowTextW, rcx, addr g_txtbuf, 159
+    mov     eax, dword ptr [rbp-40]
+    add     eax, 2
+    mov     dword ptr [rbp-80], eax           ; label rect L
+    mov     eax, dword ptr [rbp-44]
+    mov     dword ptr [rbp-76], eax           ; T
+    mov     eax, dword ptr [rbp-60]
+    sub     eax, 6
+    mov     dword ptr [rbp-72], eax           ; R (before pill)
+    mov     eax, dword ptr [rbp-52]
+    mov     dword ptr [rbp-68], eax           ; B
+    WINCALL DrawTextW, qword ptr [rbp-32], addr g_txtbuf, -1, addr rbp-80, DT_LFLAGS
+    ; ---- pill: narrow lpdis rect to the pill area, draw, restore ----
+    mov     r10, qword ptr [rbp-24]
+    mov     eax, dword ptr [rbp-60]
+    mov     dword ptr [r10+40], eax           ; lpdis.left := pill left
+    mov     rcx, r10
+    mov     edx, dword ptr [rbp-36]
+    call    theme_toggle
+    mov     r10, qword ptr [rbp-24]
+    mov     eax, dword ptr [rbp-40]
+    mov     dword ptr [r10+40], eax           ; restore original left
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+theme_toggle_labeled endp
+
+; =============================================================================
 ; theme_progressbar(rcx=lpdis, edx=num, r8d=denom) -> 1 - draw a Fluent progress
 ;   bar in the owner-draw control's rect: a hairline track with an accent fill of
 ;   width num/denom from the left.  Used as the TOTP countdown under the code box.
