@@ -43,6 +43,9 @@ extern SetBkColor:proc
 extern SetBkMode:proc
 extern GetStockObject:proc
 extern RoundRect:proc
+extern GradientFill:proc
+extern CreateRoundRectRgn:proc
+extern SelectClipRgn:proc
 extern Ellipse:proc
 
 extern GetClientRect:proc
@@ -82,8 +85,6 @@ WM_CTLCOLORLISTBOX  equ 134h
 WM_CTLCOLORSTATIC   equ 138h
 DM_SETDEFID         equ 401h
 THEME_TIMER         equ 9
-RAINBOW_MS          equ 70                  ; Rainbow accent animation tick (ms)
-RAINBOW_STEP        equ 6                   ; hue advance per tick (1530 hues / 6 -> ~18s cycle)
 GWL_STYLE           equ -16
 GWL_EXSTYLE         equ -20
 GWL_USERDATA        equ -21                  ; 1 = Fluent accent (primary) button
@@ -131,7 +132,6 @@ align 8
 ; IID_IDXGIFactory1 {770aae78-f26f-4dba-a829-253c83d1b387}
 g_overlay   dd 0
 g_phase     dd 0
-g_rainbow_phase dd 0                      ; Rainbow scheme: hue position 0..1529
 g_bw        dd 0
 g_bh        dd 0
 g_memdc     dq 0
@@ -158,7 +158,7 @@ g_col_side  dd 00342A26h                  ; sidebar (list + search) panel colour
 g_col_filebadge dd 00544A3Ah              ; attachment/file chip fill (distinct from bg/panel)
 SCHEME_DW   equ 14                        ; dwords per scheme row
 SCHEME_COUNT equ 9
-SCHEME_RAINBOW equ 8                       ; animated: accent/frame hue cycles on theme_tick
+SCHEME_RAINBOW equ 8                       ; purple base; accent surfaces get a static rainbow gradient
 schemes label dword
     ; bg       panel     frame     btn       btnsel    text      textdim   border    accent    accsel    focus     dark  side      filebadge
     dd 00202020h,002D2D2Dh,003D3D3Dh,002D2D2Dh,002A2A2Ah,00FFFFFFh,00C8C8C8h,003D3D3Dh,00FFC24Ch,00DBA03Ah,00FFC24Ch,1,00342A26h,00544A3Ah  ; Dark
@@ -169,7 +169,7 @@ schemes label dword
     dd 00D8ECF4h,00E0F3FBh,00A8C8D8h,00E0F3FBh,00C0DFEAh,002A3B4Bh,00556A7Ah,00A8C8D8h,001D65B5h,00144E90h,001D65B5h,0,00C4D2D6h,00CCDCE4h  ; Sepia
     dd 0040342Eh,0052423Bh,006A564Ch,0052423Bh,005E4C43h,00F4EFECh,00E9DED8h,006A564Ch,00D0C088h,00B0A06Fh,00D0C088h,1,004F4039h,00786858h  ; Nord
     dd 00F3F0FFh,00FFFFFFh,00D0C8F0h,00FFFFFFh,00E4DCFAh,00302A3Ah,00746A8Ah,00D0C8F0h,006C33D6h,005A28B0h,006C33D6h,0,00F8E0E9h,00E0D0F0h  ; Rose
-    dd 00181418h,00241E28h,00403850h,00241E28h,002E2838h,00FFFFFFh,00C8C8C8h,00403850h,004040FFh,003030C0h,004040FFh,1,001C1622h,00382E42h  ; Rainbow (accent animates)
+    dd 00181420h,00241E30h,00443A5Ah,00241E30h,00302842h,00FFFFFFh,00C8C8C8h,00443A5Ah,00FF5A96h,00D24678h,00FF5A96h,1,001E1628h,003C3050h  ; Rainbow (purple base, gradient accents)
 g_br_bg     dq 0
 g_br_side   dq 0                            ; sidebar (list + search) fill
 g_br_panel  dq 0
@@ -198,6 +198,16 @@ g_uline_br   dq 0
 g_uline_ctl2 dd 0
 g_uline_br2  dq 0
 
+; 7 rainbow boundary colours (COLOR16 = value<<8) for the Rainbow scheme's
+; horizontal gradient fills: red, yellow, green, cyan, blue, magenta, red.
+rb_grad label word                      ; [7][3] = R,G,B per stop
+    dw 0FF00h,0,0
+    dw 0FF00h,0FF00h,0
+    dw 0,0FF00h,0
+    dw 0,0FF00h,0FF00h
+    dw 0,0,0FF00h
+    dw 0FF00h,0,0FF00h
+    dw 0FF00h,0,0
 td_dark label word                      ; control theme class for dark scrollbars
     dw 'D','a','r','k','M','o','d','e','_','E','x','p','l','o','r','e','r', 0
 td_light label word                     ; control theme class for light scrollbars
@@ -610,10 +620,6 @@ theme_attach proc frame
     WINCALL SetLayeredWindowAttributes, qword ptr [rbp-24], 0, WIN_ALPHA, LWA_ALPHA
     ; dark scrollbars/borders on the standard controls (listbox, multiline edits)
     WINCALL EnumChildWindows, qword ptr [rbp-24], addr theme_dark_cb, 0
-    cmp     dword ptr [g_scheme], SCHEME_RAINBOW  ; Rainbow -> run the accent animation timer
-    jne     ta_defid
-    WINCALL SetTimer, qword ptr [rbp-24], THEME_TIMER, RAINBOW_MS, 0
-ta_defid:
     cmp     dword ptr [rbp-32], 0
     je      ta_done
     WINCALL SendMessageW, qword ptr [rbp-24], DM_SETDEFID, dword ptr [rbp-32], 0
@@ -625,106 +631,101 @@ ta_done:
     ret
 theme_attach endp
 
-; hue6(ecx = phase 0..1529) -> eax = COLORREF for a full-saturation rainbow.  Leaf.
-hue6 proc
-    mov     eax, ecx
-    xor     edx, edx
-    mov     r8d, 255
-    div     r8d                          ; eax = segment (0..5), edx = t (0..254)
+; =============================================================================
+; theme_rainbow_fill(rcx=hdc, edx=L, r8d=T, r9d=R, [rbp+48]=B, [rbp+56]=radius) -
+;   fill a rounded rect with a static horizontal rainbow gradient (6 segments via
+;   GradientFill, clipped to a rounded region).  Used by the Rainbow scheme for
+;   the accent surfaces (primary buttons, toggle-on tracks).
+; =============================================================================
+public theme_rainbow_fill
+theme_rainbow_fill proc frame
+    FRAME_PROLOG 160
+    mov     qword ptr [rbp-24], rcx           ; hdc
+    mov     dword ptr [rbp-28], edx           ; L
+    mov     dword ptr [rbp-32], r8d           ; T
+    mov     dword ptr [rbp-36], r9d           ; R
+    mov     eax, dword ptr [rbp+48]
+    mov     dword ptr [rbp-40], eax           ; B
+    mov     eax, dword ptr [rbp+56]
+    mov     dword ptr [rbp-44], eax           ; radius
+    mov     eax, dword ptr [rbp-36]           ; w = R - L
+    sub     eax, dword ptr [rbp-28]
+    mov     dword ptr [rbp-48], eax
     cmp     eax, 0
-    je      h_s0
-    cmp     eax, 1
-    je      h_s1
-    cmp     eax, 2
-    je      h_s2
-    cmp     eax, 3
-    je      h_s3
-    cmp     eax, 4
-    je      h_s4
-    mov     r9d, 255                      ; seg 5: magenta -> red  (R=255,G=0,B=255-t)
-    xor     r10d, r10d
-    mov     r11d, 255
-    sub     r11d, edx
-    jmp     h_pack
-h_s0:                                     ; red -> yellow  (R=255,G=t,B=0)
-    mov     r9d, 255
-    mov     r10d, edx
-    xor     r11d, r11d
-    jmp     h_pack
-h_s1:                                     ; yellow -> green  (R=255-t,G=255,B=0)
-    mov     r9d, 255
-    sub     r9d, edx
-    mov     r10d, 255
-    xor     r11d, r11d
-    jmp     h_pack
-h_s2:                                     ; green -> cyan  (R=0,G=255,B=t)
-    xor     r9d, r9d
-    mov     r10d, 255
-    mov     r11d, edx
-    jmp     h_pack
-h_s3:                                     ; cyan -> blue  (R=0,G=255-t,B=255)
-    xor     r9d, r9d
-    mov     r10d, 255
-    sub     r10d, edx
-    mov     r11d, 255
-    jmp     h_pack
-h_s4:                                     ; blue -> magenta  (R=t,G=0,B=255)
-    mov     r9d, edx
-    xor     r10d, r10d
-    mov     r11d, 255
-h_pack:
-    mov     eax, r9d                      ; COLORREF = R | G<<8 | B<<16
-    shl     r10d, 8
-    or      eax, r10d
-    shl     r11d, 16
-    or      eax, r11d
-    ret
-hue6 endp
-
-; scale_col(eax = COLORREF, ecx = numerator over 16) -> eax = dimmed COLORREF.  Leaf.
-scale_col proc
-    movzx   r8d, al                       ; R
-    mov     r9d, eax                      ; G
-    shr     r9d, 8
-    movzx   r9d, r9b
-    mov     r10d, eax
-    shr     r10d, 16
-    movzx   r10d, r10b                    ; B
-    imul    r8d, ecx
-    shr     r8d, 4
-    imul    r9d, ecx
-    shr     r9d, 4
-    imul    r10d, ecx
-    shr     r10d, 4
-    mov     eax, r8d
-    shl     r9d, 8
-    or      eax, r9d
-    shl     r10d, 16
-    or      eax, r10d
-    ret
-scale_col endp
-
-; theme_rainbow_step - advance the hue and rebuild the accent (vivid) + frame
-;   (dim complementary) colours, then recreate the scheme brushes/pens.
-theme_rainbow_step proc frame
-    FRAME_PROLOG 48
-    mov     eax, dword ptr [g_rainbow_phase]
-    add     eax, RAINBOW_STEP
-    cmp     eax, 1530
-    jb      @F
-    sub     eax, 1530
-@@: mov     dword ptr [g_rainbow_phase], eax
-    mov     ecx, eax                      ; accent = hue6(phase)
-    call    hue6
-    mov     dword ptr [g_col_accent], eax
-    mov     dword ptr [g_col_focus], eax
-    mov     ecx, 12                       ; accsel = 75% accent
-    call    scale_col
-    mov     dword ptr [g_col_accsel], eax
-    call    theme_rebrush
+    jle     trf_done
+    WINCALL CreateRoundRectRgn, dword ptr [rbp-28], dword ptr [rbp-32], \
+            dword ptr [rbp-36], dword ptr [rbp-40], dword ptr [rbp-44], dword ptr [rbp-44]
+    mov     qword ptr [rbp-56], rax
+    WINCALL SelectClipRgn, qword ptr [rbp-24], qword ptr [rbp-56]
+    lea     r10, [rbp-104]                    ; GRADIENT_RECT {0,1}
+    mov     dword ptr [r10], 0
+    mov     dword ptr [r10+4], 1
+    mov     dword ptr [rbp-60], 0             ; seg
+trf_seg:
+    cmp     dword ptr [rbp-60], 6
+    jae     trf_unclip
+    mov     eax, dword ptr [rbp-60]           ; xL = L + seg*w/6
+    imul    eax, dword ptr [rbp-48]
+    cdq
+    mov     ecx, 6
+    idiv    ecx
+    add     eax, dword ptr [rbp-28]
+    mov     r8d, eax                          ; xL
+    mov     eax, dword ptr [rbp-60]
+    inc     eax
+    cmp     eax, 6
+    jne     trf_xr
+    mov     r9d, dword ptr [rbp-36]           ; last segment -> R exactly
+    jmp     trf_verts
+trf_xr:
+    imul    eax, dword ptr [rbp-48]
+    cdq
+    mov     ecx, 6
+    idiv    ecx
+    add     eax, dword ptr [rbp-28]
+    mov     r9d, eax                          ; xR
+trf_verts:
+    lea     r10, [rbp-96]                     ; v0 = { xL, T, rb_grad[seg] }
+    mov     dword ptr [r10], r8d
+    mov     eax, dword ptr [rbp-32]
+    mov     dword ptr [r10+4], eax
+    mov     eax, dword ptr [rbp-60]
+    imul    eax, eax, 6
+    lea     r11, [rb_grad]
+    add     r11, rax
+    movzx   ecx, word ptr [r11]
+    mov     word ptr [r10+8], cx
+    movzx   ecx, word ptr [r11+2]
+    mov     word ptr [r10+10], cx
+    movzx   ecx, word ptr [r11+4]
+    mov     word ptr [r10+12], cx
+    mov     word ptr [r10+14], 0
+    lea     r10, [rbp-80]                     ; v1 = { xR, B, rb_grad[seg+1] }
+    mov     dword ptr [r10], r9d
+    mov     eax, dword ptr [rbp-40]
+    mov     dword ptr [r10+4], eax
+    mov     eax, dword ptr [rbp-60]
+    inc     eax
+    imul    eax, eax, 6
+    lea     r11, [rb_grad]
+    add     r11, rax
+    movzx   ecx, word ptr [r11]
+    mov     word ptr [r10+8], cx
+    movzx   ecx, word ptr [r11+2]
+    mov     word ptr [r10+10], cx
+    movzx   ecx, word ptr [r11+4]
+    mov     word ptr [r10+12], cx
+    mov     word ptr [r10+14], 0
+    WINCALL GradientFill, qword ptr [rbp-24], addr rbp-96, 2, addr rbp-104, 1, 0
+    inc     dword ptr [rbp-60]
+    jmp     trf_seg
+trf_unclip:
+    WINCALL SelectClipRgn, qword ptr [rbp-24], 0
+    WINCALL DeleteObject, qword ptr [rbp-56]
+trf_done:
     FRAME_EPILOG
     ret
-theme_rainbow_step endp
+theme_rainbow_fill endp
 
 ; =============================================================================
 ; theme_tick(rcx=hwnd)
@@ -733,12 +734,6 @@ public theme_tick
 theme_tick proc frame
     FRAME_PROLOG 48
     mov     qword ptr [rbp-24], rcx
-    cmp     dword ptr [g_scheme], SCHEME_RAINBOW
-    jne     tt_bg
-    call    theme_rainbow_step
-    WINCALL RedrawWindow, qword ptr [rbp-24], 0, 0, 81h   ; RDW_INVALIDATE|RDW_ALLCHILDREN
-    jmp     tt_done
-tt_bg:
     cmp     qword ptr [g_bits], 0
     je      tt_done
     inc     dword ptr [g_phase]
@@ -1139,6 +1134,17 @@ tdi_acc_on:
 tdi_btnshape:
     WINCALL RoundRect, qword ptr [rbp-32], dword ptr [rbp-80], dword ptr [rbp-76], \
             dword ptr [rbp-72], dword ptr [rbp-68], 8, 8
+    ; Rainbow scheme: overpaint the accent (primary) button with a rainbow gradient
+    cmp     dword ptr [g_scheme], SCHEME_RAINBOW
+    jne     tdi_tclr
+    WINCALL GetWindowLongPtrW, qword ptr [rbp-40], GWL_USERDATA
+    test    rax, rax
+    jz      tdi_tclr                          ; standard (non-accent) button -> no gradient
+    test    dword ptr [rbp-48], ODS_DISABLED
+    jnz     tdi_tclr
+    WINCALL theme_rainbow_fill, qword ptr [rbp-32], dword ptr [rbp-80], dword ptr [rbp-76], \
+            dword ptr [rbp-72], dword ptr [rbp-68], 8
+tdi_tclr:
     mov     ecx, dword ptr [rbp-116]
     test    dword ptr [rbp-48], ODS_DISABLED
     jz      tdi_tcol
@@ -1237,6 +1243,17 @@ tg_dimtrack:
 tg_track:
     WINCALL RoundRect, qword ptr [rbp-32], dword ptr [rbp-40], dword ptr [rbp-44], \
             dword ptr [rbp-48], dword ptr [rbp-52], dword ptr [rbp-56], dword ptr [rbp-56]
+    ; Rainbow scheme: rainbow-gradient the ON track
+    cmp     dword ptr [g_scheme], SCHEME_RAINBOW
+    jne     tg_thumb
+    cmp     dword ptr [rbp-36], 0
+    je      tg_thumb
+    mov     r10, qword ptr [rbp-24]
+    test    dword ptr [r10+16], 4
+    jnz     tg_thumb
+    WINCALL theme_rainbow_fill, qword ptr [rbp-32], dword ptr [rbp-40], dword ptr [rbp-44], \
+            dword ptr [rbp-48], dword ptr [rbp-52], dword ptr [rbp-56]
+tg_thumb:
     ; ---- thumb ----
     mov     r10, qword ptr [rbp-24]           ; disabled -> muted thumb (state still shown by pos)
     test    dword ptr [r10+16], 4

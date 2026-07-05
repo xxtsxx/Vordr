@@ -256,8 +256,6 @@ WM_CTLCOLORBTN      equ 135h
 WM_CTLCOLORDLG      equ 136h
 WM_CTLCOLORSTATIC   equ 138h
 THEME_TIMER         equ 9
-SCHEME_RAINBOW      equ 8                   ; animated rainbow-accent scheme
-RAINBOW_MS          equ 70
 EM_SETCUEBANNER     equ 1501h
 ; ---- system tray / window-loop -----------------------------------------------
 WM_DESTROY          equ 2
@@ -7676,13 +7674,6 @@ vp_theme:
 @@: mov     dword ptr [g_scheme], eax
     mov     rcx, qword ptr [rbp-8]
     call    gui_apply_scheme
-    cmp     dword ptr [g_scheme], SCHEME_RAINBOW  ; run/stop the accent animation timer
-    jne     vpt_notimer
-    WINCALL SetTimer, qword ptr [rbp-8], THEME_TIMER, RAINBOW_MS, 0
-    jmp     vpt_tdone
-vpt_notimer:
-    WINCALL KillTimer, qword ptr [rbp-8], THEME_TIMER
-vpt_tdone:
     call    gui_save_prefs
     jmp     vp_handled
 vp_export:
