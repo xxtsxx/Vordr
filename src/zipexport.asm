@@ -31,6 +31,7 @@ extern attach_open:proc
 extern WideCharToMultiByte:proc
 VF_IMAGE_   equ 9
 VF_FILE_    equ 10
+VF_PWHIST_  equ 13                   ; reserved field history - never exported
 JSON_CAP    equ 16*1024*1024
 CP_UTF8_    equ 65001
 
@@ -609,6 +610,10 @@ zbj_flp:
     call    vault_field_get
     test    eax, eax
     jz      zbj_fnext
+    mov     eax, dword ptr [g_zj_fld]           ; never export the reserved history field
+    and     eax, 0FFh
+    cmp     eax, VF_PWHIST_
+    je      zbj_fnext
     ; image/file fields are emitted too, but their value carries the ZIP path
     ; (<title>/<filename>) that ze_add_attachments uses - so import can reconnect
     ; each attachment to its record.
