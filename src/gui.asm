@@ -8826,7 +8826,7 @@ sst_loop:
     mov     eax, dword ptr [rbp-48]
     mov     dword ptr [r10+12], eax             ; state
     mov     dword ptr [r10+16], LVIS_STATEIMAGEMASK
-    WINCALL SendMessageW, qword ptr [rbp-32], LVM_SETITEMSTATE, qword ptr [rbp-44], addr g_lvi
+    WINCALL SendMessageW, qword ptr [rbp-32], LVM_SETITEMSTATE, dword ptr [rbp-44], addr g_lvi
     inc     dword ptr [rbp-44]
     jmp     sst_loop
 sst_done:
