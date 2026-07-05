@@ -79,6 +79,7 @@ externdef g_zi_stg_n:dword              ; staged entry count
 extern ze_free:proc
 externdef g_zbuf:qword
 extern ShellExecuteW:proc
+extern PlaySoundW:proc
 extern GetTempPathW:proc
 extern GetClientRect:proc
 extern DeleteFileW:proc
@@ -248,6 +249,8 @@ GWLP_WNDPROC        equ -4
 IDC_HAND            equ 32649
 HTCLIENT            equ 1
 LINK_BLUE           equ 00E08C3Ch        ; COLORREF (RGB 60,140,224) hyperlink blue
+WAV_RATE            equ 22050            ; chiptune sample rate
+SND_MEM_ASYNC       equ 5                ; SND_MEMORY | SND_ASYNC
 WM_MEASUREITEM      equ 2Ch
 WM_COMPAREITEM      equ 39h
 WM_CTLCOLOREDIT     equ 133h
@@ -799,6 +802,8 @@ verb_open label word
     dw 'o','p','e','n', 0
 url_https label word                    ; scheme prefix for a bare URL (e.g. "example.com")
     dw 'h','t','t','p','s',':','/','/', 0
+align 4
+note_tab dd 523,1800, 659,1800, 784,1800, 1047,2400, 784,1200, 1047,3400, 0,0  ; C-E-G-C arpeggio jingle
 gl_cloud    dw 0E753h, 0                 ; Segoe Fluent Icons: Cloud (OneDrive)
 gl_doc      dw 0E8A5h, 0                 ; Document (Documents folder)
 gl_folder   dw 0E8B7h, 0                 ; Folder (other location)
@@ -987,6 +992,8 @@ g_phon_w    dw 6144 dup (?)          ; phonetic spelling text (wiped on close)
 g_urlbuf    dw 1024 dup (?)          ; URL read from a URL field for click-to-open
 g_urlbuf2   dw 1040 dup (?)          ; URL with an https:// scheme prepended if bare
 g_menuinfo  db 40 dup (?)            ; MENUINFO scratch for themed popup menus
+align 4
+g_wav       db 32768 dup (?)         ; in-memory WAV built for the retro-theme chiptune
 align 8
 g_url_origproc dq ?                  ; original EDIT wndproc (URL fields subclassed for hand cursor)
 ; --- modular field-row model (runtime detail form) ---
@@ -5413,6 +5420,80 @@ guo_done:
     ret
 gui_url_open endp
 
+; gui_chiptune() - synthesize a short square-wave "power-up" jingle into g_wav
+;   (8-bit mono PCM WAV built entirely at runtime) and play it async.  Only for
+;   the 30 retro/cyberpunk styles (scheme >= 9); classic themes stay silent.
+gui_chiptune proc frame
+    FRAME_PROLOG 64
+    cmp     dword ptr [g_scheme], 9
+    jb      gct_done
+    lea     rax, [g_wav+44]                     ; sample cursor (after the 44-byte header)
+    mov     qword ptr [rbp-24], rax
+    lea     rax, [note_tab]
+    mov     qword ptr [rbp-32], rax
+gct_note:
+    mov     r10, qword ptr [rbp-32]
+    mov     r8d, dword ptr [r10]                ; freq (0 = end)
+    test    r8d, r8d
+    jz      gct_hdr
+    mov     r9d, dword ptr [r10+4]              ; sample count
+    mov     eax, WAV_RATE                       ; period = rate / freq
+    xor     edx, edx
+    div     r8d
+    mov     ecx, eax                            ; period
+    shr     eax, 1
+    mov     r8d, eax                            ; half period
+    xor     edx, edx                            ; phase
+    mov     r11, qword ptr [rbp-24]             ; dst
+gct_samp:
+    test    r9d, r9d
+    jz      gct_nextnote
+    cmp     edx, r8d                            ; phase < half -> high level, else low
+    jae     gct_low
+    mov     byte ptr [r11], 0C6h
+    jmp     gct_adv
+gct_low:
+    mov     byte ptr [r11], 03Ah
+gct_adv:
+    inc     r11
+    inc     edx
+    cmp     edx, ecx
+    jb      @F
+    xor     edx, edx
+@@: dec     r9d
+    jmp     gct_samp
+gct_nextnote:
+    mov     qword ptr [rbp-24], r11             ; save advanced cursor
+    add     qword ptr [rbp-32], 8
+    jmp     gct_note
+gct_hdr:
+    mov     rax, qword ptr [rbp-24]             ; data bytes = cursor - (g_wav+44)
+    lea     r10, [g_wav+44]
+    sub     rax, r10
+    mov     dword ptr [rbp-40], eax
+    lea     r11, [g_wav]
+    mov     dword ptr [r11+0], 46464952h        ; "RIFF"
+    mov     eax, dword ptr [rbp-40]
+    add     eax, 36
+    mov     dword ptr [r11+4], eax              ; RIFF chunk size
+    mov     dword ptr [r11+8], 45564157h        ; "WAVE"
+    mov     dword ptr [r11+12], 20746D66h       ; "fmt "
+    mov     dword ptr [r11+16], 16
+    mov     word ptr [r11+20], 1                ; PCM
+    mov     word ptr [r11+22], 1                ; mono
+    mov     dword ptr [r11+24], WAV_RATE
+    mov     dword ptr [r11+28], WAV_RATE        ; byte rate = rate*1*1
+    mov     word ptr [r11+32], 1                ; block align
+    mov     word ptr [r11+34], 8                ; bits/sample
+    mov     dword ptr [r11+36], 61746164h       ; "data"
+    mov     eax, dword ptr [rbp-40]
+    mov     dword ptr [r11+40], eax             ; data size
+    WINCALL PlaySoundW, addr g_wav, 0, SND_MEM_ASYNC
+gct_done:
+    FRAME_EPILOG
+    ret
+gui_chiptune endp
+
 ; url_editproc(rcx=hwnd, rdx=msg, r8=wParam, r9=lParam) -> rax - subclass proc for
 ;   a URL field's value edit: in view mode it shows a hand cursor over the client
 ;   area; everything else defers to the original EDIT window procedure.
@@ -7477,6 +7558,7 @@ vp_init:
     mov     rcx, qword ptr [rbp-8]
     mov     edx, IDC_V_SAVE                   ; Save is the accent/primary (default) button
     call    theme_attach
+    call    gui_chiptune                     ; retro/cyberpunk theme -> boot jingle
     WINCALL SendMessageW, qword ptr [rbp-8], WM_GETFONT, 0, 0   ; font for runtime ctls
     mov     qword ptr [g_dlgfont], rax
     mov     dword ptr [g_field_count], 0
