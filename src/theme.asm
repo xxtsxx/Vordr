@@ -135,7 +135,7 @@ g_bits      dq 0
 ; ---- runtime-selectable colour scheme -------------------------------------
 ; g_col_* are 13 consecutive dwords (order matches each schemes[] row).
 public g_scheme, g_col_bg, g_col_panel, g_col_text, g_col_textdim, g_col_frame, g_col_dark
-public g_col_side, g_col_accent
+public g_col_side, g_col_accent, g_col_filebadge
 g_scheme    dd 0
 align 4
 g_col_bg    dd 00202020h
@@ -151,18 +151,19 @@ g_col_accsel dd 00DBA03Ah
 g_col_focus dd 00FFC24Ch
 g_col_dark  dd 1
 g_col_side  dd 00342A26h                  ; sidebar (list + search) panel colour
-SCHEME_DW   equ 13                        ; dwords per scheme row
+g_col_filebadge dd 00544A3Ah              ; attachment/file chip fill (distinct from bg/panel)
+SCHEME_DW   equ 14                        ; dwords per scheme row
 SCHEME_COUNT equ 8
 schemes label dword
-    ; bg       panel     frame     btn       btnsel    text      textdim   border    accent    accsel    focus     dark  side
-    dd 00202020h,002D2D2Dh,003D3D3Dh,002D2D2Dh,002A2A2Ah,00FFFFFFh,00C8C8C8h,003D3D3Dh,00FFC24Ch,00DBA03Ah,00FFC24Ch,1,00342A26h  ; Dark
-    dd 00F3F3F3h,00FFFFFFh,00D2D2D2h,00FFFFFFh,00E6E6E6h,00202020h,00707070h,00D2D2D2h,00C26A00h,00A05800h,00C26A00h,0,00FFFFFFh  ; Light
-    dd 001A1410h,00282018h,00403420h,00282018h,00201810h,00FFF0E0h,00C0B0A0h,00403420h,00E0C040h,00B09020h,00E0C040h,1,00170F0Fh  ; Midnight
-    dd 00000000h,00151515h,00808080h,00202020h,00404040h,00FFFFFFh,00E0E0E0h,00808080h,0000FFFFh,0000C0C0h,0000FFFFh,1,001E0C0Ch  ; Contrast
-    dd 00E3F6FDh,00D5E8EEh,00A1A193h,00D5E8EEh,00C8DAE0h,00756E58h,00969483h,00A1A193h,00D28B26h,00A86F1Eh,00D28B26h,0,00B0E4EFh  ; Solarized
-    dd 00D8ECF4h,00E0F3FBh,00A8C8D8h,00E0F3FBh,00C0DFEAh,002A3B4Bh,00556A7Ah,00A8C8D8h,001D65B5h,00144E90h,001D65B5h,0,00C4D2D6h  ; Sepia
-    dd 0040342Eh,0052423Bh,006A564Ch,0052423Bh,005E4C43h,00F4EFECh,00E9DED8h,006A564Ch,00D0C088h,00B0A06Fh,00D0C088h,1,004F4039h  ; Nord
-    dd 00F3F0FFh,00FFFFFFh,00D0C8F0h,00FFFFFFh,00E4DCFAh,00302A3Ah,00746A8Ah,00D0C8F0h,006C33D6h,005A28B0h,006C33D6h,0,00F8E0E9h  ; Rose
+    ; bg       panel     frame     btn       btnsel    text      textdim   border    accent    accsel    focus     dark  side      filebadge
+    dd 00202020h,002D2D2Dh,003D3D3Dh,002D2D2Dh,002A2A2Ah,00FFFFFFh,00C8C8C8h,003D3D3Dh,00FFC24Ch,00DBA03Ah,00FFC24Ch,1,00342A26h,00544A3Ah  ; Dark
+    dd 00F3F3F3h,00FFFFFFh,00D2D2D2h,00FFFFFFh,00E6E6E6h,00202020h,00707070h,00D2D2D2h,00C26A00h,00A05800h,00C26A00h,0,00FFFFFFh,00E8DCC8h  ; Light
+    dd 001A1410h,00282018h,00403420h,00282018h,00201810h,00FFF0E0h,00C0B0A0h,00403420h,00E0C040h,00B09020h,00E0C040h,1,00170F0Fh,00504028h  ; Midnight
+    dd 00000000h,00151515h,00808080h,00202020h,00404040h,00FFFFFFh,00E0E0E0h,00808080h,0000FFFFh,0000C0C0h,0000FFFFh,1,001E0C0Ch,00404040h  ; Contrast
+    dd 00E3F6FDh,00D5E8EEh,00A1A193h,00D5E8EEh,00C8DAE0h,00756E58h,00969483h,00A1A193h,00D28B26h,00A86F1Eh,00D28B26h,0,00B0E4EFh,00C8D8C0h  ; Solarized
+    dd 00D8ECF4h,00E0F3FBh,00A8C8D8h,00E0F3FBh,00C0DFEAh,002A3B4Bh,00556A7Ah,00A8C8D8h,001D65B5h,00144E90h,001D65B5h,0,00C4D2D6h,00CCDCE4h  ; Sepia
+    dd 0040342Eh,0052423Bh,006A564Ch,0052423Bh,005E4C43h,00F4EFECh,00E9DED8h,006A564Ch,00D0C088h,00B0A06Fh,00D0C088h,1,004F4039h,00786858h  ; Nord
+    dd 00F3F0FFh,00FFFFFFh,00D0C8F0h,00FFFFFFh,00E4DCFAh,00302A3Ah,00746A8Ah,00D0C8F0h,006C33D6h,005A28B0h,006C33D6h,0,00F8E0E9h,00E0D0F0h  ; Rose
 g_br_bg     dq 0
 g_br_side   dq 0                            ; sidebar (list + search) fill
 g_br_panel  dq 0
