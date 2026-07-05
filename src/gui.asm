@@ -661,7 +661,10 @@ pht_old db 'oldpw'
 pht_ttl dw 'T', 0
 pht_new dw 'n','e','w','p','w', 0
 wb_gen label word
-    dw 0E72Ch, 0                                 ; Refresh (generate password)
+    dw 021BBh, 0                                 ; U+21BB clockwise arrow (generate); a plain
+                                                 ; Unicode char (drawn in the UI font, like the
+                                                 ; '+' glyph) - Fluent Icons lacks 0xE72C (was
+                                                 ; MDL2 "Refresh"), which rendered blank
 sn_dark dw 'D','a','r','k',0
 sn_light dw 'L','i','g','h','t',0
 sn_mid  dw 'M','i','d','n','i','g','h','t',0
