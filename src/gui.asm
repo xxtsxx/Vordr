@@ -53,6 +53,7 @@ extern g_col_textdim:dword
 extern g_col_accent:dword
 extern g_col_dark:dword
 extern g_col_side:dword
+extern g_col_filebadge:dword
 extern DwmSetWindowAttribute:proc
 extern g_scheme:dword
 extern theme_set_scheme:proc
@@ -2362,8 +2363,8 @@ gtl_loop:
     mov     eax, dword ptr [rbp-56]           ; chip right = R - 2
     sub     eax, 2
     mov     dword ptr [rbp-152], eax
-    ; rounded chip fill (panel), NULL pen
-    WINCALL CreateSolidBrush, dword ptr [g_col_panel]
+    ; rounded chip fill (dedicated file-badge colour), NULL pen
+    WINCALL CreateSolidBrush, dword ptr [g_col_filebadge]
     mov     qword ptr [rbp-128], rax
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-128]
     mov     qword ptr [rbp-136], rax          ; old brush
