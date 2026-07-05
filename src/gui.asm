@@ -6948,8 +6948,12 @@ vp_cmd:
     cmp     eax, IDC_DYN_BASE                 ; any runtime row value/label edit
     jae     vp_setdirty
 vp_cmd_disp:
-    cmp     eax, IDC_DYN_BASE                 ; runtime row button (reveal/up/down/del)?
-    jae     vp_dyn
+    cmp     eax, IDC_DYN_BASE                 ; runtime row control (button OR edit)?
+    jb      vp_cmd_fixed
+    test    r10d, r10d                        ; act ONLY on a real click (BN/STN_CLICKED=0);
+    jnz     vp_handled                        ;   an edit's stray notifs (EN_UPDATE, EN_MAXTEXT,
+    jmp     vp_dyn                            ;   ...) must never fire a row button action
+vp_cmd_fixed:
     cmp     eax, IDC_V_LIST
     je      vp_list
     cmp     eax, IDC_V_ADDFIELD
