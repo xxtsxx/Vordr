@@ -1,6 +1,7 @@
 /* vordr.rc - app icon, VERSIONINFO, and the GUI dialog templates for
    bin\vordr.exe (compiled by rc.exe in build.cmd, then linked in). */
 #include <windows.h>
+#include <commctrl.h>
 
 /* control IDs - MUST match the equ values in src/gui.asm */
 #define DLG_UNLOCK   100
@@ -210,7 +211,7 @@ CAPTION "Vordr - Select entries to export"
 FONT 9, "Segoe UI"
 BEGIN
     EDITTEXT IDC_SEL_SEARCH, 8, 8, 284, 12, ES_AUTOHSCROLL | NOT WS_BORDER, 0
-    CONTROL "", IDC_SEL_LIST, "Button", BS_OWNERDRAW | WS_TABSTOP, 8, 26, 284, 232
+    CONTROL "", IDC_SEL_LIST, WC_LISTVIEW, LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_TABSTOP | WS_BORDER, 8, 26, 284, 232
     PUSHBUTTON "All", IDC_SEL_ALL, 8, 264, 46, 16, BS_OWNERDRAW
     PUSHBUTTON "None", IDC_SEL_NONE, 58, 264, 46, 16, BS_OWNERDRAW
     PUSHBUTTON "Export", IDOK, 180, 264, 54, 16, BS_OWNERDRAW
