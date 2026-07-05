@@ -160,6 +160,7 @@ extern PostMessageW:proc
 extern SetWindowTextW:proc
 extern CheckDlgButton:proc
 extern GetDlgCtrlID:proc
+extern GetKeyState:proc
 extern SetTextColor:proc
 extern SetBkMode:proc
 extern TextOutW:proc
@@ -748,6 +749,8 @@ tag_xw label word
     dw 0D7h, 0                             ; multiplication sign, used as the tag 'x'
 verb_open label word
     dw 'o','p','e','n', 0
+url_https label word                    ; scheme prefix for a bare URL (e.g. "example.com")
+    dw 'h','t','t','p','s',':','/','/', 0
 f_iconname label word
     dw 'S','e','g','o','e',' ','F','l','u','e','n','t',' ','I','c','o','n','s', 0
 f_segoeui label word
@@ -923,6 +926,8 @@ g_genout    db 260 dup (?)           ; generator ASCII output (wiped after use)
 g_genout_w  dw 260 dup (?)           ; generator output widened for the edit
 g_readpw    dw 260 dup (?)           ; password being read out (wiped on close)
 g_phon_w    dw 6144 dup (?)          ; phonetic spelling text (wiped on close)
+g_urlbuf    dw 1024 dup (?)          ; URL read from a URL field for click-to-open
+g_urlbuf2   dw 1040 dup (?)          ; URL with an https:// scheme prepended if bare
 align 8
 ; --- modular field-row model (runtime detail form) ---
 g_fields      db MAXROWS*DESCSZ dup (?)   ; row descriptors
@@ -5169,6 +5174,58 @@ dynid proc
     ret
 dynid endp
 
+; gui_url_open(rcx=hdlg, edx=row) - read the URL from the row's value field and
+;   open it in the default browser, prepending https:// when the value carries no
+;   "://" scheme.  Invoked when a URL field is clicked in view mode.
+gui_url_open proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-32], edx
+    mov     ecx, edx
+    mov     edx, DS_VALUE
+    call    dynid
+    mov     dword ptr [rbp-40], eax             ; value control id
+    WINCALL GetDlgItemTextW, qword ptr [rbp-24], dword ptr [rbp-40], addr g_urlbuf, 1024
+    test    eax, eax
+    jz      guo_done                            ; empty field
+    lea     r10, [g_urlbuf]                     ; scheme present ("://")?
+    xor     ecx, ecx
+guo_scan:
+    movzx   eax, word ptr [r10+rcx*2]
+    test    eax, eax
+    jz      guo_bare
+    cmp     eax, ':'
+    jne     guo_next
+    movzx   eax, word ptr [r10+rcx*2+2]
+    cmp     eax, '/'
+    jne     guo_next
+    movzx   eax, word ptr [r10+rcx*2+4]
+    cmp     eax, '/'
+    je      guo_hasscheme
+guo_next:
+    inc     ecx
+    cmp     ecx, 1022
+    jb      guo_scan
+guo_bare:
+    lea     rcx, [g_urlbuf2]                    ; target = "https://" + url
+    lea     rdx, [url_https]
+    call    gui_wstrcpy
+    mov     rcx, rax
+    lea     rdx, [g_urlbuf]
+    call    gui_wstrcpy
+    lea     rax, [g_urlbuf2]
+    mov     qword ptr [rbp-48], rax
+    jmp     guo_exec
+guo_hasscheme:
+    lea     rax, [g_urlbuf]
+    mov     qword ptr [rbp-48], rax
+guo_exec:
+    WINCALL ShellExecuteW, 0, addr verb_open, qword ptr [rbp-48], 0, 0, 1
+guo_done:
+    FRAME_EPILOG
+    ret
+gui_url_open endp
+
 ; gui_row_handle(ecx=row, edx=slot) -> rax = hwnd (0 if none).  Leaf.
 gui_row_handle proc
     mov     eax, ecx
@@ -7069,7 +7126,7 @@ vp_cmd:
     mov     r10d, r8d
     shr     r10d, 16                        ; notification code
     cmp     r10d, EN_SETFOCUS               ; focus moved -> redraw Fluent underlines
-    je      vp_refocus
+    je      vp_focusin
     cmp     r10d, EN_KILLFOCUS
     je      vp_refocus
     cmp     r10d, EN_CHANGE                 ; inline edit changed -> mark dirty
@@ -7198,6 +7255,29 @@ vp_search_now:
     mov     rcx, qword ptr [rbp-8]            ; refilter the entry list immediately
     call    gui_poplist
     jmp     vp_handled
+vp_focusin:
+    ; a genuine mouse click on a view-mode URL value opens it in the browser
+    cmp     dword ptr [g_editmode], 0
+    jne     vp_refocus                          ; edit mode: field is being edited
+    cmp     eax, IDC_DYN_BASE
+    jb      vp_refocus
+    mov     ecx, eax
+    sub     ecx, IDC_DYN_BASE
+    mov     r10d, ecx
+    and     r10d, DYN_SLOTS-1                    ; slot
+    cmp     r10d, DS_VALUE
+    jne     vp_refocus
+    shr     ecx, DYN_SLOTS_LOG2                  ; row
+    mov     dword ptr [rbp-16], ecx
+    call    gui_desc                             ; ecx=row -> rax=descriptor
+    cmp     dword ptr [rax+FD_KIND], VF_URL
+    jne     vp_refocus
+    WINCALL GetKeyState, 1                        ; VK_LBUTTON: focus from a click, not a tab?
+    test    ax, ax
+    jns     vp_refocus                          ; high bit clear -> keyboard focus, ignore
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, dword ptr [rbp-16]
+    call    gui_url_open
 vp_refocus:
     WINCALL InvalidateRect, qword ptr [rbp-8], 0, 1
     jmp     vp_handled
