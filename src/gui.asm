@@ -180,6 +180,7 @@ extern CreateSolidBrush:proc
 extern FillRect:proc
 extern InvalidateRect:proc
 extern FileTimeToSystemTime:proc
+extern GetSystemTimeAsFileTime:proc
 extern RedrawWindow:proc
 extern InitCommonControlsEx:proc
 extern pw_metrics:proc
@@ -232,6 +233,7 @@ WM_CLOSE            equ 10h
 WM_TIMER            equ 113h
 WM_INITDIALOG       equ 110h
 WM_SETFONT          equ 30h
+WM_MOUSEWHEEL       equ 20Ah
 WM_COMMAND          equ 111h
 WM_PAINT            equ 0Fh
 WM_ERASEBKGND       equ 14h
@@ -430,6 +432,16 @@ MAX_TFILES  equ 24             ; <= MAX_FIELDS minus the other fields of an entr
 TFILE_ENTRY equ 328
 TFILE_NAME  equ 68             ; filename offset within a tile-file entry
 MAX_FIELDS  equ 56             ; g_field_list capacity (matches main.asm)
+; Password history: each overwritten password is archived as a reserved VF_PWHIST
+; field, value = raw {u64 FILETIME, wide old-password} (VFL_RAW).  Loaded into
+; g_pwhist for the open entry; g_pworig holds the entry's ORIGINAL secret values
+; (at load) so gui_commit can detect which passwords were overwritten.
+MAX_PWHIST   equ 32
+PWHIST_ENTRY equ 264           ; {u64 filetime, wide pw NUL-term (<=127 wchars)}
+PWHIST_PW    equ 8             ; password offset within a g_pwhist entry
+PWHBLOB_ENTRY equ 272          ; emit scratch {u32 len, u64 filetime, wide pw}
+MAX_PWORIG   equ 8
+PWORIG_STRIDE equ 256          ; wide original secret value (bytes, <=127 wchars)
 MAXROWS     equ 24
 FDF_LABELED equ 1               ; FD_FLAGS bit0 = carries a custom label
 FDF_REVEALED equ 2              ; FD_FLAGS bit1 = value currently unmasked
@@ -464,7 +476,12 @@ IDC_V_SEARCH equ 232          ; search/filter box under the entry list
 IDC_V_HEADER equ 233          ; detail-pane header (icon tile + title, view mode)
 IDC_V_TITLELBL equ 234        ; "Title" static label (edit mode only)
 IDC_V_ICON   equ 249          ; edit-mode icon tile before the title (opens picker)
+IDC_V_HIST   equ 250          ; edit-mode password-history button (top-right)
 IDC_V_OVFL   equ 235          ; header overflow (...) menu button
+DLG_PWHIST   equ 780          ; password-history browser dialog
+IDC_PH_LIST  equ 781          ; owner-draw list of archived passwords
+PH_ROW_H     equ 26           ; history row height (px)
+PH_PURGE_W   equ 22           ; per-row purge hotspot width (px)
 IDC_V_TIMES  equ 236          ; created/modified timestamps line (below the last row)
 IDC_V_FAV    equ 237          ; header favorite (star) toggle
 IDC_V_CANCEL equ 238          ; "Cancel" button (edit mode, discards edits)
@@ -636,6 +653,8 @@ wb_star label word
     dw 0E734h, 0                                 ; FavoriteStar (outline = not favorite)
 wb_starf label word
     dw 0E735h, 0                                 ; FavoriteStarFill (favorited)
+wb_hist label word
+    dw 0E81Ch, 0                                 ; History (clock with arrow)
 fav_one label word
     dw '1', 0                                    ; VF_FAV marker value
 wb_gen label word
@@ -923,6 +942,14 @@ g_tilefile_n  dd ?                               ; number of files in the tile
 align 8
 g_field_list2 dq 3*MAX_FIELDS dup (?)            ; commit scratch: expanded field list
 g_tileblob    db MAX_TFILES*336 dup (?)          ; per-file {u32 len, AttachRef, name}
+align 8
+g_pwhist      db MAX_PWHIST*PWHIST_ENTRY dup (?) ; open entry's overwritten passwords
+g_pwhist_n    dd ?                               ; number of history entries
+g_pwhblob     db MAX_PWHIST*PWHBLOB_ENTRY dup (?); per-history emit scratch (VFL_RAW)
+g_pworig      dw MAX_PWORIG*128 dup (?)          ; original secret values (change detect)
+g_pworig_n    dd ?
+g_pwh_scroll  dd ?                               ; history browser: first visible row
+g_phdate      dw 40 dup (?)                      ; history browser: formatted date scratch
 align 2
 g_imgfn_w     dw 200 dup (?)               ; current image's filename (wide) to store
 g_imgbuf      dq ?                         ; imported file bytes (mem_alloc'd)
@@ -2679,6 +2706,7 @@ gsd_noicon:
     mov     rcx, qword ptr [rbp-24]
     call    gui_rows_clear
     call    tf_reset                             ; start the attachments tile empty
+    call    pwh_reset                            ; start password history empty
     ; Title (fixed control)
     mov     ecx, dword ptr [rbp-32]
     mov     edx, VF_TITLE
@@ -2709,6 +2737,8 @@ gsd_floop:
     je      gsd_fnext
     cmp     eax, VF_ICON                         ; reserved icon override: not a row
     je      gsd_fnext
+    cmp     eax, VF_PWHIST                       ; archived old password: not a row
+    je      gsd_pwhist
     cmp     eax, VF_IMAGE                        ; attachments collapse into one tile
     je      gsd_attach
     cmp     eax, VF_FILE
@@ -2765,6 +2795,9 @@ gsd_secret:
     and     edx, NOT FDF_PWLVL_MASK           ; preserve other flag bits
     or      edx, eax
     mov     dword ptr [r10+FD_FLAGS], edx
+    mov     rcx, qword ptr [rbp-72]           ; remember the original secret value
+    mov     edx, dword ptr [rbp-64]           ; so a later overwrite can be archived
+    call    pworig_add
     jmp     gsd_mask
 gsd_mask:
     mov     ecx, dword ptr [rbp-44]
@@ -2791,6 +2824,16 @@ gsd_attach_row:
     mov     rcx, qword ptr [rbp-24]
     mov     edx, VF_FILE
     call    gui_row_add
+    jmp     gsd_fnext
+gsd_pwhist:
+    ; reserved archived password {u64 filetime, wide pw} -> g_pwhist (not a row)
+    mov     eax, dword ptr [rbp-64]             ; vallen
+    cmp     eax, 8
+    jb      gsd_fnext                           ; need at least the filetime
+    mov     r10, qword ptr [rbp-72]             ; valptr
+    mov     rcx, qword ptr [r10]                ; filetime qword
+    lea     rdx, [r10+8]                        ; wide old-password (NUL-terminated)
+    call    pwh_append
     jmp     gsd_fnext
 gsd_fnext:
     inc     dword ptr [rbp-40]
@@ -3189,6 +3232,105 @@ gte_finish:
     ret
 gui_tile_expand endp
 
+; gui_pwhist_capture() - archive any password that was overwritten in this edit.
+;   For each original secret value (captured at load in g_pworig) that no longer
+;   appears among the new secret fields (g_field_list), append {now, old value} to
+;   g_pwhist.  Removing a secret also archives it.
+gui_pwhist_capture proc frame
+    FRAME_PROLOG 64
+    mov     dword ptr [rbp-24], 0             ; oi = original index
+gpc_orig:
+    mov     eax, dword ptr [rbp-24]
+    cmp     eax, dword ptr [g_pworig_n]
+    jae     gpc_done
+    imul    eax, eax, PWORIG_STRIDE
+    lea     r10, [g_pworig]
+    add     r10, rax
+    mov     qword ptr [rbp-32], r10           ; orig wide ptr
+    cmp     word ptr [r10], 0                 ; empty original -> nothing to archive
+    je      gpc_orignext
+    mov     dword ptr [rbp-40], 0            ; fi = field index
+gpc_field:
+    mov     eax, dword ptr [rbp-40]
+    cmp     eax, dword ptr [g_field_n]
+    jae     gpc_notfound
+    imul    eax, eax, 24
+    lea     r11, [g_field_list]
+    add     r11, rax
+    mov     rcx, qword ptr [r11]             ; kind
+    and     ecx, VF_KINDMASK
+    cmp     ecx, VF_SECRET
+    jne     gpc_fieldnext
+    mov     rcx, qword ptr [rbp-32]           ; orig value
+    mov     rdx, qword ptr [r11+16]           ; new secret value (wide)
+    call    gui_wstr_eq
+    test    eax, eax
+    jnz     gpc_orignext                      ; still present -> not overwritten
+gpc_fieldnext:
+    inc     dword ptr [rbp-40]
+    jmp     gpc_field
+gpc_notfound:
+    lea     rcx, [rbp-56]                      ; now -> FILETIME
+    call    GetSystemTimeAsFileTime
+    mov     rcx, qword ptr [rbp-56]
+    mov     rdx, qword ptr [rbp-32]
+    call    pwh_append
+gpc_orignext:
+    inc     dword ptr [rbp-24]
+    jmp     gpc_orig
+gpc_done:
+    FRAME_EPILOG
+    ret
+gui_pwhist_capture endp
+
+; gui_pwhist_emit() - append every g_pwhist entry to g_field_list as a reserved
+;   VF_PWHIST|VFL_RAW field: value = {u32 len, u64 filetime, wide old-password} built
+;   into g_pwhblob so it survives until vault_build_entry consumes it.
+gui_pwhist_emit proc frame
+    FRAME_PROLOG 48
+    mov     dword ptr [rbp-24], 0            ; i
+gpe_loop:
+    mov     eax, dword ptr [rbp-24]
+    cmp     eax, dword ptr [g_pwhist_n]
+    jae     gpe_done
+    mov     eax, dword ptr [g_field_n]
+    cmp     eax, MAX_FIELDS
+    jae     gpe_done                          ; no field slots left
+    mov     eax, dword ptr [rbp-24]           ; blob = g_pwhblob + i*PWHBLOB_ENTRY
+    imul    eax, eax, PWHBLOB_ENTRY
+    lea     r11, [g_pwhblob]
+    add     r11, rax
+    mov     qword ptr [rbp-32], r11
+    mov     ecx, dword ptr [rbp-24]
+    call    pwh_entry
+    mov     qword ptr [rbp-40], rax
+    mov     r10, qword ptr [rax]             ; filetime -> blob+4
+    mov     r11, qword ptr [rbp-32]
+    mov     qword ptr [r11+4], r10
+    mov     rcx, qword ptr [rbp-32]           ; wide pw -> blob+12
+    add     rcx, 12
+    mov     rdx, qword ptr [rbp-40]
+    add     rdx, PWHIST_PW
+    call    gui_wcpy_capped                   ; eax = pw bytes incl NUL
+    add     eax, 8                            ; len = filetime(8) + pw bytes
+    mov     r11, qword ptr [rbp-32]
+    mov     dword ptr [r11], eax             ; u32 len at blob+0
+    mov     eax, dword ptr [g_field_n]        ; g_field_list[g_field_n]
+    imul    eax, eax, 24
+    lea     r11, [g_field_list]
+    add     r11, rax
+    mov     qword ptr [r11+0], VF_PWHIST or VFL_RAW
+    mov     qword ptr [r11+8], 0
+    mov     rax, qword ptr [rbp-32]
+    mov     qword ptr [r11+16], rax
+    inc     dword ptr [g_field_n]
+    inc     dword ptr [rbp-24]
+    jmp     gpe_loop
+gpe_done:
+    FRAME_EPILOG
+    ret
+gui_pwhist_emit endp
+
 ; gui_commit(rcx = hdlg) - gather Title + rows into g_field_list and write the
 ;   record back (remove the old entry, rebuild via vault_build_entry, reseal).
 ;   Reselects the entry.  Refuses to save an empty title (keeps the old entry).
@@ -3205,6 +3347,8 @@ gui_commit proc frame
     jz      gco_notitle
     cmp     word ptr [r10], 0                 ; empty title -> keep the old entry
     je      gco_notitle
+    call    gui_pwhist_capture                ; archive any overwritten password, then
+    call    gui_pwhist_emit                   ; write history back as VF_PWHIST fields
     mov     ecx, dword ptr [g_cur_idx]        ; preserve the original creation date
     call    vault_entry_ptr
     test    rax, rax
@@ -3342,6 +3486,13 @@ sem_addcmd:
     xor     eax, SW_SHOW
     mov     rcx, qword ptr [rbp-72]
     mov     edx, eax
+    call    ShowWindow
+    mov     rcx, qword ptr [rbp-24]           ; password-history button: EDIT mode only
+    mov     edx, IDC_V_HIST
+    call    GetDlgItem
+    mov     qword ptr [rbp-72], rax
+    mov     rcx, rax
+    mov     edx, dword ptr [rbp-52]          ; SW_SHOW in edit, SW_HIDE in view
     call    ShowWindow
     mov     rcx, qword ptr [rbp-24]
     call    gui_rows_layout
@@ -3787,6 +3938,116 @@ tff_none:
     FRAME_EPILOG
     ret
 tf_find_row endp
+
+; -----------------------------------------------------------------------------
+; pwh_* / pworig_* - password history for the open entry (g_pwhist) and the
+;   original secret values captured at load (g_pworig) used to detect overwrites.
+; -----------------------------------------------------------------------------
+; pwh_reset() - clear history + originals for a freshly opened entry.  Leaf.
+pwh_reset proc
+    mov     dword ptr [g_pwhist_n], 0
+    mov     dword ptr [g_pworig_n], 0
+    ret
+pwh_reset endp
+
+; pwh_entry(ecx = index) -> rax = &g_pwhist[index].  Leaf.
+pwh_entry proc
+    mov     eax, ecx
+    imul    eax, eax, PWHIST_ENTRY
+    lea     rdx, [g_pwhist]
+    add     rax, rdx
+    ret
+pwh_entry endp
+
+; pwh_append(rcx = FILETIME qword, rdx = wide old-password) - add a history entry;
+;   when full, drop the oldest so the most recent are kept.
+pwh_append proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], rdx
+    mov     eax, dword ptr [g_pwhist_n]
+    cmp     eax, MAX_PWHIST
+    jb      pwa_slot
+    mov     dword ptr [rbp-40], 0             ; shift [1..n) down over [0..n-1)
+pwa_shift:
+    mov     eax, dword ptr [rbp-40]
+    cmp     eax, MAX_PWHIST-1
+    jae     pwa_shifted
+    mov     ecx, dword ptr [rbp-40]
+    call    pwh_entry
+    mov     qword ptr [rbp-48], rax
+    mov     ecx, dword ptr [rbp-40]
+    inc     ecx
+    call    pwh_entry
+    mov     rcx, qword ptr [rbp-48]
+    mov     rdx, rax
+    mov     r8, PWHIST_ENTRY
+    call    gui_bcpy
+    inc     dword ptr [rbp-40]
+    jmp     pwa_shift
+pwa_shifted:
+    mov     dword ptr [g_pwhist_n], MAX_PWHIST-1
+    mov     eax, MAX_PWHIST-1
+pwa_slot:
+    mov     ecx, eax
+    call    pwh_entry
+    mov     r10, qword ptr [rbp-24]
+    mov     qword ptr [rax], r10              ; filetime
+    lea     rcx, [rax+PWHIST_PW]
+    mov     rdx, qword ptr [rbp-32]
+    call    gui_wcpy_capped                   ; old password (capped, NUL-term)
+    inc     dword ptr [g_pwhist_n]
+    FRAME_EPILOG
+    ret
+pwh_append endp
+
+; pwh_remove(ecx = index) - purge one history entry (shift the tail down).
+pwh_remove proc frame
+    FRAME_PROLOG 48
+    mov     dword ptr [rbp-24], ecx
+    cmp     ecx, dword ptr [g_pwhist_n]
+    jae     pwr_done
+pwr_shift:
+    mov     ecx, dword ptr [rbp-24]
+    inc     ecx
+    cmp     ecx, dword ptr [g_pwhist_n]
+    jae     pwr_dec
+    mov     ecx, dword ptr [rbp-24]
+    call    pwh_entry
+    mov     qword ptr [rbp-32], rax
+    mov     ecx, dword ptr [rbp-24]
+    inc     ecx
+    call    pwh_entry
+    mov     rcx, qword ptr [rbp-32]
+    mov     rdx, rax
+    mov     r8, PWHIST_ENTRY
+    call    gui_bcpy
+    inc     dword ptr [rbp-24]
+    jmp     pwr_shift
+pwr_dec:
+    dec     dword ptr [g_pwhist_n]
+pwr_done:
+    FRAME_EPILOG
+    ret
+pwh_remove endp
+
+; pworig_add(rcx = utf8 secret value, edx = len) - remember an original secret value
+;   (converted to wide) at load, so gui_commit can detect if it was overwritten.
+pworig_add proc frame
+    FRAME_PROLOG 48
+    mov     eax, dword ptr [g_pworig_n]
+    cmp     eax, MAX_PWORIG
+    jae     poa_done
+    imul    eax, eax, PWORIG_STRIDE
+    lea     r8, [g_pworig]
+    add     r8, rax                           ; dst wide slot (rcx=utf8, edx=len intact)
+    mov     r9d, 127
+    call    gui_towide
+    inc     dword ptr [g_pworig_n]
+poa_done:
+    FRAME_EPILOG
+    ret
+pworig_add endp
 
 ; gui_wcpy_capped(rcx=dst, rdx=src wide) -> eax = bytes copied incl NUL.  Leaf.
 gui_wcpy_capped proc
@@ -6067,6 +6328,7 @@ gui_update_fav_glyph proc frame
     lea     rax, [wb_starf]                      ; filled (favorite)
 guf_set:
     WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_FAV, rax
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_HIST, addr wb_hist
     FRAME_EPILOG
     ret
 gui_update_fav_glyph endp
@@ -6490,6 +6752,7 @@ vp_init:
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_REMOVE, addr wb_rem
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_OVFL, addr wb_more
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_FAV, addr wb_star
+    WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_HIST, addr wb_hist
     call    gui_load_prefs                    ; apply persisted color scheme + layout
     mov     rcx, qword ptr [rbp-8]
     call    gui_apply_scheme
@@ -6567,6 +6830,8 @@ vp_cmd_disp:
     je      vp_fav
     cmp     eax, IDC_V_ICON                      ; edit-mode icon button -> picker
     je      vp_iconpick
+    cmp     eax, IDC_V_HIST                      ; edit-mode history button -> browser
+    je      vp_hist
     cmp     eax, IDC_V_MTPMINFO
     je      vp_tpminfo
     cmp     eax, IDC_V_MTPM
@@ -6643,6 +6908,12 @@ vp_ovfl:
     jl      vp_handled
     mov     rcx, qword ptr [rbp-8]
     call    gui_overflow_menu
+    jmp     vp_handled
+vp_hist:
+    cmp     dword ptr [g_cur_idx], 0             ; only with an entry shown
+    jl      vp_handled
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_open_pwhist
     jmp     vp_handled
 vp_iconpick:
     cmp     dword ptr [g_cur_idx], 0             ; only with an entry shown (edit mode only)
@@ -7932,6 +8203,316 @@ ep_ret:
     pop     rbp
     ret
 export_proc endp
+
+; =============================================================================
+; Password history browser (DLG_PWHIST): a scrollable owner-draw list of the
+; open entry's archived passwords (g_pwhist), each showing when it was changed,
+; the old password, and a per-row purge 'x'.
+; =============================================================================
+; gui_draw_pwhist(rcx = lpdis) - paint the visible history rows from g_pwh_scroll.
+gui_draw_pwhist proc frame
+    FRAME_PROLOG 240
+    mov     qword ptr [rbp-24], rcx
+    mov     r10, rcx
+    mov     rax, qword ptr [r10+32]
+    mov     qword ptr [rbp-32], rax            ; hdc
+    mov     eax, dword ptr [r10+40]
+    mov     dword ptr [rbp-40], eax            ; L
+    mov     eax, dword ptr [r10+44]
+    mov     dword ptr [rbp-48], eax            ; T
+    mov     eax, dword ptr [r10+48]
+    mov     dword ptr [rbp-56], eax            ; R
+    mov     eax, dword ptr [r10+52]
+    mov     dword ptr [rbp-64], eax            ; B
+    WINCALL CreateSolidBrush, dword ptr [g_col_bg]
+    mov     qword ptr [rbp-72], rax
+    mov     r10, qword ptr [rbp-24]
+    lea     rdx, [r10+40]
+    WINCALL FillRect, qword ptr [rbp-32], rdx, qword ptr [rbp-72]
+    WINCALL DeleteObject, qword ptr [rbp-72]
+    cmp     dword ptr [g_pwhist_n], 0
+    je      gdh_done
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_subfont]
+    mov     qword ptr [rbp-80], rax            ; old font
+    WINCALL SetBkMode, qword ptr [rbp-32], 1
+    mov     dword ptr [rbp-88], 0             ; k = visible row
+gdh_loop:
+    mov     eax, dword ptr [g_pwh_scroll]
+    add     eax, dword ptr [rbp-88]
+    cmp     eax, dword ptr [g_pwhist_n]
+    jae     gdh_restore
+    mov     dword ptr [rbp-96], eax           ; i = entry index
+    mov     eax, dword ptr [rbp-88]
+    imul    eax, eax, PH_ROW_H
+    add     eax, dword ptr [rbp-48]
+    mov     dword ptr [rbp-104], eax          ; rowTop
+    mov     ecx, eax
+    add     ecx, PH_ROW_H
+    cmp     ecx, dword ptr [rbp-64]
+    jg      gdh_restore                        ; next row would overflow the control
+    sub     ecx, 2
+    mov     dword ptr [rbp-112], ecx          ; rowBot
+    ; row panel (rounded)
+    WINCALL CreateSolidBrush, dword ptr [g_col_panel]
+    mov     qword ptr [rbp-120], rax
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-120]
+    mov     qword ptr [rbp-128], rax
+    WINCALL GetStockObject, 8                  ; NULL_PEN
+    WINCALL SelectObject, qword ptr [rbp-32], rax
+    mov     qword ptr [rbp-136], rax
+    mov     eax, dword ptr [rbp-56]
+    sub     eax, 2
+    mov     dword ptr [rbp-144], eax           ; right = R-2
+    WINCALL RoundRect, qword ptr [rbp-32], dword ptr [rbp-40], dword ptr [rbp-104], \
+            dword ptr [rbp-144], dword ptr [rbp-112], 6, 6
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-128]
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-136]
+    WINCALL DeleteObject, qword ptr [rbp-120]
+    ; format the change date
+    mov     ecx, dword ptr [rbp-96]
+    call    pwh_entry
+    mov     qword ptr [rbp-152], rax           ; entry ptr (filetime @ +0)
+    lea     rcx, [g_phdate]
+    mov     rdx, rax
+    call    gui_fmt_datetime
+    ; date (dim, top line)
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_textdim]
+    mov     eax, dword ptr [rbp-40]
+    add     eax, 8
+    mov     dword ptr [rbp-176], eax
+    mov     eax, dword ptr [rbp-104]
+    add     eax, 2
+    mov     dword ptr [rbp-172], eax
+    mov     eax, dword ptr [rbp-56]
+    sub     eax, 2 + PH_PURGE_W
+    mov     dword ptr [rbp-168], eax
+    mov     eax, dword ptr [rbp-104]
+    add     eax, 13
+    mov     dword ptr [rbp-164], eax
+    WINCALL DrawTextW, qword ptr [rbp-32], addr g_phdate, -1, addr rbp-176, 20h
+    ; old password (normal, bottom line, ellipsized)
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_text]
+    mov     eax, dword ptr [rbp-40]
+    add     eax, 8
+    mov     dword ptr [rbp-176], eax
+    mov     eax, dword ptr [rbp-104]
+    add     eax, 12
+    mov     dword ptr [rbp-172], eax
+    mov     eax, dword ptr [rbp-56]
+    sub     eax, 2 + PH_PURGE_W
+    mov     dword ptr [rbp-168], eax
+    mov     eax, dword ptr [rbp-112]
+    mov     dword ptr [rbp-164], eax
+    mov     rax, qword ptr [rbp-152]
+    add     rax, PWHIST_PW
+    WINCALL DrawTextW, qword ptr [rbp-32], rax, -1, addr rbp-176, 8020h
+    ; purge 'x' (right)
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_textdim]
+    mov     eax, dword ptr [rbp-56]
+    sub     eax, 2 + PH_PURGE_W
+    mov     dword ptr [rbp-176], eax
+    mov     eax, dword ptr [rbp-104]
+    mov     dword ptr [rbp-172], eax
+    mov     eax, dword ptr [rbp-56]
+    sub     eax, 2
+    mov     dword ptr [rbp-168], eax
+    mov     eax, dword ptr [rbp-112]
+    mov     dword ptr [rbp-164], eax
+    WINCALL DrawTextW, qword ptr [rbp-32], addr tag_xw, -1, addr rbp-176, DT_IMGFLAGS
+    inc     dword ptr [rbp-88]
+    jmp     gdh_loop
+gdh_restore:
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-80]
+gdh_done:
+    FRAME_EPILOG
+    ret
+gui_draw_pwhist endp
+
+; gui_pwhist_click(rcx = hdlg) - a history row was clicked; if the click landed on
+;   the right-hand purge 'x', remove that archived password (marks the entry dirty).
+gui_pwhist_click proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx
+    cmp     dword ptr [g_pwhist_n], 0
+    je      gpk_done
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_PH_LIST
+    call    GetDlgItem
+    mov     qword ptr [rbp-32], rax
+    test    rax, rax
+    jz      gpk_done
+    lea     rcx, [rbp-48]                      ; POINT x@-48 y@-44
+    call    GetCursorPos
+    mov     rcx, qword ptr [rbp-32]
+    lea     rdx, [rbp-48]
+    call    ScreenToClient
+    mov     rcx, qword ptr [rbp-32]
+    lea     rdx, [rbp-64]                      ; RECT l-64 t-60 r-56 b-52
+    call    GetClientRect
+    mov     eax, dword ptr [rbp-44]           ; row = scroll + pt.y / PH_ROW_H
+    cdq
+    mov     ecx, PH_ROW_H
+    idiv    ecx
+    add     eax, dword ptr [g_pwh_scroll]
+    cmp     eax, 0
+    jl      gpk_done
+    cmp     eax, dword ptr [g_pwhist_n]
+    jae     gpk_done
+    mov     dword ptr [rbp-68], eax           ; row
+    mov     eax, dword ptr [rbp-56]           ; purge region: pt.x >= clientW-2-PURGE
+    sub     eax, 2 + PH_PURGE_W
+    cmp     dword ptr [rbp-48], eax
+    jl      gpk_done
+    mov     ecx, dword ptr [rbp-68]
+    call    pwh_remove
+    mov     dword ptr [g_dirty], 1
+    mov     eax, dword ptr [g_pwh_scroll]     ; keep scroll in range
+    cmp     eax, dword ptr [g_pwhist_n]
+    jb      gpk_repaint
+    mov     dword ptr [g_pwh_scroll], 0
+gpk_repaint:
+    WINCALL InvalidateRect, qword ptr [rbp-32], 0, 1
+gpk_done:
+    FRAME_EPILOG
+    ret
+gui_pwhist_click endp
+
+; pwhist_proc - DLG_PWHIST procedure (themed).
+pwhist_proc proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 64
+    mov     qword ptr [rbp-8], rcx
+    cmp     rdx, WM_INITDIALOG
+    je      ph_init
+    cmp     rdx, WM_COMMAND
+    je      ph_cmd
+    cmp     rdx, WM_CTLCOLORSTATIC
+    je      ph_col
+    cmp     rdx, WM_CTLCOLORBTN
+    je      ph_col
+    cmp     rdx, WM_CTLCOLORDLG
+    je      ph_col
+    cmp     rdx, WM_PAINT
+    je      ph_paint
+    cmp     rdx, WM_ERASEBKGND
+    je      ph_erase
+    cmp     rdx, WM_DRAWITEM
+    je      ph_draw
+    cmp     rdx, WM_MOUSEWHEEL
+    je      ph_wheel
+    cmp     rdx, WM_TIMER
+    je      ph_timer
+    xor     eax, eax
+    jmp     ph_ret
+ph_col:
+    call    theme_ctlcolor
+    jmp     ph_ret
+ph_paint:
+    mov     rcx, qword ptr [rbp-8]
+    call    theme_paint
+    jmp     ph_ret
+ph_erase:
+    mov     rcx, r8
+    mov     rdx, qword ptr [rbp-8]
+    call    theme_erase
+    jmp     ph_ret
+ph_draw:
+    mov     r10, r9
+    mov     eax, dword ptr [r10+4]
+    cmp     eax, IDC_PH_LIST
+    jne     ph_draw_def
+    mov     rcx, r9
+    call    gui_draw_pwhist
+    mov     eax, 1
+    jmp     ph_ret
+ph_draw_def:
+    mov     rcx, r9
+    call    theme_drawitem
+    mov     eax, 1
+    jmp     ph_ret
+ph_wheel:
+    mov     eax, r8d                           ; wParam hi word = wheel delta (signed)
+    sar     eax, 16
+    test    eax, eax
+    jz      ph_wheel_done
+    jle     ph_wheel_down
+    mov     eax, dword ptr [g_pwh_scroll]     ; up
+    dec     eax
+    jns     ph_wheel_set
+    xor     eax, eax
+    jmp     ph_wheel_set
+ph_wheel_down:
+    mov     eax, dword ptr [g_pwhist_n]
+    dec     eax                               ; max scroll = n-1
+    mov     ecx, dword ptr [g_pwh_scroll]
+    inc     ecx
+    cmp     ecx, eax
+    jle     @F
+    mov     ecx, eax
+@@: mov     eax, ecx
+    cmp     eax, 0
+    jns     ph_wheel_set
+    xor     eax, eax
+ph_wheel_set:
+    mov     dword ptr [g_pwh_scroll], eax
+    WINCALL GetDlgItem, qword ptr [rbp-8], IDC_PH_LIST
+    WINCALL InvalidateRect, rax, 0, 1
+ph_wheel_done:
+    mov     eax, 1
+    jmp     ph_ret
+ph_timer:
+    cmp     r8d, THEME_TIMER
+    jne     ph_unh
+    mov     rcx, qword ptr [rbp-8]
+    call    theme_tick
+    mov     eax, 1
+    jmp     ph_ret
+ph_unh:
+    xor     eax, eax
+    jmp     ph_ret
+ph_init:
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDOK
+    call    theme_attach
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_set_winicon
+    mov     dword ptr [g_pwh_scroll], 0
+    mov     eax, 1
+    jmp     ph_ret
+ph_cmd:
+    movzx   eax, r8w
+    cmp     eax, IDC_PH_LIST
+    je      ph_list
+    cmp     eax, IDOK
+    je      ph_close
+    cmp     eax, IDCANCEL
+    je      ph_close
+    xor     eax, eax
+    jmp     ph_ret
+ph_list:
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_pwhist_click
+    mov     eax, 1
+    jmp     ph_ret
+ph_close:
+    WINCALL EndDialog, qword ptr [rbp-8], 0
+    mov     eax, 1
+ph_ret:
+    mov     rsp, rbp
+    pop     rbp
+    ret
+pwhist_proc endp
+
+; gui_open_pwhist(rcx = hdlg) - open the password-history browser (modal).
+gui_open_pwhist proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_PWHIST, qword ptr [rbp-24], \
+            addr pwhist_proc, 0
+    FRAME_EPILOG
+    ret
+gui_open_pwhist endp
 
 ; gui_wstrcpy(rcx=dst, rdx=src wide) -> rax = ptr to the terminating NUL in dst.  Leaf.
 gui_wstrcpy proc

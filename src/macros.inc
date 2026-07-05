@@ -98,6 +98,8 @@ VF_FILE             equ 10         ; generic file attachment (any bytes + filena
 VF_FAV              equ 11         ; reserved marker: entry is a favorite (value "1")
 VF_ICON             equ 12         ; reserved: custom icon override, value = 12 hex
                                    ;   chars "GGGGCCCCCCCC" (glyph codepoint + COLORREF)
+VF_PWHIST           equ 13         ; reserved: one overwritten password + when it was
+                                   ;   changed; value = 16 hex FILETIME + old password
 ; A stored field type carries the base kind in its low byte; VF_LABELED in the
 ; high byte marks a field whose value bytes are prefixed with a custom label:
 ;   labeled: bytes = u16 labellen | label_utf8 | value_utf8
