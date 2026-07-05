@@ -437,11 +437,13 @@ MAX_FIELDS  equ 56             ; g_field_list capacity (matches main.asm)
 ; g_pwhist for the open entry; g_pworig holds the entry's ORIGINAL secret values
 ; (at load) so gui_commit can detect which passwords were overwritten.
 MAX_PWHIST   equ 32
-PWHIST_ENTRY equ 264           ; {u64 filetime, wide pw NUL-term (<=127 wchars)}
-PWHIST_PW    equ 8             ; password offset within a g_pwhist entry
-PWHBLOB_ENTRY equ 272          ; emit scratch {u32 len, u64 filetime, wide pw}
+PWHIST_ENTRY equ 528           ; {u64 filetime, label wide[128], pw wide[128]}
+PWHIST_LBL   equ 8             ; label offset within a g_pwhist entry
+PWHIST_PW    equ 264           ; password offset (8 + 128*2)
+PWHBLOB_ENTRY equ 512          ; emit scratch {u32 len, u64 ft, label wide, pw wide}
 MAX_PWORIG   equ 8
-PWORIG_STRIDE equ 256          ; wide original secret value (bytes, <=127 wchars)
+PWORIG_STRIDE equ 512          ; original secret {label wide[128], value wide[128]}
+PWORIG_VAL   equ 256           ; value offset (bytes) within a g_pworig slot
 MAXROWS     equ 24
 FDF_LABELED equ 1               ; FD_FLAGS bit0 = carries a custom label
 FDF_REVEALED equ 2              ; FD_FLAGS bit1 = value currently unmasked
@@ -945,7 +947,7 @@ align 8
 g_pwhist      db MAX_PWHIST*PWHIST_ENTRY dup (?) ; open entry's overwritten passwords
 g_pwhist_n    dd ?                               ; number of history entries
 g_pwhblob     db MAX_PWHIST*PWHBLOB_ENTRY dup (?); per-history emit scratch (VFL_RAW)
-g_pworig      dw MAX_PWORIG*128 dup (?)          ; original secret values (change detect)
+g_pworig      db MAX_PWORIG*PWORIG_STRIDE dup (?); original {label,value} per secret
 g_pworig_n    dd ?
 g_pwh_scroll  dd ?                               ; history browser: first visible row
 g_pwh_dirty   dd ?                               ; history browser: a purge happened
@@ -2795,8 +2797,10 @@ gsd_secret:
     and     edx, NOT FDF_PWLVL_MASK           ; preserve other flag bits
     or      edx, eax
     mov     dword ptr [r10+FD_FLAGS], edx
-    mov     rcx, qword ptr [rbp-72]           ; remember the original secret value
-    mov     edx, dword ptr [rbp-64]           ; so a later overwrite can be archived
+    mov     rcx, qword ptr [rbp-88]           ; remember this secret's original label +
+    mov     edx, dword ptr [rbp-80]           ; value so a later overwrite can be
+    mov     r8, qword ptr [rbp-72]            ; archived and attributed to the right tile
+    mov     r9d, dword ptr [rbp-64]
     call    pworig_add
     jmp     gsd_mask
 gsd_mask:
@@ -2826,13 +2830,35 @@ gsd_attach_row:
     call    gui_row_add
     jmp     gsd_fnext
 gsd_pwhist:
-    ; reserved archived password {u64 filetime, wide pw} -> g_pwhist (not a row)
+    ; reserved archive {u64 filetime, label wide\0, pw wide\0} -> g_pwhist (not a row).
+    ; Back-compat: an older record is just {u64 filetime, pw wide\0} (no label).
     mov     eax, dword ptr [rbp-64]             ; vallen
-    cmp     eax, 8
-    jb      gsd_fnext                           ; need at least the filetime
+    cmp     eax, 10
+    jb      gsd_fnext                           ; need the filetime + a NUL
     mov     r10, qword ptr [rbp-72]             ; valptr
     mov     rcx, qword ptr [r10]                ; filetime qword
-    lea     rdx, [r10+8]                        ; wide old-password (NUL-terminated)
+    lea     r8, [r10+8]                         ; scan string1 to its NUL
+    xor     r9d, r9d
+gsd_ph_scan:
+    cmp     word ptr [r8], 0
+    je      gsd_ph_s1end
+    add     r8, 2
+    inc     r9d
+    cmp     r9d, 255
+    jb      gsd_ph_scan
+gsd_ph_s1end:
+    add     r8, 2                               ; past string1's NUL
+    mov     r11, r10                            ; value end = valptr + vallen
+    mov     eax, dword ptr [rbp-64]
+    add     r11, rax
+    cmp     r8, r11
+    jb      gsd_ph_new                          ; a second string follows -> new format
+    lea     rdx, [kl_secret]                    ; old format: label = "Password",
+    lea     r8, [r10+8]                         ;             pw = value+8
+    call    pwh_append
+    jmp     gsd_fnext
+gsd_ph_new:
+    lea     rdx, [r10+8]                        ; new: label = value+8, pw = past its NUL
     call    pwh_append
     jmp     gsd_fnext
 gsd_fnext:
@@ -3246,8 +3272,8 @@ gpc_orig:
     imul    eax, eax, PWORIG_STRIDE
     lea     r10, [g_pworig]
     add     r10, rax
-    mov     qword ptr [rbp-32], r10           ; orig wide ptr
-    cmp     word ptr [r10], 0                 ; empty original -> nothing to archive
+    mov     qword ptr [rbp-32], r10           ; orig slot (label @ +0, value @ +PWORIG_VAL)
+    cmp     word ptr [r10+PWORIG_VAL], 0      ; empty original value -> nothing to archive
     je      gpc_orignext
     mov     dword ptr [rbp-40], 0            ; fi = field index
 gpc_field:
@@ -3262,6 +3288,7 @@ gpc_field:
     cmp     ecx, VF_SECRET
     jne     gpc_fieldnext
     mov     rcx, qword ptr [rbp-32]           ; orig value
+    add     rcx, PWORIG_VAL
     mov     rdx, qword ptr [r11+16]           ; new secret value (wide)
     call    gui_wstr_eq
     test    eax, eax
@@ -3272,8 +3299,10 @@ gpc_fieldnext:
 gpc_notfound:
     lea     rcx, [rbp-56]                      ; now -> FILETIME
     call    GetSystemTimeAsFileTime
-    mov     rcx, qword ptr [rbp-56]
-    mov     rdx, qword ptr [rbp-32]
+    mov     rcx, qword ptr [rbp-56]           ; ft
+    mov     rdx, qword ptr [rbp-32]           ; label (slot+0)
+    mov     r8, qword ptr [rbp-32]           ; old value (slot+PWORIG_VAL)
+    add     r8, PWORIG_VAL
     call    pwh_append
 gpc_orignext:
     inc     dword ptr [rbp-24]
@@ -3284,7 +3313,7 @@ gpc_done:
 gui_pwhist_capture endp
 
 ; gui_pwhist_emit() - append every g_pwhist entry to g_field_list as a reserved
-;   VF_PWHIST|VFL_RAW field: value = {u32 len, u64 filetime, wide old-password} built
+;   VF_PWHIST|VFL_RAW field: value = {u32 len, u64 ft, label wide\0, pw wide\0} built
 ;   into g_pwhblob so it survives until vault_build_entry consumes it.
 gui_pwhist_emit proc frame
     FRAME_PROLOG 48
@@ -3307,12 +3336,20 @@ gpe_loop:
     mov     r10, qword ptr [rax]             ; filetime -> blob+4
     mov     r11, qword ptr [rbp-32]
     mov     qword ptr [r11+4], r10
-    mov     rcx, qword ptr [rbp-32]           ; wide pw -> blob+12
+    mov     rcx, qword ptr [rbp-32]           ; label wide -> blob+12
     add     rcx, 12
+    mov     rdx, qword ptr [rbp-40]
+    add     rdx, PWHIST_LBL
+    call    gui_wcpy_capped                   ; eax = label bytes incl NUL
+    mov     dword ptr [rbp-44], eax
+    mov     rcx, qword ptr [rbp-32]           ; pw wide -> blob+12+labelbytes
+    add     rcx, 12
+    add     rcx, rax
     mov     rdx, qword ptr [rbp-40]
     add     rdx, PWHIST_PW
     call    gui_wcpy_capped                   ; eax = pw bytes incl NUL
-    add     eax, 8                            ; len = filetime(8) + pw bytes
+    add     eax, 8                            ; len = ft(8) + label bytes + pw bytes
+    add     eax, dword ptr [rbp-44]
     mov     r11, qword ptr [rbp-32]
     mov     dword ptr [r11], eax             ; u32 len at blob+0
     mov     eax, dword ptr [g_field_n]        ; g_field_list[g_field_n]
@@ -3952,12 +3989,13 @@ pwh_entry proc
     ret
 pwh_entry endp
 
-; pwh_append(rcx = FILETIME qword, rdx = wide old-password) - add a history entry;
-;   when full, drop the oldest so the most recent are kept.
+; pwh_append(rcx = FILETIME qword, rdx = wide label, r8 = wide old-password) - add a
+;   history entry; when full, drop the oldest so the most recent are kept.
 pwh_append proc frame
     FRAME_PROLOG 48
     mov     qword ptr [rbp-24], rcx
     mov     qword ptr [rbp-32], rdx
+    mov     qword ptr [rbp-56], r8
     mov     eax, dword ptr [g_pwhist_n]
     cmp     eax, MAX_PWHIST
     jb      pwa_slot
@@ -3984,11 +4022,16 @@ pwa_shifted:
 pwa_slot:
     mov     ecx, eax
     call    pwh_entry
+    mov     qword ptr [rbp-48], rax           ; entry ptr
     mov     r10, qword ptr [rbp-24]
     mov     qword ptr [rax], r10              ; filetime
-    lea     rcx, [rax+PWHIST_PW]
+    lea     rcx, [rax+PWHIST_LBL]             ; label (capped, NUL-term)
     mov     rdx, qword ptr [rbp-32]
-    call    gui_wcpy_capped                   ; old password (capped, NUL-term)
+    call    gui_wcpy_capped
+    mov     rax, qword ptr [rbp-48]
+    lea     rcx, [rax+PWHIST_PW]             ; old password (capped, NUL-term)
+    mov     rdx, qword ptr [rbp-56]
+    call    gui_wcpy_capped
     inc     dword ptr [g_pwhist_n]
     FRAME_EPILOG
     ret
@@ -4024,16 +4067,39 @@ pwr_done:
     ret
 pwh_remove endp
 
-; pworig_add(rcx = utf8 secret value, edx = len) - remember an original secret value
-;   (converted to wide) at load, so gui_commit can detect if it was overwritten.
+; pworig_add(rcx = label utf8 (0/empty -> "Password"), edx = labellen,
+;            r8 = value utf8, r9d = vallen) - remember an original secret's label +
+;   value (as wide) at load, so gui_commit can detect + attribute an overwrite.
 pworig_add proc frame
     FRAME_PROLOG 48
     mov     eax, dword ptr [g_pworig_n]
     cmp     eax, MAX_PWORIG
     jae     poa_done
+    mov     qword ptr [rbp-24], rcx           ; label utf8
+    mov     dword ptr [rbp-28], edx           ; labellen
+    mov     qword ptr [rbp-32], r8            ; value utf8
+    mov     dword ptr [rbp-36], r9d           ; vallen
     imul    eax, eax, PWORIG_STRIDE
-    lea     r8, [g_pworig]
-    add     r8, rax                           ; dst wide slot (rcx=utf8, edx=len intact)
+    lea     r10, [g_pworig]
+    add     r10, rax
+    mov     qword ptr [rbp-40], r10           ; slot
+    cmp     dword ptr [rbp-28], 0
+    je      poa_deflbl
+    mov     rcx, qword ptr [rbp-24]           ; custom label -> wide
+    mov     edx, dword ptr [rbp-28]
+    mov     r8, qword ptr [rbp-40]
+    mov     r9d, 127
+    call    gui_towide
+    jmp     poa_val
+poa_deflbl:
+    mov     rcx, qword ptr [rbp-40]           ; unlabeled -> "Password"
+    lea     rdx, [kl_secret]
+    call    gui_wcpy_capped
+poa_val:
+    mov     rcx, qword ptr [rbp-32]           ; value -> wide at slot+PWORIG_VAL
+    mov     edx, dword ptr [rbp-36]
+    mov     r8, qword ptr [rbp-40]
+    add     r8, PWORIG_VAL
     mov     r9d, 127
     call    gui_towide
     inc     dword ptr [g_pworig_n]
@@ -8271,10 +8337,27 @@ gdh_loop:
     mov     eax, dword ptr [rbp-56]            ; dateLeft = R-2-PURGE-100 (right column)
     sub     eax, 2 + PH_PURGE_W + 100
     mov     dword ptr [rbp-144], eax
-    ; old password (left, vcentered, ellipsized) - given most of the width
-    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_text]
+    ; tile name / label (dim, left column)
+    mov     eax, dword ptr [rbp-40]
+    add     eax, 110                           ; labelRight = L+10+100
+    mov     dword ptr [rbp-184], eax
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_textdim]
     mov     eax, dword ptr [rbp-40]
     add     eax, 10
+    mov     dword ptr [rbp-176], eax
+    mov     eax, dword ptr [rbp-104]
+    mov     dword ptr [rbp-172], eax
+    mov     eax, dword ptr [rbp-184]
+    mov     dword ptr [rbp-168], eax
+    mov     eax, dword ptr [rbp-112]
+    mov     dword ptr [rbp-164], eax
+    mov     rax, qword ptr [rbp-152]
+    add     rax, PWHIST_LBL
+    WINCALL DrawTextW, qword ptr [rbp-32], rax, -1, addr rbp-176, 8024h
+    ; old password (normal, middle column, ellipsized)
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_text]
+    mov     eax, dword ptr [rbp-184]
+    add     eax, 8
     mov     dword ptr [rbp-176], eax
     mov     eax, dword ptr [rbp-104]
     mov     dword ptr [rbp-172], eax
@@ -8839,11 +8922,9 @@ gui_pg_apply proc frame
     FRAME_PROLOG 48
     cmp     dword ptr [g_pg_target], 0
     jl      pga_done
-    mov     edx, VF_SECRET                       ; resolve the secret row afresh
-    call    gui_row_of_kind
-    cmp     eax, 0
-    jl      pga_have
-    mov     dword ptr [g_pg_target], eax
+    ; write to the row whose Generate was clicked (g_pg_target).  The pwgen dialog
+    ; is modal so rows can't change under us; DO NOT re-resolve to "the first
+    ; secret" - that would send every tile's generated password to the same field.
 pga_have:
     lea     r10, [g_genout]
     xor     ecx, ecx
