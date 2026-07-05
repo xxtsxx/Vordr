@@ -359,7 +359,6 @@ IDC_PG_UP     equ 768
 IDC_PG_LO     equ 769
 IDC_PG_DI     equ 770
 IDC_PG_SY     equ 771
-IDC_PG_AMB    equ 772
 PWCLASS_U     equ 1
 PWCLASS_L     equ 2
 PWCLASS_D     equ 4
@@ -631,7 +630,6 @@ WSTR pg_lbl_up,  <Uppercase>
 WSTR pg_lbl_lo,  <Lowercase>
 WSTR pg_lbl_di,  <Digits>
 WSTR pg_lbl_sy,  <Symbols>
-WSTR pg_lbl_amb, <Avoid ambiguous>
 WSTR pg_style_pre, <Style: >
 WSTR pg_sn0, <Random>
 WSTR pg_sn1, <Passphrase>
@@ -9481,13 +9479,6 @@ gui_pg_sync proc frame
     mov     edx, IDC_PG_SY
     lea     r9, [pg_lbl_sy]
     call    gui_pg_toggle_text
-    xor     r8d, r8d
-    test    dword ptr [g_pg_opt], PWO_NOAMBIG
-    setnz   r8b
-    mov     rcx, qword ptr [rbp-24]
-    mov     edx, IDC_PG_AMB
-    lea     r9, [pg_lbl_amb]
-    call    gui_pg_toggle_text
     ; style button
     lea     rcx, [g_pg_tmpw]
     lea     rdx, [pg_style_pre]
@@ -9655,8 +9646,6 @@ pp_draw:
     je      pp_d_di
     cmp     eax, IDC_PG_SY
     je      pp_d_sy
-    cmp     eax, IDC_PG_AMB
-    je      pp_d_amb
     mov     rcx, r9
     call    theme_drawitem
     jmp     pp_ret
@@ -9671,9 +9660,6 @@ pp_d_di:
     jmp     pp_d_tog
 pp_d_sy:
     mov     edx, PWCLASS_S
-    jmp     pp_d_tog
-pp_d_amb:
-    mov     edx, PWO_NOAMBIG
 pp_d_tog:
     and     edx, dword ptr [g_pg_opt]          ; state = option bit (nonzero = on)
     mov     rcx, r9
@@ -9730,8 +9716,6 @@ pp_cmd:
     je      pp_tdi
     cmp     eax, IDC_PG_SY
     je      pp_tsy
-    cmp     eax, IDC_PG_AMB
-    je      pp_tamb
     xor     eax, eax
     jmp     pp_ret
 pp_regen:
@@ -9758,9 +9742,6 @@ pp_tdi:
     jmp     pp_syncgen
 pp_tsy:
     xor     dword ptr [g_pg_opt], PWCLASS_S
-    jmp     pp_syncgen
-pp_tamb:
-    xor     dword ptr [g_pg_opt], PWO_NOAMBIG
 pp_syncgen:
     mov     rcx, qword ptr [rbp-8]
     call    gui_pg_sync

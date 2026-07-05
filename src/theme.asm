@@ -66,6 +66,7 @@ extern ScreenToClient:proc
 extern GetFocus:proc
 extern GetDlgCtrlID:proc
 extern MapDialogRect:proc
+extern GetParent:proc
 extern g_vaulthwnd:qword              ; the DLG_VAULT window (sidebar card only there)
 IDC_V_SEARCH_TH equ 232               ; = IDC_V_SEARCH in gui.asm (sidebar search box)
 extern IsWindowVisible:proc
@@ -1167,13 +1168,14 @@ theme_toggle endp
 
 ; =============================================================================
 ; theme_toggle_labeled(rcx=lpdis, edx=on) -> 1 - draw an owner-draw button as a
-;   left-aligned caption plus a Fluent pill toggle at the right edge of its rect.
-;   The pill sub-rect is width 2*height; theme_toggle renders it (rect narrowed
-;   in place, then restored) so the switch matches the settings toggles exactly.
+;   left-aligned caption plus a small Fluent pill toggle (20x8 DLU, matching the
+;   settings toggles) vertically centred at the right edge of its rect.  The pill
+;   is rendered by theme_toggle after the lpdis rect is temporarily replaced with
+;   the pill sub-rect, then restored.
 ; =============================================================================
 public theme_toggle_labeled
 theme_toggle_labeled proc frame
-    FRAME_PROLOG 128
+    FRAME_PROLOG 176
     mov     qword ptr [rbp-24], rcx           ; lpdis
     mov     dword ptr [rbp-36], edx           ; on
     mov     r10, rcx
@@ -1189,14 +1191,34 @@ theme_toggle_labeled proc frame
     mov     dword ptr [rbp-52], eax           ; bottom
     mov     eax, dword ptr [r10+16]
     mov     dword ptr [rbp-56], eax           ; itemState
-    ; pill sub-rect: width = 2*height, hugging the right edge (2px margin)
-    mov     eax, dword ptr [rbp-52]
+    ; ---- pill size = 20x8 DLU -> pixels via the parent dialog ----
+    mov     r10, qword ptr [rbp-24]
+    mov     rcx, qword ptr [r10+24]           ; hwndItem
+    call    GetParent
+    mov     qword ptr [rbp-88], rax           ; hDlg
+    mov     dword ptr [rbp-104], 0            ; RECT{0,0,20,8}
+    mov     dword ptr [rbp-100], 0
+    mov     dword ptr [rbp-96], 20
+    mov     dword ptr [rbp-92], 8
+    WINCALL MapDialogRect, qword ptr [rbp-88], addr rbp-104
+    mov     eax, dword ptr [rbp-96]
+    mov     dword ptr [rbp-60], eax           ; pill width (px)
+    mov     eax, dword ptr [rbp-92]
+    mov     dword ptr [rbp-64], eax           ; pill height (px)
+    ; pill rect: right edge - 4, vertically centred
+    mov     eax, dword ptr [rbp-48]
+    sub     eax, 4
+    mov     dword ptr [rbp-76], eax           ; pR
+    sub     eax, dword ptr [rbp-60]
+    mov     dword ptr [rbp-68], eax           ; pL
+    mov     eax, dword ptr [rbp-52]           ; pT = T + ((B-T)-h)/2
     sub     eax, dword ptr [rbp-44]
-    add     eax, eax
-    mov     ecx, dword ptr [rbp-48]
-    sub     ecx, eax
-    sub     ecx, 2
-    mov     dword ptr [rbp-60], ecx           ; pill left
+    sub     eax, dword ptr [rbp-64]
+    sar     eax, 1
+    add     eax, dword ptr [rbp-44]
+    mov     dword ptr [rbp-72], eax           ; pT
+    add     eax, dword ptr [rbp-64]
+    mov     dword ptr [rbp-80], eax           ; pB
     ; ---- caption (left, dim if disabled) ----
     WINCALL SetBkMode, qword ptr [rbp-32], BKMODE_TRANSP
     mov     ecx, dword ptr [g_col_text]
@@ -1209,25 +1231,37 @@ theme_toggle_labeled proc frame
     WINCALL GetWindowTextW, rcx, addr g_txtbuf, 159
     mov     eax, dword ptr [rbp-40]
     add     eax, 2
-    mov     dword ptr [rbp-80], eax           ; label rect L
+    mov     dword ptr [rbp-120], eax          ; label rect L
     mov     eax, dword ptr [rbp-44]
-    mov     dword ptr [rbp-76], eax           ; T
-    mov     eax, dword ptr [rbp-60]
+    mov     dword ptr [rbp-116], eax          ; T
+    mov     eax, dword ptr [rbp-68]
     sub     eax, 6
-    mov     dword ptr [rbp-72], eax           ; R (before pill)
+    mov     dword ptr [rbp-112], eax          ; R (before pill)
     mov     eax, dword ptr [rbp-52]
-    mov     dword ptr [rbp-68], eax           ; B
-    WINCALL DrawTextW, qword ptr [rbp-32], addr g_txtbuf, -1, addr rbp-80, DT_LFLAGS
-    ; ---- pill: narrow lpdis rect to the pill area, draw, restore ----
+    mov     dword ptr [rbp-108], eax          ; B
+    WINCALL DrawTextW, qword ptr [rbp-32], addr g_txtbuf, -1, addr rbp-120, DT_LFLAGS
+    ; ---- pill: swap lpdis rect for the pill sub-rect, draw, restore ----
     mov     r10, qword ptr [rbp-24]
-    mov     eax, dword ptr [rbp-60]
-    mov     dword ptr [r10+40], eax           ; lpdis.left := pill left
+    mov     eax, dword ptr [rbp-68]
+    mov     dword ptr [r10+40], eax           ; left
+    mov     eax, dword ptr [rbp-72]
+    mov     dword ptr [r10+44], eax           ; top
+    mov     eax, dword ptr [rbp-76]
+    mov     dword ptr [r10+48], eax           ; right
+    mov     eax, dword ptr [rbp-80]
+    mov     dword ptr [r10+52], eax           ; bottom
     mov     rcx, r10
     mov     edx, dword ptr [rbp-36]
     call    theme_toggle
-    mov     r10, qword ptr [rbp-24]
+    mov     r10, qword ptr [rbp-24]           ; restore the original rect
     mov     eax, dword ptr [rbp-40]
-    mov     dword ptr [r10+40], eax           ; restore original left
+    mov     dword ptr [r10+40], eax
+    mov     eax, dword ptr [rbp-44]
+    mov     dword ptr [r10+44], eax
+    mov     eax, dword ptr [rbp-48]
+    mov     dword ptr [r10+48], eax
+    mov     eax, dword ptr [rbp-52]
+    mov     dword ptr [r10+52], eax
     mov     eax, 1
     FRAME_EPILOG
     ret
