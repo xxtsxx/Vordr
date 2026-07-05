@@ -134,7 +134,7 @@ g_bits      dq 0
 ; ---- runtime-selectable colour scheme -------------------------------------
 ; g_col_* are 13 consecutive dwords (order matches each schemes[] row).
 public g_scheme, g_col_bg, g_col_panel, g_col_text, g_col_textdim, g_col_frame, g_col_dark
-public g_col_side
+public g_col_side, g_col_accent
 g_scheme    dd 0
 align 4
 g_col_bg    dd 00202020h

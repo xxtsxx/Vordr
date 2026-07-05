@@ -50,6 +50,7 @@ extern g_col_panel:dword
 extern g_col_frame:dword
 extern g_col_text:dword
 extern g_col_textdim:dword
+extern g_col_accent:dword
 extern g_col_dark:dword
 extern g_col_side:dword
 extern DwmSetWindowAttribute:proc
@@ -432,17 +433,19 @@ MAX_TFILES  equ 24             ; <= MAX_FIELDS minus the other fields of an entr
 TFILE_ENTRY equ 328
 TFILE_NAME  equ 68             ; filename offset within a tile-file entry
 MAX_FIELDS  equ 56             ; g_field_list capacity (matches main.asm)
-; Password history: each overwritten password is archived as a reserved VF_PWHIST
-; field, value = raw {u64 FILETIME, wide old-password} (VFL_RAW).  Loaded into
-; g_pwhist for the open entry; g_pworig holds the entry's ORIGINAL secret values
-; (at load) so gui_commit can detect which passwords were overwritten.
-MAX_PWHIST   equ 32
-PWHIST_ENTRY equ 528           ; {u64 filetime, label wide[128], pw wide[128]}
+; Field history: each overwritten field value (ANY tile, not just secrets) is
+; archived as a reserved VF_PWHIST field, value = raw {u64 FILETIME, label wide,
+; old value wide} (VFL_RAW).  Loaded into g_pwhist for the open entry; g_pworig
+; holds the entry's ORIGINAL field values keyed by (effective) label at load, so
+; gui_commit can detect per-tile which values were overwritten.  The browser
+; groups records into one tab per label.
+MAX_PWHIST   equ 64
+PWHIST_ENTRY equ 528           ; {u64 filetime, label wide[128], value wide[128]}
 PWHIST_LBL   equ 8             ; label offset within a g_pwhist entry
-PWHIST_PW    equ 264           ; password offset (8 + 128*2)
-PWHBLOB_ENTRY equ 512          ; emit scratch {u32 len, u64 ft, label wide, pw wide}
-MAX_PWORIG   equ 8
-PWORIG_STRIDE equ 512          ; original secret {label wide[128], value wide[128]}
+PWHIST_PW    equ 264           ; value offset (8 + 128*2)
+PWHBLOB_ENTRY equ 512          ; emit scratch {u32 len, u64 ft, label wide, value wide}
+MAX_PWORIG   equ 24            ; up to MAXROWS value fields captured per entry
+PWORIG_STRIDE equ 512          ; original field {label wide[128], value wide[128]}
 PWORIG_VAL   equ 256           ; value offset (bytes) within a g_pworig slot
 MAXROWS     equ 24
 FDF_LABELED equ 1               ; FD_FLAGS bit0 = carries a custom label
@@ -483,6 +486,8 @@ DLG_PWHIST   equ 780          ; password-history browser dialog
 IDC_PH_LIST  equ 781          ; owner-draw list of archived passwords
 PH_ROW_H     equ 26           ; history row height (px)
 PH_PURGE_W   equ 22           ; per-row purge hotspot width (px)
+PH_TABH      equ 28           ; height (px) of the per-tile tab strip atop the list
+MAX_TABS     equ 16           ; distinct labels (tabs) shown in the history browser
 IDC_V_TIMES  equ 236          ; created/modified timestamps line (below the last row)
 IDC_V_FAV    equ 237          ; header favorite (star) toggle
 IDC_V_CANCEL equ 238          ; "Cancel" button (edit mode, discards edits)
@@ -660,6 +665,10 @@ pht_lbl db 'Password'                            ; gui_phtest scratch (headless 
 pht_old db 'oldpw'
 pht_ttl dw 'T', 0
 pht_new dw 'n','e','w','p','w', 0
+pht_loginu  db 'Login'                           ; phtest: a 2nd, different-label field
+pht_stayu   db 'stays'
+pht_loginw  dw 'L','o','g','i','n', 0
+pht_staysw  dw 's','t','a','y','s', 0
     even                                         ; wb_gen MUST be word-aligned: an odd
 wb_gen label word                                ; caption addr fails CreateWindowExW (998)
     dw 0E72Ch, 0                                 ; Refresh (generate password)
@@ -957,6 +966,11 @@ g_pworig_n    dd ?
 g_pwh_scroll  dd ?                               ; history browser: first visible row
 g_pwh_dirty   dd ?                               ; history browser: a purge happened
 g_phdate      dw 40 dup (?)                      ; history browser: formatted date scratch
+g_pwh_tab     dd ?                               ; selected tab (0-based)
+g_pwh_ntabs   dd ?                               ; number of distinct-label tabs
+g_pwh_tabs    dd MAX_TABS dup (?)                ; each tab -> a representative g_pwhist index
+g_pwh_filter  dd MAX_PWHIST dup (?)              ; g_pwhist indices belonging to the current tab
+g_pwh_fn      dd ?                               ; number of rows in g_pwh_filter
 align 2
 g_imgfn_w     dw 200 dup (?)               ; current image's filename (wide) to store
 g_imgbuf      dq ?                         ; imported file bytes (mem_alloc'd)
@@ -2782,6 +2796,21 @@ gsd_setval:
     mov     r8, qword ptr [rbp-72]              ; valptr
     mov     r9d, dword ptr [rbp-64]             ; vallen
     call    gui_setfield
+    ; remember this field's original (effective label, value) for per-tile history
+    mov     edx, dword ptr [rbp-80]             ; labellen
+    test    edx, edx
+    jnz     gsd_cap_custom
+    mov     edx, dword ptr [rbp-96]             ; unlabeled -> the kind's default label
+    call    kind_label                          ;   (wide) so both sides key the same way
+    mov     rcx, rax
+    xor     edx, edx
+    jmp     gsd_cap_go
+gsd_cap_custom:
+    mov     rcx, qword ptr [rbp-88]             ; custom label (utf8, len in edx)
+gsd_cap_go:
+    mov     r8, qword ptr [rbp-72]              ; value (utf8)
+    mov     r9d, dword ptr [rbp-64]
+    call    pworig_add
     mov     eax, dword ptr [rbp-96]             ; kind
     cmp     eax, VF_SECRET
     je      gsd_secret
@@ -2802,12 +2831,7 @@ gsd_secret:
     and     edx, NOT FDF_PWLVL_MASK           ; preserve other flag bits
     or      edx, eax
     mov     dword ptr [r10+FD_FLAGS], edx
-    mov     rcx, qword ptr [rbp-88]           ; remember this secret's original label +
-    mov     edx, dword ptr [rbp-80]           ; value so a later overwrite can be
-    mov     r8, qword ptr [rbp-72]            ; archived and attributed to the right tile
-    mov     r9d, dword ptr [rbp-64]
-    call    pworig_add
-    jmp     gsd_mask
+    jmp     gsd_mask                          ; (original value already captured above)
 gsd_mask:
     mov     ecx, dword ptr [rbp-44]
     mov     edx, DS_VALUE
@@ -3263,12 +3287,13 @@ gte_finish:
     ret
 gui_tile_expand endp
 
-; gui_pwhist_capture() - archive any password that was overwritten in this edit.
-;   For each original secret value (captured at load in g_pworig) that no longer
-;   appears among the new secret fields (g_field_list), append {now, old value} to
-;   g_pwhist.  Removing a secret also archives it.
+; gui_pwhist_capture() - archive any TILE value that was overwritten in this edit.
+;   Per-label set difference: for each original field (label L, value V) captured
+;   at load in g_pworig, if no NEW field with the same effective label L still holds
+;   value V, append {now, L, V} to g_pwhist.  This attributes each overwrite to its
+;   own tile (label); renaming/removing a tile also archives its old value.
 gui_pwhist_capture proc frame
-    FRAME_PROLOG 64
+    FRAME_PROLOG 80
     mov     dword ptr [rbp-24], 0             ; oi = original index
 gpc_orig:
     mov     eax, dword ptr [rbp-24]
@@ -3288,16 +3313,39 @@ gpc_field:
     imul    eax, eax, 24
     lea     r11, [g_field_list]
     add     r11, rax
-    mov     rcx, qword ptr [r11]             ; kind
+    mov     ecx, dword ptr [r11]             ; kind (low byte)
     and     ecx, VF_KINDMASK
-    cmp     ecx, VF_SECRET
-    jne     gpc_fieldnext
-    mov     rcx, qword ptr [rbp-32]           ; orig value
-    add     rcx, PWORIG_VAL
-    mov     rdx, qword ptr [r11+16]           ; new secret value (wide)
+    cmp     ecx, VF_TITLE                     ; skip non-tile fields (title / reserved /
+    je      gpc_fieldnext                     ;   attachment placeholders)
+    cmp     ecx, VF_FAV
+    je      gpc_fieldnext
+    cmp     ecx, VF_ICON
+    je      gpc_fieldnext
+    cmp     ecx, VF_PWHIST
+    je      gpc_fieldnext
+    cmp     ecx, VF_FILE
+    je      gpc_fieldnext
+    cmp     ecx, VF_IMAGE
+    je      gpc_fieldnext
+    ; effective label of this new field (custom, or the kind default)
+    mov     rax, qword ptr [r11+8]
+    test    rax, rax
+    jnz     gpc_haveEL
+    mov     edx, ecx
+    call    kind_label
+gpc_haveEL:
+    mov     qword ptr [rbp-48], rax           ; EL (survives the wstr_eq calls)
+    mov     rcx, qword ptr [rbp-32]           ; compare EL to the original's label
+    mov     rdx, qword ptr [rbp-48]
     call    gui_wstr_eq
     test    eax, eax
-    jnz     gpc_orignext                      ; still present -> not overwritten
+    jz      gpc_fieldnext                     ; different tile -> keep looking
+    mov     rcx, qword ptr [rbp-32]           ; same label: compare values
+    add     rcx, PWORIG_VAL
+    mov     rdx, qword ptr [r11+16]
+    call    gui_wstr_eq
+    test    eax, eax
+    jnz     gpc_orignext                      ; same label + value still present -> not overwritten
 gpc_fieldnext:
     inc     dword ptr [rbp-40]
     jmp     gpc_field
@@ -3329,7 +3377,12 @@ gui_phtest proc frame
     lea     r8, [pht_old]                     ; original value "oldpw" (utf8, 5)
     mov     r9d, 5
     call    pworig_add
-    cmp     dword ptr [g_pworig_n], 1         ; 10 = pworig_add didn't record
+    lea     rcx, [pht_loginu]                 ; 2nd original: "Login" = "stays" (UNCHANGED)
+    mov     edx, 5
+    lea     r8, [pht_stayu]
+    mov     r9d, 5
+    call    pworig_add
+    cmp     dword ptr [g_pworig_n], 2         ; 10 = pworig_add didn't record both
     jne     pht_e10
     lea     r10, [g_pworig]                   ; 20 = original value not stored
     cmp     word ptr [r10+PWORIG_VAL], 0
@@ -3339,13 +3392,18 @@ gui_phtest proc frame
     mov     qword ptr [r10+8], 0
     lea     rax, [pht_ttl]
     mov     qword ptr [r10+16], rax
-    mov     qword ptr [r10+24], VF_SECRET
+    mov     qword ptr [r10+24], VF_SECRET     ; secret changed "oldpw" -> "newpw"
     mov     qword ptr [r10+32], 0
-    lea     rax, [pht_new]                    ; new secret value "newpw" (wide)
+    lea     rax, [pht_new]
     mov     qword ptr [r10+40], rax
-    mov     dword ptr [g_field_n], 2
+    mov     qword ptr [r10+48], VF_USERNAME   ; "Login" tile UNCHANGED ("stays")
+    lea     rax, [pht_loginw]
+    mov     qword ptr [r10+56], rax
+    lea     rax, [pht_staysw]
+    mov     qword ptr [r10+64], rax
+    mov     dword ptr [g_field_n], 3
     call    gui_pwhist_capture
-    cmp     dword ptr [g_pwhist_n], 1         ; 30 = nothing archived
+    cmp     dword ptr [g_pwhist_n], 1         ; 30 = wrong count (Login must NOT archive)
     jne     pht_e30
     lea     r10, [g_pwhist]                   ; verify stored content (pwh_append)
     cmp     word ptr [r10+PWHIST_LBL], 'P'    ; 40 = label not "Password"
@@ -3353,9 +3411,9 @@ gui_phtest proc frame
     cmp     word ptr [r10+PWHIST_PW], 'o'     ; 50 = pw not "oldpw"
     jne     pht_e50
     call    gui_pwhist_emit                   ; exercise emit -> VF_PWHIST field
-    cmp     dword ptr [g_field_n], 3          ; 60 = emit didn't append a field
+    cmp     dword ptr [g_field_n], 4          ; 60 = emit didn't append a field (3 -> 4)
     jne     pht_e60
-    lea     r10, [g_field_list+48]            ; g_field_list[2]
+    lea     r10, [g_field_list+72]            ; g_field_list[3] (the emitted record)
     mov     rcx, qword ptr [r10]              ; 70 = kind not VF_PWHIST|VFL_RAW
     cmp     rcx, VF_PWHIST or VFL_RAW
     jne     pht_e70
@@ -4155,9 +4213,10 @@ pwr_done:
     ret
 pwh_remove endp
 
-; pworig_add(rcx = label utf8 (0/empty -> "Password"), edx = labellen,
-;            r8 = value utf8, r9d = vallen) - remember an original secret's label +
-;   value (as wide) at load, so gui_commit can detect + attribute an overwrite.
+; pworig_add(edx = labellen; rcx = custom label utf8 when labellen>0, else the
+;            kind's DEFAULT label wide-ptr; r8 = value utf8, r9d = vallen) -
+;   remember an original field's effective label + value (as wide) at load, so
+;   gui_commit can detect + attribute a per-tile overwrite.
 pworig_add proc frame
     FRAME_PROLOG 80                            ; each local its own 8-byte slot (a dword
     mov     eax, dword ptr [g_pworig_n]        ; under a qword's footprint gets clobbered
@@ -4180,8 +4239,8 @@ pworig_add proc frame
     call    gui_towide
     jmp     poa_val
 poa_deflbl:
-    mov     rcx, qword ptr [rbp-48]           ; unlabeled -> "Password"
-    lea     rdx, [kl_secret]
+    mov     rcx, qword ptr [rbp-48]           ; unlabeled -> caller's kind default (wide)
+    mov     rdx, qword ptr [rbp-16]
     call    gui_wcpy_capped
 poa_val:
     mov     rcx, qword ptr [rbp-32]           ; value -> wide at slot+PWORIG_VAL
@@ -8357,9 +8416,99 @@ export_proc endp
 ; open entry's archived passwords (g_pwhist), each showing when it was changed,
 ; the old password, and a per-row purge 'x'.
 ; =============================================================================
-; gui_draw_pwhist(rcx = lpdis) - paint the visible history rows from g_pwh_scroll.
+; pwh_build_tabs() - scan g_pwhist and collect the distinct labels into g_pwh_tabs
+;   (each entry = the index of the first record carrying that label).  Clamps the
+;   selected tab g_pwh_tab into range.  One tab per tile that has history.
+pwh_build_tabs proc frame
+    FRAME_PROLOG 64
+    mov     dword ptr [g_pwh_ntabs], 0
+    mov     dword ptr [rbp-24], 0             ; i = record index
+pbt_i:
+    mov     eax, dword ptr [rbp-24]
+    cmp     eax, dword ptr [g_pwhist_n]
+    jae     pbt_done
+    mov     ecx, eax
+    call    pwh_entry
+    lea     rax, [rax+PWHIST_LBL]
+    mov     qword ptr [rbp-32], rax           ; label_i
+    mov     dword ptr [rbp-40], 0             ; t = tab index
+pbt_t:
+    mov     eax, dword ptr [rbp-40]
+    cmp     eax, dword ptr [g_pwh_ntabs]
+    jae     pbt_add
+    lea     r10, [g_pwh_tabs]
+    mov     ecx, dword ptr [r10+rax*4]        ; representative record of tab t
+    call    pwh_entry
+    lea     rdx, [rax+PWHIST_LBL]
+    mov     rcx, qword ptr [rbp-32]
+    call    gui_wstr_eq
+    test    eax, eax
+    jnz     pbt_inext                         ; already have a tab for this label
+    inc     dword ptr [rbp-40]
+    jmp     pbt_t
+pbt_add:
+    mov     eax, dword ptr [g_pwh_ntabs]
+    cmp     eax, MAX_TABS
+    jae     pbt_inext
+    lea     r10, [g_pwh_tabs]
+    mov     ecx, dword ptr [rbp-24]
+    mov     dword ptr [r10+rax*4], ecx
+    inc     dword ptr [g_pwh_ntabs]
+pbt_inext:
+    inc     dword ptr [rbp-24]
+    jmp     pbt_i
+pbt_done:
+    mov     eax, dword ptr [g_pwh_tab]        ; clamp selection
+    cmp     eax, dword ptr [g_pwh_ntabs]
+    jb      pbt_ok
+    mov     dword ptr [g_pwh_tab], 0
+pbt_ok:
+    FRAME_EPILOG
+    ret
+pwh_build_tabs endp
+
+; pwh_build_filter() - fill g_pwh_filter with the g_pwhist indices whose label matches
+;   the selected tab (g_pwh_tab), preserving order.  g_pwh_fn = count.
+pwh_build_filter proc frame
+    FRAME_PROLOG 64
+    mov     dword ptr [g_pwh_fn], 0
+    mov     eax, dword ptr [g_pwh_tab]
+    cmp     eax, dword ptr [g_pwh_ntabs]
+    jae     pbf_done
+    lea     r10, [g_pwh_tabs]
+    mov     ecx, dword ptr [r10+rax*4]
+    call    pwh_entry
+    lea     rax, [rax+PWHIST_LBL]
+    mov     qword ptr [rbp-24], rax           ; target label
+    mov     dword ptr [rbp-32], 0             ; i
+pbf_i:
+    mov     eax, dword ptr [rbp-32]
+    cmp     eax, dword ptr [g_pwhist_n]
+    jae     pbf_done
+    mov     ecx, eax
+    call    pwh_entry
+    lea     rdx, [rax+PWHIST_LBL]
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_wstr_eq
+    test    eax, eax
+    jz      pbf_inext
+    mov     eax, dword ptr [g_pwh_fn]
+    lea     r10, [g_pwh_filter]
+    mov     ecx, dword ptr [rbp-32]
+    mov     dword ptr [r10+rax*4], ecx
+    inc     dword ptr [g_pwh_fn]
+pbf_inext:
+    inc     dword ptr [rbp-32]
+    jmp     pbf_i
+pbf_done:
+    FRAME_EPILOG
+    ret
+pwh_build_filter endp
+
+; gui_draw_pwhist(rcx = lpdis) - paint the per-tile tab strip, then the visible
+;   history rows for the selected tab from g_pwh_scroll (newest on top).
 gui_draw_pwhist proc frame
-    FRAME_PROLOG 240
+    FRAME_PROLOG 272
     mov     qword ptr [rbp-24], rcx
     mov     r10, rcx
     mov     rax, qword ptr [r10+32]
@@ -8383,20 +8532,88 @@ gui_draw_pwhist proc frame
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_subfont]
     mov     qword ptr [rbp-80], rax            ; old font
     WINCALL SetBkMode, qword ptr [rbp-32], 1
-    mov     dword ptr [rbp-88], 0             ; k = visible row
+    call    pwh_build_tabs
+    call    pwh_build_filter
+    ; --- per-tile tab strip (splits the width evenly among the labels) ---
+    mov     eax, dword ptr [rbp-56]           ; tabW = (R - L) / ntabs
+    sub     eax, dword ptr [rbp-40]
+    cdq
+    idiv    dword ptr [g_pwh_ntabs]
+    mov     dword ptr [rbp-188], eax          ; tabW
+    mov     dword ptr [rbp-88], 0             ; t
+gdh_tab:
+    mov     eax, dword ptr [rbp-88]
+    cmp     eax, dword ptr [g_pwh_ntabs]
+    jae     gdh_tabsdone
+    mov     eax, dword ptr [rbp-88]           ; tabX = L + t*tabW
+    imul    eax, dword ptr [rbp-188]
+    add     eax, dword ptr [rbp-40]
+    mov     dword ptr [rbp-192], eax
+    mov     eax, dword ptr [g_col_textdim]    ; selected tab = bright text
+    mov     ecx, dword ptr [rbp-88]
+    cmp     ecx, dword ptr [g_pwh_tab]
+    jne     @F
+    mov     eax, dword ptr [g_col_text]
+@@: WINCALL SetTextColor, qword ptr [rbp-32], eax
+    mov     eax, dword ptr [rbp-192]          ; text rect [tabX+4, T, tabX+tabW-4, T+PH_TABH]
+    add     eax, 4
+    mov     dword ptr [rbp-176], eax
+    mov     eax, dword ptr [rbp-48]
+    mov     dword ptr [rbp-172], eax
+    mov     eax, dword ptr [rbp-192]
+    add     eax, dword ptr [rbp-188]
+    sub     eax, 4
+    mov     dword ptr [rbp-168], eax
+    mov     eax, dword ptr [rbp-48]
+    add     eax, PH_TABH
+    mov     dword ptr [rbp-164], eax
+    mov     ecx, dword ptr [rbp-88]           ; tab label = its representative record's label
+    lea     r10, [g_pwh_tabs]
+    mov     ecx, dword ptr [r10+rcx*4]
+    call    pwh_entry
+    add     rax, PWHIST_LBL
+    WINCALL DrawTextW, qword ptr [rbp-32], rax, -1, addr rbp-176, 8025h
+    mov     eax, dword ptr [rbp-88]           ; selected tab -> accent underline
+    cmp     eax, dword ptr [g_pwh_tab]
+    jne     gdh_tabnext
+    WINCALL CreateSolidBrush, dword ptr [g_col_accent]
+    mov     qword ptr [rbp-120], rax
+    mov     eax, dword ptr [rbp-192]
+    add     eax, 8
+    mov     dword ptr [rbp-176], eax
+    mov     eax, dword ptr [rbp-48]
+    add     eax, PH_TABH-3
+    mov     dword ptr [rbp-172], eax
+    mov     eax, dword ptr [rbp-192]
+    add     eax, dword ptr [rbp-188]
+    sub     eax, 8
+    mov     dword ptr [rbp-168], eax
+    mov     eax, dword ptr [rbp-48]
+    add     eax, PH_TABH-1
+    mov     dword ptr [rbp-164], eax
+    WINCALL FillRect, qword ptr [rbp-32], addr rbp-176, qword ptr [rbp-120]
+    WINCALL DeleteObject, qword ptr [rbp-120]
+gdh_tabnext:
+    inc     dword ptr [rbp-88]
+    jmp     gdh_tab
+gdh_tabsdone:
+    mov     dword ptr [rbp-88], 0             ; k = visible row within the selected tab
 gdh_loop:
     mov     eax, dword ptr [g_pwh_scroll]
-    add     eax, dword ptr [rbp-88]           ; disp = scroll + k
-    cmp     eax, dword ptr [g_pwhist_n]
+    add     eax, dword ptr [rbp-88]           ; fdisp = scroll + k
+    cmp     eax, dword ptr [g_pwh_fn]
     jae     gdh_restore
-    mov     ecx, dword ptr [g_pwhist_n]       ; i = (n-1) - disp  (newest on top)
+    mov     ecx, dword ptr [g_pwh_fn]         ; fi = (fn-1) - fdisp  (newest on top)
     dec     ecx
     sub     ecx, eax
+    lea     r10, [g_pwh_filter]               ; i = filter[fi] = record index
+    mov     ecx, dword ptr [r10+rcx*4]
     mov     dword ptr [rbp-96], ecx           ; i = entry index
     mov     eax, dword ptr [rbp-88]
     imul    eax, eax, PH_ROW_H
     add     eax, dword ptr [rbp-48]
-    mov     dword ptr [rbp-104], eax          ; rowTop
+    add     eax, PH_TABH
+    mov     dword ptr [rbp-104], eax          ; rowTop (below the tab strip)
     mov     ecx, eax
     add     ecx, PH_ROW_H
     cmp     ecx, dword ptr [rbp-64]
@@ -8502,6 +8719,7 @@ gui_pwhist_click proc frame
     mov     qword ptr [rbp-24], rcx
     cmp     dword ptr [g_pwhist_n], 0
     je      gpk_done
+    call    pwh_build_tabs
     mov     rcx, qword ptr [rbp-24]
     mov     edx, IDC_PH_LIST
     call    GetDlgItem
@@ -8516,18 +8734,42 @@ gui_pwhist_click proc frame
     mov     rcx, qword ptr [rbp-32]
     lea     rdx, [rbp-64]                      ; RECT l-64 t-60 r-56 b-52
     call    GetClientRect
-    mov     eax, dword ptr [rbp-44]           ; disp = scroll + pt.y / PH_ROW_H
+    ; --- click in the tab strip? (pt.y < PH_TABH) -> switch tab ---
+    cmp     dword ptr [rbp-44], PH_TABH
+    jge     gpk_row
+    mov     eax, dword ptr [rbp-56]           ; tabW = clientW / ntabs
+    cdq
+    idiv    dword ptr [g_pwh_ntabs]
+    test    eax, eax
+    jz      gpk_done
+    mov     ecx, eax                          ; tabW
+    mov     eax, dword ptr [rbp-48]           ; tab = pt.x / tabW
+    cdq
+    idiv    ecx
+    cmp     eax, dword ptr [g_pwh_ntabs]      ; clamp to last tab
+    jb      @F
+    mov     eax, dword ptr [g_pwh_ntabs]
+    dec     eax
+@@: mov     dword ptr [g_pwh_tab], eax
+    mov     dword ptr [g_pwh_scroll], 0
+    jmp     gpk_repaint
+gpk_row:
+    call    pwh_build_filter
+    mov     eax, dword ptr [rbp-44]           ; disp = scroll + (pt.y-PH_TABH)/PH_ROW_H
+    sub     eax, PH_TABH
     cdq
     mov     ecx, PH_ROW_H
     idiv    ecx
     add     eax, dword ptr [g_pwh_scroll]
     cmp     eax, 0
     jl      gpk_done
-    cmp     eax, dword ptr [g_pwhist_n]
+    cmp     eax, dword ptr [g_pwh_fn]
     jae     gpk_done
-    mov     ecx, dword ptr [g_pwhist_n]       ; entry index = (n-1) - disp (reversed)
+    mov     ecx, dword ptr [g_pwh_fn]         ; fi = (fn-1) - disp (reversed)
     dec     ecx
     sub     ecx, eax
+    lea     r10, [g_pwh_filter]               ; record index = filter[fi]
+    mov     ecx, dword ptr [r10+rcx*4]
     mov     dword ptr [rbp-68], ecx
     mov     eax, dword ptr [rbp-56]           ; purge region: pt.x >= clientW-2-PURGE
     sub     eax, 2 + PH_PURGE_W
@@ -8537,8 +8779,10 @@ gui_pwhist_click proc frame
     call    pwh_remove
     mov     dword ptr [g_dirty], 1
     mov     dword ptr [g_pwh_dirty], 1        ; persist on close (view mode has no Save)
+    call    pwh_build_tabs                    ; a purge may have emptied a tab
+    call    pwh_build_filter
     mov     eax, dword ptr [g_pwh_scroll]     ; keep scroll in range
-    cmp     eax, dword ptr [g_pwhist_n]
+    cmp     eax, dword ptr [g_pwh_fn]
     jb      gpk_repaint
     mov     dword ptr [g_pwh_scroll], 0
 gpk_repaint:
@@ -8614,8 +8858,8 @@ ph_wheel:
     xor     eax, eax
     jmp     ph_wheel_set
 ph_wheel_down:
-    mov     eax, dword ptr [g_pwhist_n]
-    dec     eax                               ; max scroll = n-1
+    mov     eax, dword ptr [g_pwh_fn]         ; rows in the selected tab
+    dec     eax                               ; max scroll = fn-1
     mov     ecx, dword ptr [g_pwh_scroll]
     inc     ecx
     cmp     ecx, eax
@@ -8649,6 +8893,7 @@ ph_init:
     mov     rcx, qword ptr [rbp-8]
     call    gui_set_winicon
     mov     dword ptr [g_pwh_scroll], 0
+    mov     dword ptr [g_pwh_tab], 0          ; start on the first tile's tab
     mov     eax, 1
     jmp     ph_ret
 ph_cmd:
