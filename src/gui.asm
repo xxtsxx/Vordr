@@ -211,6 +211,7 @@ extern CreatePopupMenu:proc
 extern AppendMenuW:proc
 extern TrackPopupMenu:proc
 extern DestroyMenu:proc
+extern SetMenuInfo:proc
 extern GetCursorPos:proc
 extern SetForegroundWindow:proc
 
@@ -257,6 +258,8 @@ NIM_DELETE          equ 2
 NIF_TRAY            equ 7                 ; NIF_MESSAGE | NIF_ICON | NIF_TIP
 MF_STRING           equ 0
 MF_SEPARATOR        equ 800h
+MF_OWNERDRAW        equ 100h
+MIM_DARK            equ 80000002h        ; MIM_APPLYTOSUBMENUS | MIM_BACKGROUND
 TPM_RIGHTBUTTON     equ 2
 TPM_LEFTALIGN       equ 0
 TPM_RETURNCMD       equ 0100h
@@ -940,6 +943,7 @@ g_readpw    dw 260 dup (?)           ; password being read out (wiped on close)
 g_phon_w    dw 6144 dup (?)          ; phonetic spelling text (wiped on close)
 g_urlbuf    dw 1024 dup (?)          ; URL read from a URL field for click-to-open
 g_urlbuf2   dw 1040 dup (?)          ; URL with an https:// scheme prepended if bare
+g_menuinfo  db 40 dup (?)            ; MENUINFO scratch for themed popup menus
 align 8
 ; --- modular field-row model (runtime detail form) ---
 g_fields      db MAXROWS*DESCSZ dup (?)   ; row descriptors
@@ -5941,25 +5945,129 @@ grk_none:
     ret
 gui_row_of_kind endp
 
+; =============================================================================
+; Themed owner-draw popup menus.  Items are appended with MF_OWNERDRAW (their
+; text pointer carried as the item data); gui_menu_dark tints the menu window
+; background, and vault_proc / tray_wndproc route WM_MEASUREITEM + WM_DRAWITEM
+; for ODT_MENU (CtlType 1) here.
+; =============================================================================
+
+; gui_menu_dark(rcx=hmenu) -> rax = HBRUSH (delete after TrackPopupMenu returns).
+gui_menu_dark proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    WINCALL CreateSolidBrush, dword ptr [g_col_panel]
+    mov     qword ptr [rbp-32], rax
+    lea     r10, [g_menuinfo]
+    mov     dword ptr [r10+0], 40                ; cbSize
+    mov     dword ptr [r10+4], MIM_DARK          ; fMask
+    mov     dword ptr [r10+8], 0                 ; dwStyle
+    mov     dword ptr [r10+12], 0                ; cyMax
+    mov     rax, qword ptr [rbp-32]
+    mov     qword ptr [r10+16], rax              ; hbrBack
+    mov     qword ptr [r10+24], 0
+    mov     qword ptr [r10+32], 0
+    WINCALL SetMenuInfo, qword ptr [rbp-24], addr g_menuinfo
+    mov     rax, qword ptr [rbp-32]
+    FRAME_EPILOG
+    ret
+gui_menu_dark endp
+
+; gui_menu_measure(rcx=lpmis) - size an owner-draw menu item to its label.
+gui_menu_measure proc frame
+    FRAME_PROLOG 32
+    mov     r10, rcx
+    mov     rax, qword ptr [r10+24]              ; itemData = label ptr
+    xor     r8d, r8d
+gmm_len:
+    cmp     word ptr [rax+r8*2], 0
+    je      gmm_done
+    inc     r8d
+    jmp     gmm_len
+gmm_done:
+    imul    r8d, r8d, 7                          ; ~7 px/char + padding
+    add     r8d, 44
+    mov     dword ptr [r10+12], r8d              ; itemWidth
+    mov     dword ptr [r10+16], 22               ; itemHeight
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gui_menu_measure endp
+
+; gui_menu_draw(rcx=lpdis) - paint an owner-draw menu item in the theme colours.
+gui_menu_draw proc frame
+    FRAME_PROLOG 160
+    mov     qword ptr [rbp-24], rcx
+    mov     r10, rcx
+    mov     rax, qword ptr [r10+32]
+    mov     qword ptr [rbp-32], rax              ; hdc
+    mov     eax, dword ptr [r10+40]
+    mov     dword ptr [rbp-80], eax              ; rc L
+    mov     eax, dword ptr [r10+44]
+    mov     dword ptr [rbp-76], eax
+    mov     eax, dword ptr [r10+48]
+    mov     dword ptr [rbp-72], eax
+    mov     eax, dword ptr [r10+52]
+    mov     dword ptr [rbp-68], eax
+    mov     ecx, dword ptr [g_col_panel]         ; selected row -> frame highlight
+    mov     r11, qword ptr [rbp-24]
+    test    dword ptr [r11+16], 1                ; ODS_SELECTED
+    jz      @F
+    mov     ecx, dword ptr [g_col_frame]
+@@: WINCALL CreateSolidBrush, ecx
+    mov     qword ptr [rbp-40], rax
+    WINCALL FillRect, qword ptr [rbp-32], addr rbp-80, qword ptr [rbp-40]
+    WINCALL DeleteObject, qword ptr [rbp-40]
+    WINCALL SetBkMode, qword ptr [rbp-32], 1
+    mov     ecx, dword ptr [g_col_text]          ; grayed/disabled item -> dim text
+    mov     r11, qword ptr [rbp-24]
+    test    dword ptr [r11+16], 6                ; ODS_GRAYED | ODS_DISABLED
+    jz      @F
+    mov     ecx, dword ptr [g_col_textdim]
+@@: WINCALL SetTextColor, qword ptr [rbp-32], ecx
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_dlgfont]
+    mov     qword ptr [rbp-48], rax              ; old font
+    mov     r11, qword ptr [rbp-24]
+    mov     rax, qword ptr [r11+56]              ; itemData = label ptr
+    mov     qword ptr [rbp-56], rax
+    mov     eax, dword ptr [rbp-80]
+    add     eax, 12
+    mov     dword ptr [rbp-120], eax             ; text rect [L+12 .. R]
+    mov     eax, dword ptr [rbp-76]
+    mov     dword ptr [rbp-116], eax
+    mov     eax, dword ptr [rbp-72]
+    mov     dword ptr [rbp-112], eax
+    mov     eax, dword ptr [rbp-68]
+    mov     dword ptr [rbp-108], eax
+    WINCALL DrawTextW, qword ptr [rbp-32], qword ptr [rbp-56], -1, addr rbp-120, 24h
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-48]
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gui_menu_draw endp
+
 ; gui_overflow_menu(rcx=hdlg) - the header "..." menu: copy password/username,
 ;   delete entry.  Copies reuse gui_row_copy; delete posts IDC_V_REMOVE.
 gui_overflow_menu proc frame
-    FRAME_PROLOG 96
+    FRAME_PROLOG 128
     mov     qword ptr [rbp-24], rcx
     WINCALL CreatePopupMenu
     mov     qword ptr [rbp-32], rax
     test    rax, rax
     jz      gom_done
-    WINCALL AppendMenuW, qword ptr [rbp-32], 0, 1, addr om_copypw
-    WINCALL AppendMenuW, qword ptr [rbp-32], 0, 2, addr om_copyuser
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 1, addr om_copypw
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 2, addr om_copyuser
     cmp     dword ptr [g_no_phonetic], 0         ; "Disable phonetic reader" -> hide it
     jne     @F
-    WINCALL AppendMenuW, qword ptr [rbp-32], 0, 4, addr om_read
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 4, addr om_read
 @@: cmp     dword ptr [g_no_history], 0          ; "Do not save history" -> hide the browser
     jne     @F
-    WINCALL AppendMenuW, qword ptr [rbp-32], 0, 5, addr om_history
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 5, addr om_history
 @@: WINCALL AppendMenuW, qword ptr [rbp-32], MF_SEPARATOR, 0, 0
-    WINCALL AppendMenuW, qword ptr [rbp-32], 0, 3, addr om_delete
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 3, addr om_delete
+    mov     rcx, qword ptr [rbp-32]              ; tint the menu background
+    call    gui_menu_dark
+    mov     qword ptr [rbp-64], rax              ; bg brush (delete after tracking)
     lea     rcx, [rbp-56]                        ; POINT
     call    GetCursorPos
     WINCALL SetForegroundWindow, qword ptr [rbp-24]
@@ -5967,6 +6075,7 @@ gui_overflow_menu proc frame
             dword ptr [rbp-56], dword ptr [rbp-52], 0, qword ptr [rbp-24], 0
     mov     dword ptr [rbp-44], eax              ; chosen id
     WINCALL DestroyMenu, qword ptr [rbp-32]
+    WINCALL DeleteObject, qword ptr [rbp-64]
     cmp     dword ptr [rbp-44], 3
     jne     gom_notdel
     WINCALL PostMessageW, qword ptr [rbp-24], WM_COMMAND, IDC_V_REMOVE, 0
@@ -6769,26 +6878,29 @@ gui_update_fav_glyph endp
 
 ; gui_addfield_menu(rcx=hdlg) - popup the field-type palette at the cursor.
 gui_addfield_menu proc frame
-    FRAME_PROLOG 96
+    FRAME_PROLOG 128
     mov     qword ptr [rbp-24], rcx
     WINCALL CreatePopupMenu
     mov     qword ptr [rbp-32], rax
     test    rax, rax
     jz      gam_done
-    WINCALL AppendMenuW, qword ptr [rbp-32], 0, 1, addr kl_user
-    WINCALL AppendMenuW, qword ptr [rbp-32], 0, 2, addr kl_secret
-    WINCALL AppendMenuW, qword ptr [rbp-32], 0, 3, addr kl_url
-    WINCALL AppendMenuW, qword ptr [rbp-32], 0, 4, addr kl_email
-    WINCALL AppendMenuW, qword ptr [rbp-32], 0, 5, addr kl_notes
-    mov     dword ptr [rbp-40], 0               ; MF_STRING|MF_ENABLED
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 1, addr kl_user
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 2, addr kl_secret
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 3, addr kl_url
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 4, addr kl_email
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 5, addr kl_notes
+    mov     dword ptr [rbp-40], MF_OWNERDRAW    ; enabled owner-draw
     call    gui_has_totp                        ; grey TOTP if one already exists (live rows)
     test    eax, eax
     jz      gam_totp
-    mov     dword ptr [rbp-40], 1               ; MF_GRAYED
+    mov     dword ptr [rbp-40], MF_OWNERDRAW or 1  ; MF_OWNERDRAW | MF_GRAYED
 gam_totp:
     WINCALL AppendMenuW, qword ptr [rbp-32], dword ptr [rbp-40], 6, addr kl_totp
-    WINCALL AppendMenuW, qword ptr [rbp-32], 0, 9, addr kl_file
-    WINCALL AppendMenuW, qword ptr [rbp-32], 0, 7, addr pm_custom
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 9, addr kl_file
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 7, addr pm_custom
+    mov     rcx, qword ptr [rbp-32]              ; tint the menu background
+    call    gui_menu_dark
+    mov     qword ptr [rbp-64], rax
     lea     rcx, [rbp-56]                        ; POINT
     call    GetCursorPos
     WINCALL SetForegroundWindow, qword ptr [rbp-24]
@@ -6796,6 +6908,7 @@ gam_totp:
             dword ptr [rbp-56], dword ptr [rbp-52], 0, qword ptr [rbp-24], 0
     mov     dword ptr [rbp-44], eax              ; chosen id
     WINCALL DestroyMenu, qword ptr [rbp-32]
+    WINCALL DeleteObject, qword ptr [rbp-64]
     cmp     dword ptr [rbp-44], 0
     je      gam_done
     mov     rcx, qword ptr [rbp-24]
@@ -7054,12 +7167,24 @@ vp_tdraw_list:
     call    gui_draw_listitem
     mov     eax, 1
     jmp     vp_ret
+vp_tdraw_menu:
+    mov     rcx, r9
+    call    gui_menu_draw
+    mov     eax, 1
+    jmp     vp_ret
 vp_measure:
-    mov     r10, r9                          ; MEASUREITEMSTRUCT.itemHeight per layout
-    mov     eax, dword ptr [g_layout]
+    mov     r10, r9
+    cmp     dword ptr [r10+0], 1             ; ODT_MENU -> size to the label
+    je      vp_measure_menu
+    mov     eax, dword ptr [g_layout]        ; MEASUREITEMSTRUCT.itemHeight per layout
     lea     r11, [lay_itemh]
     mov     eax, dword ptr [r11+rax*4]
     mov     dword ptr [r10+16], eax
+    mov     eax, 1
+    jmp     vp_ret
+vp_measure_menu:
+    mov     rcx, r9
+    call    gui_menu_measure
     mov     eax, 1
     jmp     vp_ret
 vp_compare:
@@ -7084,6 +7209,8 @@ vp_terase:
     jmp     vp_ret
 vp_tdraw:
     mov     r10, r9
+    cmp     dword ptr [r10+0], 1              ; ODT_MENU -> themed owner-draw menu item
+    je      vp_tdraw_menu
     mov     eax, dword ptr [r10+4]            ; DRAWITEMSTRUCT.CtlID
     cmp     eax, IDC_V_MTPM                   ; the TPM control = Fluent pill toggle
     je      vp_tdraw_toggle
@@ -10778,15 +10905,19 @@ gui_tray_menu proc frame
     mov     qword ptr [rbp-24], rcx
     WINCALL CreatePopupMenu
     mov     qword ptr [rbp-32], rax
-    WINCALL AppendMenuW, qword ptr [rbp-32], MF_STRING, IDM_ABOUT, addr t_about
-    WINCALL AppendMenuW, qword ptr [rbp-32], MF_STRING, IDM_OPEN, addr mi_open
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, IDM_ABOUT, addr t_about
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, IDM_OPEN, addr mi_open
     WINCALL AppendMenuW, qword ptr [rbp-32], MF_SEPARATOR, 0, 0
-    WINCALL AppendMenuW, qword ptr [rbp-32], MF_STRING, IDM_EXIT, addr mi_exit
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, IDM_EXIT, addr mi_exit
+    mov     rcx, qword ptr [rbp-32]              ; tint the menu background
+    call    gui_menu_dark
+    mov     qword ptr [rbp-40], rax
     WINCALL GetCursorPos, addr g_pt
     WINCALL SetForegroundWindow, qword ptr [rbp-24]
     WINCALL TrackPopupMenu, qword ptr [rbp-32], TPM_RIGHTBUTTON, dword ptr [g_pt], \
             dword ptr [g_pt+4], 0, qword ptr [rbp-24], 0
     WINCALL DestroyMenu, qword ptr [rbp-32]
+    WINCALL DeleteObject, qword ptr [rbp-40]
     FRAME_EPILOG
     ret
 gui_tray_menu endp
@@ -10808,7 +10939,21 @@ tray_wndproc proc
     je      twp_cmd
     cmp     rdx, WM_DESTROY
     je      twp_destroy
+    cmp     rdx, WM_MEASUREITEM                 ; themed owner-draw tray menu
+    je      twp_measure
+    cmp     rdx, WM_DRAWITEM
+    je      twp_draw
     WINCALL DefWindowProcW, qword ptr [rbp-8], qword ptr [rbp-16], qword ptr [rbp-24], qword ptr [rbp-32]
+    jmp     twp_ret
+twp_measure:
+    mov     rcx, qword ptr [rbp-32]
+    call    gui_menu_measure
+    mov     eax, 1
+    jmp     twp_ret
+twp_draw:
+    mov     rcx, qword ptr [rbp-32]
+    call    gui_menu_draw
+    mov     eax, 1
     jmp     twp_ret
 twp_tray:
     movzx   eax, word ptr [rbp-32]           ; LOWORD(lParam) = mouse message
