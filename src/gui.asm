@@ -256,6 +256,8 @@ WM_CTLCOLORBTN      equ 135h
 WM_CTLCOLORDLG      equ 136h
 WM_CTLCOLORSTATIC   equ 138h
 THEME_TIMER         equ 9
+SCHEME_RAINBOW      equ 8                   ; animated rainbow-accent scheme
+RAINBOW_MS          equ 70
 EM_SETCUEBANNER     equ 1501h
 ; ---- system tray / window-loop -----------------------------------------------
 WM_DESTROY          equ 2
@@ -713,9 +715,10 @@ sn_solar dw 'S','o','l','a','r','i','z','e','d',0
 sn_sepia dw 'S','e','p','i','a',0
 sn_nord dw 'N','o','r','d',0
 sn_rose dw 'R','o','s','e',0
+sn_rainbow dw 'R','a','i','n','b','o','w',0
 align 8
-scheme_names dq sn_dark, sn_light, sn_mid, sn_contrast, sn_solar, sn_sepia, sn_nord, sn_rose
-GUI_SCHEME_COUNT equ 8
+scheme_names dq sn_dark, sn_light, sn_mid, sn_contrast, sn_solar, sn_sepia, sn_nord, sn_rose, sn_rainbow
+GUI_SCHEME_COUNT equ 9
 layout_gaps  dd 7, 3, 14                          ; inter-card gap (DLU) per layout
 lay_band     dd 14, 0, 18                         ; label band: card(top) vs 0=flat(left)
 lay_itemh    dd 42, 30, 58                         ; list-item pixel height (index 0 used)
@@ -7673,6 +7676,13 @@ vp_theme:
 @@: mov     dword ptr [g_scheme], eax
     mov     rcx, qword ptr [rbp-8]
     call    gui_apply_scheme
+    cmp     dword ptr [g_scheme], SCHEME_RAINBOW  ; run/stop the accent animation timer
+    jne     vpt_notimer
+    WINCALL SetTimer, qword ptr [rbp-8], THEME_TIMER, RAINBOW_MS, 0
+    jmp     vpt_tdone
+vpt_notimer:
+    WINCALL KillTimer, qword ptr [rbp-8], THEME_TIMER
+vpt_tdone:
     call    gui_save_prefs
     jmp     vp_handled
 vp_export:

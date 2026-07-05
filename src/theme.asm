@@ -57,6 +57,7 @@ extern GetWindowLongPtrW:proc
 extern SetWindowLongPtrW:proc
 extern GetDlgItem:proc
 extern SetTimer:proc
+extern RedrawWindow:proc
 extern SendMessageW:proc
 extern EnumChildWindows:proc
 extern SetWindowTheme:proc
@@ -81,6 +82,8 @@ WM_CTLCOLORLISTBOX  equ 134h
 WM_CTLCOLORSTATIC   equ 138h
 DM_SETDEFID         equ 401h
 THEME_TIMER         equ 9
+RAINBOW_MS          equ 70                  ; Rainbow accent animation tick (ms)
+RAINBOW_STEP        equ 6                   ; hue advance per tick (1530 hues / 6 -> ~18s cycle)
 GWL_STYLE           equ -16
 GWL_EXSTYLE         equ -20
 GWL_USERDATA        equ -21                  ; 1 = Fluent accent (primary) button
@@ -128,6 +131,7 @@ align 8
 ; IID_IDXGIFactory1 {770aae78-f26f-4dba-a829-253c83d1b387}
 g_overlay   dd 0
 g_phase     dd 0
+g_rainbow_phase dd 0                      ; Rainbow scheme: hue position 0..1529
 g_bw        dd 0
 g_bh        dd 0
 g_memdc     dq 0
@@ -153,7 +157,8 @@ g_col_dark  dd 1
 g_col_side  dd 00342A26h                  ; sidebar (list + search) panel colour
 g_col_filebadge dd 00544A3Ah              ; attachment/file chip fill (distinct from bg/panel)
 SCHEME_DW   equ 14                        ; dwords per scheme row
-SCHEME_COUNT equ 8
+SCHEME_COUNT equ 9
+SCHEME_RAINBOW equ 8                       ; animated: accent/frame hue cycles on theme_tick
 schemes label dword
     ; bg       panel     frame     btn       btnsel    text      textdim   border    accent    accsel    focus     dark  side      filebadge
     dd 00202020h,002D2D2Dh,003D3D3Dh,002D2D2Dh,002A2A2Ah,00FFFFFFh,00C8C8C8h,003D3D3Dh,00FFC24Ch,00DBA03Ah,00FFC24Ch,1,00342A26h,00544A3Ah  ; Dark
@@ -164,6 +169,7 @@ schemes label dword
     dd 00D8ECF4h,00E0F3FBh,00A8C8D8h,00E0F3FBh,00C0DFEAh,002A3B4Bh,00556A7Ah,00A8C8D8h,001D65B5h,00144E90h,001D65B5h,0,00C4D2D6h,00CCDCE4h  ; Sepia
     dd 0040342Eh,0052423Bh,006A564Ch,0052423Bh,005E4C43h,00F4EFECh,00E9DED8h,006A564Ch,00D0C088h,00B0A06Fh,00D0C088h,1,004F4039h,00786858h  ; Nord
     dd 00F3F0FFh,00FFFFFFh,00D0C8F0h,00FFFFFFh,00E4DCFAh,00302A3Ah,00746A8Ah,00D0C8F0h,006C33D6h,005A28B0h,006C33D6h,0,00F8E0E9h,00E0D0F0h  ; Rose
+    dd 00181418h,00241E28h,00403850h,00241E28h,002E2838h,00FFFFFFh,00C8C8C8h,00403850h,004040FFh,003030C0h,004040FFh,1,001C1622h,00382E42h  ; Rainbow (accent animates)
 g_br_bg     dq 0
 g_br_side   dq 0                            ; sidebar (list + search) fill
 g_br_panel  dq 0
@@ -604,6 +610,10 @@ theme_attach proc frame
     WINCALL SetLayeredWindowAttributes, qword ptr [rbp-24], 0, WIN_ALPHA, LWA_ALPHA
     ; dark scrollbars/borders on the standard controls (listbox, multiline edits)
     WINCALL EnumChildWindows, qword ptr [rbp-24], addr theme_dark_cb, 0
+    cmp     dword ptr [g_scheme], SCHEME_RAINBOW  ; Rainbow -> run the accent animation timer
+    jne     ta_defid
+    WINCALL SetTimer, qword ptr [rbp-24], THEME_TIMER, RAINBOW_MS, 0
+ta_defid:
     cmp     dword ptr [rbp-32], 0
     je      ta_done
     WINCALL SendMessageW, qword ptr [rbp-24], DM_SETDEFID, dword ptr [rbp-32], 0
@@ -615,6 +625,107 @@ ta_done:
     ret
 theme_attach endp
 
+; hue6(ecx = phase 0..1529) -> eax = COLORREF for a full-saturation rainbow.  Leaf.
+hue6 proc
+    mov     eax, ecx
+    xor     edx, edx
+    mov     r8d, 255
+    div     r8d                          ; eax = segment (0..5), edx = t (0..254)
+    cmp     eax, 0
+    je      h_s0
+    cmp     eax, 1
+    je      h_s1
+    cmp     eax, 2
+    je      h_s2
+    cmp     eax, 3
+    je      h_s3
+    cmp     eax, 4
+    je      h_s4
+    mov     r9d, 255                      ; seg 5: magenta -> red  (R=255,G=0,B=255-t)
+    xor     r10d, r10d
+    mov     r11d, 255
+    sub     r11d, edx
+    jmp     h_pack
+h_s0:                                     ; red -> yellow  (R=255,G=t,B=0)
+    mov     r9d, 255
+    mov     r10d, edx
+    xor     r11d, r11d
+    jmp     h_pack
+h_s1:                                     ; yellow -> green  (R=255-t,G=255,B=0)
+    mov     r9d, 255
+    sub     r9d, edx
+    mov     r10d, 255
+    xor     r11d, r11d
+    jmp     h_pack
+h_s2:                                     ; green -> cyan  (R=0,G=255,B=t)
+    xor     r9d, r9d
+    mov     r10d, 255
+    mov     r11d, edx
+    jmp     h_pack
+h_s3:                                     ; cyan -> blue  (R=0,G=255-t,B=255)
+    xor     r9d, r9d
+    mov     r10d, 255
+    sub     r10d, edx
+    mov     r11d, 255
+    jmp     h_pack
+h_s4:                                     ; blue -> magenta  (R=t,G=0,B=255)
+    mov     r9d, edx
+    xor     r10d, r10d
+    mov     r11d, 255
+h_pack:
+    mov     eax, r9d                      ; COLORREF = R | G<<8 | B<<16
+    shl     r10d, 8
+    or      eax, r10d
+    shl     r11d, 16
+    or      eax, r11d
+    ret
+hue6 endp
+
+; scale_col(eax = COLORREF, ecx = numerator over 16) -> eax = dimmed COLORREF.  Leaf.
+scale_col proc
+    movzx   r8d, al                       ; R
+    mov     r9d, eax                      ; G
+    shr     r9d, 8
+    movzx   r9d, r9b
+    mov     r10d, eax
+    shr     r10d, 16
+    movzx   r10d, r10b                    ; B
+    imul    r8d, ecx
+    shr     r8d, 4
+    imul    r9d, ecx
+    shr     r9d, 4
+    imul    r10d, ecx
+    shr     r10d, 4
+    mov     eax, r8d
+    shl     r9d, 8
+    or      eax, r9d
+    shl     r10d, 16
+    or      eax, r10d
+    ret
+scale_col endp
+
+; theme_rainbow_step - advance the hue and rebuild the accent (vivid) + frame
+;   (dim complementary) colours, then recreate the scheme brushes/pens.
+theme_rainbow_step proc frame
+    FRAME_PROLOG 48
+    mov     eax, dword ptr [g_rainbow_phase]
+    add     eax, RAINBOW_STEP
+    cmp     eax, 1530
+    jb      @F
+    sub     eax, 1530
+@@: mov     dword ptr [g_rainbow_phase], eax
+    mov     ecx, eax                      ; accent = hue6(phase)
+    call    hue6
+    mov     dword ptr [g_col_accent], eax
+    mov     dword ptr [g_col_focus], eax
+    mov     ecx, 12                       ; accsel = 75% accent
+    call    scale_col
+    mov     dword ptr [g_col_accsel], eax
+    call    theme_rebrush
+    FRAME_EPILOG
+    ret
+theme_rainbow_step endp
+
 ; =============================================================================
 ; theme_tick(rcx=hwnd)
 ; =============================================================================
@@ -622,6 +733,12 @@ public theme_tick
 theme_tick proc frame
     FRAME_PROLOG 48
     mov     qword ptr [rbp-24], rcx
+    cmp     dword ptr [g_scheme], SCHEME_RAINBOW
+    jne     tt_bg
+    call    theme_rainbow_step
+    WINCALL RedrawWindow, qword ptr [rbp-24], 0, 0, 81h   ; RDW_INVALIDATE|RDW_ALLCHILDREN
+    jmp     tt_done
+tt_bg:
     cmp     qword ptr [g_bits], 0
     je      tt_done
     inc     dword ptr [g_phase]
