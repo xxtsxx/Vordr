@@ -344,7 +344,7 @@ BEGIN
         BLOCK "040904b0"           /* US English (0x0409), Unicode (1200) */
         BEGIN
             VALUE "CompanyName",      "Thomas Smistad"
-            VALUE "FileDescription",  "Vordr - hardened password manager (AES-256-GCM + Argon2id)"
+            VALUE "FileDescription",  "Vordr password manager https://github.com/xxtsxx/vordr"
             VALUE "FileVersion",      "0.1.0.0"
             VALUE "InternalName",     "vordr"
             VALUE "LegalCopyright",   "Copyright (C) 2026 Thomas Smistad"

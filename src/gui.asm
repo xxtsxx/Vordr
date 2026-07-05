@@ -163,6 +163,11 @@ extern SetWindowTextW:proc
 extern CheckDlgButton:proc
 extern GetDlgCtrlID:proc
 extern GetKeyState:proc
+extern SetWindowLongPtrW:proc
+extern CallWindowProcW:proc
+extern LoadCursorW:proc
+extern SetCursor:proc
+extern HideCaret:proc
 extern SetTextColor:proc
 extern SetBkMode:proc
 extern TextOutW:proc
@@ -236,8 +241,13 @@ WM_SETFONT          equ 30h
 WM_MOUSEWHEEL       equ 20Ah
 WM_COMMAND          equ 111h
 WM_PAINT            equ 0Fh
+WM_SETCURSOR        equ 20h
 WM_ERASEBKGND       equ 14h
 WM_DRAWITEM         equ 2Bh
+GWLP_WNDPROC        equ -4
+IDC_HAND            equ 32649
+HTCLIENT            equ 1
+LINK_BLUE           equ 00E08C3Ch        ; COLORREF (RGB 60,140,224) hyperlink blue
 WM_MEASUREITEM      equ 2Ch
 WM_COMPAREITEM      equ 39h
 WM_CTLCOLOREDIT     equ 133h
@@ -947,6 +957,7 @@ g_urlbuf    dw 1024 dup (?)          ; URL read from a URL field for click-to-op
 g_urlbuf2   dw 1040 dup (?)          ; URL with an https:// scheme prepended if bare
 g_menuinfo  db 40 dup (?)            ; MENUINFO scratch for themed popup menus
 align 8
+g_url_origproc dq ?                  ; original EDIT wndproc (URL fields subclassed for hand cursor)
 ; --- modular field-row model (runtime detail form) ---
 g_fields      db MAXROWS*DESCSZ dup (?)   ; row descriptors
 g_field_count dd ?                        ; live row count
@@ -3065,6 +3076,8 @@ gsd_fnext:
 gsd_fdone:
     mov     rcx, qword ptr [rbp-24]
     call    gui_rows_layout
+    mov     rcx, qword ptr [rbp-24]           ; hand-cursor subclass on URL value edits
+    call    gui_subclass_urls
     mov     rcx, qword ptr [rbp-24]           ; repaint the header tile+title for this entry
     mov     edx, IDC_V_HEADER
     call    GetDlgItem
@@ -5369,6 +5382,95 @@ guo_done:
     ret
 gui_url_open endp
 
+; url_editproc(rcx=hwnd, rdx=msg, r8=wParam, r9=lParam) -> rax - subclass proc for
+;   a URL field's value edit: in view mode it shows a hand cursor over the client
+;   area; everything else defers to the original EDIT window procedure.
+url_editproc proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 64
+    mov     qword ptr [rbp-8], rcx              ; hwnd
+    mov     qword ptr [rbp-16], rdx             ; msg
+    mov     qword ptr [rbp-24], r8              ; wParam
+    mov     qword ptr [rbp-32], r9              ; lParam
+    cmp     rdx, WM_SETCURSOR
+    jne     uep_pass
+    cmp     dword ptr [g_editmode], 0
+    jne     uep_pass                            ; edit mode -> normal I-beam
+    movzx   eax, word ptr [rbp-32]              ; LOWORD(lParam) = hit-test
+    cmp     eax, HTCLIENT
+    jne     uep_pass
+    WINCALL LoadCursorW, 0, IDC_HAND
+    WINCALL SetCursor, rax
+    mov     eax, 1                              ; TRUE -> halt default cursor handling
+    jmp     uep_ret
+uep_pass:
+    WINCALL CallWindowProcW, qword ptr [g_url_origproc], qword ptr [rbp-8], \
+            qword ptr [rbp-16], qword ptr [rbp-24], qword ptr [rbp-32]
+uep_ret:
+    mov     rsp, rbp
+    pop     rbp
+    ret
+url_editproc endp
+
+; gui_subclass_urls(rcx=hdlg) - subclass every VF_URL row's value edit with
+;   url_editproc (freshly-built controls, so idempotent per row rebuild).
+gui_subclass_urls proc frame
+    FRAME_PROLOG 48
+    mov     dword ptr [rbp-24], 0               ; row
+gsu_l:
+    mov     eax, dword ptr [rbp-24]
+    cmp     eax, dword ptr [g_field_count]
+    jae     gsu_done
+    mov     ecx, eax
+    call    gui_desc
+    cmp     dword ptr [rax+FD_KIND], VF_URL
+    jne     gsu_next
+    mov     ecx, dword ptr [rbp-24]
+    mov     edx, DS_VALUE
+    call    gui_row_handle                      ; -> rax = value control hwnd
+    test    rax, rax
+    jz      gsu_next
+    WINCALL SetWindowLongPtrW, rax, GWLP_WNDPROC, addr url_editproc
+    mov     qword ptr [g_url_origproc], rax     ; original EDIT proc (same for all)
+gsu_next:
+    inc     dword ptr [rbp-24]
+    jmp     gsu_l
+gsu_done:
+    FRAME_EPILOG
+    ret
+gui_subclass_urls endp
+
+; gui_ctlcolor(rcx=hdlg, rdx=msg, r8=hdc, r9=hctl) -> rax=brush - theme_ctlcolor,
+;   then paint a view-mode URL value edit's text in link blue.
+gui_ctlcolor proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], r8              ; hdc
+    mov     qword ptr [rbp-32], r9              ; hctl
+    call    theme_ctlcolor                      ; rdx/r8/r9 still valid -> rax = brush
+    mov     qword ptr [rbp-40], rax             ; brush
+    cmp     dword ptr [g_editmode], 0
+    jne     gcc_ret                             ; only recolour in view mode
+    WINCALL GetDlgCtrlID, qword ptr [rbp-32]
+    cmp     eax, IDC_DYN_BASE
+    jb      gcc_ret
+    mov     ecx, eax
+    sub     ecx, IDC_DYN_BASE
+    mov     r10d, ecx
+    and     r10d, DYN_SLOTS-1
+    cmp     r10d, DS_VALUE
+    jne     gcc_ret
+    shr     ecx, DYN_SLOTS_LOG2                 ; row
+    call    gui_desc
+    cmp     dword ptr [rax+FD_KIND], VF_URL
+    jne     gcc_ret
+    WINCALL SetTextColor, qword ptr [rbp-24], LINK_BLUE
+gcc_ret:
+    mov     rax, qword ptr [rbp-40]
+    FRAME_EPILOG
+    ret
+gui_ctlcolor endp
+
 ; gui_row_handle(ecx=row, edx=slot) -> rax = hwnd (0 if none).  Leaf.
 gui_row_handle proc
     mov     eax, ecx
@@ -7163,7 +7265,7 @@ vault_proc proc
     xor     eax, eax
     jmp     vp_ret
 vp_tcolor:
-    call    theme_ctlcolor
+    call    gui_ctlcolor                     ; theme + link-blue for view-mode URL values
     jmp     vp_ret
 vp_tdraw_list:
     mov     rcx, r9
@@ -7522,9 +7624,20 @@ vp_search_now:
     call    gui_poplist
     jmp     vp_handled
 vp_focusin:
-    ; a genuine mouse click on a view-mode URL value opens it in the browser
     cmp     dword ptr [g_editmode], 0
     jne     vp_refocus                          ; edit mode: field is being edited
+    ; view mode: suppress the blinking caret on the read-only detail edits (the
+    ; search box, id < IDC_DYN_BASE and not the title, keeps its caret)
+    mov     dword ptr [rbp-16], eax             ; save ctrl id
+    cmp     eax, IDC_DYN_BASE
+    jae     vpf_hidecaret
+    cmp     eax, IDC_V_TITLE
+    jne     vpf_caretdone
+vpf_hidecaret:
+    WINCALL HideCaret, r9                        ; r9 = focused control
+vpf_caretdone:
+    mov     eax, dword ptr [rbp-16]
+    ; a genuine mouse click on a view-mode URL value opens it in the browser
     cmp     eax, IDC_DYN_BASE
     jb      vp_refocus
     mov     ecx, eax
