@@ -156,20 +156,92 @@ g_col_focus dd 00FFC24Ch
 g_col_dark  dd 1
 g_col_side  dd 00342A26h                  ; sidebar (list + search) panel colour
 g_col_filebadge dd 00544A3Ah              ; attachment/file chip fill (distinct from bg/panel)
-SCHEME_DW   equ 14                        ; dwords per scheme row
-SCHEME_COUNT equ 9
+g_col_accent2 dd 00FFC24Ch                ; secondary accent (two-tone gradient end)
+SCHEME_DW   equ 15                        ; dwords per scheme row
+SCHEME_COUNT equ 39
 SCHEME_RAINBOW equ 8                       ; purple base; accent surfaces get a static rainbow gradient
 schemes label dword
-    ; bg       panel     frame     btn       btnsel    text      textdim   border    accent    accsel    focus     dark  side      filebadge
-    dd 00202020h,002D2D2Dh,003D3D3Dh,002D2D2Dh,002A2A2Ah,00FFFFFFh,00C8C8C8h,003D3D3Dh,00FFC24Ch,00DBA03Ah,00FFC24Ch,1,00342A26h,00544A3Ah  ; Dark
-    dd 00F3F3F3h,00FFFFFFh,00D2D2D2h,00FFFFFFh,00E6E6E6h,00202020h,00707070h,00D2D2D2h,00C26A00h,00A05800h,00C26A00h,0,00FFFFFFh,00E8DCC8h  ; Light
-    dd 001A1410h,00282018h,00403420h,00282018h,00201810h,00FFF0E0h,00C0B0A0h,00403420h,00E0C040h,00B09020h,00E0C040h,1,00170F0Fh,00504028h  ; Midnight
-    dd 00000000h,00151515h,00808080h,00202020h,00404040h,00FFFFFFh,00E0E0E0h,00808080h,0000FFFFh,0000C0C0h,0000FFFFh,1,001E0C0Ch,00404040h  ; Contrast
-    dd 00E3F6FDh,00D5E8EEh,00A1A193h,00D5E8EEh,00C8DAE0h,00756E58h,00969483h,00A1A193h,00D28B26h,00A86F1Eh,00D28B26h,0,00B0E4EFh,00C8D8C0h  ; Solarized
-    dd 00D8ECF4h,00E0F3FBh,00A8C8D8h,00E0F3FBh,00C0DFEAh,002A3B4Bh,00556A7Ah,00A8C8D8h,001D65B5h,00144E90h,001D65B5h,0,00C4D2D6h,00CCDCE4h  ; Sepia
-    dd 0040342Eh,0052423Bh,006A564Ch,0052423Bh,005E4C43h,00F4EFECh,00E9DED8h,006A564Ch,00D0C088h,00B0A06Fh,00D0C088h,1,004F4039h,00786858h  ; Nord
-    dd 00F3F0FFh,00FFFFFFh,00D0C8F0h,00FFFFFFh,00E4DCFAh,00302A3Ah,00746A8Ah,00D0C8F0h,006C33D6h,005A28B0h,006C33D6h,0,00F8E0E9h,00E0D0F0h  ; Rose
-    dd 00181420h,00241E30h,00443A5Ah,00241E30h,00302842h,00FFFFFFh,00C8C8C8h,00443A5Ah,00FF5A96h,00D24678h,00FF5A96h,1,001E1628h,003C3050h  ; Rainbow (purple base, gradient accents)
+    ; bg,panel,frame,btn,btnsel,text,textdim,border,accent,accsel,focus,dark,side,filebadge,accent2
+    dd 00202020h,002D2D2Dh,003D3D3Dh,002D2D2Dh,002A2A2Ah,00FFFFFFh,00C8C8C8h,003D3D3Dh,00FFC24Ch,00DBA03Ah,00FFC24Ch,00000001h,00342A26h,00544A3Ah,00FFC24Ch  ; Dark
+    dd 00F3F3F3h,00FFFFFFh,00D2D2D2h,00FFFFFFh,00E6E6E6h,00202020h,00707070h,00D2D2D2h,00C26A00h,00A05800h,00C26A00h,00000000h,00FFFFFFh,00E8DCC8h,00C26A00h  ; Light
+    dd 001A1410h,00282018h,00403420h,00282018h,00201810h,00FFF0E0h,00C0B0A0h,00403420h,00E0C040h,00B09020h,00E0C040h,00000001h,00170F0Fh,00504028h,00E0C040h  ; Midnight
+    dd 00000000h,00151515h,00808080h,00202020h,00404040h,00FFFFFFh,00E0E0E0h,00808080h,0000FFFFh,0000C0C0h,0000FFFFh,00000001h,001E0C0Ch,00404040h,0000FFFFh  ; Contrast
+    dd 00E3F6FDh,00D5E8EEh,00A1A193h,00D5E8EEh,00C8DAE0h,00756E58h,00969483h,00A1A193h,00D28B26h,00A86F1Eh,00D28B26h,00000000h,00B0E4EFh,00C8D8C0h,00D28B26h  ; Solarized
+    dd 00D8ECF4h,00E0F3FBh,00A8C8D8h,00E0F3FBh,00C0DFEAh,002A3B4Bh,00556A7Ah,00A8C8D8h,001D65B5h,00144E90h,001D65B5h,00000000h,00C4D2D6h,00CCDCE4h,001D65B5h  ; Sepia
+    dd 0040342Eh,0052423Bh,006A564Ch,0052423Bh,005E4C43h,00F4EFECh,00E9DED8h,006A564Ch,00D0C088h,00B0A06Fh,00D0C088h,00000001h,004F4039h,00786858h,00D0C088h  ; Nord
+    dd 00F3F0FFh,00FFFFFFh,00D0C8F0h,00FFFFFFh,00E4DCFAh,00302A3Ah,00746A8Ah,00D0C8F0h,006C33D6h,005A28B0h,006C33D6h,00000000h,00F8E0E9h,00E0D0F0h,006C33D6h  ; Rose
+    dd 00181420h,00241E30h,00443A5Ah,00241E30h,00302842h,00FFFFFFh,00C8C8C8h,00443A5Ah,00FF5A96h,00D24678h,00FF5A96h,00000001h,001E1628h,003C3050h,00FF5A96h  ; Rainbow
+    dd 001A0B0Bh,00341C1Ch,005A3A3Ah,00341C1Ch,004A2828h,00FCFCFCh,00C09C9Ch,005A3A3Ah,004030E4h,002010A0h,004030E4h,00000001h,00301414h,004A2A2Ah,00FCBC3Ch  ; NES
+    dd 000F380Fh,00306230h,000FAC8Bh,00306230h,00245024h,000FBC9Bh,000FAC8Bh,000FAC8Bh,000FBC9Bh,000FAC8Bh,000FBC9Bh,00000001h,000C300Ch,00245024h,00306230h  ; Game Boy
+    dd 008D3140h,00A03A48h,00C46978h,00A03A48h,00B04050h,00D67F8Bh,00C46978h,00C46978h,00FFA0B0h,00D06070h,00FFA0B0h,00000001h,00802C37h,00B04858h,00FFA0B0h  ; Commodore
+    dd 00000000h,000A0A0Ah,00555555h,000A0A0Ah,001A1A1Ah,00FFFFFFh,00AAAAAAh,00555555h,00FF55FFh,00C020C0h,00FF55FFh,00000001h,000A0A0Ah,00202020h,00FFFF55h  ; CGA
+    dd 00000000h,00101010h,00606060h,00101010h,00202020h,00FFFFFFh,00C0C0C0h,00606060h,000000FFh,00FF0000h,000000FFh,00000001h,000A0A0Ah,00181818h,0000FFFFh  ; ZX Spectrum
+    dd 0000101Ah,00001C2Ah,0000B0FFh,00001C2Ah,0000283Ah,0000B0FFh,000080C0h,0000B0FFh,0000B0FFh,000080C0h,0000B0FFh,00000001h,00000C14h,00001C2Ah,0000B0FFh  ; Amber CRT
+    dd 00001200h,00002200h,0066FF00h,00002200h,00003300h,0066FF00h,0040A000h,0066FF00h,0066FF00h,0040A000h,0066FF00h,00000001h,00000E00h,00002200h,0066FF00h  ; Green CRT
+    dd 00000000h,000E0E0Eh,0040FF40h,000E0E0Eh,001A1A1Ah,0040FF40h,0030B030h,0040FF40h,00FF40FFh,00FFFF40h,00FF40FFh,00000001h,000A0A0Ah,00181818h,00FFFF40h  ; Apple II
+    dd 00AA0000h,00C40000h,00FF5555h,00C40000h,00C01515h,00FFFFFFh,00D0B0B0h,00FF5555h,0055FFFFh,0020C0C0h,0055FFFFh,00000001h,00900000h,00C01515h,00FFFF55h  ; DOS
+    dd 003A1B2Bh,0050253Ah,00D56AFFh,0050253Ah,00662F4Ah,00FFE1F5h,00E09AC8h,00D56AFFh,00D56AFFh,00B05AC0h,00D56AFFh,00000001h,00301524h,005A2E44h,00FFC68Ah  ; Vaporwave
+    dd 002E0B1Ah,0048112Ah,00882EFFh,0048112Ah,005A1A3Ah,00F5E6FFh,00D09AC8h,00882EFFh,00882EFFh,006A1AD0h,00882EFFh,00000001h,00260815h,005A1534h,002E8AFFh  ; Synthwave
+    dd 0021020Dh,003A0A19h,00FF22F2h,003A0A19h,004A1024h,00FFF5FDh,00D090B0h,00FF22F2h,00FF22F2h,00D010C0h,00FF22F2h,00000001h,00180109h,00420D20h,00FFE000h  ; Outrun
+    dd 00120E0Ah,00221A12h,000AEEFCh,00221A12h,0030261Ch,00FFFBE8h,00C0B08Ah,000AEEFCh,000AEEFCh,0000B8C0h,000AEEFCh,00000001h,000F0B07h,00302418h,00FFF000h  ; Cyberpunk
+    dd 0016140Bh,002A2312h,00564A1Eh,002A2312h,003E341Ah,00F5F0D8h,00B4A87Ah,00564A1Eh,00307AFFh,00185AD0h,00307AFFh,00000001h,00141008h,00383016h,00D0C030h  ; Blade Runner
+    dd 00080500h,001C1403h,00C4A00Ah,001C1403h,00382A06h,00FFFBCFh,00C8B060h,00C4A00Ah,00FFE015h,00C0A010h,00FFE015h,00000001h,000E0900h,00302405h,00FFE015h  ; Tron
+    dd 00000000h,00001400h,0030C000h,00001400h,00002800h,0041FF00h,00289000h,0030C000h,0041FF00h,00289000h,0041FF00h,00000001h,00000A00h,00001C00h,0041FF00h  ; Matrix
+    dd 001E0812h,0030101Eh,00972EFFh,0030101Eh,0044182Ah,00FFE8FBh,00D098C0h,00972EFFh,00972EFFh,007818D0h,00972EFFh,00000001h,0018060Eh,00401428h,00FFCB2Eh  ; Neon Tokyo
+    dd 00332A13h,00443A1Ch,00C0D600h,00443A1Ch,00544A26h,00F8FBEFh,00BCC090h,00C0D600h,009C5EFFh,007C40D0h,009C5EFFh,00000001h,0029220Eh,004E4424h,00C8E000h  ; Miami
+    dd 00020602h,00061206h,0022C022h,00061206h,000A1E0Ah,0033FF33h,001FA01Fh,0022C022h,0033FF33h,001FA01Fh,0033FF33h,00000001h,00010401h,000A1A0Ah,0033FF33h  ; Hacker
+    dd 00000000h,00101010h,00909090h,00101010h,00202020h,00FFFFFFh,00B0B0B0h,00909090h,00FFFFFFh,00C0C0C0h,00FFFFFFh,00000001h,000A0A0Ah,001A1A1Ah,00FFFFFFh  ; Monochrome
+    dd 002E0A19h,00461026h,00B03A6Ah,00461026h,005A1A34h,00FFE4F0h,00D89AB8h,00B03A6Ah,00F755A8h,00D03880h,00F755A8h,00000001h,00240714h,0050162Eh,00FFA0D8h  ; Amethyst
+    dd 001A2006h,0028320Ah,005E7A1Ah,0028320Ah,003A4612h,00F4FFE0h,00BCD090h,005E7A1Ah,0098E010h,0078B00Ah,0098E010h,00000001h,000F1804h,0034400Eh,00D0FF60h  ; Emerald
+    dd 000C0622h,00140A38h,00341A8Ah,00140A38h,0020104Eh,00EAE4FFh,00A89AD8h,00341A8Ah,005A2EFFh,004018D0h,005A2EFFh,00000001h,000A041Ah,00120834h,00A08AFFh  ; Ruby
+    dd 00220E06h,0038180Ah,008A3A1Ah,0038180Ah,004E2210h,00FFEAE0h,00E0B09Ah,008A3A1Ah,00FF6A2Eh,00D04818h,00FF6A2Eh,00000001h,001A0A04h,00341208h,00FFB08Ah  ; Sapphire
+    dd 00081014h,000C1A22h,001A6E8Ah,000C1A22h,000E2834h,00E0F6FFh,009AC8D8h,001A6E8Ah,003CC8FFh,0020A0D0h,003CC8FFh,00000001h,00040A0Eh,0010202Ah,0090E6FFh  ; Royal Gold
+    dd 00222827h,002A302Fh,003E4849h,002A302Fh,00343B3Ah,00F2F8F8h,008A9090h,003E4849h,002EE2A6h,0020B080h,002EE2A6h,00000001h,001D2322h,00343D3Ch,001F97FDh  ; Monokai
+    dd 00362A28h,00463734h,005A4744h,00463734h,00503F3Ch,00F2F8F8h,00B0A2A0h,005A4744h,00F993BDh,00D0709Ah,00F993BDh,00000001h,002E2422h,004E3D3Ah,00C679FFh  ; Dracula
+    dd 00282828h,002F3032h,00454950h,002F3032h,0036383Ch,00B2DBEBh,008499A8h,00454950h,001980FEh,001060D0h,001980FEh,00000001h,001F2022h,0034363Ah,0026BBB8h  ; Gruvbox
+    dd 0026180Ah,003A2812h,005E4A1Eh,003A2812h,00503A1Ah,00FFF6E6h,00D0B890h,005E4A1Eh,00C0E05Eh,0098B03Ah,00C0E05Eh,00000001h,001E1308h,004A3816h,00F040A0h  ; Aurora
+    dd 003A1E2Ah,00502A3Ah,00D09AFFh,00502A3Ah,0060354Ah,00FFECFBh,00DCA8CAh,00D09AFFh,00D09AFFh,00A870D0h,00D09AFFh,00000001h,00321824h,005A3042h,00FFD09Ah  ; Cotton Candy
+; scheme_traits[scheme] = radius(byte0) | accent-mode(byte1: 0 solid/1 rainbow/2 two-tone) | flags(byte2: bit0 scanlines)
+scheme_traits label dword
+    dd 00000008h  ; Dark
+    dd 00000008h  ; Light
+    dd 00000008h  ; Midnight
+    dd 00000008h  ; Contrast
+    dd 00000008h  ; Solarized
+    dd 00000008h  ; Sepia
+    dd 00000008h  ; Nord
+    dd 00000008h  ; Rose
+    dd 00000108h  ; Rainbow
+    dd 00010000h  ; NES
+    dd 00010000h  ; Game Boy
+    dd 00000000h  ; Commodore
+    dd 00010200h  ; CGA
+    dd 00010000h  ; ZX Spectrum
+    dd 00010000h  ; Amber CRT
+    dd 00010000h  ; Green CRT
+    dd 00010200h  ; Apple II
+    dd 00000000h  ; DOS
+    dd 00000206h  ; Vaporwave
+    dd 00010204h  ; Synthwave
+    dd 00010204h  ; Outrun
+    dd 00010200h  ; Cyberpunk
+    dd 00000206h  ; Blade Runner
+    dd 00010000h  ; Tron
+    dd 00010000h  ; Matrix
+    dd 00010206h  ; Neon Tokyo
+    dd 00000206h  ; Miami
+    dd 00010000h  ; Hacker
+    dd 00010000h  ; Monochrome
+    dd 00000208h  ; Amethyst
+    dd 00000208h  ; Emerald
+    dd 00000208h  ; Ruby
+    dd 00000208h  ; Sapphire
+    dd 00000208h  ; Royal Gold
+    dd 00000006h  ; Monokai
+    dd 00000206h  ; Dracula
+    dd 00000006h  ; Gruvbox
+    dd 00000208h  ; Aurora
+    dd 00000208h  ; Cotton Candy
 g_br_bg     dq 0
 g_br_side   dq 0                            ; sidebar (list + search) fill
 g_br_panel  dq 0
@@ -727,6 +799,110 @@ trf_done:
     ret
 theme_rainbow_fill endp
 
+; theme_trait() -> eax = scheme_traits[g_scheme].  Leaf.  (byte0 radius, byte1
+;   accent mode 0 solid/1 rainbow/2 two-tone, byte2 bit0 = CRT scanlines.)
+public theme_trait
+theme_trait proc
+    mov     eax, dword ptr [g_scheme]
+    lea     r10, [scheme_traits]
+    mov     eax, dword ptr [r10+rax*4]
+    ret
+theme_trait endp
+
+; theme_twotone_fill(rcx=hdc, edx=L, r8d=T, r9d=R, [rbp+48]=B, [rbp+56]=radius) -
+;   fill a rounded rect with an accent -> accent2 horizontal gradient.
+theme_twotone_fill proc frame
+    FRAME_PROLOG 160
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-28], edx           ; L
+    mov     dword ptr [rbp-32], r8d           ; T
+    mov     dword ptr [rbp-36], r9d           ; R
+    mov     eax, dword ptr [rbp+48]
+    mov     dword ptr [rbp-40], eax           ; B
+    mov     eax, dword ptr [rbp+56]
+    mov     dword ptr [rbp-44], eax           ; radius
+    WINCALL CreateRoundRectRgn, dword ptr [rbp-28], dword ptr [rbp-32], \
+            dword ptr [rbp-36], dword ptr [rbp-40], dword ptr [rbp-44], dword ptr [rbp-44]
+    mov     qword ptr [rbp-56], rax
+    WINCALL SelectClipRgn, qword ptr [rbp-24], qword ptr [rbp-56]
+    lea     r10, [rbp-104]                    ; GRADIENT_RECT {0,1}
+    mov     dword ptr [r10], 0
+    mov     dword ptr [r10+4], 1
+    lea     r10, [rbp-96]                     ; v0 = { L, T, accent }
+    mov     eax, dword ptr [rbp-28]
+    mov     dword ptr [r10], eax
+    mov     eax, dword ptr [rbp-32]
+    mov     dword ptr [r10+4], eax
+    mov     ecx, dword ptr [g_col_accent]
+    call    tt_setcolor
+    lea     r10, [rbp-80]                     ; v1 = { R, B, accent2 }
+    mov     eax, dword ptr [rbp-36]
+    mov     dword ptr [r10], eax
+    mov     eax, dword ptr [rbp-40]
+    mov     dword ptr [r10+4], eax
+    mov     ecx, dword ptr [g_col_accent2]
+    call    tt_setcolor
+    WINCALL GradientFill, qword ptr [rbp-24], addr rbp-96, 2, addr rbp-104, 1, 0
+    WINCALL SelectClipRgn, qword ptr [rbp-24], 0
+    WINCALL DeleteObject, qword ptr [rbp-56]
+    FRAME_EPILOG
+    ret
+; tt_setcolor: r10 -> TRIVERTEX, ecx = COLORREF; write Red/Green/Blue COLOR16 (<<8), alpha 0.
+tt_setcolor:
+    movzx   eax, cl                           ; R
+    shl     eax, 8
+    mov     word ptr [r10+8], ax
+    mov     eax, ecx                          ; G
+    shr     eax, 8
+    movzx   eax, al
+    shl     eax, 8
+    mov     word ptr [r10+10], ax
+    mov     eax, ecx                          ; B
+    shr     eax, 16
+    movzx   eax, al
+    shl     eax, 8
+    mov     word ptr [r10+12], ax
+    mov     word ptr [r10+14], 0
+    ret
+theme_twotone_fill endp
+
+; theme_accent_fill(rcx=hdc, edx=L, r8d=T, r9d=R, [rbp+48]=B, [rbp+56]=radius) ->
+;   eax = 1 if it painted a gradient (mode 1/2), 0 if solid (caller keeps its fill).
+public theme_accent_fill
+theme_accent_fill proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-28], edx
+    mov     dword ptr [rbp-32], r8d
+    mov     dword ptr [rbp-36], r9d
+    mov     eax, dword ptr [rbp+48]
+    mov     dword ptr [rbp-40], eax
+    mov     eax, dword ptr [rbp+56]
+    mov     dword ptr [rbp-44], eax
+    call    theme_trait
+    shr     eax, 8
+    and     eax, 0FFh                          ; accent mode
+    cmp     eax, 1
+    je      taf_rain
+    cmp     eax, 2
+    je      taf_two
+    xor     eax, eax                           ; solid -> caller already filled
+    FRAME_EPILOG
+    ret
+taf_rain:
+    WINCALL theme_rainbow_fill, qword ptr [rbp-24], dword ptr [rbp-28], dword ptr [rbp-32], \
+            dword ptr [rbp-36], dword ptr [rbp-40], dword ptr [rbp-44]
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+taf_two:
+    WINCALL theme_twotone_fill, qword ptr [rbp-24], dword ptr [rbp-28], dword ptr [rbp-32], \
+            dword ptr [rbp-36], dword ptr [rbp-40], dword ptr [rbp-44]
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+theme_accent_fill endp
+
 ; =============================================================================
 ; theme_tick(rcx=hwnd)
 ; =============================================================================
@@ -962,11 +1138,42 @@ frame_cb endp
 ; =============================================================================
 public theme_erase
 theme_erase proc frame
-    FRAME_PROLOG 80
+    FRAME_PROLOG 128
     mov     qword ptr [rbp-24], rcx           ; hdc
     mov     qword ptr [rbp-32], rdx           ; hwnd
     WINCALL GetClientRect, qword ptr [rbp-32], addr rbp-72
     WINCALL FillRect, qword ptr [rbp-24], addr rbp-72, qword ptr [g_br_bg]
+    ; CRT scanline overlay for schemes flagged with it (dim 1px lines every 3px)
+    call    theme_trait
+    test    eax, 010000h                      ; flags byte2 bit0
+    jz      te_noscan
+    mov     eax, dword ptr [g_col_bg]          ; line colour = bg dimmed ~50%
+    shr     eax, 1
+    and     eax, 007F7F7Fh
+    WINCALL CreateSolidBrush, eax
+    mov     qword ptr [rbp-40], rax
+    mov     eax, dword ptr [rbp-68]           ; y = rect.top
+    mov     dword ptr [rbp-48], eax
+te_scanlp:
+    mov     eax, dword ptr [rbp-48]
+    cmp     eax, dword ptr [rbp-60]           ; rect.bottom
+    jge     te_scandone
+    lea     r10, [rbp-96]                     ; line rect { left, y, right, y+1 }
+    mov     eax, dword ptr [rbp-72]
+    mov     dword ptr [r10], eax
+    mov     eax, dword ptr [rbp-48]
+    mov     dword ptr [r10+4], eax
+    mov     eax, dword ptr [rbp-64]
+    mov     dword ptr [r10+8], eax
+    mov     eax, dword ptr [rbp-48]
+    inc     eax
+    mov     dword ptr [r10+12], eax
+    WINCALL FillRect, qword ptr [rbp-24], addr rbp-96, qword ptr [rbp-40]
+    add     dword ptr [rbp-48], 3
+    jmp     te_scanlp
+te_scandone:
+    WINCALL DeleteObject, qword ptr [rbp-40]
+te_noscan:
     cmp     dword ptr [g_overlay], 0          ; draw the sidebar card (flat path)
     jne     te_noside
     mov     rax, qword ptr [rbp-32]           ; only on the vault window
@@ -1132,18 +1339,19 @@ tdi_acc_on:
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_pen_acc]
     mov     dword ptr [rbp-116], COL_ONACC
 tdi_btnshape:
+    call    theme_trait                       ; per-scheme corner radius (0 = sharp 8-bit)
+    and     eax, 0FFh
+    mov     dword ptr [rbp-120], eax
     WINCALL RoundRect, qword ptr [rbp-32], dword ptr [rbp-80], dword ptr [rbp-76], \
-            dword ptr [rbp-72], dword ptr [rbp-68], 8, 8
-    ; Rainbow scheme: overpaint the accent (primary) button with a rainbow gradient
-    cmp     dword ptr [g_scheme], SCHEME_RAINBOW
-    jne     tdi_tclr
+            dword ptr [rbp-72], dword ptr [rbp-68], dword ptr [rbp-120], dword ptr [rbp-120]
+    ; accent (primary) button gets the scheme's gradient accent, if any
     WINCALL GetWindowLongPtrW, qword ptr [rbp-40], GWL_USERDATA
     test    rax, rax
     jz      tdi_tclr                          ; standard (non-accent) button -> no gradient
     test    dword ptr [rbp-48], ODS_DISABLED
     jnz     tdi_tclr
-    WINCALL theme_rainbow_fill, qword ptr [rbp-32], dword ptr [rbp-80], dword ptr [rbp-76], \
-            dword ptr [rbp-72], dword ptr [rbp-68], 8
+    WINCALL theme_accent_fill, qword ptr [rbp-32], dword ptr [rbp-80], dword ptr [rbp-76], \
+            dword ptr [rbp-72], dword ptr [rbp-68], dword ptr [rbp-120]
 tdi_tclr:
     mov     ecx, dword ptr [rbp-116]
     test    dword ptr [rbp-48], ODS_DISABLED
@@ -1243,15 +1451,13 @@ tg_dimtrack:
 tg_track:
     WINCALL RoundRect, qword ptr [rbp-32], dword ptr [rbp-40], dword ptr [rbp-44], \
             dword ptr [rbp-48], dword ptr [rbp-52], dword ptr [rbp-56], dword ptr [rbp-56]
-    ; Rainbow scheme: rainbow-gradient the ON track
-    cmp     dword ptr [g_scheme], SCHEME_RAINBOW
-    jne     tg_thumb
+    ; gradient the ON track for schemes with a gradient accent (no-op otherwise)
     cmp     dword ptr [rbp-36], 0
     je      tg_thumb
     mov     r10, qword ptr [rbp-24]
     test    dword ptr [r10+16], 4
     jnz     tg_thumb
-    WINCALL theme_rainbow_fill, qword ptr [rbp-32], dword ptr [rbp-40], dword ptr [rbp-44], \
+    WINCALL theme_accent_fill, qword ptr [rbp-32], dword ptr [rbp-40], dword ptr [rbp-44], \
             dword ptr [rbp-48], dword ptr [rbp-52], dword ptr [rbp-56]
 tg_thumb:
     ; ---- thumb ----
