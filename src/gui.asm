@@ -8411,20 +8411,26 @@ gsp_loop:
     test    eax, eax
     jz      gsp_next
 gsp_show:
-    mov     ecx, dword ptr [rbp-44]             ; title bytes -> wide in g_conv_w
+    mov     ecx, dword ptr [rbp-44]
     lea     rdx, [rbp-56]
-    call    gui_sel_title                        ; rax = ptr, [rbp-56] = byte len
-    mov     rcx, rax
+    call    gui_sel_title                        ; rax = ptr, [rbp-56] = len
+    ; import titles are already wide + NUL-terminated; vault titles are UTF-8 bytes
+    cmp     dword ptr [g_sel_src], 0
+    jne     gsp_wide
+    mov     rcx, rax                             ; vault: UTF-8 -> wide in g_conv_w
     mov     edx, dword ptr [rbp-56]
     lea     r8, [g_conv_w]
     mov     r9d, EBUF*2-1
     call    gui_towide
+    lea     rax, [g_conv_w]
+gsp_wide:
+    mov     qword ptr [rbp-64], rax              ; pszText (wide, NUL-terminated)
     lea     r10, [g_lvi]                         ; marshal LVITEMW
     mov     dword ptr [r10+0], LVIF_TEXT or LVIF_PARAM or LVIF_STATE
     mov     eax, dword ptr [rbp-48]
     mov     dword ptr [r10+4], eax               ; iItem = row
     mov     dword ptr [r10+8], 0                 ; iSubItem
-    lea     rax, [g_conv_w]
+    mov     rax, qword ptr [rbp-64]
     mov     qword ptr [r10+24], rax              ; pszText
     mov     eax, dword ptr [rbp-44]
     mov     qword ptr [r10+40], rax              ; lParam = source index
