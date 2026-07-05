@@ -28,13 +28,9 @@ extern WideCharToMultiByte:proc
 extern attach_reset:proc
 extern attach_stage:proc
 extern vault_build_entry:proc
-extern csv_to_wide:proc                  ; vordr.csv route
-extern csv_import_buffer:proc
-extern xlsx_import:proc                  ; vordr.xlsx route
 externdef g_ae_dk:byte
 externdef g_field_list:qword
 externdef g_field_n:dword
-externdef g_csv_alloc:qword
 
 ARF_SIZE    equ 68
 CP_UTF8_    equ 65001
@@ -68,8 +64,6 @@ g_zi_alabel dq ?                          ; zi_addattach: label wide (0/none)
 
 .const
 zi_jsonname db "vordr.json"
-zi_csvname  db "vordr.csv"
-zi_xlsxname db "vordr.xlsx"
 zl_title    db '"title":'
 zl_fields   db ',"fields":['
 zl_type     db '"type":'
@@ -779,17 +773,7 @@ zi_import proc frame
     call    zi_find
     cmp     eax, -1
     jne     zim_json
-    lea     rcx, [zi_csvname]
-    mov     edx, 9
-    call    zi_find
-    cmp     eax, -1
-    jne     zim_csv
-    lea     rcx, [zi_xlsxname]
-    mov     edx, 10
-    call    zi_find
-    cmp     eax, -1
-    jne     zim_xlsx
-    mov     dword ptr [rbp-40], -1              ; no recognizable data file
+    mov     dword ptr [rbp-40], -1              ; no vordr.json in the archive
     jmp     zim_free
 zim_json:
     mov     dword ptr [rbp-36], eax             ; member idx
@@ -806,50 +790,6 @@ zim_json_ok:
     call    zi_import_json
     mov     dword ptr [rbp-40], eax
     jmp     zim_free
-zim_csv:
-    mov     dword ptr [rbp-36], eax
-    mov     ecx, eax
-    call    zi_decrypt
-    test    eax, eax
-    jz      zim_csv_ok
-    mov     dword ptr [rbp-40], eax
-    jmp     zim_free
-zim_csv_ok:
-    mov     ecx, dword ptr [rbp-36]
-    call    zi_plain
-    lea     r8, [rbp-48]                        ; *wptr
-    lea     r9, [rbp-56]                        ; *wcount
-    mov     rcx, rax
-    call    csv_to_wide
-    test    eax, eax
-    jnz     zim_csv_fail
-    mov     rcx, qword ptr [rbp-48]
-    mov     edx, dword ptr [rbp-56]
-    call    csv_import_buffer
-    mov     dword ptr [rbp-40], eax
-    cmp     qword ptr [g_csv_alloc], 0
-    je      zim_free
-    mov     rcx, qword ptr [rbp-48]
-    mov     rdx, qword ptr [g_csv_alloc]
-    call    mem_free
-    jmp     zim_free
-zim_csv_fail:
-    mov     dword ptr [rbp-40], -1
-    jmp     zim_free
-zim_xlsx:
-    mov     dword ptr [rbp-36], eax
-    mov     ecx, eax
-    call    zi_decrypt
-    test    eax, eax
-    jz      zim_xlsx_ok
-    mov     dword ptr [rbp-40], eax
-    jmp     zim_free
-zim_xlsx_ok:
-    mov     ecx, dword ptr [rbp-36]
-    call    zi_plain
-    mov     rcx, rax
-    call    xlsx_import
-    mov     dword ptr [rbp-40], eax
 zim_free:
     mov     rcx, qword ptr [g_zi_arena]
     test    rcx, rcx

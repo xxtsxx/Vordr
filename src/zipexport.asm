@@ -16,12 +16,6 @@
 
 include macros.inc
 
-extern buf_putb:proc
-extern buf_putn:proc
-extern buf_pu16:proc
-extern buf_pu32:proc
-extern buf_zero:proc
-externdef g_xl_err:byte
 extern aes_expand_key:proc
 extern aes_ctr_xor:proc
 extern hmac_sha1:proc
@@ -29,21 +23,12 @@ extern rng_fill:proc
 extern mem_alloc:proc
 extern mem_free:proc
 extern secure_zero:proc
-extern buf_putcstr:proc
-extern buf_pu32dec:proc
 extern vault_count:proc
 extern vault_title_at:proc
 extern vault_field_count:proc
 extern vault_field_get:proc
 extern attach_open:proc
 extern WideCharToMultiByte:proc
-; --- Excel builder / agile encryptor (for the excel format inside ze_compose) ---
-extern xl_build_xlsx:proc
-extern xl_free:proc
-extern xl_encrypt:proc
-extern g_xlsx_ptr:qword
-extern g_xlsx_len:qword
-
 VF_IMAGE_   equ 9
 VF_FILE_    equ 10
 JSON_CAP    equ 16*1024*1024
@@ -57,6 +42,7 @@ CSV_ATT_CAP equ 4096                 ; max bytes for one row's joined attachment
 PBKDF2_ITERS equ 1000
 
 .data?
+g_xl_err    db ?                     ; shared build-error flag (moved from xlexport)
 align 16
 public g_zbuf
 g_zbuf      dq 3 dup (?)             ; {ptr,len,cap}
@@ -1233,40 +1219,16 @@ ze_build_csv endp
 ;   the AES-256 encrypted ZIP (0).
 ; =============================================================================
 public ze_compose
+; ze_compose(rcx = wide pw, edx = pw bytes) -> eax 0 ok / 1 error.  Builds the one
+;   supported archive: an AES-256 encrypted ZIP holding vordr.json (all tiles of
+;   the selected entries, history excluded) + every attachment.
 ze_compose proc frame
     FRAME_PROLOG 96
     mov     qword ptr [rbp-24], rcx             ; wide pw
     mov     dword ptr [rbp-32], edx             ; pw bytes
-    mov     dword ptr [rbp-36], r8d             ; format
-    mov     dword ptr [rbp-40], r9d             ; attachments
-    cmp     dword ptr [rbp-36], EXP_EXCEL
-    jne     comp_zip
-    cmp     dword ptr [rbp-40], 0
-    jne     comp_zip
-    ; ---- standalone encrypted .xlsx ----
-    call    xl_build_xlsx
-    test    eax, eax
-    jnz     comp_err
-    mov     rcx, qword ptr [rbp-24]
-    mov     edx, dword ptr [rbp-32]
-    call    xl_encrypt
-    test    eax, eax
-    jnz     comp_xerr
-    mov     eax, 2
-    FRAME_EPILOG
-    ret
-comp_xerr:
-    call    xl_free                             ; encrypt failed -> free plaintext package
-    mov     eax, 1
-    FRAME_EPILOG
-    ret
-comp_zip:
-    ; ---- encrypted ZIP: wide pw -> UTF-8, then assemble ----
     mov     eax, dword ptr [rbp-32]
     shr     eax, 1                              ; wide chars
-    mov     r9d, eax                            ; stage cchWideChar in r9d: WINCALL clobbers
-                                                ;   rax while lea-ing the `addr g_ze_u8pw` stack
-                                                ;   arg, so the 4th arg must NOT come from eax
+    mov     r9d, eax                            ; stage cchWideChar in r9d (WINCALL rax footgun)
     WINCALL WideCharToMultiByte, CP_UTF8_, 0, qword ptr [rbp-24], r9d, addr g_ze_u8pw, 500, 0, 0
     mov     dword ptr [rbp-44], eax             ; UTF-8 length
     call    ze_reset
@@ -1275,24 +1237,7 @@ comp_zip:
     lea     rcx, [g_ze_u8pw]
     mov     edx, dword ptr [rbp-44]
     call    ze_set_pw
-    mov     eax, dword ptr [rbp-36]
-    cmp     eax, EXP_JSON
-    je      comp_json
-    cmp     eax, EXP_CSV
-    je      comp_csv
-    ; ---- excel format wrapped in the zip: plain .xlsx package (zip encrypts) ----
-    call    xl_build_xlsx
-    test    eax, eax
-    jnz     comp_ziperr
-    lea     rcx, [zj_xlsxname]
-    mov     edx, 10
-    mov     r8, qword ptr [g_xlsx_ptr]
-    mov     r9, qword ptr [g_xlsx_len]
-    call    ze_add_file
-    call    xl_free
-    jmp     comp_attach
-comp_json:
-    call    ze_build_json
+    call    ze_build_json                       ; all tiles, history excluded
     test    eax, eax
     jnz     comp_ziperr
     lea     rcx, [zj_jsonname]
@@ -1305,29 +1250,9 @@ comp_json:
     mov     rcx, qword ptr [r10]
     mov     rdx, qword ptr [r10+16]
     call    mem_free
-    jmp     comp_attach
-comp_csv:
-    call    ze_build_csv
+    call    ze_add_attachments                  ; every image/file, path recorded in json
     test    eax, eax
     jnz     comp_ziperr
-    lea     rcx, [zj_csvname]
-    mov     edx, 9
-    lea     r10, [g_csvbuf]
-    mov     r8, qword ptr [r10]
-    mov     r9, qword ptr [r10+8]
-    call    ze_add_file
-    lea     r10, [g_csvbuf]
-    mov     rcx, qword ptr [r10]
-    mov     rdx, qword ptr [r10+16]
-    call    mem_free
-    jmp     comp_attach
-comp_attach:
-    cmp     dword ptr [rbp-40], 0
-    je      comp_fin
-    call    ze_add_attachments
-    test    eax, eax
-    jnz     comp_ziperr
-comp_fin:
     call    ze_finish
     lea     rcx, [g_ze_u8pw]                    ; wipe the UTF-8 password copy
     mov     edx, 500
@@ -1347,5 +1272,182 @@ comp_err:
     FRAME_EPILOG
     ret
 ze_compose endp
+
+
+; ---------------------------------------------------------------------------
+; Byte-buffer append helpers (moved from the removed xlexport.asm; the
+; encrypted-zip builder is now their only user).  Buffer desc = {ptr,len,cap}.
+; ---------------------------------------------------------------------------
+buf_putb proc
+    mov     rax, qword ptr [rcx+8]
+    cmp     rax, qword ptr [rcx+16]
+    jae     bpb_over
+    mov     r10, qword ptr [rcx]
+    mov     byte ptr [r10+rax], dl
+    inc     qword ptr [rcx+8]
+    ret
+bpb_over:
+    mov     byte ptr [g_xl_err], 1
+    ret
+buf_putb endp
+
+; buf_putn(rcx=desc, rdx=src, r8=len)                                          leaf
+buf_putn proc
+    test    r8, r8
+    jz      bpn_ret
+    mov     rax, qword ptr [rcx+8]
+    mov     r9, rax
+    add     r9, r8
+    cmp     r9, qword ptr [rcx+16]
+    ja      bpn_over
+    mov     r10, qword ptr [rcx]
+    add     r10, rax
+    xor     r11, r11
+bpn_lp:
+    mov     r9b, byte ptr [rdx+r11]
+    mov     byte ptr [r10+r11], r9b
+    inc     r11
+    cmp     r11, r8
+    jb      bpn_lp
+    add     qword ptr [rcx+8], r8
+bpn_ret:
+    ret
+bpn_over:
+    mov     byte ptr [g_xl_err], 1
+    ret
+buf_putn endp
+
+; buf_pu16(rcx=desc, edx=val)                                                  leaf
+buf_pu16 proc
+    mov     rax, qword ptr [rcx+8]
+    mov     r9, rax
+    add     r9, 2
+    cmp     r9, qword ptr [rcx+16]
+    ja      bp16_over
+    mov     r10, qword ptr [rcx]
+    mov     byte ptr [r10+rax], dl
+    shr     edx, 8
+    mov     byte ptr [r10+rax+1], dl
+    add     qword ptr [rcx+8], 2
+    ret
+bp16_over:
+    mov     byte ptr [g_xl_err], 1
+    ret
+buf_pu16 endp
+
+; buf_pu32(rcx=desc, edx=val)                                                  leaf
+buf_pu32 proc
+    mov     rax, qword ptr [rcx+8]
+    mov     r9, rax
+    add     r9, 4
+    cmp     r9, qword ptr [rcx+16]
+    ja      bp32_over
+    mov     r10, qword ptr [rcx]
+    mov     byte ptr [r10+rax], dl
+    shr     edx, 8
+    mov     byte ptr [r10+rax+1], dl
+    shr     edx, 8
+    mov     byte ptr [r10+rax+2], dl
+    shr     edx, 8
+    mov     byte ptr [r10+rax+3], dl
+    add     qword ptr [rcx+8], 4
+    ret
+bp32_over:
+    mov     byte ptr [g_xl_err], 1
+    ret
+buf_pu32 endp
+
+; buf_pu64(rcx=desc, rdx=val)                                                  leaf
+buf_pu64 proc
+    mov     rax, qword ptr [rcx+8]
+    mov     r9, rax
+    add     r9, 8
+    cmp     r9, qword ptr [rcx+16]
+    ja      bp64_over
+    mov     r10, qword ptr [rcx]
+    mov     qword ptr [r10+rax], rdx
+    add     qword ptr [rcx+8], 8
+    ret
+bp64_over:
+    mov     byte ptr [g_xl_err], 1
+    ret
+buf_pu64 endp
+
+; buf_zero(rcx=desc, rdx=count) - append count zero bytes                      leaf
+buf_zero proc
+    test    rdx, rdx
+    jz      bz_ret
+    mov     rax, qword ptr [rcx+8]
+    mov     r9, rax
+    add     r9, rdx
+    cmp     r9, qword ptr [rcx+16]
+    ja      bz_over
+    mov     r10, qword ptr [rcx]
+    add     r10, rax
+    xor     r11, r11
+bz_lp:
+    mov     byte ptr [r10+r11], 0
+    inc     r11
+    cmp     r11, rdx
+    jb      bz_lp
+    add     qword ptr [rcx+8], rdx
+bz_ret:
+    ret
+bz_over:
+    mov     byte ptr [g_xl_err], 1
+    ret
+buf_zero endp
+
+; buf_putcstr(rcx=desc, rdx=cstr)                                              leaf
+buf_putcstr proc
+bpc_lp:
+    mov     r8b, byte ptr [rdx]
+    test    r8b, r8b
+    jz      bpc_ret
+    mov     rax, qword ptr [rcx+8]
+    cmp     rax, qword ptr [rcx+16]
+    jae     bpc_over
+    mov     r10, qword ptr [rcx]
+    mov     byte ptr [r10+rax], r8b
+    inc     qword ptr [rcx+8]
+    inc     rdx
+    jmp     bpc_lp
+bpc_ret:
+    ret
+bpc_over:
+    mov     byte ptr [g_xl_err], 1
+    ret
+buf_putcstr endp
+
+; buf_pu32dec(rcx=desc, edx=val) - append value in decimal
+buf_pu32dec proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    mov     eax, edx                         ; value
+    lea     r9, [rbp-32]                     ; one past a 16-byte digit scratch
+    mov     r8d, 10
+    test    eax, eax
+    jnz     bpd_lp
+    dec     r9
+    mov     byte ptr [r9], '0'
+    jmp     bpd_emit
+bpd_lp:
+    xor     edx, edx
+    div     r8d
+    add     dl, '0'
+    dec     r9
+    mov     byte ptr [r9], dl
+    test    eax, eax
+    jnz     bpd_lp
+bpd_emit:
+    lea     rax, [rbp-32]
+    sub     rax, r9                          ; length
+    mov     rcx, qword ptr [rbp-24]
+    mov     rdx, r9
+    mov     r8, rax
+    call    buf_putn
+    FRAME_EPILOG
+    ret
+buf_pu32dec endp
 
 end
