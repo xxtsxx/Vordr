@@ -54,6 +54,9 @@ g_hkcu  dq 080000001h            ; HKEY_CURRENT_USER
 g_cfg_cb    dd ?                 ; RegGetValue/Set byte count
 g_cfg_dw    dd ?                 ; REG_DWORD value scratch
 g_cfg_khan  dq ?                 ; open key handle
+align 2
+cc_od       dw 1024 dup (?)      ; %OneDrive% root (cfg_classify_path scratch)
+cc_docs     dw 1024 dup (?)      ; Documents root (cfg_classify_path scratch)
 
 .code
 
@@ -341,6 +344,80 @@ cdv_fail:
     FRAME_EPILOG
     ret
 cfg_default_vault endp
+
+; ===========================================================================
+; cfg_path_prefix(rcx=path, rdx=prefix) -> eax = 1 if the wide path starts with
+;   prefix (ASCII case-insensitive), else 0.  Leaf.
+; ===========================================================================
+cfg_path_prefix proc
+    xor     r8d, r8d
+cpp_l:
+    movzx   eax, word ptr [rdx+r8*2]          ; prefix[i]
+    test    eax, eax
+    jz      cpp_yes                            ; prefix exhausted -> match
+    movzx   r9d, word ptr [rcx+r8*2]          ; path[i]
+    cmp     eax, 'A'                           ; fold prefix char
+    jb      cpp_p2
+    cmp     eax, 'Z'
+    ja      cpp_p2
+    add     eax, 32
+cpp_p2:
+    cmp     r9d, 'A'                           ; fold path char
+    jb      cpp_cmp
+    cmp     r9d, 'Z'
+    ja      cpp_cmp
+    add     r9d, 32
+cpp_cmp:
+    cmp     eax, r9d
+    jne     cpp_no
+    inc     r8d
+    cmp     r8d, 1024
+    jb      cpp_l
+cpp_yes:
+    mov     eax, 1
+    ret
+cpp_no:
+    xor     eax, eax
+    ret
+cfg_path_prefix endp
+
+; ===========================================================================
+; cfg_classify_path(rcx=path wide) -> eax = 0 OneDrive / 1 Documents / 2 other.
+;   Resolves the %OneDrive% and Documents roots and prefix-matches the path
+;   (OneDrive wins when Documents is itself OneDrive-backed).
+; ===========================================================================
+public cfg_classify_path
+cfg_classify_path proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    WINCALL GetEnvironmentVariableW, addr env_onedrive, addr cc_od, 1024
+    test    eax, eax
+    jz      ccp_docs
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [cc_od]
+    call    cfg_path_prefix
+    test    eax, eax
+    jz      ccp_docs
+    xor     eax, eax                           ; OneDrive
+    FRAME_EPILOG
+    ret
+ccp_docs:
+    WINCALL SHGetFolderPathW, 0, CSIDL_PERSONAL, 0, 0, addr cc_docs
+    test    eax, eax
+    jnz     ccp_other
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [cc_docs]
+    call    cfg_path_prefix
+    test    eax, eax
+    jz      ccp_other
+    mov     eax, 1                             ; Documents
+    FRAME_EPILOG
+    ret
+ccp_other:
+    mov     eax, 2
+    FRAME_EPILOG
+    ret
+cfg_classify_path endp
 
 ; ===========================================================================
 ; TPM convenience-unlock blobs live under HKCU\SOFTWARE\Vordr\TPM-Unlock, one

@@ -177,6 +177,7 @@ g_pen_bd    dq 0
 g_pen_acc   dq 0
 g_pen_focus dq 0                            ; 2px accent focus underline
 g_font_big  dq 0                            ; large glyph font for toolbar buttons
+public g_font_icon
 g_font_icon dq 0                            ; Segoe Fluent Icons (PUA glyph buttons)
 public g_font_totp
 g_font_totp dq 0                            ; slightly larger font for the TOTP code
