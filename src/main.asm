@@ -107,7 +107,10 @@ g_cfg_totp          dq 0                ; --> wide base32 TOTP secret (GUI)
 ; --- modular field list (the GUI composes this; vault_build_entry consumes it) --
 ; g_field_list[] = up to MAX_FIELDS descriptors of 3 qwords each:
 ;   { qword type(base kind), qword label-wide ptr (0=none), qword value-wide ptr }
-MAX_FIELDS          equ 32
+; Sized for the worst committed entry: title + up to MAXROWS-1 non-tile fields +
+; up to MAX_TFILES attachment files (the tile expands to one field per file) +
+; the reserved favorite/icon markers (see gui_tile_expand).
+MAX_FIELDS          equ 56
 public g_field_list, g_field_n
 g_field_n           dd 0                ; number of composed fields
 align 8

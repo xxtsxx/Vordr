@@ -26,7 +26,7 @@ externdef g_field_list:qword
 externdef g_field_n:dword
 
 CP_UTF8_ equ 65001
-MAX_FIELDS equ 32               ; matches main.asm g_field_list capacity
+MAX_FIELDS equ 32               ; CSV per-row column cap (<= main.asm g_field_list cap)
 
 .const
 ; header keywords (lowercase); checked in order, first substring hit wins

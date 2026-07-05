@@ -429,7 +429,7 @@ DESCSZ      equ 480            ; 16 + 16 handles*8 + 328 arf blob + 8 reserved (
 MAX_TFILES  equ 24             ; <= MAX_FIELDS minus the other fields of an entry
 TFILE_ENTRY equ 328
 TFILE_NAME  equ 68             ; filename offset within a tile-file entry
-MAX_FIELDS  equ 32             ; g_field_list capacity (matches main.asm)
+MAX_FIELDS  equ 56             ; g_field_list capacity (matches main.asm)
 MAXROWS     equ 24
 FDF_LABELED equ 1               ; FD_FLAGS bit0 = carries a custom label
 FDF_REVEALED equ 2              ; FD_FLAGS bit1 = value currently unmasked
@@ -2757,10 +2757,12 @@ gsd_attach:
     ; append this file to the attachments tile; create the tile row only once
     mov     eax, dword ptr [rbp-64]             ; vallen
     cmp     eax, 68
-    jb      gsd_attach_row                      ; malformed value -> skip the file
+    jb      gsd_attach_row                      ; < 68: no valid AttachRef -> skip the file
     mov     rcx, qword ptr [rbp-72]             ; valptr -> AttachRef
+    lea     rdx, [g_empty_w]                    ; default: no filename (vallen == 68)
+    jbe     @F
     lea     rdx, [rcx+68]                       ; filename wide (at value+68)
-    call    tf_append
+@@: call    tf_append
 gsd_attach_row:
     call    tf_find_row
     cmp     eax, -1
@@ -3857,7 +3859,10 @@ gui_basename endp
 ; Generic file attachments (VF_FILE)
 ; =============================================================================
 
-; gui_tile_make_temp(ecx = file index) - build g_tmpfile = %TEMP%\<filename>.
+; gui_tile_make_temp(ecx = file index) - build g_tmpfile = %TEMP%\<basename>.
+;   The stored filename can be attacker-controlled (imported from a zip), so any
+;   directory part is stripped (basename after the last '\' or '/') to keep the
+;   written+opened file confined to %TEMP% - no "..\" path traversal out of it.
 gui_tile_make_temp proc frame
     FRAME_PROLOG 48
     mov     dword ptr [rbp-24], ecx
@@ -3866,7 +3871,23 @@ gui_tile_make_temp proc frame
     mov     ecx, dword ptr [rbp-24]
     call    tf_entry
     add     rax, TFILE_NAME
-    mov     qword ptr [rbp-40], rax                  ; filename ptr
+    mov     r10, rax                                 ; scan cursor
+    mov     r11, rax                                 ; basename start
+gtmt_scan:
+    mov     dx, word ptr [r10]
+    test    dx, dx
+    jz      gtmt_scandone
+    cmp     dx, '\'
+    je      gtmt_sep
+    cmp     dx, '/'
+    jne     gtmt_next
+gtmt_sep:
+    lea     r11, [r10+2]                             ; name restarts after the separator
+gtmt_next:
+    add     r10, 2
+    jmp     gtmt_scan
+gtmt_scandone:
+    mov     qword ptr [rbp-40], r11                  ; sanitized filename ptr (basename)
     mov     eax, dword ptr [rbp-32]
     lea     rcx, [g_tmpfile]
     lea     rcx, [rcx+rax*2]                         ; dst = g_tmpfile + baselen
@@ -3963,9 +3984,12 @@ gui_tag_open proc frame
     mov     rdx, qword ptr [rbp-56]
     mov     r8, qword ptr [rbp-48]
     call    write_file
+    mov     dword ptr [rbp-60], eax                  ; write_file result
     mov     rcx, qword ptr [rbp-56]
     mov     rdx, qword ptr [rbp-48]
     call    mem_free
+    cmp     dword ptr [rbp-60], 0                     ; only open if the temp was written
+    jne     gto_done
     WINCALL ShellExecuteW, 0, addr verb_open, addr g_tmpfile, 0, 0, 1
 gto_done:
     FRAME_EPILOG
@@ -3998,17 +4022,21 @@ gui_tag_click proc frame
     mov     rcx, qword ptr [rbp-40]                  ; RECT: l -72,t -68,r -64,b -60
     lea     rdx, [rbp-72]
     call    GetClientRect
-    mov     ecx, dword ptr [rbp-60]                  ; clientH
-    test    ecx, ecx
+    mov     eax, dword ptr [rbp-60]                  ; chipH = clientH / n  (matches the
+    test    eax, eax                                 ; painter's chip layout exactly)
     jz      gtk_done
-    mov     eax, dword ptr [rbp-52]                  ; chip = pt.y * n / clientH
-    imul    eax, dword ptr [g_tilefile_n]
+    cdq
+    idiv    dword ptr [g_tilefile_n]
+    test    eax, eax
+    jz      gtk_done                                 ; more files than pixels -> bail
+    mov     ecx, eax                                 ; ecx = chipH
+    mov     eax, dword ptr [rbp-52]                  ; chip = pt.y / chipH
     cdq
     idiv    ecx
     cmp     eax, 0
     jl      gtk_done
     cmp     eax, dword ptr [g_tilefile_n]
-    jae     gtk_done
+    jae     gtk_done                                 ; in the unpainted bottom band -> ignore
     mov     dword ptr [rbp-76], eax                  ; chip index
     cmp     dword ptr [g_editmode], 0                ; x-hotspot only in edit mode
     je      gtk_open
@@ -4383,6 +4411,10 @@ grl_totptog_done:
     je      grl_attach
     jmp     grl_advance
 grl_attach:
+    mov     r10, qword ptr [rbp-32]                  ; the tile has no editable label
+    mov     rcx, qword ptr [r10+FD_HANDLES+DS_LABEL*8]  ; (files ARE the content) - hide
+    xor     edx, edx                                 ; it so a stray label can't be typed
+    call    ShowWindow                               ; and then silently dropped on save
     mov     rcx, qword ptr [rbp-24]                  ; "+" add button, card top-right
     mov     r10, qword ptr [rbp-32]                  ; corner (where the trash sits on
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_IMPORT*8]  ; other rows)
