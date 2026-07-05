@@ -1081,7 +1081,7 @@ theme_drawitem endp
 ; =============================================================================
 public theme_toggle
 theme_toggle proc frame
-    FRAME_PROLOG 112
+    FRAME_PROLOG 144
     mov     qword ptr [rbp-24], rcx           ; lpdis
     mov     dword ptr [rbp-36], edx           ; on
     mov     r10, rcx
@@ -1099,6 +1099,9 @@ theme_toggle proc frame
     sub     eax, dword ptr [rbp-44]
     mov     dword ptr [rbp-56], eax           ; height = pill diameter
     ; ---- track ----
+    mov     r10, qword ptr [rbp-24]           ; ODS_DISABLED (HKLM-locked) -> muted, no accent
+    test    dword ptr [r10+16], 4
+    jnz     tg_dimtrack
     cmp     dword ptr [rbp-36], 0
     je      tg_off
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_br_accent]
@@ -1107,16 +1110,26 @@ theme_toggle proc frame
 tg_off:
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_br_panel]
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_pen_bd]
+    jmp     tg_track
+tg_dimtrack:
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_br_dim]
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_pen_bd]
 tg_track:
     WINCALL RoundRect, qword ptr [rbp-32], dword ptr [rbp-40], dword ptr [rbp-44], \
             dword ptr [rbp-48], dword ptr [rbp-52], dword ptr [rbp-56], dword ptr [rbp-56]
     ; ---- thumb ----
+    mov     r10, qword ptr [rbp-24]           ; disabled -> muted thumb (state still shown by pos)
+    test    dword ptr [r10+16], 4
+    jnz     tg_tb_dim
     cmp     dword ptr [rbp-36], 0
     je      tg_tb_off
     WINCALL GetStockObject, WHITE_BRUSH
     jmp     tg_tb_sel
 tg_tb_off:
     mov     rax, qword ptr [g_br_dim]
+    jmp     tg_tb_sel
+tg_tb_dim:
+    mov     rax, qword ptr [g_br_panel]
 tg_tb_sel:
     WINCALL SelectObject, qword ptr [rbp-32], rax
     WINCALL GetStockObject, NULL_PEN
