@@ -119,8 +119,8 @@ STYLE  DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Vordr - Unlock vault"
 FONT 9, "Segoe UI"
 BEGIN
-    LTEXT           "Vault file:", -1, 12, 12, 50, 10
-    LTEXT           "(no vault selected)", IDC_U_PATH, 66, 12, 242, 10
+    LTEXT           "Storage location:", -1, 12, 13, 66, 10
+    CONTROL         "", IDC_U_PATH, "Button", BS_OWNERDRAW | WS_TABSTOP, 80, 9, 228, 16
     EDITTEXT        IDC_U_PW, 12, 40, 296, 11, ES_PASSWORD | ES_AUTOHSCROLL | NOT WS_BORDER, 0
     PUSHBUTTON      "Unlock", IDC_U_UNLOCK, 254, 70, 54, 18, BS_OWNERDRAW
     LTEXT           "", IDC_U_STATUS, 12, 74, 232, 24

@@ -94,6 +94,8 @@ extern tpm_available:proc
 extern reg_load_vault:proc
 extern reg_save_vault:proc
 extern cfg_default_vault:proc
+extern cfg_classify_path:proc
+extern g_font_icon:qword
 extern cfg_get_dword:proc
 extern cfg_set_dword_hkcu:proc
 extern check_password_policy:proc
@@ -751,6 +753,11 @@ verb_open label word
     dw 'o','p','e','n', 0
 url_https label word                    ; scheme prefix for a bare URL (e.g. "example.com")
     dw 'h','t','t','p','s',':','/','/', 0
+gl_cloud    dw 0E753h, 0                 ; Segoe Fluent Icons: Cloud (OneDrive)
+gl_doc      dw 0E8A5h, 0                 ; Document (Documents folder)
+gl_folder   dw 0E8B7h, 0                 ; Folder (other location)
+WSTR st_onedrive,   <OneDrive>
+WSTR st_documents,  <Documents>
 f_iconname label word
     dw 'S','e','g','o','e',' ','F','l','u','e','n','t',' ','I','c','o','n','s', 0
 f_segoeui label word
@@ -831,6 +838,11 @@ g_allfilter label word          ; "All files\0*.*\0\0"
 g_zipfilter label word          ; "ZIP archive\0*.zip\0\0"
     dw 'Z','I','P',' ','a','r','c','h','i','v','e',0
     dw '*','.','z','i','p',0,0
+g_vaultfilter label word        ; "Vordr vault\0*.vordr\0All files\0*.*\0\0"
+    dw 'V','o','r','d','r',' ','v','a','u','l','t',0
+    dw '*','.','v','o','r','d','r',0
+    dw 'A','l','l',' ','f','i','l','e','s',0
+    dw '*','.','*',0,0
 g_impfilter label word          ; "Vordr export\0*.zip\0All files\0*.*\0\0"
     dw 'V','o','r','d','r',' ','e','x','p','o','r','t',0
     dw '*','.','z','i','p',0
@@ -1163,6 +1175,115 @@ gui_set_winicon proc frame
 gui_set_winicon endp
 
 ; =============================================================================
+; gui_draw_storage(rcx=lpdis) - paint the unlock dialog's storage-location button
+;   as an icon + friendly name: OneDrive / Documents (when the vault lives there)
+;   else the full path, drawn in the accent colour to read as a clickable link.
+; =============================================================================
+gui_draw_storage proc frame
+    FRAME_PROLOG 160
+    mov     qword ptr [rbp-24], rcx
+    mov     r10, rcx
+    mov     rax, qword ptr [r10+32]
+    mov     qword ptr [rbp-32], rax           ; hdc
+    mov     eax, dword ptr [r10+40]
+    mov     dword ptr [rbp-80], eax           ; rc L
+    mov     eax, dword ptr [r10+44]
+    mov     dword ptr [rbp-76], eax           ; T
+    mov     eax, dword ptr [r10+48]
+    mov     dword ptr [rbp-72], eax           ; R
+    mov     eax, dword ptr [r10+52]
+    mov     dword ptr [rbp-68], eax           ; B
+    WINCALL CreateSolidBrush, dword ptr [g_col_bg]
+    mov     qword ptr [rbp-40], rax
+    WINCALL FillRect, qword ptr [rbp-32], addr rbp-80, qword ptr [rbp-40]
+    WINCALL DeleteObject, qword ptr [rbp-40]
+    WINCALL SetBkMode, qword ptr [rbp-32], 1
+    lea     rcx, [g_vpath]                    ; classify: 0 OneDrive / 1 Documents / 2 other
+    call    cfg_classify_path
+    lea     r8, [gl_cloud]
+    lea     r9, [st_onedrive]
+    cmp     eax, 0
+    je      gds_have
+    cmp     eax, 1
+    jne     gds_other
+    lea     r8, [gl_doc]
+    lea     r9, [st_documents]
+    jmp     gds_have
+gds_other:
+    lea     r8, [gl_folder]
+    lea     r9, [g_vpath]
+gds_have:
+    mov     qword ptr [rbp-48], r8            ; glyph ptr
+    mov     qword ptr [rbp-56], r9            ; label ptr
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_accent]
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_font_icon]
+    mov     qword ptr [rbp-64], rax           ; old font
+    mov     eax, dword ptr [rbp-80]
+    mov     dword ptr [rbp-120], eax          ; glyph rect L
+    mov     eax, dword ptr [rbp-76]
+    mov     dword ptr [rbp-116], eax
+    mov     eax, dword ptr [rbp-80]
+    add     eax, 18
+    mov     dword ptr [rbp-112], eax
+    mov     eax, dword ptr [rbp-68]
+    mov     dword ptr [rbp-108], eax
+    WINCALL DrawTextW, qword ptr [rbp-32], qword ptr [rbp-48], -1, addr rbp-120, 24h
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-64]   ; restore font
+    mov     eax, dword ptr [rbp-80]           ; label rect: [L+20 .. R]
+    add     eax, 20
+    mov     dword ptr [rbp-120], eax
+    mov     eax, dword ptr [rbp-76]
+    mov     dword ptr [rbp-116], eax
+    mov     eax, dword ptr [rbp-72]
+    mov     dword ptr [rbp-112], eax
+    mov     eax, dword ptr [rbp-68]
+    mov     dword ptr [rbp-108], eax
+    WINCALL DrawTextW, qword ptr [rbp-32], qword ptr [rbp-56], -1, addr rbp-120, 8024h
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gui_draw_storage endp
+
+; gui_pick_vault(rcx=hdlg) - browse for a vault file (opening at the current
+;   vault's folder); on selection update g_vpath + create/open state and repaint
+;   the storage-location button.
+gui_pick_vault proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    lea     rcx, [g_ofn]
+    mov     edx, sizeof OPENFILENAMEW
+    call    secure_zero
+    lea     r10, [g_ofn]
+    mov     dword ptr [r10].OPENFILENAMEW.lStructSize, sizeof OPENFILENAMEW
+    mov     rax, qword ptr [rbp-24]
+    mov     qword ptr [r10].OPENFILENAMEW.hwndOwner, rax
+    lea     rax, [g_vaultfilter]
+    mov     qword ptr [r10].OPENFILENAMEW.lpstrFilter, rax
+    lea     rax, [g_vpath]                    ; prefilled -> dialog opens at its folder
+    mov     qword ptr [r10].OPENFILENAMEW.lpstrFile, rax
+    mov     dword ptr [r10].OPENFILENAMEW.nMaxFile, 1024
+    mov     dword ptr [r10].OPENFILENAMEW.nFilterIndex, 1
+    mov     dword ptr [r10].OPENFILENAMEW.Flags, OFN_PATHMUSTEXIST or OFN_HIDEREADONLY or OFN_EXPLORER
+    WINCALL GetOpenFileNameW, addr g_ofn
+    test    eax, eax
+    jz      gpv_done                           ; cancelled -> keep the old path
+    mov     dword ptr [g_vpath_set], 1
+    lea     rcx, [g_vpath]                     ; file present -> open; absent -> create
+    call    gui_file_exists
+    mov     dword ptr [rbp-32], eax
+    xor     edx, edx
+    test    eax, eax
+    jnz     @F
+    mov     edx, 1
+@@: mov     dword ptr [g_create], edx
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_U_PATH
+    WINCALL InvalidateRect, rax, 0, 1
+gpv_done:
+    FRAME_EPILOG
+    ret
+gui_pick_vault endp
+
+; =============================================================================
 ; unlock_proc - DLG_UNLOCK dialog procedure (raw frame; OS callback).
 ; rcx=hdlg rdx=msg r8=wParam r9=lParam -> rax = BOOL handled
 ; =============================================================================
@@ -1208,6 +1329,14 @@ up_terase:
     call    theme_erase
     jmp     up_ret
 up_tdraw:
+    mov     r10, r9
+    cmp     dword ptr [r10+4], IDC_U_PATH        ; storage-location button: icon + name
+    jne     up_tdraw_def
+    mov     rcx, r9
+    call    gui_draw_storage
+    mov     eax, 1
+    jmp     up_ret
+up_tdraw_def:
     mov     rcx, r9
     call    theme_drawitem
     jmp     up_ret
@@ -1258,9 +1387,16 @@ up_cmd:
     movzx   eax, r8w                        ; LOWORD(wParam) = control id
     cmp     eax, IDC_U_UNLOCK
     je      up_unlock
+    cmp     eax, IDC_U_PATH                 ; click the storage location -> browse
+    je      up_pickvault
     cmp     eax, IDCANCEL
     je      up_cancel
     xor     eax, eax
+    jmp     up_ret
+up_pickvault:
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_pick_vault
+    mov     eax, 1
     jmp     up_ret
 up_refocus:
     sub     rsp, 32
