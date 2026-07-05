@@ -724,6 +724,26 @@ g_glyphpal_col label dword
     dd 0003030D0h, 0002EA02Eh, 000208CE6h, 000909090h  ; red green amber grey
 name_default_att label word
     dw 'v','o','r','d','r','_','a','t','t','a','c','h','.','b','i','n', 0
+; Executable / script extensions Vordr will never auto-open.  Opening one of these
+; attachments prompts a Save As instead, so the USER (not Vordr) decides to run it.
+; Lowercase, NUL-separated, double-NUL terminated (see gui_ext_is_exec).
+exec_exts label word
+    dw 'e','x','e',0,  'c','o','m',0,  's','c','r',0,  'p','i','f',0
+    dw 'b','a','t',0,  'c','m','d',0,  'h','t','a',0,  'c','p','l',0
+    dw 'm','s','i',0,  'm','s','p',0,  'm','s','c',0,  'j','a','r',0
+    dw 'j','s',0,      'j','s','e',0,  'v','b','s',0,  'v','b','e',0
+    dw 'w','s','f',0,  'w','s','h',0,  'w','s','c',0,  'p','s','1',0
+    dw 'p','s','m','1',0,  'p','s','c','1',0,  'r','e','g',0,  'l','n','k',0
+    dw 'u','r','l',0,  'i','n','f',0,  's','c','f',0,  's','c','t',0
+    dw 's','h','b',0,  's','h','s',0,  'c','h','m',0,  'h','l','p',0
+    dw 'a','d','e',0,  'a','d','p',0,  'm','d','e',0,  'm','d','b',0
+    dw 'd','l','l',0,  'o','c','x',0,  's','y','s',0,  'd','r','v',0
+    dw 'v','b',0,      'g','a','d','g','e','t',0
+    dw 'a','p','p','l','i','c','a','t','i','o','n',0
+    dw 'm','s','i','x',0,  'a','p','p','x',0
+    dw 'a','p','p','x','b','u','n','d','l','e',0,  'm','s','i','x','b','u','n','d','l','e',0
+    dw 'p','s','1','x','m','l',0,  'm','s','h',0,  'w','s',0
+    dw 0                                             ; double-NUL terminator
 badge_weak label word
     dw 'W','e','a','k', 0
 badge_fair label word
@@ -914,6 +934,7 @@ g_imgpath     dw 1024 dup (?)             ; import/export file path (wide)
 g_valblob   dw 32768 dup (?)          ; commit scratch: field values, NUL-joined
 g_lblblob   dw 4096 dup (?)           ; commit scratch: custom labels, NUL-joined
 g_rlabel    dw 128 dup (?)            ; per-row label read scratch
+g_extw      dw 20 dup (?)             ; scratch: an attachment's extension, lowercased
 align 8
 g_ofn       OPENFILENAMEW <>
 
@@ -3996,6 +4017,175 @@ gto_done:
     ret
 gui_tag_open endp
 
+; gui_ext_is_exec(rcx = wide filename) -> eax = 1 if the extension is a known
+;   executable/script type (exec_exts denylist).  Extracts the extension of the
+;   basename (last '.' after the last '\' or '/'), ignoring trailing dots/spaces
+;   that Windows strips, and compares case-insensitively.
+gui_ext_is_exec proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx            ; name
+    mov     r10, rcx                           ; find the NUL terminator
+gxe_end:
+    cmp     word ptr [r10], 0
+    je      gxe_haveend
+    add     r10, 2
+    jmp     gxe_end
+gxe_haveend:
+    ; trim trailing '.' and ' ' (Windows ignores them when resolving a name)
+gxe_trim:
+    cmp     r10, qword ptr [rbp-24]
+    jbe     gxe_noext
+    movzx   eax, word ptr [r10-2]
+    cmp     eax, '.'
+    je      gxe_trimc
+    cmp     eax, ' '
+    jne     gxe_trimdone
+gxe_trimc:
+    sub     r10, 2
+    jmp     gxe_trim
+gxe_trimdone:
+    mov     qword ptr [rbp-32], r10            ; end (after trim)
+    ; last '.' within the basename (a separator resets it -> new component)
+    mov     r11, qword ptr [rbp-24]
+    mov     qword ptr [rbp-40], 0             ; dot ptr = none
+gxe_scan:
+    cmp     r11, qword ptr [rbp-32]
+    jae     gxe_scandone
+    movzx   eax, word ptr [r11]
+    cmp     eax, '\'
+    je      gxe_ssep
+    cmp     eax, '/'
+    je      gxe_ssep
+    cmp     eax, '.'
+    jne     gxe_snext
+    mov     qword ptr [rbp-40], r11
+    jmp     gxe_snext
+gxe_ssep:
+    mov     qword ptr [rbp-40], 0
+gxe_snext:
+    add     r11, 2
+    jmp     gxe_scan
+gxe_scandone:
+    mov     r11, qword ptr [rbp-40]
+    test    r11, r11
+    jz      gxe_noext                          ; no '.' in the basename
+    add     r11, 2                             ; ext start = after the '.'
+    cmp     r11, qword ptr [rbp-32]
+    jae     gxe_noext                          ; nothing after the '.'
+    ; copy the extension -> g_extw, lowercased, capped at 15 chars
+    lea     r8, [g_extw]
+    xor     ecx, ecx
+gxe_cpy:
+    cmp     r11, qword ptr [rbp-32]
+    jae     gxe_cpd
+    cmp     ecx, 15
+    jae     gxe_cpd
+    movzx   eax, word ptr [r11]
+    cmp     eax, 'A'
+    jb      @F
+    cmp     eax, 'Z'
+    ja      @F
+    add     eax, 20h
+@@: mov     word ptr [r8+rcx*2], ax
+    inc     ecx
+    add     r11, 2
+    jmp     gxe_cpy
+gxe_cpd:
+    mov     word ptr [r8+rcx*2], 0             ; NUL-terminate
+    lea     r10, [exec_exts]
+    mov     qword ptr [rbp-40], r10            ; denylist cursor (survives the call)
+gxe_next:
+    mov     r10, qword ptr [rbp-40]
+    cmp     word ptr [r10], 0
+    je      gxe_noext                          ; double-NUL -> not found
+    lea     rcx, [g_extw]
+    mov     rdx, r10
+    call    gui_wstr_eq
+    test    eax, eax
+    jnz     gxe_yes
+    mov     r10, qword ptr [rbp-40]            ; advance past this entry's NUL
+gxe_adv:
+    cmp     word ptr [r10], 0
+    je      gxe_advd
+    add     r10, 2
+    jmp     gxe_adv
+gxe_advd:
+    add     r10, 2
+    mov     qword ptr [rbp-40], r10
+    jmp     gxe_next
+gxe_yes:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gxe_noext:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gui_ext_is_exec endp
+
+; gui_tag_saveas(rcx = hdlg, edx = file index) - decrypt the attachment and let the
+;   user pick where to save it (Save As).  Used for executable/script types instead
+;   of opening them: Vordr writes the file but never runs it on the user's behalf.
+gui_tag_saveas proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx           ; hdlg
+    mov     dword ptr [rbp-32], edx           ; index
+    ; prefill the Save As name with the basename of the stored filename
+    mov     ecx, edx
+    call    tf_entry
+    add     rax, TFILE_NAME
+    mov     r10, rax
+    mov     r11, rax
+gts_scan:
+    mov     dx, word ptr [r10]
+    test    dx, dx
+    jz      gts_scandone
+    cmp     dx, '\'
+    je      gts_sep
+    cmp     dx, '/'
+    jne     gts_snext
+gts_sep:
+    lea     r11, [r10+2]
+gts_snext:
+    add     r10, 2
+    jmp     gts_scan
+gts_scandone:
+    mov     qword ptr [rbp-40], r11
+    movzx   eax, word ptr [r11]               ; empty name -> default
+    test    eax, eax
+    jnz     @F
+    lea     r11, [name_default_att]
+    mov     qword ptr [rbp-40], r11
+@@: lea     rcx, [g_imgpath]
+    mov     rdx, qword ptr [rbp-40]
+    call    gui_wcpy_capped
+    lea     rax, [g_allfilter]
+    mov     qword ptr [g_pickfilter], rax
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, 1                            ; Save As dialog
+    call    img_pick
+    test    eax, eax
+    jz      gts_done                          ; cancelled
+    mov     ecx, dword ptr [rbp-32]
+    call    tf_entry                          ; AttachRef @ +0
+    mov     rcx, rax
+    lea     rdx, [rbp-48]                      ; &len
+    call    attach_open
+    test    rax, rax
+    jz      gts_done
+    mov     qword ptr [rbp-56], rax           ; plaintext
+    lea     rcx, [g_imgpath]                  ; write to the chosen path (no ShellExecute)
+    mov     rdx, rax
+    mov     r8, qword ptr [rbp-48]
+    call    write_file
+    mov     rcx, qword ptr [rbp-56]
+    mov     rdx, qword ptr [rbp-48]
+    call    mem_free
+gts_done:
+    FRAME_EPILOG
+    ret
+gui_tag_saveas endp
+
 ; gui_tag_click(rcx = hdlg, edx = row) - a tag-list chip was clicked.  Map the cursor
 ;   to a chip index; in edit mode a hit on the right-side 'x' removes that file (and
 ;   deletes the whole tile when the last file goes), otherwise the file is opened.
@@ -4060,8 +4250,19 @@ gtk_relayout:
     call    gui_tile_relayout
     jmp     gtk_done
 gtk_open:
-    mov     ecx, dword ptr [rbp-76]
+    mov     ecx, dword ptr [rbp-76]                  ; executable/script type?
+    call    tf_entry
+    lea     rcx, [rax+TFILE_NAME]
+    call    gui_ext_is_exec
+    test    eax, eax
+    jnz     gtk_saveas                               ; yes -> Save As, never run it
+    mov     ecx, dword ptr [rbp-76]                  ; otherwise open in the default app
     call    gui_tag_open
+    jmp     gtk_done
+gtk_saveas:
+    mov     rcx, qword ptr [rbp-24]                  ; hdlg
+    mov     edx, dword ptr [rbp-76]                  ; index
+    call    gui_tag_saveas
 gtk_done:
     FRAME_EPILOG
     ret
