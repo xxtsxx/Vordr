@@ -31,12 +31,15 @@ extern vault_build_entry:proc
 externdef g_ae_dk:byte
 externdef g_field_list:qword
 externdef g_field_n:dword
+externdef g_sel:byte                      ; per-entry import selection mask (from gui.asm)
 
 ARF_SIZE    equ 68
 CP_UTF8_    equ 65001
 ZI_MAXMEM   equ 8192                      ; max archive members
+ZI_MAXENT   equ 8192                      ; max stageable entries (matches MAX_SEL)
 ZI_ARENA    equ 4*1024*1024              ; per-entry wide/blob scratch
 ZI_SBUF     equ 256*1024                  ; one string's decoded UTF-8
+ZI_TBUF     equ 1024*1024                 ; persistent staged-title wide storage
 MEMREC      equ 32                        ; {nameptr8, namelen4, _4, dataptr8, usize4, _4}
 
 .data?
@@ -61,9 +64,24 @@ g_zi_count  dd ?
 g_zi_slot   dd ?                          ; zi_addattach: field slot
 g_zi_atype  dd ?                          ; zi_addattach: base type (9/10)
 g_zi_alabel dq ?                          ; zi_addattach: label wide (0/none)
+g_zi_mode   dd ?                          ; zi_walk: 0 = stage (titles), 1 = commit (build)
+g_zi_e      dd ?                          ; zi_walk: running entry index
+g_zi_build  dd ?                          ; zi_walk: current entry builds fields (1) or discards (0)
+g_zi_jptr   dq ?                          ; decrypted vordr.json ptr (persists stage -> commit)
+g_zi_jlen   dd ?
+g_zi_tap    dd ?                          ; staged-title arena bump offset
+align 8
+public g_zi_stg_n
+g_zi_stg_n  dd ?                          ; number of entries staged (titles ready)
+public g_zi_titles
+g_zi_titles dq ZI_MAXENT dup (?)          ; per-entry wide title ptr (into g_zi_tbuf)
+public g_zi_tlens
+g_zi_tlens  dd ZI_MAXENT dup (?)          ; per-entry wide title length (wchars)
+g_zi_tbuf   db ZI_TBUF dup (?)            ; persistent staged-title text (wide)
 
 .const
 zi_jsonname db "vordr.json"
+zi_empty_w  dw 0                          ; NUL wide string (title fallback on overflow)
 zl_title    db '"title":'
 zl_fields   db ',"fields":['
 zl_type     db '"type":'
@@ -609,15 +627,78 @@ za_skip:
 zi_addattach endp
 
 ; =============================================================================
-; zi_import_json(rcx = json ptr, edx = json len) -> eax = entries imported.
+; zi_stage_title(rcx = index, rdx = UTF-8 src, r8d = srclen) - convert the entry
+;   title to a NUL-terminated wide string in the persistent title arena and record
+;   it in g_zi_titles[index] / g_zi_tlens[index].  On overflow, records "".
 ; =============================================================================
-zi_import_json proc frame
+zi_stage_title proc frame
+    FRAME_PROLOG 128                            ; room for 6-arg MBtoWC arg spill
+    mov     qword ptr [rbp-24], rcx             ; index
+    mov     qword ptr [rbp-32], rdx             ; src
+    mov     dword ptr [rbp-36], r8d             ; srclen
+    cmp     rcx, ZI_MAXENT
+    jae     st_full
+    lea     r10, [g_zi_tbuf]                    ; dst = tbuf + tap
+    mov     eax, dword ptr [g_zi_tap]
+    add     r10, rax
+    mov     qword ptr [rbp-48], r10             ; dst
+    mov     ecx, ZI_TBUF                        ; cap (wchars) = (TBUF - tap - 2)/2
+    sub     ecx, dword ptr [g_zi_tap]
+    sub     ecx, 2
+    shr     ecx, 1
+    mov     dword ptr [rbp-52], ecx             ; cap
+    cmp     ecx, 0
+    jle     st_full
+    cmp     dword ptr [rbp-36], 0
+    je      st_empty
+    WINCALL MultiByteToWideChar, CP_UTF8_, 0, qword ptr [rbp-32], dword ptr [rbp-36], \
+            qword ptr [rbp-48], dword ptr [rbp-52]
+    jmp     st_term
+st_empty:
+    xor     eax, eax
+st_term:
+    mov     r10, qword ptr [rbp-48]             ; NUL-terminate
+    mov     word ptr [r10+rax*2], 0
+    mov     dword ptr [rbp-56], eax             ; wchars (excl NUL)
+    mov     rcx, qword ptr [rbp-24]             ; g_zi_titles[index] = dst
+    lea     r8, [g_zi_titles]
+    mov     rdx, qword ptr [rbp-48]
+    mov     qword ptr [r8+rcx*8], rdx
+    lea     r8, [g_zi_tlens]                   ; g_zi_tlens[index] = wchars
+    mov     edx, dword ptr [rbp-56]
+    mov     dword ptr [r8+rcx*4], edx
+    mov     eax, dword ptr [rbp-56]            ; advance tap by (wchars+1)*2
+    inc     eax
+    lea     eax, [eax*2]
+    add     dword ptr [g_zi_tap], eax
+    FRAME_EPILOG
+    ret
+st_full:
+    mov     rcx, qword ptr [rbp-24]
+    cmp     rcx, ZI_MAXENT
+    jae     st_ret
+    lea     r8, [g_zi_titles]                  ; empty-title fallback keeps indices aligned
+    lea     rdx, [zi_empty_w]
+    mov     qword ptr [r8+rcx*8], rdx
+    lea     r8, [g_zi_tlens]
+    mov     dword ptr [r8+rcx*4], 0
+st_ret:
+    FRAME_EPILOG
+    ret
+zi_stage_title endp
+
+; =============================================================================
+; zi_walk() -> eax.  Walk the entry array at g_zi_p..g_zi_jend once.
+;   g_zi_mode = 0 (stage): decode every title into g_zi_titles[], count into
+;               g_zi_stg_n; build nothing.  Returns 0.
+;   g_zi_mode = 1 (commit): build + vault_build_entry only for entries whose
+;               g_sel[e] is set; others are parsed and discarded.  Returns the
+;               number of entries actually imported.
+; =============================================================================
+zi_walk proc frame
     FRAME_PROLOG 96
-    mov     qword ptr [g_zi_p], rcx
-    mov     eax, edx
-    add     rax, rcx
-    mov     qword ptr [g_zi_jend], rax
     mov     dword ptr [g_zi_count], 0
+    mov     dword ptr [g_zi_e], 0
     mov     al, '['
     call    zj_skipch
 zij_entry:
@@ -634,11 +715,30 @@ zij_entry:
 zij_e0:
     mov     al, '{'
     call    zj_skipch
-    lea     rcx, [zl_title]                     ; "title": (skip the redundant value)
+    ; per-entry build flag: commit mode builds only g_sel[e]-selected entries
+    mov     dword ptr [g_zi_build], 0
+    cmp     dword ptr [g_zi_mode], 1
+    jne     zij_titr                            ; stage -> build nothing
+    mov     eax, dword ptr [g_zi_e]
+    cmp     eax, ZI_MAXENT
+    jae     zij_titr
+    lea     r10, [g_sel]
+    movzx   ecx, byte ptr [r10+rax]
+    mov     dword ptr [g_zi_build], ecx
+zij_titr:
+    lea     rcx, [zl_title]                     ; "title":
     mov     edx, 8
     call    zj_lit
-    lea     rcx, [g_zi_sbuf]
+    lea     rcx, [g_zi_sbuf]                    ; decode title -> sbuf
     call    zj_str
+    mov     dword ptr [rbp-52], eax             ; title UTF-8 len
+    cmp     dword ptr [g_zi_mode], 1
+    je      zij_titdone                         ; commit: title already staged
+    mov     ecx, dword ptr [g_zi_e]             ; stage: capture the title
+    lea     rdx, [g_zi_sbuf]
+    mov     r8d, dword ptr [rbp-52]
+    call    zi_stage_title
+zij_titdone:
     lea     rcx, [zl_fields]                    ; ,"fields":[
     mov     edx, 11
     call    zj_lit
@@ -685,7 +785,9 @@ zij_lbldone:
     mov     dword ptr [rbp-48], eax             ; vallen
     mov     al, '}'
     call    zj_skipch
-    ; ---- build the field ----
+    ; ---- build the field (selected entries only; else parsed + discarded) ----
+    cmp     dword ptr [g_zi_build], 0
+    je      zij_field
     mov     eax, dword ptr [rbp-28]             ; type
     cmp     eax, VF_IMAGE
     je      zij_att
@@ -724,28 +826,59 @@ zij_fend:
     call    zj_skipch
     mov     al, '}'
     call    zj_skipch
-    ; commit the entry if it has a (title) field
+    ; build the entry (commit + selected) if it accumulated any fields
+    cmp     dword ptr [g_zi_build], 0
+    je      zij_eadv
     mov     eax, dword ptr [rbp-24]
     test    eax, eax
-    jz      zij_entry
+    jz      zij_eadv
     mov     dword ptr [g_field_n], eax
     call    vault_build_entry
     test    eax, eax
-    jnz     zij_entry
+    jnz     zij_eadv
     inc     dword ptr [g_zi_count]
+zij_eadv:
+    inc     dword ptr [g_zi_e]
     jmp     zij_entry
 zij_done:
+    cmp     dword ptr [g_zi_mode], 1
+    je      zij_dret
+    mov     eax, dword ptr [g_zi_e]             ; stage: publish the entry count
+    mov     dword ptr [g_zi_stg_n], eax
+zij_dret:
     mov     eax, dword ptr [g_zi_count]
     FRAME_EPILOG
     ret
-zi_import_json endp
+zi_walk endp
+
+; zi_free_wipe() - release the per-entry arena (if held) and wipe the UTF-8 pw.
+zi_free_wipe proc frame
+    FRAME_PROLOG 32
+    mov     rcx, qword ptr [g_zi_arena]
+    test    rcx, rcx
+    jz      zfw_wipe
+    mov     rdx, ZI_ARENA
+    call    mem_free
+    mov     qword ptr [g_zi_arena], 0
+zfw_wipe:
+    lea     rcx, [g_zi_u8pw]
+    mov     edx, 512
+    call    secure_zero
+    mov     dword ptr [g_zi_pwlen], 0
+    FRAME_EPILOG
+    ret
+zi_free_wipe endp
 
 ; =============================================================================
-; zi_import(rcx=raw, edx=rawlen, r8=wide pw, r9d=pw bytes) -> eax
-;   >=0 imported / -3 wrong pw / -1 not a Vordr zip / error.
+; zi_stage(rcx=raw, edx=rawlen, r8=wide pw, r9d=pw bytes) -> eax
+;   >=0  entries staged: their titles are in g_zi_titles[0..n) / g_zi_tlens,
+;        g_zi_stg_n = n.  The arena + decrypted json + password are KEPT so a
+;        subsequent zi_commit (or zi_abort) can finish the job.
+;   -3   wrong password        -1   not a readable Vordr zip / error
+; On every error path the arena is freed and the password wiped.
 ; =============================================================================
-public zi_import
-zi_import proc frame
+public zi_stage
+zi_stage proc frame
     FRAME_PROLOG 160                            ; room for the 8-arg WCtoMB arg spill
     mov     qword ptr [rbp-24], rcx             ; raw
     mov     dword ptr [rbp-28], edx             ; rawlen
@@ -760,55 +893,85 @@ zi_import proc frame
     mov     rcx, ZI_ARENA
     call    mem_alloc
     test    rax, rax
-    jz      zim_err
+    jz      zs_err
     mov     qword ptr [g_zi_arena], rax
     ; scan members
     mov     rcx, qword ptr [rbp-24]
     mov     edx, dword ptr [rbp-28]
     call    zi_scan
     call    attach_reset                        ; start fresh pending-attachment set
-    ; find + route the data file
+    ; find + decrypt the data file
     lea     rcx, [zi_jsonname]
     mov     edx, 10
     call    zi_find
     cmp     eax, -1
-    jne     zim_json
+    jne     zs_json
     mov     dword ptr [rbp-40], -1              ; no vordr.json in the archive
-    jmp     zim_free
-zim_json:
+    jmp     zs_fail
+zs_json:
     mov     dword ptr [rbp-36], eax             ; member idx
     mov     ecx, eax
     call    zi_decrypt
     test    eax, eax
-    jz      zim_json_ok
+    jz      zs_json_ok
     mov     dword ptr [rbp-40], eax             ; -3 wrong pw / -1 corrupt
-    jmp     zim_free
-zim_json_ok:
+    jmp     zs_fail
+zs_json_ok:
     mov     ecx, dword ptr [rbp-36]
-    call    zi_plain
-    mov     rcx, rax
-    call    zi_import_json
-    mov     dword ptr [rbp-40], eax
-    jmp     zim_free
-zim_free:
-    mov     rcx, qword ptr [g_zi_arena]
-    test    rcx, rcx
-    jz      zim_wipe
-    mov     rdx, ZI_ARENA
-    call    mem_free
-    mov     qword ptr [g_zi_arena], 0
-zim_wipe:
-    lea     rcx, [g_zi_u8pw]                    ; wipe the UTF-8 password
-    mov     edx, 512
-    call    secure_zero
-    mov     dword ptr [g_zi_pwlen], 0
+    call    zi_plain                            ; rax=ptr edx=len
+    mov     qword ptr [g_zi_jptr], rax          ; persist json for the commit pass
+    mov     dword ptr [g_zi_jlen], edx
+    mov     qword ptr [g_zi_p], rax
+    add     rax, rdx
+    mov     qword ptr [g_zi_jend], rax
+    mov     dword ptr [g_zi_tap], 0
+    mov     dword ptr [g_zi_stg_n], 0
+    mov     dword ptr [g_zi_mode], 0            ; STAGE: collect titles
+    call    zi_walk
+    mov     eax, dword ptr [g_zi_stg_n]         ; keep arena + pw for zi_commit
+    FRAME_EPILOG
+    ret
+zs_fail:
+    call    zi_free_wipe
     mov     eax, dword ptr [rbp-40]
     FRAME_EPILOG
     ret
-zim_err:
+zs_err:
+    call    zi_free_wipe
     mov     eax, -1
     FRAME_EPILOG
     ret
-zi_import endp
+zi_stage endp
+
+; =============================================================================
+; zi_commit() -> eax = entries imported.  Re-walk the staged json, building only
+;   the entries whose g_sel[e] is set, then free the arena + wipe the password.
+; =============================================================================
+public zi_commit
+zi_commit proc frame
+    FRAME_PROLOG 48
+    mov     rax, qword ptr [g_zi_jptr]
+    mov     qword ptr [g_zi_p], rax
+    mov     edx, dword ptr [g_zi_jlen]
+    add     rax, rdx
+    mov     qword ptr [g_zi_jend], rax
+    mov     dword ptr [g_zi_ap], 0
+    mov     dword ptr [g_zi_mode], 1            ; COMMIT: build selected entries
+    call    zi_walk
+    mov     dword ptr [rbp-24], eax
+    call    zi_free_wipe
+    mov     eax, dword ptr [rbp-24]
+    FRAME_EPILOG
+    ret
+zi_commit endp
+
+; zi_abort() - discard a staged import (user cancelled the selection).
+public zi_abort
+zi_abort proc frame
+    FRAME_PROLOG 32
+    call    zi_free_wipe
+    FRAME_EPILOG
+    ret
+zi_abort endp
 
 end

@@ -54,7 +54,8 @@ extern vault_reseal:proc
 extern mem_free:proc
 ; --- attachment export/import probes (atgen / zitest) ------------------------
 extern do_attgen:proc
-extern zi_import:proc
+extern zi_stage:proc
+extern zi_commit:proc
 extern write_file:proc
 extern ze_compose:proc
 extern ze_free:proc
@@ -1020,8 +1021,24 @@ zit_cpd:
     mov     edx, dword ptr [rbp-32]
     lea     r8, [wpw_exp]                        ; UTF-16 export password
     mov     r9d, 24                              ; "VordrExp1234" = 12 chars * 2
-    call    zi_import
+    call    zi_stage                            ; -> eax = staged count / <0 error
     mov     dword ptr [rbp-40], eax
+    cmp     eax, 0
+    jl      zit_freeraw                         ; error: zi_stage already freed the arena
+    lea     r10, [g_sel]                        ; headless probe: import every staged entry
+    xor     r8d, r8d
+zit_sel:
+    cmp     r8d, dword ptr [rbp-40]
+    jae     zit_seld
+    cmp     r8d, 8192
+    jae     zit_seld
+    mov     byte ptr [r10+r8], 1
+    inc     r8d
+    jmp     zit_sel
+zit_seld:
+    call    zi_commit                           ; imports selected, frees the arena
+    mov     dword ptr [rbp-40], eax
+zit_freeraw:
     mov     rcx, qword ptr [rbp-24]              ; free the raw zip
     mov     rdx, qword ptr [rbp-32]
     call    mem_free
