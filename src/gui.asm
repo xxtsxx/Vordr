@@ -476,7 +476,6 @@ IDC_V_SEARCH equ 232          ; search/filter box under the entry list
 IDC_V_HEADER equ 233          ; detail-pane header (icon tile + title, view mode)
 IDC_V_TITLELBL equ 234        ; "Title" static label (edit mode only)
 IDC_V_ICON   equ 249          ; edit-mode icon tile before the title (opens picker)
-IDC_V_HIST   equ 250          ; edit-mode password-history button (top-right)
 IDC_V_OVFL   equ 235          ; header overflow (...) menu button
 DLG_PWHIST   equ 780          ; password-history browser dialog
 IDC_PH_LIST  equ 781          ; owner-draw list of archived passwords
@@ -653,8 +652,6 @@ wb_star label word
     dw 0E734h, 0                                 ; FavoriteStar (outline = not favorite)
 wb_starf label word
     dw 0E735h, 0                                 ; FavoriteStarFill (favorited)
-wb_hist label word
-    dw 0E81Ch, 0                                 ; History (clock with arrow)
 fav_one label word
     dw '1', 0                                    ; VF_FAV marker value
 wb_gen label word
@@ -779,6 +776,8 @@ om_delete label word
     dw 'D','e','l','e','t','e',' ','e','n','t','r','y', 0
 om_read label word
     dw 'R','e','a','d',' ','p','a','s','s','w','o','r','d', 0
+om_history label word
+    dw 'S','h','o','w',' ','h','i','s','t','o','r','y', 0
 t_created label word
     dw 'C','r','e','a','t','e','d',' ', 0
 t_modified label word
@@ -949,6 +948,7 @@ g_pwhblob     db MAX_PWHIST*PWHBLOB_ENTRY dup (?); per-history emit scratch (VFL
 g_pworig      dw MAX_PWORIG*128 dup (?)          ; original secret values (change detect)
 g_pworig_n    dd ?
 g_pwh_scroll  dd ?                               ; history browser: first visible row
+g_pwh_dirty   dd ?                               ; history browser: a purge happened
 g_phdate      dw 40 dup (?)                      ; history browser: formatted date scratch
 align 2
 g_imgfn_w     dw 200 dup (?)               ; current image's filename (wide) to store
@@ -3487,13 +3487,6 @@ sem_addcmd:
     mov     rcx, qword ptr [rbp-72]
     mov     edx, eax
     call    ShowWindow
-    mov     rcx, qword ptr [rbp-24]           ; password-history button: EDIT mode only
-    mov     edx, IDC_V_HIST
-    call    GetDlgItem
-    mov     qword ptr [rbp-72], rax
-    mov     rcx, rax
-    mov     edx, dword ptr [rbp-52]          ; SW_SHOW in edit, SW_HIDE in view
-    call    ShowWindow
     mov     rcx, qword ptr [rbp-24]
     call    gui_rows_layout
     ; the pencil button stays a pencil in both modes (Save handles committing)
@@ -5529,6 +5522,7 @@ gui_overflow_menu proc frame
     WINCALL AppendMenuW, qword ptr [rbp-32], 0, 1, addr om_copypw
     WINCALL AppendMenuW, qword ptr [rbp-32], 0, 2, addr om_copyuser
     WINCALL AppendMenuW, qword ptr [rbp-32], 0, 4, addr om_read
+    WINCALL AppendMenuW, qword ptr [rbp-32], 0, 5, addr om_history
     WINCALL AppendMenuW, qword ptr [rbp-32], MF_SEPARATOR, 0, 0
     WINCALL AppendMenuW, qword ptr [rbp-32], 0, 3, addr om_delete
     lea     rcx, [rbp-56]                        ; POINT
@@ -5549,6 +5543,12 @@ gom_notdel:
     call    gui_read_password
     jmp     gom_done
 gom_notread:
+    cmp     dword ptr [rbp-44], 5
+    jne     gom_nothist
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_open_pwhist
+    jmp     gom_done
+gom_nothist:
     cmp     dword ptr [rbp-44], 1
     je      gom_cppw
     cmp     dword ptr [rbp-44], 2
@@ -6328,7 +6328,6 @@ gui_update_fav_glyph proc frame
     lea     rax, [wb_starf]                      ; filled (favorite)
 guf_set:
     WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_FAV, rax
-    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_HIST, addr wb_hist
     FRAME_EPILOG
     ret
 gui_update_fav_glyph endp
@@ -6752,7 +6751,6 @@ vp_init:
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_REMOVE, addr wb_rem
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_OVFL, addr wb_more
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_FAV, addr wb_star
-    WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_HIST, addr wb_hist
     call    gui_load_prefs                    ; apply persisted color scheme + layout
     mov     rcx, qword ptr [rbp-8]
     call    gui_apply_scheme
@@ -6830,8 +6828,6 @@ vp_cmd_disp:
     je      vp_fav
     cmp     eax, IDC_V_ICON                      ; edit-mode icon button -> picker
     je      vp_iconpick
-    cmp     eax, IDC_V_HIST                      ; edit-mode history button -> browser
-    je      vp_hist
     cmp     eax, IDC_V_MTPMINFO
     je      vp_tpminfo
     cmp     eax, IDC_V_MTPM
@@ -6908,12 +6904,6 @@ vp_ovfl:
     jl      vp_handled
     mov     rcx, qword ptr [rbp-8]
     call    gui_overflow_menu
-    jmp     vp_handled
-vp_hist:
-    cmp     dword ptr [g_cur_idx], 0             ; only with an entry shown
-    jl      vp_handled
-    mov     rcx, qword ptr [rbp-8]
-    call    gui_open_pwhist
     jmp     vp_handled
 vp_iconpick:
     cmp     dword ptr [g_cur_idx], 0             ; only with an entry shown (edit mode only)
@@ -8238,10 +8228,13 @@ gui_draw_pwhist proc frame
     mov     dword ptr [rbp-88], 0             ; k = visible row
 gdh_loop:
     mov     eax, dword ptr [g_pwh_scroll]
-    add     eax, dword ptr [rbp-88]
+    add     eax, dword ptr [rbp-88]           ; disp = scroll + k
     cmp     eax, dword ptr [g_pwhist_n]
     jae     gdh_restore
-    mov     dword ptr [rbp-96], eax           ; i = entry index
+    mov     ecx, dword ptr [g_pwhist_n]       ; i = (n-1) - disp  (newest on top)
+    dec     ecx
+    sub     ecx, eax
+    mov     dword ptr [rbp-96], ecx           ; i = entry index
     mov     eax, dword ptr [rbp-88]
     imul    eax, eax, PH_ROW_H
     add     eax, dword ptr [rbp-48]
@@ -8268,45 +8261,44 @@ gdh_loop:
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-128]
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-136]
     WINCALL DeleteObject, qword ptr [rbp-120]
-    ; format the change date
+    ; entry ptr + formatted change date
     mov     ecx, dword ptr [rbp-96]
     call    pwh_entry
     mov     qword ptr [rbp-152], rax           ; entry ptr (filetime @ +0)
     lea     rcx, [g_phdate]
     mov     rdx, rax
     call    gui_fmt_datetime
-    ; date (dim, top line)
-    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_textdim]
-    mov     eax, dword ptr [rbp-40]
-    add     eax, 8
-    mov     dword ptr [rbp-176], eax
-    mov     eax, dword ptr [rbp-104]
-    add     eax, 2
-    mov     dword ptr [rbp-172], eax
-    mov     eax, dword ptr [rbp-56]
-    sub     eax, 2 + PH_PURGE_W
-    mov     dword ptr [rbp-168], eax
-    mov     eax, dword ptr [rbp-104]
-    add     eax, 13
-    mov     dword ptr [rbp-164], eax
-    WINCALL DrawTextW, qword ptr [rbp-32], addr g_phdate, -1, addr rbp-176, 20h
-    ; old password (normal, bottom line, ellipsized)
+    mov     eax, dword ptr [rbp-56]            ; dateLeft = R-2-PURGE-100 (right column)
+    sub     eax, 2 + PH_PURGE_W + 100
+    mov     dword ptr [rbp-144], eax
+    ; old password (left, vcentered, ellipsized) - given most of the width
     WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_text]
     mov     eax, dword ptr [rbp-40]
-    add     eax, 8
+    add     eax, 10
     mov     dword ptr [rbp-176], eax
     mov     eax, dword ptr [rbp-104]
-    add     eax, 12
+    mov     dword ptr [rbp-172], eax
+    mov     eax, dword ptr [rbp-144]
+    sub     eax, 6
+    mov     dword ptr [rbp-168], eax
+    mov     eax, dword ptr [rbp-112]
+    mov     dword ptr [rbp-164], eax
+    mov     rax, qword ptr [rbp-152]
+    add     rax, PWHIST_PW
+    WINCALL DrawTextW, qword ptr [rbp-32], rax, -1, addr rbp-176, 8024h
+    ; change date (dim, right-aligned column)
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_textdim]
+    mov     eax, dword ptr [rbp-144]
+    mov     dword ptr [rbp-176], eax
+    mov     eax, dword ptr [rbp-104]
     mov     dword ptr [rbp-172], eax
     mov     eax, dword ptr [rbp-56]
     sub     eax, 2 + PH_PURGE_W
     mov     dword ptr [rbp-168], eax
     mov     eax, dword ptr [rbp-112]
     mov     dword ptr [rbp-164], eax
-    mov     rax, qword ptr [rbp-152]
-    add     rax, PWHIST_PW
-    WINCALL DrawTextW, qword ptr [rbp-32], rax, -1, addr rbp-176, 8020h
-    ; purge 'x' (right)
+    WINCALL DrawTextW, qword ptr [rbp-32], addr g_phdate, -1, addr rbp-176, 26h
+    ; purge 'x' (far right)
     WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_textdim]
     mov     eax, dword ptr [rbp-56]
     sub     eax, 2 + PH_PURGE_W
@@ -8349,7 +8341,7 @@ gui_pwhist_click proc frame
     mov     rcx, qword ptr [rbp-32]
     lea     rdx, [rbp-64]                      ; RECT l-64 t-60 r-56 b-52
     call    GetClientRect
-    mov     eax, dword ptr [rbp-44]           ; row = scroll + pt.y / PH_ROW_H
+    mov     eax, dword ptr [rbp-44]           ; disp = scroll + pt.y / PH_ROW_H
     cdq
     mov     ecx, PH_ROW_H
     idiv    ecx
@@ -8358,7 +8350,10 @@ gui_pwhist_click proc frame
     jl      gpk_done
     cmp     eax, dword ptr [g_pwhist_n]
     jae     gpk_done
-    mov     dword ptr [rbp-68], eax           ; row
+    mov     ecx, dword ptr [g_pwhist_n]       ; entry index = (n-1) - disp (reversed)
+    dec     ecx
+    sub     ecx, eax
+    mov     dword ptr [rbp-68], ecx
     mov     eax, dword ptr [rbp-56]           ; purge region: pt.x >= clientW-2-PURGE
     sub     eax, 2 + PH_PURGE_W
     cmp     dword ptr [rbp-48], eax
@@ -8366,6 +8361,7 @@ gui_pwhist_click proc frame
     mov     ecx, dword ptr [rbp-68]
     call    pwh_remove
     mov     dword ptr [g_dirty], 1
+    mov     dword ptr [g_pwh_dirty], 1        ; persist on close (view mode has no Save)
     mov     eax, dword ptr [g_pwh_scroll]     ; keep scroll in range
     cmp     eax, dword ptr [g_pwhist_n]
     jb      gpk_repaint
@@ -8508,8 +8504,14 @@ pwhist_proc endp
 gui_open_pwhist proc frame
     FRAME_PROLOG 48
     mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [g_pwh_dirty], 0
     WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_PWHIST, qword ptr [rbp-24], \
             addr pwhist_proc, 0
+    cmp     dword ptr [g_pwh_dirty], 0        ; a purge -> re-save the entry so it sticks
+    je      gop_done
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_commit
+gop_done:
     FRAME_EPILOG
     ret
 gui_open_pwhist endp
