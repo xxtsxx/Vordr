@@ -14,7 +14,6 @@
 include macros.inc
 
 extern sha256_hash:proc
-extern sha512_hash:proc
 extern ct_memcmp:proc
 extern print_a:proc
 extern gcm_seal:proc
@@ -69,12 +68,6 @@ st_abc          db "abc"
 sha_abc_exp     db 0bah,078h,016h,0bfh,08fh,001h,0cfh,0eah,041h,041h,040h,0deh,05dh,0aeh,022h,023h
                 db 0b0h,003h,061h,0a3h,096h,017h,07ah,09ch,0b4h,010h,0ffh,061h,0f2h,000h,015h,0adh
 ; SHA-512("abc") - FIPS 180-4
-sha512_abc_exp  db 0ddh,0afh,035h,0a1h,093h,061h,07ah,0bah,0cch,041h,073h,049h,0aeh,020h,041h,031h
-                db 012h,0e6h,0fah,04eh,089h,0a9h,07eh,0a2h,00ah,09eh,0eeh,0e6h,04bh,055h,0d3h,09ah
-                db 021h,092h,099h,02ah,027h,04fh,0c1h,0a8h,036h,0bah,03ch,023h,0a3h,0feh,0ebh,0bdh
-                db 045h,04dh,044h,023h,064h,03ch,0e8h,00eh,02ah,09ah,0c9h,04fh,0a5h,04ch,0a4h,09fh
-CSTR st_pass_sha512, "  [PASS] sha-512  (FIPS 180-4 'abc')",13,10
-CSTR st_fail_sha512, "  [FAIL] sha-512",13,10
 
 CSTR st_hdr,       "running self-tests:",13,10
 CSTR st_pass_sha,  "  [PASS] sha-256  (FIPS 180-4 'abc')",13,10
@@ -156,7 +149,6 @@ gcm_tag_exp db 0d0h,0d1h,0c8h,0a7h,099h,099h,06bh,0f0h,026h,05bh,098h,0b5h,0d4h,
 
 .data?
 st_out          db 32 dup (?)
-st_out64        db 64 dup (?)
 b2b_out         db 64 dup (?)
 gcm_aadbuf      db 32 dup (?)
 gcm_pt2b        db 16 dup (?)
@@ -247,24 +239,6 @@ st_sha_fail:
     STPRINT st_fail_sha, st_fail_sha_len
     inc     qword ptr [rbp-24]
 st_after_sha:
-
-    ; ---- SHA-512("abc") -----------------------------------------------------
-    lea     rcx, [st_abc]
-    mov     rdx, 3
-    lea     r8, [st_out64]
-    call    sha512_hash
-    lea     rcx, [st_out64]
-    lea     rdx, [sha512_abc_exp]
-    mov     r8, 64
-    call    ct_memcmp
-    test    eax, eax
-    jnz     st_sha512_fail
-    STPRINT st_pass_sha512, st_pass_sha512_len
-    jmp     st_after_sha512
-st_sha512_fail:
-    STPRINT st_fail_sha512, st_fail_sha512_len
-    inc     qword ptr [rbp-24]
-st_after_sha512:
 
     ; ---- AES-256-GCM seal (key/iv/pt all zero via BSS) ----------------------
     lea     rax, [gcm_key]

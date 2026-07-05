@@ -60,12 +60,6 @@
 #define IDC_V_MEXPORT 245
 #define IDC_V_MIMPORT 246
 #define IDC_V_MEXPZIP 247
-#define DLG_EXPORT   750
-#define IDC_EX_FMTL  751
-#define IDC_EX_FMT   752
-#define IDC_EX_ATTL  753
-#define IDC_EX_ATTACH 754
-#define IDC_EX_WARN  755
 #define DLG_PWGEN    760
 #define IDC_PG_OUT   761
 #define IDC_PG_REGEN 762
@@ -203,20 +197,6 @@ BEGIN
     EDITTEXT IDC_XP_PW, 16, 52, 232, 12, ES_PASSWORD | ES_AUTOHSCROLL | NOT WS_BORDER, 0
     PUSHBUTTON "Import", IDOK, 134, 74, 54, 18, BS_OWNERDRAW
     PUSHBUTTON "Cancel", IDCANCEL, 194, 74, 54, 18, BS_OWNERDRAW
-END
-
-DLG_EXPORT DIALOGEX 0, 0, 264, 150
-STYLE DS_CENTER | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
-CAPTION "Vordr - Export"
-FONT 9, "Segoe UI"
-BEGIN
-    LTEXT "Select file format", IDC_EX_FMTL, 16, 17, 120, 10
-    PUSHBUTTON "Excel", IDC_EX_FMT, 150, 12, 98, 16, BS_OWNERDRAW
-    LTEXT "Include attachments (files & images)", IDC_EX_ATTL, 16, 45, 180, 10
-    PUSHBUTTON "", IDC_EX_ATTACH, 228, 44, 20, 10, BS_OWNERDRAW | NOT WS_TABSTOP
-    LTEXT "This exports EVERY entry - all fields plus passwords and TOTP secrets. Unencrypted formats and attachments are wrapped in an encrypted ZIP. Keep the file safe and delete it when you no longer need it.", IDC_EX_WARN, 16, 74, 232, 42, 0
-    PUSHBUTTON "Continue", IDOK, 134, 124, 54, 18, BS_OWNERDRAW
-    PUSHBUTTON "Cancel", IDCANCEL, 194, 124, 54, 18, BS_OWNERDRAW
 END
 
 DLG_ICON DIALOGEX 0, 0, 208, 262
