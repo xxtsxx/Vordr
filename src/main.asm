@@ -59,6 +59,7 @@ extern write_file:proc
 extern ze_compose:proc
 extern ze_free:proc
 externdef g_zbuf:qword
+externdef g_sel:byte
 
 CP_UTF8              equ 65001
 WC_ERR_INVALID_CHARS equ 80h
@@ -958,10 +959,10 @@ cmd_atgen proc frame
     call    do_attgen
     test    eax, eax
     jnz     atg_fail
+    lea     r10, [g_sel]                         ; select the one entry for export
+    mov     byte ptr [r10], 1
     lea     rcx, [wpw_exp]
     mov     edx, 24                              ; "VordrExp1234" = 12 chars * 2
-    mov     r8d, EXP_JSON
-    mov     r9d, 1                               ; include attachments
     call    ze_compose
     test    eax, eax                             ; 0 = zip in g_zbuf
     jnz     atg_fail

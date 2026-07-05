@@ -369,6 +369,13 @@ IDC_XP_WARN  equ 723
 IDC_XP_PWL   equ 724
 IDC_XP_PW2L  equ 725
 DLG_IMPPW    equ 730                  ; import-password prompt (single field)
+DLG_SELECT   equ 750                  ; export/import entry-selection checklist
+IDC_SEL_SEARCH equ 751
+IDC_SEL_LIST equ 752                  ; owner-draw checklist of entries
+IDC_SEL_ALL  equ 753
+IDC_SEL_NONE equ 754
+MAX_SEL      equ 8192                 ; entries the selection screen can list
+SEL_ROW_H    equ 22                   ; checklist row height (px)
 SW_HIDE      equ 0
 SW_SHOW      equ 5
 DLG_CREATE   equ 400
@@ -591,6 +598,8 @@ WSTR imp_g_bad,      <That file is not a Vordr encrypted export (.vaultz), or th
 WSTR zip_title,      <Export to encrypted archive>
 WSTR zip_defname,    <vordr-export.vaultz>
 WSTR exp_done_ok,    <Export complete. Keep the file safe and delete it when you no longer need it.>
+sel_box dw '[',' ',']',0                        ; checklist: unchecked / checked markers
+sel_chk dw '[','x',']',0
 WSTR pg_on,   <[x] >
 WSTR pg_off,  <[ ] >
 WSTR pg_lbl_up,  <Uppercase>
@@ -942,6 +951,12 @@ align 8
 g_field_list2 dq 3*MAX_FIELDS dup (?)            ; commit scratch: expanded field list
 g_tileblob    db MAX_TFILES*336 dup (?)          ; per-file {u32 len, AttachRef, name}
 align 8
+public g_sel
+g_sel         db MAX_SEL dup (?)                 ; export/import selection mask (1=selected)
+g_sel_scroll  dd ?                               ; checklist: first visible row
+g_sel_fn      dd ?                               ; checklist: filtered (searched) row count
+align 4
+g_sel_filter  dd MAX_SEL dup (?)                 ; entry indices matching the search
 g_pwhist      db MAX_PWHIST*PWHIST_ENTRY dup (?) ; open entry's overwritten passwords
 g_pwhist_n    dd ?                               ; number of history entries
 g_pwhblob     db MAX_PWHIST*PWHBLOB_ENTRY dup (?); per-history emit scratch (VFL_RAW)
@@ -8258,6 +8273,373 @@ cp_ret:
 create_proc endp
 
 ; =============================================================================
+; =============================================================================
+; Entry-selection checklist (DLG_SELECT): an owner-draw list of the vault's
+; entries, each with a [ ]/[x] checkbox, a search box, and Select all/none.
+; Used by export (pick what to write).  g_sel[e] = 1 selects entry e.
+; =============================================================================
+; gui_sel_buildfilter(rcx = hdlg) - rebuild g_sel_filter = the entry indices whose
+;   title/fields match the search box (all entries when the query is empty).
+gui_sel_buildfilter proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    WINCALL GetDlgItemTextW, qword ptr [rbp-24], IDC_SEL_SEARCH, addr g_search_w, 255
+    mov     dword ptr [rbp-32], eax
+    WINCALL CharUpperBuffW, addr g_search_w, dword ptr [rbp-32]
+    mov     dword ptr [g_sel_fn], 0
+    call    vault_count
+    mov     dword ptr [rbp-40], eax
+    mov     dword ptr [rbp-44], 0
+sbf_loop:
+    mov     eax, dword ptr [rbp-44]
+    cmp     eax, dword ptr [rbp-40]
+    jae     sbf_done
+    cmp     eax, MAX_SEL
+    jae     sbf_done
+    cmp     dword ptr [rbp-32], 0                ; empty query -> everything matches
+    je      sbf_add
+    mov     ecx, dword ptr [rbp-44]
+    call    gui_entry_matches
+    test    eax, eax
+    jz      sbf_next
+sbf_add:
+    mov     eax, dword ptr [g_sel_fn]
+    lea     r10, [g_sel_filter]
+    mov     ecx, dword ptr [rbp-44]
+    mov     dword ptr [r10+rax*4], ecx
+    inc     dword ptr [g_sel_fn]
+sbf_next:
+    inc     dword ptr [rbp-44]
+    jmp     sbf_loop
+sbf_done:
+    FRAME_EPILOG
+    ret
+gui_sel_buildfilter endp
+
+; gui_draw_sellist(rcx = lpdis) - paint the visible checklist rows from g_sel_scroll.
+gui_draw_sellist proc frame
+    FRAME_PROLOG 208
+    mov     qword ptr [rbp-24], rcx
+    mov     r10, rcx
+    mov     rax, qword ptr [r10+32]
+    mov     qword ptr [rbp-32], rax              ; hdc
+    mov     eax, dword ptr [r10+40]
+    mov     dword ptr [rbp-40], eax              ; L
+    mov     eax, dword ptr [r10+44]
+    mov     dword ptr [rbp-48], eax              ; T
+    mov     eax, dword ptr [r10+48]
+    mov     dword ptr [rbp-56], eax              ; R
+    mov     eax, dword ptr [r10+52]
+    mov     dword ptr [rbp-64], eax              ; B
+    WINCALL CreateSolidBrush, dword ptr [g_col_bg]
+    mov     qword ptr [rbp-72], rax
+    mov     r10, qword ptr [rbp-24]
+    lea     rdx, [r10+40]
+    WINCALL FillRect, qword ptr [rbp-32], rdx, qword ptr [rbp-72]
+    WINCALL DeleteObject, qword ptr [rbp-72]
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_dlgfont]
+    mov     qword ptr [rbp-80], rax
+    WINCALL SetBkMode, qword ptr [rbp-32], 1
+    mov     dword ptr [rbp-88], 0                ; k
+dsl_loop:
+    mov     eax, dword ptr [g_sel_scroll]
+    add     eax, dword ptr [rbp-88]              ; fi
+    cmp     eax, dword ptr [g_sel_fn]
+    jae     dsl_restore
+    lea     r10, [g_sel_filter]
+    mov     eax, dword ptr [r10+rax*4]
+    mov     dword ptr [rbp-96], eax              ; e
+    mov     eax, dword ptr [rbp-88]
+    imul    eax, eax, SEL_ROW_H
+    add     eax, dword ptr [rbp-48]
+    mov     dword ptr [rbp-104], eax             ; rowTop
+    mov     ecx, eax
+    add     ecx, SEL_ROW_H
+    cmp     ecx, dword ptr [rbp-64]
+    jg      dsl_restore
+    ; checkbox marker + colour (checked = text, unchecked = dim)
+    lea     r10, [g_sel]
+    mov     eax, dword ptr [rbp-96]
+    movzx   eax, byte ptr [r10+rax]
+    lea     rdx, [sel_box]
+    mov     r8d, dword ptr [g_col_textdim]
+    test    eax, eax
+    jz      @F
+    lea     rdx, [sel_chk]
+    mov     r8d, dword ptr [g_col_text]
+@@: mov     qword ptr [rbp-112], rdx
+    WINCALL SetTextColor, qword ptr [rbp-32], r8d
+    mov     eax, dword ptr [rbp-40]
+    add     eax, 8
+    mov     dword ptr [rbp-160], eax
+    mov     eax, dword ptr [rbp-104]
+    mov     dword ptr [rbp-156], eax
+    mov     eax, dword ptr [rbp-40]
+    add     eax, 30
+    mov     dword ptr [rbp-152], eax
+    mov     eax, dword ptr [rbp-104]
+    add     eax, SEL_ROW_H
+    mov     dword ptr [rbp-148], eax
+    WINCALL DrawTextW, qword ptr [rbp-32], qword ptr [rbp-112], -1, addr rbp-160, 24h
+    ; title
+    mov     ecx, dword ptr [rbp-96]
+    lea     rdx, [rbp-120]
+    call    vault_title_at                       ; rax = ptr, [rbp-120] = len
+    mov     qword ptr [rbp-128], rax
+    mov     eax, dword ptr [rbp-40]
+    add     eax, 34
+    mov     dword ptr [rbp-160], eax
+    mov     eax, dword ptr [rbp-104]
+    mov     dword ptr [rbp-156], eax
+    mov     eax, dword ptr [rbp-56]
+    sub     eax, 6
+    mov     dword ptr [rbp-152], eax
+    mov     eax, dword ptr [rbp-104]
+    add     eax, SEL_ROW_H
+    mov     dword ptr [rbp-148], eax
+    WINCALL DrawTextW, qword ptr [rbp-32], qword ptr [rbp-128], dword ptr [rbp-120], addr rbp-160, 8024h
+    inc     dword ptr [rbp-88]
+    jmp     dsl_loop
+dsl_restore:
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-80]
+    FRAME_EPILOG
+    ret
+gui_draw_sellist endp
+
+; gui_sel_click(rcx = hdlg) - a checklist row was clicked: toggle that entry.
+gui_sel_click proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx
+    mov     edx, IDC_SEL_LIST
+    call    GetDlgItem
+    mov     qword ptr [rbp-32], rax
+    test    rax, rax
+    jz      sck_done
+    lea     rcx, [rbp-48]                        ; POINT x@-48 y@-44
+    call    GetCursorPos
+    mov     rcx, qword ptr [rbp-32]
+    lea     rdx, [rbp-48]
+    call    ScreenToClient
+    mov     eax, dword ptr [rbp-44]              ; row = scroll + pt.y / SEL_ROW_H
+    cdq
+    mov     ecx, SEL_ROW_H
+    idiv    ecx
+    add     eax, dword ptr [g_sel_scroll]
+    cmp     eax, 0
+    jl      sck_done
+    cmp     eax, dword ptr [g_sel_fn]
+    jae     sck_done
+    lea     r10, [g_sel_filter]
+    mov     eax, dword ptr [r10+rax*4]           ; entry index e
+    lea     r10, [g_sel]
+    xor     byte ptr [r10+rax], 1                ; toggle
+    WINCALL InvalidateRect, qword ptr [rbp-32], 0, 1
+sck_done:
+    FRAME_EPILOG
+    ret
+gui_sel_click endp
+
+; select_proc - DLG_SELECT dialog procedure (themed).  Returns 1 (OK) / 0 (Cancel).
+select_proc proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 64
+    mov     qword ptr [rbp-8], rcx
+    cmp     rdx, WM_INITDIALOG
+    je      sel_init
+    cmp     rdx, WM_COMMAND
+    je      sel_cmd
+    cmp     rdx, WM_CTLCOLORSTATIC
+    je      sel_col
+    cmp     rdx, WM_CTLCOLOREDIT
+    je      sel_col
+    cmp     rdx, WM_CTLCOLORBTN
+    je      sel_col
+    cmp     rdx, WM_CTLCOLORDLG
+    je      sel_col
+    cmp     rdx, WM_CTLCOLORLISTBOX
+    je      sel_col
+    cmp     rdx, WM_PAINT
+    je      sel_paint
+    cmp     rdx, WM_ERASEBKGND
+    je      sel_erase
+    cmp     rdx, WM_DRAWITEM
+    je      sel_draw
+    cmp     rdx, WM_MOUSEWHEEL
+    je      sel_wheel
+    cmp     rdx, WM_TIMER
+    je      sel_timer
+    xor     eax, eax
+    jmp     sel_ret
+sel_col:
+    call    theme_ctlcolor
+    jmp     sel_ret
+sel_paint:
+    mov     rcx, qword ptr [rbp-8]
+    call    theme_paint
+    jmp     sel_ret
+sel_erase:
+    mov     rcx, r8
+    mov     rdx, qword ptr [rbp-8]
+    call    theme_erase
+    mov     eax, 1
+    jmp     sel_ret
+sel_draw:
+    mov     r10, r9
+    mov     eax, dword ptr [r10+4]
+    cmp     eax, IDC_SEL_LIST
+    jne     sel_draw_def
+    mov     rcx, r9
+    call    gui_draw_sellist
+    mov     eax, 1
+    jmp     sel_ret
+sel_draw_def:
+    mov     rcx, r9
+    call    theme_drawitem
+    mov     eax, 1
+    jmp     sel_ret
+sel_wheel:
+    mov     eax, r8d
+    sar     eax, 16
+    test    eax, eax
+    jz      sel_wheel_done
+    jle     sel_wheel_dn
+    mov     eax, dword ptr [g_sel_scroll]
+    dec     eax
+    jns     sel_wheel_set
+    xor     eax, eax
+    jmp     sel_wheel_set
+sel_wheel_dn:
+    mov     eax, dword ptr [g_sel_fn]
+    dec     eax
+    mov     ecx, dword ptr [g_sel_scroll]
+    inc     ecx
+    cmp     ecx, eax
+    jle     @F
+    mov     ecx, eax
+@@: mov     eax, ecx
+    cmp     eax, 0
+    jns     sel_wheel_set
+    xor     eax, eax
+sel_wheel_set:
+    mov     dword ptr [g_sel_scroll], eax
+    WINCALL GetDlgItem, qword ptr [rbp-8], IDC_SEL_LIST
+    WINCALL InvalidateRect, rax, 0, 1
+sel_wheel_done:
+    mov     eax, 1
+    jmp     sel_ret
+sel_timer:
+    cmp     r8d, THEME_TIMER
+    jne     sel_unh
+    mov     rcx, qword ptr [rbp-8]
+    call    theme_tick
+    mov     eax, 1
+    jmp     sel_ret
+sel_unh:
+    xor     eax, eax
+    jmp     sel_ret
+sel_init:
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDOK
+    call    theme_attach
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_set_winicon
+    mov     dword ptr [g_sel_scroll], 0
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_sel_buildfilter
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_SEL_SEARCH, EM_SETCUEBANNER, 1, addr cue_search
+    mov     eax, 1
+    jmp     sel_ret
+sel_cmd:
+    movzx   eax, r8w
+    mov     r10d, r8d
+    shr     r10d, 16                             ; notification
+    cmp     r10d, EN_CHANGE
+    jne     sel_cmd_disp
+    cmp     eax, IDC_SEL_SEARCH
+    jne     sel_handled
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_sel_buildfilter
+    mov     dword ptr [g_sel_scroll], 0
+    WINCALL GetDlgItem, qword ptr [rbp-8], IDC_SEL_LIST
+    WINCALL InvalidateRect, rax, 0, 1
+    jmp     sel_handled
+sel_cmd_disp:
+    cmp     eax, IDC_SEL_LIST
+    je      sel_c_list
+    cmp     eax, IDC_SEL_ALL
+    je      sel_c_all
+    cmp     eax, IDC_SEL_NONE
+    je      sel_c_none
+    cmp     eax, IDOK
+    je      sel_c_ok
+    cmp     eax, IDCANCEL
+    je      sel_c_cancel
+    xor     eax, eax
+    jmp     sel_ret
+sel_c_list:
+    test    r10d, r10d                           ; only a real click (BN_CLICKED)
+    jnz     sel_handled
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_sel_click
+    jmp     sel_handled
+sel_c_all:
+    mov     r8d, 1
+    jmp     sel_setall
+sel_c_none:
+    xor     r8d, r8d
+sel_setall:
+    mov     dword ptr [rbp-16], r8d
+    xor     r9d, r9d
+sel_sa_lp:
+    cmp     r9d, dword ptr [g_sel_fn]
+    jae     sel_sa_done
+    lea     r10, [g_sel_filter]
+    mov     eax, dword ptr [r10+r9*4]
+    lea     r10, [g_sel]
+    mov     cl, byte ptr [rbp-16]
+    mov     byte ptr [r10+rax], cl
+    inc     r9d
+    jmp     sel_sa_lp
+sel_sa_done:
+    WINCALL GetDlgItem, qword ptr [rbp-8], IDC_SEL_LIST
+    WINCALL InvalidateRect, rax, 0, 1
+    jmp     sel_handled
+sel_c_ok:
+    WINCALL EndDialog, qword ptr [rbp-8], 1
+    jmp     sel_handled
+sel_c_cancel:
+    WINCALL EndDialog, qword ptr [rbp-8], 0
+    jmp     sel_handled
+sel_handled:
+    mov     eax, 1
+sel_ret:
+    mov     rsp, rbp
+    pop     rbp
+    ret
+select_proc endp
+
+; gui_sel_all(rcx = count) - preselect entries 0..count-1 (capped at MAX_SEL) and
+;   clear the rest, so the checklist opens with everything ticked.
+gui_sel_all proc frame
+    FRAME_PROLOG 32
+    lea     r10, [g_sel]
+    xor     r11d, r11d
+gsa_lp:
+    cmp     r11d, MAX_SEL
+    jae     gsa_done
+    xor     eax, eax
+    cmp     r11d, ecx
+    jae     @F
+    mov     eax, 1
+@@: mov     byte ptr [r10+r11], al
+    inc     r11d
+    jmp     gsa_lp
+gsa_done:
+    FRAME_EPILOG
+    ret
+gui_sel_all endp
+
 ; gui_export(rcx = hdlg) - prompt for a password, ze_compose builds the AES-256
 ;   encrypted ZIP (vordr.json of all tiles + every attachment, history excluded),
 ;   then pick a save path and write it.
@@ -8265,6 +8647,12 @@ create_proc endp
 gui_export proc frame
     FRAME_PROLOG 64
     mov     qword ptr [rbp-24], rcx
+    call    vault_count                          ; open the checklist with all entries ticked
+    mov     ecx, eax
+    call    gui_sel_all
+    WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_SELECT, qword ptr [rbp-24], addr select_proc, 0
+    cmp     eax, 1
+    jne     gx_done
     WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_XLPW, qword ptr [rbp-24], addr xlpw_proc, 0
     cmp     eax, 1
     jne     gx_done
