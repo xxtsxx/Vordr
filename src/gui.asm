@@ -656,6 +656,10 @@ wb_starf label word
     dw 0E735h, 0                                 ; FavoriteStarFill (favorited)
 fav_one label word
     dw '1', 0                                    ; VF_FAV marker value
+pht_lbl db 'Password'                            ; gui_phtest scratch (headless probe)
+pht_old db 'oldpw'
+pht_ttl dw 'T', 0
+pht_new dw 'n','e','w','p','w', 0
 wb_gen label word
     dw 0E72Ch, 0                                 ; Refresh (generate password)
 sn_dark dw 'D','a','r','k',0
@@ -3312,6 +3316,88 @@ gpc_done:
     ret
 gui_pwhist_capture endp
 
+; gui_phtest() -> eax = g_pwhist_n after a synthetic capture (headless probe).
+;   Seeds one original secret ("Password"="oldpw") + a new secret field "newpw",
+;   runs gui_pwhist_capture; a working capture returns 1.
+public gui_phtest
+gui_phtest proc frame
+    FRAME_PROLOG 48
+    call    pwh_reset
+    lea     rcx, [pht_lbl]                    ; original label "Password" (utf8, 8)
+    mov     edx, 8
+    lea     r8, [pht_old]                     ; original value "oldpw" (utf8, 5)
+    mov     r9d, 5
+    call    pworig_add
+    cmp     dword ptr [g_pworig_n], 1         ; 10 = pworig_add didn't record
+    jne     pht_e10
+    lea     r10, [g_pworig]                   ; 20 = original value not stored
+    cmp     word ptr [r10+PWORIG_VAL], 0
+    je      pht_e20
+    lea     r10, [g_field_list]
+    mov     qword ptr [r10+0], VF_TITLE
+    mov     qword ptr [r10+8], 0
+    lea     rax, [pht_ttl]
+    mov     qword ptr [r10+16], rax
+    mov     qword ptr [r10+24], VF_SECRET
+    mov     qword ptr [r10+32], 0
+    lea     rax, [pht_new]                    ; new secret value "newpw" (wide)
+    mov     qword ptr [r10+40], rax
+    mov     dword ptr [g_field_n], 2
+    call    gui_pwhist_capture
+    cmp     dword ptr [g_pwhist_n], 1         ; 30 = nothing archived
+    jne     pht_e30
+    lea     r10, [g_pwhist]                   ; verify stored content (pwh_append)
+    cmp     word ptr [r10+PWHIST_LBL], 'P'    ; 40 = label not "Password"
+    jne     pht_e40
+    cmp     word ptr [r10+PWHIST_PW], 'o'     ; 50 = pw not "oldpw"
+    jne     pht_e50
+    call    gui_pwhist_emit                   ; exercise emit -> VF_PWHIST field
+    cmp     dword ptr [g_field_n], 3          ; 60 = emit didn't append a field
+    jne     pht_e60
+    lea     r10, [g_field_list+48]            ; g_field_list[2]
+    mov     rcx, qword ptr [r10]              ; 70 = kind not VF_PWHIST|VFL_RAW
+    cmp     rcx, VF_PWHIST or VFL_RAW
+    jne     pht_e70
+    mov     r10, qword ptr [r10+16]           ; emitted value {u32 len, ft, label\0, pw\0}
+    cmp     word ptr [r10+12], 'P'            ; 80 = emitted label wrong
+    jne     pht_e80
+    mov     eax, 1                            ; all good
+    FRAME_EPILOG
+    ret
+pht_e10:
+    mov     eax, 10
+    FRAME_EPILOG
+    ret
+pht_e20:
+    mov     eax, 20
+    FRAME_EPILOG
+    ret
+pht_e30:
+    mov     eax, 30
+    FRAME_EPILOG
+    ret
+pht_e40:
+    mov     eax, 40
+    FRAME_EPILOG
+    ret
+pht_e50:
+    mov     eax, 50
+    FRAME_EPILOG
+    ret
+pht_e60:
+    mov     eax, 60
+    FRAME_EPILOG
+    ret
+pht_e70:
+    mov     eax, 70
+    FRAME_EPILOG
+    ret
+pht_e80:
+    mov     eax, 80
+    FRAME_EPILOG
+    ret
+gui_phtest endp
+
 ; gui_pwhist_emit() - append every g_pwhist entry to g_field_list as a reserved
 ;   VF_PWHIST|VFL_RAW field: value = {u32 len, u64 ft, label wide\0, pw wide\0} built
 ;   into g_pwhblob so it survives until vault_build_entry consumes it.
@@ -4071,34 +4157,34 @@ pwh_remove endp
 ;            r8 = value utf8, r9d = vallen) - remember an original secret's label +
 ;   value (as wide) at load, so gui_commit can detect + attribute an overwrite.
 pworig_add proc frame
-    FRAME_PROLOG 48
-    mov     eax, dword ptr [g_pworig_n]
-    cmp     eax, MAX_PWORIG
+    FRAME_PROLOG 80                            ; each local its own 8-byte slot (a dword
+    mov     eax, dword ptr [g_pworig_n]        ; under a qword's footprint gets clobbered
+    cmp     eax, MAX_PWORIG                     ; when the qword pointer is written)
     jae     poa_done
-    mov     qword ptr [rbp-24], rcx           ; label utf8
-    mov     dword ptr [rbp-28], edx           ; labellen
+    mov     qword ptr [rbp-16], rcx           ; label utf8
+    mov     dword ptr [rbp-24], edx           ; labellen
     mov     qword ptr [rbp-32], r8            ; value utf8
-    mov     dword ptr [rbp-36], r9d           ; vallen
+    mov     dword ptr [rbp-40], r9d           ; vallen
     imul    eax, eax, PWORIG_STRIDE
     lea     r10, [g_pworig]
     add     r10, rax
-    mov     qword ptr [rbp-40], r10           ; slot
-    cmp     dword ptr [rbp-28], 0
+    mov     qword ptr [rbp-48], r10           ; slot
+    cmp     dword ptr [rbp-24], 0
     je      poa_deflbl
-    mov     rcx, qword ptr [rbp-24]           ; custom label -> wide
-    mov     edx, dword ptr [rbp-28]
-    mov     r8, qword ptr [rbp-40]
+    mov     rcx, qword ptr [rbp-16]           ; custom label -> wide
+    mov     edx, dword ptr [rbp-24]
+    mov     r8, qword ptr [rbp-48]
     mov     r9d, 127
     call    gui_towide
     jmp     poa_val
 poa_deflbl:
-    mov     rcx, qword ptr [rbp-40]           ; unlabeled -> "Password"
+    mov     rcx, qword ptr [rbp-48]           ; unlabeled -> "Password"
     lea     rdx, [kl_secret]
     call    gui_wcpy_capped
 poa_val:
     mov     rcx, qword ptr [rbp-32]           ; value -> wide at slot+PWORIG_VAL
-    mov     edx, dword ptr [rbp-36]
-    mov     r8, qword ptr [rbp-40]
+    mov     edx, dword ptr [rbp-40]
+    mov     r8, qword ptr [rbp-48]
     add     r8, PWORIG_VAL
     mov     r9d, 127
     call    gui_towide
