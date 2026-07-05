@@ -661,6 +661,8 @@ wb_close label word
     dw 2715h, 0                                  ; multiplication X
 wb_add label word
     dw 002Bh, 0                                  ; +  (add)
+wb_addf label word
+    dw 0E710h, 0                                 ; Segoe Fluent Icons: Add (centered glyph)
 wb_edit label word
     dw 0E70Fh, 0                                 ; Segoe Fluent Icons: Edit (pencil)
 wb_rem label word
@@ -4101,7 +4103,7 @@ gra_file:
     ; the tile is removed automatically when its last file is deleted.
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_VALUE, addr cls_button, 0, \
             BS_OWNERDRAW_ or WS_TABSTOP_
-    WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_IMPORT, addr cls_button, addr wb_add, \
+    WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_IMPORT, addr cls_button, addr wb_addf, \
             BS_OWNERDRAW_ or WS_TABSTOP_
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_UP, addr cls_button, addr wb_up, \
             BS_OWNERDRAW_
@@ -5259,19 +5261,20 @@ grl_attach:
     mov     r8d, 394
     mov     r9d, dword ptr [rbp-40]
     add     r9d, 4
-    WINCALL move_ctl, rcx, rdx, r8d, r9d, 12, 11
+    WINCALL move_ctl, rcx, rdx, r8d, r9d, 12, 12
     mov     eax, dword ptr [g_tilefile_n]            ; tag-list height = n * chip
     test    eax, eax
     jnz     @F
     mov     eax, 1
 @@: imul    eax, eax, 15
     mov     dword ptr [rbp-56], eax
-    mov     rcx, qword ptr [rbp-24]                  ; tag list (164,content_y,146,h)
-    mov     r10, qword ptr [rbp-32]
+    mov     rcx, qword ptr [rbp-24]                  ; tag list: right of the chevrons (176)
+    mov     r10, qword ptr [rbp-32]                  ; and up in the top band (no label here)
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_VALUE*8]
-    mov     r8d, 164
-    mov     r9d, dword ptr [rbp-60]
-    WINCALL move_ctl, rcx, rdx, r8d, r9d, 146, dword ptr [rbp-56]
+    mov     r8d, 176
+    mov     r9d, dword ptr [rbp-40]
+    add     r9d, 4
+    WINCALL move_ctl, rcx, rdx, r8d, r9d, 134, dword ptr [rbp-56]
     mov     r10, qword ptr [rbp-32]                  ; "+" shows in edit mode only
     mov     rcx, qword ptr [r10+FD_HANDLES+DS_IMPORT*8]
     mov     edx, dword ptr [rbp-52]
