@@ -28,6 +28,7 @@ extern vault_title_at:proc
 extern vault_field_count:proc
 extern vault_field_get:proc
 extern attach_open:proc
+externdef g_sel:byte                     ; per-entry export selection mask (gui.asm)
 extern WideCharToMultiByte:proc
 VF_IMAGE_   equ 9
 VF_FILE_    equ 10
@@ -572,16 +573,22 @@ ze_build_json proc frame
     call    vault_count
     mov     dword ptr [rbp-24], eax             ; n
     mov     dword ptr [rbp-28], 0               ; e
+    mov     dword ptr [rbp-56], 1               ; first emitted entry
 zbj_elp:
     mov     eax, dword ptr [rbp-28]
     cmp     eax, dword ptr [rbp-24]
     jae     zbj_edone
-    cmp     eax, 0
-    je      zbj_e0
+    lea     r10, [g_sel]                        ; export selection: skip unchecked entries
+    movzx   ecx, byte ptr [r10+rax]
+    test    ecx, ecx
+    je      zbj_eskip
+    cmp     dword ptr [rbp-56], 0               ; comma before every emitted entry but the 1st
+    jne     zbj_e0
     lea     rcx, [g_json]
     mov     dl, ','
     call    buf_putb
 zbj_e0:
+    mov     dword ptr [rbp-56], 0
     lea     rcx, [g_json]
     lea     rdx, [zj_title]
     call    buf_putcstr
@@ -674,6 +681,7 @@ zbj_fdone:
     lea     rcx, [g_json]
     mov     dl, '}'
     call    buf_putb
+zbj_eskip:
     inc     dword ptr [rbp-28]
     jmp     zbj_elp
 zbj_edone:
