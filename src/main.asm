@@ -37,6 +37,7 @@ extern secure_zero:proc
 extern run_selftest:proc
 extern log_result:proc
 extern do_bench:proc                    ; benchmark (bench.asm)
+extern gui_phtest:proc                  ; pw-history capture probe (gui.asm)
 extern read_file:proc
 ifdef DBG_TRACE
 extern cmd_redteam:proc                 ; fault-injection self-test (redteam.asm)
@@ -170,6 +171,7 @@ WSTR w_citest,   <citest>
 WSTR w_xetest,   <xetest>
 WSTR w_atgen,    <atgen>
 WSTR w_zitest,   <zitest>
+WSTR w_phtest,   <phtest>
 WSTR wpw_test,   <VordrTest123>
 WSTR wpw_exp,    <VordrExp1234>
 ifdef DBG_TRACE
@@ -207,12 +209,13 @@ cmd_table label CMDENT
     CMDENT { w_xetest,    cmd_xetest,    4, 0 }   ; headless export probe: <vault> <out> <fmt> <attach>
     CMDENT { w_atgen,     cmd_atgen,     1, 0 }   ; headless attachment-export probe: <out.zip>
     CMDENT { w_zitest,    cmd_zitest,    2, 0 }   ; headless encrypted-zip import probe
+    CMDENT { w_phtest,    cmd_phtest,    0, 0 }   ; headless pw-history capture probe
 ifdef DBG_TRACE
     CMDENT { w_redteam,   cmd_redteam,   1, 0 }   ; fault-injection self-test (dbg)
     CMDENT { w_tpmtest,   cmd_tpmtest,   0, 0 }   ; TPM round-trip probe (dbg)
-CMD_COUNT equ 12
+CMD_COUNT equ 13
 else
-CMD_COUNT equ 10
+CMD_COUNT equ 11
 endif
 
 .data?
@@ -1296,6 +1299,16 @@ zit_fail:
     FRAME_EPILOG
     ret
 cmd_zitest endp
+
+; cmd_phtest - headless password-history capture probe.  exit = g_pwhist_n after a
+;   synthetic overwrite (1 = capture works, 0 = broken).
+LANDING_PAD
+cmd_phtest proc frame
+    FRAME_PROLOG 32
+    call    gui_phtest
+    FRAME_EPILOG
+    ret
+cmd_phtest endp
 
 ; =============================================================================
 ; is_cli_command -> eax = 1 if argv[1] names a known command verb, else 0.
