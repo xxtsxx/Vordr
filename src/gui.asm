@@ -339,6 +339,10 @@ IDC_V_MCLS   equ 223
 IDC_V_MTPM   equ 224
 IDC_V_MTPMINFO equ 226
 IDC_V_MTPML  equ 228                  ; "TPM Unlock" label beside the toggle
+IDC_V_MNOHISTL equ 250                ; "Do not save history" label
+IDC_V_MNOHIST  equ 251                ; "Do not save history" toggle
+IDC_V_MNOPHONL equ 252                ; "Disable phonetic reader" label
+IDC_V_MNOPHON  equ 253                ; "Disable phonetic reader" toggle
 IDC_V_MTHEME equ 240                  ; color-scheme cycle button (settings)
 IDC_V_MTHEMEL equ 241                 ; "Color scheme" label
 IDC_V_COLORPW equ 244                 ; overlay: colored revealed secret (owner-draw)
@@ -573,6 +577,8 @@ WSTR req_p2,        < characters and use at least >
 WSTR req_p3,        < of 4 character types - lowercase / uppercase / number / symbol.>
 WSTR wv_pwlen,      <PwMinLen>
 WSTR wv_pwcls,      <PwMinClasses>
+WSTR wv_nohist,     <NoHistory>
+WSTR wv_nophon,     <NoPhonetic>
 ; --- system tray strings ------------------------------------------------------
 WSTR t_about,       <About Vordr>
 WSTR m_about,       <Vordr - a hardened password manager. AES-256-GCM with Argon2id key derivation. Fail-closed and self-tested on every launch. Written in x64 assembly with no runtime dependencies.>
@@ -833,7 +839,8 @@ g_menu_ids label dword
     dd IDC_V_MCLSL, IDC_V_MCLS, IDC_V_MTPM, IDC_V_MTPML, IDC_V_MTPMINFO
     dd IDC_V_MTHEMEL, IDC_V_MTHEME, IDC_V_MEXPORT
     dd IDC_V_MIMPORT
-MENU_ID_COUNT equ 14
+    dd IDC_V_MNOHISTL, IDC_V_MNOHIST, IDC_V_MNOPHONL, IDC_V_MNOPHON
+MENU_ID_COUNT equ 18
 
 .data?
 align 8
@@ -855,6 +862,10 @@ g_create    dd ?
 g_is_default dd ?                     ; 1 = auto-created default vault (register it)
 g_pol_len_lock dd ?                   ; 1 = min-length set by HKLM policy (locked)
 g_pol_cls_lock dd ?                   ; 1 = min-classes set by HKLM policy (locked)
+g_no_history  dd ?                    ; 1 = "Do not save history" setting on
+g_no_phonetic dd ?                    ; 1 = "Disable phonetic reader" setting on
+g_nohist_lock dd ?                    ; 1 = NoHistory forced by HKLM policy (locked)
+g_nophon_lock dd ?                    ; 1 = NoPhonetic forced by HKLM policy (locked)
 g_pw_compliant dd ?                   ; 1 = create-dialog password meets the policy
 g_tpm_present dd ?                    ; 1 = a usable platform TPM was detected
 g_pw_level  dd ?                      ; 0 bad/none, 1 weak, 2 adequate, 3 strong
@@ -3530,8 +3541,11 @@ gui_commit proc frame
     jz      gco_notitle
     cmp     word ptr [r10], 0                 ; empty title -> keep the old entry
     je      gco_notitle
-    call    gui_pwhist_capture                ; archive any overwritten password, then
+    cmp     dword ptr [g_no_history], 0        ; "Do not save history" -> neither capture
+    jne     gco_nohist                         ;   new overwrites nor re-emit existing ones
+    call    gui_pwhist_capture                ; archive any overwritten value, then
     call    gui_pwhist_emit                   ; write history back as VF_PWHIST fields
+gco_nohist:
     mov     ecx, dword ptr [g_cur_idx]        ; preserve the original creation date
     call    vault_entry_ptr
     test    rax, rax
@@ -5734,9 +5748,13 @@ gui_overflow_menu proc frame
     jz      gom_done
     WINCALL AppendMenuW, qword ptr [rbp-32], 0, 1, addr om_copypw
     WINCALL AppendMenuW, qword ptr [rbp-32], 0, 2, addr om_copyuser
+    cmp     dword ptr [g_no_phonetic], 0         ; "Disable phonetic reader" -> hide it
+    jne     @F
     WINCALL AppendMenuW, qword ptr [rbp-32], 0, 4, addr om_read
+@@: cmp     dword ptr [g_no_history], 0          ; "Do not save history" -> hide the browser
+    jne     @F
     WINCALL AppendMenuW, qword ptr [rbp-32], 0, 5, addr om_history
-    WINCALL AppendMenuW, qword ptr [rbp-32], MF_SEPARATOR, 0, 0
+@@: WINCALL AppendMenuW, qword ptr [rbp-32], MF_SEPARATOR, 0, 0
     WINCALL AppendMenuW, qword ptr [rbp-32], 0, 3, addr om_delete
     lea     rcx, [rbp-56]                        ; POINT
     call    GetCursorPos
@@ -6649,6 +6667,23 @@ mo_tpm_set:
     mov     rcx, rax
     mov     edx, dword ptr [g_tpm_present]    ; enable iff hardware present
     call    EnableWindow
+    ; the two privacy toggles: disable them when HKLM policy locks the value
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_V_MNOHIST
+    call    GetDlgItem
+    mov     rcx, rax
+    mov     eax, dword ptr [g_nohist_lock]
+    xor     eax, 1                            ; enable = NOT locked
+    mov     edx, eax
+    call    EnableWindow
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_V_MNOPHON
+    call    GetDlgItem
+    mov     rcx, rax
+    mov     eax, dword ptr [g_nophon_lock]
+    xor     eax, 1
+    mov     edx, eax
+    call    EnableWindow
     WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_MENU, addr wb_close
     mov     dword ptr [g_menu_open], 1
     mov     ecx, 1                            ; opaque backdrop in theme_paint
@@ -6753,6 +6788,18 @@ msv_unwant:
     je      msv_apply_close                 ; !want + !have -> nothing
     call    vault_tpm_forget
 msv_apply_close:
+    cmp     dword ptr [g_nohist_lock], 0    ; persist the privacy toggles (HKCU) unless
+    jne     msv_phon                        ;   HKLM policy locks them
+    lea     rcx, [wv_nohist]
+    mov     edx, dword ptr [g_no_history]
+    call    cfg_set_dword_hkcu
+msv_phon:
+    cmp     dword ptr [g_nophon_lock], 0
+    jne     msv_done
+    lea     rcx, [wv_nophon]
+    mov     edx, dword ptr [g_no_phonetic]
+    call    cfg_set_dword_hkcu
+msv_done:
     FRAME_EPILOG
     ret
 gui_menu_save endp
@@ -6836,6 +6883,10 @@ vp_tdraw:
     mov     eax, dword ptr [r10+4]            ; DRAWITEMSTRUCT.CtlID
     cmp     eax, IDC_V_MTPM                   ; the TPM control = Fluent pill toggle
     je      vp_tdraw_toggle
+    cmp     eax, IDC_V_MNOHIST               ; the two privacy pill toggles
+    je      vp_tdraw_tnohist
+    cmp     eax, IDC_V_MNOPHON
+    je      vp_tdraw_tnophon
     cmp     eax, IDC_V_LIST                   ; the entry list = icon cards
     je      vp_tdraw_list
     cmp     eax, IDC_V_HEADER                 ; detail-pane header (tile + title)
@@ -6893,6 +6944,16 @@ vp_tdraw_chev:
 vp_tdraw_toggle:
     mov     rcx, r9
     mov     edx, dword ptr [g_tpm_want]
+    call    theme_toggle
+    jmp     vp_ret
+vp_tdraw_tnohist:
+    mov     rcx, r9
+    mov     edx, dword ptr [g_no_history]
+    call    theme_toggle
+    jmp     vp_ret
+vp_tdraw_tnophon:
+    mov     rcx, r9
+    mov     edx, dword ptr [g_no_phonetic]
     call    theme_toggle
     jmp     vp_ret
 vp_tdraw_totp:
@@ -7049,6 +7110,10 @@ vp_cmd_fixed:
     je      vp_tpminfo
     cmp     eax, IDC_V_MTPM
     je      vp_mtpm
+    cmp     eax, IDC_V_MNOHIST
+    je      vp_mnohist
+    cmp     eax, IDC_V_MNOPHON
+    je      vp_mnophon
     cmp     eax, IDCANCEL
     je      vp_esc
     xor     eax, eax
@@ -7065,6 +7130,38 @@ vp_mtpm:
     mov     dword ptr [g_tpm_want], eax
     mov     rcx, qword ptr [rbp-8]
     mov     edx, IDC_V_MTPM
+    call    GetDlgItem
+    sub     rsp, 32
+    mov     rcx, rax
+    xor     edx, edx
+    mov     r8d, 1
+    call    InvalidateRect
+    add     rsp, 32
+    jmp     vp_handled
+vp_mnohist:
+    cmp     dword ptr [g_nohist_lock], 0      ; HKLM-locked -> ignore the click
+    jne     vp_handled
+    mov     eax, dword ptr [g_no_history]
+    xor     eax, 1
+    mov     dword ptr [g_no_history], eax
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_V_MNOHIST
+    call    GetDlgItem
+    sub     rsp, 32
+    mov     rcx, rax
+    xor     edx, edx
+    mov     r8d, 1
+    call    InvalidateRect
+    add     rsp, 32
+    jmp     vp_handled
+vp_mnophon:
+    cmp     dword ptr [g_nophon_lock], 0
+    jne     vp_handled
+    mov     eax, dword ptr [g_no_phonetic]
+    xor     eax, 1
+    mov     dword ptr [g_no_phonetic], eax
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_V_MNOPHON
     call    GetDlgItem
     sub     rsp, 32
     mov     rcx, rax
@@ -7494,6 +7591,22 @@ gui_load_policy proc frame
     jbe     @F
     mov     eax, 4
 @@: mov     dword ptr [g_cfg_pwminclasses], eax
+    lea     rcx, [wv_nohist]                    ; "Do not save history" (0/1; HKLM locks)
+    xor     edx, edx
+    lea     r8, [g_nohist_lock]
+    call    cfg_get_dword
+    test    eax, eax
+    jz      @F
+    mov     eax, 1
+@@: mov     dword ptr [g_no_history], eax
+    lea     rcx, [wv_nophon]                    ; "Disable phonetic reader" (0/1)
+    xor     edx, edx
+    lea     r8, [g_nophon_lock]
+    call    cfg_get_dword
+    test    eax, eax
+    jz      @F
+    mov     eax, 1
+@@: mov     dword ptr [g_no_phonetic], eax
     FRAME_EPILOG
     ret
 gui_load_policy endp
