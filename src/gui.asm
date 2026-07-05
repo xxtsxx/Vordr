@@ -69,7 +69,12 @@ extern mem_free:proc
 extern read_file:proc
 extern write_file:proc
 extern ze_compose:proc                  ; encrypted-ZIP export composer (zipexport.asm)
-extern zi_import:proc                   ; encrypted-ZIP import (zipimport.asm)
+extern zi_stage:proc                    ; encrypted-ZIP import: stage titles (zipimport.asm)
+extern zi_commit:proc                   ; import the g_sel-selected staged entries
+extern zi_abort:proc                    ; discard a staged import
+externdef g_zi_titles:qword             ; staged entry titles (wide ptr array)
+externdef g_zi_tlens:dword              ; staged entry title lengths (wchars)
+externdef g_zi_stg_n:dword              ; staged entry count
 extern ze_free:proc
 externdef g_zbuf:qword
 extern ShellExecuteW:proc
@@ -556,6 +561,8 @@ WSTR s_pwshort,     <Password is too short for the current policy.>
 WSTR s_pwclasses,   <Password needs more character types (lowercase / uppercase / number / symbol).>
 WSTR wt_newentry,   <New entry>
 WSTR cue_search,    <Search>
+WSTR sel_cap_imp,   <Vordr - Select entries to import>
+WSTR sel_ok_imp,    <Import>
 WSTR t_tpminfo,     <TPM Unlock>
 WSTR m_tpminfo,     <The TPM chip in this computer can unlock the vault automatically on this device. You will not need to type the master password at startup. The password still works everywhere and is never stored.>
 WSTR cue_pw,        <Master password>
@@ -953,6 +960,7 @@ g_tileblob    db MAX_TFILES*336 dup (?)          ; per-file {u32 len, AttachRef,
 align 8
 public g_sel
 g_sel         db MAX_SEL dup (?)                 ; export/import selection mask (1=selected)
+g_sel_src     dd ?                               ; checklist source: 0 = vault (export), 1 = staged import
 g_sel_scroll  dd ?                               ; checklist: first visible row
 g_sel_fn      dd ?                               ; checklist: filtered (searched) row count
 align 4
@@ -8278,6 +8286,85 @@ create_proc endp
 ; entries, each with a [ ]/[x] checkbox, a search box, and Select all/none.
 ; Used by export (pick what to write).  g_sel[e] = 1 selects entry e.
 ; =============================================================================
+; -----------------------------------------------------------------------------
+; Checklist source shims: the DLG_SELECT dialog serves both export (g_sel_src=0,
+; rows come from the open vault) and import (g_sel_src=1, rows come from the
+; staged-title arrays g_zi_titles/g_zi_tlens filled by zi_stage).
+; -----------------------------------------------------------------------------
+
+; gui_sel_count() -> eax = number of selectable rows.
+gui_sel_count proc frame
+    FRAME_PROLOG 32
+    cmp     dword ptr [g_sel_src], 0
+    jne     gsc_imp
+    call    vault_count
+    FRAME_EPILOG
+    ret
+gsc_imp:
+    mov     eax, dword ptr [g_zi_stg_n]
+    FRAME_EPILOG
+    ret
+gui_sel_count endp
+
+; gui_sel_title(rcx = index, rdx = *len) -> rax = wide title ptr, [rdx] = wchars.
+gui_sel_title proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], rdx
+    cmp     dword ptr [g_sel_src], 0
+    jne     gst_imp
+    mov     rcx, qword ptr [rbp-24]
+    mov     rdx, qword ptr [rbp-32]
+    call    vault_title_at
+    FRAME_EPILOG
+    ret
+gst_imp:
+    mov     r10, qword ptr [rbp-24]              ; index
+    lea     r8, [g_zi_titles]
+    mov     rax, qword ptr [r8+r10*8]
+    lea     r8, [g_zi_tlens]
+    mov     ecx, dword ptr [r8+r10*4]
+    mov     r10, qword ptr [rbp-32]
+    mov     dword ptr [r10], ecx
+    FRAME_EPILOG
+    ret
+gui_sel_title endp
+
+; gui_sel_match(rcx = index) -> eax = 1 if the row matches g_search_w, else 0.
+;   Vault rows delegate to gui_entry_matches; staged rows fold the title into
+;   g_match_w and substring-scan for the (already upper-cased) query.
+gui_sel_match proc frame
+    FRAME_PROLOG 48
+    cmp     dword ptr [g_sel_src], 0
+    jne     gsm_imp
+    call    gui_entry_matches                    ; rcx = index
+    FRAME_EPILOG
+    ret
+gsm_imp:
+    lea     r8, [g_zi_titles]                    ; src = g_zi_titles[index]
+    mov     r8, qword ptr [r8+rcx*8]
+    lea     r9, [g_match_w]                      ; copy up to 255 wchars + NUL
+    xor     r10d, r10d
+gsm_cp:
+    cmp     r10d, 255
+    jae     gsm_cpend
+    mov     ax, word ptr [r8+r10*2]
+    mov     word ptr [r9+r10*2], ax
+    test    ax, ax
+    jz      gsm_upper
+    inc     r10d
+    jmp     gsm_cp
+gsm_cpend:
+    mov     word ptr [r9+r10*2], 0
+gsm_upper:
+    WINCALL CharUpperBuffW, addr g_match_w, r10d
+    lea     rcx, [g_match_w]
+    lea     rdx, [g_search_w]
+    call    wide_find
+    FRAME_EPILOG
+    ret
+gui_sel_match endp
+
 ; gui_sel_buildfilter(rcx = hdlg) - rebuild g_sel_filter = the entry indices whose
 ;   title/fields match the search box (all entries when the query is empty).
 gui_sel_buildfilter proc frame
@@ -8287,7 +8374,7 @@ gui_sel_buildfilter proc frame
     mov     dword ptr [rbp-32], eax
     WINCALL CharUpperBuffW, addr g_search_w, dword ptr [rbp-32]
     mov     dword ptr [g_sel_fn], 0
-    call    vault_count
+    call    gui_sel_count
     mov     dword ptr [rbp-40], eax
     mov     dword ptr [rbp-44], 0
 sbf_loop:
@@ -8299,7 +8386,7 @@ sbf_loop:
     cmp     dword ptr [rbp-32], 0                ; empty query -> everything matches
     je      sbf_add
     mov     ecx, dword ptr [rbp-44]
-    call    gui_entry_matches
+    call    gui_sel_match
     test    eax, eax
     jz      sbf_next
 sbf_add:
@@ -8384,7 +8471,7 @@ dsl_loop:
     ; title
     mov     ecx, dword ptr [rbp-96]
     lea     rdx, [rbp-120]
-    call    vault_title_at                       ; rax = ptr, [rbp-120] = len
+    call    gui_sel_title                        ; rax = ptr, [rbp-120] = len
     mov     qword ptr [rbp-128], rax
     mov     eax, dword ptr [rbp-40]
     add     eax, 34
@@ -8545,6 +8632,11 @@ sel_init:
     mov     rcx, qword ptr [rbp-8]
     call    gui_set_winicon
     mov     dword ptr [g_sel_scroll], 0
+    cmp     dword ptr [g_sel_src], 0            ; import mode: relabel caption + OK button
+    je      sel_init_flt
+    WINCALL SetWindowTextW, qword ptr [rbp-8], addr sel_cap_imp
+    WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDOK, addr sel_ok_imp
+sel_init_flt:
     mov     rcx, qword ptr [rbp-8]
     call    gui_sel_buildfilter
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_SEL_SEARCH, EM_SETCUEBANNER, 1, addr cue_search
@@ -8647,6 +8739,7 @@ gui_sel_all endp
 gui_export proc frame
     FRAME_PROLOG 64
     mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [g_sel_src], 0             ; checklist draws from the open vault
     call    vault_count                          ; open the checklist with all entries ticked
     mov     ecx, eax
     call    gui_sel_all
@@ -9312,33 +9405,43 @@ gim_read_ok:
     WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_IMPPW, qword ptr [rbp-24], addr imppw_proc, 0
     cmp     eax, 1
     jne     gim_done
+    ; ---- stage: decrypt vordr.json + collect entry titles (raw stays mapped) ----
     mov     rcx, qword ptr [rbp-32]             ; raw zip
     mov     edx, dword ptr [rbp-40]
     lea     r8, [g_xlpw]                        ; UTF-16 archive password
     mov     r9d, dword ptr [g_xlpwlen]
-    call    zi_import
+    call    zi_stage
     mov     dword ptr [rbp-64], eax
-    lea     rcx, [g_xlpw]                       ; wipe the password
+    lea     rcx, [g_xlpw]                       ; wipe the wide pw (zi_stage kept a UTF-8 copy)
     mov     edx, 512
     call    secure_zero
     mov     dword ptr [g_xlpwlen], 0
-    jmp     gim_result
+    cmp     dword ptr [rbp-64], -3
+    je      gim_wrongpw                         ; zi_stage already freed the arena + wiped pw
+    cmp     dword ptr [rbp-64], 0
+    jl      gim_bad
+    jg      gim_sel
+    call    zi_abort                            ; staged 0 entries
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr imp_g_none, addr imp_g_title, 030h
+    jmp     gim_done
 gim_notvordr:
     WINCALL gui_msgbox, qword ptr [rbp-24], addr imp_g_bad, addr imp_g_title, 030h
     jmp     gim_done
-gim_result:
-    mov     rcx, qword ptr [rbp-32]             ; wipe + free the raw file (plaintext)
-    test    rcx, rcx
-    jz      gim_interpret
-    mov     rdx, qword ptr [rbp-40]
-    call    mem_free
-    mov     qword ptr [rbp-32], 0
-gim_interpret:
-    cmp     dword ptr [rbp-64], -3
-    je      gim_wrongpw
-    cmp     dword ptr [rbp-64], 0
-    jl      gim_bad
-    jg      gim_ok
+gim_sel:
+    ; ---- selection screen (all entries pre-checked; import adds them as new) ----
+    mov     dword ptr [g_sel_src], 1
+    mov     ecx, dword ptr [rbp-64]             ; staged count
+    call    gui_sel_all
+    WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_SELECT, qword ptr [rbp-24], addr select_proc, 0
+    cmp     eax, 1
+    je      gim_commit
+    call    zi_abort                            ; user cancelled the selection
+    jmp     gim_done
+gim_commit:
+    call    zi_commit                           ; -> eax = entries imported
+    mov     dword ptr [rbp-64], eax
+    test    eax, eax
+    jnz     gim_ok
     WINCALL gui_msgbox, qword ptr [rbp-24], addr imp_g_none, addr imp_g_title, 030h
     jmp     gim_done
 gim_ok:
