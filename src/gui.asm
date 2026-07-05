@@ -186,6 +186,7 @@ extern theme_erase:proc
 extern theme_ctlcolor:proc
 extern theme_drawitem:proc
 extern theme_toggle:proc
+extern theme_toggle_labeled:proc
 extern theme_progressbar:proc
 extern g_font_totp:qword
 extern theme_backdrop:proc
@@ -626,8 +627,6 @@ WSTR imp_g_bad,      <That file is not a Vordr encrypted export (.zip), or the p
 WSTR zip_title,      <Export to encrypted archive>
 WSTR zip_defname,    <vordr-export.zip>
 WSTR exp_done_ok,    <Export complete. Keep the file safe and delete it when you no longer need it.>
-WSTR pg_on,   <[x] >
-WSTR pg_off,  <[ ] >
 WSTR pg_lbl_up,  <Uppercase>
 WSTR pg_lbl_lo,  <Lowercase>
 WSTR pg_lbl_di,  <Digits>
@@ -9435,21 +9434,16 @@ gui_import endp
 
 ; gui_pg_toggle_text(rcx=hdlg, edx=ctlid, r8d=state, r9=base wide) - set a toggle
 ;   button's caption to "[x] "/"[ ] " + base.
+; gui_pg_toggle_text(rcx=hdlg, edx=ctrlID, r8d=on(unused), r9=label) - set the
+;   option control's caption to the plain label; the on/off state is rendered as
+;   a Fluent pill by theme_toggle_labeled (which reads g_pg_opt), and the
+;   SetDlgItemTextW here invalidates the owner-draw control so it repaints.
 gui_pg_toggle_text proc frame
     FRAME_PROLOG 48
     mov     qword ptr [rbp-24], rcx
     mov     dword ptr [rbp-28], edx
     mov     qword ptr [rbp-40], r9
-    lea     rcx, [g_pg_tmpw]
-    lea     rdx, [pg_off]
-    cmp     r8d, 0
-    je      @F
-    lea     rdx, [pg_on]
-@@: call    gui_wstrcpy
-    mov     rcx, rax
-    mov     rdx, qword ptr [rbp-40]
-    call    gui_wstrcpy
-    WINCALL SetDlgItemTextW, qword ptr [rbp-24], dword ptr [rbp-28], addr g_pg_tmpw
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], dword ptr [rbp-28], qword ptr [rbp-40]
     FRAME_EPILOG
     ret
 gui_pg_toggle_text endp
@@ -9651,8 +9645,39 @@ pp_erase:
     call    theme_erase
     jmp     pp_ret
 pp_draw:
+    mov     r10, r9
+    mov     eax, dword ptr [r10+4]             ; DRAWITEMSTRUCT.CtlID
+    cmp     eax, IDC_PG_UP
+    je      pp_d_up
+    cmp     eax, IDC_PG_LO
+    je      pp_d_lo
+    cmp     eax, IDC_PG_DI
+    je      pp_d_di
+    cmp     eax, IDC_PG_SY
+    je      pp_d_sy
+    cmp     eax, IDC_PG_AMB
+    je      pp_d_amb
     mov     rcx, r9
     call    theme_drawitem
+    jmp     pp_ret
+pp_d_up:
+    mov     edx, PWCLASS_U
+    jmp     pp_d_tog
+pp_d_lo:
+    mov     edx, PWCLASS_L
+    jmp     pp_d_tog
+pp_d_di:
+    mov     edx, PWCLASS_D
+    jmp     pp_d_tog
+pp_d_sy:
+    mov     edx, PWCLASS_S
+    jmp     pp_d_tog
+pp_d_amb:
+    mov     edx, PWO_NOAMBIG
+pp_d_tog:
+    and     edx, dword ptr [g_pg_opt]          ; state = option bit (nonzero = on)
+    mov     rcx, r9
+    call    theme_toggle_labeled
     jmp     pp_ret
 pp_timer:
     cmp     r8d, THEME_TIMER
