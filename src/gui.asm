@@ -1530,6 +1530,31 @@ mwf_done:
     ret
 gui_make_welcomefont endp
 
+; gui_center_ok(rcx=hdlg) - centre the message-box OK button (DLU 122,120,56,22)
+;   for single-button boxes, so it isn't left where the 2-button pair sits.
+gui_center_ok proc frame
+    FRAME_PROLOG 128
+    mov     qword ptr [rbp-24], rcx
+    lea     r10, [rbp-72]                    ; RECT {122,120,178,142} in DLU
+    mov     dword ptr [r10], 122
+    mov     dword ptr [r10+4], 120
+    mov     dword ptr [r10+8], 178
+    mov     dword ptr [r10+12], 142
+    WINCALL MapDialogRect, qword ptr [rbp-24], addr rbp-72
+    mov     eax, dword ptr [rbp-64]          ; width = right - left
+    sub     eax, dword ptr [rbp-72]
+    mov     dword ptr [rbp-44], eax
+    mov     eax, dword ptr [rbp-60]          ; height = bottom - top
+    sub     eax, dword ptr [rbp-68]
+    mov     dword ptr [rbp-48], eax
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_M_OK
+    mov     qword ptr [rbp-32], rax
+    WINCALL MoveWindow, qword ptr [rbp-32], dword ptr [rbp-72], dword ptr [rbp-68], \
+            dword ptr [rbp-44], dword ptr [rbp-48], 1
+    FRAME_EPILOG
+    ret
+gui_center_ok endp
+
 gui_make_listfonts proc frame
     FRAME_PROLOG 112
     cmp     qword ptr [g_iconfont], 0
@@ -11233,6 +11258,15 @@ mp_init:
     mov     r8, qword ptr [g_msg_text]
     call    SetDlgItemTextW
     add     rsp, 32
+    call    gui_make_welcomefont              ; larger body font for the message text
+    sub     rsp, 48
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_M_TEXT
+    mov     r8d, WM_SETFONT
+    mov     r9, qword ptr [g_welcomefont]
+    mov     qword ptr [rsp+32], 1
+    call    SendDlgItemMessageW
+    add     rsp, 48
     mov     eax, dword ptr [g_msg_flags]
     and     eax, MB_TYPEMASK
     cmp     eax, MB_YESNO
@@ -11251,6 +11285,8 @@ mp_init:
     xor     edx, edx                          ; SW_HIDE
     call    ShowWindow
     add     rsp, 32
+    mov     rcx, qword ptr [rbp-8]            ; centre the lone OK button
+    call    gui_center_ok
     jmp     mp_initdone
 mp_yesno:
     sub     rsp, 32
