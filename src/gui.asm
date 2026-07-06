@@ -1008,6 +1008,7 @@ g_totp_codehwnd dq ?                      ; live-code display control of the TOT
 g_totp_barhwnd  dq ?                      ; drain-bar control of the TOTP row
 align 8
 g_iconfont    dq ?                         ; Segoe Fluent Icons for list/tile glyphs
+g_welcomefont dq ?                         ; slightly larger body font for the create welcome text
 g_cardfont    dq ?                         ; list entry title (semibold)
 g_subfont     dq ?                         ; list entry subtitle (regular, dim)
 g_titlefont   dq ?                         ; detail-header title (large semibold)
@@ -8687,6 +8688,12 @@ cp_init:
     mov     qword ptr [rbp-16], rax
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_C_LOGO, STM_SETICON, qword ptr [rbp-16], 0
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_C_WELCOME, addr m_welcome
+    cmp     qword ptr [g_welcomefont], 0     ; slightly larger body font for the welcome text
+    jne     cp_wf_set
+    WINCALL CreateFontW, -15, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, addr f_segoeui
+    mov     qword ptr [g_welcomefont], rax
+cp_wf_set:
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_C_WELCOME, WM_SETFONT, qword ptr [g_welcomefont], 1
     mov     dword ptr [g_uline_ctl], 0       ; start with default (accent) underlines
     mov     dword ptr [g_uline_ctl2], 0
     mov     qword ptr [g_uline_br], 0
