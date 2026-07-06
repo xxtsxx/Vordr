@@ -1037,9 +1037,29 @@ frame_cb proc
     call    GetFocus
     cmp     rax, qword ptr [rbp-8]
     je      fc_focus
+    ; unfocused: a strength/match override shows persistently (2px), else 1px hairline
+    mov     ecx, dword ptr [rbp-80]
+    xor     r9, r9
+    cmp     ecx, dword ptr [g_uline_ctl]
+    jne     fc_nf_ov2
+    mov     r9, qword ptr [g_uline_br]
+    jmp     fc_nf_test
+fc_nf_ov2:
+    cmp     ecx, dword ptr [g_uline_ctl2]
+    jne     fc_nf_test
+    mov     r9, qword ptr [g_uline_br2]
+fc_nf_test:
+    test    r9, r9
+    jz      fc_nf_hair
+    mov     eax, dword ptr [rbp-28]
+    add     eax, 2
+    mov     dword ptr [rbp-60], eax           ; 2px strength/match bar
+    mov     r8, r9
+    jmp     fc_fill
+fc_nf_hair:
     mov     eax, dword ptr [rbp-28]
     add     eax, 1
-    mov     dword ptr [rbp-60], eax           ; 1px
+    mov     dword ptr [rbp-60], eax           ; 1px hairline
     mov     r8, qword ptr [g_br_frame]
     jmp     fc_fill
 fc_focus:

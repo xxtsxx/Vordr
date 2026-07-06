@@ -11399,7 +11399,8 @@ gui_main proc frame
     mov     dword ptr [rbp-24], 8           ; INITCOMMONCONTROLSEX.dwSize
     mov     dword ptr [rbp-20], 4005h       ; ICC_STANDARD | ICC_BAR (trackbar) | ICC_LISTVIEW_CLASSES
     WINCALL InitCommonControlsEx, addr rbp-24
-    call    theme_boot
+    call    gui_load_prefs                  ; load the saved scheme BEFORE theme_boot so the
+    call    theme_boot                      ;   create/unlock dialogs use it too, not the default
     call    tpm_available
     mov     dword ptr [g_tpm_present], eax
     call    gui_load_policy
