@@ -609,6 +609,29 @@ WSTR t_req,         <Password requirements>
 WSTR req_p1,        <Your master password must be at least >
 WSTR req_p2,        < characters and use at least >
 WSTR req_p3,        < of 4 character types - lowercase / uppercase / number / symbol.>
+req_p4 label word
+    dw 13,10,13,10,84,104,101,32,109,97,115,116,101,114,32,112
+    dw 97,115,115,119,111,114,100,32,105,115,32,116,104,101,32,111
+    dw 110,108,121,32,107,101,121,32,116,111,32,101,118,101,114,121
+    dw 32,97,99,99,111,117,110,116,32,121,111,117,39,118,101,32
+    dw 115,97,118,101,100,46,32,84,104,101,114,101,32,105,115,32
+    dw 110,111,32,114,101,115,101,116,32,98,117,116,116,111,110,44
+    dw 32,110,111,32,34,102,111,114,103,111,116,32,112,97,115,115
+    dw 119,111,114,100,34,32,108,105,110,107,44,32,97,110,100,32
+    dw 110,111,32,119,97,121,32,116,111,32,114,101,99,111,118,101
+    dw 114,32,105,116,32,105,102,32,121,111,117,32,108,111,115,101
+    dw 32,105,116,46,32,67,104,111,111,115,101,32,97,32,115,116
+    dw 114,111,110,103,32,112,97,115,115,119,111,114,100,32,121,111
+    dw 117,39,108,108,32,116,114,117,108,121,32,114,101,109,101,109
+    dw 98,101,114,44,32,107,101,101,112,32,105,116,32,115,97,102
+    dw 101,44,32,97,110,100,32,110,101,118,101,114,32,115,104,97
+    dw 114,101,32,105,116,46,32,80,114,111,116,101,99,116,32,105
+    dw 116,32,108,105,107,101,32,116,104,101,32,111,110,108,121,32
+    dw 107,101,121,32,116,111,32,121,111,117,114,32,100,105,103,105
+    dw 116,97,108,32,104,111,109,101,8212,98,101,99,97,117,115,101
+    dw 32,105,102,32,105,116,39,115,32,103,111,110,101,44,32,101
+    dw 118,101,114,121,116,104,105,110,103,32,105,115,32,103,111,110
+    dw 101,46,0
 WSTR wv_pwlen,      <PwMinLen>
 WSTR wv_pwcls,      <PwMinClasses>
 WSTR wv_nohist,     <NoHistory>
@@ -941,7 +964,7 @@ g_br_red    dq ?                      ; cached strength/match line brushes (0=un
 g_br_amber  dq ?
 g_br_lgreen dq ?
 g_br_dgreen dq ?
-g_reqbuf    dw 512 dup (?)            ; formatted password-requirements callout text
+g_reqbuf    dw 768 dup (?)            ; formatted password-requirements callout text
 g_numtmp    db 16 dup (?)             ; scratch for uint-to-decimal
 g_vault_lock dd ?                     ; 1 = vault path set by HKLM (locked)
 g_menu_open  dd ?                     ; 1 = settings overlay is showing
@@ -1535,11 +1558,11 @@ gui_make_welcomefont endp
 gui_center_ok proc frame
     FRAME_PROLOG 128
     mov     qword ptr [rbp-24], rcx
-    lea     r10, [rbp-72]                    ; RECT {122,120,178,142} in DLU
+    lea     r10, [rbp-72]                    ; RECT {122,170,178,192} in DLU
     mov     dword ptr [r10], 122
-    mov     dword ptr [r10+4], 120
+    mov     dword ptr [r10+4], 170
     mov     dword ptr [r10+8], 178
-    mov     dword ptr [r10+12], 142
+    mov     dword ptr [r10+12], 192
     WINCALL MapDialogRect, qword ptr [rbp-24], addr rbp-72
     mov     eax, dword ptr [rbp-64]          ; width = right - left
     sub     eax, dword ptr [rbp-72]
@@ -8648,6 +8671,9 @@ gui_show_info proc frame
     call    gui_uint_w
     mov     rcx, rax
     lea     rdx, [req_p3]
+    call    gui_w_appendz
+    mov     rcx, rax                          ; the "there is no reset" warning
+    lea     rdx, [req_p4]
     call    gui_w_appendz
     mov     word ptr [rax], 0                 ; terminate
     WINCALL gui_msgbox, qword ptr [rbp-24], addr g_reqbuf, addr t_req, \
