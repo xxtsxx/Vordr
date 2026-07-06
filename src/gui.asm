@@ -424,9 +424,9 @@ SW_SHOW      equ 5
 DLG_CREATE   equ 400
 IDC_C_PW     equ 402
 IDC_C_PW2    equ 403
-IDC_C_PWBAR  equ 404                  ; strength line under the master-password box
-IDC_C_PW2BAR equ 405                  ; match line under the confirm box
 IDC_C_INFO   equ 406                  ; (i) password-requirements callout
+IDC_C_LOGO   equ 407                  ; large Vordr icon (welcome screen)
+IDC_C_WELCOME equ 408                 ; welcome text
 DLG_MSG      equ 600                  ; Fluent message box (replaces MessageBoxW)
 IDC_M_TEXT   equ 601
 IDC_M_OK     equ 602
@@ -615,6 +615,34 @@ WSTR wv_nohist,     <NoHistory>
 WSTR wv_nophon,     <NoPhonetic>
 ; --- system tray strings ------------------------------------------------------
 WSTR t_about,       <About Vordr>
+m_welcome label word
+    dw 87,101,108,99,111,109,101,32,116,111,32,86,111,114,100,114
+    dw 44,32,116,104,101,32,112,97,115,115,119,111,114,100,32,109
+    dw 97,110,97,103,101,114,32,98,117,105,108,116,32,102,111,114
+    dw 32,116,111,116,97,108,32,100,105,103,105,116,97,108,32,115
+    dw 111,118,101,114,101,105,103,110,116,121,46,13,10,13,10,87
+    dw 101,32,112,114,111,116,101,99,116,32,121,111,117,114,32,115
+    dw 101,99,114,101,116,115,32,119,105,116,104,32,115,116,97,116
+    dw 101,45,111,102,45,116,104,101,45,97,114,116,32,113,117,97
+    dw 110,116,117,109,45,114,101,115,105,115,116,97,110,116,32,101
+    dw 110,99,114,121,112,116,105,111,110,44,32,101,110,115,117,114
+    dw 105,110,103,32,116,104,101,121,32,114,101,109,97,105,110,32
+    dw 115,97,102,101,32,97,103,97,105,110,115,116,32,98,111,116
+    dw 104,32,99,117,114,114,101,110,116,32,116,104,114,101,97,116
+    dw 115,32,97,110,100,32,102,117,116,117,114,101,32,99,111,109
+    dw 112,117,116,105,110,103,32,97,100,118,97,110,99,101,115,46
+    dw 13,10,13,10,86,111,114,100,114,32,111,112,101,114,97,116
+    dw 101,115,32,99,111,109,112,108,101,116,101,108,121,32,111,102
+    dw 102,108,105,110,101,32,119,105,116,104,32,122,101,114,111,32
+    dw 101,120,116,101,114,110,97,108,32,100,101,112,101,110,100,101
+    dw 110,99,105,101,115,46,32,89,111,117,114,32,115,101,99,114
+    dw 101,116,115,32,115,116,97,121,32,101,120,97,99,116,108,121
+    dw 32,119,104,101,114,101,32,116,104,101,121,32,98,101,108,111
+    dw 110,103,58,32,117,110,100,101,114,32,121,111,117,114,32,99
+    dw 111,110,116,114,111,108,46,13,10,13,10,83,101,116,32,97
+    dw 32,115,101,99,117,114,101,32,109,97,115,116,101,114,32,112
+    dw 97,115,115,119,111,114,100,32,116,111,32,103,101,116,32,115
+    dw 116,97,114,116,101,100,46,0
 WSTR m_about,       <Vordr - a hardened password manager. AES-256-GCM with Argon2id key derivation. Fail-closed and self-tested on every launch. Written in x64 assembly with no runtime dependencies.>
 WSTR mi_open,       <Open>
 WSTR mi_exit,       <Exit>
@@ -8289,6 +8317,16 @@ gui_pw_strength proc frame
     WINCALL GetDlgItemTextW, qword ptr [rbp-24], IDC_C_PW, addr g_pwbuf, 1024
     mov     dword ptr [rbp-32], eax          ; password length (chars)
     WINCALL GetDlgItemTextW, qword ptr [rbp-24], IDC_C_PW2, addr g_pw2buf, 1024
+    mov     dword ptr [rbp-56], 0            ; pw_empty (captured before the buffers are wiped)
+    cmp     dword ptr [rbp-32], 0
+    jne     @F
+    mov     dword ptr [rbp-56], 1
+@@: mov     dword ptr [rbp-64], 0            ; pw2_empty
+    movzx   eax, word ptr [g_pw2buf]
+    test    eax, eax
+    jnz     @F
+    mov     dword ptr [rbp-64], 1
+@@:
     ; ---- confirm matches a non-empty password? -----------------------------
     mov     dword ptr [g_pw_match], 0
     movzx   eax, word ptr [g_pw2buf]
@@ -8354,15 +8392,34 @@ ps_done:
     mov     rcx, rax
     mov     edx, dword ptr [rbp-48]
     call    EnableWindow
-    ; repaint the two colour lines
-    mov     rcx, qword ptr [rbp-24]
-    mov     edx, IDC_C_PWBAR
-    call    GetDlgItem
-    WINCALL InvalidateRect, rax, 0, 1
-    mov     rcx, qword ptr [rbp-24]
-    mov     edx, IDC_C_PW2BAR
-    call    GetDlgItem
-    WINCALL InvalidateRect, rax, 0, 1
+    ; strength/match integrated into the field underlines (like the export dialog)
+    mov     dword ptr [g_uline_ctl], IDC_C_PW
+    cmp     dword ptr [rbp-56], 0            ; empty field -> default accent underline
+    jne     cs_pwdef
+    mov     eax, dword ptr [g_pw_level]      ; contiguous red/amber/lgreen/dgreen
+    lea     r10, [g_br_red]
+    mov     rax, qword ptr [r10+rax*8]
+    mov     qword ptr [g_uline_br], rax
+    jmp     cs_confirm
+cs_pwdef:
+    mov     qword ptr [g_uline_br], 0
+cs_confirm:
+    mov     dword ptr [g_uline_ctl2], IDC_C_PW2
+    cmp     dword ptr [rbp-64], 0
+    jne     cs_cfdef
+    cmp     dword ptr [g_pw_match], 0
+    je      cs_cfbad
+    mov     rax, qword ptr [g_br_dgreen]
+    mov     qword ptr [g_uline_br2], rax
+    jmp     cs_inval
+cs_cfbad:
+    mov     rax, qword ptr [g_br_red]
+    mov     qword ptr [g_uline_br2], rax
+    jmp     cs_inval
+cs_cfdef:
+    mov     qword ptr [g_uline_br2], 0
+cs_inval:
+    WINCALL InvalidateRect, qword ptr [rbp-24], 0, 1
     FRAME_EPILOG
     ret
 gui_pw_strength endp
@@ -8489,41 +8546,6 @@ pbi_done:
     ret
 gui_pwbars_init endp
 
-; gui_drawbar(rcx = lpdrawitem, edx = 0 strength / 1 match) - fill the colour
-;   line: strength uses red/amber/light-green/deep-green by g_pw_level; match
-;   uses red (mismatch) / deep-green (match).
-gui_drawbar proc frame
-    FRAME_PROLOG 64
-    mov     qword ptr [rbp-24], rcx          ; lpdis
-    cmp     edx, 0
-    jne     db_match
-    ; strength: pick by g_pw_level
-    mov     eax, dword ptr [g_pw_level]
-    lea     r10, [g_br_red]
-    mov     rax, qword ptr [r10+rax*8]        ; brushes are contiguous red/amber/lg/dg
-    jmp     db_fill
-db_match:
-    mov     rax, qword ptr [g_br_red]
-    cmp     dword ptr [g_pw_match], 0
-    je      db_fill_have
-    mov     rax, qword ptr [g_br_dgreen]
-db_fill_have:
-db_fill:
-    mov     qword ptr [rbp-32], rax           ; brush
-    mov     rcx, qword ptr [rbp-24]
-    mov     rax, qword ptr [rcx+32]           ; hDC
-    mov     qword ptr [rbp-40], rax
-    ; FillRect(hDC, &rcItem, brush)
-    mov     rcx, qword ptr [rbp-40]
-    mov     rax, qword ptr [rbp-24]
-    lea     rdx, [rax+40]                     ; &rcItem
-    mov     r8, qword ptr [rbp-32]
-    call    FillRect
-    mov     eax, 1
-    FRAME_EPILOG
-    ret
-gui_drawbar endp
-
 ; gui_w_appendz(rcx = dst wide, rdx = src wideZ) -> rax = dst end (no NUL copied).
 gui_w_appendz proc
 az_loop:
@@ -8641,24 +8663,8 @@ cp_terase:
     call    theme_erase
     jmp     cp_ret
 cp_tdraw:
-    ; the two colour lines are owner-draw statics; everything else is themed
-    mov     eax, dword ptr [r9+4]            ; DRAWITEMSTRUCT.CtlID
-    cmp     eax, IDC_C_PWBAR
-    je      cp_drawbar_pw
-    cmp     eax, IDC_C_PW2BAR
-    je      cp_drawbar_pw2
     mov     rcx, r9
     call    theme_drawitem
-    jmp     cp_ret
-cp_drawbar_pw:
-    mov     rcx, r9
-    xor     edx, edx                         ; strength
-    call    gui_drawbar
-    jmp     cp_ret
-cp_drawbar_pw2:
-    mov     rcx, r9
-    mov     edx, 1                           ; match
-    call    gui_drawbar
     jmp     cp_ret
 cp_ttimer:
     cmp     r8d, THEME_TIMER
@@ -8676,11 +8682,19 @@ cp_init:
     call    theme_attach
     mov     rcx, qword ptr [rbp-8]
     call    gui_set_winicon
-    call    gui_pwbars_init                  ; build the colour-line brushes
+    call    gui_pwbars_init                  ; build the strength brushes
+    WINCALL LoadImageW, qword ptr [g_hinst], 1, 1, 64, 64, 0   ; large Vordr logo
+    mov     qword ptr [rbp-16], rax
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_C_LOGO, STM_SETICON, qword ptr [rbp-16], 0
+    WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_C_WELCOME, addr m_welcome
+    mov     dword ptr [g_uline_ctl], 0       ; start with default (accent) underlines
+    mov     dword ptr [g_uline_ctl2], 0
+    mov     qword ptr [g_uline_br], 0
+    mov     qword ptr [g_uline_br2], 0
     ; placeholder cue text inside the two password boxes
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_C_PW, EM_SETCUEBANNER, 1, addr cue_pw
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_C_PW2, EM_SETCUEBANNER, 1, addr cue_pw2
-    mov     rcx, qword ptr [rbp-8]           ; prime the colour lines + Create state
+    mov     rcx, qword ptr [rbp-8]           ; prime the underlines + Create state
     call    gui_pw_strength
     mov     eax, 1
     jmp     cp_ret
