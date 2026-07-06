@@ -1517,6 +1517,19 @@ gui_poplist endp
 ; =============================================================================
 
 ; gui_make_listfonts() - lazily create the list fonts.
+; gui_make_welcomefont() - lazily build the larger body font for the create
+;   dialog's welcome text.  Its own frame: the 14-arg CreateFontW needs the room.
+gui_make_welcomefont proc frame
+    FRAME_PROLOG 112
+    cmp     qword ptr [g_welcomefont], 0
+    jne     mwf_done
+    WINCALL CreateFontW, -15, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, addr f_segoeui
+    mov     qword ptr [g_welcomefont], rax
+mwf_done:
+    FRAME_EPILOG
+    ret
+gui_make_welcomefont endp
+
 gui_make_listfonts proc frame
     FRAME_PROLOG 112
     cmp     qword ptr [g_iconfont], 0
@@ -8688,11 +8701,7 @@ cp_init:
     mov     qword ptr [rbp-16], rax
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_C_LOGO, STM_SETICON, qword ptr [rbp-16], 0
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_C_WELCOME, addr m_welcome
-    cmp     qword ptr [g_welcomefont], 0     ; slightly larger body font for the welcome text
-    jne     cp_wf_set
-    WINCALL CreateFontW, -15, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, addr f_segoeui
-    mov     qword ptr [g_welcomefont], rax
-cp_wf_set:
+    call    gui_make_welcomefont             ; larger body font (own frame: 14-arg CreateFontW)
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_C_WELCOME, WM_SETFONT, qword ptr [g_welcomefont], 1
     mov     dword ptr [g_uline_ctl], 0       ; start with default (accent) underlines
     mov     dword ptr [g_uline_ctl2], 0
