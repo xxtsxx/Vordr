@@ -708,22 +708,18 @@ pht_staysw  dw 's','t','a','y','s', 0
     even                                         ; wb_gen MUST be word-aligned: an odd
 wb_gen label word                                ; caption addr fails CreateWindowExW (998)
     dw 0E72Ch, 0                                 ; Refresh (generate password)
-sn_dark dw 'D','a','r','k',0
 sn_light dw 'L','i','g','h','t',0
-sn_midnight dw 'M','i','d','n','i','g','h','t',0
 sn_sepia dw 'S','e','p','i','a',0
 sn_nord dw 'N','o','r','d',0
+sn_midnight dw 'M','i','d','n','i','g','h','t',0
 sn_commodore dw 'C','o','m','m','o','d','o','r','e',0
-sn_bladerunner dw 'B','l','a','d','e',' ','R','u','n','n','e','r',0
-sn_monochrome dw 'M','o','n','o','c','h','r','o','m','e',0
 sn_amethyst dw 'A','m','e','t','h','y','s','t',0
 sn_emerald dw 'E','m','e','r','a','l','d',0
 sn_sapphire dw 'S','a','p','p','h','i','r','e',0
-sn_monokai dw 'M','o','n','o','k','a','i',0
 sn_gruvbox dw 'G','r','u','v','b','o','x',0
 align 8
-scheme_names dq sn_dark,sn_light,sn_midnight,sn_sepia,sn_nord,sn_commodore,sn_bladerunner,sn_monochrome,sn_amethyst,sn_emerald,sn_sapphire,sn_monokai,sn_gruvbox
-GUI_SCHEME_COUNT equ 13
+scheme_names dq sn_light,sn_sepia,sn_nord,sn_midnight,sn_commodore,sn_amethyst,sn_emerald,sn_sapphire,sn_gruvbox
+GUI_SCHEME_COUNT equ 9
 layout_gaps  dd 7, 3, 14                          ; inter-card gap (DLU) per layout
 lay_band     dd 14, 0, 18                         ; label band: card(top) vs 0=flat(left)
 lay_itemh    dd 42, 30, 58                         ; list-item pixel height (index 0 used)
@@ -5396,10 +5392,10 @@ gui_url_open endp
 
 ; gui_chiptune() - synthesize a short square-wave "power-up" jingle into g_wav
 ;   (8-bit mono PCM WAV built entirely at runtime) and play it async.  Only the
-;   8-bit Commodore theme (scheme 5) gets the jingle; other themes stay silent.
+;   8-bit Commodore theme (scheme 4) gets the jingle; other themes stay silent.
 gui_chiptune proc frame
     FRAME_PROLOG 64
-    cmp     dword ptr [g_scheme], 5
+    cmp     dword ptr [g_scheme], 4
     jne     gct_done
     lea     rax, [g_wav+44]                     ; sample cursor (after the 44-byte header)
     mov     qword ptr [rbp-24], rax
