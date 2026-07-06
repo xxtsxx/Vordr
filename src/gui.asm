@@ -871,8 +871,6 @@ g_impfilter label word          ; "Vordr export\0*.zip\0All files\0*.*\0\0"
     dw '*','.','*',0,0
 g_empty_w label word
     dw 0                                          ; empty wide string (default field value)
-pm_custom label word
-    dw 'C','u','s','t','o','m',' ','f','i','e','l','d', 0
 ; control-id groups toggled when the settings overlay opens/closes
 align 4
 g_vault_ids label dword
@@ -7084,7 +7082,6 @@ gui_addfield_menu proc frame
 gam_totp:
     WINCALL AppendMenuW, qword ptr [rbp-32], dword ptr [rbp-40], 6, addr kl_totp
     WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 9, addr kl_file
-    WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 7, addr pm_custom
     mov     rcx, qword ptr [rbp-32]              ; tint the menu background
     call    gui_menu_dark
     mov     qword ptr [rbp-64], rax
