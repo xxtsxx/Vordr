@@ -711,45 +711,19 @@ wb_gen label word                                ; caption addr fails CreateWind
 sn_dark dw 'D','a','r','k',0
 sn_light dw 'L','i','g','h','t',0
 sn_midnight dw 'M','i','d','n','i','g','h','t',0
-sn_contrast dw 'C','o','n','t','r','a','s','t',0
-sn_solarized dw 'S','o','l','a','r','i','z','e','d',0
 sn_sepia dw 'S','e','p','i','a',0
 sn_nord dw 'N','o','r','d',0
-sn_rose dw 'R','o','s','e',0
-sn_rainbow dw 'R','a','i','n','b','o','w',0
-sn_nes dw 'N','E','S',0
-sn_gameboy dw 'G','a','m','e',' ','B','o','y',0
 sn_commodore dw 'C','o','m','m','o','d','o','r','e',0
-sn_cga dw 'C','G','A',0
-sn_zxspectrum dw 'Z','X',' ','S','p','e','c','t','r','u','m',0
-sn_ambercrt dw 'A','m','b','e','r',' ','C','R','T',0
-sn_greencrt dw 'G','r','e','e','n',' ','C','R','T',0
-sn_appleii dw 'A','p','p','l','e',' ','I','I',0
-sn_dos dw 'D','O','S',0
-sn_vaporwave dw 'V','a','p','o','r','w','a','v','e',0
-sn_synthwave dw 'S','y','n','t','h','w','a','v','e',0
-sn_outrun dw 'O','u','t','r','u','n',0
-sn_cyberpunk dw 'C','y','b','e','r','p','u','n','k',0
 sn_bladerunner dw 'B','l','a','d','e',' ','R','u','n','n','e','r',0
-sn_tron dw 'T','r','o','n',0
-sn_matrix dw 'M','a','t','r','i','x',0
-sn_neontokyo dw 'N','e','o','n',' ','T','o','k','y','o',0
-sn_miami dw 'M','i','a','m','i',0
-sn_hacker dw 'H','a','c','k','e','r',0
 sn_monochrome dw 'M','o','n','o','c','h','r','o','m','e',0
 sn_amethyst dw 'A','m','e','t','h','y','s','t',0
 sn_emerald dw 'E','m','e','r','a','l','d',0
-sn_ruby dw 'R','u','b','y',0
 sn_sapphire dw 'S','a','p','p','h','i','r','e',0
-sn_royalgold dw 'R','o','y','a','l',' ','G','o','l','d',0
 sn_monokai dw 'M','o','n','o','k','a','i',0
-sn_dracula dw 'D','r','a','c','u','l','a',0
 sn_gruvbox dw 'G','r','u','v','b','o','x',0
-sn_aurora dw 'A','u','r','o','r','a',0
-sn_cottoncandy dw 'C','o','t','t','o','n',' ','C','a','n','d','y',0
 align 8
-scheme_names dq sn_dark,sn_light,sn_midnight,sn_contrast,sn_solarized,sn_sepia,sn_nord,sn_rose,sn_rainbow,sn_nes,sn_gameboy,sn_commodore,sn_cga,sn_zxspectrum,sn_ambercrt,sn_greencrt,sn_appleii,sn_dos,sn_vaporwave,sn_synthwave,sn_outrun,sn_cyberpunk,sn_bladerunner,sn_tron,sn_matrix,sn_neontokyo,sn_miami,sn_hacker,sn_monochrome,sn_amethyst,sn_emerald,sn_ruby,sn_sapphire,sn_royalgold,sn_monokai,sn_dracula,sn_gruvbox,sn_aurora,sn_cottoncandy
-GUI_SCHEME_COUNT equ 39
+scheme_names dq sn_dark,sn_light,sn_midnight,sn_sepia,sn_nord,sn_commodore,sn_bladerunner,sn_monochrome,sn_amethyst,sn_emerald,sn_sapphire,sn_monokai,sn_gruvbox
+GUI_SCHEME_COUNT equ 13
 layout_gaps  dd 7, 3, 14                          ; inter-card gap (DLU) per layout
 lay_band     dd 14, 0, 18                         ; label band: card(top) vs 0=flat(left)
 lay_itemh    dd 42, 30, 58                         ; list-item pixel height (index 0 used)
@@ -5421,12 +5395,12 @@ guo_done:
 gui_url_open endp
 
 ; gui_chiptune() - synthesize a short square-wave "power-up" jingle into g_wav
-;   (8-bit mono PCM WAV built entirely at runtime) and play it async.  Only for
-;   the 30 retro/cyberpunk styles (scheme >= 9); classic themes stay silent.
+;   (8-bit mono PCM WAV built entirely at runtime) and play it async.  Only the
+;   8-bit Commodore theme (scheme 5) gets the jingle; other themes stay silent.
 gui_chiptune proc frame
     FRAME_PROLOG 64
-    cmp     dword ptr [g_scheme], 9
-    jb      gct_done
+    cmp     dword ptr [g_scheme], 5
+    jne     gct_done
     lea     rax, [g_wav+44]                     ; sample cursor (after the 44-byte header)
     mov     qword ptr [rbp-24], rax
     lea     rax, [note_tab]
