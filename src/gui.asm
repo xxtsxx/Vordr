@@ -388,6 +388,7 @@ IDC_V_MIDLE  equ 260                  ; idle-minutes edit
 IDC_V_MWLKL  equ 261                  ; "Lock with Windows" label
 IDC_V_MWLK   equ 262                  ; lock-with-Windows toggle
 IDC_V_MNOPREVL   equ 263              ; "Disable attachment preview" label
+IDC_V_MTOUTS equ 266                  ; "Timeouts" section heading
 IDC_V_MNOPREV    equ 264              ; disable-attachment-preview toggle
 IDC_V_MNOPREVINFO equ 265            ; "Disable attachment preview" info (i)
 IDC_V_MTHEME equ 240                  ; color-scheme cycle button (settings)
@@ -645,7 +646,7 @@ WSTR s_pwmismatch,  <The passwords do not match.>
 WSTR s_pwshort,     <Password is too short for the current policy.>
 WSTR s_pwclasses,   <Password needs more character types (lowercase / uppercase / number / symbol).>
 WSTR t_noprevinfo,  <Disable attachment preview>
-WSTR m_noprevinfo,  <When on, attachments can only be saved to a location you pick, never opened in another app. Opening would decrypt the file to a temp folder where its plaintext can linger for other software to read, and may be left behind.>
+WSTR m_noprevinfo,  <Disable preview of attachments so it never opens in another app. Opening would decrypt the file to a temp folder where its plaintext can linger for other software to read, and may be left behind.>
 WSTR wtmptest_name, <vordr_tmptest.bin>       ; gui_tmptest scratch (headless probe)
 WSTR wt_newentry,   <New entry>
 WSTR cue_search,    <Search>
@@ -1018,7 +1019,7 @@ g_vault_ids label dword
     dd IDC_V_LIST, IDC_V_ADD, IDC_V_EDIT, IDC_V_REMOVE, IDC_V_TITLE
     dd IDC_V_ADDFIELD, IDC_V_SAVE, IDC_V_LOCK, IDC_V_SEARCH
 VAULT_ID_COUNT equ 9
-g_menu_ids label dword
+g_menu_ids label dword ; controls menu IDs which are hidden and displayed between settings and main screen.
     dd IDC_V_MBACK, IDC_V_MTITLE, IDC_V_MPOLL, IDC_V_MLENL, IDC_V_MLEN
     dd IDC_V_MCLSL, IDC_V_MCLS, IDC_V_MTPM, IDC_V_MTPML, IDC_V_MTPMINFO
     dd IDC_V_MTHEMEL, IDC_V_MTHEME, IDC_V_MEXPORT
@@ -1028,7 +1029,8 @@ g_menu_ids label dword
     dd IDC_V_MCLIPL, IDC_V_MCLIP
     dd IDC_V_MIDLEL, IDC_V_MIDLE, IDC_V_MWLKL, IDC_V_MWLK
     dd IDC_V_MNOPREVL, IDC_V_MNOPREV, IDC_V_MNOPREVINFO
-MENU_ID_COUNT equ 30
+    dd IDC_V_MTOUTS
+MENU_ID_COUNT equ 31
 
 .data?
 align 8
