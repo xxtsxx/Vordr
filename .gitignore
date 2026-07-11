@@ -22,3 +22,4 @@
 # diagnostic outputs (imgtest/thumbtest/pvtest)
 thumb_out.png
 pvtmp.pdf
+tools/__pycache__/
