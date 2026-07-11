@@ -1,0 +1,44 @@
+=== framecheck ===
+[warn] gui.asm:4979 gui_temp_purge: FRAME_PROLOG 96 (alloc 112) < heuristic need 120 (deepest local -64, 7-arg WINCALL) - verify the overlapped local is dead at that call
+[warn] gui.asm:8046 vault_proc: 5-arg WINCALL spill (to rsp+32) reaches the local region (frame 64, deepest local -32) - verify liveness
+[warn] gui.asm:8347 vault_proc: 5-arg WINCALL spill (to rsp+32) reaches the local region (frame 64, deepest local -32) - verify liveness
+[warn] gui.asm:8448 vault_proc: 5-arg WINCALL spill (to rsp+32) reaches the local region (frame 64, deepest local -32) - verify liveness
+[warn] gui.asm:8522 vault_proc: 5-arg WINCALL spill (to rsp+32) reaches the local region (frame 64, deepest local -32) - verify liveness
+[warn] gui.asm:8541 vault_proc: 5-arg WINCALL spill (to rsp+32) reaches the local region (frame 64, deepest local -32) - verify liveness
+framecheck: 0 fatal, 6 warn (clean)
+=== assembling ===
+ Assembling: src\main.asm
+ Assembling: src\console.asm
+ Assembling: src\hardening.asm
+ Assembling: src\random.asm
+ Assembling: src\loadcfg.asm
+ Assembling: src\sha256.asm
+ Assembling: src\sha1.asm
+ Assembling: src\aesgcm.asm
+ Assembling: src\blake2b.asm
+ Assembling: src\argon2.asm
+ Assembling: src\fileio.asm
+ Assembling: src\secmem.asm
+ Assembling: src\vault.asm
+ Assembling: src\totp.asm
+ Assembling: src\tpm.asm
+ Assembling: src\regcfg.asm
+ Assembling: src\pwgen.asm
+ Assembling: src\bench.asm
+ Assembling: src\log.asm
+ Assembling: src\selftest.asm
+ Assembling: src\redteam.asm
+ Assembling: src\theme.asm
+ Assembling: src\zipexport.asm
+ Assembling: src\zipimport.asm
+ Assembling: src\gui.asm
+=== resource (VERSIONINFO) ===
+=== linking vordr.exe (/CETCOMPAT) ===
+=== mitigation check (optional, needs dumpbin) ===
+                   High Entropy Virtual Addresses
+                   Dynamic base
+                   NX compatible
+    6A529B14 feat          14 00034D04    33B04    Counts: Pre-VC++ 11.00=0, C/C++=0, /GS=0, /sdl=0, guardN=0
+                   CET compatible
+
+BUILD OK: bin\vordr.exe

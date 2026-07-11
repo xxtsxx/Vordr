@@ -315,6 +315,10 @@ IDLE_POLL_MS        equ 30000              ; check system idle time every 30 s
 WM_WTSSESSION_CHANGE equ 02B1h             ; session notification (Win+L etc.)
 WTS_SESSION_LOCK    equ 7                  ; wparam: the workstation locked
 SEARCH_DEBOUNCE_MIN equ 200               ; ...but only when the list exceeds this many entries
+SCORE_CAP           equ 8192              ; entries beyond this index score 0 (ranking cap)
+FZ_WORDSTART        equ 16                ; fuzzy bonus: char matched at a word start
+FZ_CONTIG           equ 8                 ; fuzzy bonus: char contiguous with the previous match
+FZ_BASE             equ 1                 ; fuzzy score per matched char
 LBN_SELCHANGE       equ 1
 LB_ADDSTRING        equ 180h
 LB_RESETCONTENT     equ 184h
@@ -1081,6 +1085,9 @@ g_vaulthwnd dq ?                      ; the open DLG_VAULT window (0 when not sh
 align 2
 g_search_w  dw 512 dup (?)            ; current search query (wide, upper-cased)
 g_match_w   dw EBUF*2 dup (?)         ; scratch: a field value/label folded for matching
+align 4
+g_search_len dd ?                     ; active query length in chars (0 = no query -> title sort)
+g_entry_score dd SCORE_CAP dup (?)    ; fuzzy score per vault index (for score-descending sort)
 g_vpath     dw 1024 dup (?)        ; chosen vault path (wide, NUL-terminated)
 g_xlpw      dw 256 dup (?)         ; export password (wide; wiped after use)
 g_xlpw2     dw 256 dup (?)         ; export confirm password (wide; wiped)
@@ -1608,6 +1615,7 @@ gui_poplist proc frame
     ; read the search query and upper-case it for case-insensitive matching
     WINCALL GetDlgItemTextW, qword ptr [rbp-24], IDC_V_SEARCH, addr g_search_w, 255
     mov     dword ptr [rbp-56], eax              ; query length (chars)
+    mov     dword ptr [g_search_len], eax        ; publish for the score-aware sort
     test    eax, eax
     jz      gp_nofold
     WINCALL CharUpperBuffW, addr g_search_w, dword ptr [rbp-56]
@@ -1622,9 +1630,15 @@ gp_loop:
     cmp     dword ptr [rbp-56], 0               ; empty query -> show everything
     je      gp_show
     mov     ecx, dword ptr [rbp-40]
-    call    gui_entry_matches
-    test    eax, eax
-    jz      gp_next
+    call    gui_entry_fuzzy                      ; eax = best fuzzy score, or -1
+    mov     r10d, dword ptr [rbp-40]             ; cache the score for the sort (idx<CAP)
+    cmp     r10d, SCORE_CAP
+    jae     gp_scored
+    lea     r11, [g_entry_score]
+    mov     dword ptr [r11+r10*4], eax
+gp_scored:
+    test    eax, eax                             ; -1 = no match -> skip
+    js      gp_next
 gp_show:
     ; owner-draw list: the item data IS the vault index; WM_COMPAREITEM sorts by
     ; title, WM_DRAWITEM renders the icon card.  Pass the index as a DWORD so the
@@ -1706,11 +1720,37 @@ mlf_done:
     ret
 gui_make_listfonts endp
 
+; gtc_score(ecx = entry index) -> eax = cached fuzzy score (0 when idx >= SCORE_CAP).
+;   Leaf helper for the score-aware sort.
+gtc_score proc
+    cmp     ecx, SCORE_CAP
+    jae     gts_zero
+    lea     rax, [g_entry_score]
+    mov     eax, dword ptr [rax+rcx*4]
+    ret
+gts_zero:
+    xor     eax, eax
+    ret
+gtc_score endp
+
 ; gui_title_cmp(ecx=idxA, edx=idxB) -> eax = -1/0/1 (case-insensitive title order).
 gui_title_cmp proc frame
     FRAME_PROLOG 96
     mov     dword ptr [rbp-24], ecx
     mov     dword ptr [rbp-28], edx
+    ; with an active search query, rank by fuzzy score (descending); ties -> title
+    cmp     dword ptr [g_search_len], 0
+    je      gtc_favcheck
+    mov     ecx, dword ptr [rbp-24]
+    call    gtc_score
+    mov     r8d, eax                             ; scoreA
+    mov     ecx, dword ptr [rbp-28]
+    call    gtc_score                            ; eax = scoreB
+    cmp     r8d, eax
+    jg      gtc_lt                               ; A higher score -> A first
+    jl      gtc_gt
+    jmp     gtc_bytitle                          ; equal score -> alphabetical
+gtc_favcheck:
     ; favorites sort ahead of everything else; ties fall through to the title
     mov     ecx, dword ptr [rbp-24]
     call    gui_entry_is_fav
@@ -2974,6 +3014,154 @@ wf_no:
     xor     eax, eax
     ret
 wide_find endp
+
+; fuzzy_score(rcx = needle wide, rdx = hay wide; both NUL-terminated, pre-folded to
+;   upper case) -> eax = match score (>=0), or -1 if the needle does not match.
+;   The needle is split on spaces into terms; EVERY term must appear in the hay as
+;   an ordered subsequence (terms themselves are order-independent - each is scanned
+;   from the start of the hay).  Bonuses: word-start (FZ_WORDSTART), contiguity with
+;   the previous matched char (FZ_CONTIG), plus FZ_BASE per char.  Empty needle -> 0.
+;   Leaf; clobbers rax/r8/r9/r10/r11.  rcx/rdx preserved conceptually (rcx advances
+;   via r10, rdx stays as the hay base).
+public fuzzy_score
+fuzzy_score proc
+    xor     eax, eax                         ; score accumulator
+    mov     r10, rcx                         ; needle cursor
+    mov     r8, rdx                          ; hay cursor (starts at base)
+    mov     r9d, -1                          ; prev matched position (chars) in hay
+fz_need:
+    movzx   ecx, word ptr [r10]
+    test    cx, cx
+    jz      fz_ok                            ; needle consumed -> success
+    cmp     cx, ' '
+    jne     fz_find
+    add     r10, 2                           ; term separator: reset hay scan, new term
+    mov     r8, rdx
+    mov     r9d, -1
+    jmp     fz_need
+fz_find:
+    movzx   r11d, word ptr [r8]
+    test    r11w, r11w
+    jz      fz_nomatch                       ; hay ended before this term char -> fail
+    cmp     r11w, cx
+    je      fz_hit
+    add     r8, 2
+    jmp     fz_find
+fz_hit:
+    add     eax, FZ_BASE
+    mov     r11, r8                          ; pos = (cursor - base) / 2
+    sub     r11, rdx
+    shr     r11, 1                           ; r11 = matched char position
+    test    r11, r11
+    jz      fz_ws                            ; position 0 -> word start
+    mov     ecx, dword ptr [rdx+r11*2-2]     ; hay[pos-1]
+    cmp     cx, ' '
+    je      fz_ws
+    cmp     cx, '-'
+    je      fz_ws
+    cmp     cx, '_'
+    je      fz_ws
+    cmp     cx, '/'
+    je      fz_ws
+    cmp     cx, '.'
+    je      fz_ws
+    cmp     cx, ':'
+    je      fz_ws
+    jmp     fz_ctg
+fz_ws:
+    add     eax, FZ_WORDSTART
+fz_ctg:
+    mov     ecx, r9d
+    inc     ecx
+    cmp     r11d, ecx                        ; pos == prev+1 -> contiguous
+    jne     fz_adv
+    add     eax, FZ_CONTIG
+fz_adv:
+    mov     r9d, r11d                        ; prev = pos
+    add     r8, 2                            ; advance hay + needle
+    add     r10, 2
+    jmp     fz_need
+fz_ok:
+    ret
+fz_nomatch:
+    mov     eax, -1
+    ret
+fuzzy_score endp
+
+; gui_entry_fuzzy(ecx = entry index) -> eax = best fuzzy score across the entry's
+;   non-sensitive fields (value + custom label), or -1 if nothing matched g_search_w.
+;   Mirrors gui_entry_matches but scores instead of boolean-matching.
+gui_entry_fuzzy proc frame
+    FRAME_PROLOG 112
+    mov     dword ptr [rbp-24], ecx              ; idx
+    mov     dword ptr [rbp-96], -1               ; best score
+    call    vault_field_count                    ; ecx still = idx
+    mov     dword ptr [rbp-32], eax              ; n
+    mov     dword ptr [rbp-40], 0               ; j
+gef_loop:
+    mov     eax, dword ptr [rbp-40]
+    cmp     eax, dword ptr [rbp-32]
+    jae     gef_done
+    mov     ecx, dword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-40]
+    lea     r8, [rbp-88]                         ; out: -88 kind,-80 lblptr,-72 lbllen,
+    call    vault_field_get                      ;      -64 valptr,-56 vallen
+    test    eax, eax
+    jz      gef_next
+    mov     eax, dword ptr [rbp-88]              ; kind
+    cmp     eax, VF_SECRET                       ; sensitive -> never searched
+    je      gef_next
+    cmp     eax, VF_TOTP
+    je      gef_next
+    mov     rcx, qword ptr [rbp-64]              ; value ptr
+    mov     edx, dword ptr [rbp-56]             ; value len
+    call    gef_field
+    cmp     eax, dword ptr [rbp-96]
+    jle     gef_trylabel
+    mov     dword ptr [rbp-96], eax
+gef_trylabel:
+    mov     rax, qword ptr [rbp-72]             ; label len
+    test    rax, rax
+    jz      gef_next
+    mov     rcx, qword ptr [rbp-80]             ; label ptr
+    mov     edx, dword ptr [rbp-72]
+    call    gef_field
+    cmp     eax, dword ptr [rbp-96]
+    jle     gef_next
+    mov     dword ptr [rbp-96], eax
+gef_next:
+    inc     dword ptr [rbp-40]
+    jmp     gef_loop
+gef_done:
+    mov     eax, dword ptr [rbp-96]
+    FRAME_EPILOG
+    ret
+gui_entry_fuzzy endp
+
+; gef_field(rcx = utf8 ptr, edx = byte len) -> eax = fuzzy score of the folded text
+;   against g_search_w, or -1.  Converts to wide in g_match_w, upper-cases, scores.
+gef_field proc frame
+    FRAME_PROLOG 32
+    test    rcx, rcx
+    jz      gff_no
+    test    edx, edx
+    jz      gff_no
+    lea     r8, [g_match_w]
+    mov     r9d, EBUF*2-1
+    call    gui_towide                           ; eax = wide chars written
+    test    eax, eax
+    jz      gff_no
+    WINCALL CharUpperBuffW, addr g_match_w, eax
+    lea     rcx, [g_search_w]
+    lea     rdx, [g_match_w]
+    call    fuzzy_score
+    FRAME_EPILOG
+    ret
+gff_no:
+    mov     eax, -1
+    FRAME_EPILOG
+    ret
+gef_field endp
 
 ; gui_lb_seldata(rcx = hdlg) -> eax = vault index of the selected row (its item
 ;   data), or -1 if nothing is selected.
