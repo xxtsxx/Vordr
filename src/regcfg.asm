@@ -169,6 +169,22 @@ cgd_def:
 cfg_get_dword endp
 
 ; ===========================================================================
+; cfg_get_hklm(rcx=value name, rdx=*out dword) -> eax = 1 if HKLM defines it
+;   (admin policy).  Used where the "no policy" default is not a constant (e.g.
+;   TPM Unlock, whose non-policy state is the per-vault enrollment).
+; ===========================================================================
+public cfg_get_hklm
+cfg_get_hklm proc frame
+    FRAME_PROLOG 48
+    mov     r8, rdx                          ; *out
+    mov     rdx, rcx                         ; value name
+    mov     rcx, qword ptr [g_hklm]          ; HKLM hive
+    call    reg_query_dw
+    FRAME_EPILOG
+    ret
+cfg_get_hklm endp
+
+; ===========================================================================
 ; cfg_set_dword_hkcu(rcx=value name, edx=value) -> eax = 1/0.
 ; ===========================================================================
 public cfg_set_dword_hkcu
@@ -314,6 +330,27 @@ cdv_docs:
     WINCALL SHGetFolderPathW, 0, CSIDL_PERSONAL, 0, 0, qword ptr [rbp-24]
     test    eax, eax                         ; S_OK = 0
     jnz     cdv_fail
+    ; dst = "<Documents>"; append "\Vordr" and create it, mirroring OneDrive
+    mov     r11, qword ptr [rbp-24]
+    xor     r8d, r8d
+cdv_docs_end:
+    cmp     word ptr [r11+r8*2], 0
+    je      cdv_docs_sub
+    inc     r8d
+    jmp     cdv_docs_end
+cdv_docs_sub:
+    lea     r10, [r11+r8*2]
+    lea     r9, [onedrive_sub]                ; "\Vordr"
+    xor     ecx, ecx
+cdv_docs_cpy:
+    movzx   eax, word ptr [r9+rcx*2]
+    mov     word ptr [r10+rcx*2], ax
+    test    eax, eax
+    jz      cdv_docs_dir
+    inc     ecx
+    jmp     cdv_docs_cpy
+cdv_docs_dir:
+    WINCALL CreateDirectoryW, qword ptr [rbp-24], 0   ; ignore "already exists"
     mov     rcx, qword ptr [rbp-24]
 cdv_app:
     ; find the terminating NUL of dst, then append "\vault.vordr"
