@@ -40,6 +40,7 @@ extern log_result:proc
 extern do_bench:proc                    ; benchmark (bench.asm)
 extern gui_phtest:proc                  ; pw-history capture probe (gui.asm)
 extern gui_tmptest:proc                 ; secure temp-file lifecycle probe (gui.asm)
+extern fuzzy_score:proc                 ; fuzzy-search scoring (gui.asm)
 extern cmd_secscan:proc                 ; secret-wipe page-scan probe (secmem.asm)
 extern cmd_securedesk:proc              ; secure-desktop spike (gui.asm)
 extern read_file:proc
@@ -167,6 +168,7 @@ WSTR w_zitest,   <zitest>
 WSTR w_phtest,   <phtest>
 WSTR w_secscan,  <secscan>
 WSTR w_tmptest,  <tmptest>
+WSTR w_fztest,   <fztest>
 WSTR w_securedesk, <securedesk>
 WSTR wpw_exp,    <VordrExp1234>
 ifdef DBG_TRACE
@@ -204,14 +206,15 @@ cmd_table label CMDENT
     CMDENT { w_phtest,    cmd_phtest,    0, 0 }   ; headless pw-history capture probe
     CMDENT { w_secscan,   cmd_secscan,   0, 0 }   ; secret-wipe page-scan probe
     CMDENT { w_tmptest,   cmd_tmptest,   0, 0 }   ; secure temp-file lifecycle probe
+    CMDENT { w_fztest,    cmd_fztest,    0, 0 }   ; fuzzy-search scoring KAT
     CMDENT { w_securedesk, cmd_securedesk, 0, 0 } ; show a dialog on the private desktop (plan 4 spike)
 ifdef DBG_TRACE
     CMDENT { w_redteam,   cmd_redteam,   1, 0 }   ; fault-injection self-test (dbg)
     CMDENT { w_tpmtest,   cmd_tpmtest,   0, 0 }   ; TPM round-trip probe (dbg)
     CMDENT { w_cttest,    cmd_cttest,    0, 0 }   ; ct_memcmp timing probe (dbg)
-CMD_COUNT equ 13
+CMD_COUNT equ 14
 else
-CMD_COUNT equ 10
+CMD_COUNT equ 11
 endif
 
 .data?
@@ -1083,6 +1086,84 @@ cmd_tmptest proc frame
     FRAME_EPILOG
     ret
 cmd_tmptest endp
+
+; fuzzy_score KAT strings (upper-cased, since fuzzy_score assumes pre-folded input)
+WSTR fz_gm,        <GM>
+WSTR fz_gmail,     <GMAIL>
+WSTR fz_gmwk,      <GMWK>
+WSTR fz_gmailwork, <GMAIL WORK>
+WSTR fz_agmb,      <AGMB>
+WSTR fz_empty,     <>
+WSTR fz_any,       <ANYTHING>
+WSTR fz_workgmail, <WORK GMAIL ACCOUNT>
+WSTR fz_gmailwrk,  <GMAIL WRK>
+WSTR fz_zz,        <ZZ>
+CSTR fzt_ok,   "fztest: PASS (fuzzy scoring + ranking)",13,10
+CSTR fzt_bad,  "fztest: FAIL",13,10
+
+; cmd_fztest - fuzzy-search scoring known-answer test.  exit 0 = pass.
+;   [rbp-24] holds score(GM,GMAIL) while the ordering comparison runs.
+LANDING_PAD
+cmd_fztest proc frame
+    FRAME_PROLOG 32
+    lea     rcx, [fz_gm]                    ; match: "GM" in "GMAIL"
+    lea     rdx, [fz_gmail]
+    call    fuzzy_score
+    test    eax, eax
+    js      fzt_fail
+    lea     rcx, [fz_gmwk]                  ; nomatch: "GMWK" (no W in "GMAIL")
+    lea     rdx, [fz_gmail]
+    call    fuzzy_score
+    test    eax, eax
+    jns     fzt_fail
+    lea     rcx, [fz_gmwk]                  ; match: "GMWK" in "GMAIL WORK"
+    lea     rdx, [fz_gmailwork]
+    call    fuzzy_score
+    test    eax, eax
+    js      fzt_fail
+    lea     rcx, [fz_empty]                 ; empty needle matches anything (score 0)
+    lea     rdx, [fz_any]
+    call    fuzzy_score
+    test    eax, eax
+    js      fzt_fail
+    lea     rcx, [fz_gmailwrk]              ; nomatch: term "WRK" absent from "GMAIL"
+    lea     rdx, [fz_gmail]
+    call    fuzzy_score
+    test    eax, eax
+    jns     fzt_fail
+    lea     rcx, [fz_gmailwrk]              ; match: both terms in "WORK GMAIL ACCOUNT"
+    lea     rdx, [fz_workgmail]
+    call    fuzzy_score
+    test    eax, eax
+    js      fzt_fail
+    lea     rcx, [fz_zz]                    ; nomatch: "ZZ" absent
+    lea     rdx, [fz_gmail]
+    call    fuzzy_score
+    test    eax, eax
+    jns     fzt_fail
+    lea     rcx, [fz_gm]                    ; ordering: word-start+contiguous beats mid-word
+    lea     rdx, [fz_gmail]
+    call    fuzzy_score
+    mov     dword ptr [rbp-24], eax         ; score(GM,GMAIL)
+    lea     rcx, [fz_gm]
+    lea     rdx, [fz_agmb]
+    call    fuzzy_score                     ; score(GM,AGMB)
+    cmp     dword ptr [rbp-24], eax
+    jle     fzt_fail                        ; GMAIL must rank strictly higher
+    lea     rcx, [fzt_ok]
+    mov     edx, fzt_ok_len
+    call    print_a
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+fzt_fail:
+    lea     rcx, [fzt_bad]
+    mov     edx, fzt_bad_len
+    call    print_a
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_fztest endp
 
 ; =============================================================================
 ; is_cli_command -> eax = 1 if argv[1] names a known command verb, else 0.

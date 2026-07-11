@@ -123,6 +123,9 @@ if not "!errorlevel!"=="0" ( echo   secscan: FAIL ^(exit !errorlevel!, secret re
 bin\vordr.exe tmptest > "%WORK%\tmptest.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   tmptest: FAIL ^(exit !errorlevel!, temp file not wiped+deleted^) & set RT=FAIL )
 
+bin\vordr.exe fztest > "%WORK%\fztest.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   fztest: FAIL ^(exit !errorlevel!, fuzzy scoring KAT^) & set RT=FAIL )
+
 set R_ROUNDTRIP=!RT!
 call :now T1
 set /a T_ROUNDTRIP=!T1!-!T0!
