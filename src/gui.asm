@@ -7222,24 +7222,9 @@ mo_len_ok:
     xor     edx, edx
     call    EnableWindow
 mo_cls_ok:
-    ; TPM toggle: HKLM policy > HKCU > per-vault enrollment.  cfg_get_dword with
-    ; a -1 sentinel default tells "neither hive set" (use enrollment) apart from
-    ; an explicit 0/1; *locked is set only for an HKLM policy value.  Enabled
-    ; only with hardware present and not policy-locked.
-    mov     dword ptr [g_tpm_lock], 0
-    mov     dword ptr [g_tpm_want], 0
-    cmp     dword ptr [g_tpm_present], 0
-    je      mo_tpm_enable                     ; no hardware -> off + disabled
-    WINCALL cfg_get_dword, addr wv_tpm, -1, addr g_tpm_lock
-    cmp     eax, -1
-    jne     mo_tpm_val
-    call    vault_tpm_has                     ; neither hive -> per-vault enrollment
-    mov     dword ptr [g_tpm_want], eax
-    jmp     mo_tpm_enable
-mo_tpm_val:
-    and     eax, 1                            ; explicit HKLM (locked) / HKCU value
-    mov     dword ptr [g_tpm_want], eax
-mo_tpm_enable:
+    ; TPM toggle: g_tpm_want / g_tpm_lock were loaded once at startup
+    ; (gui_load_policy: HKLM > HKCU > default ON).  Just enable the control when
+    ; hardware is present and no HKLM policy locks it.
     mov     rcx, qword ptr [rbp-24]
     mov     edx, IDC_V_MTPM
     call    GetDlgItem
@@ -7381,13 +7366,19 @@ msv_tpm:
     cmp     dword ptr [rbp-32], 0
     je      msv_unwant
     cmp     dword ptr [rbp-36], 0
-    jne     msv_apply_close                 ; want + have -> nothing
+    jne     msv_tpm_persist                 ; want + have -> just persist
     call    vault_tpm_remember
-    jmp     msv_apply_close
+    jmp     msv_tpm_persist
 msv_unwant:
     cmp     dword ptr [rbp-36], 0
-    je      msv_apply_close                 ; !want + !have -> nothing
+    je      msv_tpm_persist                 ; !want + !have
     call    vault_tpm_forget
+msv_tpm_persist:
+    cmp     dword ptr [g_tpm_lock], 0       ; persist the toggle (HKCU) unless HKLM locks it
+    jne     msv_apply_close
+    lea     rcx, [wv_tpm]
+    mov     edx, dword ptr [g_tpm_want]
+    call    cfg_set_dword_hkcu
 msv_apply_close:
     cmp     dword ptr [g_nohist_lock], 0    ; persist the privacy toggles (HKCU) unless
     jne     msv_phon                        ;   HKLM policy locks them
@@ -8304,6 +8295,19 @@ gui_load_policy proc frame
     jz      @F
     mov     eax, 1
 @@: mov     dword ptr [g_secunlock], eax
+    ; TPM Unlock: HKLM > HKCU > default ON (only meaningful with hardware).  The
+    ; loaded value drives both the settings toggle AND the actual auto-unlock /
+    ; new-vault enrollment, so an HKLM "TpmUnlock=0" really disables the feature.
+    mov     dword ptr [g_tpm_lock], 0
+    mov     dword ptr [g_tpm_want], 0
+    cmp     dword ptr [g_tpm_present], 0
+    je      lp_tpm_done
+    WINCALL cfg_get_dword, addr wv_tpm, 1, addr g_tpm_lock
+    test    eax, eax
+    jz      @F
+    mov     eax, 1
+@@: mov     dword ptr [g_tpm_want], eax
+lp_tpm_done:
     FRAME_EPILOG
     ret
 gui_load_policy endp
@@ -8484,8 +8488,11 @@ cd_open:
     call    vault_unlock
     test    eax, eax
     jnz     cd_unlockfail
-    ; TPM unlock is on by default for a new vault when the hardware supports it
+    ; enroll TPM unlock for a new vault when supported AND the setting/policy
+    ; allows it (g_tpm_want: HKLM > HKCU > default ON, loaded at startup)
     cmp     dword ptr [g_tpm_present], 0
+    je      cd_done
+    cmp     dword ptr [g_tpm_want], 0
     je      cd_done
     call    vault_tpm_remember
     jmp     cd_done
@@ -11135,6 +11142,8 @@ gui_resolve_vault endp
 ; gui_try_tpm_auto() -> eax = 1 if the registered vault was unlocked via TPM.
 gui_try_tpm_auto proc frame
     FRAME_PROLOG 32
+    cmp     dword ptr [g_tpm_want], 0        ; TPM Unlock off (setting/HKLM) -> ask for password
+    je      gta_no
     lea     rax, [g_vpath]
     mov     qword ptr [g_cfg_in], rax
     call    vault_tpm_has
