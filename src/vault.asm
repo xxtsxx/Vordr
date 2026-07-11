@@ -123,16 +123,6 @@ ATT_ENThDR      equ 24          ; on-disk entry header = id16 + u64 ctlen
 MAX_ATT         equ 512         ; index / pending-table capacity
 
 .const
-lbl_title   db "  title : "
-lbl_title_n equ $ - lbl_title
-lbl_user    db "  user  : "
-lbl_user_n  equ $ - lbl_user
-lbl_secret  db "  secret: "
-lbl_secret_n equ $ - lbl_secret
-lbl_url     db "  url   : "
-lbl_url_n   equ $ - lbl_url
-lbl_notes   db "  notes : "
-lbl_notes_n equ $ - lbl_notes
 vst_src     db "vault-kat-test!!"      ; 16-byte plaintext for vault_selftest
 ; --- field-serialization KAT (labeled + duplicate fields) ------------------
 align 2
@@ -149,19 +139,8 @@ kat_img      dd 7                              ; {u32 len, raw bytes} for VFL_RA
 kat_img_b    db 089h,'P','N','G',000h,001h,0FFh   ; binary incl NUL + high byte
 kat_exp_img  db 089h,'P','N','G',000h,001h,0FFh
 CSTR e_io,      "error: cannot read/write the vault file",13,10
-CSTR e_corrupt, "error: not a Vordr vault (bad magic/version) or corrupt",13,10
-CSTR e_locked,  "error: wrong master password (key-check failed)",13,10
-CSTR e_auth,    "error: vault authentication failed (tampered or corrupt)",13,10
-CSTR e_full,    "error: vault is full (1 MiB entry limit)",13,10
 CSTR e_oom,     "error: out of memory",13,10
-CSTR e_notitle, "error: 'add' needs --title (and usually --secret)",13,10
-CSTR e_noopt,   "error: 'get' needs --title NAME",13,10
-CSTR e_notfound,"no entry with that title",13,10
-CSTR m_added,   "entry added.",13,10
 CSTR m_created, "vault created.",13,10
-CSTR m_removed, "entry removed.",13,10
-CSTR m_updated, "entry updated.",13,10
-CSTR m_empty,   "(vault is empty)",13,10
 
 .data?
 align 16

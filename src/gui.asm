@@ -286,7 +286,6 @@ WM_TRAYICON         equ 8001h            ; WM_APP+1, our tray callback message
 NIM_ADD             equ 0
 NIM_DELETE          equ 2
 NIF_TRAY            equ 7                 ; NIF_MESSAGE | NIF_ICON | NIF_TIP
-MF_STRING           equ 0
 MF_SEPARATOR        equ 800h
 MF_OWNERDRAW        equ 100h
 MIM_DARK            equ 80000002h        ; MIM_APPLYTOSUBMENUS | MIM_BACKGROUND
@@ -439,7 +438,6 @@ LVM_FIRST                    equ 1000h
 LVM_DELETEALLITEMS           equ LVM_FIRST + 9
 LVM_INSERTITEMW              equ LVM_FIRST + 77
 LVM_SETITEMSTATE             equ LVM_FIRST + 43
-LVM_GETITEMSTATE             equ LVM_FIRST + 44
 LVM_GETITEMW                 equ LVM_FIRST + 75
 LVM_GETITEMCOUNT             equ LVM_FIRST + 4
 LVM_INSERTCOLUMNW            equ LVM_FIRST + 97
@@ -448,7 +446,6 @@ LVM_SETBKCOLOR               equ LVM_FIRST + 1
 LVM_SETTEXTCOLOR             equ LVM_FIRST + 36
 LVM_SETTEXTBKCOLOR           equ LVM_FIRST + 38
 LVM_SETEXTENDEDLISTVIEWSTYLE equ LVM_FIRST + 54
-LVSIL_STATE                  equ 2
 LVS_EX_CHECKBOXES            equ 4
 LVS_EX_FULLROWSELECT         equ 20h
 LVIF_TEXT                    equ 1
@@ -495,9 +492,6 @@ FD_FLAGS    equ 4               ; dd  bit0 = custom label; bits4-5 = pw-strength
 FD_Y        equ 8              ; dd  row top in DLU (within the detail pane)
 FD_H        equ 12             ; dd  row height in DLU
 FD_HANDLES  equ 16             ; q[DYN_SLOTS]  control hwnd per slot (0 = absent)
-FD_ARF      equ 144            ; {u32 len, AttachRef[68], filename wide}  attachment value blob
-FD_RSVD     equ 472            ; q  reserved (kept for 16-byte DESCSZ alignment)
-ARFBLOB     equ 328            ; size of the {u32 len,AttachRef,filename} attachment blob
 DESCSZ      equ 480            ; 16 + 16 handles*8 + 328 arf blob + 8 reserved (16-aligned)
 ; The attachments tile aggregates every VF_FILE/VF_IMAGE field of the open entry
 ; into one row backed by g_tilefiles (see the tf_* helpers).  Each file entry is
@@ -534,7 +528,6 @@ PWORIG_VAL   equ 256           ; value offset (bytes) within a g_pworig slot
 MAXROWS     equ 24
 FDF_LABELED equ 1               ; FD_FLAGS bit0 = carries a custom label
 FDF_REVEALED equ 2              ; FD_FLAGS bit1 = value currently unmasked
-FDF_HASIMG  equ 4               ; FD_FLAGS bit2 = attachment row has a blob in FD_ARF
 FDF_PWLVL_MASK equ 30h          ; FD_FLAGS bits4-5 = secret strength grade 0..3
 FDF_PWLVL_SHIFT equ 4
 ; Runtime control ids: IDC_DYN_BASE + row*DYN_SLOTS + slot (DYN_SLOTS = power of 2).
@@ -553,8 +546,6 @@ DS_TBAR     equ 7               ; TOTP drain bar
 DS_COPY     equ 8               ; copy-to-clipboard (secret value / TOTP code)
                                 ; slots 9 and 11 are unused (were thumbnail/paste)
 DS_IMPORT   equ 10              ; attachment: choose a file to attach (edit mode)
-DS_EXPORT   equ 12              ; attachment: save the file to disk
-DS_OPEN     equ 13              ; attachment: open the file in the default app
 DS_SBADGE   equ 14              ; secret: password-strength badge (owner-draw, view mode)
 DS_GEN      equ 15              ; secret: generate-password button (edit mode)
 TAG_XW      equ 16              ; width (px) of a tag's edit-mode 'x' delete hotspot
@@ -585,7 +576,6 @@ ES_AUTOHSCROLL_ equ 0080h
 ES_AUTOVSCROLL_ equ 0040h
 ES_PASSWORD_    equ 0020h
 ES_MULTILINE_   equ 0004h
-ES_READONLY_    equ 0800h
 ES_WANTRETURN_  equ 1000h
 BS_OWNERDRAW_   equ 000Bh
 SS_OWNERDRAW_   equ 000Dh
@@ -627,7 +617,6 @@ CSTR c_stfail,  "SELFTEST FAILURE - refusing to run",13,10
 WSTR t_err,         <Vordr - error>
 WSTR m_nocpu,       <This CPU lacks required features (AES-NI / PCLMULQDQ / SSE4.1) - cannot run.>
 WSTR m_stfail,      <Self-test FAILED - refusing to run. The binary may be corrupt.>
-WSTR t_open,        <Open vault>
 WSTR t_remove,      <Remove this entry?>
 WSTR s_pickvault,   <Select or create a vault file first.>
 WSTR s_nopw,        <Enter the master password.>
@@ -771,14 +760,6 @@ WSTR cf_cloud_name, <CanUploadToCloudClipboard>
 WSTR cf_excl_name,  <ExcludeClipboardContentFromMonitorProcessing>
 WSTR sd_spike_ttl, <Secure desktop>
 WSTR sd_spike_txt, <This dialog is running on a private, isolated Vordr desktop. Same-session keyloggers and screen-scrapers cannot see it. Click OK to return to your normal desktop.>
-; OPENFILENAMEW filter: "Vordr vault\0*.vordr\0All files\0*.*\0\0"
-align 2
-xlsx_filter label word
-    dw 'E','x','c','e','l',' ','W','o','r','k','b','o','o','k',0
-    dw '*','.','x','l','s','x',0
-    dw 0
-xlsx_defext label word
-    dw 'x','l','s','x',0
 WSTR xp_mm_title,    <Export all secrets>
 WSTR imp_xls_wrongpw,<Could not open the workbook - the password was incorrect.>
 WSTR imp_g_title,    <Import>
@@ -986,10 +967,6 @@ t_created label word
     dw 'C','r','e','a','t','e','d',' ', 0
 t_modified label word
     dw ' ',' ',' ',' ','M','o','d','i','f','i','e','d',' ', 0
-cap_noimg label word
-    dw '(','n','o',' ','i','m','a','g','e',')', 0
-suffix_dotpng label word
-    dw '.','p','n','g', 0
 g_imgfilter label word          ; "Images\0*.png;*.jpg;*.jpeg;*.bmp;*.gif\0All\0*.*\0\0"
     dw 'I','m','a','g','e','s',0
     dw '*','.','p','n','g',';','*','.','j','p','g',';','*','.','j','p','e','g',';','*','.','b','m','p',';','*','.','g','i','f',0

@@ -445,8 +445,6 @@ zj_flabel db ',"label":',0
 zj_fvalue db ',"value":',0
 zj_jsonname db "vordr.json"
 zj_defname  db "attachment.bin"
-zj_csvname  db "vordr.csv"
-zj_xlsxname db "vordr.xlsx"
 csv_hdr   db "title,username,password,url,notes,totp,attachments",13,10,0
 csv_kinds db VF_TITLE, VF_USERNAME, VF_SECRET, VF_URL, VF_NOTES, VF_TOTP
 hexdig    db "0123456789abcdef"
