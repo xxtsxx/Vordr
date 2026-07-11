@@ -122,6 +122,15 @@ extern GetModuleHandleW:proc
 extern ExitProcess:proc
 extern MessageBoxW:proc
 extern DialogBoxParamW:proc
+; secure-desktop (anti-keylogger) master-password entry
+extern CreateDesktopW:proc
+extern OpenInputDesktop:proc
+extern SwitchDesktop:proc
+extern SetThreadDesktop:proc
+extern CloseDesktop:proc
+extern CreateThread:proc
+extern WaitForSingleObject:proc
+extern CloseHandle:proc
 extern EndDialog:proc
 extern GetDlgItemTextW:proc
 extern SetDlgItemTextW:proc
@@ -706,6 +715,10 @@ tray_cls label word
     dw 'V','o','r','d','r','T','r','a','y', 0
 tray_wt label word
     dw 'V','o','r','d','r', 0
+secdesk_name label word                          ; private desktop for password entry
+    dw 'V','o','r','d','r','-','S','e','c','u','r','e', 0
+WSTR sd_spike_ttl, <Secure desktop>
+WSTR sd_spike_txt, <This dialog is running on a private, isolated Vordr desktop. Same-session keyloggers and screen-scrapers cannot see it. Click OK to return to your normal desktop.>
 ; OPENFILENAMEW filter: "Vordr vault\0*.vordr\0All files\0*.*\0\0"
 align 2
 xlsx_filter label word
@@ -970,6 +983,14 @@ g_msg_text  dq ?                      ; Fluent message box: body text / title / 
 g_msg_title dq ?
 g_msg_flags dd ?
 g_tpm_want  dd ?                      ; Fluent TPM toggle state (1 = enrolled/on)
+; ---- secure-desktop password entry (anti-keylogger) -------------------------
+g_securedesk    dd ?                  ; setting: 1 = enter master password on a private desktop
+g_secdesk_dlg   dd ?                  ; template id marshalled to the worker thread
+align 8
+g_secdesk_proc  dq ?                  ; dialog proc addr for the worker thread
+g_secdesk_hd    dq ?                  ; HDESK of the private desktop
+g_secdesk_orig  dq ?                  ; HDESK of the original input desktop (restore on exit)
+g_secdesk_res   dq ?                  ; DialogBox result marshalled back to the caller
 align 8
 g_nid       db 976 dup (?)           ; NOTIFYICONDATAW (x64 full size)
 g_wc        db 80 dup (?)            ; WNDCLASSW (72 used)
@@ -11044,6 +11065,112 @@ gta_no:
     FRAME_EPILOG
     ret
 gui_try_tpm_auto endp
+
+; =============================================================================
+; Secure-desktop master-password entry (anti-keylogger).
+;
+; A password-entry dialog shown on a private Windows desktop is invisible to
+; same-session input hooks (WH_KEYBOARD_LL, WH_GETMESSAGE, ...) and to
+; screen-scrapers, because those are bound to the desktop that installed them.
+; SetThreadDesktop only works on a thread that owns no windows/hooks yet, so
+; the dialog runs on a freshly spawned worker thread; the entered password
+; lands directly in the process-shared (and VirtualLock'd) g_cfg_pass buffer -
+; no clipboard, no window messages cross the boundary.  If the desktop or
+; thread cannot be created (limited token, Win7, etc.) it degrades gracefully
+; to a normal on-desktop dialog so the user is never locked out.
+; =============================================================================
+DESKTOP_MAXALLOWED equ 02000000h                 ; MAXIMUM_ALLOWED access
+WAIT_FOREVER       equ 0FFFFFFFFh                 ; INFINITE
+
+; secdesk_thread(rcx = unused) - worker: bind to the private desktop, make it
+;   the visible input desktop, run the dialog, then switch back.  eax = 0.
+secdesk_thread proc frame
+    FRAME_PROLOG 48
+    WINCALL SetThreadDesktop, qword ptr [g_secdesk_hd]
+    test    eax, eax
+    jz      sdt_run                              ; couldn't bind -> show on current desktop
+    WINCALL SwitchDesktop, qword ptr [g_secdesk_hd]
+sdt_run:
+    WINCALL DialogBoxParamW, qword ptr [g_hinst], dword ptr [g_secdesk_dlg], 0, \
+            qword ptr [g_secdesk_proc], 0
+    mov     qword ptr [g_secdesk_res], rax       ; marshal the result back to the caller
+    cmp     qword ptr [g_secdesk_orig], 0        ; return the user to their own desktop
+    je      sdt_done
+    WINCALL SwitchDesktop, qword ptr [g_secdesk_orig]
+sdt_done:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+secdesk_thread endp
+
+; gui_secdesk_show(ecx = dialog template id, rdx = dialog proc) -> rax = result.
+;   Runs the given dialog on a private desktop via secdesk_thread and blocks
+;   until it closes.  Falls back to a normal modal dialog on any failure.
+public gui_secdesk_show
+gui_secdesk_show proc frame
+    FRAME_PROLOG 64                              ; room for 6-arg WINCALL spill above [rbp-24]
+    mov     dword ptr [g_secdesk_dlg], ecx
+    mov     qword ptr [g_secdesk_proc], rdx
+    mov     qword ptr [g_secdesk_res], 0
+    mov     qword ptr [g_secdesk_hd], 0
+    ; remember the desktop currently receiving input, to restore afterwards
+    WINCALL OpenInputDesktop, 0, 0, DESKTOP_MAXALLOWED
+    mov     qword ptr [g_secdesk_orig], rax
+    ; create the private desktop the dialog will live on
+    WINCALL CreateDesktopW, addr secdesk_name, 0, 0, 0, DESKTOP_MAXALLOWED, 0
+    mov     qword ptr [g_secdesk_hd], rax
+    test    rax, rax
+    jz      gss_fallback                         ; no desktop -> plain dialog
+    WINCALL CreateThread, 0, 0, addr secdesk_thread, 0, 0, 0
+    mov     qword ptr [rbp-24], rax              ; worker thread handle
+    test    rax, rax
+    jz      gss_fallback                         ; no thread -> plain dialog
+    WINCALL WaitForSingleObject, qword ptr [rbp-24], WAIT_FOREVER
+    WINCALL CloseHandle, qword ptr [rbp-24]
+    jmp     gss_cleanup
+gss_fallback:
+    ; degrade to a normal on-desktop modal dialog (never lock the user out)
+    WINCALL DialogBoxParamW, qword ptr [g_hinst], dword ptr [g_secdesk_dlg], 0, \
+            qword ptr [g_secdesk_proc], 0
+    mov     qword ptr [g_secdesk_res], rax
+gss_cleanup:
+    cmp     qword ptr [g_secdesk_hd], 0
+    je      gss_orig
+    WINCALL CloseDesktop, qword ptr [g_secdesk_hd]
+    mov     qword ptr [g_secdesk_hd], 0
+gss_orig:
+    cmp     qword ptr [g_secdesk_orig], 0
+    je      gss_ret
+    WINCALL CloseDesktop, qword ptr [g_secdesk_orig]
+    mov     qword ptr [g_secdesk_orig], 0
+gss_ret:
+    mov     rax, qword ptr [g_secdesk_res]
+    FRAME_EPILOG
+    ret
+gui_secdesk_show endp
+
+; cmd_securedesk - Plan 4 Step 1 spike: bring up a themed dialog on the private
+;   desktop, so the desktop-switch mechanism can be eyeballed before it is wired
+;   into the real unlock flow.  eax = 0.
+public cmd_securedesk
+LANDING_PAD
+cmd_securedesk proc frame
+    FRAME_PROLOG 48
+    WINCALL GetModuleHandleW, 0
+    mov     qword ptr [g_hinst], rax
+    call    theme_boot                           ; brushes/fonts for the themed dialog
+    lea     rax, [sd_spike_txt]
+    mov     qword ptr [g_msg_text], rax
+    lea     rax, [sd_spike_ttl]
+    mov     qword ptr [g_msg_title], rax
+    mov     dword ptr [g_msg_flags], 0           ; MB_OK
+    mov     ecx, DLG_MSG
+    lea     rdx, [msg_proc]
+    call    gui_secdesk_show
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+cmd_securedesk endp
 
 ; =============================================================================
 ; gui_open(rcx = owner hwnd) - run the create/unlock -> vault flow, then lock and
