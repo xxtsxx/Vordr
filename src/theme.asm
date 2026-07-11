@@ -95,6 +95,11 @@ WIN_ALPHA           equ 255                  ; 100% (fully opaque)
 DWMWA_DARK          equ 20
 DWMWA_CORNER        equ 33                   ; DWMWA_WINDOW_CORNER_PREFERENCE
 DWMWCP_ROUND        equ 2                    ; rounded corners (Fluent)
+DWMWA_CAPTION_COLOR equ 35                   ; title-bar fill (Win11; older: E_INVALIDARG, ignored)
+DWMWA_TEXT_COLOR    equ 36                   ; title-bar text
+DWMWA_BACKDROP      equ 38                   ; DWMWA_SYSTEMBACKDROP_TYPE (Win11 22H2+)
+DWMSBT_NONE         equ 1                    ; opaque (clears a previously set material)
+DWMWA_COLOR_NONE    equ 0FFFFFFFEh           ; caption draws no fill -> backdrop material shows
 SRCCOPY             equ 0CC0020h
 HALFTONE            equ 4
 NULL_BRUSH          equ 5
@@ -170,17 +175,19 @@ schemes label dword
     dd 001A2006h,0028320Ah,005E7A1Ah,0028320Ah,003A4612h,00F4FFE0h,00BCD090h,005E7A1Ah,0098E010h,0078B00Ah,0098E010h,00000001h,000F1804h,0034400Eh,00D0FF60h  ; Emerald
     dd 00220E06h,0038180Ah,008A3A1Ah,0038180Ah,004E2210h,00FFEAE0h,00E0B09Ah,008A3A1Ah,00FF6A2Eh,00D04818h,00FF6A2Eh,00000001h,001A0A04h,00341208h,00FFB08Ah  ; Sapphire
     dd 00282828h,002F3032h,00454950h,002F3032h,0036383Ch,00B2DBEBh,008499A8h,00454950h,001980FEh,001060D0h,001980FEh,00000001h,001F2022h,0034363Ah,0026BBB8h  ; Gruvbox
-; scheme_traits[scheme] = radius(byte0) | accent-mode(byte1: 0 solid/1 rainbow/2 two-tone) | flags(byte2: bit0 scanlines)
+; scheme_traits[scheme] = radius(byte0) | accent-mode(byte1: 0 solid/1 rainbow/2 two-tone) |
+;   flags(byte2: bit0 scanlines) | backdrop material(byte3: DWMSBT_* - 0 auto/opaque,
+;   2 Mica, 3 Acrylic, 4 Mica-Alt; shows in the title bar via DWMWA_COLOR_NONE)
 scheme_traits label dword
-    dd 00000008h  ; Light
-    dd 00000008h  ; Sepia
-    dd 00000008h  ; Nord
-    dd 00000008h  ; Midnight
-    dd 00000000h  ; Commodore
-    dd 00000208h  ; Amethyst
-    dd 00000208h  ; Emerald
-    dd 00000208h  ; Sapphire
-    dd 00000006h  ; Gruvbox
+    dd 02000008h  ; Light      - Mica
+    dd 02000008h  ; Sepia      - Mica
+    dd 02000008h  ; Nord       - Mica
+    dd 04000008h  ; Midnight   - Mica Alt
+    dd 00000000h  ; Commodore  - opaque (CRT look)
+    dd 03000208h  ; Amethyst   - Acrylic
+    dd 03000208h  ; Emerald    - Acrylic
+    dd 03000208h  ; Sapphire   - Acrylic
+    dd 02000006h  ; Gruvbox    - Mica
 g_br_bg     dq 0
 g_br_side   dq 0                            ; sidebar (list + search) fill
 g_br_panel  dq 0
@@ -608,6 +615,51 @@ theme_scrollbars proc frame
 theme_scrollbars endp
 
 ; =============================================================================
+; theme_dwm_apply(rcx=hwnd) - apply every scheme-dependent DWM window attribute:
+;   immersive dark mode, rounded corners, title-bar fill/text colours, and the
+;   scheme's backdrop material (Mica / Acrylic / Mica-Alt from scheme_traits
+;   byte3).  Material schemes set DWMWA_COLOR_NONE so the caption draws no fill
+;   and the material shows through; opaque schemes paint the caption g_col_bg.
+;   Every attribute is fire-and-forget: pre-Win11 DWM answers E_INVALIDARG for
+;   the newer ones and the window simply keeps the classic look.
+;   Called by theme_attach (every dialog init) and gui_apply_scheme (live switch).
+; =============================================================================
+public theme_dwm_apply
+theme_dwm_apply proc frame
+    FRAME_PROLOG 48
+    ; [rbp-24] hwnd  [rbp-40] attribute value cell
+    mov     qword ptr [rbp-24], rcx
+    mov     eax, dword ptr [g_col_dark]         ; dark title bar only for dark schemes
+    mov     dword ptr [rbp-40], eax
+    WINCALL DwmSetWindowAttribute, qword ptr [rbp-24], DWMWA_DARK, addr rbp-40, 4
+    mov     dword ptr [rbp-40], DWMWCP_ROUND    ; Fluent rounded window corners
+    WINCALL DwmSetWindowAttribute, qword ptr [rbp-24], DWMWA_CORNER, addr rbp-40, 4
+    call    theme_trait                         ; byte3 = backdrop material
+    shr     eax, 24
+    movzx   eax, al
+    mov     dword ptr [rbp-44], eax
+    test    eax, eax
+    jnz     tda_mat
+    mov     dword ptr [rbp-40], DWMSBT_NONE     ; opaque scheme: clear any material,
+    WINCALL DwmSetWindowAttribute, qword ptr [rbp-24], DWMWA_BACKDROP, addr rbp-40, 4
+    mov     eax, dword ptr [g_col_bg]           ; ...and paint the caption like the bg
+    mov     dword ptr [rbp-40], eax
+    jmp     tda_cap
+tda_mat:
+    mov     eax, dword ptr [rbp-44]             ; material scheme: set Mica/Acrylic
+    mov     dword ptr [rbp-40], eax
+    WINCALL DwmSetWindowAttribute, qword ptr [rbp-24], DWMWA_BACKDROP, addr rbp-40, 4
+    mov     dword ptr [rbp-40], DWMWA_COLOR_NONE ; no caption fill -> material shows
+tda_cap:
+    WINCALL DwmSetWindowAttribute, qword ptr [rbp-24], DWMWA_CAPTION_COLOR, addr rbp-40, 4
+    mov     eax, dword ptr [g_col_text]         ; caption text follows the scheme
+    mov     dword ptr [rbp-40], eax
+    WINCALL DwmSetWindowAttribute, qword ptr [rbp-24], DWMWA_TEXT_COLOR, addr rbp-40, 4
+    FRAME_EPILOG
+    ret
+theme_dwm_apply endp
+
+; =============================================================================
 ; theme_attach(rcx=hwnd, edx=defid)
 ; =============================================================================
 public theme_attach
@@ -616,11 +668,8 @@ theme_attach proc frame
     ; [rbp-24] hwnd  [rbp-32] defid  [rbp-40] dwmflag  RECT @ [rbp-64]
     mov     qword ptr [rbp-24], rcx
     mov     dword ptr [rbp-32], edx
-    mov     eax, dword ptr [g_col_dark]         ; dark title bar only for dark schemes
-    mov     dword ptr [rbp-40], eax
-    WINCALL DwmSetWindowAttribute, qword ptr [rbp-24], DWMWA_DARK, addr rbp-40, 4
-    mov     dword ptr [rbp-40], DWMWCP_ROUND          ; Fluent rounded window corners
-    WINCALL DwmSetWindowAttribute, qword ptr [rbp-24], DWMWA_CORNER, addr rbp-40, 4
+    mov     rcx, qword ptr [rbp-24]
+    call    theme_dwm_apply                     ; dark/corners/caption/backdrop
     WINCALL GetWindowLongPtrW, qword ptr [rbp-24], GWL_STYLE
     or      rax, WS_CLIPCHILDREN            ; clip children so the frame ring isn't overpainted
     WINCALL SetWindowLongPtrW, qword ptr [rbp-24], GWL_STYLE, rax

@@ -58,6 +58,7 @@ extern DwmSetWindowAttribute:proc
 extern g_scheme:dword
 extern theme_set_scheme:proc
 extern theme_scrollbars:proc
+extern theme_dwm_apply:proc
 extern cfg_set_dword_hkcu:proc
 extern cfg_get_dword:proc
 extern vault_field_count:proc
@@ -6932,9 +6933,8 @@ gui_apply_scheme proc frame
     mov     rax, qword ptr [r10+rax*8]
     mov     qword ptr [rbp-32], rax
     WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_MTHEME, qword ptr [rbp-32]
-    mov     eax, dword ptr [g_col_dark]          ; match the title bar to the scheme
-    mov     dword ptr [rbp-40], eax
-    WINCALL DwmSetWindowAttribute, qword ptr [rbp-24], 20, addr rbp-40, 4
+    mov     rcx, qword ptr [rbp-24]              ; title bar + backdrop material follow the scheme
+    call    theme_dwm_apply
     mov     rcx, qword ptr [rbp-24]              ; re-theme scrollbars to match dark/light
     call    theme_scrollbars
     WINCALL RedrawWindow, qword ptr [rbp-24], 0, 0, 185h
