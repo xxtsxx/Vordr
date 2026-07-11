@@ -153,11 +153,18 @@ recorded in g_tempfiles (path + plaintext size). gui_temp_purge overwrites each
 file's full length with zeros, FlushFileBuffers to force the platter, closes,
 DeleteFileW's it, then scrubs the table; it runs from vp_lock_go so it fires on
 every lock path (Lock button, Escape, WM_CLOSE, Win+L, idle-lock). Temp files
-are created FILE_ATTRIBUTE_TEMPORARY (cache hint). A "Purge temp files now"
-Settings button calls it on demand. DELETE_ON_CLOSE is intentionally not used:
-the file is handed to an external viewer via ShellExecuteW whose handle we don't
-control, so the deterministic tracked-wipe is the reliable path. Headless
-`tmptest` verb (in run_all) writes/tracks/purges and asserts the file is gone.
+are created FILE_ATTRIBUTE_TEMPORARY (cache hint). DELETE_ON_CLOSE is
+intentionally not used: the file is handed to an external viewer via
+ShellExecuteW whose handle we don't control, so the deterministic tracked-wipe
+is the reliable path. Headless `tmptest` verb (in run_all) writes/tracks/purges
+and asserts the file is gone.
+
+The on-demand "purge now" button was superseded by a **"Disable attachment
+preview"** Settings toggle (with an (i) note): when on, `gtk_open` routes every
+attachment to the Save-As download path (like executables always are), so no
+plaintext temp file is ever created. `NoPreview` persists HKLM>HKCU>default(0)
+with the usual locked-UI disable. This prevents the lingering copy rather than
+cleaning it up after the fact.
 
 ---
 

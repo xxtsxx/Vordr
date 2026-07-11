@@ -387,7 +387,9 @@ IDC_V_MIDLEL equ 259                  ; "Auto-lock idle (minutes)" label
 IDC_V_MIDLE  equ 260                  ; idle-minutes edit
 IDC_V_MWLKL  equ 261                  ; "Lock with Windows" label
 IDC_V_MWLK   equ 262                  ; lock-with-Windows toggle
-IDC_V_MPURGE equ 263                  ; "Purge temp files now" button
+IDC_V_MNOPREVL   equ 263              ; "Disable attachment preview" label
+IDC_V_MNOPREV    equ 264              ; disable-attachment-preview toggle
+IDC_V_MNOPREVINFO equ 265            ; "Disable attachment preview" info (i)
 IDC_V_MTHEME equ 240                  ; color-scheme cycle button (settings)
 IDC_V_MTHEMEL equ 241                 ; "Color scheme" label
 IDC_V_COLORPW equ 244                 ; overlay: colored revealed secret (owner-draw)
@@ -642,8 +644,8 @@ WSTR s_kept,        <Existing vault kept. Cancel, or use "Create new..." to choo
 WSTR s_pwmismatch,  <The passwords do not match.>
 WSTR s_pwshort,     <Password is too short for the current policy.>
 WSTR s_pwclasses,   <Password needs more character types (lowercase / uppercase / number / symbol).>
-WSTR s_purged_ttl,  <Temporary files>
-WSTR s_purged,      <Decrypted attachment temp files have been overwritten and deleted.>
+WSTR t_noprevinfo,  <Disable attachment preview>
+WSTR m_noprevinfo,  <When on, attachments can only be saved to a location you pick, never opened in another app. Opening would decrypt the file to a temp folder where its plaintext can linger for other software to read, and may be left behind.>
 WSTR wtmptest_name, <vordr_tmptest.bin>       ; gui_tmptest scratch (headless probe)
 WSTR wt_newentry,   <New entry>
 WSTR cue_search,    <Search>
@@ -685,6 +687,7 @@ req_p4 label word
 WSTR wv_clip,       <ClipSeconds>
 WSTR wv_idlemin,    <IdleLockMin>
 WSTR wv_winlock,    <LockOnWinLock>
+WSTR wv_nopreview,  <NoPreview>
 WSTR wv_pwlen,      <PwMinLen>
 WSTR wv_pwcls,      <PwMinClasses>
 WSTR wv_nohist,     <NoHistory>
@@ -1024,8 +1027,8 @@ g_menu_ids label dword
     dd IDC_V_MSECDL, IDC_V_MSECD, IDC_V_MSECINFO
     dd IDC_V_MCLIPL, IDC_V_MCLIP
     dd IDC_V_MIDLEL, IDC_V_MIDLE, IDC_V_MWLKL, IDC_V_MWLK
-    dd IDC_V_MPURGE
-MENU_ID_COUNT equ 28
+    dd IDC_V_MNOPREVL, IDC_V_MNOPREV, IDC_V_MNOPREVINFO
+MENU_ID_COUNT equ 30
 
 .data?
 align 8
@@ -1083,6 +1086,8 @@ g_idle_min  dd ?                      ; auto-lock after N idle minutes (0 = off)
 g_idle_lock dd ?                      ; 1 = idle timeout forced by HKLM policy
 g_winlock   dd ?                      ; 1 = lock the vault when Windows locks (Win+L)
 g_winlock_lock dd ?                   ; 1 = LockOnWinLock forced by HKLM policy
+g_nopreview dd ?                      ; 1 = never open attachments in-place; download only
+g_nopreview_lock dd ?                 ; 1 = NoPreview forced by HKLM policy
 g_cf_hist   dd ?                      ; registered format: CanIncludeInClipboardHistory
 g_cf_cloud  dd ?                      ; registered format: CanUploadToCloudClipboard
 g_cf_excl   dd ?                      ; registered format: ExcludeClipboardContentFromMonitorProcessing
@@ -5319,6 +5324,8 @@ gtk_relayout:
     call    gui_tile_relayout
     jmp     gtk_done
 gtk_open:
+    cmp     dword ptr [g_nopreview], 0               ; preview disabled -> download only,
+    jne     gtk_saveas                               ;   never decrypt to a temp file
     mov     ecx, dword ptr [rbp-76]                  ; executable/script type?
     call    tf_entry
     lea     rcx, [rax+TFILE_NAME]
@@ -7563,6 +7570,24 @@ mo_cls_ok:
     xor     eax, 1
     mov     edx, eax
     call    EnableWindow
+    ; Lock-with-Windows toggle: disable when HKLM policy locks it
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_V_MWLK
+    call    GetDlgItem
+    mov     rcx, rax
+    mov     eax, dword ptr [g_winlock_lock]
+    xor     eax, 1
+    mov     edx, eax
+    call    EnableWindow
+    ; Disable-attachment-preview toggle: disable when HKLM policy locks it
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_V_MNOPREV
+    call    GetDlgItem
+    mov     rcx, rax
+    mov     eax, dword ptr [g_nopreview_lock]
+    xor     eax, 1
+    mov     edx, eax
+    call    EnableWindow
     ; colour-scheme button: disable when HKLM policy locks the scheme
     mov     rcx, qword ptr [rbp-24]
     mov     edx, IDC_V_MTHEME
@@ -7727,9 +7752,15 @@ msv_phon:
     call    cfg_set_dword_hkcu
 msv_secd:
     cmp     dword ptr [g_secunlock_lock], 0    ; HKLM policy -> don't overwrite with HKCU
-    jne     msv_done
+    jne     msv_noprev
     lea     rcx, [wv_secunlock]
     mov     edx, dword ptr [g_secunlock]
+    call    cfg_set_dword_hkcu
+msv_noprev:
+    cmp     dword ptr [g_nopreview_lock], 0    ; disable-attachment-preview toggle
+    jne     msv_done
+    lea     rcx, [wv_nopreview]
+    mov     edx, dword ptr [g_nopreview]
     call    cfg_set_dword_hkcu
 msv_done:
     FRAME_EPILOG
@@ -7839,6 +7870,8 @@ vp_tdraw:
     je      vp_tdraw_tsecd
     cmp     eax, IDC_V_MWLK                   ; lock-with-Windows toggle
     je      vp_tdraw_twlk
+    cmp     eax, IDC_V_MNOPREV               ; disable-attachment-preview toggle
+    je      vp_tdraw_tnoprev
     cmp     eax, IDC_V_LIST                   ; the entry list = icon cards
     je      vp_tdraw_list
     cmp     eax, IDC_V_HEADER                 ; detail-pane header (tile + title)
@@ -7916,6 +7949,11 @@ vp_tdraw_tsecd:
 vp_tdraw_twlk:
     mov     rcx, r9
     mov     edx, dword ptr [g_winlock]
+    call    theme_toggle
+    jmp     vp_ret
+vp_tdraw_tnoprev:
+    mov     rcx, r9
+    mov     edx, dword ptr [g_nopreview]
     call    theme_toggle
     jmp     vp_ret
 vp_tdraw_totp:
@@ -8102,8 +8140,6 @@ vp_cmd_fixed:
     je      vp_export
     cmp     eax, IDC_V_MIMPORT
     je      vp_import
-    cmp     eax, IDC_V_MPURGE
-    je      vp_purge
     cmp     eax, IDC_V_OVFL
     je      vp_ovfl
     cmp     eax, IDC_V_FAV
@@ -8124,6 +8160,10 @@ vp_cmd_fixed:
     je      vp_msecinfo
     cmp     eax, IDC_V_MWLK
     je      vp_mwlk
+    cmp     eax, IDC_V_MNOPREV
+    je      vp_mnoprev
+    cmp     eax, IDC_V_MNOPREVINFO
+    je      vp_mnoprevinfo
     cmp     eax, IDCANCEL
     je      vp_esc
     xor     eax, eax
@@ -8158,6 +8198,22 @@ vp_mwlk:
     mov     dword ptr [g_winlock], eax
     mov     rcx, qword ptr [rbp-8]
     mov     edx, IDC_V_MWLK
+    call    GetDlgItem
+    sub     rsp, 32
+    mov     rcx, rax
+    xor     edx, edx
+    mov     r8d, 1
+    call    InvalidateRect
+    add     rsp, 32
+    jmp     vp_handled
+vp_mnoprev:
+    cmp     dword ptr [g_nopreview_lock], 0   ; HKLM-locked -> ignore the click
+    jne     vp_handled
+    mov     eax, dword ptr [g_nopreview]
+    xor     eax, 1
+    mov     dword ptr [g_nopreview], eax
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_V_MNOPREV
     call    GetDlgItem
     sub     rsp, 32
     mov     rcx, rax
@@ -8296,9 +8352,9 @@ vp_import:
     mov     rcx, qword ptr [rbp-8]
     call    gui_import
     jmp     vp_handled
-vp_purge:
-    call    gui_temp_purge                          ; wipe+delete decrypt-to-temp files now
-    WINCALL MessageBoxW, qword ptr [rbp-8], addr s_purged, addr s_purged_ttl, 040h  ; MB_ICONINFORMATION
+vp_mnoprevinfo:
+    WINCALL gui_msgbox, qword ptr [rbp-8], addr m_noprevinfo, addr t_noprevinfo, \
+            <MB_OK or MB_ICONINFORMATION>
     jmp     vp_handled
 vp_ovfl:
     cmp     dword ptr [g_cur_idx], 0             ; only with an entry shown
@@ -8739,6 +8795,12 @@ lp_tpm_done:
     jz      @F
     mov     eax, 1
 @@: mov     dword ptr [g_winlock], eax
+    ; disable attachment preview -> download-only (0/1; HKLM > HKCU > default 0)
+    WINCALL cfg_get_dword, addr wv_nopreview, 0, addr g_nopreview_lock
+    test    eax, eax
+    jz      @F
+    mov     eax, 1
+@@: mov     dword ptr [g_nopreview], eax
     FRAME_EPILOG
     ret
 gui_load_policy endp
