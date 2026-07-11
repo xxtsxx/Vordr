@@ -148,6 +148,11 @@ extern GlobalUnlock:proc
 extern GetClipboardSequenceNumber:proc
 extern SetTimer:proc
 extern KillTimer:proc
+extern GetLastInputInfo:proc              ; auto-lock: system-wide idle time
+extern GetTickCount:proc
+extern GetActiveWindow:proc
+extern WTSRegisterSessionNotification:proc   ; wtsapi32: Win+L lock events
+extern WTSUnRegisterSessionNotification:proc
 extern MultiByteToWideChar:proc
 extern WideCharToMultiByte:proc
 extern IsDlgButtonChecked:proc
@@ -302,6 +307,10 @@ TOTP_TIMER          equ 2                  ; timer id for live auth-code refresh
 TOTP_MS             equ 1000               ; recompute the code once a second
 SEARCH_TIMER        equ 3                  ; timer id for debounced search-as-you-type
 SEARCH_MS           equ 300                ; refilter only after 0.3 s of no keystrokes
+IDLE_TIMER          equ 4                  ; timer id for the auto-lock idle poll
+IDLE_POLL_MS        equ 30000              ; check system idle time every 30 s
+WM_WTSSESSION_CHANGE equ 02B1h             ; session notification (Win+L etc.)
+WTS_SESSION_LOCK    equ 7                  ; wparam: the workstation locked
 SEARCH_DEBOUNCE_MIN equ 200               ; ...but only when the list exceeds this many entries
 LBN_SELCHANGE       equ 1
 LB_ADDSTRING        equ 180h
@@ -370,6 +379,10 @@ IDC_V_MSECD    equ 255                ; "Secure password entry" toggle
 IDC_V_MSECINFO equ 256               ; "Secure password entry" info screen
 IDC_V_MCLIPL equ 257                  ; "Clipboard clear (seconds)" label
 IDC_V_MCLIP  equ 258                  ; clipboard timeout edit
+IDC_V_MIDLEL equ 259                  ; "Auto-lock idle (minutes)" label
+IDC_V_MIDLE  equ 260                  ; idle-minutes edit
+IDC_V_MWLKL  equ 261                  ; "Lock with Windows" label
+IDC_V_MWLK   equ 262                  ; lock-with-Windows toggle
 IDC_V_MTHEME equ 240                  ; color-scheme cycle button (settings)
 IDC_V_MTHEMEL equ 241                 ; "Color scheme" label
 IDC_V_COLORPW equ 244                 ; overlay: colored revealed secret (owner-draw)
@@ -651,6 +664,8 @@ req_p4 label word
     dw 118,101,114,121,116,104,105,110,103,32,105,115,32,103,111,110
     dw 101,46,0
 WSTR wv_clip,       <ClipSeconds>
+WSTR wv_idlemin,    <IdleLockMin>
+WSTR wv_winlock,    <LockOnWinLock>
 WSTR wv_pwlen,      <PwMinLen>
 WSTR wv_pwcls,      <PwMinClasses>
 WSTR wv_nohist,     <NoHistory>
@@ -989,7 +1004,8 @@ g_menu_ids label dword
     dd IDC_V_MNOHISTL, IDC_V_MNOHIST, IDC_V_MNOPHONL, IDC_V_MNOPHON
     dd IDC_V_MSECDL, IDC_V_MSECD, IDC_V_MSECINFO
     dd IDC_V_MCLIPL, IDC_V_MCLIP
-MENU_ID_COUNT equ 23
+    dd IDC_V_MIDLEL, IDC_V_MIDLE, IDC_V_MWLKL, IDC_V_MWLK
+MENU_ID_COUNT equ 27
 
 .data?
 align 8
@@ -1043,6 +1059,10 @@ g_revealed  dd ?
 g_clip_seq  dd ?                      ; clipboard sequence number at last copy
 g_clip_secs dd ?                      ; auto-clear timeout in seconds (0 = off); HKLM>HKCU>20
 g_clip_lock dd ?                      ; 1 = clipboard timeout forced by HKLM policy
+g_idle_min  dd ?                      ; auto-lock after N idle minutes (0 = off); HKLM>HKCU>10
+g_idle_lock dd ?                      ; 1 = idle timeout forced by HKLM policy
+g_winlock   dd ?                      ; 1 = lock the vault when Windows locks (Win+L)
+g_winlock_lock dd ?                   ; 1 = LockOnWinLock forced by HKLM policy
 g_cf_hist   dd ?                      ; registered format: CanIncludeInClipboardHistory
 g_cf_cloud  dd ?                      ; registered format: CanUploadToCloudClipboard
 g_cf_excl   dd ?                      ; registered format: ExcludeClipboardContentFromMonitorProcessing
@@ -7291,6 +7311,20 @@ gui_menu_open proc frame
     xor     edx, edx
     call    EnableWindow
 mo_clip_ok:
+    mov     rcx, qword ptr [rbp-24]                 ; auto-lock idle (minutes)
+    mov     edx, IDC_V_MIDLE
+    mov     r8d, dword ptr [g_idle_min]
+    xor     r9d, r9d
+    call    SetDlgItemInt
+    cmp     dword ptr [g_idle_lock], 0              ; disable if HKLM-locked
+    je      mo_idle_ok
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_V_MIDLE
+    call    GetDlgItem
+    mov     rcx, rax
+    xor     edx, edx
+    call    EnableWindow
+mo_idle_ok:
     ; disable policy fields locked by HKLM
     cmp     dword ptr [g_pol_len_lock], 0
     je      mo_len_ok
@@ -7445,7 +7479,7 @@ msv_cls:
     mov     edx, dword ptr [g_cfg_pwminclasses]
     call    cfg_set_dword_hkcu
     cmp     dword ptr [g_clip_lock], 0          ; clipboard auto-clear timeout (seconds)
-    jne     msv_tpm
+    jne     msv_idle
     WINCALL GetDlgItemInt, qword ptr [rbp-24], IDC_V_MCLIP, 0, 0
     cmp     eax, 3600                           ; 0 = off is allowed; clamp the top
     jbe     @F
@@ -7453,6 +7487,28 @@ msv_cls:
 @@: mov     dword ptr [g_clip_secs], eax
     lea     rcx, [wv_clip]
     mov     edx, dword ptr [g_clip_secs]
+    call    cfg_set_dword_hkcu
+msv_idle:
+    cmp     dword ptr [g_idle_lock], 0          ; auto-lock idle timeout (minutes)
+    jne     msv_idle_arm
+    WINCALL GetDlgItemInt, qword ptr [rbp-24], IDC_V_MIDLE, 0, 0
+    cmp     eax, 1440                           ; 0 = off is allowed; clamp to 24 h
+    jbe     @F
+    mov     eax, 1440
+@@: mov     dword ptr [g_idle_min], eax
+    lea     rcx, [wv_idlemin]
+    mov     edx, dword ptr [g_idle_min]
+    call    cfg_set_dword_hkcu
+msv_idle_arm:
+    WINCALL KillTimer, qword ptr [rbp-24], IDLE_TIMER   ; re-arm to the new value
+    cmp     dword ptr [g_idle_min], 0
+    je      msv_wlk
+    WINCALL SetTimer, qword ptr [rbp-24], IDLE_TIMER, IDLE_POLL_MS, 0
+msv_wlk:
+    cmp     dword ptr [g_winlock_lock], 0       ; lock-with-Windows toggle
+    jne     msv_tpm
+    lea     rcx, [wv_winlock]
+    mov     edx, dword ptr [g_winlock]
     call    cfg_set_dword_hkcu
 msv_tpm:
     cmp     dword ptr [g_tpm_present], 0
@@ -7516,6 +7572,8 @@ vault_proc proc
     je      vp_close
     cmp     rdx, WM_TIMER
     je      vp_timer
+    cmp     rdx, WM_WTSSESSION_CHANGE
+    je      vp_wts
     cmp     rdx, WM_PAINT
     je      vp_tpaint
     cmp     rdx, WM_ERASEBKGND
@@ -7599,6 +7657,8 @@ vp_tdraw:
     je      vp_tdraw_tnophon
     cmp     eax, IDC_V_MSECD                  ; secure-desktop entry toggle
     je      vp_tdraw_tsecd
+    cmp     eax, IDC_V_MWLK                   ; lock-with-Windows toggle
+    je      vp_tdraw_twlk
     cmp     eax, IDC_V_LIST                   ; the entry list = icon cards
     je      vp_tdraw_list
     cmp     eax, IDC_V_HEADER                 ; detail-pane header (tile + title)
@@ -7673,6 +7733,11 @@ vp_tdraw_tsecd:
     mov     edx, dword ptr [g_secunlock]
     call    theme_toggle
     jmp     vp_ret
+vp_tdraw_twlk:
+    mov     rcx, r9
+    mov     edx, dword ptr [g_winlock]
+    call    theme_toggle
+    jmp     vp_ret
 vp_tdraw_totp:
     mov     rcx, r9
     mov     edx, dword ptr [g_totp_secs]
@@ -7696,7 +7761,41 @@ vp_timer_clip:
     je      vp_t_totp
     cmp     r8d, SEARCH_TIMER
     je      vp_t_search
+    cmp     r8d, IDLE_TIMER
+    je      vp_t_idle
     jmp     vp_unhandled
+vp_wts:
+    cmp     r8d, WTS_SESSION_LOCK             ; only the lock event matters
+    jne     vp_handled
+    cmp     dword ptr [g_winlock], 0          ; setting off -> ignore
+    je      vp_handled
+    jmp     vp_lock
+vp_t_idle:
+    cmp     dword ptr [g_idle_min], 0         ; setting turned off since arming
+    je      vp_handled
+    sub     rsp, 32                           ; one of OUR modal popups active?
+    call    GetActiveWindow                   ;   (thread-local; NULL if another app
+    add     rsp, 32                           ;    has focus - locking then is fine)
+    test    rax, rax
+    jz      @F
+    cmp     rax, qword ptr [rbp-8]
+    jne     vp_handled                        ; modal child up -> skip this tick
+@@: mov     dword ptr [rbp-32], 8             ; LASTINPUTINFO { cbSize=8, dwTime }
+    sub     rsp, 32
+    lea     rcx, [rbp-32]
+    call    GetLastInputInfo
+    add     rsp, 32
+    test    eax, eax
+    jz      vp_handled
+    sub     rsp, 32
+    call    GetTickCount
+    add     rsp, 32
+    sub     eax, dword ptr [rbp-28]           ; idle ms (wrap-safe unsigned diff)
+    mov     ecx, dword ptr [g_idle_min]
+    imul    ecx, ecx, 60000                   ; minutes -> ms
+    cmp     eax, ecx
+    jb      vp_handled
+    jmp     vp_lock                           ; idle long enough -> lock the vault
 vp_t_clip:
     sub     rsp, 32
     mov     rcx, qword ptr [rbp-8]
@@ -7757,6 +7856,12 @@ vp_init:
     mov     rcx, qword ptr [rbp-8]            ; start in view mode (fields locked)
     xor     edx, edx
     call    gui_set_editmode
+    ; auto-lock: Win+L notifications (gated by g_winlock on receipt) + idle poll
+    WINCALL WTSRegisterSessionNotification, qword ptr [rbp-8], 0  ; NOTIFY_FOR_THIS_SESSION
+    cmp     dword ptr [g_idle_min], 0
+    je      @F
+    WINCALL SetTimer, qword ptr [rbp-8], IDLE_TIMER, IDLE_POLL_MS, 0
+@@:
     sub     rsp, 32                          ; foreground the window so keystrokes land
     mov     rcx, qword ptr [rbp-8]            ;   here (launched from the tray, it is
     call    SetForegroundWindow              ;   otherwise visible but not active)
@@ -7835,6 +7940,8 @@ vp_cmd_fixed:
     je      vp_msecd
     cmp     eax, IDC_V_MSECINFO
     je      vp_msecinfo
+    cmp     eax, IDC_V_MWLK
+    je      vp_mwlk
     cmp     eax, IDCANCEL
     je      vp_esc
     xor     eax, eax
@@ -7853,6 +7960,22 @@ vp_mtpm:
     mov     dword ptr [g_tpm_want], eax
     mov     rcx, qword ptr [rbp-8]
     mov     edx, IDC_V_MTPM
+    call    GetDlgItem
+    sub     rsp, 32
+    mov     rcx, rax
+    xor     edx, edx
+    mov     r8d, 1
+    call    InvalidateRect
+    add     rsp, 32
+    jmp     vp_handled
+vp_mwlk:
+    cmp     dword ptr [g_winlock_lock], 0     ; HKLM-locked -> ignore the click
+    jne     vp_handled
+    mov     eax, dword ptr [g_winlock]
+    xor     eax, 1
+    mov     dword ptr [g_winlock], eax
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_V_MWLK
     call    GetDlgItem
     sub     rsp, 32
     mov     rcx, rax
@@ -8313,6 +8436,11 @@ vp_lock_go:
     mov     rcx, qword ptr [rbp-8]
     mov     edx, SEARCH_TIMER               ; drop any pending debounced refilter
     call    KillTimer
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDLE_TIMER                 ; stop the auto-lock poll
+    call    KillTimer
+    mov     rcx, qword ptr [rbp-8]          ; window is going away
+    call    WTSUnRegisterSessionNotification
     add     rsp, 32
     mov     dword ptr [g_totp_on], 0
     call    gui_clipclear                   ; clear the clipboard if it is still ours
@@ -8412,6 +8540,18 @@ lp_tpm_done:
     jbe     @F
     mov     eax, 3600
 @@: mov     dword ptr [g_clip_secs], eax
+    ; auto-lock idle timeout (minutes; HKLM > HKCU > default 10; 0 = off)
+    WINCALL cfg_get_dword, addr wv_idlemin, 10, addr g_idle_lock
+    cmp     eax, 1440                           ; clamp to [0, 24 h]
+    jbe     @F
+    mov     eax, 1440
+@@: mov     dword ptr [g_idle_min], eax
+    ; lock the vault when Windows locks (0/1; HKLM > HKCU > default 1)
+    WINCALL cfg_get_dword, addr wv_winlock, 1, addr g_winlock_lock
+    test    eax, eax
+    jz      @F
+    mov     eax, 1
+@@: mov     dword ptr [g_winlock], eax
     FRAME_EPILOG
     ret
 gui_load_policy endp

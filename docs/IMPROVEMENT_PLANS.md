@@ -127,6 +127,13 @@ times diff@first vs diff@last (10k x 4 KiB) and passes within 2%.
 3. Settings: idle minutes (0=off) + "lock when Windows locks" checkbox, persisted (HKLM>HKCU>default).
    *Test:* persistence across restart; SELFTEST; FRAMES (the new handlers stay in helpers).
 
+**Status: IMPLEMENTED** — WTSRegisterSessionNotification on the vault window;
+WM_WTSSESSION_CHANGE/WTS_SESSION_LOCK jumps the existing vp_lock path (gated by
+the `LockOnWinLock` toggle, default on). IDLE_TIMER polls GetLastInputInfo every
+30 s and locks after `IdleLockMin` minutes (default 10, 0 = off, clamp 24 h);
+skips a tick while one of our own modal popups is active. Both settings HKLM>
+HKCU>default with locked-UI disable; the timer re-arms on settings save.
+
 ### 8. Secure temp-file lifecycle for attachment "Open"
 **Goal:** Decrypt-to-temp files (from `gui_file_open`) are overwritten and deleted deterministically.
 **Steps:**
