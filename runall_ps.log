@@ -8,6 +8,6 @@
   redteam      skip     -
   build        PASS     1
   selftest     PASS     0
-  roundtrip    PASS     3
+  roundtrip    PASS     4
 =========================================
 ALL STAGES PASSED 

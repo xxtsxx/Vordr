@@ -126,6 +126,9 @@ if not "!errorlevel!"=="0" ( echo   tmptest: FAIL ^(exit !errorlevel!, temp file
 bin\vordr.exe fztest > "%WORK%\fztest.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   fztest: FAIL ^(exit !errorlevel!, fuzzy scoring KAT^) & set RT=FAIL )
 
+bin\vordr.exe trtest > "%WORK%\trtest.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   trtest: FAIL ^(exit !errorlevel!, trash timestamp/threshold KAT^) & set RT=FAIL )
+
 set R_ROUNDTRIP=!RT!
 call :now T1
 set /a T_ROUNDTRIP=!T1!-!T0!
