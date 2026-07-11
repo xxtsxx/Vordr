@@ -364,6 +364,8 @@ IDC_V_MNOHISTL equ 250                ; "Do not save history" label
 IDC_V_MNOHIST  equ 251                ; "Do not save history" toggle
 IDC_V_MNOPHONL equ 252                ; "Disable phonetic reader" label
 IDC_V_MNOPHON  equ 253                ; "Disable phonetic reader" toggle
+IDC_V_MSECDL   equ 254                ; "Secure password entry" label
+IDC_V_MSECD    equ 255                ; "Secure password entry" toggle
 IDC_V_MTHEME equ 240                  ; color-scheme cycle button (settings)
 IDC_V_MTHEMEL equ 241                 ; "Color scheme" label
 IDC_V_COLORPW equ 244                 ; overlay: colored revealed secret (owner-draw)
@@ -646,6 +648,7 @@ WSTR wv_pwlen,      <PwMinLen>
 WSTR wv_pwcls,      <PwMinClasses>
 WSTR wv_nohist,     <NoHistory>
 WSTR wv_nophon,     <NoPhonetic>
+WSTR wv_securedesk, <SecureDesk>
 ; --- system tray strings ------------------------------------------------------
 WSTR t_about,       <About Vordr>
 m_welcome label word
@@ -972,7 +975,8 @@ g_menu_ids label dword
     dd IDC_V_MTHEMEL, IDC_V_MTHEME, IDC_V_MEXPORT
     dd IDC_V_MIMPORT
     dd IDC_V_MNOHISTL, IDC_V_MNOHIST, IDC_V_MNOPHONL, IDC_V_MNOPHON
-MENU_ID_COUNT equ 18
+    dd IDC_V_MSECDL, IDC_V_MSECD
+MENU_ID_COUNT equ 20
 
 .data?
 align 8
@@ -7355,9 +7359,13 @@ msv_apply_close:
     call    cfg_set_dword_hkcu
 msv_phon:
     cmp     dword ptr [g_nophon_lock], 0
-    jne     msv_done
+    jne     msv_secd
     lea     rcx, [wv_nophon]
     mov     edx, dword ptr [g_no_phonetic]
+    call    cfg_set_dword_hkcu
+msv_secd:
+    lea     rcx, [wv_securedesk]
+    mov     edx, dword ptr [g_securedesk]
     call    cfg_set_dword_hkcu
 msv_done:
     FRAME_EPILOG
@@ -7461,6 +7469,8 @@ vp_tdraw:
     je      vp_tdraw_tnohist
     cmp     eax, IDC_V_MNOPHON
     je      vp_tdraw_tnophon
+    cmp     eax, IDC_V_MSECD                  ; secure-desktop entry toggle
+    je      vp_tdraw_tsecd
     cmp     eax, IDC_V_LIST                   ; the entry list = icon cards
     je      vp_tdraw_list
     cmp     eax, IDC_V_HEADER                 ; detail-pane header (tile + title)
@@ -7528,6 +7538,11 @@ vp_tdraw_tnohist:
 vp_tdraw_tnophon:
     mov     rcx, r9
     mov     edx, dword ptr [g_no_phonetic]
+    call    theme_toggle
+    jmp     vp_ret
+vp_tdraw_tsecd:
+    mov     rcx, r9
+    mov     edx, dword ptr [g_securedesk]
     call    theme_toggle
     jmp     vp_ret
 vp_tdraw_totp:
@@ -7688,6 +7703,8 @@ vp_cmd_fixed:
     je      vp_mnohist
     cmp     eax, IDC_V_MNOPHON
     je      vp_mnophon
+    cmp     eax, IDC_V_MSECD
+    je      vp_msecd
     cmp     eax, IDCANCEL
     je      vp_esc
     xor     eax, eax
@@ -7736,6 +7753,20 @@ vp_mnophon:
     mov     dword ptr [g_no_phonetic], eax
     mov     rcx, qword ptr [rbp-8]
     mov     edx, IDC_V_MNOPHON
+    call    GetDlgItem
+    sub     rsp, 32
+    mov     rcx, rax
+    xor     edx, edx
+    mov     r8d, 1
+    call    InvalidateRect
+    add     rsp, 32
+    jmp     vp_handled
+vp_msecd:
+    mov     eax, dword ptr [g_securedesk]
+    xor     eax, 1
+    mov     dword ptr [g_securedesk], eax
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_V_MSECD
     call    GetDlgItem
     sub     rsp, 32
     mov     rcx, rax
@@ -8215,6 +8246,14 @@ gui_load_policy proc frame
     jz      @F
     mov     eax, 1
 @@: mov     dword ptr [g_no_phonetic], eax
+    lea     rcx, [wv_securedesk]                ; "Secure password entry" (0/1; HKCU only)
+    xor     edx, edx
+    xor     r8, r8
+    call    cfg_get_dword
+    test    eax, eax
+    jz      @F
+    mov     eax, 1
+@@: mov     dword ptr [g_securedesk], eax
     FRAME_EPILOG
     ret
 gui_load_policy endp
@@ -11189,12 +11228,28 @@ gui_open proc frame
     call    gui_try_tpm_auto                ; silent unlock if this device is enrolled
     test    eax, eax
     jnz     go_vault
+    cmp     dword ptr [g_securedesk], 0     ; enter the master password on a private desktop?
+    je      go_unlock_normal
+    mov     ecx, DLG_UNLOCK
+    lea     rdx, [unlock_proc]
+    call    gui_secdesk_show
+    jmp     go_unlock_res
+go_unlock_normal:
     WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_UNLOCK, qword ptr [rbp-24], addr unlock_proc, 0
+go_unlock_res:
     cmp     rax, 1
     jne     go_reset
     jmp     go_vault
 go_create:
+    cmp     dword ptr [g_securedesk], 0     ; set the master password on a private desktop?
+    je      go_create_normal
+    mov     ecx, DLG_CREATE
+    lea     rdx, [create_proc]
+    call    gui_secdesk_show
+    jmp     go_create_res
+go_create_normal:
     WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_CREATE, qword ptr [rbp-24], addr create_proc, 0
+go_create_res:
     cmp     rax, 1
     jne     go_reset
 go_vault:
