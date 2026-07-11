@@ -80,6 +80,8 @@ isolating it from same-session key/message hooks.
 3. Settings checkbox + HKCU persistence via `regcfg.asm`.
    *Test:* toggle, restart app, setting persists; SELFTEST; FRAMES.
 
+**Status: IMPLEMENTED 2026-07-11** (commits e9b5efd, 5cf345c). CLI `securedesk` spike verb; g_securedesk setting persisted to HKCU "SecureDesk"; unlock + create dialogs routed via gui_secdesk_show on a private "Vordr-Secure" desktop with graceful fallback.
+
 ### 5. Clipboard hygiene: auto-clear + history exclusion
 **Goal:** Copied secrets clear after N seconds and never enter Windows clipboard history / cloud sync.
 **Steps:**
