@@ -164,7 +164,7 @@ g_col_side  dd 00342A26h                  ; sidebar (list + search) panel colour
 g_col_filebadge dd 00544A3Ah              ; attachment/file chip fill (distinct from bg/panel)
 g_col_accent2 dd 00FFC24Ch                ; secondary accent (two-tone gradient end)
 SCHEME_DW   equ 15                        ; dwords per scheme row
-SCHEME_COUNT equ 9
+SCHEME_COUNT equ 11
 schemes label dword
     ; bg,panel,frame,btn,btnsel,text,textdim,border,accent,accsel,focus,dark,side,filebadge,accent2
     dd 00F3F3F3h,00FFFFFFh,00D2D2D2h,00FFFFFFh,00E6E6E6h,00202020h,00707070h,00D2D2D2h,00C26A00h,00A05800h,00C26A00h,00000000h,00FFFFFFh,00E8DCC8h,00C26A00h  ; Light
@@ -176,19 +176,28 @@ schemes label dword
     dd 001A2006h,0028320Ah,005E7A1Ah,0028320Ah,003A4612h,00F4FFE0h,00BCD090h,005E7A1Ah,0098E010h,0078B00Ah,0098E010h,00000001h,000F1804h,0034400Eh,00D0FF60h  ; Emerald
     dd 00220E06h,0038180Ah,008A3A1Ah,0038180Ah,004E2210h,00FFEAE0h,00E0B09Ah,008A3A1Ah,00FF6A2Eh,00D04818h,00FF6A2Eh,00000001h,001A0A04h,00341208h,00FFB08Ah  ; Sapphire
     dd 00282828h,002F3032h,00454950h,002F3032h,0036383Ch,00B2DBEBh,008499A8h,00454950h,001980FEh,001060D0h,001980FEh,00000001h,001F2022h,0034363Ah,0026BBB8h  ; Gruvbox
+    ; The two glass schemes are DESIGNED for the additive sheet-of-glass
+    ; compositing: every surface colour (bg/panel/btn/side) is very low value,
+    ; so the DWM material shows through panels, buttons and textbox fills too -
+    ; the fills read as faint frosted brightenings, not opaque slabs.  Text and
+    ; accents stay bright, which the additive blend renders crisp.
+    dd 00101010h,00202020h,00343434h,00202020h,00161616h,00FFFFFFh,00BEBEBEh,00343434h,00FFC24Ch,00DBA03Ah,00FFC24Ch,00000001h,000A0A0Ah,00343434h,00FFC24Ch  ; Mica (glass)
+    dd 00140A10h,00281822h,00423042h,00281822h,001C1016h,00FFFFFFh,00CCB4C4h,00423042h,00FF8CB4h,00D06A94h,00FF8CB4h,00000001h,000E060Ah,00423042h,00FFB4D2h  ; Acrylic (glass)
 ; scheme_traits[scheme] = radius(byte0) | accent-mode(byte1: 0 solid/1 rainbow/2 two-tone) |
-;   flags(byte2: bit0 scanlines) | backdrop material(byte3: DWMSBT_* - 0 auto/opaque,
-;   2 Mica, 3 Acrylic, 4 Mica-Alt; shows in the title bar via DWMWA_COLOR_NONE)
+;   flags(byte2: bit0 scanlines) | backdrop material(byte3: DWMSBT_* - 0 opaque,
+;   2 Mica, 3 Acrylic, 4 Mica-Alt; material = glass caption AND client)
 scheme_traits label dword
-    dd 02000008h  ; Light      - Mica
-    dd 02000008h  ; Sepia      - Mica
-    dd 02000008h  ; Nord       - Mica
-    dd 04000008h  ; Midnight   - Mica Alt
-    dd 00000000h  ; Commodore  - opaque (CRT look)
-    dd 03000208h  ; Amethyst   - Acrylic
-    dd 03000208h  ; Emerald    - Acrylic
-    dd 03000208h  ; Sapphire   - Acrylic
-    dd 02000006h  ; Gruvbox    - Mica
+    dd 00000008h  ; Light
+    dd 00000008h  ; Sepia
+    dd 00000008h  ; Nord
+    dd 00000008h  ; Midnight
+    dd 00000000h  ; Commodore
+    dd 00000208h  ; Amethyst
+    dd 00000208h  ; Emerald
+    dd 00000208h  ; Sapphire
+    dd 00000006h  ; Gruvbox
+    dd 02000008h  ; Mica    (glass) - Mica backdrop through the whole client
+    dd 03000008h  ; Acrylic (glass) - Acrylic blur through the whole client
 g_br_bg     dq 0
 g_br_side   dq 0                            ; sidebar (list + search) fill
 g_br_panel  dq 0
