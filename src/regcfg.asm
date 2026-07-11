@@ -169,22 +169,6 @@ cgd_def:
 cfg_get_dword endp
 
 ; ===========================================================================
-; cfg_get_hklm(rcx=value name, rdx=*out dword) -> eax = 1 if HKLM defines it
-;   (admin policy).  Used where the "no policy" default is not a constant (e.g.
-;   TPM Unlock, whose non-policy state is the per-vault enrollment).
-; ===========================================================================
-public cfg_get_hklm
-cfg_get_hklm proc frame
-    FRAME_PROLOG 48
-    mov     r8, rdx                          ; *out
-    mov     rdx, rcx                         ; value name
-    mov     rcx, qword ptr [g_hklm]          ; HKLM hive
-    call    reg_query_dw
-    FRAME_EPILOG
-    ret
-cfg_get_hklm endp
-
-; ===========================================================================
 ; cfg_set_dword_hkcu(rcx=value name, edx=value) -> eax = 1/0.
 ; ===========================================================================
 public cfg_set_dword_hkcu
