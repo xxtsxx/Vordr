@@ -40,6 +40,8 @@ VirtualLock'd (non-pageable) and wiped.
    committed pages for a known sentinel password — must not be found.
    *Test:* `dbg` build: plant sentinel, lock, scan verb reports 0 hits; then disable one wipe
    → scan must report a hit (proves the scanner works).
+**Status: IMPLEMENTED** — sec_lock/sec_lock_statics in secmem.asm (VirtualLock + working-set-grow fallback) pin g_cfg_pass/g_vkey/g_pwbuf/g_pw2buf/g_secret_w/g_e_totp/g_totp_b32 at startup; docs/SECRETS.md audits every secret buffer + exceptions; `secscan` probe (in run_all) proves no post-wipe residue.
+
 
 ### 2. Clipboard hygiene: auto-clear + history exclusion
 **Goal:** Copied secrets clear after N seconds and never enter Windows clipboard history / cloud sync.
