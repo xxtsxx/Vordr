@@ -32,6 +32,7 @@ endif
 endm
 
 extern hardening_init:proc
+extern sec_lock_statics:proc
 extern iat_lockdown:proc
 extern secure_zero:proc
 extern run_selftest:proc
@@ -1187,6 +1188,7 @@ start proc frame
     call    hardening_init              ; 2. canary + shadow stack live
     test    eax, eax
     jz      st_oom_raw
+    call    sec_lock_statics           ; VirtualLock the static secret buffers
     DBG     'C'
     call    con_init                    ; 3. console up (protected calls ok now)
     DBG     'D'

@@ -1048,6 +1048,7 @@ g_vpath     dw 1024 dup (?)        ; chosen vault path (wide, NUL-terminated)
 g_xlpw      dw 256 dup (?)         ; export password (wide; wiped after use)
 g_xlpw2     dw 256 dup (?)         ; export confirm password (wide; wiped)
 g_xlpwlen   dd ?                   ; export password length in bytes
+public g_pwbuf, g_pw2buf, g_secret_w, g_e_totp, g_totp_b32
 g_pwbuf     dw 1024 dup (?)        ; password field (wide; wiped after use)
 g_pw2buf    dw 1024 dup (?)        ; confirm-password field (wide; wiped)
 g_conv_w    dw EBUF*2 dup (?)      ; utf8 -> wide display scratch
