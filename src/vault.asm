@@ -444,6 +444,20 @@ vk_kcv proc frame
     ret
 vk_kcv endp
 
+; vk_kcv_ok() -> eax = 0 if KCV(g_vkey) matches the file header, else 1.
+;   Constant-time compare (ct_memcmp) of the recomputed KCV against g_filebuf.
+vk_kcv_ok proc frame
+    FRAME_PROLOG 32
+    call    vk_kcv
+    lea     rcx, [g_sha32]
+    mov     r10, qword ptr [g_filebuf]
+    lea     rdx, [r10+VH_KCV]
+    mov     r8, KCV_LEN
+    call    ct_memcmp
+    FRAME_EPILOG
+    ret
+vk_kcv_ok endp
+
 ; ===========================================================================
 ; vault_seal_write() - seal g_body (g_body_len bytes) under g_vkey with a fresh
 ;   nonce already placed in g_hdr, build the file image, write it to g_cfg_in.
@@ -624,16 +638,11 @@ vu_hcpy:
     jnz     vu_locked                   ; no/failed TPM -> GUI falls back to pw
     jmp     vu_havekey
 vu_pwderive:
-    call    vk_derive
+    call    vk_derive                   ; Argon2id
     test    eax, eax
     jnz     vu_oom
 vu_havekey:
-    call    vk_kcv
-    lea     rcx, [g_sha32]
-    mov     r10, qword ptr [g_filebuf]
-    lea     rdx, [r10+VH_KCV]
-    mov     r8, KCV_LEN
-    call    ct_memcmp
+    call    vk_kcv_ok
     test    eax, eax
     jnz     vu_locked
     ; detect the attachments trailer at the end of the file (absent = old format)
