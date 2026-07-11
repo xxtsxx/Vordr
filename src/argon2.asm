@@ -697,7 +697,6 @@ g_pass    dq 0
 g_slice   dq 0
 g_lane    dq 0
 g_idx     dq 0
-g_actr    dq 0            ; address counter (data-independent)
 g_col     dq 0
 g_prevcol dq 0
 g_reflane dq 0
@@ -944,7 +943,6 @@ a2_lane:
     jae     a2_slice_next
 
     ; data-independent addressing?  (argon2id: type==2 && pass==0 && slice<2)
-    mov     qword ptr [g_actr], 0
     cmp     qword ptr [g_type], 2
     jne     a2_setup_done
     cmp     qword ptr [g_pass], 0
@@ -969,6 +967,23 @@ a2_lane:
     mov     rax, qword ptr [g_type]
     mov     qword ptr [r11+40], rax
     mov     qword ptr [r11+48], 0            ; v[6] counter
+    ; pass0/slice0 pre-generates the first address block (the reference does
+    ; this before the fill loop, which then indexes addresses by the segment
+    ; index i - and i starts at 2 here, not 0).
+    cmp     qword ptr [g_slice], 0
+    jne     a2_setup_done
+    lea     r11, [g_inp]
+    inc     qword ptr [r11+48]              ; inp.v[6] -> 1
+    lea     rcx, [g_addr]
+    lea     rdx, [g_zero]
+    lea     r8, [g_inp]
+    xor     r9d, r9d
+    call    argon2_compress
+    lea     rcx, [g_addr]
+    lea     rdx, [g_zero]
+    lea     r8, [g_addr]
+    xor     r9d, r9d
+    call    argon2_compress
 a2_setup_done:
 
     ; start index in segment
@@ -1007,8 +1022,12 @@ a2_pc_done:
     jne     a2_rnd_dep
     cmp     qword ptr [g_slice], 2
     jae     a2_rnd_dep
-    ; data-independent: regenerate addr block every 128 values
-    mov     rax, qword ptr [g_actr]
+    ; data-independent: index the address block by the segment index i (g_idx),
+    ; regenerating whenever i crosses a 128-address boundary.  For pass0/slice0
+    ; i starts at 2 and the block was pre-generated in setup, so the first
+    ; regenerate here fires only at i=128 (large segments); pass0/slice1 starts
+    ; at i=0 so it regenerates immediately.
+    mov     rax, qword ptr [g_idx]
     and     rax, 127
     jnz     a2_addr_use
     lea     r11, [g_inp]
@@ -1024,11 +1043,10 @@ a2_pc_done:
     xor     r9d, r9d
     call    argon2_compress
 a2_addr_use:
-    mov     rax, qword ptr [g_actr]
+    mov     rax, qword ptr [g_idx]
     and     rax, 127
     lea     r11, [g_addr]
     mov     r15, qword ptr [r11+rax*8]
-    inc     qword ptr [g_actr]
     jmp     a2_have_rnd
 a2_rnd_dep:
     mov     rcx, qword ptr [g_lane]

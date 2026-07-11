@@ -62,6 +62,25 @@ GCMREQ struct
     tag     dq ?
 GCMREQ ends
 
+; one extended Argon2id known-answer vector (t/m/p/outlen + optional keyed
+; secret and associated data).  Emphasises single-lane (p=1) and large-segment
+; cases - the pass0/slice0 address-index path the lone RFC vector never touched.
+A2VEC struct
+    v_t         dd ?
+    v_m         dd ?
+    v_p         dd ?
+    v_outlen    dd ?
+    v_pwd       dq ?
+    v_pwdlen    dd ?
+    v_saltlen   dd ?
+    v_salt      dq ?
+    v_sec       dq ?
+    v_seclen    dd ?
+    v_adlen     dd ?
+    v_ad        dq ?
+    v_exp       dq ?
+A2VEC ends
+
 .const
 st_abc          db "abc"
 ; SHA-256("abc")
@@ -84,6 +103,12 @@ CSTR st_pass_ac,   "  [PASS] argon2 compress  (block KAT)",13,10
 CSTR st_fail_ac,   "  [FAIL] argon2 compress",13,10
 CSTR st_pass_a2,   "  [PASS] argon2id  (RFC 9106 test vector)",13,10
 CSTR st_fail_a2,   "  [FAIL] argon2id",13,10
+CSTR st_pass_a2v,  "  [PASS] argon2id conformance vectors (4x, incl. single-lane)",13,10
+.data
+; mutable: the '#0' digit is patched to the failing vector index before printing
+st_fail_a2v      db "  [FAIL] argon2id conformance vector #0",13,10
+st_fail_a2v_len  equ $ - st_fail_a2v
+.const
 CSTR st_pass_pw,   "  [PASS] password policy (length + class rules)",13,10
 CSTR st_fail_pw,   "  [FAIL] password policy",13,10
 CSTR st_pass_gen,  "  [PASS] pwgen  (alphabet + length, no bias tail)",13,10
@@ -138,6 +163,41 @@ arg_out0    dq 0dc71308d33513477h
 ; RFC 9106 Argon2id tag (t=3,m=32,p=4,secret,ad)
 a2_exp      db 00dh,064h,00dh,0f5h,08dh,078h,076h,06ch,008h,0c0h,037h,0a3h,04ah,08bh,053h,0c9h
             db 0d0h,01eh,0f0h,045h,02dh,075h,0b6h,05eh,0b5h,025h,020h,0e9h,06bh,001h,0e6h,059h
+; Argon2id conformance vectors, cross-checked against the argon2 reference
+; (argon2.low_level.lib.argon2_ctx, type Argon2id, version 0x13).  k1/k2 are
+; single-lane (p=1); k4 is p=4 with a large enough segment to fill during
+; pass0/slice0.  All exercise the corrected data-independent address indexing.
+k1_pwd  db 063h,06fh,072h,072h,065h,063h,074h,068h,06fh,072h,073h,065h
+k1_salt db 073h,061h,06ch,074h,073h,061h,06ch,074h,073h,061h,06ch,074h,031h,032h,033h,034h
+k1_sec  db 0aah,0bbh,0cch,0ddh
+k1_ad   db 011h,022h,033h
+k1_exp  db 08fh,0aah,01dh,01dh,0ebh,0a7h,0a7h,0eeh,0c0h,0a0h,02eh,019h,050h,09eh,021h,098h
+        db 088h,05eh,073h,0e6h,062h,05fh,06ch,0cbh,06ch,055h,05ah,07ah,065h,074h,07fh,03ah
+k2_pwd  db 005h,005h,005h,005h,005h,005h,005h,005h,005h,005h,005h,005h,005h,005h,005h,005h,005h,005h,005h,005h
+k2_salt db 006h,006h,006h,006h,006h,006h,006h,006h,006h,006h,006h,006h,006h,006h,006h,006h
+k2_sec  db 007h,007h,007h,007h,007h,007h,007h,007h
+k2_ad   db 008h,008h,008h,008h,008h,008h,008h,008h,008h,008h,008h,008h
+k2_exp  db 05ah,038h,022h,0f3h,06eh,071h,0e4h,0deh,089h,060h,0ebh,063h,019h,0a8h,05bh,054h
+        db 0f6h,036h,053h,085h,0fbh,057h,066h,0c3h,010h,05eh,030h,0bch,036h,0bch,0bch,055h
+k3_pwd  db 070h,077h
+k3_salt db 030h,031h,032h,033h,034h,035h,036h,037h,038h,039h,061h,062h,063h,064h,065h,066h
+k3_sec  db 099h
+k3_ad   db 042h,042h
+k3_exp  db 04fh,07bh,07ah,06dh,0f4h,0bch,0dah,05ch,083h,0dch,094h,0f1h,047h,0b6h,04fh,06fh
+        db 089h,02fh,021h,04dh,06ah,035h,002h,048h,072h,038h,0e0h,0f8h,09ch,087h,00fh,0a7h
+        db 0f8h,056h,0b4h,0eah,007h,05fh,0d1h,02bh,0c9h,017h,012h,06ch,0b4h,05dh,053h,036h
+        db 03fh,04dh,0cch,04ch,0e4h,074h,02bh,03fh,098h,0bfh,057h,097h,00fh,0c9h,097h,00ah
+k4_pwd  db 0a0h,0a1h,0a2h
+k4_salt db 04eh,061h,043h,06ch,04eh,061h,043h,06ch,04eh,061h,043h,06ch,04eh,061h,043h,06ch
+k4_exp  db 034h,07bh,096h,05eh,068h,072h,091h,0f2h,0d1h,0c8h,09fh,046h,0bch,020h,04eh,0d0h
+        db 0dbh,097h,050h,0a0h,0c3h,002h,0c6h,033h,0a6h,005h,047h,03ch,0a4h,06ch,055h,05fh
+align 8
+a2_vecs label A2VEC
+    A2VEC { 3, 32,  1, 32, k1_pwd, 12, 16, k1_salt, k1_sec, 4, 3,  k1_ad, k1_exp }
+    A2VEC { 1, 64,  1, 32, k2_pwd, 20, 16, k2_salt, k2_sec, 8, 12, k2_ad, k2_exp }
+    A2VEC { 2, 128, 2, 64, k3_pwd,  2, 16, k3_salt, k3_sec, 1, 2,  k3_ad, k3_exp }
+    A2VEC { 3, 256, 4, 32, k4_pwd,  3, 16, k4_salt, 0,      0, 0,  0,     k4_exp }
+A2VEC_N equ 4
 ; BLAKE2b-512("abc") - RFC 7693 Appendix A
 b2b_abc_exp db 0bah,080h,0a5h,03fh,098h,01ch,04dh,00dh,06ah,027h,097h,0b6h,09fh,012h,0f6h,0e9h
             db 04ch,021h,02fh,014h,068h,05ah,0c4h,0b7h,04bh,012h,0bbh,06fh,0dbh,0ffh,0a2h,0d1h
@@ -167,6 +227,7 @@ a2_salt         db 16 dup (?)
 a2_secret       db 8 dup (?)
 a2_ad           db 12 dup (?)
 a2_out          db 32 dup (?)
+a2_vout         db 64 dup (?)        ; conformance-vector output (up to 64 bytes)
 align 8
 a2_req          ARGON2REQ <>
 gcm_key         db 32 dup (?)
@@ -492,6 +553,70 @@ st_a2_fail:
     STPRINT st_fail_a2, st_fail_a2_len
     inc     qword ptr [rbp-24]
 st_after_a2:
+
+    ; ---- Argon2id conformance vectors (table-driven) ------------------------
+    ; cursor + index live in stack locals ([rbp-32]/[rbp-40]) because
+    ; argon2id_hash does not preserve r10-r15 across the call.
+    lea     rax, [a2_vecs]
+    mov     qword ptr [rbp-32], rax
+    mov     qword ptr [rbp-40], 0
+st_a2v_loop:
+    cmp     qword ptr [rbp-40], A2VEC_N
+    jae     st_a2v_ok
+    mov     r10, qword ptr [rbp-32]
+    lea     r11, [a2_req]
+    mov     eax, dword ptr [r10].A2VEC.v_t
+    mov     dword ptr [r11].ARGON2REQ.t_cost, eax
+    mov     eax, dword ptr [r10].A2VEC.v_m
+    mov     dword ptr [r11].ARGON2REQ.m_cost, eax
+    mov     eax, dword ptr [r10].A2VEC.v_p
+    mov     dword ptr [r11].ARGON2REQ.lanes, eax
+    mov     eax, dword ptr [r10].A2VEC.v_outlen
+    mov     dword ptr [r11].ARGON2REQ.outlen, eax
+    mov     dword ptr [r11].ARGON2REQ.version, 13h
+    mov     dword ptr [r11].ARGON2REQ.atype, 2
+    mov     rax, qword ptr [r10].A2VEC.v_pwd
+    mov     qword ptr [r11].ARGON2REQ.pwd, rax
+    mov     eax, dword ptr [r10].A2VEC.v_pwdlen
+    mov     dword ptr [r11].ARGON2REQ.pwdlen, eax
+    mov     rax, qword ptr [r10].A2VEC.v_salt
+    mov     qword ptr [r11].ARGON2REQ.salt, rax
+    mov     eax, dword ptr [r10].A2VEC.v_saltlen
+    mov     dword ptr [r11].ARGON2REQ.saltlen, eax
+    mov     rax, qword ptr [r10].A2VEC.v_sec
+    mov     qword ptr [r11].ARGON2REQ.secret, rax
+    mov     eax, dword ptr [r10].A2VEC.v_seclen
+    mov     dword ptr [r11].ARGON2REQ.secretlen, eax
+    mov     rax, qword ptr [r10].A2VEC.v_ad
+    mov     qword ptr [r11].ARGON2REQ.ad, rax
+    mov     eax, dword ptr [r10].A2VEC.v_adlen
+    mov     dword ptr [r11].ARGON2REQ.adlen, eax
+    lea     rax, [a2_vout]
+    mov     qword ptr [r11].ARGON2REQ.outp, rax
+    lea     rcx, [a2_req]
+    call    argon2id_hash
+    test    eax, eax
+    jnz     st_a2v_fail
+    mov     r10, qword ptr [rbp-32]                 ; reload (argon2 clobbers r10)
+    lea     rcx, [a2_vout]
+    mov     rdx, qword ptr [r10].A2VEC.v_exp
+    mov     r8d, dword ptr [r10].A2VEC.v_outlen
+    call    ct_memcmp
+    test    eax, eax
+    jnz     st_a2v_fail
+    add     qword ptr [rbp-32], sizeof A2VEC
+    inc     qword ptr [rbp-40]
+    jmp     st_a2v_loop
+st_a2v_fail:
+    mov     eax, dword ptr [rbp-40]                 ; patch the failing index into the message
+    add     eax, '0'
+    mov     byte ptr [st_fail_a2v + 38], al
+    STPRINT st_fail_a2v, st_fail_a2v_len
+    inc     qword ptr [rbp-24]
+    jmp     st_after_a2v
+st_a2v_ok:
+    STPRINT st_pass_a2v, st_pass_a2v_len
+st_after_a2v:
 
     ; ---- password policy (default min 12 chars / 3 of 4 classes) ------------
     mov     dword ptr [g_cfg_pwminlen], 12
