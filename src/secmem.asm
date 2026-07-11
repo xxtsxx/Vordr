@@ -27,6 +27,10 @@ extern VirtualUnlock:proc
 extern secure_zero:proc
 extern GetCurrentProcess:proc
 extern SetProcessWorkingSetSize:proc
+extern rng_fill:proc
+extern VirtualQuery:proc
+extern print_a:proc
+externdef g_cfg_passlen:dword
 
 ; the fixed static secret buffers, locked once at startup by sec_lock_statics
 externdef g_cfg_pass:byte           ; master password (main.asm)
@@ -152,5 +156,132 @@ sf_done:
     FRAME_EPILOG
     ret
 secmem_free endp
+
+; =============================================================================
+; cmd_secscan (probe) - prove the secret-wipe path leaves no residue.
+;   Plant a random 16-byte sentinel into g_cfg_pass; scan this process's own
+;   committed read/write pages for it (must find the plant -> the scanner
+;   works); wipe g_cfg_pass with the real secure_zero; scan again (must find 0
+;   -> the wipe removed it).  The reference copy in secscan_ref is excluded by
+;   address.  exit 0 = pass.
+; =============================================================================
+.data?
+secscan_ref db 16 dup (?)               ; runtime-random reference sentinel
+align 8
+ss_mbi      db 48 dup (?)               ; MEMORY_BASIC_INFORMATION (static: no stack use)
+
+.code
+CSTR ss_pass, "secscan: PASS (sentinel found before wipe, absent after)",13,10
+CSTR ss_res,  "secscan: FAIL (sentinel survived the wipe)",13,10
+CSTR ss_blind,"secscan: FAIL (scanner never found the plant)",13,10
+
+; ss_scan() -> eax = count of 16-byte sentinel copies in committed RW pages,
+;   excluding the reference buffer secscan_ref itself.
+ss_scan proc frame
+    FRAME_PROLOG 48
+    ; [rbp-24] scan cursor, [rbp-32] count
+    mov     qword ptr [rbp-24], 0
+    mov     dword ptr [rbp-32], 0
+ss_loop:
+    WINCALL VirtualQuery, qword ptr [rbp-24], addr ss_mbi, 48
+    test    rax, rax
+    jz      ss_done                         ; walked off the end of the address space
+    lea     r10, [ss_mbi]
+    cmp     dword ptr [r10+32], MEM_COMMIT   ; State
+    jne     ss_next
+    cmp     dword ptr [r10+36], PAGE_READWRITE ; Protect (exact RW -> readable, no guard)
+    jne     ss_next
+    mov     r8, qword ptr [r10+0]            ; region base
+    mov     r9, qword ptr [r10+24]           ; region size
+    lea     r9, [r8+r9]
+    sub     r9, 16                           ; last start offset
+    mov     r11, r8                          ; cursor
+ss_scanb:
+    cmp     r11, r9
+    ja      ss_next
+    lea     r10, [secscan_ref]
+    xor     ecx, ecx
+ss_cmp:
+    mov     al, byte ptr [r11+rcx]
+    cmp     al, byte ptr [r10+rcx]
+    jne     ss_nomatch
+    inc     ecx
+    cmp     ecx, 16
+    jb      ss_cmp
+    cmp     r11, r10                         ; the reference copy itself -> skip
+    je      ss_nomatch
+    inc     dword ptr [rbp-32]
+ss_nomatch:
+    inc     r11
+    jmp     ss_scanb
+ss_next:
+    lea     r10, [ss_mbi]
+    mov     rax, qword ptr [r10+0]
+    add     rax, qword ptr [r10+24]
+    mov     qword ptr [rbp-24], rax
+    jmp     ss_loop
+ss_done:
+    mov     eax, dword ptr [rbp-32]
+    FRAME_EPILOG
+    ret
+ss_scan endp
+
+public cmd_secscan
+LANDING_PAD                              ; dispatch reaches handlers via CALL_GUARDED
+cmd_secscan proc frame
+    FRAME_PROLOG 48
+    ; [rbp-24] = hit count before the wipe
+    lea     rcx, [secscan_ref]
+    mov     edx, 16
+    call    rng_fill
+    test    eax, eax
+    jz      ss_fail                          ; no RNG -> can't run the probe
+    lea     r10, [secscan_ref]              ; plant into g_cfg_pass (byte loop: no
+    lea     r11, [g_cfg_pass]               ;   16-contiguous copy lands on the stack)
+    xor     ecx, ecx
+ss_plant:
+    mov     al, byte ptr [r10+rcx]
+    mov     byte ptr [r11+rcx], al
+    inc     ecx
+    cmp     ecx, 16
+    jb      ss_plant
+    mov     dword ptr [g_cfg_passlen], 16
+    call    ss_scan                          ; phase 1: must find the plant
+    mov     dword ptr [rbp-24], eax
+    lea     rcx, [g_cfg_pass]               ; wipe with the real primitive
+    mov     edx, MAX_PASSWORD_BYTES+1
+    call    secure_zero
+    mov     dword ptr [g_cfg_passlen], 0
+    call    ss_scan                          ; phase 2: must find nothing
+    test    eax, eax
+    jnz     ss_residue
+    cmp     dword ptr [rbp-24], 1
+    jb      ss_blind_fail
+    lea     rcx, [ss_pass]
+    mov     edx, ss_pass_len
+    call    print_a
+    lea     rcx, [secscan_ref]
+    mov     edx, 16
+    call    secure_zero
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+ss_residue:
+    lea     rcx, [ss_res]
+    mov     edx, ss_res_len
+    call    print_a
+    jmp     ss_fail
+ss_blind_fail:
+    lea     rcx, [ss_blind]
+    mov     edx, ss_blind_len
+    call    print_a
+ss_fail:
+    lea     rcx, [secscan_ref]
+    mov     edx, 16
+    call    secure_zero
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_secscan endp
 
 end
