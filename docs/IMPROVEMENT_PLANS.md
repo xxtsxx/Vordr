@@ -56,6 +56,10 @@ VirtualLock'd (non-pageable) and wiped.
 3. Settings row: timeout seconds (0 = off), persisted in HKCU.
    *Test:* set 5 s, verify clears at ~5 s; set 0, verify never clears; SELFTEST.
 
+**Status: IMPLEMENTED** — gui_clip_markers attaches the three exclusion formats on
+every copy; the auto-clear timeout is a Settings field (`ClipSeconds`, HKLM>HKCU>
+default 20, clamp [0,3600], 0 = off) driving the sequence-checked CLIP_TIMER.
+
 ### 3. Vault anti-rollback counter
 **Goal:** Detect an attacker restoring an older vault file (e.g. to resurrect a purged password).
 **Steps:**
@@ -104,6 +108,13 @@ truncation or record-splicing is always caught, not just per-record.
 3. Replace secret-touching sites (GCM tag check, password verify, HOTP compare).
    *Test:* SELFTEST + REDTEAM + ROUNDTRIP all pass; `dbg` timing probe shows compare time
    independent of first-differing-byte position (coarse check, 10k iterations).
+
+**Status: IMPLEMENTED** — audit table in docs/SECRETS.md (every mem-vs-mem compare
+classified); ct_memcmp already covered GCM/KCV/TPM, and the stragglers are fixed:
+.vaultz import pw-verifier + HMAC tag now use ct_memcmp, gui_wstr_eq (password
+confirm, export confirm, pw-history set-diff) rewritten OR-accumulating with no
+content-dependent branches. Selftest KATs both primitives; dbg `cttest` verb
+times diff@first vs diff@last (10k x 4 KiB) and passes within 2%.
 
 ### 7. Auto-lock on idle and on workstation lock
 **Goal:** Vault locks itself after configurable idle time and immediately when Windows locks.

@@ -45,6 +45,7 @@ extern read_file:proc
 ifdef DBG_TRACE
 extern cmd_redteam:proc                 ; fault-injection self-test (redteam.asm)
 extern cmd_tpmtest:proc                 ; TPM seal/unseal round-trip (tpm.asm)
+extern cmd_cttest:proc                  ; ct_memcmp timing probe (hardening.asm)
 endif
 
 extern con_init:proc
@@ -170,6 +171,7 @@ WSTR wpw_exp,    <VordrExp1234>
 ifdef DBG_TRACE
 WSTR w_redteam,  <redteam>
 WSTR w_tpmtest,  <tpmtest>
+WSTR w_cttest,   <cttest>
 endif
 WSTR w_opt_m,    <-m>
 WSTR w_opt_t,    <-t>
@@ -204,7 +206,8 @@ cmd_table label CMDENT
 ifdef DBG_TRACE
     CMDENT { w_redteam,   cmd_redteam,   1, 0 }   ; fault-injection self-test (dbg)
     CMDENT { w_tpmtest,   cmd_tpmtest,   0, 0 }   ; TPM round-trip probe (dbg)
-CMD_COUNT equ 11
+    CMDENT { w_cttest,    cmd_cttest,    0, 0 }   ; ct_memcmp timing probe (dbg)
+CMD_COUNT equ 12
 else
 CMD_COUNT equ 9
 endif
