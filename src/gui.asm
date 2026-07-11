@@ -142,6 +142,7 @@ extern EmptyClipboard:proc
 extern SetClipboardData:proc
 extern CloseClipboard:proc
 extern GlobalAlloc:proc
+extern RegisterClipboardFormatW:proc
 extern GlobalLock:proc
 extern GlobalUnlock:proc
 extern GetClipboardSequenceNumber:proc
@@ -297,7 +298,6 @@ EN_CHANGE           equ 300h
 EN_SETFOCUS         equ 100h
 EN_KILLFOCUS        equ 200h
 CLIP_TIMER          equ 1                  ; timer id for clipboard auto-clear
-CLIP_MS             equ 20000              ; clear a copied secret after 20 s
 TOTP_TIMER          equ 2                  ; timer id for live auth-code refresh
 TOTP_MS             equ 1000               ; recompute the code once a second
 SEARCH_TIMER        equ 3                  ; timer id for debounced search-as-you-type
@@ -317,6 +317,7 @@ EM_SETREADONLY      equ 0CFh
 CP_UTF8_            equ 65001
 CF_UNICODETEXT      equ 13
 GMEM_MOVEABLE       equ 2
+GMEM_ZEROINIT       equ 40h
 
 ; dialog + control IDs (MUST match vordr.rc)
 DLG_UNLOCK   equ 100
@@ -367,6 +368,8 @@ IDC_V_MNOPHON  equ 253                ; "Disable phonetic reader" toggle
 IDC_V_MSECDL   equ 254                ; "Secure password entry" label
 IDC_V_MSECD    equ 255                ; "Secure password entry" toggle
 IDC_V_MSECINFO equ 256               ; "Secure password entry" info screen
+IDC_V_MCLIPL equ 257                  ; "Clipboard clear (seconds)" label
+IDC_V_MCLIP  equ 258                  ; clipboard timeout edit
 IDC_V_MTHEME equ 240                  ; color-scheme cycle button (settings)
 IDC_V_MTHEMEL equ 241                 ; "Color scheme" label
 IDC_V_COLORPW equ 244                 ; overlay: colored revealed secret (owner-draw)
@@ -647,6 +650,7 @@ req_p4 label word
     dw 32,105,102,32,105,116,39,115,32,103,111,110,101,44,32,101
     dw 118,101,114,121,116,104,105,110,103,32,105,115,32,103,111,110
     dw 101,46,0
+WSTR wv_clip,       <ClipSeconds>
 WSTR wv_pwlen,      <PwMinLen>
 WSTR wv_pwcls,      <PwMinClasses>
 WSTR wv_nohist,     <NoHistory>
@@ -724,6 +728,9 @@ tray_wt label word
     dw 'V','o','r','d','r', 0
 secdesk_name label word                          ; private desktop for password entry
     dw 'V','o','r','d','r','-','S','e','c','u','r','e', 0
+WSTR cf_hist_name,  <CanIncludeInClipboardHistory>
+WSTR cf_cloud_name, <CanUploadToCloudClipboard>
+WSTR cf_excl_name,  <ExcludeClipboardContentFromMonitorProcessing>
 WSTR sd_spike_ttl, <Secure desktop>
 WSTR sd_spike_txt, <This dialog is running on a private, isolated Vordr desktop. Same-session keyloggers and screen-scrapers cannot see it. Click OK to return to your normal desktop.>
 ; OPENFILENAMEW filter: "Vordr vault\0*.vordr\0All files\0*.*\0\0"
@@ -981,7 +988,8 @@ g_menu_ids label dword
     dd IDC_V_MIMPORT
     dd IDC_V_MNOHISTL, IDC_V_MNOHIST, IDC_V_MNOPHONL, IDC_V_MNOPHON
     dd IDC_V_MSECDL, IDC_V_MSECD, IDC_V_MSECINFO
-MENU_ID_COUNT equ 21
+    dd IDC_V_MCLIPL, IDC_V_MCLIP
+MENU_ID_COUNT equ 23
 
 .data?
 align 8
@@ -1033,6 +1041,11 @@ g_vault_lock dd ?                     ; 1 = vault path set by HKLM (locked)
 g_menu_open  dd ?                     ; 1 = settings overlay is showing
 g_revealed  dd ?
 g_clip_seq  dd ?                      ; clipboard sequence number at last copy
+g_clip_secs dd ?                      ; auto-clear timeout in seconds (0 = off); HKLM>HKCU>20
+g_clip_lock dd ?                      ; 1 = clipboard timeout forced by HKLM policy
+g_cf_hist   dd ?                      ; registered format: CanIncludeInClipboardHistory
+g_cf_cloud  dd ?                      ; registered format: CanUploadToCloudClipboard
+g_cf_excl   dd ?                      ; registered format: ExcludeClipboardContentFromMonitorProcessing
 g_cur_idx   dd ?                      ; entry currently shown/edited inline (-1=none)
 g_dirty     dd ?                      ; 1 = inline fields edited since last load/save
 g_loading   dd ?                      ; 1 = programmatically loading fields (ignore EN_CHANGE)
@@ -3296,7 +3309,50 @@ gui_totp_refresh endp
 ; (gui_reveal / gui_reveal_tkey removed - per-row reveal is gui_row_reveal.)
 
 ; gui_copy(rcx = hdlg, rdx = wide NUL-terminated source) - copy to the clipboard
-;   and arm a timer to auto-clear it after CLIP_MS (only if still ours).
+;   and arm a timer to auto-clear it after g_clip_secs seconds (0 = off; only if
+;   the copy is still ours).
+; gui_clip_markers() - while the clipboard is open, attach the three Windows
+;   markers that keep the current content out of clipboard history (Win+V), out
+;   of the cloud clipboard, and out of clipboard-monitor processing.  Each
+;   marker is its own zero-init HGLOBAL (the clipboard takes ownership).  Idempo-
+;   tently registers the formats on first use.  Best-effort - failures are
+;   silently ignored (the copy + auto-clear still work).
+gui_clip_markers proc frame
+    FRAME_PROLOG 32
+    cmp     dword ptr [g_cf_hist], 0            ; register the formats once
+    jne     cm_have
+    WINCALL RegisterClipboardFormatW, addr cf_hist_name
+    mov     dword ptr [g_cf_hist], eax
+    WINCALL RegisterClipboardFormatW, addr cf_cloud_name
+    mov     dword ptr [g_cf_cloud], eax
+    WINCALL RegisterClipboardFormatW, addr cf_excl_name
+    mov     dword ptr [g_cf_excl], eax
+cm_have:
+    cmp     dword ptr [g_cf_hist], 0           ; CanIncludeInClipboardHistory = 0
+    je      cm_cloud
+    WINCALL GlobalAlloc, <GMEM_MOVEABLE or GMEM_ZEROINIT>, 4
+    test    rax, rax
+    jz      cm_cloud
+    WINCALL SetClipboardData, dword ptr [g_cf_hist], rax
+cm_cloud:
+    cmp     dword ptr [g_cf_cloud], 0          ; CanUploadToCloudClipboard = 0
+    je      cm_excl
+    WINCALL GlobalAlloc, <GMEM_MOVEABLE or GMEM_ZEROINIT>, 4
+    test    rax, rax
+    jz      cm_excl
+    WINCALL SetClipboardData, dword ptr [g_cf_cloud], rax
+cm_excl:
+    cmp     dword ptr [g_cf_excl], 0           ; ExcludeClipboardContentFromMonitorProcessing
+    je      cm_done
+    WINCALL GlobalAlloc, <GMEM_MOVEABLE or GMEM_ZEROINIT>, 4
+    test    rax, rax
+    jz      cm_done
+    WINCALL SetClipboardData, dword ptr [g_cf_excl], rax
+cm_done:
+    FRAME_EPILOG
+    ret
+gui_clip_markers endp
+
 gui_copy proc frame
     FRAME_PROLOG 64
     mov     qword ptr [rbp-40], rcx         ; hdlg (for SetTimer)
@@ -3341,12 +3397,18 @@ gc_cpd:
     jz      gc_done
     WINCALL EmptyClipboard
     WINCALL SetClipboardData, CF_UNICODETEXT, qword ptr [rbp-24]
+    call    gui_clip_markers                ; exclude from history / cloud / monitors
     WINCALL CloseClipboard
     ; remember the clipboard state and arm the auto-clear timer
     WINCALL GetClipboardSequenceNumber
     mov     dword ptr [g_clip_seq], eax
     WINCALL KillTimer, qword ptr [rbp-40], CLIP_TIMER     ; cancel any prior
-    WINCALL SetTimer, qword ptr [rbp-40], CLIP_TIMER, CLIP_MS, 0
+    mov     eax, dword ptr [g_clip_secs]        ; 0 = never auto-clear
+    test    eax, eax
+    jz      gc_done
+    imul    eax, eax, 1000                      ; seconds -> ms
+    mov     r10d, eax                           ; stage off the arg regs (r9 is arg4)
+    WINCALL SetTimer, qword ptr [rbp-40], CLIP_TIMER, r10d, 0
 gc_done:
     FRAME_EPILOG
     ret
@@ -7204,6 +7266,20 @@ gui_menu_open proc frame
     mov     r8d, dword ptr [g_cfg_pwminclasses]
     xor     r9d, r9d
     call    SetDlgItemInt
+    mov     rcx, qword ptr [rbp-24]                 ; clipboard timeout (seconds)
+    mov     edx, IDC_V_MCLIP
+    mov     r8d, dword ptr [g_clip_secs]
+    xor     r9d, r9d
+    call    SetDlgItemInt
+    cmp     dword ptr [g_clip_lock], 0              ; disable if HKLM-locked
+    je      mo_clip_ok
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_V_MCLIP
+    call    GetDlgItem
+    mov     rcx, rax
+    xor     edx, edx
+    call    EnableWindow
+mo_clip_ok:
     ; disable policy fields locked by HKLM
     cmp     dword ptr [g_pol_len_lock], 0
     je      mo_len_ok
@@ -7356,6 +7432,16 @@ msv_cls:
 @@: mov     dword ptr [g_cfg_pwminclasses], eax
     lea     rcx, [wv_pwcls]
     mov     edx, dword ptr [g_cfg_pwminclasses]
+    call    cfg_set_dword_hkcu
+    cmp     dword ptr [g_clip_lock], 0          ; clipboard auto-clear timeout (seconds)
+    jne     msv_tpm
+    WINCALL GetDlgItemInt, qword ptr [rbp-24], IDC_V_MCLIP, 0, 0
+    cmp     eax, 3600                           ; 0 = off is allowed; clamp the top
+    jbe     @F
+    mov     eax, 3600
+@@: mov     dword ptr [g_clip_secs], eax
+    lea     rcx, [wv_clip]
+    mov     edx, dword ptr [g_clip_secs]
     call    cfg_set_dword_hkcu
 msv_tpm:
     cmp     dword ptr [g_tpm_present], 0
@@ -8309,6 +8395,12 @@ gui_load_policy proc frame
     mov     eax, 1
 @@: mov     dword ptr [g_tpm_want], eax
 lp_tpm_done:
+    ; clipboard auto-clear timeout (seconds; HKLM > HKCU > default 20; 0 = off)
+    WINCALL cfg_get_dword, addr wv_clip, 20, addr g_clip_lock
+    cmp     eax, 3600                           ; clamp to [0, 3600]
+    jbe     @F
+    mov     eax, 3600
+@@: mov     dword ptr [g_clip_secs], eax
     FRAME_EPILOG
     ret
 gui_load_policy endp
