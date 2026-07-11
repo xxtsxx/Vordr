@@ -61,6 +61,7 @@ extern theme_scrollbars:proc
 extern theme_dwm_apply:proc
 extern cfg_set_dword_hkcu:proc
 extern cfg_get_dword:proc
+extern cfg_get_hklm:proc
 extern vault_field_count:proc
 extern vault_field_get:proc
 extern vault_build_entry:proc
@@ -366,6 +367,7 @@ IDC_V_MNOPHONL equ 252                ; "Disable phonetic reader" label
 IDC_V_MNOPHON  equ 253                ; "Disable phonetic reader" toggle
 IDC_V_MSECDL   equ 254                ; "Secure password entry" label
 IDC_V_MSECD    equ 255                ; "Secure password entry" toggle
+IDC_V_MSECINFO equ 256               ; "Secure password entry" info screen
 IDC_V_MTHEME equ 240                  ; color-scheme cycle button (settings)
 IDC_V_MTHEMEL equ 241                 ; "Color scheme" label
 IDC_V_COLORPW equ 244                 ; overlay: colored revealed secret (owner-draw)
@@ -615,6 +617,8 @@ WSTR sel_cap_imp,   <Vordr - Select entries to import>
 WSTR sel_ok_imp,    <Import>
 WSTR t_tpminfo,     <TPM Unlock>
 WSTR m_tpminfo,     <The TPM chip in this computer can unlock the vault automatically on this device. You will not need to type the master password at startup. The password still works everywhere and is never stored.>
+WSTR t_msecinfo,    <Secure Unlock>
+WSTR m_msecinfo,    <The master password is typed on a private, isolated Windows desktop, like the one used for UAC prompts. Keyloggers and screen-scrapers in your normal session cannot see it. If a private desktop is unavailable, a normal prompt is used.>
 WSTR cue_pw,        <Master password>
 WSTR cue_pw2,       <Confirm password>
 WSTR t_req,         <Password requirements>
@@ -648,7 +652,8 @@ WSTR wv_pwlen,      <PwMinLen>
 WSTR wv_pwcls,      <PwMinClasses>
 WSTR wv_nohist,     <NoHistory>
 WSTR wv_nophon,     <NoPhonetic>
-WSTR wv_securedesk, <SecureDesk>
+WSTR wv_secunlock,  <SecureUnlock>
+WSTR wv_tpm,        <TpmUnlock>
 ; --- system tray strings ------------------------------------------------------
 WSTR t_about,       <About Vordr>
 m_welcome label word
@@ -814,6 +819,7 @@ sn_gruvbox dw 'G','r','u','v','b','o','x',0
 align 8
 scheme_names dq sn_light,sn_sepia,sn_nord,sn_midnight,sn_commodore,sn_amethyst,sn_emerald,sn_sapphire,sn_gruvbox
 GUI_SCHEME_COUNT equ 9
+GUI_SCHEME_GRUVBOX equ 8               ; default scheme (index into schemes[])
 layout_gaps  dd 7, 3, 14                          ; inter-card gap (DLU) per layout
 lay_band     dd 14, 0, 18                         ; label band: card(top) vs 0=flat(left)
 lay_itemh    dd 42, 30, 58                         ; list-item pixel height (index 0 used)
@@ -975,8 +981,8 @@ g_menu_ids label dword
     dd IDC_V_MTHEMEL, IDC_V_MTHEME, IDC_V_MEXPORT
     dd IDC_V_MIMPORT
     dd IDC_V_MNOHISTL, IDC_V_MNOHIST, IDC_V_MNOPHONL, IDC_V_MNOPHON
-    dd IDC_V_MSECDL, IDC_V_MSECD
-MENU_ID_COUNT equ 20
+    dd IDC_V_MSECDL, IDC_V_MSECD, IDC_V_MSECINFO
+MENU_ID_COUNT equ 21
 
 .data?
 align 8
@@ -988,7 +994,10 @@ g_msg_title dq ?
 g_msg_flags dd ?
 g_tpm_want  dd ?                      ; Fluent TPM toggle state (1 = enrolled/on)
 ; ---- secure-desktop password entry (anti-keylogger) -------------------------
-g_securedesk    dd ?                  ; setting: 1 = enter master password on a private desktop
+g_secunlock      dd ?                 ; setting: 1 = Secure Unlock (master pw on a private desktop)
+g_secunlock_lock dd ?                 ; 1 = Secure Unlock forced by HKLM policy (locked)
+g_tpm_lock       dd ?                 ; 1 = TPM Unlock forced by HKLM policy (locked)
+g_scheme_lock    dd ?                 ; 1 = colour scheme forced by HKLM policy (locked)
 g_secdesk_dlg   dd ?                  ; template id marshalled to the worker thread
 align 8
 g_secdesk_proc  dq ?                  ; dialog proc addr for the worker thread
@@ -7004,13 +7013,12 @@ gui_save_prefs endp
 ; gui_load_prefs() - load the persisted UI scheme + layout (clamped to range).
 gui_load_prefs proc frame
     FRAME_PROLOG 48
-    WINCALL cfg_get_dword, addr pref_scheme, 0, 0
-    cmp     eax, GUI_SCHEME_COUNT
-    jae     glp_layout
-    mov     dword ptr [g_scheme], eax
-glp_layout:
+    WINCALL cfg_get_dword, addr pref_scheme, GUI_SCHEME_GRUVBOX, addr g_scheme_lock
+    cmp     eax, GUI_SCHEME_COUNT               ; clamp out-of-range to the default
+    jb      @F
+    mov     eax, GUI_SCHEME_GRUVBOX
+@@: mov     dword ptr [g_scheme], eax
     mov     dword ptr [g_layout], 0             ; Comfortable is the only layout
-glp_done:
     FRAME_EPILOG
     ret
 gui_load_prefs endp
@@ -7215,21 +7223,36 @@ mo_len_ok:
     xor     edx, edx
     call    EnableWindow
 mo_cls_ok:
-    ; TPM toggle: only meaningful with hardware -> check it iff enrolled, and
-    ; enable the checkbox only when the platform TPM is present.
-    mov     dword ptr [rbp-32], 0
+    ; TPM toggle: HKLM policy (TpmUnlock) forces + locks it; otherwise the state
+    ; reflects this vault's enrollment.  Enabled only with hardware present and
+    ; not policy-locked.
+    mov     dword ptr [g_tpm_lock], 0
+    mov     dword ptr [g_tpm_want], 0
     cmp     dword ptr [g_tpm_present], 0
-    je      mo_tpm_set
-    call    vault_tpm_has
-    mov     dword ptr [rbp-32], eax
-mo_tpm_set:
-    mov     eax, dword ptr [rbp-32]           ; prime the Fluent toggle state
+    je      mo_tpm_enable                     ; no hardware -> off + disabled
+    lea     rcx, [wv_tpm]                     ; HKLM policy set?
+    lea     rdx, [rbp-40]
+    call    cfg_get_hklm
+    test    eax, eax
+    jz      mo_tpm_enroll
+    mov     eax, dword ptr [rbp-40]           ; HKLM forces the value + locks
+    and     eax, 1
     mov     dword ptr [g_tpm_want], eax
+    mov     dword ptr [g_tpm_lock], 1
+    jmp     mo_tpm_enable
+mo_tpm_enroll:
+    call    vault_tpm_has                     ; else reflect per-vault enrollment
+    mov     dword ptr [g_tpm_want], eax
+mo_tpm_enable:
     mov     rcx, qword ptr [rbp-24]
     mov     edx, IDC_V_MTPM
     call    GetDlgItem
     mov     rcx, rax
-    mov     edx, dword ptr [g_tpm_present]    ; enable iff hardware present
+    mov     eax, dword ptr [g_tpm_present]    ; enable = present AND not policy-locked
+    mov     edx, dword ptr [g_tpm_lock]
+    xor     edx, 1
+    and     eax, edx
+    mov     edx, eax
     call    EnableWindow
     ; the two privacy toggles: disable them when HKLM policy locks the value
     mov     rcx, qword ptr [rbp-24]
@@ -7245,6 +7268,24 @@ mo_tpm_set:
     call    GetDlgItem
     mov     rcx, rax
     mov     eax, dword ptr [g_nophon_lock]
+    xor     eax, 1
+    mov     edx, eax
+    call    EnableWindow
+    ; Secure Unlock toggle: disable when HKLM policy locks it
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_V_MSECD
+    call    GetDlgItem
+    mov     rcx, rax
+    mov     eax, dword ptr [g_secunlock_lock]
+    xor     eax, 1
+    mov     edx, eax
+    call    EnableWindow
+    ; colour-scheme button: disable when HKLM policy locks the scheme
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_V_MTHEME
+    call    GetDlgItem
+    mov     rcx, rax
+    mov     eax, dword ptr [g_scheme_lock]
     xor     eax, 1
     mov     edx, eax
     call    EnableWindow
@@ -7364,8 +7405,10 @@ msv_phon:
     mov     edx, dword ptr [g_no_phonetic]
     call    cfg_set_dword_hkcu
 msv_secd:
-    lea     rcx, [wv_securedesk]
-    mov     edx, dword ptr [g_securedesk]
+    cmp     dword ptr [g_secunlock_lock], 0    ; HKLM policy -> don't overwrite with HKCU
+    jne     msv_done
+    lea     rcx, [wv_secunlock]
+    mov     edx, dword ptr [g_secunlock]
     call    cfg_set_dword_hkcu
 msv_done:
     FRAME_EPILOG
@@ -7542,7 +7585,7 @@ vp_tdraw_tnophon:
     jmp     vp_ret
 vp_tdraw_tsecd:
     mov     rcx, r9
-    mov     edx, dword ptr [g_securedesk]
+    mov     edx, dword ptr [g_secunlock]
     call    theme_toggle
     jmp     vp_ret
 vp_tdraw_totp:
@@ -7705,6 +7748,8 @@ vp_cmd_fixed:
     je      vp_mnophon
     cmp     eax, IDC_V_MSECD
     je      vp_msecd
+    cmp     eax, IDC_V_MSECINFO
+    je      vp_msecinfo
     cmp     eax, IDCANCEL
     je      vp_esc
     xor     eax, eax
@@ -7716,6 +7761,8 @@ vp_esc:
 vp_mtpm:
     cmp     dword ptr [g_tpm_present], 0       ; disabled with no TPM hardware
     je      vp_handled
+    cmp     dword ptr [g_tpm_lock], 0          ; HKLM-locked -> ignore the click
+    jne     vp_handled
     mov     eax, dword ptr [g_tpm_want]
     xor     eax, 1
     mov     dword ptr [g_tpm_want], eax
@@ -7762,9 +7809,11 @@ vp_mnophon:
     add     rsp, 32
     jmp     vp_handled
 vp_msecd:
-    mov     eax, dword ptr [g_securedesk]
+    cmp     dword ptr [g_secunlock_lock], 0    ; HKLM-locked -> ignore the click
+    jne     vp_handled
+    mov     eax, dword ptr [g_secunlock]
     xor     eax, 1
-    mov     dword ptr [g_securedesk], eax
+    mov     dword ptr [g_secunlock], eax
     mov     rcx, qword ptr [rbp-8]
     mov     edx, IDC_V_MSECD
     call    GetDlgItem
@@ -7775,6 +7824,11 @@ vp_msecd:
     call    InvalidateRect
     add     rsp, 32
     jmp     vp_handled
+vp_msecinfo:
+    WINCALL gui_msgbox, qword ptr [rbp-8], addr m_msecinfo, addr t_msecinfo, \
+            <MB_OK or MB_ICONINFORMATION>
+    jmp     vp_handled
+
 vp_setdirty:
     cmp     dword ptr [g_loading], 0          ; ignore programmatic field loads
     jne     vp_handled
@@ -8246,14 +8300,14 @@ gui_load_policy proc frame
     jz      @F
     mov     eax, 1
 @@: mov     dword ptr [g_no_phonetic], eax
-    lea     rcx, [wv_securedesk]                ; "Secure password entry" (0/1; HKCU only)
-    xor     edx, edx
-    xor     r8, r8
+    lea     rcx, [wv_secunlock]                 ; "Secure unlock" (default ON; HKLM locks)
+    mov     edx, 1
+    lea     r8, [g_secunlock_lock]
     call    cfg_get_dword
     test    eax, eax
     jz      @F
     mov     eax, 1
-@@: mov     dword ptr [g_securedesk], eax
+@@: mov     dword ptr [g_secunlock], eax
     FRAME_EPILOG
     ret
 gui_load_policy endp
@@ -11228,7 +11282,7 @@ gui_open proc frame
     call    gui_try_tpm_auto                ; silent unlock if this device is enrolled
     test    eax, eax
     jnz     go_vault
-    cmp     dword ptr [g_securedesk], 0     ; enter the master password on a private desktop?
+    cmp     dword ptr [g_secunlock], 0     ; enter the master password on a private desktop?
     je      go_unlock_normal
     mov     ecx, DLG_UNLOCK
     lea     rdx, [unlock_proc]
@@ -11241,7 +11295,7 @@ go_unlock_res:
     jne     go_reset
     jmp     go_vault
 go_create:
-    cmp     dword ptr [g_securedesk], 0     ; set the master password on a private desktop?
+    cmp     dword ptr [g_secunlock], 0     ; set the master password on a private desktop?
     je      go_create_normal
     mov     ecx, DLG_CREATE
     lea     rdx, [create_proc]
