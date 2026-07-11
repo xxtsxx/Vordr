@@ -1,4 +1,4 @@
-# Vordr — 50 Improvement Plans
+# Vordr — 45 Improvement Plans
 
 Each plan is broken into small, independently buildable steps. Every step lists a
 concrete verification test. Global conventions used below:
@@ -12,10 +12,18 @@ concrete verification test. Global conventions used below:
   in a `FRAME_PROLOG N` helper. This is the crash class that produced BEX64/offset-0.
 - **ROUNDTRIP** = create temp vault via CLI, `add` entries, export `.vaultz`, re-import,
   diff plaintexts.
+- **RUNALL** = `tests\run_all.cmd` (build + framecheck + selftest + roundtrip; `--quick` skips
+  the dbg redteam stage). This is the one-command gate; use it in place of the individual
+  BUILD/SELFTEST/ROUNDTRIP steps where convenient.
+
+> **Already delivered (removed from this list):** secure-desktop ("Secure Unlock") master-
+> password entry; DWM dark/immersive title-bar theming (a Mica/Acrylic client-area glass
+> variant was tried and reverted); `framecheck.py` v2 raw-proc scanner; the GitHub Actions
+> CI pipeline; and the consolidated `tests\run_all.cmd` runner.
 
 ---
 
-## A. Security & Crypto (Plans 1–12)
+## A. Security & Crypto (Plans 1–11)
 
 ### 1. Argon2id parameter auto-calibration
 **Goal:** Pick memory/iteration cost at vault-creation time so unlock takes ~500 ms on the
@@ -66,23 +74,7 @@ VirtualLock'd (non-pageable) and wiped.
    *Test:* `dbg` build: plant sentinel, lock, scan verb reports 0 hits; then disable one wipe
    → scan must report a hit (proves the scanner works).
 
-### 4. Secure-desktop master-password entry (anti-keylogger)
-**Goal:** Optional setting: the unlock dialog runs on a separate Windows desktop (like UAC),
-isolating it from same-session key/message hooks.
-**Steps:**
-1. Spike: `CreateDesktopW` + `SetThreadDesktop` + show a bare themed dialog there; return to
-   the default desktop after. Keep it behind a `securedesk` CLI verb first.
-   *Test:* verb shows the dialog on a blank desktop; Alt-Tab shows nothing from the main session.
-2. Move the unlock dialog invocation behind the switch; marshal the entered password back via
-   a locked shared buffer (no clipboard, no window messages).
-   *Test:* unlock works end-to-end with the setting on; a test hook (SetWindowsHookEx WH_KEYBOARD_LL
-   in a helper exe) captures keystrokes with the setting OFF but captures nothing with it ON.
-3. Settings checkbox + HKCU persistence via `regcfg.asm`.
-   *Test:* toggle, restart app, setting persists; SELFTEST; FRAMES.
-
-**Status: IMPLEMENTED 2026-07-11** (commits e9b5efd, 5cf345c). CLI `securedesk` spike verb; g_securedesk setting persisted to HKCU "SecureDesk"; unlock + create dialogs routed via gui_secdesk_show on a private "Vordr-Secure" desktop with graceful fallback.
-
-### 5. Clipboard hygiene: auto-clear + history exclusion
+### 4. Clipboard hygiene: auto-clear + history exclusion
 **Goal:** Copied secrets clear after N seconds and never enter Windows clipboard history / cloud sync.
 **Steps:**
 1. On every secret copy, also set the `ExcludeClipboardContentFromMonitorProcessing`,
@@ -95,7 +87,7 @@ isolating it from same-session key/message hooks.
 3. Settings row: timeout seconds (0 = off), persisted in HKCU.
    *Test:* set 5 s, verify clears at ~5 s; set 0, verify never clears; SELFTEST.
 
-### 6. Vault anti-rollback counter
+### 5. Vault anti-rollback counter
 **Goal:** Detect an attacker restoring an older vault file (e.g. to resurrect a purged password).
 **Steps:**
 1. Add a monotonically increasing `save_counter` to the authenticated vault header.
@@ -107,7 +99,7 @@ isolating it from same-session key/message hooks.
    *Test:* save, copy vault aside, save again, restore the old copy → warning appears;
    normal unlock → no warning. REDTEAM still passes.
 
-### 7. Full-file HMAC / header hardening pass
+### 6. Full-file HMAC / header hardening pass
 **Goal:** One authenticated digest covers everything (header fields, all records, trailer) so
 truncation or record-splicing is always caught, not just per-record.
 **Steps:**
@@ -120,7 +112,7 @@ truncation or record-splicing is always caught, not just per-record.
 3. Fuzz splice test: Python script swaps two encrypted records → unlock must fail.
    *Test:* scripted 100 random splices/truncations — 100/100 rejected; ROUNDTRIP still passes.
 
-### 8. Argon2id RFC 9106 full vector coverage
+### 7. Argon2id RFC 9106 full vector coverage
 **Goal:** Selftest covers all published Argon2id vectors, not just one.
 **Steps:**
 1. Encode the RFC 9106 §5 test vectors (and the reference-repo extended vectors) as data in
@@ -132,7 +124,7 @@ truncation or record-splicing is always caught, not just per-record.
 3. Time it: keep added startup cost < 100 ms (drop the highest-memory vector if needed).
    *Test:* `bench` verb before/after; delta under budget.
 
-### 9. Constant-time comparison audit
+### 8. Constant-time comparison audit
 **Goal:** No secret-dependent early-exit comparisons anywhere.
 **Steps:**
 1. Grep for byte-compare loops (`repe cmpsb`, `jne` inside compare loops) across `src/*.asm`;
@@ -144,7 +136,7 @@ truncation or record-splicing is always caught, not just per-record.
    *Test:* SELFTEST + REDTEAM + ROUNDTRIP all pass; `dbg` timing probe shows compare time
    independent of first-differing-byte position (coarse check, 10k iterations).
 
-### 10. Auto-lock on idle and on workstation lock
+### 9. Auto-lock on idle and on workstation lock
 **Goal:** Vault locks itself after configurable idle time and immediately when Windows locks.
 **Steps:**
 1. Register for `WM_WTSSESSION_CHANGE` (WTSRegisterSessionNotification) on the vault window;
@@ -152,10 +144,10 @@ truncation or record-splicing is always caught, not just per-record.
    *Test:* unlock vault, press Win+L, unlock Windows → Vordr shows its unlock dialog.
 2. Idle timer: `GetLastInputInfo` polled by a 30 s `SetTimer`; lock after N minutes idle.
    *Test:* set 1 min, leave machine untouched 70 s → locked; move mouse at 50 s → not locked.
-3. Settings: idle minutes (0=off) + "lock when Windows locks" checkbox, persisted.
+3. Settings: idle minutes (0=off) + "lock when Windows locks" checkbox, persisted (HKLM>HKCU>default).
    *Test:* persistence across restart; SELFTEST; FRAMES (the new handlers stay in helpers).
 
-### 11. Decoy/duress vault
+### 10. Decoy/duress vault
 **Goal:** A second password opens a separate, plausible decoy vault stored in the same file.
 **Steps:**
 1. Format: two independent key slots trial-decrypt the header (like LUKS); no flag says which
@@ -166,7 +158,7 @@ truncation or record-splicing is always caught, not just per-record.
 3. GUI: create-decoy flow behind an "Advanced" expander on the create dialog.
    *Test:* GUI round-trip both personas; ROUNDTRIP per persona; REDTEAM.
 
-### 12. Secure temp-file lifecycle for attachment "Open"
+### 11. Secure temp-file lifecycle for attachment "Open"
 **Goal:** Decrypt-to-temp files (from `gui_file_open`) are overwritten and deleted deterministically.
 **Steps:**
 1. Track every temp path created this session in a small table; on lock/exit, overwrite with
@@ -182,9 +174,9 @@ truncation or record-splicing is always caught, not just per-record.
 
 ---
 
-## B. Features (Plans 13–26)
+## B. Features (Plans 12–25)
 
-### 13. otpauth:// URI import for TOTP
+### 12. otpauth:// URI import for TOTP
 **Goal:** Paste an `otpauth://totp/...` URI to fill secret/digits/period/algorithm automatically.
 **Steps:**
 1. Parser proc `otp_parse_uri` (percent-decode, extract secret/issuer/digits/period/algo)
@@ -196,7 +188,7 @@ truncation or record-splicing is always caught, not just per-record.
 3. SELFTEST vector: fixed URI → fixed parsed tuple.
    *Test:* SELFTEST; corrupt expected digits → fail.
 
-### 14. Offline breach check (HIBP bloom filter)
+### 13. Offline breach check (HIBP bloom filter)
 **Goal:** Flag vault passwords found in public breach corpora — fully offline.
 **Steps:**
 1. Build-side tool `tools/mkbloom.py`: from the HIBP SHA-1 ordered file, build a bloom filter
@@ -209,7 +201,7 @@ truncation or record-splicing is always caught, not just per-record.
    *Test:* entry with "password123" shows red; random 20-char shows green; remove the db file
    → grey and no crash.
 
-### 15. Global auto-type hotkey
+### 14. Global auto-type hotkey
 **Goal:** Ctrl+Alt+V types username{TAB}password{ENTER} into the previously focused window.
 **Steps:**
 1. `RegisterHotKey` on the tray window; on fire, capture `GetForegroundWindow` BEFORE showing
@@ -225,7 +217,7 @@ truncation or record-splicing is always caught, not just per-record.
 4. Safety: refuse to type into elevated windows / consoles unless confirmed.
    *Test:* target an admin cmd → confirmation dialog appears first.
 
-### 16. Fuzzy search in the sidebar
+### 15. Fuzzy search in the sidebar
 **Goal:** `gmail wrk` matches "Work – Gmail account" (subsequence scoring), not just prefix.
 **Steps:**
 1. `fuzzy_score` proc: case-folded subsequence match with contiguity + word-start bonuses;
@@ -236,7 +228,7 @@ truncation or record-splicing is always caught, not just per-record.
 3. Highlight matched characters in the tile painter (existing owner-draw text run).
    *Test:* visual check: matched letters render in accent color; no clipping at 9 pt.
 
-### 17. Entry templates
+### 16. Entry templates
 **Goal:** New-entry menu offers Login / Credit card / Identity / Server / Note presets that
 pre-create the right modular field rows.
 **Steps:**
@@ -249,7 +241,7 @@ pre-create the right modular field rows.
 3. "Save current entry as template" (stored in HKCU as a label list).
    *Test:* custom template round-trips app restart.
 
-### 18. Tag-based sidebar filtering
+### 17. Tag-based sidebar filtering
 **Goal:** Entries can carry tags; sidebar gets a tag strip; clicking a tag filters the list.
 **Steps:**
 1. Reserved `VF_TAGS` field (VFL_RAW, comma-separated) per entry; editor row in edit mode.
@@ -260,7 +252,7 @@ pre-create the right modular field rows.
    second click clears.
    *Test:* two tags AND-combine; empty result shows a friendly "no matches" state; FRAMES.
 
-### 19. Vault health dashboard
+### 18. Vault health dashboard
 **Goal:** One screen: weak / reused / old / breached password counts with drill-down lists.
 **Steps:**
 1. Analysis pass proc: iterate decrypted entries, bucket by (strength level via existing
@@ -272,7 +264,7 @@ pre-create the right modular field rows.
 3. Sidebar badge showing the worst-bucket count.
    *Test:* fix one weak password → badge decrements after save.
 
-### 20. Password expiry reminders
+### 19. Password expiry reminders
 **Goal:** Optional per-entry "rotate every N days"; overdue entries get a badge + tray balloon.
 **Steps:**
 1. Reserved `VF_EXPIRY` field storing N days; edit-mode row (0=never).
@@ -283,7 +275,7 @@ pre-create the right modular field rows.
 3. Amber clock badge on overdue tiles + one tray balloon per unlock session.
    *Test:* visual check; balloon appears once, not repeatedly.
 
-### 21. Import from Bitwarden/KeePass CSV
+### 20. Import from Bitwarden/KeePass CSV
 **Goal:** `Import → CSV` maps common manager exports into staged entries via the existing
 DLG_SELECT staging flow.
 **Steps:**
@@ -298,7 +290,7 @@ DLG_SELECT staging flow.
 4. Secure-wipe the plaintext CSV buffer after staging.
    *Test:* `dbg` scan finds no CSV content post-commit.
 
-### 22. KDBX 4 import
+### 21. KDBX 4 import
 **Goal:** Read KeePass 4.x databases directly (AES-KDF and Argon2 variants, no plugins/attachments v1).
 **Steps:**
 1. Header parser: outer header TLVs, cipher/KDF params; `kdbxinfo <file>` verb prints them.
@@ -312,7 +304,7 @@ DLG_SELECT staging flow.
 4. Stage into DLG_SELECT like the CSV path; wipe all intermediate buffers.
    *Test:* GUI import of the fixture; ROUNDTRIP; `dbg` scan for a known fixture password post-commit = 0 hits.
 
-### 23. Multiple vaults / vault switcher
+### 22. Multiple vaults / vault switcher
 **Goal:** File → recent-vaults list; switching locks the current vault first.
 **Steps:**
 1. Track the open vault path (already known) + an HKCU MRU (max 5, paths only — no secrets).
@@ -323,7 +315,7 @@ DLG_SELECT staging flow.
 3. Guard: refuse switch with unsaved edits (prompt Save/Discard/Cancel).
    *Test:* dirty entry + switch → prompt appears; Cancel keeps state intact.
 
-### 24. Read-only mode
+### 23. Read-only mode
 **Goal:** Open a vault without write intent — all mutating UI disabled; good for USB/backup review.
 **Steps:**
 1. `--ro` CLI flag and a checkbox on the unlock dialog set `g_readonly`.
@@ -335,7 +327,7 @@ DLG_SELECT staging flow.
 3. Title bar suffix "(read-only)".
    *Test:* visual check both modes.
 
-### 25. Printable emergency sheet
+### 24. Printable emergency sheet
 **Goal:** Settings → "Emergency sheet": renders vault location, key-slot info, and OWNER-FILLED
 blanks (never the password) to a printable page.
 **Steps:**
@@ -347,13 +339,13 @@ blanks (never the password) to a printable page.
 3. Confirmation dialog first (this leaves a paper trail — user must acknowledge).
    *Test:* Cancel produces nothing.
 
-### 26. CLI `clip` verb
+### 25. CLI `clip` verb
 **Goal:** `vordr clip <entry> [field]` prompts for the master password (console, no echo),
 copies the secret to clipboard with the auto-clear timer, prints nothing secret.
 **Steps:**
 1. Console hidden-input already exists for other verbs — reuse; resolve entry by fuzzy name.
    *Test:* correct secret lands on clipboard (paste in Notepad); stdout contains no secret.
-2. Apply the same clipboard-history-exclusion formats as Plan 5 and spawn the clear timer via
+2. Apply the same clipboard-history-exclusion formats as Plan 4 and spawn the clear timer via
    a detached sleeper thread that outlives the CLI (or message-only window + timer).
    *Test:* Win+V shows nothing; clipboard empty after timeout even though the process exited.
 3. Non-zero exit codes for not-found/ambiguous names.
@@ -361,9 +353,9 @@ copies the secret to clipboard with the auto-clear timer, prints nothing secret.
 
 ---
 
-## C. GUI / UX (Plans 27–36)
+## C. GUI / UX (Plans 26–34)
 
-### 27. Full keyboard navigation audit
+### 26. Full keyboard navigation audit
 **Goal:** Every dialog usable without a mouse: logical tab order, accelerators, Enter/Esc correct.
 **Steps:**
 1. Audit table: for each dialog in `vordr.rc`, walk with Tab and note dead ends (owner-draw
@@ -375,7 +367,7 @@ copies the secret to clipboard with the auto-clear timer, prints nothing secret.
 3. Add `&`-accelerators to labels/buttons where the owner-draw painter can render underscores.
    *Test:* Alt+letter activates each marked control.
 
-### 28. Per-monitor-v2 DPI audit
+### 27. Per-monitor-v2 DPI audit
 **Goal:** Crisp rendering at 100/150/200% and when dragging between mixed-DPI monitors.
 **Steps:**
 1. Confirm the manifest declares PerMonitorV2 (`vordr.manifest`); log `GetDpiForWindow` in `dbg`.
@@ -388,7 +380,7 @@ copies the secret to clipboard with the auto-clear timer, prints nothing secret.
    *Test:* drag between monitors — text reflows without restart; no GDI handle leak
    (`dbg`: GetGuiResources GDI count stable over 20 drags).
 
-### 29. Screen-reader accessibility for owner-draw controls
+### 28. Screen-reader accessibility for owner-draw controls
 **Goal:** Narrator/NVDA announce owner-draw buttons and tiles meaningfully.
 **Steps:**
 1. Ensure every owner-draw BUTTON keeps a real window text (SetWindowTextW even though the
@@ -401,7 +393,7 @@ copies the secret to clipboard with the auto-clear timer, prints nothing secret.
    the schemes table).
    *Test:* script prints per-scheme ratios; fix any failing pair; visual regression screenshots.
 
-### 30. Resizable main window
+### 29. Resizable main window
 **Goal:** The vault window resizes with a sensible reflow; size/position persisted.
 **Steps:**
 1. Add `WS_THICKFRAME` + WM_GETMINMAXINFO (min = current fixed size).
@@ -413,19 +405,7 @@ copies the secret to clipboard with the auto-clear timer, prints nothing secret.
    *Test:* resize+move, restart → same place; unplug-monitor simulation (save coords off-screen
    manually in registry) → window still appears on-screen.
 
-### 31. Dark/immersive title bar + Mica-adjacent polish
-**Goal:** Title bar matches the theme (DWMWA_USE_IMMERSIVE_DARK_MODE) and follows scheme switches.
-**Steps:**
-1. On dialog init + theme switch, set attribute 20 (immersive dark) = scheme's `dark` trait via
-   `DwmSetWindowAttribute` (dwmapi is already linked).
-   *Test:* Midnight scheme → dark title bar; Light scheme → light; switching updates live.
-2. Set DWMWA_CAPTION_COLOR (Win11) to `g_col_bg` where supported, ignore failure on Win10.
-   *Test:* Win11: caption matches bg exactly; API failure path leaves default (no error box).
-3. Apply to ALL top-level dialogs (create, unlock, msg, about, export…) via one helper called
-   from each `*_init`.
-   *Test:* visual sweep of every dialog in 3 schemes.
-
-### 32. In-app toast notifications
+### 30. In-app toast notifications
 **Goal:** Non-blocking "Copied", "Saved", "Locked in 4:59…" toasts instead of/alongside cue text.
 **Steps:**
 1. Toast child window: layered, rounded, auto-fade via timer, painter reuses theme brushes.
@@ -435,7 +415,7 @@ copies the secret to clipboard with the auto-clear timer, prints nothing secret.
 3. Settings toggle.
    *Test:* off → old behavior only.
 
-### 33. Trash / undo-delete for entries
+### 31. Trash / undo-delete for entries
 **Goal:** Deleted entries go to a Trash section for 30 days instead of vanishing.
 **Steps:**
 1. Reserved `VF_DELETED` timestamp field; delete = set it (entry stays in the file, encrypted
@@ -447,7 +427,7 @@ copies the secret to clipboard with the auto-clear timer, prints nothing secret.
 3. Auto-purge >30 days at unlock (count shown once).
    *Test:* back-date a deletion timestamp via a `dbg` verb → purged at next unlock.
 
-### 34. Drag-and-drop attachment add
+### 32. Drag-and-drop attachment add
 **Goal:** Drop files from Explorer onto an entry's attachment tile (edit mode) to attach them.
 **Steps:**
 1. `DragAcceptFiles` on the vault window; handle `WM_DROPFILES` → `DragQueryFileW` loop.
@@ -459,7 +439,7 @@ copies the secret to clipboard with the auto-clear timer, prints nothing secret.
 3. Save + reopen round-trip.
    *Test:* all dropped files download back byte-identical (fc.exe compare).
 
-### 35. Localization scaffolding
+### 33. Localization scaffolding
 **Goal:** All user-visible strings live in one table so a second language is a data-only change.
 **Steps:**
 1. Script `tools/strings_audit.py`: find WSTR/dw-string data in `gui.asm`/`theme.asm` and emit
@@ -473,7 +453,7 @@ copies the secret to clipboard with the auto-clear timer, prints nothing secret.
 4. Migrate remaining dialogs incrementally (one commit each).
    *Test:* per-dialog visual check + SELFTEST each commit.
 
-### 36. Font-size / density unification
+### 34. Font-size / density unification
 **Goal:** The existing layout-density setting also scales fonts (S/M/L) consistently everywhere.
 **Steps:**
 1. Central font factory: all CreateFontW calls route through one FRAME_PROLOG helper taking a
@@ -487,9 +467,9 @@ copies the secret to clipboard with the auto-clear timer, prints nothing secret.
 
 ---
 
-## D. Code quality, build & test infrastructure (Plans 37–44)
+## D. Code quality, build & test infrastructure (Plans 35–39)
 
-### 37. Migrate shared framework into the Patterns library
+### 35. Migrate shared framework into the Patterns library
 **Goal:** Vordr consumes the canonical `Projects\Patterns` MASM library instead of a private
 copy of hardening/crypto/IO (per the cross-project plan).
 **Steps:**
@@ -500,40 +480,11 @@ copy of hardening/crypto/IO (per the cross-project plan).
    *Test:* Patterns' own test suite passes after each merge.
 3. Switch `build.cmd` to assemble those sources from the Patterns path (include dir or
    pre-build copy step).
-   *Test:* BUILD from a clean clone (delete obj/) + SELFTEST + REDTEAM + ROUNDTRIP.
+   *Test:* BUILD from a clean clone (delete obj/) + RUNALL.
 4. Delete the now-shadowed local copies.
    *Test:* BUILD still clean; `git grep` finds no stale include of the deleted files.
 
-### 38. framecheck v2: raw-proc WINCALL scanner
-**Goal:** Automate detection of the exact bug class that crashed create_proc (>4-arg WINCALL
-inside a raw `sub rsp, 64` proc).
-**Steps:**
-1. Extend `tools/framecheck.py`: also parse procs WITHOUT FRAME_PROLOG; detect `sub rsp, N`
-   prologue; count WINCALL args at each call site; flag spill-past-frame (32+(args-4)*8 > N
-   after accounting for the pushed rbp).
-   *Test:* run against the git commit BEFORE the gui_make_welcomefont fix → must flag
-   create_proc's 14-arg CreateFontW; run against HEAD → no new findings beyond the 9 known
-   FRAME_PROLOG false positives.
-2. Also flag manual `sub rsp, K … call … add rsp, K` sequences where K is too small for the
-   preceding arg stores.
-   *Test:* seed a deliberate too-small K in a scratch branch → flagged; revert.
-3. Wire into `build.cmd` as a non-fatal warning step (fatal with `build strict`).
-   *Test:* BUILD prints the framecheck summary; `build strict` fails on a seeded bug.
-
-### 39. CI pipeline
-**Goal:** Every push to GitHub builds and runs the full test gate on a Windows runner.
-**Steps:**
-1. `.github/workflows/build.yml`: windows-latest, install VS BuildTools (ml64 via
-   microsoft/setup-msbuild or choco), run `build.cmd`.
-   *Test:* Actions run green; artifact `vordr.exe` downloadable.
-2. Add test stage: `vordr.exe selftest`, framecheck v2, and the scripted ROUNDTRIP
-   (init/add/export/import via CLI with a fixture password from an env secret — CLI reads it
-   from stdin, never argv).
-   *Test:* intentionally break a KAT on a branch → CI fails; revert → green.
-3. Add the redteam stage on the `dbg` build.
-   *Test:* CI matrix shows both configs green; badge in README.
-
-### 40. In-proc fuzzer for the vault parser
+### 36. In-proc fuzzer for the vault parser
 **Goal:** Coverage-light structural fuzzing of `vault.asm`'s record parser to shake out
 malformed-input crashes before an attacker does.
 **Steps:**
@@ -547,7 +498,7 @@ malformed-input crashes before an attacker does.
    for reproduction.
    *Test:* nightly green; deliberately re-run a failed seed reproduces identically (determinism).
 
-### 41. Fuzz the zip/inflate import path
+### 37. Fuzz the zip/inflate import path
 **Goal:** Same treatment for `zipimport.asm` + `inflate.asm` (they parse attacker-supplied files).
 **Steps:**
 1. `fuzzzip <seed> <iters>` verb mutating a fixture `.vaultz` in memory, running the stage
@@ -560,7 +511,7 @@ malformed-input crashes before an attacker does.
    *Test:* member claiming 4 GiB output rejected before any large alloc (peak WS < 100 MiB
    during the test, watched via `Get-Process`).
 
-### 42. Automated dead-code detector
+### 38. Automated dead-code detector
 **Goal:** Repeatable tool replacing the manual dead-symbol sweeps done in the audit.
 **Steps:**
 1. `tools/deadcode.py`: parse `obj/*.lst` listings for defined symbols, cross-reference call/
@@ -573,18 +524,7 @@ malformed-input crashes before an attacker does.
 3. Hook into `build strict`.
    *Test:* strict build fails on the seeded case, passes on HEAD.
 
-### 43. Consolidated test-runner
-**Goal:** One command (`tests\run_all.cmd`) executes: build, selftest, framecheck, roundtrip,
-redteam (dbg), fuzz-smoke (10k), dead-code — with a summary table.
-**Steps:**
-1. Write the runner with per-stage timing and PASS/FAIL rows; non-zero exit on any FAIL.
-   *Test:* full run green on HEAD; exit code 0.
-2. Add `--quick` (skip redteam + fuzz) for inner-loop use.
-   *Test:* quick run < 60 s on the dev box.
-3. Document in README; make it the pre-push convention.
-   *Test:* README section exists; run_all catches a seeded KAT break (exit ≠ 0).
-
-### 44. Reproducible release builds
+### 39. Reproducible release builds
 **Goal:** Two clean builds of the same commit produce byte-identical exes (auditability).
 **Steps:**
 1. Identify nondeterminism: link `/Brepro`, strip PDB path (`/pdbaltpath`), fix the rc
@@ -599,9 +539,9 @@ redteam (dbg), fuzz-smoke (10k), dead-code — with a summary table.
 
 ---
 
-## E. Performance & robustness (Plans 45–50)
+## E. Performance & robustness (Plans 40–45)
 
-### 45. Faster unlock: parallel KAT gate
+### 40. Faster unlock: parallel KAT gate
 **Goal:** Run the startup self-test KATs across worker threads to cut launch latency.
 **Steps:**
 1. Measure: `dbg` timestamps per KAT; identify the top 3 (Argon2id will dominate).
@@ -613,7 +553,7 @@ redteam (dbg), fuzz-smoke (10k), dead-code — with a summary table.
 3. Keep single-threaded order for tests with shared state (audit for statics first).
    *Test:* 1000 repeated selftest runs in a loop, zero flakes.
 
-### 46. Sidebar virtualization for large vaults
+### 41. Sidebar virtualization for large vaults
 **Goal:** 5,000-entry vault scrolls smoothly; tiles are drawn, not created, per row.
 **Steps:**
 1. Generate a 5k-entry synthetic vault via a script (CLI `add` loop); profile current load
@@ -622,10 +562,10 @@ redteam (dbg), fuzz-smoke (10k), dead-code — with a summary table.
 2. Convert the sidebar to a single owner-draw scrolled surface: paint only visible tile rows
    from `g_entries` (painters already exist), hit-test by y-offset; kill per-entry child windows.
    *Test:* GDI handle count independent of entry count; scroll paint < 5 ms/frame at 5k entries.
-3. Keep keyboard selection + accessibility names (Plan 29) working.
+3. Keep keyboard selection + accessibility names (Plan 28) working.
    *Test:* arrow keys walk entries; NVDA still reads them.
 
-### 47. Crash containment without secret leakage
+### 42. Crash containment without secret leakage
 **Goal:** On any unhandled exception: wipe secrets, show a minimal apology box, and ensure NO
 minidump/WER report containing key material leaves the machine.
 **Steps:**
@@ -639,7 +579,7 @@ minidump/WER report containing key material leaves the machine.
    file (no secrets by construction — trace lines are static strings + codes).
    *Test:* crashme produces the breadcrumb file; grep for planted sentinel password → absent.
 
-### 48. Atomic saves + backup generations
+### 43. Atomic saves + backup generations
 **Goal:** A crash/power-cut mid-save can never lose the vault; keep N rotated backups.
 **Steps:**
 1. Audit the current save: ensure write-to-temp → FlushFileBuffers → ReplaceFileW/MoveFileEx
@@ -652,37 +592,36 @@ minidump/WER report containing key material leaves the machine.
 3. "Restore from backup…" picker on the unlock dialog's error path.
    *Test:* corrupt the main file → unlock offers backups → restore succeeds.
 
-### 49. External-change detection
+### 44. External-change detection
 **Goal:** If the vault file changes on disk while open (sync tools, second instance), warn
 before overwriting.
 **Steps:**
 1. Snapshot (size, mtime, BLAKE2b of header) at load; re-check before every save.
    *Test:* touch the file externally → next save shows the conflict dialog.
-2. Conflict dialog: Reload / Overwrite / Save-As, with the anti-rollback counter (Plan 6)
+2. Conflict dialog: Reload / Overwrite / Save-As, with the anti-rollback counter (Plan 5)
    shown for both versions.
    *Test:* each button does what it says; Reload preserves unsaved-edit warning first.
 3. Single-instance guard: named mutex; second launch focuses the first window instead.
    *Test:* launch twice → one window, first instance foregrounded (tray-foreground pattern).
 
-### 50. Startup breadcrumb + first-run experience
+### 45. Startup breadcrumb + first-run experience
 **Goal:** Cold-start problems become diagnosable and the very first launch is welcoming.
 **Steps:**
 1. Promote the dbg breadcrumb trace to release (static strings only) behind `--trace <file>`.
    *Test:* run with the flag → ordered milestones (selftest gate, TPM probe, prefs load,
    dialog up) in the file; without flag → no file.
 2. First-run detection (no HKCU prefs): after vault creation, show a one-time 3-step tour
-   overlay (add entry → generator → lock) using the toast/overlay machinery (Plan 32).
+   overlay (add entry → generator → lock) using the toast/overlay machinery (Plan 30).
    *Test:* delete the HKCU key → tour appears once, never again after completion.
 3. Measure cold start (process create → dialog visible) before/after all this; budget ≤ 1.5 s
-   with the parallel KAT gate (Plan 45).
+   with the parallel KAT gate (Plan 40).
    *Test:* scripted 10-run average printed; within budget.
 
 ---
 
 ## Suggested sequencing
 
-- **Safety first:** 38 (framecheck v2) → 43 (runner) → 39 (CI) make every later plan cheaper to verify.
-- **High user value / low risk:** 5, 10, 26, 31, 33, 16.
-- **Format-touching plans (1, 2, 6, 7, 11, 18, 20, 33)** each bump/extend the header — batch
+- **High user value / low risk:** 4, 9, 15, 25, 31.
+- **Format-touching plans (1, 2, 5, 6, 10, 17, 19, 31)** each bump/extend the header — batch
   compatibly and always ship with ROUNDTRIP + a version-gate test (old vault still opens).
-- **Big rocks:** 22 (KDBX), 46 (virtualization), 37 (Patterns migration) deserve their own branches.
+- **Big rocks:** 21 (KDBX), 41 (virtualization), 35 (Patterns migration) deserve their own branches.
