@@ -77,7 +77,6 @@ extern IsWindowVisible:proc
 extern GetSystemInfo:proc
 extern GetSystemPowerStatus:proc
 extern DwmSetWindowAttribute:proc
-extern DwmExtendFrameIntoClientArea:proc
 extern CreateDXGIFactory1:proc
 
 ; ---- message / api constants ------------------------------------------------
@@ -98,9 +97,6 @@ DWMWA_CORNER        equ 33                   ; DWMWA_WINDOW_CORNER_PREFERENCE
 DWMWCP_ROUND        equ 2                    ; rounded corners (Fluent)
 DWMWA_CAPTION_COLOR equ 35                   ; title-bar fill (Win11; older: E_INVALIDARG, ignored)
 DWMWA_TEXT_COLOR    equ 36                   ; title-bar text
-DWMWA_BACKDROP      equ 38                   ; DWMWA_SYSTEMBACKDROP_TYPE (Win11 22H2+)
-DWMSBT_NONE         equ 1                    ; opaque (clears a previously set material)
-DWMWA_COLOR_NONE    equ 0FFFFFFFEh           ; caption draws no fill -> backdrop material shows
 SRCCOPY             equ 0CC0020h
 HALFTONE            equ 4
 NULL_BRUSH          equ 5
@@ -164,7 +160,7 @@ g_col_side  dd 00342A26h                  ; sidebar (list + search) panel colour
 g_col_filebadge dd 00544A3Ah              ; attachment/file chip fill (distinct from bg/panel)
 g_col_accent2 dd 00FFC24Ch                ; secondary accent (two-tone gradient end)
 SCHEME_DW   equ 15                        ; dwords per scheme row
-SCHEME_COUNT equ 10
+SCHEME_COUNT equ 9
 schemes label dword
     ; bg,panel,frame,btn,btnsel,text,textdim,border,accent,accsel,focus,dark,side,filebadge,accent2
     dd 00F3F3F3h,00FFFFFFh,00D2D2D2h,00FFFFFFh,00E6E6E6h,00202020h,00707070h,00D2D2D2h,00C26A00h,00A05800h,00C26A00h,00000000h,00FFFFFFh,00E8DCC8h,00C26A00h  ; Light
@@ -176,17 +172,8 @@ schemes label dword
     dd 001A2006h,0028320Ah,005E7A1Ah,0028320Ah,003A4612h,00F4FFE0h,00BCD090h,005E7A1Ah,0098E010h,0078B00Ah,0098E010h,00000001h,000F1804h,0034400Eh,00D0FF60h  ; Emerald
     dd 00220E06h,0038180Ah,008A3A1Ah,0038180Ah,004E2210h,00FFEAE0h,00E0B09Ah,008A3A1Ah,00FF6A2Eh,00D04818h,00FF6A2Eh,00000001h,001A0A04h,00341208h,00FFB08Ah  ; Sapphire
     dd 00282828h,002F3032h,00454950h,002F3032h,0036383Ch,00B2DBEBh,008499A8h,00454950h,001980FEh,001060D0h,001980FEh,00000001h,001F2022h,0034363Ah,0026BBB8h  ; Gruvbox
-    ; The glass scheme is DESIGNED for the sheet-of-glass compositing, and it
-    ; relies on COLOUR SYMMETRY: every chrome colour (panel/frame/btn/btnsel/
-    ; border/side/badge) is EXACTLY the bg value, so whatever the compositor
-    ; does with a pixel, chrome pixels render identically to background pixels
-    ; - i.e. as the material itself.  Buttons, textbox fills, hairlines and
-    ; the sidebar ring all melt into the acrylic; the visible UI is carried
-    ; entirely by text, glyphs, the pink accent and the 2px focus underline.
-    dd 00080608h,00080608h,00080608h,00080608h,00080608h,00FFFFFFh,00D0C4CCh,00080608h,00FF8CB4h,00D06A94h,00FF8CB4h,00000001h,00080608h,00080608h,00FFB4D2h  ; Acrylic (dark glass)
 ; scheme_traits[scheme] = radius(byte0) | accent-mode(byte1: 0 solid/1 rainbow/2 two-tone) |
-;   flags(byte2: bit0 scanlines) | backdrop material(byte3: DWMSBT_* - 0 opaque,
-;   2 Mica, 3 Acrylic, 4 Mica-Alt; material = glass caption AND client)
+;   flags(byte2: bit0 scanlines)
 scheme_traits label dword
     dd 00000008h  ; Light
     dd 00000008h  ; Sepia
@@ -197,7 +184,6 @@ scheme_traits label dword
     dd 00000208h  ; Emerald
     dd 00000208h  ; Sapphire
     dd 00000006h  ; Gruvbox
-    dd 03000008h  ; Acrylic (dark glass) - Acrylic blur through the whole client
 g_br_bg     dq 0
 g_br_side   dq 0                            ; sidebar (list + search) fill
 g_br_panel  dq 0
@@ -636,70 +622,20 @@ theme_scrollbars endp
 ; =============================================================================
 public theme_dwm_apply
 theme_dwm_apply proc frame
-    FRAME_PROLOG 96
-    ; [rbp-24] hwnd  [rbp-40] attribute value cell  [rbp-44] material
-    ; [rbp-48] backdrop HRESULT  MARGINS @ [rbp-64..-52]
+    FRAME_PROLOG 48
+    ; [rbp-24] hwnd  [rbp-40] attribute value cell
     mov     qword ptr [rbp-24], rcx
-    mov     dword ptr [rbp-48], 1               ; "no material" until proven otherwise
     mov     eax, dword ptr [g_col_dark]         ; dark title bar only for dark schemes
     mov     dword ptr [rbp-40], eax
     WINCALL DwmSetWindowAttribute, qword ptr [rbp-24], DWMWA_DARK, addr rbp-40, 4
     mov     dword ptr [rbp-40], DWMWCP_ROUND    ; Fluent rounded window corners
     WINCALL DwmSetWindowAttribute, qword ptr [rbp-24], DWMWA_CORNER, addr rbp-40, 4
-    call    theme_trait                         ; byte3 = backdrop material
-    shr     eax, 24
-    movzx   eax, al
-    mov     dword ptr [rbp-44], eax
-    test    eax, eax
-    jnz     tda_mat
-    mov     dword ptr [rbp-40], DWMSBT_NONE     ; opaque scheme: clear any material,
-    WINCALL DwmSetWindowAttribute, qword ptr [rbp-24], DWMWA_BACKDROP, addr rbp-40, 4
-    mov     eax, dword ptr [g_col_bg]           ; ...and paint the caption like the bg
+    mov     eax, dword ptr [g_col_bg]           ; caption painted like the window bg
     mov     dword ptr [rbp-40], eax
-    jmp     tda_cap
-tda_mat:
-    mov     eax, dword ptr [rbp-44]             ; material scheme: set Mica/Acrylic
-    mov     dword ptr [rbp-40], eax
-    WINCALL DwmSetWindowAttribute, qword ptr [rbp-24], DWMWA_BACKDROP, addr rbp-40, 4
-    mov     dword ptr [rbp-48], eax             ; S_OK only on Win11 22H2+ DWM
-    mov     dword ptr [rbp-40], DWMWA_COLOR_NONE ; no caption fill -> material shows
-tda_cap:
     WINCALL DwmSetWindowAttribute, qword ptr [rbp-24], DWMWA_CAPTION_COLOR, addr rbp-40, 4
     mov     eax, dword ptr [g_col_text]         ; caption text follows the scheme
     mov     dword ptr [rbp-40], eax
     WINCALL DwmSetWindowAttribute, qword ptr [rbp-24], DWMWA_TEXT_COLOR, addr rbp-40, 4
-    ; ---- client-area material: sheet-of-glass frame extension --------------
-    ; Material accepted by the DWM -> extend the frame into the whole client
-    ; (MARGINS all -1).  GDI paints leave the surface alpha at 0, so the
-    ; Mica/Acrylic backdrop composites through the client with the themed UI
-    ; rendered over it.  Opaque schemes (and pre-22H2 DWM, where the backdrop
-    ; set fails) reset the margins to 0 - the classic fully opaque client -
-    ; so live scheme switches revert cleanly and Win10 never sees the glass.
-    xor     ecx, ecx                            ; margin value: 0 = reset
-    cmp     dword ptr [rbp-48], 0               ; material set AND accepted?
-    jne     tda_mar
-    or      ecx, -1                             ; -1 = whole surface
-tda_mar:
-    mov     dword ptr [rbp-64], ecx             ; MARGINS {cxL, cxR, cyT, cyB}
-    mov     dword ptr [rbp-60], ecx
-    mov     dword ptr [rbp-56], ecx
-    mov     dword ptr [rbp-52], ecx
-    WINCALL DwmExtendFrameIntoClientArea, qword ptr [rbp-24], addr rbp-64
-    ; ---- layered style: only for opaque clients -----------------------------
-    ; WS_EX_LAYERED redirection can suppress the extended-frame alpha
-    ; compositing, so glass windows shed it; opaque windows keep the original
-    ; layered-at-full-alpha setup.
-    WINCALL GetWindowLongPtrW, qword ptr [rbp-24], GWL_EXSTYLE
-    cmp     dword ptr [rbp-48], 0
-    je      tda_glass
-    or      rax, WS_EX_LAYERED                  ; opaque: layered at 100%
-    WINCALL SetWindowLongPtrW, qword ptr [rbp-24], GWL_EXSTYLE, rax
-    WINCALL SetLayeredWindowAttributes, qword ptr [rbp-24], 0, WIN_ALPHA, LWA_ALPHA
-    jmp     tda_done
-tda_glass:
-    btr     rax, 19                             ; glass: clear WS_EX_LAYERED (bit 19 = 80000h)
-    WINCALL SetWindowLongPtrW, qword ptr [rbp-24], GWL_EXSTYLE, rax
-tda_done:
     FRAME_EPILOG
     ret
 theme_dwm_apply endp
@@ -714,10 +650,15 @@ theme_attach proc frame
     mov     qword ptr [rbp-24], rcx
     mov     dword ptr [rbp-32], edx
     mov     rcx, qword ptr [rbp-24]
-    call    theme_dwm_apply                     ; dark/corners/caption/backdrop/glass/layered
+    call    theme_dwm_apply                     ; dark/corners/caption colours
     WINCALL GetWindowLongPtrW, qword ptr [rbp-24], GWL_STYLE
     or      rax, WS_CLIPCHILDREN            ; clip children so the frame ring isn't overpainted
     WINCALL SetWindowLongPtrW, qword ptr [rbp-24], GWL_STYLE, rax
+    ; WS_EX_LAYERED at full (100%) alpha — opaque window
+    WINCALL GetWindowLongPtrW, qword ptr [rbp-24], GWL_EXSTYLE
+    or      rax, WS_EX_LAYERED
+    WINCALL SetWindowLongPtrW, qword ptr [rbp-24], GWL_EXSTYLE, rax
+    WINCALL SetLayeredWindowAttributes, qword ptr [rbp-24], 0, WIN_ALPHA, LWA_ALPHA
     ; dark scrollbars/borders on the standard controls (listbox, multiline edits)
     WINCALL EnumChildWindows, qword ptr [rbp-24], addr theme_dark_cb, 0
     cmp     dword ptr [rbp-32], 0
@@ -996,8 +937,6 @@ theme_sidecard proc frame
     mov     eax, dword ptr [rbp-52]
     mov     dword ptr [rbp-80], eax           ; card B
     ; ---- drop shadow (offset +2,+3), NULL pen ----
-    ; Skipped on glass schemes: a darkened-bg shadow reads as a harsh opaque
-    ; ring on the translucent material, where the card should melt in instead.
     WINCALL GetStockObject, 8                 ; NULL_PEN
     WINCALL SelectObject, qword ptr [rbp-32], rax
     mov     qword ptr [rbp-104], rax          ; old pen
@@ -1008,10 +947,6 @@ theme_sidecard proc frame
     mov     qword ptr [rbp-88], rax           ; shadow brush
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-88]
     mov     qword ptr [rbp-96], rax           ; old brush
-    call    theme_trait                       ; byte3 != 0 -> material scheme
-    shr     eax, 24
-    test    eax, eax
-    jnz     tsc_card                          ; glass: no shadow
     mov     eax, dword ptr [rbp-72]
     add     eax, 2
     mov     dword ptr [rbp-112], eax          ; shadow L
@@ -1026,7 +961,6 @@ theme_sidecard proc frame
     mov     dword ptr [rbp-124], eax          ; shadow B
     WINCALL RoundRect, qword ptr [rbp-32], dword ptr [rbp-112], dword ptr [rbp-116], \
             dword ptr [rbp-120], dword ptr [rbp-124], 14, 14
-tsc_card:
     ; ---- the card: side fill + 1px border pen ----
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_pen_bd]
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_br_side]
