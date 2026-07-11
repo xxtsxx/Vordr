@@ -168,7 +168,6 @@ WSTR w_phtest,   <phtest>
 WSTR w_secscan,  <secscan>
 WSTR w_tmptest,  <tmptest>
 WSTR w_securedesk, <securedesk>
-WSTR wpw_test,   <VordrTest123>
 WSTR wpw_exp,    <VordrExp1234>
 ifdef DBG_TRACE
 WSTR w_redteam,  <redteam>

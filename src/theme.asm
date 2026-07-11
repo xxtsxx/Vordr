@@ -127,7 +127,6 @@ FKX equ 3
 
 ; internal-resolution caps per tier
 BW_MAX equ 480
-BH_MAX equ 320
 
 .data
 align 8
@@ -235,8 +234,6 @@ td_iconfont label word                  ; Fluent icon font (PUA glyphs e.g. tras
 align 16
 sin_lut     db 256 dup (?)
 glow_x      db BW_MAX dup (?)
-glow_y      db BH_MAX dup (?)
-glow_d      db (BW_MAX+BH_MAX) dup (?)
 g_txtbuf    dw 160 dup (?)
 g_clsbuf    dw 16 dup (?)               ; control class name (Static vs Edit)
 
