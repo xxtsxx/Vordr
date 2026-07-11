@@ -1,0 +1,50 @@
+# Vordr CI - build + full test gate on every push/PR.
+#
+# Runs tests\run_all.cmd, which is the same gate used locally:
+#   1. dbg build + all 8 redteam fault-injection cases (0xFADE fail-fast codes)
+#   2. strict release build (framecheck FATALs fail the build)
+#   3. selftest ("all self-tests passed")
+#   4. headless roundtrip: seedtest -> atgen -> zitest -> phtest
+#
+# windows-latest ships VS (ml64/link/rc) and Python; ilammy/msvc-dev-cmd puts
+# the x64 toolchain on PATH the same way a "x64 Native Tools" prompt does.
+# build.cmd's hardcoded SDK paths are a local-machine convenience - when they
+# don't exist on the runner, rc/link fall back to the INCLUDE/LIB environment
+# that msvc-dev-cmd sets, so the build works on both.
+
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  gate:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: MSVC x64 environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: run_all gate (redteam + strict build + selftest + roundtrip)
+        shell: cmd
+        run: call tests\run_all.cmd
+
+      - name: upload vordr.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: vordr-exe
+          path: bin/vordr.exe
+
+      - name: upload stage logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runall-logs
+          path: ${{ runner.temp }}\vordr_runall\
+          if-no-files-found: ignore

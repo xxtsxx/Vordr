@@ -38,64 +38,9 @@ IO_CHUNK            equ 1000000h         ; 16 MiB per ReadFile/WriteFile
 
 .data?
 align 2
-g_dfdir     dw MAX_PATH_CHARS dup (?)    ; scratch: directory of a path
 
 .code
 
-; =============================================================================
-; disk_has_space(rcx = wide path on the target volume, rdx = required bytes)
-;   -> eax: 0 = enough free, 1 = NOT enough, 2 = could not determine
-; The path may be a not-yet-existing file; we query the volume of its parent
-; directory (everything up to the last separator), which always exists at the
-; point of the check.  Returns 2 (proceed) if the query fails, so a finicky
-; filesystem never blocks a valid operation.
-; =============================================================================
-public disk_has_space
-disk_has_space proc frame
-    FRAME_PROLOG 48
-    ; [rbp-24] = required   [rbp-32] = free-bytes-available (out)
-    mov     qword ptr [rbp-24], rdx
-    ; copy path -> g_dfdir, remembering the last separator index
-    mov     r10, rcx                     ; src
-    lea     r11, [g_dfdir]               ; dst
-    xor     r9, r9                       ; index
-    mov     rax, -1                      ; last separator index (none yet)
-dhs_cpy:
-    mov     dx, word ptr [r10+r9*2]
-    mov     word ptr [r11+r9*2], dx
-    test    dx, dx
-    jz      dhs_cpyd
-    cmp     dx, '\'
-    je      dhs_sep
-    cmp     dx, '/'
-    jne     dhs_adv
-dhs_sep:
-    mov     rax, r9
-dhs_adv:
-    inc     r9
-    cmp     r9, MAX_PATH_CHARS-1
-    jb      dhs_cpy
-dhs_cpyd:
-    xIF rax, ne, -1                      ; a separator was found
-        lea     r11, [g_dfdir]           ; truncate just after the last sep
-        inc     rax
-        mov     word ptr [r11+rax*2], 0
-    xENDIF
-dhs_query:
-    WINCALL GetDiskFreeSpaceExW, addr g_dfdir, addr rbp-32, 0, 0
-    xIFZ eax
-        mov     eax, 2                   ; query failed -> proceed anyway
-    xELSE
-        mov     rax, qword ptr [rbp-32]
-        xIF rax, b, qword ptr [rbp-24]   ; free < required (unsigned)
-            mov     eax, 1
-        xELSE
-            xor     eax, eax             ; enough
-        xENDIF
-    xENDIF
-    FRAME_EPILOG
-    ret
-disk_has_space endp
 
 ; =============================================================================
 public mem_alloc
@@ -249,138 +194,12 @@ write_file endp
 ; Handle-based primitives for streaming I/O
 ; =============================================================================
 
-; file_open_read(rcx = wpath) -> rax = handle (or INVALID_HANDLE_VALUE = -1)
-public file_open_read
-file_open_read proc frame
-    FRAME_PROLOG 64
-    WINCALL CreateFileW, rcx, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, FILE_ATTR_NORMAL, 0
-    FRAME_EPILOG
-    ret
-file_open_read endp
 
-; file_open_write(rcx = wpath) -> rax = handle (or -1)
-public file_open_write
-file_open_write proc frame
-    FRAME_PROLOG 64
-    WINCALL CreateFileW, rcx, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, FILE_ATTR_NORMAL, 0
-    FRAME_EPILOG
-    ret
-file_open_write endp
 
-; get_file_size(rcx = handle, rdx = *size) -> eax 0/EXIT_IO
-public get_file_size
-get_file_size proc frame
-    FRAME_PROLOG 48
-    WINCALL GetFileSizeEx, rcx, rdx
-    test    eax, eax
-    jz      gfs_io
-    xor     eax, eax
-    FRAME_EPILOG
-    ret
-gfs_io:
-    mov     eax, EXIT_IO
-    FRAME_EPILOG
-    ret
-get_file_size endp
 
-; file_read_exact(rcx = handle, rdx = buf, r8 = len) -> eax 0/EXIT_IO
-; reads exactly len bytes (looping); short read before len -> EXIT_IO
-public file_read_exact
-file_read_exact proc frame
-    FRAME_PROLOG 64
-    mov     qword ptr [rbp-24], rcx     ; handle
-    mov     qword ptr [rbp-32], rdx     ; cursor
-    mov     qword ptr [rbp-40], r8      ; remaining
-    xWHILE qword ptr [rbp-40], ne, 0         ; while bytes remain
-        mov     r10, qword ptr [rbp-40]
-        xIF r10, a, IO_CHUNK
-            mov     r10, IO_CHUNK
-        xENDIF
-        WINCALL ReadFile, qword ptr [rbp-24], qword ptr [rbp-32], r10, addr rbp-48, 0
-        test    eax, eax
-        jz      fre_io
-        mov     r10d, dword ptr [rbp-48]
-        test    r10d, r10d
-        jz      fre_io                       ; short read / unexpected EOF
-        add     qword ptr [rbp-32], r10
-        sub     qword ptr [rbp-40], r10
-    xENDW
-fre_ok:
-    xor     eax, eax
-    FRAME_EPILOG
-    ret
-fre_io:
-    mov     eax, EXIT_IO
-    FRAME_EPILOG
-    ret
-file_read_exact endp
 
-; =============================================================================
-; file_read_at(rcx=handle, rdx=offset64, r8=buf, r9=len) -> eax 0/EXIT_IO
-; Positioned exact read: seek to offset (FILE_BEGIN) then read len bytes.  Leaves
-; the file pointer at offset+len so sequential file_read_exact can continue.
-; =============================================================================
-public file_read_at
-file_read_at proc frame
-    FRAME_PROLOG 48
-    mov     qword ptr [rbp-24], rcx         ; handle
-    mov     qword ptr [rbp-32], r8          ; buf
-    mov     qword ptr [rbp-40], r9          ; len
-    ; SetFilePointerEx(handle, distance=offset, NULL, FILE_BEGIN=0)
-    WINCALL SetFilePointerEx, rcx, rdx, 0, 0
-    test    eax, eax
-    jz      fra_io
-    mov     rcx, qword ptr [rbp-24]
-    mov     rdx, qword ptr [rbp-32]
-    mov     r8, qword ptr [rbp-40]
-    call    file_read_exact
-    FRAME_EPILOG
-    ret
-fra_io:
-    mov     eax, EXIT_IO
-    FRAME_EPILOG
-    ret
-file_read_at endp
 
-; file_write_all(rcx = handle, rdx = buf, r8 = len) -> eax 0/EXIT_IO
-public file_write_all
-file_write_all proc frame
-    FRAME_PROLOG 64
-    mov     qword ptr [rbp-24], rcx
-    mov     qword ptr [rbp-32], rdx
-    mov     qword ptr [rbp-40], r8
-    xWHILE qword ptr [rbp-40], ne, 0         ; while bytes remain
-        mov     r10, qword ptr [rbp-40]
-        xIF r10, a, IO_CHUNK
-            mov     r10, IO_CHUNK
-        xENDIF
-        WINCALL WriteFile, qword ptr [rbp-24], qword ptr [rbp-32], r10, addr rbp-48, 0
-        test    eax, eax
-        jz      fwa_io                           ; I/O error
-        mov     r10d, dword ptr [rbp-48]
-        add     qword ptr [rbp-32], r10
-        sub     qword ptr [rbp-40], r10
-    xENDW
-fwa_ok:
-    xor     eax, eax
-    FRAME_EPILOG
-    ret
-fwa_io:
-    mov     eax, EXIT_IO
-    FRAME_EPILOG
-    ret
-file_write_all endp
 
-; file_close(rcx = handle)
-public file_close
-file_close proc frame
-    FRAME_PROLOG 48
-    xIF rcx, ne, -1
-        WINCALL CloseHandle, rcx
-    xENDIF
-    FRAME_EPILOG
-    ret
-file_close endp
 
 ; file_rename(rcx = from, rdx = to) -> eax 0/EXIT_IO  (atomic replace)
 public file_rename
@@ -398,13 +217,5 @@ frn_io:
     ret
 file_rename endp
 
-; file_delete(rcx = wpath)
-public file_delete
-file_delete proc frame
-    FRAME_PROLOG 48
-    WINCALL DeleteFileW, rcx
-    FRAME_EPILOG
-    ret
-file_delete endp
 
 end

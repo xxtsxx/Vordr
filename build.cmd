@@ -36,16 +36,37 @@ rem                (0xFADE<code>) for the security test harness (tests/redteam.p
 rem ---------------------------------------------------------------------------
 set GUARDFLAGS=/CETCOMPAT
 set ASMEXTRA=
+set STRICT=0
 :argloop
 if "%1"=="" goto :doneargs
 if /i "%1"=="nohw" set GUARDFLAGS=
 if /i "%1"=="dbg" set ASMEXTRA=%ASMEXTRA% /DDBG_TRACE
+if /i "%1"=="strict" set STRICT=1
 shift
 goto :argloop
 :doneargs
 
+rem ---------------------------------------------------------------------------
+rem framecheck: static scan for WINCALL stack-arg spills that overflow a proc's
+rem frame (the raw-dialog-proc return-address-smash class, see
+rem tools\framecheck.py).  Advisory by default; "build strict" makes a FATAL
+rem finding fail the build.  Skipped silently when python is not on PATH.
+rem ---------------------------------------------------------------------------
+where python >nul 2>nul
+if errorlevel 1 goto :nofc
+echo === framecheck ===
+python tools\framecheck.py
+if errorlevel 1 (
+    if "%STRICT%"=="1" (
+        echo framecheck: FATAL frame bug - failing strict build
+        goto :failed
+    )
+    echo framecheck: WARNING - fatal findings above; build continues. Use "build strict" to gate.
+)
+:nofc
+
 set ASMFLAGS=/c /nologo /W3 /Zi %ASMEXTRA%
-set SOURCES=main console hardening random loadcfg sha256 sha1 sha512 aesgcm blake2b argon2 fileio secmem vault totp tpm regcfg pwgen bench log selftest redteam theme img preview xlexport xlcrypt csvimport zipexport zipimport inflate xlsximport oleagile gui
+set SOURCES=main console hardening random loadcfg sha256 sha1 aesgcm blake2b argon2 fileio secmem vault totp tpm regcfg pwgen bench log selftest redteam theme zipexport zipimport gui
 
 echo === assembling ===
 for %%f in (%SOURCES%) do (
@@ -76,8 +97,8 @@ link /nologo /subsystem:windows /entry:wstart /nodefaultlib /incremental:no ^
      %GUARDFLAGS% /debug /pdb:bin\vordr.pdb ^
      /manifest:embed /manifestinput:vordr.manifest /manifestuac:no ^
      /libpath:"%SDKLIB%" ^
-     /out:bin\vordr.exe obj\main.obj obj\console.obj obj\hardening.obj obj\random.obj obj\loadcfg.obj obj\sha256.obj obj\sha1.obj obj\sha512.obj obj\aesgcm.obj obj\blake2b.obj obj\argon2.obj obj\fileio.obj obj\secmem.obj obj\vault.obj obj\totp.obj obj\tpm.obj obj\regcfg.obj obj\pwgen.obj obj\bench.obj obj\log.obj obj\selftest.obj obj\redteam.obj obj\theme.obj obj\img.obj obj\preview.obj obj\xlexport.obj obj\xlcrypt.obj obj\csvimport.obj obj\zipexport.obj obj\zipimport.obj obj\inflate.obj obj\xlsximport.obj obj\oleagile.obj obj\gui.obj obj\vordr.res ^
-     kernel32.lib bcrypt.lib user32.lib gdi32.lib dwmapi.lib dxgi.lib comctl32.lib uxtheme.lib advapi32.lib comdlg32.lib ncrypt.lib shell32.lib gdiplus.lib shlwapi.lib ole32.lib
+     /out:bin\vordr.exe obj\main.obj obj\console.obj obj\hardening.obj obj\random.obj obj\loadcfg.obj obj\sha256.obj obj\sha1.obj obj\aesgcm.obj obj\blake2b.obj obj\argon2.obj obj\fileio.obj obj\secmem.obj obj\vault.obj obj\totp.obj obj\tpm.obj obj\regcfg.obj obj\pwgen.obj obj\bench.obj obj\log.obj obj\selftest.obj obj\redteam.obj obj\theme.obj obj\zipexport.obj obj\zipimport.obj obj\gui.obj obj\vordr.res ^
+     kernel32.lib bcrypt.lib user32.lib gdi32.lib msimg32.lib dwmapi.lib dxgi.lib comctl32.lib uxtheme.lib advapi32.lib comdlg32.lib ncrypt.lib shell32.lib wtsapi32.lib
 if errorlevel 1 goto :failed
 
 echo === mitigation check (optional, needs dumpbin) ===

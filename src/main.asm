@@ -32,52 +32,40 @@ endif
 endm
 
 extern hardening_init:proc
+extern sec_lock_statics:proc
 extern iat_lockdown:proc
 extern secure_zero:proc
 extern run_selftest:proc
 extern log_result:proc
 extern do_bench:proc                    ; benchmark (bench.asm)
-extern img_startup:proc                 ; GDI+ diagnostics (img.asm)
-extern img_load:proc
-extern img_dims:proc
-extern img_free:proc
-extern shell_thumb:proc
-extern DeleteObject:proc
-extern preview_open:proc
-extern preview_close:proc
-externdef g_pv_stage:dword
+extern gui_phtest:proc                  ; pw-history capture probe (gui.asm)
+extern gui_tmptest:proc                 ; secure temp-file lifecycle probe (gui.asm)
+extern cmd_secscan:proc                 ; secret-wipe page-scan probe (secmem.asm)
+extern cmd_securedesk:proc              ; secure-desktop spike (gui.asm)
 extern read_file:proc
 ifdef DBG_TRACE
 extern cmd_redteam:proc                 ; fault-injection self-test (redteam.asm)
 extern cmd_tpmtest:proc                 ; TPM seal/unseal round-trip (tpm.asm)
+extern cmd_cttest:proc                  ; ct_memcmp timing probe (hardening.asm)
 endif
 
-ENC_VAR              equ 0FFFFFFFEh  ; CMDENT.pos_args sentinel: variable (>=1)
 extern con_init:proc
 extern print_a:proc
 extern pwgen_ex:proc                    ; styled password generator (pwgen.asm)
 extern do_seed:proc                     ; bulk test-vault seeder (vault.asm)
 extern print_err:proc
-; --- xitest verb: headless .xlsx import probe (mirrors imgtest/pvtest) --------
 extern vault_unlock:proc
 extern vault_reseal:proc
-extern xlsx_import:proc
-extern xlsx_decrypt:proc
-extern csv_to_wide:proc
-extern csv_import_buffer:proc
 extern mem_free:proc
-externdef g_csv_alloc:qword
-; --- xetest verb: headless export composer probe ------------------------------
+; --- attachment export/import probes (atgen / zitest) ------------------------
 extern do_attgen:proc
-extern zi_import:proc
+extern zi_stage:proc
+extern zi_commit:proc
 extern write_file:proc
 extern ze_compose:proc
 extern ze_free:proc
-extern xl_free:proc
-extern xl_encrypt_free:proc
 externdef g_zbuf:qword
-extern g_ole_ptr:qword
-extern g_ole_len:qword
+externdef g_sel:byte
 
 CP_UTF8              equ 65001
 WC_ERR_INVALID_CHARS equ 80h
@@ -117,7 +105,10 @@ g_cfg_totp          dq 0                ; --> wide base32 TOTP secret (GUI)
 ; --- modular field list (the GUI composes this; vault_build_entry consumes it) --
 ; g_field_list[] = up to MAX_FIELDS descriptors of 3 qwords each:
 ;   { qword type(base kind), qword label-wide ptr (0=none), qword value-wide ptr }
-MAX_FIELDS          equ 32
+; Sized for the worst committed entry: title + up to MAXROWS-1 non-tile fields +
+; up to MAX_TFILES attachment files (the tile expands to one field per file) +
+; the reserved favorite/icon markers (see gui_tile_expand).
+MAX_FIELDS          equ 56
 public g_field_list, g_field_n
 g_field_n           dd 0                ; number of composed fields
 align 8
@@ -127,8 +118,6 @@ g_field_list        dq 3*MAX_FIELDS dup (0)
 public g_cfg_pass, g_positionals, g_poscount
 g_argv          dq MAX_ARGS dup (?)
 g_argbuf        dw ARGBUF_CHARS dup (?)
-g_it_buf        dq ?                     ; imgtest: file buffer
-g_it_len        dq ?
 g_gen_buf       db 160 dup (?)           ; genpw: sample output buffer
 g_cfg_pass      db MAX_PASSWORD_BYTES+1 dup (?)
 g_positionals   dq MAX_ARGS dup (?)  ; -> UTF-16 positional argument strings
@@ -171,24 +160,19 @@ seed_pw   db "vordrtest", 0
 
 WSTR w_selftest, <selftest>
 WSTR w_bench,    <bench>
-WSTR w_imgtest,  <imgtest>
-WSTR w_thumbtest,<thumbtest>
-WSTR w_pvtest,   <pvtest>
 WSTR w_genpw,    <genpw>
 WSTR w_seedtest, <seedtest>
-WSTR w_xitest,   <xitest>
-WSTR w_xdtest,   <xdtest>
-WSTR w_citest,   <citest>
-WSTR w_xetest,   <xetest>
 WSTR w_atgen,    <atgen>
 WSTR w_zitest,   <zitest>
-WSTR wpw_test,   <VordrTest123>
+WSTR w_phtest,   <phtest>
+WSTR w_secscan,  <secscan>
+WSTR w_tmptest,  <tmptest>
+WSTR w_securedesk, <securedesk>
 WSTR wpw_exp,    <VordrExp1234>
-WSTR ext_pdf,    <.pdf>
-WSTR w_pvtmp,    <pvtmp.pdf>
 ifdef DBG_TRACE
 WSTR w_redteam,  <redteam>
 WSTR w_tpmtest,  <tpmtest>
+WSTR w_cttest,   <cttest>
 endif
 WSTR w_opt_m,    <-m>
 WSTR w_opt_t,    <-t>
@@ -213,23 +197,21 @@ CMDENT ends
 cmd_table label CMDENT
     CMDENT { w_selftest,  cmd_selftest,  0, 0 }
     CMDENT { w_bench,     cmd_bench,     0, 0 }
-    CMDENT { w_imgtest,   cmd_imgtest,   1, 0 }   ; decode probe: exit=(w<<16)|h
-    CMDENT { w_thumbtest, cmd_thumbtest, 1, 0 }   ; shell-thumbnail probe: exit 0 ok
-    CMDENT { w_pvtest,    cmd_pvtest,    1, 0 }   ; preview-handler probe (.pdf): exit 0 ok
     CMDENT { w_genpw,     cmd_genpw,     0, 0 }   ; print one sample of each generator style
     CMDENT { w_seedtest,  cmd_seedtest,  1, 0 }   ; bulk-fill a test vault with 5000 entries
-    CMDENT { w_xitest,    cmd_xitest,    2, 0 }   ; headless .xlsx import probe
-    CMDENT { w_xdtest,    cmd_xdtest,    2, 0 }   ; headless encrypted .xlsx import probe
-    CMDENT { w_citest,    cmd_citest,    2, 0 }   ; headless .csv import probe
-    CMDENT { w_xetest,    cmd_xetest,    4, 0 }   ; headless export probe: <vault> <out> <fmt> <attach>
     CMDENT { w_atgen,     cmd_atgen,     1, 0 }   ; headless attachment-export probe: <out.zip>
     CMDENT { w_zitest,    cmd_zitest,    2, 0 }   ; headless encrypted-zip import probe
+    CMDENT { w_phtest,    cmd_phtest,    0, 0 }   ; headless pw-history capture probe
+    CMDENT { w_secscan,   cmd_secscan,   0, 0 }   ; secret-wipe page-scan probe
+    CMDENT { w_tmptest,   cmd_tmptest,   0, 0 }   ; secure temp-file lifecycle probe
+    CMDENT { w_securedesk, cmd_securedesk, 0, 0 } ; show a dialog on the private desktop (plan 4 spike)
 ifdef DBG_TRACE
     CMDENT { w_redteam,   cmd_redteam,   1, 0 }   ; fault-injection self-test (dbg)
     CMDENT { w_tpmtest,   cmd_tpmtest,   0, 0 }   ; TPM round-trip probe (dbg)
-CMD_COUNT equ 15
-else
+    CMDENT { w_cttest,    cmd_cttest,    0, 0 }   ; ct_memcmp timing probe (dbg)
 CMD_COUNT equ 13
+else
+CMD_COUNT equ 10
 endif
 
 .data?
@@ -980,254 +962,6 @@ cst_fail:
     ret
 cmd_seedtest endp
 
-; cmd_xitest - headless .xlsx import probe: unlock the vault at argv[2] with the
-;   fixed test password, import the workbook at argv[3], reseal.  exit = number
-;   of entries imported (or 0xE0xx on error).  Pairs with seedtest for a
-;   scriptable round-trip test of the Excel importer.
-LANDING_PAD
-cmd_xitest proc frame
-    FRAME_PROLOG 128
-    lea     r10, [g_argv]
-    mov     rax, qword ptr [r10+16]
-    mov     qword ptr [g_cfg_in], rax
-    lea     r10, [seed_pw]
-    lea     r11, [g_cfg_pass]
-    xor     ecx, ecx
-xit_cp:
-    mov     al, byte ptr [r10+rcx]
-    mov     byte ptr [r11+rcx], al
-    test    al, al
-    jz      xit_cpd
-    inc     ecx
-    cmp     ecx, 32
-    jb      xit_cp
-xit_cpd:
-    mov     dword ptr [g_cfg_passlen], 9
-    call    vault_unlock
-    test    eax, eax
-    jnz     xit_fail
-    lea     r10, [g_argv]
-    mov     rcx, qword ptr [r10+24]
-    lea     rdx, [rbp-24]
-    lea     r8, [rbp-32]
-    call    read_file
-    test    eax, eax
-    jnz     xit_fail
-    mov     rcx, qword ptr [rbp-24]
-    mov     edx, dword ptr [rbp-32]
-    call    xlsx_import
-    mov     dword ptr [rbp-40], eax
-    cmp     eax, 0
-    jl      xit_reterr
-    call    vault_reseal
-    mov     eax, dword ptr [rbp-40]
-    FRAME_EPILOG
-    ret
-xit_reterr:
-    mov     eax, dword ptr [rbp-40]
-    and     eax, 0FFFFh
-    or      eax, 0E0A0h
-    FRAME_EPILOG
-    ret
-xit_fail:
-    mov     eax, 0E0C8h
-    FRAME_EPILOG
-    ret
-cmd_xitest endp
-
-; cmd_xdtest - headless encrypted-.xlsx import probe: unlock the vault at argv[2]
-;   with the fixed test password, decrypt+import the workbook at argv[3] using the
-;   fixed test workbook password, reseal.  exit = entries imported.
-LANDING_PAD
-cmd_xdtest proc frame
-    FRAME_PROLOG 128
-    lea     r10, [g_argv]
-    mov     rax, qword ptr [r10+16]
-    mov     qword ptr [g_cfg_in], rax
-    lea     r10, [seed_pw]
-    lea     r11, [g_cfg_pass]
-    xor     ecx, ecx
-xdt_cp:
-    mov     al, byte ptr [r10+rcx]
-    mov     byte ptr [r11+rcx], al
-    test    al, al
-    jz      xdt_cpd
-    inc     ecx
-    cmp     ecx, 32
-    jb      xdt_cp
-xdt_cpd:
-    mov     dword ptr [g_cfg_passlen], 9
-    call    vault_unlock
-    test    eax, eax
-    jnz     xdt_fail
-    lea     r10, [g_argv]
-    mov     rcx, qword ptr [r10+24]
-    lea     rdx, [rbp-24]
-    lea     r8, [rbp-32]
-    call    read_file
-    test    eax, eax
-    jnz     xdt_fail
-    mov     rcx, qword ptr [rbp-24]
-    mov     edx, dword ptr [rbp-32]
-    lea     r8, [wpw_test]
-    mov     r9d, 24                             ; "VordrTest123" = 12 chars * 2
-    call    xlsx_decrypt
-    mov     dword ptr [rbp-40], eax
-    call    vault_reseal
-    mov     eax, dword ptr [rbp-40]
-    FRAME_EPILOG
-    ret
-xdt_fail:
-    mov     eax, 0E0C9h
-    FRAME_EPILOG
-    ret
-cmd_xdtest endp
-
-; cmd_citest - headless .csv import probe: unlock the vault at argv[2] with the
-;   fixed test password, import the CSV at argv[3], reseal.  exit = entries.
-LANDING_PAD
-cmd_citest proc frame
-    FRAME_PROLOG 128
-    mov     dword ptr [rbp-56], 0              ; imported count (0 on any early bail)
-    lea     r10, [g_argv]
-    mov     rax, qword ptr [r10+16]
-    mov     qword ptr [g_cfg_in], rax
-    lea     r10, [seed_pw]
-    lea     r11, [g_cfg_pass]
-    xor     ecx, ecx
-cit_cp:
-    mov     al, byte ptr [r10+rcx]
-    mov     byte ptr [r11+rcx], al
-    test    al, al
-    jz      cit_cpd
-    inc     ecx
-    cmp     ecx, 32
-    jb      cit_cp
-cit_cpd:
-    mov     dword ptr [g_cfg_passlen], 9
-    call    vault_unlock
-    test    eax, eax
-    jnz     cit_fail
-    lea     r10, [g_argv]
-    mov     rcx, qword ptr [r10+24]
-    lea     rdx, [rbp-24]                      ; *raw
-    lea     r8, [rbp-32]                       ; *rawlen
-    call    read_file
-    test    eax, eax
-    jnz     cit_fail
-    mov     rcx, qword ptr [rbp-24]
-    mov     edx, dword ptr [rbp-32]
-    lea     r8, [rbp-40]                       ; *wptr
-    lea     r9, [rbp-48]                       ; *wcount
-    call    csv_to_wide
-    test    eax, eax
-    jnz     cit_freeraw
-    mov     rcx, qword ptr [rbp-40]
-    mov     edx, dword ptr [rbp-48]
-    call    csv_import_buffer
-    mov     dword ptr [rbp-56], eax
-    cmp     qword ptr [g_csv_alloc], 0
-    je      cit_freeraw
-    mov     rcx, qword ptr [rbp-40]
-    mov     rdx, qword ptr [g_csv_alloc]
-    call    mem_free
-cit_freeraw:
-    mov     rcx, qword ptr [rbp-24]
-    mov     rdx, qword ptr [rbp-32]
-    call    mem_free
-    call    vault_reseal
-    mov     eax, dword ptr [rbp-56]
-    FRAME_EPILOG
-    ret
-cit_fail:
-    mov     eax, 0E0CAh
-    FRAME_EPILOG
-    ret
-cmd_citest endp
-
-; cmd_xetest - headless export composer probe.  Unlock the vault at argv[2] with
-;   the fixed test password, run ze_compose with the requested format (argv[4]:
-;   0=Excel 1=CSV 2=JSON) and attachments flag (argv[5]: 0/1), and write the
-;   resulting encrypted .xlsx / .zip to argv[3].  exit 0 = OK, nonzero = failure.
-LANDING_PAD
-cmd_xetest proc frame
-    FRAME_PROLOG 128
-    lea     r10, [g_argv]
-    mov     rax, qword ptr [r10+16]
-    mov     qword ptr [g_cfg_in], rax
-    lea     r10, [seed_pw]
-    lea     r11, [g_cfg_pass]
-    xor     ecx, ecx
-xet_cp:
-    mov     al, byte ptr [r10+rcx]
-    mov     byte ptr [r11+rcx], al
-    test    al, al
-    jz      xet_cpd
-    inc     ecx
-    cmp     ecx, 32
-    jb      xet_cp
-xet_cpd:
-    mov     dword ptr [g_cfg_passlen], 9
-    call    vault_unlock
-    test    eax, eax
-    jnz     xet_fail
-    ; --- parse format + attachments from the leading wide digit of each arg ---
-    lea     r10, [g_argv]
-    mov     rax, qword ptr [r10+32]              ; argv[4] = format
-    movzx   eax, word ptr [rax]
-    sub     eax, '0'
-    mov     dword ptr [rbp-24], eax              ; fmt
-    lea     r10, [g_argv]
-    mov     rax, qword ptr [r10+40]              ; argv[5] = attachments
-    movzx   eax, word ptr [rax]
-    sub     eax, '0'
-    mov     dword ptr [rbp-28], eax              ; attach
-    ; --- compose ---
-    lea     rcx, [wpw_exp]
-    mov     edx, 24                              ; "VordrExp1234" = 12 chars * 2
-    mov     r8d, dword ptr [rbp-24]
-    mov     r9d, dword ptr [rbp-28]
-    call    ze_compose
-    mov     dword ptr [rbp-32], eax              ; 0 = zip, 2 = xlsx, 1 = error
-    cmp     eax, 2
-    je      xet_wrxlsx
-    cmp     eax, 0
-    je      xet_wrzip
-    call    ze_free
-    call    vault_reseal
-    mov     eax, 0E0CBh
-    FRAME_EPILOG
-    ret
-xet_wrxlsx:
-    lea     r10, [g_argv]
-    mov     rcx, qword ptr [r10+24]              ; out path (wide)
-    mov     rdx, qword ptr [g_ole_ptr]
-    mov     r8, qword ptr [g_ole_len]
-    call    write_file
-    mov     dword ptr [rbp-36], eax
-    call    xl_encrypt_free
-    call    xl_free
-    jmp     xet_wrdone
-xet_wrzip:
-    lea     r10, [g_argv]
-    mov     rcx, qword ptr [r10+24]
-    lea     r11, [g_zbuf]
-    mov     rdx, qword ptr [r11]
-    mov     r8, qword ptr [r11+8]
-    call    write_file
-    mov     dword ptr [rbp-36], eax
-    call    ze_free
-xet_wrdone:
-    call    vault_reseal
-    mov     eax, dword ptr [rbp-36]              ; 0 = write OK
-    FRAME_EPILOG
-    ret
-xet_fail:
-    mov     eax, 0E0CCh
-    FRAME_EPILOG
-    ret
-cmd_xetest endp
-
 ; cmd_atgen - headless attachment-export probe.  Build an in-memory vault with a
 ;   single entry carrying one staged attachment, JSON-export it WITH attachments
 ;   into the AES-256 ZIP, and write the archive to argv[2].  exit 0 = OK.  Pairs
@@ -1238,10 +972,10 @@ cmd_atgen proc frame
     call    do_attgen
     test    eax, eax
     jnz     atg_fail
+    lea     r10, [g_sel]                         ; select the one entry for export
+    mov     byte ptr [r10], 1
     lea     rcx, [wpw_exp]
     mov     edx, 24                              ; "VordrExp1234" = 12 chars * 2
-    mov     r8d, EXP_JSON
-    mov     r9d, 1                               ; include attachments
     call    ze_compose
     test    eax, eax                             ; 0 = zip in g_zbuf
     jnz     atg_fail
@@ -1299,8 +1033,24 @@ zit_cpd:
     mov     edx, dword ptr [rbp-32]
     lea     r8, [wpw_exp]                        ; UTF-16 export password
     mov     r9d, 24                              ; "VordrExp1234" = 12 chars * 2
-    call    zi_import
+    call    zi_stage                            ; -> eax = staged count / <0 error
     mov     dword ptr [rbp-40], eax
+    cmp     eax, 0
+    jl      zit_freeraw                         ; error: zi_stage already freed the arena
+    lea     r10, [g_sel]                        ; headless probe: import every staged entry
+    xor     r8d, r8d
+zit_sel:
+    cmp     r8d, dword ptr [rbp-40]
+    jae     zit_seld
+    cmp     r8d, 8192
+    jae     zit_seld
+    mov     byte ptr [r10+r8], 1
+    inc     r8d
+    jmp     zit_sel
+zit_seld:
+    call    zi_commit                           ; imports selected, frees the arena
+    mov     dword ptr [rbp-40], eax
+zit_freeraw:
     mov     rcx, qword ptr [rbp-24]              ; free the raw zip
     mov     rdx, qword ptr [rbp-32]
     call    mem_free
@@ -1314,113 +1064,25 @@ zit_fail:
     ret
 cmd_zitest endp
 
-
-
-; cmd_imgtest - decode argv[2] as an image and return exit=(width<<16)|height,
-;   or 0xE00n on failure.  A headless probe for the GDI+ decode path.
+; cmd_phtest - headless password-history capture probe.  exit = g_pwhist_n after a
+;   synthetic overwrite (1 = capture works, 0 = broken).
 LANDING_PAD
-cmd_imgtest proc frame
-    FRAME_PROLOG 64
-    call    img_startup
-    test    eax, eax
-    jz      cit_start
-    lea     r10, [g_argv]
-    mov     rcx, qword ptr [r10+16]         ; argv[2] = image path
-    lea     rdx, [g_it_buf]
-    lea     r8, [g_it_len]
-    call    read_file
-    test    eax, eax
-    jnz     cit_read
-    mov     rcx, qword ptr [g_it_buf]
-    mov     rdx, qword ptr [g_it_len]
-    call    img_load
-    test    rax, rax
-    jz      cit_load
-    mov     qword ptr [rbp-24], rax
-    mov     rcx, rax
-    lea     rdx, [rbp-40]                    ; &w
-    lea     r8, [rbp-44]                     ; &h
-    call    img_dims
-    mov     rcx, qword ptr [rbp-24]
-    call    img_free
-    mov     eax, dword ptr [rbp-40]
-    shl     eax, 16
-    mov     ecx, dword ptr [rbp-44]
-    and     ecx, 0FFFFh
-    or      eax, ecx
+cmd_phtest proc frame
+    FRAME_PROLOG 32
+    call    gui_phtest
     FRAME_EPILOG
     ret
-cit_start:
-    mov     eax, 0E001h
-    FRAME_EPILOG
-    ret
-cit_read:
-    mov     eax, 0E002h
-    FRAME_EPILOG
-    ret
-cit_load:
-    mov     eax, 0E003h
-    FRAME_EPILOG
-    ret
-cmd_imgtest endp
+cmd_phtest endp
 
-; cmd_thumbtest - fetch the shell thumbnail for argv[2]; exit 0 if an HBITMAP came
-;   back, 0xE010 if none.  Probes the shell COM path headlessly.
+; cmd_tmptest - headless secure-temp-file lifecycle probe.  exit 0 = pass
+;   (a tracked %TEMP% file was overwritten + deleted by gui_temp_purge).
 LANDING_PAD
-cmd_thumbtest proc frame
-    FRAME_PROLOG 48
-    lea     r10, [g_argv]
-    mov     rcx, qword ptr [r10+16]
-    mov     edx, 256
-    mov     r8d, 256
-    call    shell_thumb
-    test    rax, rax
-    jz      ctt_none
-    mov     rcx, rax
-    call    DeleteObject
-    xor     eax, eax
+cmd_tmptest proc frame
+    FRAME_PROLOG 32
+    call    gui_tmptest
     FRAME_EPILOG
     ret
-ctt_none:
-    mov     eax, 0E010h
-    FRAME_EPILOG
-    ret
-cmd_thumbtest endp
-
-; cmd_pvtest - create + stream-initialize the preview handler for argv[2] (as a
-;   .pdf); exit 0 if the handler instantiated + initialized, 0xE02n otherwise.
-LANDING_PAD
-cmd_pvtest proc frame
-    FRAME_PROLOG 48
-    lea     r10, [g_argv]
-    mov     rcx, qword ptr [r10+16]
-    lea     rdx, [g_it_buf]
-    lea     r8, [g_it_len]
-    call    read_file
-    test    eax, eax
-    jnz     cpv_read
-    lea     rcx, [ext_pdf]
-    mov     rdx, qword ptr [g_it_buf]
-    mov     r8, qword ptr [g_it_len]
-    lea     r9, [w_pvtmp]
-    call    preview_open
-    test    rax, rax
-    jz      cpv_open
-    mov     rcx, rax
-    call    preview_close
-    xor     eax, eax
-    FRAME_EPILOG
-    ret
-cpv_read:
-    mov     eax, 0E020h
-    FRAME_EPILOG
-    ret
-cpv_open:
-    mov     eax, dword ptr [g_pv_stage]         ; 0..4 = last successful step
-    add     eax, 0E100h
-    FRAME_EPILOG
-    ret
-cmd_pvtest endp
+cmd_tmptest endp
 
 ; =============================================================================
 ; is_cli_command -> eax = 1 if argv[1] names a known command verb, else 0.
@@ -1544,6 +1206,7 @@ start proc frame
     call    hardening_init              ; 2. canary + shadow stack live
     test    eax, eax
     jz      st_oom_raw
+    call    sec_lock_statics           ; VirtualLock the static secret buffers
     DBG     'C'
     call    con_init                    ; 3. console up (protected calls ok now)
     DBG     'D'
