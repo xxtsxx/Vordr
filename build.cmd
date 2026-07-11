@@ -36,13 +36,34 @@ rem                (0xFADE<code>) for the security test harness (tests/redteam.p
 rem ---------------------------------------------------------------------------
 set GUARDFLAGS=/CETCOMPAT
 set ASMEXTRA=
+set STRICT=0
 :argloop
 if "%1"=="" goto :doneargs
 if /i "%1"=="nohw" set GUARDFLAGS=
 if /i "%1"=="dbg" set ASMEXTRA=%ASMEXTRA% /DDBG_TRACE
+if /i "%1"=="strict" set STRICT=1
 shift
 goto :argloop
 :doneargs
+
+rem ---------------------------------------------------------------------------
+rem framecheck: static scan for WINCALL stack-arg spills that overflow a proc's
+rem frame (the raw-dialog-proc return-address-smash class, see
+rem tools\framecheck.py).  Advisory by default; "build strict" makes a FATAL
+rem finding fail the build.  Skipped silently when python is not on PATH.
+rem ---------------------------------------------------------------------------
+where python >nul 2>nul
+if errorlevel 1 goto :nofc
+echo === framecheck ===
+python tools\framecheck.py
+if errorlevel 1 (
+    if "%STRICT%"=="1" (
+        echo framecheck: FATAL frame bug - failing strict build
+        goto :failed
+    )
+    echo framecheck: WARNING - fatal findings above; build continues. Use "build strict" to gate.
+)
+:nofc
 
 set ASMFLAGS=/c /nologo /W3 /Zi %ASMEXTRA%
 set SOURCES=main console hardening random loadcfg sha256 sha1 aesgcm blake2b argon2 fileio secmem vault totp tpm regcfg pwgen bench log selftest redteam theme zipexport zipimport gui
