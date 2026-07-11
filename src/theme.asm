@@ -77,6 +77,7 @@ extern IsWindowVisible:proc
 extern GetSystemInfo:proc
 extern GetSystemPowerStatus:proc
 extern DwmSetWindowAttribute:proc
+extern DwmExtendFrameIntoClientArea:proc
 extern CreateDXGIFactory1:proc
 
 ; ---- message / api constants ------------------------------------------------
@@ -626,9 +627,11 @@ theme_scrollbars endp
 ; =============================================================================
 public theme_dwm_apply
 theme_dwm_apply proc frame
-    FRAME_PROLOG 48
-    ; [rbp-24] hwnd  [rbp-40] attribute value cell
+    FRAME_PROLOG 96
+    ; [rbp-24] hwnd  [rbp-40] attribute value cell  [rbp-44] material
+    ; [rbp-48] backdrop HRESULT  MARGINS @ [rbp-64..-52]
     mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-48], 1               ; "no material" until proven otherwise
     mov     eax, dword ptr [g_col_dark]         ; dark title bar only for dark schemes
     mov     dword ptr [rbp-40], eax
     WINCALL DwmSetWindowAttribute, qword ptr [rbp-24], DWMWA_DARK, addr rbp-40, 4
@@ -649,12 +652,45 @@ tda_mat:
     mov     eax, dword ptr [rbp-44]             ; material scheme: set Mica/Acrylic
     mov     dword ptr [rbp-40], eax
     WINCALL DwmSetWindowAttribute, qword ptr [rbp-24], DWMWA_BACKDROP, addr rbp-40, 4
+    mov     dword ptr [rbp-48], eax             ; S_OK only on Win11 22H2+ DWM
     mov     dword ptr [rbp-40], DWMWA_COLOR_NONE ; no caption fill -> material shows
 tda_cap:
     WINCALL DwmSetWindowAttribute, qword ptr [rbp-24], DWMWA_CAPTION_COLOR, addr rbp-40, 4
     mov     eax, dword ptr [g_col_text]         ; caption text follows the scheme
     mov     dword ptr [rbp-40], eax
     WINCALL DwmSetWindowAttribute, qword ptr [rbp-24], DWMWA_TEXT_COLOR, addr rbp-40, 4
+    ; ---- client-area material: sheet-of-glass frame extension --------------
+    ; Material accepted by the DWM -> extend the frame into the whole client
+    ; (MARGINS all -1).  GDI paints leave the surface alpha at 0, so the
+    ; Mica/Acrylic backdrop composites through the client with the themed UI
+    ; rendered over it.  Opaque schemes (and pre-22H2 DWM, where the backdrop
+    ; set fails) reset the margins to 0 - the classic fully opaque client -
+    ; so live scheme switches revert cleanly and Win10 never sees the glass.
+    xor     ecx, ecx                            ; margin value: 0 = reset
+    cmp     dword ptr [rbp-48], 0               ; material set AND accepted?
+    jne     tda_mar
+    or      ecx, -1                             ; -1 = whole surface
+tda_mar:
+    mov     dword ptr [rbp-64], ecx             ; MARGINS {cxL, cxR, cyT, cyB}
+    mov     dword ptr [rbp-60], ecx
+    mov     dword ptr [rbp-56], ecx
+    mov     dword ptr [rbp-52], ecx
+    WINCALL DwmExtendFrameIntoClientArea, qword ptr [rbp-24], addr rbp-64
+    ; ---- layered style: only for opaque clients -----------------------------
+    ; WS_EX_LAYERED redirection can suppress the extended-frame alpha
+    ; compositing, so glass windows shed it; opaque windows keep the original
+    ; layered-at-full-alpha setup.
+    WINCALL GetWindowLongPtrW, qword ptr [rbp-24], GWL_EXSTYLE
+    cmp     dword ptr [rbp-48], 0
+    je      tda_glass
+    or      rax, WS_EX_LAYERED                  ; opaque: layered at 100%
+    WINCALL SetWindowLongPtrW, qword ptr [rbp-24], GWL_EXSTYLE, rax
+    WINCALL SetLayeredWindowAttributes, qword ptr [rbp-24], 0, WIN_ALPHA, LWA_ALPHA
+    jmp     tda_done
+tda_glass:
+    btr     rax, 19                             ; glass: clear WS_EX_LAYERED (bit 19 = 80000h)
+    WINCALL SetWindowLongPtrW, qword ptr [rbp-24], GWL_EXSTYLE, rax
+tda_done:
     FRAME_EPILOG
     ret
 theme_dwm_apply endp
@@ -669,15 +705,10 @@ theme_attach proc frame
     mov     qword ptr [rbp-24], rcx
     mov     dword ptr [rbp-32], edx
     mov     rcx, qword ptr [rbp-24]
-    call    theme_dwm_apply                     ; dark/corners/caption/backdrop
+    call    theme_dwm_apply                     ; dark/corners/caption/backdrop/glass/layered
     WINCALL GetWindowLongPtrW, qword ptr [rbp-24], GWL_STYLE
     or      rax, WS_CLIPCHILDREN            ; clip children so the frame ring isn't overpainted
     WINCALL SetWindowLongPtrW, qword ptr [rbp-24], GWL_STYLE, rax
-    ; WS_EX_LAYERED at full (100%) alpha — opaque window
-    WINCALL GetWindowLongPtrW, qword ptr [rbp-24], GWL_EXSTYLE
-    or      rax, WS_EX_LAYERED
-    WINCALL SetWindowLongPtrW, qword ptr [rbp-24], GWL_EXSTYLE, rax
-    WINCALL SetLayeredWindowAttributes, qword ptr [rbp-24], 0, WIN_ALPHA, LWA_ALPHA
     ; dark scrollbars/borders on the standard controls (listbox, multiline edits)
     WINCALL EnumChildWindows, qword ptr [rbp-24], addr theme_dark_cb, 0
     cmp     dword ptr [rbp-32], 0
