@@ -61,7 +61,6 @@ extern theme_scrollbars:proc
 extern theme_dwm_apply:proc
 extern cfg_set_dword_hkcu:proc
 extern cfg_get_dword:proc
-extern cfg_get_hklm:proc
 extern vault_field_count:proc
 extern vault_field_get:proc
 extern vault_build_entry:proc
@@ -7223,25 +7222,22 @@ mo_len_ok:
     xor     edx, edx
     call    EnableWindow
 mo_cls_ok:
-    ; TPM toggle: HKLM policy (TpmUnlock) forces + locks it; otherwise the state
-    ; reflects this vault's enrollment.  Enabled only with hardware present and
-    ; not policy-locked.
+    ; TPM toggle: HKLM policy > HKCU > per-vault enrollment.  cfg_get_dword with
+    ; a -1 sentinel default tells "neither hive set" (use enrollment) apart from
+    ; an explicit 0/1; *locked is set only for an HKLM policy value.  Enabled
+    ; only with hardware present and not policy-locked.
     mov     dword ptr [g_tpm_lock], 0
     mov     dword ptr [g_tpm_want], 0
     cmp     dword ptr [g_tpm_present], 0
     je      mo_tpm_enable                     ; no hardware -> off + disabled
-    lea     rcx, [wv_tpm]                     ; HKLM policy set?
-    lea     rdx, [rbp-40]
-    call    cfg_get_hklm
-    test    eax, eax
-    jz      mo_tpm_enroll
-    mov     eax, dword ptr [rbp-40]           ; HKLM forces the value + locks
-    and     eax, 1
+    WINCALL cfg_get_dword, addr wv_tpm, -1, addr g_tpm_lock
+    cmp     eax, -1
+    jne     mo_tpm_val
+    call    vault_tpm_has                     ; neither hive -> per-vault enrollment
     mov     dword ptr [g_tpm_want], eax
-    mov     dword ptr [g_tpm_lock], 1
     jmp     mo_tpm_enable
-mo_tpm_enroll:
-    call    vault_tpm_has                     ; else reflect per-vault enrollment
+mo_tpm_val:
+    and     eax, 1                            ; explicit HKLM (locked) / HKCU value
     mov     dword ptr [g_tpm_want], eax
 mo_tpm_enable:
     mov     rcx, qword ptr [rbp-24]
