@@ -39,6 +39,7 @@ extern run_selftest:proc
 extern log_result:proc
 extern do_bench:proc                    ; benchmark (bench.asm)
 extern gui_phtest:proc                  ; pw-history capture probe (gui.asm)
+extern gui_tmptest:proc                 ; secure temp-file lifecycle probe (gui.asm)
 extern cmd_secscan:proc                 ; secret-wipe page-scan probe (secmem.asm)
 extern cmd_securedesk:proc              ; secure-desktop spike (gui.asm)
 extern read_file:proc
@@ -165,6 +166,7 @@ WSTR w_atgen,    <atgen>
 WSTR w_zitest,   <zitest>
 WSTR w_phtest,   <phtest>
 WSTR w_secscan,  <secscan>
+WSTR w_tmptest,  <tmptest>
 WSTR w_securedesk, <securedesk>
 WSTR wpw_test,   <VordrTest123>
 WSTR wpw_exp,    <VordrExp1234>
@@ -202,14 +204,15 @@ cmd_table label CMDENT
     CMDENT { w_zitest,    cmd_zitest,    2, 0 }   ; headless encrypted-zip import probe
     CMDENT { w_phtest,    cmd_phtest,    0, 0 }   ; headless pw-history capture probe
     CMDENT { w_secscan,   cmd_secscan,   0, 0 }   ; secret-wipe page-scan probe
+    CMDENT { w_tmptest,   cmd_tmptest,   0, 0 }   ; secure temp-file lifecycle probe
     CMDENT { w_securedesk, cmd_securedesk, 0, 0 } ; show a dialog on the private desktop (plan 4 spike)
 ifdef DBG_TRACE
     CMDENT { w_redteam,   cmd_redteam,   1, 0 }   ; fault-injection self-test (dbg)
     CMDENT { w_tpmtest,   cmd_tpmtest,   0, 0 }   ; TPM round-trip probe (dbg)
     CMDENT { w_cttest,    cmd_cttest,    0, 0 }   ; ct_memcmp timing probe (dbg)
-CMD_COUNT equ 12
+CMD_COUNT equ 13
 else
-CMD_COUNT equ 9
+CMD_COUNT equ 10
 endif
 
 .data?
@@ -1071,6 +1074,16 @@ cmd_phtest proc frame
     FRAME_EPILOG
     ret
 cmd_phtest endp
+
+; cmd_tmptest - headless secure-temp-file lifecycle probe.  exit 0 = pass
+;   (a tracked %TEMP% file was overwritten + deleted by gui_temp_purge).
+LANDING_PAD
+cmd_tmptest proc frame
+    FRAME_PROLOG 32
+    call    gui_tmptest
+    FRAME_EPILOG
+    ret
+cmd_tmptest endp
 
 ; =============================================================================
 ; is_cli_command -> eax = 1 if argv[1] names a known command verb, else 0.

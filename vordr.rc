@@ -64,6 +64,7 @@
 #define IDC_V_MIDLE    260
 #define IDC_V_MWLKL    261
 #define IDC_V_MWLK     262
+#define IDC_V_MPURGE   263
 #define IDC_V_MTHEME 240
 #define IDC_V_MTHEMEL 241
 #define IDC_V_COLORPW 244
@@ -183,6 +184,7 @@ FONT 9, "Segoe UI"
     PUSHBUTTON "Dark", IDC_V_MTHEME, 130, 196, 96, 14, BS_OWNERDRAW
     PUSHBUTTON "Import secrets...", IDC_V_MIMPORT, 30, 300, 110, 14, BS_OWNERDRAW
     PUSHBUTTON "Export secrets...", IDC_V_MEXPORT, 30, 320, 110, 14, BS_OWNERDRAW
+    PUSHBUTTON "Purge temp files now", IDC_V_MPURGE, 160, 320, 110, 14, BS_OWNERDRAW
     PUSHBUTTON "=", IDC_V_MENU, 5, 7, 16, 16, BS_OWNERDRAW
 }
 
