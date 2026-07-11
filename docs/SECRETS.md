@@ -38,7 +38,9 @@ Heap secrets go through `secmem_alloc`, which VirtualLock's on allocation.
   for the ShellExecute hand-off). This is *not* left to the OS: every such path is
   tracked in `g_tempfiles` and, on vault lock/exit, `gui_temp_purge` overwrites
   the file's whole length with zeros, `FlushFileBuffers`, then `DeleteFileW`
-  (plan 8; regression-tested by the `tmptest` verb).
+  (plan 8; regression-tested by the `tmptest` verb). The **Disable attachment
+  preview** setting (`NoPreview`) suppresses the temp file entirely — attachments
+  are then download-only, so no plaintext copy is ever written outside the vault.
 
 No "unknown" rows: every secret buffer above is either locked or listed as an
 accepted exception with its rationale.
