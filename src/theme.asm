@@ -176,13 +176,14 @@ schemes label dword
     dd 001A2006h,0028320Ah,005E7A1Ah,0028320Ah,003A4612h,00F4FFE0h,00BCD090h,005E7A1Ah,0098E010h,0078B00Ah,0098E010h,00000001h,000F1804h,0034400Eh,00D0FF60h  ; Emerald
     dd 00220E06h,0038180Ah,008A3A1Ah,0038180Ah,004E2210h,00FFEAE0h,00E0B09Ah,008A3A1Ah,00FF6A2Eh,00D04818h,00FF6A2Eh,00000001h,001A0A04h,00341208h,00FFB08Ah  ; Sapphire
     dd 00282828h,002F3032h,00454950h,002F3032h,0036383Ch,00B2DBEBh,008499A8h,00454950h,001980FEh,001060D0h,001980FEh,00000001h,001F2022h,0034363Ah,0026BBB8h  ; Gruvbox
-    ; The glass scheme is DESIGNED for the sheet-of-glass compositing: every
-    ; surface colour (bg/panel/btn/side/badge) is near-black so buttons,
-    ; textboxes and cards render exactly like the window background - the dark
-    ; acrylic material shows through them all and nothing reads as an opaque
-    ; slab.  Borders sit a hair above the surfaces (barely-there seams), and
-    ; only text, glyphs and the pink accent carry the contrast.
-    dd 00080608h,000C0A0Ch,001A141Ah,000C0A0Ch,00141014h,00FFFFFFh,00D0C4CCh,001A141Ah,00FF8CB4h,00D06A94h,00FF8CB4h,00000001h,00080608h,001A141Ah,00FFB4D2h  ; Acrylic (dark glass)
+    ; The glass scheme is DESIGNED for the sheet-of-glass compositing, and it
+    ; relies on COLOUR SYMMETRY: every chrome colour (panel/frame/btn/btnsel/
+    ; border/side/badge) is EXACTLY the bg value, so whatever the compositor
+    ; does with a pixel, chrome pixels render identically to background pixels
+    ; - i.e. as the material itself.  Buttons, textbox fills, hairlines and
+    ; the sidebar ring all melt into the acrylic; the visible UI is carried
+    ; entirely by text, glyphs, the pink accent and the 2px focus underline.
+    dd 00080608h,00080608h,00080608h,00080608h,00080608h,00FFFFFFh,00D0C4CCh,00080608h,00FF8CB4h,00D06A94h,00FF8CB4h,00000001h,00080608h,00080608h,00FFB4D2h  ; Acrylic (dark glass)
 ; scheme_traits[scheme] = radius(byte0) | accent-mode(byte1: 0 solid/1 rainbow/2 two-tone) |
 ;   flags(byte2: bit0 scanlines) | backdrop material(byte3: DWMSBT_* - 0 opaque,
 ;   2 Mica, 3 Acrylic, 4 Mica-Alt; material = glass caption AND client)
