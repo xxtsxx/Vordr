@@ -117,6 +117,9 @@ if "!RT!"=="PASS" (
 bin\vordr.exe phtest > "%WORK%\phtest.log" 2>&1
 if not "!errorlevel!"=="1" ( echo   phtest: FAIL ^(exit !errorlevel!, expected 1^) & set RT=FAIL )
 
+bin\vordr.exe secscan > "%WORK%\secscan.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   secscan: FAIL ^(exit !errorlevel!, secret residue after wipe^) & set RT=FAIL )
+
 set R_ROUNDTRIP=!RT!
 call :now T1
 set /a T_ROUNDTRIP=!T1!-!T0!
