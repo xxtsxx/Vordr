@@ -795,10 +795,9 @@ sn_amethyst dw 'A','m','e','t','h','y','s','t',0
 sn_emerald dw 'E','m','e','r','a','l','d',0
 sn_sapphire dw 'S','a','p','p','h','i','r','e',0
 sn_gruvbox dw 'G','r','u','v','b','o','x',0
-sn_acrylic dw 'A','c','r','y','l','i','c',0
 align 8
-scheme_names dq sn_light,sn_sepia,sn_nord,sn_midnight,sn_commodore,sn_amethyst,sn_emerald,sn_sapphire,sn_gruvbox,sn_acrylic
-GUI_SCHEME_COUNT equ 10
+scheme_names dq sn_light,sn_sepia,sn_nord,sn_midnight,sn_commodore,sn_amethyst,sn_emerald,sn_sapphire,sn_gruvbox
+GUI_SCHEME_COUNT equ 9
 layout_gaps  dd 7, 3, 14                          ; inter-card gap (DLU) per layout
 lay_band     dd 14, 0, 18                         ; label band: card(top) vs 0=flat(left)
 lay_itemh    dd 42, 30, 58                         ; list-item pixel height (index 0 used)
