@@ -1,4 +1,4 @@
-# Vordr — 39 Improvement Plans
+# Vordr — Improvement Plans (remaining)
 
 Each plan is broken into small, independently buildable steps. Every step lists a
 concrete verification test. Global conventions used below:
@@ -20,45 +20,26 @@ concrete verification test. Global conventions used below:
 > password entry; DWM dark/immersive title-bar theming (a Mica/Acrylic client-area glass
 > variant was tried and reverted); `framecheck.py` v2 raw-proc scanner; the GitHub Actions
 > CI pipeline; and the consolidated `tests\run_all.cmd` runner.
+>
+> **Security plans 1, 2, 5, 6, 7, 8 delivered (removed from this list):**
+> (1) VirtualLock audit — every static secret buffer pinned + wiped, audited in
+> `docs/SECRETS.md`, proven by the `secscan` probe.
+> (2) Clipboard hygiene — history/cloud/monitor exclusion on every copy + a
+> configurable auto-clear timeout (`ClipSeconds`).
+> (5) Argon2id conformance — table-driven RFC 9106 / reference vectors (incl.
+> single-lane) in `selftest.asm` with per-index failure reporting.
+> (6) Constant-time comparison audit — every secret-touching compare uses
+> `ct_memcmp`/`gui_wstr_eq`, classified in `docs/SECRETS.md`, KAT'd + the dbg
+> `cttest` timing probe.
+> (7) Auto-lock — on Win+L (`WTS_SESSION_LOCK`) and after configurable idle
+> (`IdleLockMin`).
+> (8) Secure temp-file lifecycle — decrypt-to-temp attachments tracked and
+> overwritten+deleted on lock (`tmptest`), plus a "Disable attachment preview"
+> setting that avoids the temp copy entirely.
 
 ---
 
-## A. Security & Crypto (Plans 1–8)
-
-### 1. VirtualLock audit for secret buffers
-**Goal:** Every buffer that ever holds a master password, derived key, or plaintext secret is
-VirtualLock'd (non-pageable) and wiped.
-**Steps:**
-1. Inventory: grep `secmem.asm` callers; list every static/heap secret buffer in a table in
-   `docs/SECRETS.md` (name, size, lock status, wipe site).
-   *Test:* the table has no "unknown" rows; each wipe site cited as file:line.
-2. Add `sec_lock`/`sec_unlock` wrappers (VirtualLock + working-set growth fallback) in `secmem.asm`.
-   *Test:* `dbg` trace prints lock success for each region at startup; BUILD + SELFTEST.
-3. Apply to any unlocked buffers found in step 1.
-   *Test:* re-run inventory — zero unlocked rows; SELFTEST + REDTEAM.
-4. Add a redteam check: after `lock` (GUI lock or CLI exit path), scan the process's own
-   committed pages for a known sentinel password — must not be found.
-   *Test:* `dbg` build: plant sentinel, lock, scan verb reports 0 hits; then disable one wipe
-   → scan must report a hit (proves the scanner works).
-**Status: IMPLEMENTED** — sec_lock/sec_lock_statics in secmem.asm (VirtualLock + working-set-grow fallback) pin g_cfg_pass/g_vkey/g_pwbuf/g_pw2buf/g_secret_w/g_e_totp/g_totp_b32 at startup; docs/SECRETS.md audits every secret buffer + exceptions; `secscan` probe (in run_all) proves no post-wipe residue.
-
-
-### 2. Clipboard hygiene: auto-clear + history exclusion
-**Goal:** Copied secrets clear after N seconds and never enter Windows clipboard history / cloud sync.
-**Steps:**
-1. On every secret copy, also set the `ExcludeClipboardContentFromMonitorProcessing`,
-   `CanIncludeInClipboardHistory`=0 and `CanUploadToCloudClipboard`=0 formats.
-   *Test:* copy a password, press Win+V — the entry must not appear in history.
-2. Start a 30 s timer (`SetTimer` on the vault window); on fire, clear the clipboard only if
-   its sequence number (`GetClipboardSequenceNumber`) is unchanged since our copy.
-   *Test:* copy → wait 31 s → paste is empty; copy → user copies other text → wait → user's
-   text survives (sequence check proved).
-3. Settings row: timeout seconds (0 = off), persisted in HKCU.
-   *Test:* set 5 s, verify clears at ~5 s; set 0, verify never clears; SELFTEST.
-
-**Status: IMPLEMENTED** — gui_clip_markers attaches the three exclusion formats on
-every copy; the auto-clear timeout is a Settings field (`ClipSeconds`, HKLM>HKCU>
-default 20, clamp [0,3600], 0 = off) driving the sequence-checked CLIP_TIMER.
+## A. Security & Crypto (remaining: Plans 3–4)
 
 ### 3. Vault anti-rollback counter
 **Goal:** Detect an attacker restoring an older vault file (e.g. to resurrect a purged password).
@@ -84,87 +65,6 @@ truncation or record-splicing is always caught, not just per-record.
    the tamper error, not a partial load.
 3. Fuzz splice test: Python script swaps two encrypted records → unlock must fail.
    *Test:* scripted 100 random splices/truncations — 100/100 rejected; ROUNDTRIP still passes.
-
-### 5. Argon2id RFC 9106 full vector coverage
-**Goal:** Selftest covers all published Argon2id vectors, not just one.
-**Steps:**
-1. Encode the RFC 9106 §5 test vectors (and the reference-repo extended vectors) as data in
-   `selftest.asm`.
-   *Test:* cross-check each vector against `argon2_cffi` in Python before committing
-   (validate the reference itself, per the byte-shift lesson).
-2. Loop the KAT over all vectors; report which index failed.
-   *Test:* SELFTEST passes; corrupt vector #3's expected output → selftest names index 3.
-3. Time it: keep added startup cost < 100 ms (drop the highest-memory vector if needed).
-   *Test:* `bench` verb before/after; delta under budget.
-
-### 6. Constant-time comparison audit
-**Goal:** No secret-dependent early-exit comparisons anywhere.
-**Steps:**
-1. Grep for byte-compare loops (`repe cmpsb`, `jne` inside compare loops) across `src/*.asm`;
-   classify each as secret-touching or not in `docs/SECRETS.md`.
-   *Test:* table complete; each secret-touching site names its fix or why it's safe.
-2. Add `sec_memeq` (fixed-time OR-accumulate compare) to `secmem.asm` with a selftest KAT.
-   *Test:* SELFTEST includes equal/unequal/length-edge cases.
-3. Replace secret-touching sites (GCM tag check, password verify, HOTP compare).
-   *Test:* SELFTEST + REDTEAM + ROUNDTRIP all pass; `dbg` timing probe shows compare time
-   independent of first-differing-byte position (coarse check, 10k iterations).
-
-**Status: IMPLEMENTED** — audit table in docs/SECRETS.md (every mem-vs-mem compare
-classified); ct_memcmp already covered GCM/KCV/TPM, and the stragglers are fixed:
-.vaultz import pw-verifier + HMAC tag now use ct_memcmp, gui_wstr_eq (password
-confirm, export confirm, pw-history set-diff) rewritten OR-accumulating with no
-content-dependent branches. Selftest KATs both primitives; dbg `cttest` verb
-times diff@first vs diff@last (10k x 4 KiB) and passes within 2%.
-
-### 7. Auto-lock on idle and on workstation lock
-**Goal:** Vault locks itself after configurable idle time and immediately when Windows locks.
-**Steps:**
-1. Register for `WM_WTSSESSION_CHANGE` (WTSRegisterSessionNotification) on the vault window;
-   on `WTS_SESSION_LOCK` call the existing lock path.
-   *Test:* unlock vault, press Win+L, unlock Windows → Vordr shows its unlock dialog.
-2. Idle timer: `GetLastInputInfo` polled by a 30 s `SetTimer`; lock after N minutes idle.
-   *Test:* set 1 min, leave machine untouched 70 s → locked; move mouse at 50 s → not locked.
-3. Settings: idle minutes (0=off) + "lock when Windows locks" checkbox, persisted (HKLM>HKCU>default).
-   *Test:* persistence across restart; SELFTEST; FRAMES (the new handlers stay in helpers).
-
-**Status: IMPLEMENTED** — WTSRegisterSessionNotification on the vault window;
-WM_WTSSESSION_CHANGE/WTS_SESSION_LOCK jumps the existing vp_lock path (gated by
-the `LockOnWinLock` toggle, default on). IDLE_TIMER polls GetLastInputInfo every
-30 s and locks after `IdleLockMin` minutes (default 10, 0 = off, clamp 24 h);
-skips a tick while one of our own modal popups is active. Both settings HKLM>
-HKCU>default with locked-UI disable; the timer re-arms on settings save.
-
-### 8. Secure temp-file lifecycle for attachment "Open"
-**Goal:** Decrypt-to-temp files (from `gui_file_open`) are overwritten and deleted deterministically.
-**Steps:**
-1. Track every temp path created this session in a small table; on lock/exit, overwrite with
-   zeros (existing `secmem` wipe pattern via `write_file`) then delete.
-   *Test:* open an attachment, note the temp path, exit Vordr → file gone; recreate the file
-   name and check content is not recoverable via a hex viewer of the disk sectors (best-effort:
-   verify the overwrite write happened via `dbg` trace).
-2. Create temp files with `FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE` where the
-   viewer app tolerates it; fall back to the tracked-wipe path otherwise.
-   *Test:* .txt attachment opens in Notepad successfully both modes.
-3. Add a "purge temp now" action to Settings.
-   *Test:* click purges immediately while the app stays open.
-
-**Status: IMPLEMENTED** — every attachment decrypted to %TEMP% by gui_tag_open is
-recorded in g_tempfiles (path + plaintext size). gui_temp_purge overwrites each
-file's full length with zeros, FlushFileBuffers to force the platter, closes,
-DeleteFileW's it, then scrubs the table; it runs from vp_lock_go so it fires on
-every lock path (Lock button, Escape, WM_CLOSE, Win+L, idle-lock). Temp files
-are created FILE_ATTRIBUTE_TEMPORARY (cache hint). DELETE_ON_CLOSE is
-intentionally not used: the file is handed to an external viewer via
-ShellExecuteW whose handle we don't control, so the deterministic tracked-wipe
-is the reliable path. Headless `tmptest` verb (in run_all) writes/tracks/purges
-and asserts the file is gone.
-
-The on-demand "purge now" button was superseded by a **"Disable attachment
-preview"** Settings toggle (with an (i) note): when on, `gtk_open` routes every
-attachment to the Save-As download path (like executables always are), so no
-plaintext temp file is ever created. `NoPreview` persists HKLM>HKCU>default(0)
-with the usual locked-UI disable. This prevents the lingering copy rather than
-cleaning it up after the fact.
 
 ---
 
@@ -571,7 +471,7 @@ before overwriting.
 
 ## Suggested sequencing
 
-- **High user value / low risk:** 2, 7, 12, 20, 26.
+- **High user value / low risk:** 12, 20, 26.
 - **Format-touching plans (3, 4, 14, 16, 26)** each bump/extend the header — batch
   compatibly and always ship with ROUNDTRIP + a version-gate test (old vault still opens).
 - **Big rocks:** 35 (sidebar virtualization) deserves its own branch.
