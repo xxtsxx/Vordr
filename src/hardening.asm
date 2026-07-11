@@ -15,6 +15,8 @@ extern VirtualFree:proc
 extern VirtualProtect:proc
 extern GetModuleHandleW:proc
 extern rng_fill:proc                    ; random.asm: rcx=buf, rdx=len -> eax=1 ok
+extern print_a:proc                     ; console.asm (cttest probe)
+extern print_u64:proc
 
 MEM_COMMIT          equ 1000h
 MEM_RESERVE         equ 2000h
@@ -299,5 +301,116 @@ tc_fail:
     FASTFAIL FF_HEAP_TAG
 tagged_check endp
 
+; =============================================================================
+; cmd_cttest (dbg probe) - coarse constant-time check for ct_memcmp: time 10k
+;   4 KiB compares with the difference at the FIRST byte, then at the LAST
+;   byte.  An early-exit memcmp finishes the first case ~1000x faster; the
+;   constant-time compare must stay within 2x.  exit 0 = pass, 1 = fail.
+; =============================================================================
+.data?
+ctt_a   db 4096 dup (?)
+ctt_b   db 4096 dup (?)
+
+.code
+CSTR ctt_hdr,  "cttest: 10000 x ct_memcmp(4096 B), rdtsc cycles:",13,10
+CSTR ctt_l1,   "  diff at byte 0:    "
+CSTR ctt_l2,   "  diff at byte 4095: "
+CSTR ctt_nl,   13,10
+CSTR ctt_pass, "cttest: PASS (timing independent of the difference position)",13,10
+CSTR ctt_fail, "cttest: FAIL (compare time depends on the difference position)",13,10
+
+; ctt_run() -> rax = rdtsc cycles for 10000 x ct_memcmp(ctt_a, ctt_b, 4096)
+ctt_run proc frame
+    FRAME_PROLOG 48
+    ; [rbp-24] = start tsc, [rbp-32] = iterations left
+    lfence
+    rdtsc
+    shl     rdx, 32
+    or      rax, rdx
+    mov     qword ptr [rbp-24], rax
+    mov     dword ptr [rbp-32], 10000
+cr_loop:
+    lea     rcx, [ctt_a]
+    lea     rdx, [ctt_b]
+    mov     r8d, 4096
+    call    ct_memcmp
+    dec     dword ptr [rbp-32]
+    jnz     cr_loop
+    lfence
+    rdtsc
+    shl     rdx, 32
+    or      rax, rdx
+    sub     rax, qword ptr [rbp-24]
+    FRAME_EPILOG
+    ret
+ctt_run endp
+
+public cmd_cttest
+LANDING_PAD                              ; dispatch reaches handlers via CALL_GUARDED
+cmd_cttest proc frame
+    FRAME_PROLOG 48
+    ; [rbp-24] = cycles(diff@first), [rbp-32] = cycles(diff@last)
+    xor     ecx, ecx                    ; identical buffers: a[i] = b[i] = i
+    lea     r10, [ctt_a]                ; (RIP-relative; static+index would need ADDR32)
+    lea     r11, [ctt_b]
+ctt_fill:
+    mov     al, cl
+    mov     byte ptr [r10+rcx], al
+    mov     byte ptr [r11+rcx], al
+    inc     ecx
+    cmp     ecx, 4096
+    jb      ctt_fill
+    lea     rcx, [ctt_hdr]
+    mov     edx, ctt_hdr_len
+    call    print_a
+    xor     byte ptr [ctt_b], 1         ; difference at byte 0
+    call    ctt_run                     ; warm-up (page-in + caches)
+    call    ctt_run
+    mov     qword ptr [rbp-24], rax
+    xor     byte ptr [ctt_b], 1         ; restore
+    xor     byte ptr [ctt_b+4095], 1    ; difference at byte 4095
+    call    ctt_run                     ; warm-up
+    call    ctt_run
+    mov     qword ptr [rbp-32], rax
+    xor     byte ptr [ctt_b+4095], 1    ; restore
+    lea     rcx, [ctt_l1]
+    mov     edx, ctt_l1_len
+    call    print_a
+    mov     rcx, qword ptr [rbp-24]
+    call    print_u64
+    lea     rcx, [ctt_nl]
+    mov     edx, ctt_nl_len
+    call    print_a
+    lea     rcx, [ctt_l2]
+    mov     edx, ctt_l2_len
+    call    print_a
+    mov     rcx, qword ptr [rbp-32]
+    call    print_u64
+    lea     rcx, [ctt_nl]
+    mov     edx, ctt_nl_len
+    call    print_a
+    ; pass iff max < 2 * min (early exit would give a ~1000x gap)
+    mov     rax, qword ptr [rbp-24]
+    mov     rcx, qword ptr [rbp-32]
+    cmp     rax, rcx
+    jae     @F
+    xchg    rax, rcx                    ; rax = max, rcx = min
+@@: shr     rax, 1
+    cmp     rax, rcx
+    jae     ctt_bad                     ; max/2 >= min  ->  ratio >= 2x
+    lea     rcx, [ctt_pass]
+    mov     edx, ctt_pass_len
+    call    print_a
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+ctt_bad:
+    lea     rcx, [ctt_fail]
+    mov     edx, ctt_fail_len
+    call    print_a
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_cttest endp
 
 end

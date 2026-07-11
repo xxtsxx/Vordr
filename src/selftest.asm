@@ -28,6 +28,7 @@ extern vault_selftest:proc
 extern hmac_sha1:proc
 extern base32_decode:proc
 extern hotp:proc
+extern gui_wstr_eq:proc                  ; constant-time wide-string equality (gui.asm)
 externdef g_cfg_pass:byte
 externdef g_cfg_passlen:dword
 externdef g_cfg_pwminlen:dword
@@ -127,6 +128,24 @@ CSTR st_pass_o16,  "  [PASS] base32->hotp path  (16-char key, high bytes)",13,10
 CSTR st_fail_o16,  "  [FAIL] base32->hotp path",13,10
 CSTR st_pass_mac2, "  [PASS] hmac-sha1 short key  (RFC 2202 case 2)",13,10
 CSTR st_fail_mac2, "  [FAIL] hmac-sha1 short key",13,10
+CSTR st_pass_ctm,  "  [PASS] constant-time compare  (ct_memcmp + wstr_eq edges)",13,10
+CSTR st_fail_ctm,  "  [FAIL] constant-time compare",13,10
+
+; ct_memcmp KAT buffers: b == a; c differs in byte 0; d differs in byte 15
+ctm_a       db 010h,020h,030h,040h,050h,060h,070h,080h
+            db 090h,0a0h,0b0h,0c0h,0d0h,0e0h,0f0h,0ffh
+ctm_b       db 010h,020h,030h,040h,050h,060h,070h,080h
+            db 090h,0a0h,0b0h,0c0h,0d0h,0e0h,0f0h,0ffh
+ctm_c       db 011h,020h,030h,040h,050h,060h,070h,080h
+            db 090h,0a0h,0b0h,0c0h,0d0h,0e0h,0f0h,0ffh
+ctm_d       db 010h,020h,030h,040h,050h,060h,070h,080h
+            db 090h,0a0h,0b0h,0c0h,0d0h,0e0h,0f0h,0feh
+; gui_wstr_eq edges: equal / differ-last / proper prefix (both directions)
+align 2
+ws_a        dw 'v','o','r','d','r',0
+ws_b        dw 'v','o','r','d','r',0
+ws_c        dw 'v','o','r','d','R',0
+ws_d        dw 'v','o','r',0
 
 ; RFC 2202 HMAC-SHA1 test case 1: key = 0x0b x20, data = "Hi There"
 hm_key      db 020 dup (0bh)             ; (only first 20 used)
@@ -816,6 +835,60 @@ st_o16_fail:
     STPRINT st_fail_o16, st_fail_o16_len
     inc     qword ptr [rbp-24]
 st_after_o16:
+
+    ; ---- constant-time compare primitives -----------------------------------
+    ; ct_memcmp: equal, differ-first, differ-last, zero-length
+    lea     rcx, [ctm_a]
+    lea     rdx, [ctm_b]
+    mov     r8, 16
+    call    ct_memcmp
+    test    eax, eax
+    jnz     st_ctm_fail                       ; equal buffers must give 0
+    lea     rcx, [ctm_a]
+    lea     rdx, [ctm_c]
+    mov     r8, 16
+    call    ct_memcmp
+    cmp     eax, 1
+    jne     st_ctm_fail                       ; first-byte difference -> exactly 1
+    lea     rcx, [ctm_a]
+    lea     rdx, [ctm_d]
+    mov     r8, 16
+    call    ct_memcmp
+    cmp     eax, 1
+    jne     st_ctm_fail                       ; last-byte difference -> exactly 1
+    lea     rcx, [ctm_a]
+    lea     rdx, [ctm_c]
+    xor     r8d, r8d
+    call    ct_memcmp
+    test    eax, eax
+    jnz     st_ctm_fail                       ; zero length -> equal
+    ; gui_wstr_eq: equal, differ-last, prefix (both directions)
+    lea     rcx, [ws_a]
+    lea     rdx, [ws_b]
+    call    gui_wstr_eq
+    cmp     eax, 1
+    jne     st_ctm_fail
+    lea     rcx, [ws_a]
+    lea     rdx, [ws_c]
+    call    gui_wstr_eq
+    test    eax, eax
+    jnz     st_ctm_fail
+    lea     rcx, [ws_a]
+    lea     rdx, [ws_d]
+    call    gui_wstr_eq
+    test    eax, eax
+    jnz     st_ctm_fail                       ; longer vs prefix -> different
+    lea     rcx, [ws_d]
+    lea     rdx, [ws_a]
+    call    gui_wstr_eq
+    test    eax, eax
+    jnz     st_ctm_fail                       ; prefix vs longer -> different
+    STPRINT st_pass_ctm, st_pass_ctm_len
+    jmp     st_after_ctm
+st_ctm_fail:
+    STPRINT st_fail_ctm, st_fail_ctm_len
+    inc     qword ptr [rbp-24]
+st_after_ctm:
 
     mov     rax, qword ptr [rbp-24]
     FRAME_EPILOG

@@ -3710,7 +3710,8 @@ gpc_field:
     imul    eax, eax, 24
     lea     r11, [g_field_list]
     add     r11, rax
-    mov     ecx, dword ptr [r11]             ; kind (low byte)
+    mov     qword ptr [rbp-64], r11           ; field slot (survives the calls below;
+    mov     ecx, dword ptr [r11]             ;   volatile regs don't)
     and     ecx, VF_KINDMASK
     cmp     ecx, VF_TITLE                     ; skip non-tile fields (title / reserved /
     je      gpc_fieldnext                     ;   attachment placeholders)
@@ -3739,7 +3740,8 @@ gpc_haveEL:
     jz      gpc_fieldnext                     ; different tile -> keep looking
     mov     rcx, qword ptr [rbp-32]           ; same label: compare values
     add     rcx, PWORIG_VAL
-    mov     rdx, qword ptr [r11+16]
+    mov     rax, qword ptr [rbp-64]           ; reload the field slot
+    mov     rdx, qword ptr [rax+16]
     call    gui_wstr_eq
     test    eax, eax
     jnz     gpc_orignext                      ; same label + value still present -> not overwritten
@@ -5698,23 +5700,32 @@ gui_row_handle proc
 gui_row_handle endp
 
 ; gui_wstr_eq(rcx=a, rdx=b) -> eax = 1 if the wide NUL-terminated strings match.  Leaf.
+public gui_wstr_eq                       ; selftest KATs the constant-time behavior
 gui_wstr_eq proc
-    xor     r8d, r8d
+    ; Constant-time in the CONTENT: differences are OR-accumulated and never
+    ; branched on, so timing can't reveal the first differing character.  The
+    ; loop still ends at either string's NUL (running to a fixed bound would
+    ; read past short allocations), so only min(len_a,len_b) is timing-visible.
+    ; Some callers compare secrets (password confirm, pw-history set-diff).
+    ; Clobbers rax, r8, r9, r10 only.
+    xor     r8d, r8d                    ; index
+    xor     r10d, r10d                  ; accumulated difference
 wse_l:
     movzx   eax, word ptr [rcx+r8*2]
     movzx   r9d, word ptr [rdx+r8*2]
-    cmp     eax, r9d
-    jne     wse_ne
-    test    eax, eax
-    jz      wse_eq
+    xor     r9d, eax                    ; r9d = a xor b
+    or      r10d, r9d                   ; covers a length mismatch too: the
+    test    eax, eax                    ;   shorter side's NUL xor the longer
+    jz      wse_done                    ;   side's char is nonzero
+    cmp     r9d, eax                    ; diff == a  <=>  b == 0 -> stop
+    je      wse_done                    ;   (a NUL test, not a content test)
     inc     r8d
     cmp     r8d, 4096
     jb      wse_l
-wse_ne:
-    xor     eax, eax
-    ret
-wse_eq:
-    mov     eax, 1
+wse_done:
+    neg     r10d                        ; CF=1 iff any difference accumulated
+    sbb     eax, eax                    ; eax = -1 if different, 0 if equal
+    inc     eax                         ; eax = 1 if equal, 0 if different
     ret
 gui_wstr_eq endp
 
@@ -8406,25 +8417,11 @@ lp_tpm_done:
 gui_load_policy endp
 
 ; gui_pw_match() -> eax = 1 if g_pwbuf == g_pw2buf (wide, NUL-terminated).
+;   Tail-calls the constant-time gui_wstr_eq (secret-vs-secret compare).
 gui_pw_match proc
-    lea     r10, [g_pwbuf]
-    lea     r11, [g_pw2buf]
-    xor     ecx, ecx
-pm_loop:
-    movzx   eax, word ptr [r10+rcx*2]
-    movzx   edx, word ptr [r11+rcx*2]
-    cmp     eax, edx
-    jne     pm_no
-    test    eax, eax
-    jz      pm_yes
-    inc     ecx
-    jmp     pm_loop
-pm_no:
-    xor     eax, eax
-    ret
-pm_yes:
-    mov     eax, 1
-    ret
+    lea     rcx, [g_pwbuf]
+    lea     rdx, [g_pw2buf]
+    jmp     gui_wstr_eq
 gui_pw_match endp
 
 ; gui_wipepw_create() - scrub both wide password buffers.
