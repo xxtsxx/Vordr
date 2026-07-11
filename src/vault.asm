@@ -166,6 +166,7 @@ CSTR m_empty,   "(vault is empty)",13,10
 .data?
 align 16
 g_kat_body  db 512 dup (?)             ; scratch body for the field-serialization KAT
+public g_vkey
 g_vkey      db 32 dup (?)
 g_sha32     db 32 dup (?)
 g_hdr       db VH_TOTAL dup (?)
