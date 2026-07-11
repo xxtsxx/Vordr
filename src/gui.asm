@@ -570,6 +570,8 @@ MAX_TABS     equ 16           ; distinct labels (tabs) shown in the history brow
 IDC_V_TIMES  equ 236          ; created/modified timestamps line (below the last row)
 IDC_V_FAV    equ 237          ; header favorite (star) toggle
 IDC_V_CANCEL equ 238          ; "Cancel" button (edit mode, discards edits)
+IDC_V_TRASH  equ 270          ; sidebar: toggle trash view (deleted entries)
+IDC_V_RESTORE equ 271         ; detail: restore the shown trashed entry (trash view only)
 FIELD_AREA_BOTTOM equ 292        ; rows may not grow past here (DLU; Add-field is at 296)
 ; Win32 window styles (gui.asm builds controls at runtime; the RC gets these
 ; from windows.h, but this module needs the numeric values).
@@ -622,6 +624,10 @@ WSTR t_err,         <Vordr - error>
 WSTR m_nocpu,       <This CPU lacks required features (AES-NI / PCLMULQDQ / SSE4.1) - cannot run.>
 WSTR m_stfail,      <Self-test FAILED - refusing to run. The binary may be corrupt.>
 WSTR t_remove,      <Remove this entry?>
+WSTR t_trash,       <Move this entry to the trash? It can be restored for 30 days.>
+WSTR t_delforever,  <Permanently delete this entry? This cannot be undone.>
+WSTR wb_trash,      <Trash>
+WSTR wb_vault,      <Vault>
 WSTR s_pickvault,   <Select or create a vault file first.>
 WSTR s_nopw,        <Enter the master password.>
 WSTR s_badpw,       <Password must be 1..1024 UTF-8 bytes.>
@@ -1120,6 +1126,10 @@ g_url_origproc dq ?                  ; original EDIT wndproc (URL fields subclas
 g_fields      db MAXROWS*DESCSZ dup (?)   ; row descriptors
 g_field_count dd ?                        ; live row count
 g_fav_state   dd ?                         ; current entry is a favorite (0/1)
+g_deleted_state dd ?                       ; current entry is soft-deleted / in trash (0/1)
+g_trash_view  dd ?                         ; sidebar shows the trash (deleted entries) instead
+align 2
+g_deleted_ft  dw 20 dup (?)                ; VF_DELETED value: 16 wide hex FILETIME + NUL
 g_icon_set    dd ?                         ; current entry has a custom icon override (0/1)
 g_icon_glyph  dd ?                         ; override glyph codepoint (when g_icon_set)
 g_icon_color  dd ?                         ; override tile COLORREF   (when g_icon_set)
@@ -1627,6 +1637,10 @@ gp_loop:
     mov     eax, dword ptr [rbp-40]
     cmp     eax, dword ptr [rbp-32]
     jae     gp_done
+    mov     ecx, dword ptr [rbp-40]             ; trash filter: show deleted iff in trash view
+    call    gui_entry_is_deleted
+    cmp     eax, dword ptr [g_trash_view]
+    jne     gp_next
     cmp     dword ptr [rbp-56], 0               ; empty query -> show everything
     je      gp_show
     mov     ecx, dword ptr [rbp-40]
@@ -3270,6 +3284,23 @@ gui_showdetail proc frame
     mov     ecx, dword ptr [rbp-32]           ; favorite state for this entry
     call    gui_entry_is_fav
     mov     dword ptr [g_fav_state], eax
+    mov     ecx, dword ptr [rbp-32]           ; soft-delete (trash) state for this entry
+    call    gui_entry_is_deleted
+    mov     dword ptr [g_deleted_state], eax
+    test    eax, eax
+    jz      gsd_nodel
+    mov     ecx, dword ptr [rbp-32]           ; preserve the original deletion timestamp
+    mov     edx, VF_DELETED
+    lea     r8, [rbp-48]
+    call    vault_field_at
+    test    rax, rax
+    jz      gsd_nodel
+    mov     rcx, rax
+    mov     edx, dword ptr [rbp-48]
+    lea     r8, [g_deleted_ft]
+    mov     r9d, 17
+    call    gui_towide
+gsd_nodel:
     mov     ecx, dword ptr [rbp-32]           ; custom icon override for this entry
     call    gui_entry_icon
     mov     dword ptr [g_icon_set], eax
@@ -3322,6 +3353,8 @@ gsd_floop:
     je      gsd_fnext
     cmp     eax, VF_PWHIST                       ; archived old password: not a row
     je      gsd_pwhist
+    cmp     eax, VF_DELETED                      ; soft-delete marker: not a row
+    je      gsd_fnext
     cmp     eax, VF_IMAGE                        ; attachments collapse into one tile
     je      gsd_attach
     cmp     eax, VF_FILE
@@ -3793,6 +3826,19 @@ gg_done:
     mov     qword ptr [r11+16], rax              ; value "1"
     inc     dword ptr [rbp-32]
 gg_favdone:
+    ; append the reserved soft-delete marker (trash) when set
+    cmp     dword ptr [g_deleted_state], 0
+    je      gg_deldone
+    mov     eax, dword ptr [rbp-32]
+    imul    eax, eax, 24
+    lea     r11, [g_field_list]
+    add     r11, rax
+    mov     qword ptr [r11+0], VF_DELETED
+    mov     qword ptr [r11+8], 0                 ; no label
+    lea     rax, [g_deleted_ft]
+    mov     qword ptr [r11+16], rax              ; value = 16 hex FILETIME
+    inc     dword ptr [rbp-32]
+gg_deldone:
     ; append the custom icon override when set
     cmp     dword ptr [g_icon_set], 0
     je      gg_icondone
@@ -7565,6 +7611,181 @@ gui_entry_is_fav proc frame
     ret
 gui_entry_is_fav endp
 
+; gui_entry_is_deleted(ecx=idx) -> eax = 1 if the entry carries a VF_DELETED marker
+;   (soft-deleted / in the trash).  Leaf-ish wrapper over vault_field_at.
+gui_entry_is_deleted proc frame
+    FRAME_PROLOG 48
+    mov     edx, VF_DELETED
+    lea     r8, [rbp-24]
+    call    vault_field_at                      ; rax = ptr or 0
+    xor     ecx, ecx
+    test    rax, rax
+    setnz   cl
+    mov     eax, ecx
+    FRAME_EPILOG
+    ret
+gui_entry_is_deleted endp
+
+; gui_ft_hex16(rcx = value qword, rdx = dst wide) - format the 64-bit value as 16
+;   uppercase hex wide chars (high nibble first) + a NUL.  Leaf.
+gui_ft_hex16 proc
+    mov     r9, rcx                             ; value (ecx will be clobbered by shift)
+    xor     r8d, r8d                            ; i
+fh_lp:
+    mov     r10d, 15
+    sub     r10d, r8d                           ; nibble index high->low
+    lea     ecx, [r10*4]                        ; shift amount
+    mov     rax, r9
+    shr     rax, cl
+    and     eax, 0Fh
+    cmp     al, 10
+    jb      fh_dec
+    add     al, 'A'-10
+    jmp     fh_emit
+fh_dec:
+    add     al, '0'
+fh_emit:
+    movzx   eax, al
+    mov     word ptr [rdx+r8*2], ax
+    inc     r8d
+    cmp     r8d, 16
+    jb      fh_lp
+    mov     word ptr [rdx+r8*2], 0              ; NUL
+    ret
+gui_ft_hex16 endp
+
+; gui_hex16_to_ft(rcx = utf8/ascii hex ptr, >= 16 chars) -> rax = parsed 64-bit value.
+;   Stops at 16 chars; non-hex bytes contribute 0.  Leaf.
+gui_hex16_to_ft proc
+    xor     rax, rax
+    xor     r8d, r8d
+hf_lp:
+    movzx   r9d, byte ptr [rcx+r8]
+    shl     rax, 4
+    cmp     r9b, '0'
+    jb      hf_skip
+    cmp     r9b, '9'
+    ja      hf_alpha
+    sub     r9d, '0'
+    or      rax, r9
+    jmp     hf_skip
+hf_alpha:
+    or      r9d, 20h                            ; fold to lower
+    cmp     r9b, 'a'
+    jb      hf_skip
+    cmp     r9b, 'f'
+    ja      hf_skip
+    sub     r9d, 'a'-10
+    or      rax, r9
+hf_skip:
+    inc     r8d
+    cmp     r8d, 16
+    jb      hf_lp
+    ret
+gui_hex16_to_ft endp
+
+; gui_set_deleted_now() - stamp g_deleted_ft with the current time (16 wide hex).
+gui_set_deleted_now proc frame
+    FRAME_PROLOG 48
+    lea     rcx, [rbp-40]                       ; FILETIME (8 bytes)
+    call    GetSystemTimeAsFileTime
+    mov     rcx, qword ptr [rbp-40]
+    lea     rdx, [g_deleted_ft]
+    call    gui_ft_hex16
+    FRAME_EPILOG
+    ret
+gui_set_deleted_now endp
+
+; gui_purge_trash() -> eax = count of entries permanently removed.  Walks the vault
+;   high->low, hard-removing any VF_DELETED entry whose timestamp is older than 30
+;   days.  Reseals if anything was purged.  Called once at unlock.
+gui_purge_trash proc frame
+    FRAME_PROLOG 64
+    ; [rbp-24] now-ft, [rbp-32] purged count, [rbp-40] index
+    lea     rcx, [rbp-56]
+    call    GetSystemTimeAsFileTime
+    mov     rax, qword ptr [rbp-56]
+    mov     qword ptr [rbp-24], rax             ; now (FILETIME)
+    mov     dword ptr [rbp-32], 0
+    call    vault_count
+    mov     dword ptr [rbp-40], eax             ; i = count
+pt_loop:
+    cmp     dword ptr [rbp-40], 0
+    jle     pt_done
+    dec     dword ptr [rbp-40]                  ; i-- (walk downward)
+    mov     ecx, dword ptr [rbp-40]
+    mov     edx, VF_DELETED
+    lea     r8, [rbp-64]                        ; &vallen
+    call    vault_field_at                      ; rax = value ptr (0 if not deleted)
+    test    rax, rax
+    jz      pt_loop
+    cmp     qword ptr [rbp-64], 16              ; need a full 16-hex timestamp
+    jb      pt_loop
+    mov     rcx, rax
+    call    gui_hex16_to_ft                     ; rax = deletion FILETIME
+    mov     r10, qword ptr [rbp-24]
+    sub     r10, rax                            ; age in FILETIME units
+    mov     rax, 25920000000000                 ; 30 days * 24h * 3600s * 1e7 (100ns)
+    cmp     r10, rax
+    jbe     pt_loop                             ; younger than 30 days -> keep
+    mov     ecx, dword ptr [rbp-40]             ; expired -> hard remove
+    call    vault_remove_at
+    inc     dword ptr [rbp-32]
+    jmp     pt_loop
+pt_done:
+    cmp     dword ptr [rbp-32], 0
+    je      pt_ret
+    call    vault_reseal
+pt_ret:
+    mov     eax, dword ptr [rbp-32]
+    FRAME_EPILOG
+    ret
+gui_purge_trash endp
+
+.const
+tr_hex_upper db "0123456789ABCDEF"
+tr_hex_lower db "0123456789abcdef"
+.code
+; gui_trtest() -> eax = 0 pass / 1 fail.  Headless probe for the trash timestamp
+;   encode/decode and the 30-day purge threshold (the computational core of the
+;   soft-delete lifecycle).
+public gui_trtest
+gui_trtest proc frame
+    FRAME_PROLOG 96
+    lea     rcx, [tr_hex_upper]                  ; parse 16 upper hex -> 0x0123456789ABCDEF
+    call    gui_hex16_to_ft
+    mov     r10, 0123456789ABCDEFh
+    cmp     rax, r10
+    jne     tr_fail
+    lea     rcx, [tr_hex_lower]                  ; lowercase must parse identically
+    call    gui_hex16_to_ft
+    cmp     rax, r10
+    jne     tr_fail
+    mov     rcx, 0ABh                            ; format 0xAB -> "00000000000000AB"
+    lea     rdx, [rbp-64]
+    call    gui_ft_hex16
+    cmp     word ptr [rbp-64], '0'               ; first nibble char
+    jne     tr_fail
+    cmp     word ptr [rbp-64+28], 'A'            ; char[14]
+    jne     tr_fail
+    cmp     word ptr [rbp-64+30], 'B'            ; char[15]
+    jne     tr_fail
+    mov     rax, 34560000000000                  ; 40-day age exceeds the 30-day threshold
+    mov     r10, 25920000000000
+    cmp     rax, r10
+    jbe     tr_fail
+    mov     rax, 8640000000000                   ; 10-day age is under the threshold
+    cmp     rax, r10
+    ja      tr_fail
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+tr_fail:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gui_trtest endp
+
 ; gui_update_fav_glyph(rcx=hdlg) - set the star button glyph from g_fav_state.
 gui_update_fav_glyph proc frame
     FRAME_PROLOG 48
@@ -7578,6 +7799,37 @@ guf_set:
     FRAME_EPILOG
     ret
 gui_update_fav_glyph endp
+
+; gui_update_trash_btn(rcx = hdlg) - label the trash toggle "Vault" while in the
+;   trash (so it returns you to the vault) or "Trash" while in the normal view.
+gui_update_trash_btn proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    lea     rax, [wb_trash]
+    cmp     dword ptr [g_trash_view], 0
+    je      gut_set
+    lea     rax, [wb_vault]
+gut_set:
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_TRASH, rax
+    FRAME_EPILOG
+    ret
+gui_update_trash_btn endp
+
+; gui_update_restore_btn(rcx = hdlg) - show the Restore button only in trash view.
+gui_update_restore_btn proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    mov     edx, IDC_V_RESTORE
+    call    GetDlgItem
+    mov     r8d, SW_HIDE
+    cmp     dword ptr [g_trash_view], 0
+    je      gur_show
+    mov     r8d, SW_SHOW
+gur_show:
+    WINCALL ShowWindow, rax, r8d
+    FRAME_EPILOG
+    ret
+gui_update_restore_btn endp
 
 ; gui_addfield_menu(rcx=hdlg) - popup the field-type palette at the cursor.
 gui_addfield_menu proc frame
@@ -8226,6 +8478,11 @@ vp_init:
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_REMOVE, addr wb_rem
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_OVFL, addr wb_more
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_FAV, addr wb_star
+    mov     dword ptr [g_trash_view], 0       ; start in the vault (not the trash) view
+    mov     dword ptr [g_deleted_state], 0
+    call    gui_purge_trash                   ; drop entries trashed > 30 days ago
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_update_trash_btn
     call    gui_load_prefs                    ; apply persisted color scheme + layout
     mov     rcx, qword ptr [rbp-8]
     call    gui_apply_scheme
@@ -8297,6 +8554,10 @@ vp_cmd_fixed:
     je      ve_save                           ; discard edits, back to view mode
     cmp     eax, IDC_V_REMOVE
     je      vp_remove
+    cmp     eax, IDC_V_TRASH
+    je      vp_trash
+    cmp     eax, IDC_V_RESTORE
+    je      vp_restore
     cmp     eax, IDC_V_LOCK
     je      vp_lock
     cmp     eax, IDC_V_MENU
@@ -8803,12 +9064,24 @@ vsr_view:
 vp_remove:
     cmp     dword ptr [g_cur_idx], 0
     jl      vp_handled
-    WINCALL gui_msgbox, qword ptr [rbp-8], addr t_remove, addr t_err, <MB_YESNO or MB_ICONQUESTION>
+    cmp     dword ptr [g_trash_view], 0
+    jne     vpr_forever                      ; already in trash -> permanent delete
+    WINCALL gui_msgbox, qword ptr [rbp-8], addr t_trash, addr t_err, <MB_YESNO or MB_ICONQUESTION>
+    cmp     eax, IDYES
+    jne     vp_handled
+    mov     dword ptr [g_deleted_state], 1   ; soft-delete: mark VF_DELETED + reseal
+    call    gui_set_deleted_now
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_commit
+    jmp     vpr_teardown
+vpr_forever:
+    WINCALL gui_msgbox, qword ptr [rbp-8], addr t_delforever, addr t_err, <MB_YESNO or MB_ICONWARNING>
     cmp     eax, IDYES
     jne     vp_handled
     mov     ecx, dword ptr [g_cur_idx]
     call    vault_remove_at
     call    vault_reseal
+vpr_teardown:
     mov     rcx, qword ptr [rbp-8]
     call    gui_poplist
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_TITLE, 0
@@ -8822,10 +9095,34 @@ vp_remove:
     add     rsp, 32
     mov     dword ptr [g_cur_idx], -1
     mov     dword ptr [g_dirty], 0
+    mov     dword ptr [g_deleted_state], 0
     mov     rcx, qword ptr [rbp-8]            ; back to view mode
     xor     edx, edx
     call    gui_set_editmode
     jmp     vp_handled
+vp_trash:
+    mov     eax, dword ptr [g_trash_view]    ; toggle trash / vault view
+    xor     eax, 1
+    mov     dword ptr [g_trash_view], eax
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_update_trash_btn
+    mov     rcx, qword ptr [rbp-8]           ; clear the detail pane + refill the list
+    call    gui_rows_clear
+    WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_TITLE, 0
+    mov     dword ptr [g_cur_idx], -1
+    mov     dword ptr [g_totp_on], 0
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_poplist
+    mov     rcx, qword ptr [rbp-8]           ; show/hide the Restore button
+    call    gui_update_restore_btn
+    jmp     vp_handled
+vp_restore:
+    cmp     dword ptr [g_cur_idx], 0         ; restore the shown trashed entry
+    jl      vp_handled
+    mov     dword ptr [g_deleted_state], 0   ; clear the marker + reseal
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_commit
+    jmp     vpr_teardown
 vp_lock:
 vp_close:
     cmp     dword ptr [g_menu_open], 0       ; closing while settings open -> save

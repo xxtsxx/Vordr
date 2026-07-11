@@ -100,6 +100,8 @@ VF_ICON             equ 12         ; reserved: custom icon override, value = 12 
                                    ;   chars "GGGGCCCCCCCC" (glyph codepoint + COLORREF)
 VF_PWHIST           equ 13         ; reserved: one overwritten password + when it was
                                    ;   changed; value = 16 hex FILETIME + old password
+VF_DELETED          equ 14         ; reserved: entry is in the trash; value = 16 hex
+                                   ;   FILETIME of when it was deleted (soft-delete marker)
 ; A stored field type carries the base kind in its low byte; VF_LABELED in the
 ; high byte marks a field whose value bytes are prefixed with a custom label:
 ;   labeled: bytes = u16 labellen | label_utf8 | value_utf8
