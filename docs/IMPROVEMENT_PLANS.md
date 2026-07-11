@@ -148,6 +148,17 @@ HKCU>default with locked-UI disable; the timer re-arms on settings save.
 3. Add a "purge temp now" action to Settings.
    *Test:* click purges immediately while the app stays open.
 
+**Status: IMPLEMENTED** — every attachment decrypted to %TEMP% by gui_tag_open is
+recorded in g_tempfiles (path + plaintext size). gui_temp_purge overwrites each
+file's full length with zeros, FlushFileBuffers to force the platter, closes,
+DeleteFileW's it, then scrubs the table; it runs from vp_lock_go so it fires on
+every lock path (Lock button, Escape, WM_CLOSE, Win+L, idle-lock). Temp files
+are created FILE_ATTRIBUTE_TEMPORARY (cache hint). A "Purge temp files now"
+Settings button calls it on demand. DELETE_ON_CLOSE is intentionally not used:
+the file is handed to an external viewer via ShellExecuteW whose handle we don't
+control, so the deterministic tracked-wipe is the reliable path. Headless
+`tmptest` verb (in run_all) writes/tracks/purges and asserts the file is gone.
+
 ---
 
 ## B. Features (Plans 9–20)

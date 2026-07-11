@@ -94,7 +94,7 @@ set /a T_SELFTEST=!T1!-!T0!
 
 rem -------------------------------------------------------------- roundtrip --
 call :now T0
-echo === stage: roundtrip (seedtest / atgen / zitest / phtest) ===
+echo === stage: roundtrip (seedtest / atgen / zitest / phtest / secscan / tmptest) ===
 set RT=PASS
 
 bin\vordr.exe seedtest "%WORK%\rt.vault" > "%WORK%\seedtest.log" 2>&1
@@ -119,6 +119,9 @@ if not "!errorlevel!"=="1" ( echo   phtest: FAIL ^(exit !errorlevel!, expected 1
 
 bin\vordr.exe secscan > "%WORK%\secscan.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   secscan: FAIL ^(exit !errorlevel!, secret residue after wipe^) & set RT=FAIL )
+
+bin\vordr.exe tmptest > "%WORK%\tmptest.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   tmptest: FAIL ^(exit !errorlevel!, temp file not wiped+deleted^) & set RT=FAIL )
 
 set R_ROUNDTRIP=!RT!
 call :now T1

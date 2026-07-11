@@ -33,6 +33,12 @@ Heap secrets go through `secmem_alloc`, which VirtualLock's on allocation.
   it exists only for the duration of an explicit export.
 - **`g_conv_w`** (gui.asm) — transient UTF-8→wide display scratch, overwritten
   on each use; never the sole copy of a secret at rest.
+- **Attachment decrypt-to-temp** (gui.asm `gui_tag_open`) — opening an attachment
+  writes its plaintext to `%TEMP%` so the OS default app can read it (unavoidable
+  for the ShellExecute hand-off). This is *not* left to the OS: every such path is
+  tracked in `g_tempfiles` and, on vault lock/exit, `gui_temp_purge` overwrites
+  the file's whole length with zeros, `FlushFileBuffers`, then `DeleteFileW`
+  (plan 8; regression-tested by the `tmptest` verb).
 
 No "unknown" rows: every secret buffer above is either locked or listed as an
 accepted exception with its rationale.

@@ -164,6 +164,10 @@ extern SetFocus:proc
 extern SetDlgItemInt:proc
 extern GetDlgItemInt:proc
 extern GetFileAttributesW:proc
+extern SetFileAttributesW:proc
+extern CreateFileW:proc                   ; secure temp-file wipe (plan 8)
+extern WriteFile:proc
+extern FlushFileBuffers:proc
 extern CreateDirectoryW:proc
 extern ShowWindow:proc
 extern MoveWindow:proc
@@ -383,6 +387,7 @@ IDC_V_MIDLEL equ 259                  ; "Auto-lock idle (minutes)" label
 IDC_V_MIDLE  equ 260                  ; idle-minutes edit
 IDC_V_MWLKL  equ 261                  ; "Lock with Windows" label
 IDC_V_MWLK   equ 262                  ; lock-with-Windows toggle
+IDC_V_MPURGE equ 263                  ; "Purge temp files now" button
 IDC_V_MTHEME equ 240                  ; color-scheme cycle button (settings)
 IDC_V_MTHEMEL equ 241                 ; "Color scheme" label
 IDC_V_COLORPW equ 244                 ; overlay: colored revealed secret (owner-draw)
@@ -495,6 +500,17 @@ DESCSZ      equ 480            ; 16 + 16 handles*8 + 328 arf blob + 8 reserved (
 ; into one row backed by g_tilefiles (see the tf_* helpers).  Each file entry is
 ; {AttachRef[68], filename wide (NUL-terminated, <=129 wchars)}.
 MAX_TFILES  equ 24             ; <= MAX_FIELDS minus the other fields of an entry
+; secure temp-file tracking (plan 8): every attachment decrypted to %TEMP% is
+; recorded here and, on vault lock/exit, overwritten with zeros then deleted.
+MAX_TEMPFILES equ 16           ; tracked decrypt-to-temp files per session
+TEMP_PATHW    equ 300          ; wide chars reserved per temp path
+TEMP_SIZEOFF  equ TEMP_PATHW*2 ; qword plaintext size lives after the path
+TEMPREC       equ TEMP_SIZEOFF+8
+GENERIC_WRITE_ equ 40000000h
+OPEN_EXISTING_ equ 3
+FILE_ATTR_NORMAL_ equ 80h
+FILE_ATTRIBUTE_TEMPORARY equ 100h
+WIPE_CHUNK    equ 65536        ; bytes of zeros written per pass
 TFILE_ENTRY equ 328
 TFILE_NAME  equ 68             ; filename offset within a tile-file entry
 MAX_FIELDS  equ 56             ; g_field_list capacity (matches main.asm)
@@ -626,6 +642,9 @@ WSTR s_kept,        <Existing vault kept. Cancel, or use "Create new..." to choo
 WSTR s_pwmismatch,  <The passwords do not match.>
 WSTR s_pwshort,     <Password is too short for the current policy.>
 WSTR s_pwclasses,   <Password needs more character types (lowercase / uppercase / number / symbol).>
+WSTR s_purged_ttl,  <Temporary files>
+WSTR s_purged,      <Decrypted attachment temp files have been overwritten and deleted.>
+WSTR wtmptest_name, <vordr_tmptest.bin>       ; gui_tmptest scratch (headless probe)
 WSTR wt_newentry,   <New entry>
 WSTR cue_search,    <Search>
 WSTR sel_cap_imp,   <Vordr - Select entries to import>
@@ -1005,7 +1024,8 @@ g_menu_ids label dword
     dd IDC_V_MSECDL, IDC_V_MSECD, IDC_V_MSECINFO
     dd IDC_V_MCLIPL, IDC_V_MCLIP
     dd IDC_V_MIDLEL, IDC_V_MIDLE, IDC_V_MWLKL, IDC_V_MWLK
-MENU_ID_COUNT equ 27
+    dd IDC_V_MPURGE
+MENU_ID_COUNT equ 28
 
 .data?
 align 8
@@ -1181,6 +1201,10 @@ g_imgbuf      dq ?                         ; imported file bytes (mem_alloc'd)
 g_imgbuflen   dq ?
 g_pickfilter  dq ?                         ; OPENFILENAME filter for the next pick (0=image)
 g_tmpfile     dw 1024 dup (?)              ; temp path for opening an attachment (wide)
+align 8
+g_tempfiles   db MAX_TEMPFILES*TEMPREC dup (?)  ; tracked decrypt-to-temp paths + sizes
+g_tempfile_n  dd ?                         ; number of live tracked temp files
+g_wipezeros   db WIPE_CHUNK dup (?)        ; source of zeros for overwriting temp files
 align 2
 g_imgpath     dw 1024 dup (?)             ; import/export file path (wide)
 g_valblob   dw 32768 dup (?)          ; commit scratch: field values, NUL-joined
@@ -4874,7 +4898,8 @@ gtc_done:
 gui_tile_choose endp
 
 ; gui_tag_open(ecx = file index) - decrypt g_tilefiles[i] to a %TEMP% file and open
-;   it in the system default app (plaintext lingers in %TEMP% until the OS cleans it).
+;   it in the system default app.  The temp path is tracked (gui_temp_track) and
+;   securely overwritten + deleted when the vault locks (gui_temp_purge).
 gui_tag_open proc frame
     FRAME_PROLOG 96                             ; room for ShellExecuteW's 6-arg spill
     mov     dword ptr [rbp-32], ecx
@@ -4900,11 +4925,166 @@ gui_tag_open proc frame
     call    mem_free
     cmp     dword ptr [rbp-60], 0                     ; only open if the temp was written
     jne     gto_done
+    WINCALL SetFileAttributesW, addr g_tmpfile, FILE_ATTRIBUTE_TEMPORARY  ; hint: keep in cache
+    lea     rcx, [g_tmpfile]                          ; track for deterministic wipe on lock
+    mov     rdx, qword ptr [rbp-48]
+    call    gui_temp_track
     WINCALL ShellExecuteW, 0, addr verb_open, addr g_tmpfile, 0, 0, 1
 gto_done:
     FRAME_EPILOG
     ret
 gui_tag_open endp
+
+; gui_temp_track(rcx = wide path, rdx = plaintext size) - record a decrypt-to-temp
+;   file so gui_temp_purge can overwrite + delete it on lock/exit.  If the table is
+;   full, purge it first (flushing the older files) then record this one.
+gui_temp_track proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], rdx
+    mov     eax, dword ptr [g_tempfile_n]
+    cmp     eax, MAX_TEMPFILES
+    jb      gtt_have
+    call    gui_temp_purge                            ; full -> flush, then start over
+    xor     eax, eax
+gtt_have:
+    imul    eax, eax, TEMPREC                         ; &g_tempfiles[n]
+    lea     r10, [g_tempfiles]
+    add     r10, rax
+    mov     qword ptr [rbp-40], r10
+    mov     rcx, qword ptr [rbp-24]                   ; copy the path (capped)
+    xor     r8d, r8d
+gtt_cp:
+    mov     ax, word ptr [rcx+r8*2]
+    mov     word ptr [r10+r8*2], ax
+    test    ax, ax
+    jz      gtt_cpdone
+    inc     r8d
+    cmp     r8d, TEMP_PATHW-1
+    jb      gtt_cp
+    mov     word ptr [r10+r8*2], 0                     ; force-terminate an over-long path
+gtt_cpdone:
+    mov     r10, qword ptr [rbp-40]
+    mov     rax, qword ptr [rbp-32]
+    mov     qword ptr [r10+TEMP_SIZEOFF], rax          ; plaintext size for the wipe
+    inc     dword ptr [g_tempfile_n]
+    FRAME_EPILOG
+    ret
+gui_temp_track endp
+
+; gui_temp_purge() -> eax = count of files purged.  For each tracked temp file:
+;   open it, overwrite its whole length with zeros, flush to disk, close, delete.
+;   Clears the table.  Best-effort per file (a vanished/locked file is skipped).
+gui_temp_purge proc frame
+    FRAME_PROLOG 96                            ; CreateFileW(7)/WriteFile(5) arg spill below rbp-56
+    ; [rbp-24]=i, [rbp-32]=handle, [rbp-40]=remaining, [rbp-48]=&entry, [rbp-56]=purged
+    ; [rbp-64] = WriteFile bytes-written (throwaway, in the spill zone)
+    mov     dword ptr [rbp-56], 0
+    lea     rcx, [g_wipezeros]                        ; ensure the source really is zero
+    mov     edx, WIPE_CHUNK
+    call    secure_zero
+    mov     dword ptr [rbp-24], 0
+gtp_loop:
+    mov     eax, dword ptr [rbp-24]
+    cmp     eax, dword ptr [g_tempfile_n]
+    jae     gtp_clear
+    imul    eax, eax, TEMPREC
+    lea     r10, [g_tempfiles]
+    add     r10, rax
+    mov     qword ptr [rbp-48], r10                    ; &entry (path @ +0)
+    WINCALL CreateFileW, r10, GENERIC_WRITE_, 0, 0, OPEN_EXISTING_, FILE_ATTR_NORMAL_, 0
+    cmp     rax, -1
+    je      gtp_del                                    ; can't open -> still try to delete
+    mov     qword ptr [rbp-32], rax
+    mov     r10, qword ptr [rbp-48]
+    mov     rax, qword ptr [r10+TEMP_SIZEOFF]
+    mov     qword ptr [rbp-40], rax                    ; remaining bytes to overwrite
+gtp_wipe:
+    cmp     qword ptr [rbp-40], 0
+    je      gtp_flush
+    mov     r10, qword ptr [rbp-40]
+    cmp     r10, WIPE_CHUNK
+    jbe     @F
+    mov     r10, WIPE_CHUNK
+@@: WINCALL WriteFile, qword ptr [rbp-32], addr g_wipezeros, r10d, addr rbp-64, 0
+    test    eax, eax
+    jz      gtp_flush                                  ; write error -> stop, still delete
+    mov     r10d, dword ptr [rbp-64]
+    test    r10d, r10d
+    jz      gtp_flush                                  ; wrote 0 -> avoid an infinite loop
+    sub     qword ptr [rbp-40], r10
+    jmp     gtp_wipe
+gtp_flush:
+    WINCALL FlushFileBuffers, qword ptr [rbp-32]       ; force the zeros to the platter
+    WINCALL CloseHandle, qword ptr [rbp-32]
+gtp_del:
+    WINCALL DeleteFileW, qword ptr [rbp-48]
+    inc     dword ptr [rbp-56]
+    inc     dword ptr [rbp-24]
+    jmp     gtp_loop
+gtp_clear:
+    lea     rcx, [g_tempfiles]                         ; scrub the path table itself
+    mov     edx, MAX_TEMPFILES*TEMPREC
+    call    secure_zero
+    mov     dword ptr [g_tempfile_n], 0
+    mov     eax, dword ptr [rbp-56]
+    FRAME_EPILOG
+    ret
+gui_temp_purge endp
+
+; gui_tmptest() -> eax = 0 pass / 1 fail (headless probe for the secure temp
+;   lifecycle).  Writes a %TEMP% file, tracks it, confirms it exists, purges,
+;   then confirms gui_temp_purge overwrote + deleted it.
+public gui_tmptest
+gui_tmptest proc frame
+    FRAME_PROLOG 48
+    mov     dword ptr [g_tempfile_n], 0               ; isolated table for the probe
+    WINCALL GetTempPathW, 512, addr g_tmpfile         ; g_tmpfile = %TEMP%\
+    lea     r10, [g_tmpfile]                          ; append the fixed test name
+    lea     r10, [r10+rax*2]
+    lea     r11, [wtmptest_name]
+    xor     ecx, ecx
+gtt2_cp:
+    mov     dx, word ptr [r11+rcx*2]
+    mov     word ptr [r10+rcx*2], dx
+    test    dx, dx
+    jz      gtt2_cpd
+    inc     ecx
+    jmp     gtt2_cp
+gtt2_cpd:
+    lea     r10, [g_wipezeros]                        ; 4096 bytes of a nonzero pattern
+    mov     ecx, 4096
+gtt2_fill:
+    mov     byte ptr [r10+rcx-1], 0ABh
+    dec     ecx
+    jnz     gtt2_fill
+    lea     rcx, [g_tmpfile]
+    lea     rdx, [g_wipezeros]
+    mov     r8, 4096
+    call    write_file
+    test    eax, eax
+    jnz     gtt2_fail                                 ; couldn't write the probe file
+    lea     rcx, [g_tmpfile]                          ; track it (size 4096)
+    mov     rdx, 4096
+    call    gui_temp_track
+    WINCALL GetFileAttributesW, addr g_tmpfile        ; must exist now
+    cmp     eax, -1
+    je      gtt2_fail
+    call    gui_temp_purge                            ; overwrite + delete
+    WINCALL GetFileAttributesW, addr g_tmpfile        ; must be gone now
+    cmp     eax, -1
+    jne     gtt2_fail_del
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gtt2_fail_del:
+    WINCALL DeleteFileW, addr g_tmpfile               ; don't leak the probe file on failure
+gtt2_fail:
+    mov     dword ptr [g_tempfile_n], 0
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gui_tmptest endp
 
 ; gui_ext_is_exec(rcx = wide filename) -> eax = 1 if the extension is a known
 ;   executable/script type (exec_exts denylist).  Extracts the extension of the
@@ -7922,6 +8102,8 @@ vp_cmd_fixed:
     je      vp_export
     cmp     eax, IDC_V_MIMPORT
     je      vp_import
+    cmp     eax, IDC_V_MPURGE
+    je      vp_purge
     cmp     eax, IDC_V_OVFL
     je      vp_ovfl
     cmp     eax, IDC_V_FAV
@@ -8113,6 +8295,10 @@ vp_export:
 vp_import:
     mov     rcx, qword ptr [rbp-8]
     call    gui_import
+    jmp     vp_handled
+vp_purge:
+    call    gui_temp_purge                          ; wipe+delete decrypt-to-temp files now
+    WINCALL MessageBoxW, qword ptr [rbp-8], addr s_purged, addr s_purged_ttl, 040h  ; MB_ICONINFORMATION
     jmp     vp_handled
 vp_ovfl:
     cmp     dword ptr [g_cur_idx], 0             ; only with an entry shown
@@ -8443,6 +8629,7 @@ vp_lock_go:
     call    WTSUnRegisterSessionNotification
     add     rsp, 32
     mov     dword ptr [g_totp_on], 0
+    call    gui_temp_purge                  ; overwrite + delete any decrypt-to-temp files
     call    gui_clipclear                   ; clear the clipboard if it is still ours
     lea     rcx, [g_secret_w]               ; wipe revealed secret + TOTP material
     mov     edx, EBUF*4
