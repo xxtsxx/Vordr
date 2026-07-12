@@ -666,7 +666,8 @@ IDC_V_TIMES  equ 236          ; created/modified timestamps line (below the last
 IDC_V_FAV    equ 237          ; header favorite (star) toggle
 IDC_V_CANCEL equ 238          ; "Cancel" button (edit mode, discards edits)
 IDC_V_DONE   equ 271          ; trash view: "Done" (exit recover mode); accent button
-IDC_V_GENERATE equ 273        ; sidebar dock: standalone password generator
+IDC_V_GENERATE equ 273        ; sidebar dock: standalone password generator (retired: hidden, dock replaces)
+IDC_V_HDREDIT  equ 274        ; detail-header edit ghost button (D1 command dock; replaces sidebar "e")
 FIELD_AREA_BOTTOM equ 292        ; rows may not grow past here (DLU; Add-field is at 296)
 ; Win32 window styles (gui.asm builds controls at runtime; the RC gets these
 ; from windows.h, but this module needs the numeric values).
@@ -1089,13 +1090,14 @@ g_anchor_def label dword
     dd IDC_V_HEADER,   ANCH_STRETCHW
     dd IDC_V_TITLE,    ANCH_STRETCHW
     dd IDC_V_TIMES,    ANCH_STRETCHW
+    dd IDC_V_HDREDIT,  ANCH_RIGHT
     dd IDC_V_FAV,      ANCH_RIGHT
     dd IDC_V_OVFL,     ANCH_RIGHT
     dd IDC_V_ADDFIELD, ANCH_BOTTOM
     dd IDC_V_CANCEL,   ANCH_RIGHT or ANCH_BOTTOM
     dd IDC_V_SAVE,     ANCH_RIGHT or ANCH_BOTTOM
     dd IDC_V_LOCK,     ANCH_RIGHT or ANCH_BOTTOM
-ANCHOR_N equ 13
+ANCHOR_N equ 14
 tag_xw label word
     dw 0D7h, 0                             ; multiplication sign, used as the tag 'x'
 verb_open label word
@@ -1204,9 +1206,9 @@ g_empty_w label word
 ; control-id groups toggled when the settings overlay opens/closes
 align 4
 g_vault_ids label dword
-    dd IDC_V_LIST, IDC_V_ADD, IDC_V_EDIT, IDC_V_REMOVE, IDC_V_TITLE
+    dd IDC_V_LIST, IDC_V_TITLE
     dd IDC_V_ADDFIELD, IDC_V_SAVE, IDC_V_LOCK, IDC_V_SEARCH
-VAULT_ID_COUNT equ 9
+VAULT_ID_COUNT equ 6
 g_menu_ids label dword ; controls menu IDs which are hidden and displayed between settings and main screen.
     dd IDC_V_MBACK, IDC_V_MTITLE, IDC_V_MPOLL, IDC_V_MLENL, IDC_V_MLEN
     dd IDC_V_MCLSL, IDC_V_MCLS, IDC_V_MTPM, IDC_V_MTPML, IDC_V_MTPMINFO
@@ -4891,6 +4893,15 @@ sem_addcmd:
     call    ShowWindow
     mov     rcx, qword ptr [rbp-24]           ; favorite star shares the header visibility
     mov     edx, IDC_V_FAV
+    call    GetDlgItem
+    mov     qword ptr [rbp-72], rax
+    mov     eax, dword ptr [rbp-52]
+    xor     eax, SW_SHOW
+    mov     rcx, qword ptr [rbp-72]
+    mov     edx, eax
+    call    ShowWindow
+    mov     rcx, qword ptr [rbp-24]           ; header edit ghost shares the view-mode visibility
+    mov     edx, IDC_V_HDREDIT
     call    GetDlgItem
     mov     qword ptr [rbp-72], rax
     mov     eax, dword ptr [rbp-52]
@@ -8901,6 +8912,10 @@ gui_detail_clear proc frame
     mov     edx, IDC_V_FAV
     call    GetDlgItem
     WINCALL ShowWindow, rax, SW_HIDE
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_V_HDREDIT
+    call    GetDlgItem
+    WINCALL ShowWindow, rax, SW_HIDE
     WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_SETCURSEL, \
             -1, 0
     FRAME_EPILOG
@@ -10861,6 +10876,7 @@ vp_init:
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_REMOVE, addr wb_rem
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_OVFL, addr wb_more
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_FAV, addr wb_star
+    WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_HDREDIT, addr wb_edit
     WINCALL GetDlgItem, qword ptr [rbp-8], IDC_V_OVFL   ; header "..." -> frameless ghost
     mov     rcx, qword ptr [rbp-8]
     mov     rdx, rax
@@ -10872,6 +10888,12 @@ vp_init:
     mov     rdx, rax
     mov     r8d, GLY_FAV_OFF
     lea     r9, [gt_fav]
+    call    ghost_attach
+    WINCALL GetDlgItem, qword ptr [rbp-8], IDC_V_HDREDIT ; header edit -> frameless ghost (D1 dock)
+    mov     rcx, qword ptr [rbp-8]
+    mov     rdx, rax
+    mov     r8d, GLY_EDIT
+    lea     r9, [gt_edit]
     call    ghost_attach
     WINCALL GetDlgItem, qword ptr [rbp-8], IDC_V_ADD     ; sidebar toolbar -> frameless ghosts
     mov     rcx, qword ptr [rbp-8]
@@ -10998,6 +11020,8 @@ vp_cmd_fixed:
     cmp     eax, IDC_V_GENERATE
     je      vp_gen_standalone
     cmp     eax, IDC_V_EDIT
+    je      vp_edit
+    cmp     eax, IDC_V_HDREDIT                    ; header command-dock edit button
     je      vp_edit
     cmp     eax, IDC_V_SAVE
     je      vp_save
