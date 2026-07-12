@@ -923,6 +923,9 @@ cls_tooltip label word
 WSTR gl_t_theme, <Theme / colour scheme>
 WSTR gt_more, <More>
 WSTR gt_fav, <Favorite>
+WSTR gt_new, <New item>
+WSTR gt_edit, <Edit entry>
+WSTR gt_rem, <Delete entry>
 kl_user label word
     dw 'U','s','e','r','n','a','m','e', 0
 kl_secret label word
@@ -9106,6 +9109,24 @@ vp_init:
     mov     rdx, rax
     mov     r8d, GLY_FAV_OFF
     lea     r9, [gt_fav]
+    call    ghost_attach
+    WINCALL GetDlgItem, qword ptr [rbp-8], IDC_V_ADD     ; sidebar toolbar -> frameless ghosts
+    mov     rcx, qword ptr [rbp-8]
+    mov     rdx, rax
+    mov     r8d, GLY_NEW
+    lea     r9, [gt_new]
+    call    ghost_attach
+    WINCALL GetDlgItem, qword ptr [rbp-8], IDC_V_EDIT
+    mov     rcx, qword ptr [rbp-8]
+    mov     rdx, rax
+    mov     r8d, GLY_EDIT
+    lea     r9, [gt_edit]
+    call    ghost_attach
+    WINCALL GetDlgItem, qword ptr [rbp-8], IDC_V_REMOVE
+    mov     rcx, qword ptr [rbp-8]
+    mov     rdx, rax
+    mov     r8d, GLY_DELETE
+    lea     r9, [gt_rem]
     call    ghost_attach
     mov     dword ptr [g_trash_view], 0       ; start in the vault (not the trash) view
     mov     dword ptr [g_deleted_state], 0
