@@ -29,7 +29,8 @@ MOVEFILE_WRITE_THROUGH    equ 8
 
 GENERIC_READ        equ 80000000h
 GENERIC_WRITE       equ 40000000h
-FILE_SHARE_READ     equ 1
+FILE_SHARE_RWD      equ 7               ; READ|WRITE|DELETE - read-only-by-default opens
+                                        ;   never block another writer / sync tool (redesign B1)
 OPEN_EXISTING       equ 3
 CREATE_ALWAYS       equ 2
 FILE_ATTR_NORMAL    equ 80h
@@ -83,7 +84,7 @@ read_file proc frame
     mov     qword ptr [rbp-24], rdx
     mov     qword ptr [rbp-32], r8
 
-    WINCALL CreateFileW, rcx, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, FILE_ATTR_NORMAL, 0
+    WINCALL CreateFileW, rcx, GENERIC_READ, FILE_SHARE_RWD, 0, OPEN_EXISTING, FILE_ATTR_NORMAL, 0
     cmp     rax, -1
     je      rf_io
     mov     qword ptr [rbp-40], rax
