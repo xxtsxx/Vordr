@@ -54,6 +54,8 @@ extern tpm_delete:proc
 extern reg_tpm_set:proc
 extern reg_tpm_get:proc
 extern reg_tpm_del:proc
+extern reg_ctr_set:proc
+extern reg_ctr_get:proc
 
 externdef g_cfg_in:qword
 externdef g_argv:qword
@@ -185,6 +187,8 @@ CSTR bk_bad, "bktest: FAIL (backup missing or unopenable)",13,10
 CSTR mt_ok,  "mactest: PASS (counter tamper rejected, restore opens)",13,10
 CSTR mt_bad, "mactest: FAIL",13,10
 CSTR mt_leak,"mactest: FAIL (file-MAC did not catch the trailer tamper)",13,10
+CSTR rb_ok,  "rbtest: PASS (older counter flagged, current one not)",13,10
+CSTR rb_bad, "rbtest: FAIL",13,10
 CSTR e_io,      "error: cannot read/write the vault file",13,10
 CSTR e_oom,     "error: out of memory",13,10
 CSTR m_created, "vault created.",13,10
@@ -206,6 +210,9 @@ public g_body_len
 g_body_len  dq ?
 public g_save_counter
 g_save_counter dq ?                         ; monotonic save number (anti-rollback)
+public g_rollback
+g_rollback  dd ?                            ; 1 if this file's counter < the HKCU mirror
+g_ctr_io    dq ?                            ; reg_ctr_get/set scratch (u64 counter)
 g_fmac_len  dq ?                            ; 0 (legacy) or FMAC_TRAILER for this image
 align 16
 g_fmac_ctx  db 256 dup (?)                  ; BLAKE2B_CTX scratch (216 used)
@@ -742,6 +749,14 @@ vsw_swap:
     mov     qword ptr [g_outbuf], 0             ; ownership moved to g_filebuf
     call    attach_reset
     call    attach_rescan
+    ; mirror the new save counter in HKCU so a later restore of an older file
+    ; can be flagged as a rollback (best-effort - registry failure is non-fatal)
+    mov     rax, qword ptr [g_save_counter]
+    mov     qword ptr [g_ctr_io], rax
+    mov     rcx, qword ptr [g_cfg_in]
+    lea     rdx, [g_ctr_io]
+    mov     r8d, 8
+    call    reg_ctr_set
     mov     eax, dword ptr [rbp-24]
     FRAME_EPILOG
     ret
@@ -820,6 +835,7 @@ vu_havekey:
     ; trailer from all end-relative offset math below.  Legacy files lack it.
     mov     qword ptr [g_fmac_len], 0
     mov     qword ptr [g_save_counter], 0
+    mov     dword ptr [g_rollback], 0
     mov     rax, qword ptr [g_filesize]
     cmp     rax, VH_TOTAL + 4 + 16 + FMAC_TRAILER
     jb      vu_nofmac
@@ -847,6 +863,18 @@ vu_havekey:
     mov     rax, qword ptr [r11]
     mov     qword ptr [g_save_counter], rax
     mov     qword ptr [g_fmac_len], FMAC_TRAILER
+    ; anti-rollback: compare this file's counter against the HKCU mirror.  If the
+    ; file is OLDER than the last one this machine saved, flag it (the GUI warns).
+    mov     rcx, qword ptr [g_cfg_in]
+    lea     rdx, [g_ctr_io]
+    mov     r8d, 8
+    call    reg_ctr_get
+    cmp     eax, 8                              ; got a full u64 mirror?
+    jne     vu_nofmac
+    mov     rax, qword ptr [g_save_counter]
+    cmp     rax, qword ptr [g_ctr_io]
+    jae     vu_nofmac                           ; counter >= mirror -> not a rollback
+    mov     dword ptr [g_rollback], 1
 vu_nofmac:
     ; detect the attachments trailer at the end of the base image (absent = old)
     mov     qword ptr [g_att_total], 0
@@ -1966,6 +1994,76 @@ mt_fail:
     FRAME_EPILOG
     ret
 cmd_mactest endp
+
+; ===========================================================================
+; cmd_rbtest <path> - prove anti-rollback detection (plan 3).  Create a vault
+;   (counter 1, mirror 1), force the HKCU mirror ahead to 5, and confirm the
+;   next unlock flags g_rollback; then set the mirror back to 1 and confirm a
+;   fresh unlock does NOT flag it.  exit 0 = pass.
+; ===========================================================================
+LANDING_PAD
+public cmd_rbtest
+cmd_rbtest proc frame
+    FRAME_PROLOG 48
+    lea     r10, [g_argv]
+    mov     rax, qword ptr [r10+16]
+    mov     qword ptr [g_cfg_in], rax
+    lea     r10, [bk_pw]
+    lea     r11, [g_cfg_pass]
+    xor     ecx, ecx
+rb_pwcp:
+    mov     al, byte ptr [r10+rcx]
+    mov     byte ptr [r11+rcx], al
+    test    al, al
+    jz      rb_pwd
+    inc     ecx
+    cmp     ecx, 32
+    jb      rb_pwcp
+rb_pwd:
+    mov     dword ptr [g_cfg_passlen], 9
+    mov     dword ptr [g_cfg_t], 1
+    mov     dword ptr [g_cfg_m], 8192
+    call    do_init
+    test    eax, eax
+    jnz     rb_fail
+    ; force the mirror ahead of the file's counter (simulate a later save)
+    mov     qword ptr [g_ctr_io], 5
+    mov     rcx, qword ptr [g_cfg_in]
+    lea     rdx, [g_ctr_io]
+    mov     r8d, 8
+    call    reg_ctr_set
+    call    vault_unlock                        ; must flag a rollback
+    test    eax, eax
+    jnz     rb_fail
+    call    vault_lock
+    cmp     dword ptr [g_rollback], 1
+    jne     rb_fail
+    ; restore the mirror to the file's counter -> no rollback
+    mov     qword ptr [g_ctr_io], 1
+    mov     rcx, qword ptr [g_cfg_in]
+    lea     rdx, [g_ctr_io]
+    mov     r8d, 8
+    call    reg_ctr_set
+    call    vault_unlock
+    test    eax, eax
+    jnz     rb_fail
+    call    vault_lock
+    cmp     dword ptr [g_rollback], 0
+    jne     rb_fail
+    lea     rcx, [rb_ok]
+    mov     edx, rb_ok_len
+    call    print_a
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+rb_fail:
+    lea     rcx, [rb_bad]
+    mov     edx, rb_bad_len
+    call    print_a
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_rbtest endp
 
 
 ; ===========================================================================
