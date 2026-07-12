@@ -948,6 +948,42 @@ kl_group label word
     dw 'G','r','o','u','p',' ','h','e','a','d','i','n','g', 0
 kl_spacer label word
     dw 'S','p','a','c','e','r', 0
+; --- new-entry templates (redesign D4): a pre-built field list per preset ------
+WSTR tm_login,  <Login>
+WSTR tm_card,   <Credit card>
+WSTR tm_ident,  <Identity>
+WSTR tm_note,   <Secure note>
+WSTR lbl_holder,   <Cardholder>
+WSTR lbl_cardno,   <Card number>
+WSTR lbl_expiry,   <Expiry>
+WSTR lbl_cvv,      <CVV>
+WSTR lbl_fullname, <Full name>
+WSTR lbl_phone,    <Phone>
+align 8
+tmpl_login label qword                          ; {count; count x (type, label)} after Title
+    dq 4
+    dq VF_USERNAME, 0
+    dq VF_SECRET, 0
+    dq VF_URL, 0
+    dq VF_NOTES, 0
+tmpl_card label qword
+    dq 5
+    dq VF_TEXT, lbl_holder
+    dq VF_TEXT, lbl_cardno
+    dq VF_TEXT, lbl_expiry
+    dq VF_SECRET, lbl_cvv
+    dq VF_NOTES, 0
+tmpl_ident label qword
+    dq 4
+    dq VF_TEXT, lbl_fullname
+    dq VF_TEXT, kl_email
+    dq VF_TEXT, lbl_phone
+    dq VF_NOTES, 0
+tmpl_note label qword
+    dq 1
+    dq VF_NOTES, 0
+tmpl_table label qword
+    dq tmpl_login, tmpl_card, tmpl_ident, tmpl_note
 tag_xw label word
     dw 0D7h, 0                             ; multiplication sign, used as the tag 'x'
 verb_open label word
@@ -8494,6 +8530,81 @@ gui_restore_entry proc frame
     ret
 gui_restore_entry endp
 
+; gui_pick_template(rcx=hdlg) -> eax = template index (0..3), or -1 if cancelled.
+;   Pops the new-entry template menu (redesign D4) at the cursor.
+gui_pick_template proc frame
+    FRAME_PROLOG 128
+    mov     qword ptr [rbp-24], rcx
+    WINCALL CreatePopupMenu
+    mov     qword ptr [rbp-32], rax
+    test    rax, rax
+    jz      gpt_cancel
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 1, addr tm_login
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 2, addr tm_card
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 3, addr tm_ident
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 4, addr tm_note
+    mov     rcx, qword ptr [rbp-32]
+    call    gui_menu_dark
+    mov     qword ptr [rbp-64], rax
+    lea     rcx, [rbp-56]
+    call    GetCursorPos
+    WINCALL SetForegroundWindow, qword ptr [rbp-24]
+    WINCALL TrackPopupMenu, qword ptr [rbp-32], TPM_RETURNCMD or TPM_LEFTALIGN, \
+            dword ptr [rbp-56], dword ptr [rbp-52], 0, qword ptr [rbp-24], 0
+    mov     dword ptr [rbp-44], eax
+    WINCALL DestroyMenu, qword ptr [rbp-32]
+    WINCALL DeleteObject, qword ptr [rbp-64]
+    mov     eax, dword ptr [rbp-44]
+    test    eax, eax
+    jz      gpt_cancel
+    dec     eax                                 ; menu id 1..4 -> index 0..3
+    FRAME_EPILOG
+    ret
+gpt_cancel:
+    mov     eax, -1
+    FRAME_EPILOG
+    ret
+gui_pick_template endp
+
+; gui_build_template(edx = template index) - fill g_field_list from a template:
+;   Title first, then each preset {type, label} with an empty value.  Sets g_field_n.
+gui_build_template proc frame
+    FRAME_PROLOG 48
+    mov     dword ptr [rbp-28], edx
+    lea     r10, [g_field_list]                 ; field 0 = Title "New entry"
+    mov     qword ptr [r10+0], VF_TITLE
+    mov     qword ptr [r10+8], 0
+    lea     rax, [wt_newentry]
+    mov     qword ptr [r10+16], rax
+    mov     eax, dword ptr [rbp-28]
+    lea     r11, [tmpl_table]
+    mov     r11, qword ptr [r11+rax*8]          ; -> template descriptor
+    mov     rcx, qword ptr [r11]                ; extra-field count
+    add     r11, 8
+    mov     edx, 1                              ; k = 1
+gbt_lp:
+    test    rcx, rcx
+    jz      gbt_done
+    mov     eax, edx
+    imul    eax, eax, 24
+    lea     r9, [g_field_list]
+    add     r9, rax                             ; &g_field_list[k]
+    mov     rax, qword ptr [r11+0]              ; type
+    mov     qword ptr [r9+0], rax
+    mov     rax, qword ptr [r11+8]              ; label ptr (0 = default)
+    mov     qword ptr [r9+8], rax
+    lea     rax, [g_empty_w]                    ; value = empty
+    mov     qword ptr [r9+16], rax
+    add     r11, 16
+    inc     edx
+    dec     rcx
+    jmp     gbt_lp
+gbt_done:
+    mov     dword ptr [g_field_n], edx
+    FRAME_EPILOG
+    ret
+gui_build_template endp
+
 ; gui_addfield_menu(rcx=hdlg) - popup the field-type palette at the cursor.
 gui_addfield_menu proc frame
     FRAME_PROLOG 128
@@ -9639,26 +9750,13 @@ vp_add:
     ; adding a new entry discards any unsaved inline edits to the current one
     ; (edits are only persisted by an explicit Save)
     mov     dword ptr [g_dirty], 0
+    mov     rcx, qword ptr [rbp-8]            ; choose a template (Login/Card/Identity/Note)
+    call    gui_pick_template
+    cmp     eax, -1
+    je      vp_handled                       ; menu cancelled -> no new entry
+    mov     edx, eax                         ; build the field list from the template
+    call    gui_build_template
 va_build:
-    ; new record = Title "New entry" + empty Username + Password + Notes (last)
-    lea     r10, [g_field_list]
-    mov     qword ptr [r10+0], VF_TITLE
-    mov     qword ptr [r10+8], 0
-    lea     rax, [wt_newentry]
-    mov     qword ptr [r10+16], rax
-    mov     qword ptr [r10+24], VF_USERNAME
-    mov     qword ptr [r10+32], 0
-    lea     rax, [g_empty_w]
-    mov     qword ptr [r10+40], rax
-    mov     qword ptr [r10+48], VF_SECRET
-    mov     qword ptr [r10+56], 0
-    lea     rax, [g_empty_w]
-    mov     qword ptr [r10+64], rax
-    mov     qword ptr [r10+72], VF_NOTES
-    mov     qword ptr [r10+80], 0
-    lea     rax, [g_empty_w]
-    mov     qword ptr [r10+88], rax
-    mov     dword ptr [g_field_n], 4
     call    vault_build_entry
     test    eax, eax
     jnz     vp_handled
