@@ -2312,8 +2312,8 @@ attach_stage proc frame
     lea     r10, [g_newatt]
     add     r10, rax
     mov     qword ptr [rbp-56], r10
-    mov     rcx, r10
-    mov     rdx, qword ptr [rbp-40]             ; ref id (ARF_ID=0)
+    lea     rcx, [r10+ARF_ID]                   ; write the 16-byte ref id at ARF_ID
+    mov     rdx, qword ptr [rbp-40]
     mov     r8, 16
     call    att_cpy
     mov     r10, qword ptr [rbp-56]

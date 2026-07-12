@@ -63,6 +63,15 @@ if errorlevel 1 (
     )
     echo framecheck: WARNING - fatal findings above; build continues. Use "build strict" to gate.
 )
+echo === deadcode ===
+python tools\deadcode.py
+if errorlevel 1 (
+    if "%STRICT%"=="1" (
+        echo deadcode: dead proc/data/equ - failing strict build
+        goto :failed
+    )
+    echo deadcode: WARNING - dead symbols above; build continues. Use "build strict" to gate.
+)
 :nofc
 
 set ASMFLAGS=/c /nologo /W3 /Zi %ASMEXTRA%

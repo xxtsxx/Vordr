@@ -252,7 +252,6 @@ IDYES               equ 6
 IDNO                equ 7
 IDOK                equ 1
 IDCANCEL            equ 2
-DS_CENTER           equ 0800h
 
 WM_CLOSE            equ 10h
 WM_TIMER            equ 113h
