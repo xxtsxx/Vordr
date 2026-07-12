@@ -52,7 +52,10 @@ for %%c in (canary shadow dlpv overflow bounds typemagic heaptag iat) do (
     set /a HI="(!RC! >> 16) & 0xFFFF"
     set OK=0
     if !HI! equ 64222 set OK=1
-    if "%%c"=="iat" if !RC! equ -1073741819 set OK=1
+    rem iat corrupts the (locked) IAT -> the call faults with a raw AV, which the
+    rem crash-containment VEH now catches, wipes secrets, and terminates with
+    rem 0xC0000409 (-1073740791).  The control still fired; the fault is contained.
+    if "%%c"=="iat" if !RC! equ -1073740791 set OK=1
     if !OK!==1 (
         echo   redteam %%c: fired ^(exit !RC!^) - ok
     ) else (

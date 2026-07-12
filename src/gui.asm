@@ -21,6 +21,8 @@ include macros.inc
 ; ---- startup helpers ---------------------------------------------------------
 extern cpu_gate:proc
 extern hardening_init:proc
+extern crash_install:proc               ; hardening.asm: arm crash containment
+externdef g_gui_active:dword            ; hardening.asm: gate the crash apology box
 extern con_init:proc
 extern con_attach_parent:proc
 extern iat_lockdown:proc
@@ -12818,6 +12820,7 @@ wstart proc
     call    hardening_init
     test    eax, eax
     jz      ws_oom
+    call    crash_install                   ; arm crash containment before any secrets exist
     call    parse_cmdline
     call    is_cli_command
     test    eax, eax
@@ -12860,6 +12863,7 @@ ws_gui:
     call    run_selftest
     test    eax, eax
     jnz     ws_stfail_gui
+    mov     dword ptr [g_gui_active], 1      ; enable the crash-time apology box
     call    gui_main
     WINCALL ExitProcess, 0
 ws_stfail_gui:

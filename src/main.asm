@@ -181,6 +181,7 @@ ifdef DBG_TRACE
 WSTR w_redteam,  <redteam>
 WSTR w_tpmtest,  <tpmtest>
 WSTR w_cttest,   <cttest>
+WSTR w_crashme,  <crashme>
 endif
 WSTR w_opt_m,    <-m>
 WSTR w_opt_t,    <-t>
@@ -221,6 +222,7 @@ ifdef DBG_TRACE
     CMDENT { w_redteam,   cmd_redteam,   1, 0 }   ; fault-injection self-test (dbg)
     CMDENT { w_tpmtest,   cmd_tpmtest,   0, 0 }   ; TPM round-trip probe (dbg)
     CMDENT { w_cttest,    cmd_cttest,    0, 0 }   ; ct_memcmp timing probe (dbg)
+    CMDENT { w_crashme,   cmd_crashme,   0, 0 }   ; deliberate AV -> crash-containment (dbg)
 endif
 ; Derive the count from the table's actual size so adding a CMDENT never needs a
 ; manual bump (a stale count silently drops trailing verbs to GUI fall-through).
@@ -1173,6 +1175,27 @@ fzt_fail:
     FRAME_EPILOG
     ret
 cmd_fztest endp
+
+ifdef DBG_TRACE
+; cmd_crashme - deliberately fault to exercise crash containment (plan 36).  It
+;   plants a sentinel into the master-password buffer, then writes through a null
+;   pointer.  The unhandled exception must reach crash_filter, which wipes every
+;   secret (secmem_panic_wipe) and terminates with no WER dump.  Never returns.
+LANDING_PAD
+cmd_crashme proc frame
+    FRAME_PROLOG 32
+    lea     r10, [g_cfg_pass]                   ; plant a recognizable secret
+    mov     byte ptr [r10+0], 'S'
+    mov     byte ptr [r10+1], 'E'
+    mov     byte ptr [r10+2], 'C'
+    mov     dword ptr [g_cfg_passlen], 3
+    xor     rax, rax                            ; deliberate null-pointer write -> AV
+    mov     byte ptr [rax], 0
+    xor     eax, eax                            ; unreachable
+    FRAME_EPILOG
+    ret
+cmd_crashme endp
+endif
 
 CSTR trt_ok,   "trtest: PASS (trash timestamp + 30-day purge threshold)",13,10
 CSTR trt_bad,  "trtest: FAIL",13,10
