@@ -38,6 +38,7 @@ extern SetStretchBltMode:proc
 extern CreateSolidBrush:proc
 extern CreatePen:proc
 extern CreateFontW:proc
+extern mk_font:proc                     ; gui.asm: font factory (applies g_fontdelta)
 extern SetTextColor:proc
 extern SetBkColor:proc
 extern SetBkMode:proc
@@ -247,21 +248,62 @@ g_clsbuf    dw 16 dup (?)               ; control class name (Static vs Edit)
 ; =============================================================================
 public theme_boot
 theme_boot proc frame
-    FRAME_PROLOG 112                          ; room for the 14-arg CreateFontW
+    FRAME_PROLOG 48
     mov     ecx, dword ptr [g_scheme]         ; build brushes/pens from the active scheme
     call    theme_set_scheme
     ; large semibold font for the small toolbar symbol buttons (+ pencil)
-    WINCALL CreateFontW, -18, 0, 0, 0, 100, 0, 0, 0, 1, 0, 0, 5, 0, addr td_font
+    mov     ecx, -18
+    mov     edx, 100
+    lea     r8, [td_font]
+    call    mk_font                           ; the shared font factory (applies S/M/L)
     mov     qword ptr [g_font_big], rax
     ; Fluent icon font for PUA glyph buttons (the trashcan)
-    WINCALL CreateFontW, -18, 0, 0, 0, 100, 0, 0, 0, 1, 0, 0, 5, 0, addr td_iconfont
+    mov     ecx, -18
+    mov     edx, 100
+    lea     r8, [td_iconfont]
+    call    mk_font
     mov     qword ptr [g_font_icon], rax
     ; slightly larger semibold font for the live TOTP code box
-    WINCALL CreateFontW, -16, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, addr td_font
+    mov     ecx, -16
+    mov     edx, 600
+    lea     r8, [td_font]
+    call    mk_font
     mov     qword ptr [g_font_totp], rax
     FRAME_EPILOG
     ret
 theme_boot endp
+
+; =============================================================================
+; theme_remake_fonts() - delete + recreate the three theme fonts through the
+;   shared factory, so a live font-size change (plan 29) rescales them too.
+; =============================================================================
+public theme_remake_fonts
+theme_remake_fonts proc frame
+    FRAME_PROLOG 48
+    lea     rcx, [g_font_big]
+    call    theme_del_gdi
+    lea     rcx, [g_font_icon]
+    call    theme_del_gdi
+    lea     rcx, [g_font_totp]
+    call    theme_del_gdi
+    mov     ecx, -18
+    mov     edx, 100
+    lea     r8, [td_font]
+    call    mk_font
+    mov     qword ptr [g_font_big], rax
+    mov     ecx, -18
+    mov     edx, 100
+    lea     r8, [td_iconfont]
+    call    mk_font
+    mov     qword ptr [g_font_icon], rax
+    mov     ecx, -16
+    mov     edx, 600
+    lea     r8, [td_font]
+    call    mk_font
+    mov     qword ptr [g_font_totp], rax
+    FRAME_EPILOG
+    ret
+theme_remake_fonts endp
 
 ; =============================================================================
 ; theme_del_gdi(rcx = &handle) - DeleteObject the handle if non-zero, then 0 it.

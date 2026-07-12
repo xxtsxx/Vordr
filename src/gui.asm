@@ -218,6 +218,7 @@ extern RedrawWindow:proc
 extern InitCommonControlsEx:proc
 extern pw_metrics:proc
 extern theme_boot:proc
+extern theme_remake_fonts:proc          ; theme.asm: rebuild theme fonts at new size
 extern theme_attach:proc
 extern theme_tick:proc
 extern theme_paint:proc
@@ -406,6 +407,8 @@ IDC_V_MNOPREV    equ 264              ; disable-attachment-preview toggle
 IDC_V_MNOPREVINFO equ 265            ; "Disable attachment preview" info (i)
 IDC_V_MTHEME equ 240                  ; color-scheme cycle button (settings)
 IDC_V_MTHEMEL equ 241                 ; "Color scheme" label
+IDC_V_MFONT  equ 242                  ; font-size cycle button (settings)
+IDC_V_MFONTL equ 243                  ; "Font size" label
 IDC_V_COLORPW equ 244                 ; overlay: colored revealed secret (owner-draw)
 IDC_V_MEXPORT equ 245                 ; "Export all secrets to Excel" button (settings)
 IDC_V_MIMPORT equ 246                 ; "Import..." button (auto-detects CSV / xlsx)
@@ -648,6 +651,9 @@ WSTR s_rbabort,     <Unlock aborted (older vault).>
 WSTR t_rbtitle,     <Vault rollback warning>
 WSTR s_extchg,      <The vault file changed on disk since you opened it. Another program or copy may have written it. Overwrite with your changes?>
 WSTR t_exttitle,    <Vault changed on disk>
+WSTR fs_small,      <Small>
+WSTR fs_med,        <Medium>
+WSTR fs_large,      <Large>
 WSTR g_singleton_name, <VordrSingletonMutex_v1>
 WSTR g_vault_title,    <Vordr - Vault>
 WSTR g_unlock_title,   <Vordr - Unlock vault>
@@ -877,6 +883,7 @@ lay_band     dd 14, 0, 18                         ; label band: card(top) vs 0=f
 lay_itemh    dd 42, 30, 58                         ; list-item pixel height (index 0 used)
 pref_scheme dw 'u','i','_','s','c','h','e','m','e',0
 pref_layout dw 'u','i','_','l','a','y','o','u','t',0
+pref_fontsz dw 'u','i','_','f','o','n','t','s','i','z','e',0
 align 8
 align 4
 ; class accent colors (index 0 upper / 2 digit / 3 symbol; lowercase uses g_col_text)
@@ -1031,6 +1038,7 @@ g_menu_ids label dword ; controls menu IDs which are hidden and displayed betwee
     dd IDC_V_MBACK, IDC_V_MTITLE, IDC_V_MPOLL, IDC_V_MLENL, IDC_V_MLEN
     dd IDC_V_MCLSL, IDC_V_MCLS, IDC_V_MTPM, IDC_V_MTPML, IDC_V_MTPMINFO
     dd IDC_V_MTHEMEL, IDC_V_MTHEME, IDC_V_MEXPORT
+    dd IDC_V_MFONTL, IDC_V_MFONT
     dd IDC_V_MIMPORT
     dd IDC_V_MNOHISTL, IDC_V_MNOHIST, IDC_V_MNOPHONL, IDC_V_MNOPHON
     dd IDC_V_MSECDL, IDC_V_MSECD, IDC_V_MSECINFO
@@ -1038,7 +1046,7 @@ g_menu_ids label dword ; controls menu IDs which are hidden and displayed betwee
     dd IDC_V_MIDLEL, IDC_V_MIDLE, IDC_V_MWLKL, IDC_V_MWLK
     dd IDC_V_MNOPREVL, IDC_V_MNOPREV, IDC_V_MNOPREVINFO
     dd IDC_V_MTOUTS
-MENU_ID_COUNT equ 31
+MENU_ID_COUNT equ 33
 
 .data?
 align 8
@@ -1160,6 +1168,10 @@ g_icon_valw   dw 20 dup (?)                ; scratch wide "GGGGCCCCCCCC" for sav
 g_pick_glyph  dd ?                         ; icon picker working selection (glyph)
 g_pick_color  dd ?                         ; icon picker working selection (color)
 g_layout      dd ?                         ; UI layout/density index (0 comfortable)
+public g_fontdelta
+g_fontdelta   dd ?                         ; font-size delta in px (S=-2, M=0, L=+3)
+g_fontsize    dd ?                         ; font-size index 0=Small 1=Medium 2=Large
+g_fontsz_lock dd ?                         ; HKLM policy lock (unused; parity w/ cfg_get)
 g_colorpw_row dd ?                         ; row whose revealed secret is colored (-1=none)
 g_rowpw_w     dw 512 dup (?)               ; revealed secret text for the color overlay
 g_wordtmp     dw 32 dup (?)                ; one resolved phonetic word (scratch)
@@ -1710,10 +1722,13 @@ gui_poplist endp
 ; gui_make_welcomefont() - lazily build the larger body font for the create
 ;   dialog's welcome text.  Its own frame: the 14-arg CreateFontW needs the room.
 gui_make_welcomefont proc frame
-    FRAME_PROLOG 112
+    FRAME_PROLOG 48
     cmp     qword ptr [g_welcomefont], 0
     jne     mwf_done
-    WINCALL CreateFontW, -15, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, addr f_segoeui
+    mov     ecx, -15
+    mov     edx, 400
+    lea     r8, [f_segoeui]
+    call    mk_font
     mov     qword ptr [g_welcomefont], rax
 mwf_done:
     FRAME_EPILOG
@@ -1745,23 +1760,62 @@ gui_center_ok proc frame
     ret
 gui_center_ok endp
 
+; mk_font(ecx = base pixel height (negative), edx = weight, r8 = facename ptr)
+;   -> rax = HFONT.  THE font factory: every CreateFontW routes through here so
+;   the S/M/L font-size setting (g_fontdelta) scales the whole UI at once.
+;   Heights are negative character heights, so a positive delta grows the font.
+public mk_font
+mk_font proc frame
+    FRAME_PROLOG 160                             ; room for the 14-arg CreateFontW spill
+    movsxd  rax, ecx
+    sub     eax, dword ptr [g_fontdelta]         ; delta>0 -> more negative -> taller
+    mov     dword ptr [rbp-24], eax              ; adjusted height
+    mov     dword ptr [rbp-32], edx              ; weight
+    mov     qword ptr [rbp-40], r8               ; facename
+    WINCALL CreateFontW, dword ptr [rbp-24], 0, 0, 0, dword ptr [rbp-32], \
+            0, 0, 0, 1, 0, 0, 5, 0, qword ptr [rbp-40]
+    FRAME_EPILOG
+    ret
+mk_font endp
+
 gui_make_listfonts proc frame
-    FRAME_PROLOG 112
+    FRAME_PROLOG 48
     cmp     qword ptr [g_iconfont], 0
     jne     mlf_done
-    WINCALL CreateFontW, -19, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, addr f_iconname
+    mov     ecx, -19
+    mov     edx, 400
+    lea     r8, [f_iconname]
+    call    mk_font
     mov     qword ptr [g_iconfont], rax
-    WINCALL CreateFontW, -14, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, addr f_segoeui
+    mov     ecx, -14
+    mov     edx, 600
+    lea     r8, [f_segoeui]
+    call    mk_font
     mov     qword ptr [g_cardfont], rax
-    WINCALL CreateFontW, -12, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, addr f_segoeui
+    mov     ecx, -12
+    mov     edx, 400
+    lea     r8, [f_segoeui]
+    call    mk_font
     mov     qword ptr [g_subfont], rax
-    WINCALL CreateFontW, -21, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, addr f_segoeui
+    mov     ecx, -21
+    mov     edx, 600
+    lea     r8, [f_segoeui]
+    call    mk_font
     mov     qword ptr [g_titlefont], rax
-    WINCALL CreateFontW, -11, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, addr f_iconname
+    mov     ecx, -11
+    mov     edx, 400
+    lea     r8, [f_iconname]
+    call    mk_font
     mov     qword ptr [g_chevfont], rax
-    WINCALL CreateFontW, -24, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, addr f_mono
+    mov     ecx, -24
+    mov     edx, 600
+    lea     r8, [f_mono]
+    call    mk_font
     mov     qword ptr [g_monofont], rax
-    WINCALL CreateFontW, -12, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, addr f_mono
+    mov     ecx, -12
+    mov     edx, 400
+    lea     r8, [f_mono]
+    call    mk_font
     mov     qword ptr [g_phonfont], rax
 mlf_done:
     FRAME_EPILOG
@@ -7659,9 +7713,91 @@ gui_save_prefs proc frame
     FRAME_PROLOG 48
     WINCALL cfg_set_dword_hkcu, addr pref_scheme, dword ptr [g_scheme]
     WINCALL cfg_set_dword_hkcu, addr pref_layout, dword ptr [g_layout]
+    WINCALL cfg_set_dword_hkcu, addr pref_fontsz, dword ptr [g_fontsize]
     FRAME_EPILOG
     ret
 gui_save_prefs endp
+
+; gui_fontsize_map() - map g_fontsize (0/1/2) to the pixel delta g_fontdelta.
+gui_fontsize_map proc
+    mov     eax, dword ptr [g_fontsize]
+    mov     dword ptr [g_fontdelta], 0          ; Medium (default)
+    cmp     eax, 0
+    jne     @F
+    mov     dword ptr [g_fontdelta], -2         ; Small
+    ret
+@@: cmp     eax, 2
+    jne     gfm_done
+    mov     dword ptr [g_fontdelta], 3          ; Large
+gfm_done:
+    ret
+gui_fontsize_map endp
+
+; gui_del_font(rcx = &HFONT) - DeleteObject the handle if non-zero, then zero it.
+gui_del_font proc frame
+    FRAME_PROLOG 32
+    mov     qword ptr [rbp-24], rcx
+    mov     rax, qword ptr [rcx]
+    test    rax, rax
+    jz      gdf_zero
+    WINCALL DeleteObject, rax
+gdf_zero:
+    mov     rax, qword ptr [rbp-24]
+    mov     qword ptr [rax], 0
+    FRAME_EPILOG
+    ret
+gui_del_font endp
+
+; gui_set_fontbtn(rcx = hdlg) - label the font-size button Small/Medium/Large.
+gui_set_fontbtn proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    lea     rax, [fs_med]
+    cmp     dword ptr [g_fontsize], 0
+    jne     @F
+    lea     rax, [fs_small]
+    jmp     gsf_set
+@@: cmp     dword ptr [g_fontsize], 2
+    jne     gsf_set
+    lea     rax, [fs_large]
+gsf_set:
+    mov     qword ptr [rbp-32], rax
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_MFONT, qword ptr [rbp-32]
+    FRAME_EPILOG
+    ret
+gui_set_fontbtn endp
+
+; gui_apply_fontsize(rcx = hdlg) - recreate every cached font at the new size and
+;   relay out.  All fonts flow from the mk_font factory, so they pick up g_fontdelta.
+gui_apply_fontsize proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    lea     rcx, [g_iconfont]
+    call    gui_del_font
+    lea     rcx, [g_cardfont]
+    call    gui_del_font
+    lea     rcx, [g_subfont]
+    call    gui_del_font
+    lea     rcx, [g_titlefont]
+    call    gui_del_font
+    lea     rcx, [g_chevfont]
+    call    gui_del_font
+    lea     rcx, [g_monofont]
+    call    gui_del_font
+    lea     rcx, [g_phonfont]
+    call    gui_del_font
+    lea     rcx, [g_welcomefont]
+    call    gui_del_font
+    call    gui_make_listfonts                  ; rebuild (handles are 0 now)
+    call    gui_make_welcomefont
+    call    theme_remake_fonts                  ; the 3 theme fonts too
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_set_fontbtn
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_apply_scheme                    ; relayout + redraw with the new fonts
+    FRAME_EPILOG
+    ret
+gui_apply_fontsize endp
 
 ; gui_load_prefs() - load the persisted UI scheme + layout (clamped to range).
 gui_load_prefs proc frame
@@ -7672,6 +7808,12 @@ gui_load_prefs proc frame
     mov     eax, GUI_SCHEME_GRUVBOX
 @@: mov     dword ptr [g_scheme], eax
     mov     dword ptr [g_layout], 0             ; Comfortable is the only layout
+    WINCALL cfg_get_dword, addr pref_fontsz, 1, addr g_fontsz_lock   ; default Medium
+    cmp     eax, 3                              ; clamp 0..2
+    jb      @F
+    mov     eax, 1
+@@: mov     dword ptr [g_fontsize], eax
+    call    gui_fontsize_map                    ; -> g_fontdelta (applied at font creation)
     FRAME_EPILOG
     ret
 gui_load_prefs endp
@@ -8711,6 +8853,8 @@ vp_init:
     call    gui_apply_scheme
     mov     rcx, qword ptr [rbp-8]
     call    gui_apply_layout
+    mov     rcx, qword ptr [rbp-8]            ; label the font-size button (Small/Medium/Large)
+    call    gui_set_fontbtn
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_V_SEARCH, EM_SETCUEBANNER, 1, addr cue_search
     mov     dword ptr [g_cur_idx], -1         ; no entry selected yet
     mov     dword ptr [g_colorpw_row], -1
@@ -8785,6 +8929,8 @@ vp_cmd_fixed:
     je      vp_menu
     cmp     eax, IDC_V_MTHEME
     je      vp_theme
+    cmp     eax, IDC_V_MFONT
+    je      vp_fontsize
     cmp     eax, IDC_V_MEXPORT
     je      vp_export
     cmp     eax, IDC_V_MIMPORT
@@ -8991,6 +9137,18 @@ vp_theme:
 @@: mov     dword ptr [g_scheme], eax
     mov     rcx, qword ptr [rbp-8]
     call    gui_apply_scheme
+    call    gui_save_prefs
+    jmp     vp_handled
+vp_fontsize:
+    mov     eax, dword ptr [g_fontsize]         ; cycle Small/Medium/Large
+    inc     eax
+    cmp     eax, 3
+    jb      @F
+    xor     eax, eax
+@@: mov     dword ptr [g_fontsize], eax
+    call    gui_fontsize_map
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_apply_fontsize
     call    gui_save_prefs
     jmp     vp_handled
 vp_export:
