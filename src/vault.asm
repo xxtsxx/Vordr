@@ -167,6 +167,8 @@ VSLOT struct
     s_attidx    db MAX_ATT * 32 dup(?)
 VSLOT ends
 
+MAX_VAULTS      equ 8           ; simultaneously-open vaults (redesign items 6/7/9)
+
 .const
 vst_src     db "vault-kat-test!!"      ; 16-byte plaintext for vault_selftest
 ; --- field-serialization KAT (labeled + duplicate fields) ------------------
@@ -223,6 +225,13 @@ CSTR m_created, "vault created.",13,10
 .data?
 align 16
 g_mvslot    db (sizeof VSLOT) dup (?)  ; multi-vault: one held vault-state slot (probe/scratch)
+align 16
+public g_vaults
+public g_vault_n
+public g_vault_cur
+g_vaults    db (sizeof VSLOT) * MAX_VAULTS dup (?) ; multi-vault: per-open-vault held state
+g_vault_n   dd ?                       ; number of open vaults (0..MAX_VAULTS)
+g_vault_cur dd ?                       ; index of the fronted vault, or -1 if none live
 g_vfz_rng   dq ?                       ; vfuzz xorshift64 state (dbg/test only)
 g_kat_body  db 512 dup (?)             ; scratch body for the field-serialization KAT
 public g_vkey
@@ -2054,6 +2063,103 @@ vault_restore proc frame
     ret
 vault_restore endp
 
+; ---------------------------------------------------------------------------
+; Multi-vault context manager (redesign items 6/7/9).  The live open-vault
+; globals are always the fronted vault; every other open vault's state sits in
+; its g_vaults[] slot.  vault_ctx_open claims a fresh slot for the vault the
+; caller is about to load; vault_ctx_front swaps which slot is live.  Because a
+; VSLOT captures the heap pointers (body/filebuf) and those buffers are never
+; freed while a vault is open, switching is a pure pointer/state swap.
+; ---------------------------------------------------------------------------
+
+; vault_ctx_reset() - forget all open vaults (no buffers freed here).  Leaf.
+public vault_ctx_reset
+vault_ctx_reset proc
+    mov     dword ptr [g_vault_n], 0
+    mov     dword ptr [g_vault_cur], -1
+    ret
+vault_ctx_reset endp
+
+; vault_ctx_slotptr(ecx = index) -> rax = &g_vaults[index].  Leaf, no bounds
+;   check (callers validate against g_vault_n first).
+public vault_ctx_slotptr
+vault_ctx_slotptr proc
+    mov     eax, ecx                        ; zero-extend index into rax
+    imul    rax, rax, sizeof VSLOT
+    lea     rcx, [g_vaults]
+    add     rax, rcx
+    ret
+vault_ctx_slotptr endp
+
+; vault_ctx_open() -> eax = new vault index, or -1 if MAX_VAULTS reached.  Saves
+;   the currently-fronted vault into its slot; the caller then loads the new
+;   vault into the live globals (fresh slot, nothing to restore).
+public vault_ctx_open
+vault_ctx_open proc frame
+    FRAME_PROLOG 48
+    mov     eax, dword ptr [g_vault_n]
+    cmp     eax, MAX_VAULTS
+    jb      vco_have_room
+    mov     eax, -1
+    FRAME_EPILOG
+    ret
+vco_have_room:
+    cmp     dword ptr [g_vault_cur], 0
+    jl      vco_no_current                  ; -1: nothing live to save
+    mov     ecx, dword ptr [g_vault_cur]
+    call    vault_ctx_slotptr
+    mov     rcx, rax
+    call    vault_snapshot
+vco_no_current:
+    mov     eax, dword ptr [g_vault_n]      ; idx = n
+    mov     dword ptr [rbp-24], eax
+    inc     eax
+    mov     dword ptr [g_vault_n], eax      ; n = n + 1
+    mov     eax, dword ptr [rbp-24]
+    mov     dword ptr [g_vault_cur], eax    ; cur = idx
+    mov     eax, dword ptr [rbp-24]
+    FRAME_EPILOG
+    ret
+vault_ctx_open endp
+
+; vault_ctx_front(ecx = target index) -> eax = 0 ok / 1 bad index.  Snapshots
+;   the live vault into its slot, then restores the target slot into the live
+;   globals.  A no-op if the target is already fronted.
+public vault_ctx_front
+vault_ctx_front proc frame
+    FRAME_PROLOG 48
+    mov     dword ptr [rbp-24], ecx         ; target
+    cmp     ecx, dword ptr [g_vault_n]
+    jb      vcf_valid
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+vcf_valid:
+    mov     eax, dword ptr [rbp-24]
+    cmp     eax, dword ptr [g_vault_cur]
+    jne     vcf_switch
+    xor     eax, eax                        ; already fronted
+    FRAME_EPILOG
+    ret
+vcf_switch:
+    cmp     dword ptr [g_vault_cur], 0
+    jl      vcf_no_current                  ; -1: nothing live to save
+    mov     ecx, dword ptr [g_vault_cur]
+    call    vault_ctx_slotptr
+    mov     rcx, rax
+    call    vault_snapshot
+vcf_no_current:
+    mov     ecx, dword ptr [rbp-24]
+    call    vault_ctx_slotptr
+    mov     rcx, rax
+    call    vault_restore
+    mov     eax, dword ptr [rbp-24]
+    mov     dword ptr [g_vault_cur], eax
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+vault_ctx_front endp
+
 ; cmd_mvtest - headless probe: plant a distinct sentinel in every open-vault state
 ;   field, snapshot, clobber every field to zero, restore, and verify each field
 ;   came back.  Proves vault_snapshot/vault_restore cover the complete state (a
@@ -2192,6 +2298,141 @@ mvz_lp:
 mvz_done:
     ret
 mvt_zero endp
+
+; mv_plant(ecx = seed byte in cl) - stamp the live open-vault state with a value
+;   derived only from the seed, across a byte array, both big arrays' head+tail,
+;   and scalar qword/dword fields.  Leaf, volatile regs.  (probe helper)
+mv_plant proc
+    movzx   r8d, cl                         ; seed byte
+    lea     r10, [g_vkey]
+    xor     r9d, r9d
+mpl_vk:
+    cmp     r9d, 32
+    jae     mpl_vkd
+    mov     byte ptr [r10+r9], r8b
+    inc     r9d
+    jmp     mpl_vk
+mpl_vkd:
+    lea     r10, [g_newatt]
+    mov     byte ptr [r10], r8b
+    mov     byte ptr [r10 + MAX_ATT*32 - 1], r8b
+    lea     r10, [g_attidx]
+    mov     byte ptr [r10], r8b
+    mov     byte ptr [r10 + MAX_ATT*32 - 1], r8b
+    movzx   rax, cl                         ; replicate seed across all 8 bytes
+    mov     rdx, rax
+    shl     rdx, 8
+    or      rax, rdx
+    mov     rdx, rax
+    shl     rdx, 16
+    or      rax, rdx
+    mov     rdx, rax
+    shl     rdx, 32
+    or      rax, rdx
+    mov     qword ptr [g_body_ptr], rax
+    mov     qword ptr [g_save_counter], rax
+    mov     dword ptr [g_rollback], eax     ; low 32 bits = seed replicated 4x
+    ret
+mv_plant endp
+
+; mv_check(ecx = seed byte in cl) -> eax = 0 match / 1 mismatch.  Verifies every
+;   field mv_plant wrote still carries this seed.  Leaf, volatile regs.
+mv_check proc
+    movzx   r8d, cl
+    lea     r10, [g_vkey]
+    xor     r9d, r9d
+mck_vk:
+    cmp     r9d, 32
+    jae     mck_vkd
+    cmp     byte ptr [r10+r9], r8b
+    jne     mck_bad
+    inc     r9d
+    jmp     mck_vk
+mck_vkd:
+    lea     r10, [g_newatt]
+    cmp     byte ptr [r10], r8b
+    jne     mck_bad
+    cmp     byte ptr [r10 + MAX_ATT*32 - 1], r8b
+    jne     mck_bad
+    lea     r10, [g_attidx]
+    cmp     byte ptr [r10], r8b
+    jne     mck_bad
+    cmp     byte ptr [r10 + MAX_ATT*32 - 1], r8b
+    jne     mck_bad
+    movzx   rax, cl
+    mov     rdx, rax
+    shl     rdx, 8
+    or      rax, rdx
+    mov     rdx, rax
+    shl     rdx, 16
+    or      rax, rdx
+    mov     rdx, rax
+    shl     rdx, 32
+    or      rax, rdx
+    cmp     qword ptr [g_body_ptr], rax
+    jne     mck_bad
+    cmp     qword ptr [g_save_counter], rax
+    jne     mck_bad
+    cmp     dword ptr [g_rollback], eax
+    jne     mck_bad
+    xor     eax, eax
+    ret
+mck_bad:
+    mov     eax, 1
+    ret
+mv_check endp
+
+; cmd_mvswitch - headless proof of the multi-vault context manager.  Opens two
+;   vault contexts, plants a distinct seed in each, then fronts back and forth
+;   and verifies each front restores exactly that vault's state (no cross-vault
+;   bleed), plus that fronting an out-of-range index is rejected.  exit 0 = pass.
+LANDING_PAD
+public cmd_mvswitch
+cmd_mvswitch proc frame
+    FRAME_PROLOG 48
+    call    vault_ctx_reset
+    call    vault_ctx_open                  ; vault 0 (cur=0)
+    mov     ecx, 05Ah
+    call    mv_plant                        ; live = vault 0 state
+    call    vault_ctx_open                  ; saves vault 0 -> slot0; vault 1 (cur=1)
+    mov     ecx, 0B7h
+    call    mv_plant                        ; live = vault 1 state
+    xor     ecx, ecx                        ; front vault 0
+    call    vault_ctx_front
+    test    eax, eax
+    jnz     mvs_fail
+    mov     ecx, 05Ah
+    call    mv_check                        ; must see vault 0's seed
+    test    eax, eax
+    jnz     mvs_fail
+    mov     ecx, 1                          ; front vault 1
+    call    vault_ctx_front
+    test    eax, eax
+    jnz     mvs_fail
+    mov     ecx, 0B7h
+    call    mv_check                        ; must see vault 1's seed
+    test    eax, eax
+    jnz     mvs_fail
+    xor     ecx, ecx                        ; front vault 0 again
+    call    vault_ctx_front
+    test    eax, eax
+    jnz     mvs_fail
+    mov     ecx, 05Ah
+    call    mv_check
+    test    eax, eax
+    jnz     mvs_fail
+    mov     ecx, dword ptr [g_vault_n]      ; out-of-range front is rejected
+    call    vault_ctx_front
+    cmp     eax, 1
+    jne     mvs_fail
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+mvs_fail:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_mvswitch endp
 
 ; cmd_bktest <path> - headless proof of atomic save + backup rotation (plan 37).
 ;   Creates the vault BAK_GENS+1 times at the same path (fast KDF); each save
