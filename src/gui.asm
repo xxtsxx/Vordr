@@ -570,7 +570,6 @@ MAX_TABS     equ 16           ; distinct labels (tabs) shown in the history brow
 IDC_V_TIMES  equ 236          ; created/modified timestamps line (below the last row)
 IDC_V_FAV    equ 237          ; header favorite (star) toggle
 IDC_V_CANCEL equ 238          ; "Cancel" button (edit mode, discards edits)
-IDC_V_TRASH  equ 270          ; sidebar: toggle trash view (deleted entries)
 IDC_V_RESTORE equ 271         ; detail: restore the shown trashed entry (trash view only)
 FIELD_AREA_BOTTOM equ 292        ; rows may not grow past here (DLU; Add-field is at 296)
 ; Win32 window styles (gui.asm builds controls at runtime; the RC gets these
@@ -626,8 +625,8 @@ WSTR m_stfail,      <Self-test FAILED - refusing to run. The binary may be corru
 WSTR t_remove,      <Remove this entry?>
 WSTR t_trash,       <Move this entry to the trash? It can be restored for 30 days.>
 WSTR t_delforever,  <Permanently delete this entry? This cannot be undone.>
-WSTR wb_trash,      <Trash>
-WSTR wb_vault,      <Vault>
+WSTR t_notrash,     <There are no deleted items to recover.>
+WSTR t_recover_ttl, <Recover items>
 WSTR s_pickvault,   <Select or create a vault file first.>
 WSTR s_nopw,        <Enter the master password.>
 WSTR s_badpw,       <Password must be 1..1024 UTF-8 bytes.>
@@ -973,6 +972,10 @@ om_read label word
     dw 'R','e','a','d',' ','p','a','s','s','w','o','r','d', 0
 om_history label word
     dw 'S','h','o','w',' ','h','i','s','t','o','r','y', 0
+om_recover label word
+    dw 'R','e','c','o','v','e','r',' ','i','t','e','m','s', 2026h, 0
+om_leavetrash label word
+    dw 'R','e','t','u','r','n',' ','t','o',' ','v','a','u','l','t', 0
 t_created label word
     dw 'C','r','e','a','t','e','d',' ', 0
 t_modified label word
@@ -6806,6 +6809,13 @@ gui_overflow_menu proc frame
     mov     qword ptr [rbp-32], rax
     test    rax, rax
     jz      gom_done
+    cmp     dword ptr [g_trash_view], 0          ; trash view: only "Return to vault"
+    je      gom_vault
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 8, addr om_leavetrash
+    jmp     gom_track
+gom_vault:
+    cmp     dword ptr [g_cur_idx], 0             ; entry-scoped items only with a shown entry
+    jl      gom_recover
     WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 1, addr om_copypw
     WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 2, addr om_copyuser
     cmp     dword ptr [g_no_phonetic], 0         ; "Disable phonetic reader" -> hide it
@@ -6816,6 +6826,10 @@ gui_overflow_menu proc frame
     WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 5, addr om_history
 @@: WINCALL AppendMenuW, qword ptr [rbp-32], MF_SEPARATOR, 0, 0
     WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 3, addr om_delete
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_SEPARATOR, 0, 0
+gom_recover:
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 7, addr om_recover
+gom_track:
     mov     rcx, qword ptr [rbp-32]              ; tint the menu background
     call    gui_menu_dark
     mov     qword ptr [rbp-64], rax              ; bg brush (delete after tracking)
@@ -6827,6 +6841,25 @@ gui_overflow_menu proc frame
     mov     dword ptr [rbp-44], eax              ; chosen id
     WINCALL DestroyMenu, qword ptr [rbp-32]
     WINCALL DeleteObject, qword ptr [rbp-64]
+    cmp     dword ptr [rbp-44], 7               ; "Recover items" -> enter trash view
+    jne     gom_notrecover
+    call    gui_first_deleted
+    cmp     eax, 0
+    jge     gom_dorecover
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr t_notrash, addr t_recover_ttl, \
+            MB_OK or MB_ICONINFORMATION
+    jmp     gom_done
+gom_dorecover:
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_enter_trash
+    jmp     gom_done
+gom_notrecover:
+    cmp     dword ptr [rbp-44], 8               ; "Return to vault" -> leave trash view
+    jne     gom_not8
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_leave_trash
+    jmp     gom_done
+gom_not8:
     cmp     dword ptr [rbp-44], 3
     jne     gom_notdel
     WINCALL PostMessageW, qword ptr [rbp-24], WM_COMMAND, IDC_V_REMOVE, 0
@@ -7800,20 +7833,73 @@ guf_set:
     ret
 gui_update_fav_glyph endp
 
-; gui_update_trash_btn(rcx = hdlg) - label the trash toggle "Vault" while in the
-;   trash (so it returns you to the vault) or "Trash" while in the normal view.
-gui_update_trash_btn proc frame
+; gui_first_deleted() -> eax = index of the first trashed entry, or -1 if none.
+gui_first_deleted proc frame
     FRAME_PROLOG 48
-    mov     qword ptr [rbp-24], rcx
-    lea     rax, [wb_trash]
-    cmp     dword ptr [g_trash_view], 0
-    je      gut_set
-    lea     rax, [wb_vault]
-gut_set:
-    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_TRASH, rax
+    call    vault_count
+    mov     dword ptr [rbp-24], eax
+    mov     dword ptr [rbp-32], 0
+gfd_loop:
+    mov     eax, dword ptr [rbp-32]
+    cmp     eax, dword ptr [rbp-24]
+    jae     gfd_none
+    mov     ecx, dword ptr [rbp-32]
+    call    gui_entry_is_deleted
+    test    eax, eax
+    jnz     gfd_hit
+    inc     dword ptr [rbp-32]
+    jmp     gfd_loop
+gfd_hit:
+    mov     eax, dword ptr [rbp-32]
     FRAME_EPILOG
     ret
-gui_update_trash_btn endp
+gfd_none:
+    mov     eax, -1
+    FRAME_EPILOG
+    ret
+gui_first_deleted endp
+
+; gui_enter_trash(rcx = hdlg) - switch the sidebar into the trash (recover) view,
+;   auto-showing the first deleted entry so Restore is immediately usable.
+gui_enter_trash proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [g_trash_view], 1
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_poplist
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_update_restore_btn
+    call    gui_first_deleted
+    cmp     eax, 0
+    jl      get_done
+    mov     rcx, qword ptr [rbp-24]           ; show the first trashed entry
+    mov     edx, eax
+    call    gui_showdetail
+    mov     rcx, qword ptr [rbp-24]
+    xor     edx, edx
+    call    gui_set_editmode
+get_done:
+    FRAME_EPILOG
+    ret
+gui_enter_trash endp
+
+; gui_leave_trash(rcx = hdlg) - return the sidebar to the normal vault view.
+gui_leave_trash proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [g_trash_view], 0
+    mov     dword ptr [g_cur_idx], -1
+    mov     dword ptr [g_totp_on], 0
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_rows_clear
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_TITLE, 0
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_update_restore_btn
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_poplist
+    FRAME_EPILOG
+    ret
+gui_leave_trash endp
 
 ; gui_update_restore_btn(rcx = hdlg) - show the Restore button only in trash view.
 gui_update_restore_btn proc frame
@@ -8481,8 +8567,6 @@ vp_init:
     mov     dword ptr [g_trash_view], 0       ; start in the vault (not the trash) view
     mov     dword ptr [g_deleted_state], 0
     call    gui_purge_trash                   ; drop entries trashed > 30 days ago
-    mov     rcx, qword ptr [rbp-8]
-    call    gui_update_trash_btn
     call    gui_load_prefs                    ; apply persisted color scheme + layout
     mov     rcx, qword ptr [rbp-8]
     call    gui_apply_scheme
@@ -8554,8 +8638,6 @@ vp_cmd_fixed:
     je      ve_save                           ; discard edits, back to view mode
     cmp     eax, IDC_V_REMOVE
     je      vp_remove
-    cmp     eax, IDC_V_TRASH
-    je      vp_trash
     cmp     eax, IDC_V_RESTORE
     je      vp_restore
     cmp     eax, IDC_V_LOCK
@@ -8784,10 +8866,8 @@ vp_mnoprevinfo:
     WINCALL gui_msgbox, qword ptr [rbp-8], addr m_noprevinfo, addr t_noprevinfo, \
             <MB_OK or MB_ICONINFORMATION>
     jmp     vp_handled
-vp_ovfl:
-    cmp     dword ptr [g_cur_idx], 0             ; only with an entry shown
-    jl      vp_handled
-    mov     rcx, qword ptr [rbp-8]
+vp_ovfl:                                        ; menu opens even with no entry shown
+    mov     rcx, qword ptr [rbp-8]               ; (so "Recover items" stays reachable)
     call    gui_overflow_menu
     jmp     vp_handled
 vp_iconpick:
@@ -9100,29 +9180,16 @@ vpr_teardown:
     xor     edx, edx
     call    gui_set_editmode
     jmp     vp_handled
-vp_trash:
-    mov     eax, dword ptr [g_trash_view]    ; toggle trash / vault view
-    xor     eax, 1
-    mov     dword ptr [g_trash_view], eax
-    mov     rcx, qword ptr [rbp-8]
-    call    gui_update_trash_btn
-    mov     rcx, qword ptr [rbp-8]           ; clear the detail pane + refill the list
-    call    gui_rows_clear
-    WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_TITLE, 0
-    mov     dword ptr [g_cur_idx], -1
-    mov     dword ptr [g_totp_on], 0
-    mov     rcx, qword ptr [rbp-8]
-    call    gui_poplist
-    mov     rcx, qword ptr [rbp-8]           ; show/hide the Restore button
-    call    gui_update_restore_btn
-    jmp     vp_handled
 vp_restore:
     cmp     dword ptr [g_cur_idx], 0         ; restore the shown trashed entry
     jl      vp_handled
     mov     dword ptr [g_deleted_state], 0   ; clear the marker + reseal
     mov     rcx, qword ptr [rbp-8]
     call    gui_commit
-    jmp     vpr_teardown
+    mov     dword ptr [g_dirty], 0
+    mov     rcx, qword ptr [rbp-8]           ; recovered -> back to the vault view
+    call    gui_leave_trash
+    jmp     vp_handled
 vp_lock:
 vp_close:
     cmp     dword ptr [g_menu_open], 0       ; closing while settings open -> save
