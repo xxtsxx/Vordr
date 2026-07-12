@@ -1349,9 +1349,11 @@ tdi_notstatic:
     ; ---------- push button (Fluent: accent primary / neutral standard) ------
     WINCALL GetWindowLongPtrW, qword ptr [rbp-40], GWL_USERDATA
     mov     qword ptr [rbp-128], rax          ; save userdata (ghost: glyph<<16 | hover<<8 | 2)
-    movzx   ecx, al                           ; style byte: 0 standard, 1 accent, 2 ghost
+    movzx   ecx, al                           ; style byte: 0 standard, 1 accent, 2 ghost, 3 search-pill
     cmp     ecx, 2
     je      tdi_ghost
+    cmp     ecx, 3
+    je      tdi_searchpill
     test    rax, rax
     jnz     tdi_accent
     ; standard button - control fill + hairline stroke + light text
@@ -1469,6 +1471,49 @@ tdi_ghost_draw:
     WINCALL DrawTextW, qword ptr [rbp-32], addr g_txtbuf, -1, addr rbp-80, DT_CFLAGS
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-112]
 tdi_ghost_done:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+    ; ---------- title-bar search pill (style 3) ------------------------------
+    ; rounded control fill + hairline border, a search glyph on the left, and the
+    ; window text ("Search ...") as dim placeholder.  Scratch rect at rbp-104..-92
+    ; (shallow: above the WINCALL stack-arg spill zone).
+tdi_searchpill:
+    WINCALL FillRect, qword ptr [rbp-32], addr rbp-80, qword ptr [g_br_bg]
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_br_btn]
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_pen_bd]
+    WINCALL RoundRect, qword ptr [rbp-32], dword ptr [rbp-80], dword ptr [rbp-76], \
+            dword ptr [rbp-72], dword ptr [rbp-68], 14, 14
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_textdim]
+    ; placeholder text (window text still in g_txtbuf), left, inset past the glyph
+    mov     eax, dword ptr [rbp-80]
+    add     eax, 27
+    mov     dword ptr [rbp-104], eax           ; L
+    mov     eax, dword ptr [rbp-76]
+    mov     dword ptr [rbp-100], eax           ; T
+    mov     eax, dword ptr [rbp-72]
+    sub     eax, 6
+    mov     dword ptr [rbp-96], eax            ; R
+    mov     eax, dword ptr [rbp-68]
+    mov     dword ptr [rbp-92], eax            ; B
+    WINCALL DrawTextW, qword ptr [rbp-32], addr g_txtbuf, -1, addr rbp-104, 24h
+    ; search glyph in the icon font, left column
+    mov     word ptr [g_txtbuf], 0E721h
+    mov     word ptr [g_txtbuf+2], 0
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_font_icon]
+    mov     qword ptr [rbp-112], rax
+    mov     eax, dword ptr [rbp-80]
+    add     eax, 9
+    mov     dword ptr [rbp-104], eax           ; L
+    mov     eax, dword ptr [rbp-76]
+    mov     dword ptr [rbp-100], eax           ; T
+    mov     eax, dword ptr [rbp-80]
+    add     eax, 26
+    mov     dword ptr [rbp-96], eax            ; R
+    mov     eax, dword ptr [rbp-68]
+    mov     dword ptr [rbp-92], eax            ; B
+    WINCALL DrawTextW, qword ptr [rbp-32], addr g_txtbuf, -1, addr rbp-104, 24h
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-112]
     mov     eax, 1
     FRAME_EPILOG
     ret

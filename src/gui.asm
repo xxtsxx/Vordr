@@ -325,7 +325,9 @@ IDC_T_CLOSE         equ 292             ; caption: close
 IDC_T_NEW           equ 293             ; dock: new item
 IDC_T_GEN           equ 294             ; dock: password generator
 IDC_T_SET           equ 295             ; dock: settings
+IDC_T_SEARCH        equ 296             ; title-bar search pill
 DOCKBTN_W           equ 34              ; title-bar dock button width
+SEARCHPILL_W        equ 200             ; title-bar search pill width
 LINK_BLUE           equ 00E08C3Ch        ; COLORREF (RGB 60,140,224) hyperlink blue
 WM_MEASUREITEM      equ 2Ch
 WM_COMPAREITEM      equ 39h
@@ -965,6 +967,7 @@ WSTR gt_min, <Minimize>
 WSTR gt_max, <Maximize>
 WSTR gt_close, <Close>
 WSTR gt_settings, <Settings>
+WSTR wb_search_txt, <Search vault  (Ctrl+K)>
 kl_user label word
     dw 'U','s','e','r','n','a','m','e', 0
 kl_secret label word
@@ -9483,6 +9486,13 @@ frame_layout proc frame
     mov     dword ptr [rbp-56], eax
     WINCALL GetDlgItem, qword ptr [rbp-24], IDC_T_NEW
     WINCALL MoveWindow, rax, dword ptr [rbp-56], 0, DOCKBTN_W, TBAR_H, 1
+    ; search pill: left of the dock, vertically centred in the strip
+    mov     eax, dword ptr [rbp-56]            ; pill right = New left - 12 gap
+    sub     eax, 12
+    sub     eax, SEARCHPILL_W                  ; pill left
+    mov     dword ptr [rbp-64], eax
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_T_SEARCH
+    WINCALL MoveWindow, rax, dword ptr [rbp-64], 5, SEARCHPILL_W, 22, 1
     FRAME_EPILOG
     ret
 frame_layout endp
@@ -9550,6 +9560,17 @@ frame_build proc frame
     mov     r8d, GLY_SETTINGS
     lea     r9, [gt_settings]
     call    ghost_make
+    mov     rcx, qword ptr [rbp-24]             ; search pill: make as a ghost, then
+    mov     edx, IDC_T_SEARCH                    ;   switch its style byte 2 -> 3 so
+    mov     r8d, GLY_SEARCH                      ;   theme_drawitem paints the pill
+    lea     r9, [wb_search_txt]
+    call    ghost_make
+    mov     qword ptr [rbp-32], rax
+    WINCALL GetWindowLongPtrW, qword ptr [rbp-32], GWL_USERDATA
+    and     eax, 0FFFFFF00h
+    or      eax, 3
+    mov     edx, eax
+    WINCALL SetWindowLongPtrW, qword ptr [rbp-32], GWL_USERDATA, rdx
     mov     rcx, qword ptr [rbp-24]
     call    frame_layout
     FRAME_EPILOG
@@ -9637,6 +9658,11 @@ vp_maxtoggle:
     jmp     vp_ret
 vp_domax:
     WINCALL ShowWindow, qword ptr [rbp-8], SW_MAXIMIZE_
+    xor     eax, eax
+    jmp     vp_ret
+vp_searchfocus:
+    WINCALL GetDlgItem, qword ptr [rbp-8], IDC_V_SEARCH
+    WINCALL SetFocus, rax
     xor     eax, eax
     jmp     vp_ret
 vp_minmax:
@@ -10025,6 +10051,8 @@ vp_cmd_fixed:
     je      vp_min
     cmp     eax, IDC_T_MAX
     je      vp_maxtoggle
+    cmp     eax, IDC_T_SEARCH                 ; title-bar search pill -> focus the search box
+    je      vp_searchfocus
     cmp     eax, IDC_T_NEW                    ; title-bar control dock
     je      vp_add
     cmp     eax, IDC_T_GEN
