@@ -40,6 +40,8 @@ externdef g_pw2buf:byte             ; confirm-password field (gui.asm)
 externdef g_secret_w:byte           ; revealed secret for reveal/copy (gui.asm)
 externdef g_e_totp:byte             ; entry-form TOTP key (gui.asm)
 externdef g_totp_b32:byte           ; selected entry TOTP key (gui.asm)
+externdef g_body_ptr:qword          ; decrypted vault body arena (vault.asm)
+externdef g_body_len:qword
 
 MEM_COMMIT          equ 1000h
 MEM_RESERVE         equ 2000h
@@ -106,6 +108,49 @@ sec_lock_statics proc frame
     FRAME_EPILOG
     ret
 sec_lock_statics endp
+
+; =============================================================================
+; secmem_panic_wipe() - zero every live secret buffer in one shot.  Called from
+;   the unhandled-exception filter (hardening.asm) BEFORE the process dies, so a
+;   crash can never leave key material in a minidump / hibernation image.  It
+;   only secure_zero's known buffers (the fixed statics + the decrypted body) -
+;   no allocation, no frees - because the heap may already be corrupt at crash
+;   time.  Safe to call redundantly.
+; =============================================================================
+public secmem_panic_wipe
+secmem_panic_wipe proc frame
+    FRAME_PROLOG 32
+    lea     rcx, [g_cfg_pass]
+    mov     edx, 1025
+    call    secure_zero
+    lea     rcx, [g_vkey]
+    mov     edx, 32
+    call    secure_zero
+    lea     rcx, [g_pwbuf]
+    mov     edx, 2048
+    call    secure_zero
+    lea     rcx, [g_pw2buf]
+    mov     edx, 2048
+    call    secure_zero
+    lea     rcx, [g_secret_w]
+    mov     edx, 16384
+    call    secure_zero
+    lea     rcx, [g_e_totp]
+    mov     edx, 512
+    call    secure_zero
+    lea     rcx, [g_totp_b32]
+    mov     edx, 256
+    call    secure_zero
+    mov     rax, qword ptr [g_body_ptr]         ; decrypted vault body, if resident
+    test    rax, rax
+    jz      spw_done
+    mov     rcx, rax
+    mov     rdx, qword ptr [g_body_len]
+    call    secure_zero
+spw_done:
+    FRAME_EPILOG
+    ret
+secmem_panic_wipe endp
 
 public secmem_alloc
 secmem_alloc proc frame

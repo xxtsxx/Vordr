@@ -175,7 +175,9 @@ g_hdr       db VH_TOTAL dup (?)
 align 8
 g_areq      ARGON2REQ <>
 g_greq      GCMREQ <>
+public g_body_ptr
 g_body_ptr  dq ?
+public g_body_len
 g_body_len  dq ?
 g_filebuf   dq ?
 g_filesize  dq ?
