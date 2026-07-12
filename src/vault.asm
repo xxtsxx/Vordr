@@ -169,6 +169,23 @@ VSLOT ends
 
 MAX_VAULTS      equ 8           ; simultaneously-open vaults (redesign items 6/7/9)
 
+; Availability retry state (redesign item 9): a vault whose file can't be opened
+; (locked/missing) is not displayed; it is retried AVAIL_MAX_TRIES times at
+; AVAIL_INTERVAL_MS spacing, then given up until the user unlocks again.  All
+; time-based procs take "now" (a GetTickCount64 value) explicitly so the state
+; machine is deterministic and headless-testable.
+AVAIL_MAX_TRIES   equ 3
+AVAIL_INTERVAL_MS equ 5000
+AVSTAT_AVAIL      equ 0         ; open/usable, displayed
+AVSTAT_RETRY      equ 1         ; unavailable, auto-retrying
+AVSTAT_GAVEUP     equ 2         ; exhausted retries, dormant until manual unlock
+
+AVSLOT struct
+    av_status   dd ?
+    av_tries    dd ?           ; failed retry attempts so far (0..AVAIL_MAX_TRIES)
+    av_next     dq ?           ; tick deadline of the next retry attempt
+AVSLOT ends
+
 .const
 vst_src     db "vault-kat-test!!"      ; 16-byte plaintext for vault_selftest
 ; --- field-serialization KAT (labeled + duplicate fields) ------------------
@@ -232,6 +249,8 @@ public g_vault_cur
 g_vaults    db (sizeof VSLOT) * MAX_VAULTS dup (?) ; multi-vault: per-open-vault held state
 g_vault_n   dd ?                       ; number of open vaults (0..MAX_VAULTS)
 g_vault_cur dd ?                       ; index of the fronted vault, or -1 if none live
+align 8
+g_avslot    db (sizeof AVSLOT) dup (?) ; availability retry state (probe/scratch)
 g_vfz_rng   dq ?                       ; vfuzz xorshift64 state (dbg/test only)
 g_kat_body  db 512 dup (?)             ; scratch body for the field-serialization KAT
 public g_vkey
@@ -2160,6 +2179,70 @@ vcf_no_current:
     ret
 vault_ctx_front endp
 
+; ---------------------------------------------------------------------------
+; Availability retry state machine (redesign item 9).  Leaf procs; the caller
+; supplies "now" (GetTickCount64) so the machine is deterministic to test.
+; ---------------------------------------------------------------------------
+
+; vault_avail_begin(rcx = AVSLOT*, rdx = now) - a vault just went unavailable:
+;   enter RETRY with 0 tries and the first retry due one interval out.
+public vault_avail_begin
+vault_avail_begin proc
+    mov     dword ptr [rcx+AVSLOT.av_status], AVSTAT_RETRY
+    mov     dword ptr [rcx+AVSLOT.av_tries], 0
+    add     rdx, AVAIL_INTERVAL_MS
+    mov     qword ptr [rcx+AVSLOT.av_next], rdx
+    ret
+vault_avail_begin endp
+
+; vault_avail_due(rcx = AVSLOT*, rdx = now) -> eax = 1 if a retry attempt should
+;   run now (RETRY state and the deadline has passed), else 0.
+public vault_avail_due
+vault_avail_due proc
+    xor     eax, eax
+    cmp     dword ptr [rcx+AVSLOT.av_status], AVSTAT_RETRY
+    jne     vad_no
+    cmp     rdx, qword ptr [rcx+AVSLOT.av_next]
+    jb      vad_no
+    mov     eax, 1
+vad_no:
+    ret
+vault_avail_due endp
+
+; vault_avail_fail(rcx = AVSLOT*, rdx = now) - a retry attempt just failed:
+;   count it; after AVAIL_MAX_TRIES give up, else schedule the next interval.
+public vault_avail_fail
+vault_avail_fail proc
+    mov     eax, dword ptr [rcx+AVSLOT.av_tries]
+    inc     eax
+    mov     dword ptr [rcx+AVSLOT.av_tries], eax
+    cmp     eax, AVAIL_MAX_TRIES
+    jb      vaf_reschedule
+    mov     dword ptr [rcx+AVSLOT.av_status], AVSTAT_GAVEUP
+    ret
+vaf_reschedule:
+    add     rdx, AVAIL_INTERVAL_MS
+    mov     qword ptr [rcx+AVSLOT.av_next], rdx
+    ret
+vault_avail_fail endp
+
+; vault_avail_ok(rcx = AVSLOT*) - a retry attempt succeeded: vault is available.
+public vault_avail_ok
+vault_avail_ok proc
+    mov     dword ptr [rcx+AVSLOT.av_status], AVSTAT_AVAIL
+    ret
+vault_avail_ok endp
+
+; vault_avail_unlock(rcx = AVSLOT*, rdx = now) - user asked to unlock again:
+;   restart RETRY from zero, first attempt due immediately.
+public vault_avail_unlock
+vault_avail_unlock proc
+    mov     dword ptr [rcx+AVSLOT.av_status], AVSTAT_RETRY
+    mov     dword ptr [rcx+AVSLOT.av_tries], 0
+    mov     qword ptr [rcx+AVSLOT.av_next], rdx
+    ret
+vault_avail_unlock endp
+
 ; cmd_mvtest - headless probe: plant a distinct sentinel in every open-vault state
 ;   field, snapshot, clobber every field to zero, restore, and verify each field
 ;   came back.  Proves vault_snapshot/vault_restore cover the complete state (a
@@ -2433,6 +2516,110 @@ mvs_fail:
     FRAME_EPILOG
     ret
 cmd_mvswitch endp
+
+; cmd_avtest - headless proof of the availability retry state machine (item 9).
+;   Drives a single AVSLOT through the full unavailable->retry->give-up->manual-
+;   unlock->available lifecycle with fixed "now" values and asserts every
+;   transition (status, tries, next-deadline, due-ness).  exit 0 = pass.
+LANDING_PAD
+public cmd_avtest
+cmd_avtest proc frame
+    FRAME_PROLOG 48
+    ; begin at now=0 -> RETRY, tries 0, next 5000
+    lea     rcx, [g_avslot]
+    xor     edx, edx
+    call    vault_avail_begin
+    cmp     dword ptr [g_avslot + AVSLOT.av_status], AVSTAT_RETRY
+    jne     avt_fail
+    cmp     dword ptr [g_avslot + AVSLOT.av_tries], 0
+    jne     avt_fail
+    cmp     qword ptr [g_avslot + AVSLOT.av_next], 5000
+    jne     avt_fail
+    ; not due before the deadline, due at it
+    lea     rcx, [g_avslot]
+    mov     edx, 4999
+    call    vault_avail_due
+    test    eax, eax
+    jnz     avt_fail
+    lea     rcx, [g_avslot]
+    mov     edx, 5000
+    call    vault_avail_due
+    cmp     eax, 1
+    jne     avt_fail
+    ; first retry fails -> tries 1, next 10000, still RETRY
+    lea     rcx, [g_avslot]
+    mov     edx, 5000
+    call    vault_avail_fail
+    cmp     dword ptr [g_avslot + AVSLOT.av_tries], 1
+    jne     avt_fail
+    cmp     dword ptr [g_avslot + AVSLOT.av_status], AVSTAT_RETRY
+    jne     avt_fail
+    cmp     qword ptr [g_avslot + AVSLOT.av_next], 10000
+    jne     avt_fail
+    ; second retry fails -> tries 2, next 15000
+    lea     rcx, [g_avslot]
+    mov     edx, 10000
+    call    vault_avail_due
+    cmp     eax, 1
+    jne     avt_fail
+    lea     rcx, [g_avslot]
+    mov     edx, 10000
+    call    vault_avail_fail
+    cmp     dword ptr [g_avslot + AVSLOT.av_tries], 2
+    jne     avt_fail
+    cmp     qword ptr [g_avslot + AVSLOT.av_next], 15000
+    jne     avt_fail
+    ; third retry fails -> tries 3 -> GAVEUP, no longer due
+    lea     rcx, [g_avslot]
+    mov     edx, 15000
+    call    vault_avail_due
+    cmp     eax, 1
+    jne     avt_fail
+    lea     rcx, [g_avslot]
+    mov     edx, 15000
+    call    vault_avail_fail
+    cmp     dword ptr [g_avslot + AVSLOT.av_tries], 3
+    jne     avt_fail
+    cmp     dword ptr [g_avslot + AVSLOT.av_status], AVSTAT_GAVEUP
+    jne     avt_fail
+    lea     rcx, [g_avslot]
+    mov     edx, 20000
+    call    vault_avail_due
+    test    eax, eax
+    jnz     avt_fail
+    ; manual unlock -> RETRY, tries 0, due immediately
+    lea     rcx, [g_avslot]
+    mov     edx, 20000
+    call    vault_avail_unlock
+    cmp     dword ptr [g_avslot + AVSLOT.av_status], AVSTAT_RETRY
+    jne     avt_fail
+    cmp     dword ptr [g_avslot + AVSLOT.av_tries], 0
+    jne     avt_fail
+    cmp     qword ptr [g_avslot + AVSLOT.av_next], 20000
+    jne     avt_fail
+    lea     rcx, [g_avslot]
+    mov     edx, 20000
+    call    vault_avail_due
+    cmp     eax, 1
+    jne     avt_fail
+    ; success -> AVAIL, never due again
+    lea     rcx, [g_avslot]
+    call    vault_avail_ok
+    cmp     dword ptr [g_avslot + AVSLOT.av_status], AVSTAT_AVAIL
+    jne     avt_fail
+    lea     rcx, [g_avslot]
+    mov     edx, 99999
+    call    vault_avail_due
+    test    eax, eax
+    jnz     avt_fail
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+avt_fail:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_avtest endp
 
 ; cmd_bktest <path> - headless proof of atomic save + backup rotation (plan 37).
 ;   Creates the vault BAK_GENS+1 times at the same path (fast KDF); each save
