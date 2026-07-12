@@ -683,6 +683,21 @@ SS_OWNERDRAW_   equ 000Dh
 SS_LEFTNOWORDWRAP_ equ 000Ch
 WM_GETFONT      equ 31h
 
+; cross-vault search result (C4): a match with its display data cached, so it can
+; be painted without fronting its home vault.
+MAX_XR      equ 200
+XR struct
+    xr_vault    dd ?
+    xr_entry    dd ?
+    xr_glyph    dd ?
+    xr_color    dd ?
+    xr_score    dd ?
+    xr_pad      dd ?
+    xr_title    dw 64 dup(?)
+    xr_sub      dw 64 dup(?)
+    xr_vname    dw 32 dup(?)
+XR ends
+
 ; OPENFILENAMEW (x64 layout; STRUCT 8 gives the correct natural alignment)
 OPENFILENAMEW struct 8
     lStructSize       dd ?
@@ -1349,6 +1364,9 @@ g_monofont    dq ?                         ; monospace font for the colored pass
 g_phonfont    dq ?                         ; small monospace font for the phonetic columns
 g_symfont     dq ?                         ; Segoe UI Symbol - the recycle glyph in recover mode
 g_sub_w       dw 512 dup (?)               ; subtitle scratch (wide)
+g_xr          db (sizeof XR)*MAX_XR dup(?) ; cross-vault search results (cached display data)
+g_xr_n        dd ?                          ; number of cross-vault results
+g_xr_active   dd ?                          ; 1 = overlay list is showing cross-vault results
 g_cmpbuf      db 256 dup (?)               ; title-A copy for WM_COMPAREITEM
 g_imp_msgw    dw 160 dup (?)               ; CSV-import result message scratch (wide)
 g_pg_len      dd ?                         ; password-generator: length
@@ -9714,9 +9732,7 @@ search_overlay_open proc frame
     mov     r9d, SW_SHOW
     call    gui_show_ids
     mov     rcx, qword ptr [rbp-24]
-    mov     edx, IDC_SO_LIST
-    mov     r8d, IDC_SO_EDIT
-    call    poplist_into
+    call    search_overlay_populate
     mov     dword ptr [g_so_open], 1
 soo_focus:
     WINCALL GetDlgItem, qword ptr [rbp-24], IDC_SO_EDIT
@@ -9737,6 +9753,7 @@ search_overlay_close proc frame
     mov     r9d, SW_HIDE
     call    gui_show_ids
     mov     dword ptr [g_so_open], 0
+    mov     dword ptr [g_xr_active], 0
     WINCALL InvalidateRect, qword ptr [rbp-24], 0, 1   ; repaint the area it covered
     WINCALL SetFocus, qword ptr [rbp-24]
 soc_done:
@@ -9781,9 +9798,28 @@ search_overlay_activate proc frame
     mov     dword ptr [rbp-32], eax           ; selected row
     WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_SO_LIST, LB_GETITEMDATA, \
             dword ptr [rbp-32], 0
-    mov     dword ptr [rbp-36], eax           ; entry index
+    mov     dword ptr [rbp-36], eax           ; entry index (or xr index in cross-vault mode)
+    cmp     dword ptr [g_xr_active], 0
+    je      soa_close
+    mov     ecx, dword ptr [rbp-36]           ; cross-vault: xr index -> (vault, entry)
+    call    xr_ptr
+    mov     r10, rax
+    mov     eax, dword ptr [r10+XR.xr_entry]
+    mov     dword ptr [rbp-48], eax
+    mov     eax, dword ptr [r10+XR.xr_vault]
+    mov     dword ptr [rbp-52], eax
     mov     rcx, qword ptr [rbp-24]
     call    search_overlay_close
+    mov     rcx, qword ptr [rbp-24]           ; front the result's vault (repopulates sidebar)
+    mov     edx, dword ptr [rbp-52]
+    call    gui_switch_vault
+    mov     eax, dword ptr [rbp-48]
+    mov     dword ptr [rbp-36], eax           ; entry to select in the switched-to sidebar
+    jmp     soa_scanstart
+soa_close:
+    mov     rcx, qword ptr [rbp-24]
+    call    search_overlay_close
+soa_scanstart:
     WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_GETCOUNT, 0, 0
     mov     dword ptr [rbp-40], eax
     mov     dword ptr [rbp-44], 0             ; scan the sidebar for the same entry
@@ -9872,6 +9908,273 @@ ses_up:
     FRAME_EPILOG
     ret
 search_overlay_editsub endp
+
+; ---- cross-vault search (C4) ------------------------------------------------
+; xr_ptr(ecx=k) -> rax = &g_xr[k].  Leaf.
+xr_ptr proc
+    mov     eax, ecx
+    imul    rax, rax, sizeof XR
+    lea     rcx, [g_xr]
+    add     rax, rcx
+    ret
+xr_ptr endp
+
+; xr_wcopy(rcx=dst wide, rdx=src wide, r8d=max chars) - copy a wide string,
+;   NUL-terminated, capped.  Leaf.
+xr_wcopy proc
+    xor     r9d, r9d
+xwc_lp:
+    cmp     r9d, r8d
+    jae     xwc_end
+    movzx   eax, word ptr [rdx + r9*2]
+    mov     word ptr [rcx + r9*2], ax
+    test    ax, ax
+    jz      xwc_done
+    inc     r9d
+    jmp     xwc_lp
+xwc_end:
+    mov     word ptr [rcx + r9*2], 0
+xwc_done:
+    ret
+xr_wcopy endp
+
+; search_overlay_xfill(rcx=hdlg) - fuzzy-search EVERY open vault, caching each
+;   match's display data (glyph/color/title/subtitle/vault-name) into g_xr so it
+;   can be painted without its home vault being fronted.  Restores the original
+;   fronted vault when done.
+search_overlay_xfill proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx
+    mov     eax, dword ptr [g_vault_cur]      ; remember the fronted vault
+    mov     dword ptr [rbp-28], eax
+    WINCALL GetDlgItemTextW, qword ptr [rbp-24], IDC_SO_EDIT, addr g_search_w, 255
+    mov     dword ptr [rbp-32], eax           ; qlen
+    mov     dword ptr [g_search_len], eax
+    test    eax, eax
+    jz      @F
+    WINCALL CharUpperBuffW, addr g_search_w, dword ptr [rbp-32]
+@@: mov     dword ptr [g_xr_n], 0
+    mov     dword ptr [rbp-36], 0             ; v
+xf_vloop:
+    mov     eax, dword ptr [rbp-36]
+    cmp     eax, dword ptr [g_vault_n]
+    jae     xf_vdone
+    mov     ecx, dword ptr [rbp-36]
+    call    vault_ctx_front                   ; live = vault v
+    mov     ecx, dword ptr [rbp-36]
+    call    vault_ctx_nameptr
+    mov     qword ptr [rbp-88], rax           ; vname ptr (own 8-byte slot; -48 would overlap j at -44)
+    call    vault_count
+    mov     dword ptr [rbp-40], eax           ; cnt
+    mov     dword ptr [rbp-44], 0             ; j
+xf_eloop:
+    mov     eax, dword ptr [rbp-44]
+    cmp     eax, dword ptr [rbp-40]
+    jae     xf_vnext
+    mov     ecx, dword ptr [rbp-44]
+    call    gui_entry_is_deleted
+    test    eax, eax
+    jnz     xf_jnext
+    cmp     dword ptr [rbp-32], 0
+    je      xf_match
+    mov     ecx, dword ptr [rbp-44]
+    call    gui_entry_fuzzy
+    test    eax, eax
+    js      xf_jnext
+    mov     dword ptr [rbp-52], eax
+    jmp     xf_store
+xf_match:
+    mov     dword ptr [rbp-52], 0
+xf_store:
+    mov     eax, dword ptr [g_xr_n]
+    cmp     eax, MAX_XR
+    jae     xf_vdone
+    mov     ecx, eax
+    call    xr_ptr
+    mov     qword ptr [rbp-64], rax
+    mov     r10, rax
+    mov     eax, dword ptr [rbp-36]
+    mov     dword ptr [r10+XR.xr_vault], eax
+    mov     eax, dword ptr [rbp-44]
+    mov     dword ptr [r10+XR.xr_entry], eax
+    mov     eax, dword ptr [rbp-52]
+    mov     dword ptr [r10+XR.xr_score], eax
+    mov     ecx, dword ptr [rbp-44]           ; glyph -> cache
+    call    gui_entry_glyph
+    mov     r10, qword ptr [rbp-64]
+    mov     dword ptr [r10+XR.xr_glyph], eax
+    mov     ecx, dword ptr [rbp-44]           ; color -> cache
+    call    gui_entry_color
+    mov     r10, qword ptr [rbp-64]
+    mov     dword ptr [r10+XR.xr_color], eax
+    mov     ecx, dword ptr [rbp-44]           ; title (utf8) -> wide -> cache
+    lea     rdx, [rbp-72]
+    call    vault_title_at
+    mov     rcx, rax
+    mov     edx, dword ptr [rbp-72]
+    mov     r10, qword ptr [rbp-64]
+    lea     r8, [r10+XR.xr_title]
+    mov     r9d, 62
+    call    gui_towide
+    mov     ecx, dword ptr [rbp-44]           ; subtitle -> g_sub_w -> cache
+    call    gui_entry_subtitle
+    mov     r10, qword ptr [rbp-64]
+    lea     rcx, [r10+XR.xr_sub]
+    lea     rdx, [g_sub_w]
+    mov     r8d, 63
+    call    xr_wcopy
+    mov     r10, qword ptr [rbp-64]           ; vault name -> cache
+    lea     rcx, [r10+XR.xr_vname]
+    mov     rdx, qword ptr [rbp-88]
+    mov     r8d, 31
+    call    xr_wcopy
+    inc     dword ptr [g_xr_n]
+xf_jnext:
+    inc     dword ptr [rbp-44]
+    jmp     xf_eloop
+xf_vnext:
+    inc     dword ptr [rbp-36]
+    jmp     xf_vloop
+xf_vdone:
+    mov     ecx, dword ptr [rbp-28]           ; restore the originally fronted vault
+    call    vault_ctx_front
+    FRAME_EPILOG
+    ret
+search_overlay_xfill endp
+
+; gui_draw_xresult(rcx=lpdis) - paint one cross-vault result card from g_xr
+;   (icon + title + subtitle + right-aligned dim vault name).
+gui_draw_xresult proc frame
+    FRAME_PROLOG 192
+    mov     qword ptr [rbp-24], rcx
+    mov     r10, rcx
+    mov     eax, dword ptr [r10+8]
+    cmp     eax, -1
+    je      gxr_done
+    mov     rax, qword ptr [r10+32]
+    mov     qword ptr [rbp-32], rax           ; hdc
+    mov     eax, dword ptr [r10+40]
+    mov     dword ptr [rbp-40], eax
+    mov     eax, dword ptr [r10+44]
+    mov     dword ptr [rbp-48], eax
+    mov     eax, dword ptr [r10+48]
+    mov     dword ptr [rbp-56], eax
+    mov     eax, dword ptr [r10+52]
+    mov     dword ptr [rbp-64], eax
+    mov     eax, dword ptr [r10+16]
+    mov     dword ptr [rbp-72], eax           ; state
+    mov     eax, dword ptr [r10+56]           ; itemData = xr index
+    cmp     eax, dword ptr [g_xr_n]           ; guard: stale/foreign index -> skip
+    jae     gxr_done
+    mov     ecx, eax
+    call    xr_ptr
+    mov     qword ptr [rbp-80], rax
+    mov     eax, dword ptr [g_col_side]
+    test    dword ptr [rbp-72], 1
+    jz      @F
+    mov     eax, dword ptr [g_col_frame]
+@@: mov     dword ptr [rbp-88], eax
+    WINCALL CreateSolidBrush, dword ptr [rbp-88]
+    mov     qword ptr [rbp-96], rax
+    mov     r10, qword ptr [rbp-24]
+    lea     rdx, [r10+40]
+    WINCALL FillRect, qword ptr [rbp-32], rdx, qword ptr [rbp-96]
+    WINCALL DeleteObject, qword ptr [rbp-96]
+    mov     r10, qword ptr [rbp-80]           ; icon tile
+    mov     eax, dword ptr [r10+XR.xr_color]
+    mov     dword ptr [g_tilecolor], eax
+    mov     eax, dword ptr [r10+XR.xr_glyph]
+    mov     word ptr [g_glyph_w], ax
+    mov     word ptr [g_glyph_w+2], 0
+    mov     rcx, qword ptr [rbp-32]
+    mov     edx, dword ptr [rbp-40]
+    add     edx, 5
+    mov     r8d, dword ptr [rbp-48]
+    add     r8d, 5
+    mov     r9d, 34
+    call    gui_draw_tile
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_cardfont]   ; title
+    mov     qword ptr [rbp-104], rax
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_text]
+    WINCALL SetBkMode, qword ptr [rbp-32], 1
+    mov     eax, dword ptr [rbp-40]
+    add     eax, 46
+    mov     dword ptr [rbp-152], eax
+    mov     eax, dword ptr [rbp-48]
+    add     eax, 4
+    mov     dword ptr [rbp-148], eax
+    mov     eax, dword ptr [rbp-56]
+    sub     eax, 4
+    mov     dword ptr [rbp-144], eax
+    mov     eax, dword ptr [rbp-48]
+    add     eax, 22
+    mov     dword ptr [rbp-140], eax
+    mov     r10, qword ptr [rbp-80]
+    lea     rdx, [r10+XR.xr_title]
+    WINCALL DrawTextW, qword ptr [rbp-32], rdx, -1, addr rbp-152, 8024h
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_subfont]    ; subtitle (dim)
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_textdim]
+    mov     eax, dword ptr [rbp-48]
+    add     eax, 22
+    mov     dword ptr [rbp-148], eax
+    mov     eax, dword ptr [rbp-64]
+    sub     eax, 2
+    mov     dword ptr [rbp-140], eax
+    mov     r10, qword ptr [rbp-80]
+    lea     rdx, [r10+XR.xr_sub]
+    WINCALL DrawTextW, qword ptr [rbp-32], rdx, -1, addr rbp-152, 8024h
+    mov     eax, dword ptr [rbp-40]           ; vault name, right-aligned on the subtitle line
+    add     eax, 100
+    mov     dword ptr [rbp-152], eax
+    mov     eax, dword ptr [rbp-48]
+    add     eax, 22
+    mov     dword ptr [rbp-148], eax
+    mov     eax, dword ptr [rbp-56]
+    sub     eax, 6
+    mov     dword ptr [rbp-144], eax
+    mov     eax, dword ptr [rbp-64]
+    sub     eax, 2
+    mov     dword ptr [rbp-140], eax
+    mov     r10, qword ptr [rbp-80]
+    lea     rdx, [r10+XR.xr_vname]
+    WINCALL DrawTextW, qword ptr [rbp-32], rdx, -1, addr rbp-152, 8026h
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-104]
+gxr_done:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gui_draw_xresult endp
+
+; search_overlay_populate(rcx=hdlg) - fill the overlay results list: cross-vault
+;   (all open vaults, cached) when >1 vault is open, else the current vault.
+search_overlay_populate proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    cmp     dword ptr [g_vault_n], 1
+    jbe     sop_single
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_SO_LIST, LB_RESETCONTENT, 0, 0
+    mov     dword ptr [g_xr_active], 1        ; set AFTER clearing old (entry-index) items
+    mov     rcx, qword ptr [rbp-24]
+    call    search_overlay_xfill
+    mov     dword ptr [rbp-28], 0
+sop_addlp:
+    mov     eax, dword ptr [rbp-28]
+    cmp     eax, dword ptr [g_xr_n]
+    jae     sop_done
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_SO_LIST, LB_ADDSTRING, 0, \
+            dword ptr [rbp-28]
+    inc     dword ptr [rbp-28]
+    jmp     sop_addlp
+sop_single:
+    mov     dword ptr [g_xr_active], 0
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_SO_LIST
+    mov     r8d, IDC_SO_EDIT
+    call    poplist_into
+sop_done:
+    FRAME_EPILOG
+    ret
+search_overlay_populate endp
 
 ; gui_draw_tabs(rcx=lpdis) - paint the multi-vault tab strip: one tab per open
 ;   vault (lock glyph + display name), the fronted vault highlighted.
@@ -10288,10 +10591,39 @@ vp_measure_menu:
     mov     eax, 1
     jmp     vp_ret
 vp_compare:
-    mov     r10, r9                          ; COMPAREITEMSTRUCT: idx at +24/+40
+    mov     r10, r9                          ; COMPAREITEMSTRUCT: item data at +24/+40
+    cmp     dword ptr [g_xr_active], 0
+    jne     vp_compare_xr
     mov     ecx, dword ptr [r10+24]
     mov     edx, dword ptr [r10+40]
     call    gui_title_cmp
+    jmp     vp_ret
+vp_compare_xr:
+    mov     ecx, dword ptr [r10+24]          ; cross-vault: sort by cached score (desc)
+    cmp     ecx, dword ptr [g_xr_n]          ; guard against foreign item data
+    jae     vpc_eq
+    mov     edx, dword ptr [r10+40]
+    cmp     edx, dword ptr [g_xr_n]
+    jae     vpc_eq
+    call    xr_ptr
+    mov     r11d, dword ptr [rax+XR.xr_score]
+    mov     r10, r9
+    mov     ecx, dword ptr [r10+40]
+    call    xr_ptr
+    mov     eax, dword ptr [rax+XR.xr_score]
+    cmp     r11d, eax
+    jg      vpc_a
+    jl      vpc_b
+    xor     eax, eax
+    jmp     vp_ret
+vpc_a:
+    mov     eax, -1
+    jmp     vp_ret
+vpc_b:
+    mov     eax, 1
+    jmp     vp_ret
+vpc_eq:
+    xor     eax, eax
     jmp     vp_ret
 vp_tpaint:
     mov     rcx, qword ptr [rbp-8]
@@ -10326,8 +10658,8 @@ vp_tdraw:
     je      vp_tdraw_tnoprev
     cmp     eax, IDC_V_LIST                   ; the entry list = icon cards
     je      vp_tdraw_list
-    cmp     eax, IDC_SO_LIST                  ; search-overlay results = same cards
-    je      vp_tdraw_list
+    cmp     eax, IDC_SO_LIST                  ; search-overlay results
+    je      vp_tdraw_solist
     cmp     eax, IDC_V_TABS                   ; multi-vault tab strip
     je      vp_tdraw_tabs
     cmp     eax, IDC_V_HEADER                 ; detail-pane header (tile + title)
@@ -10365,6 +10697,13 @@ vp_tdraw_icon:
 vp_tdraw_tabs:
     mov     rcx, r9
     call    gui_draw_tabs
+    mov     eax, 1
+    jmp     vp_ret
+vp_tdraw_solist:
+    cmp     dword ptr [g_xr_active], 0        ; cross-vault results use the cached painter
+    je      vp_tdraw_list
+    mov     rcx, r9
+    call    gui_draw_xresult
     mov     eax, 1
     jmp     vp_ret
 vp_tdraw_colorpw:
@@ -10832,9 +11171,7 @@ vp_search_now:
     jmp     vp_handled
 vp_so_change:
     mov     rcx, qword ptr [rbp-8]            ; overlay: refilter the results list live
-    mov     edx, IDC_SO_LIST
-    mov     r8d, IDC_SO_EDIT
-    call    poplist_into
+    call    search_overlay_populate
     jmp     vp_handled
 vp_so_list:
     cmp     r10d, LBN_DBLCLK                  ; double-click a result -> open it
