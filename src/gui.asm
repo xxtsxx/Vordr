@@ -9963,6 +9963,124 @@ gdt_done:
     ret
 gui_draw_tabs endp
 
+; gui_switch_vault(rcx=hdlg, edx=idx) - front vault idx and repopulate the UI
+;   (clear search, rebuild the sidebar, select its first entry, repaint tabs).
+gui_switch_vault proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    mov     ecx, edx
+    call    vault_ctx_front                  ; swap live state (incl g_vpath) to vault idx
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_SEARCH, addr w_empty
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_poplist
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_GETCOUNT, 0, 0
+    test    eax, eax
+    jz      gsv_repaint
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_SETCURSEL, 0, 0
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_GETITEMDATA, 0, 0
+    mov     dword ptr [rbp-32], eax
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-32]
+    call    gui_showdetail
+    mov     rcx, qword ptr [rbp-24]
+    xor     edx, edx
+    call    gui_set_editmode
+gsv_repaint:
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_V_TABS
+    WINCALL InvalidateRect, rax, 0, 1
+    FRAME_EPILOG
+    ret
+gui_switch_vault endp
+
+; gui_tab_click(rcx=hdlg) - a click on the tab strip: switch to the clicked tab,
+;   or open an additional vault if the click landed past the last tab.
+gui_tab_click proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    WINCALL GetCursorPos, addr rbp-40         ; POINT{x=[rbp-40], y=[rbp-36]}
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_V_TABS
+    WINCALL ScreenToClient, rax, addr rbp-40
+    mov     eax, dword ptr [rbp-40]           ; client x
+    test    eax, eax
+    js      gtc_done                          ; left of the strip -> ignore
+    xor     edx, edx
+    mov     ecx, TAB_W
+    div     ecx                                ; eax = x / TAB_W
+    mov     dword ptr [rbp-32], eax
+    cmp     eax, dword ptr [g_vault_n]
+    jae     gtc_add
+    cmp     eax, dword ptr [g_vault_cur]
+    je      gtc_done                           ; already fronted
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-32]
+    call    gui_switch_vault
+    jmp     gtc_done
+gtc_add:
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_open_additional
+gtc_done:
+    FRAME_EPILOG
+    ret
+gui_tab_click endp
+
+; gui_open_additional(rcx=hdlg) - pick + unlock another vault into a new tab.
+;   Order matters: snapshot the current vault FIRST (its g_vpath is still intact),
+;   then overwrite g_vpath with the picked file and load it.  Rolls back on
+;   cancel / unlock failure by dropping the slot and restoring the previous vault.
+gui_open_additional proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    cmp     dword ptr [g_vault_n], 8          ; MAX_VAULTS
+    jae     goa_done
+    mov     eax, dword ptr [g_vault_cur]
+    mov     dword ptr [rbp-32], eax           ; saved old cur (rollback target)
+    call    vault_ctx_open                    ; snapshot current (correct g_vpath) -> its slot
+    lea     rcx, [g_ofn]
+    mov     edx, sizeof OPENFILENAMEW
+    call    secure_zero
+    lea     r10, [g_ofn]
+    mov     dword ptr [r10].OPENFILENAMEW.lStructSize, sizeof OPENFILENAMEW
+    mov     rax, qword ptr [rbp-24]
+    mov     qword ptr [r10].OPENFILENAMEW.hwndOwner, rax
+    lea     rax, [g_vaultfilter]
+    mov     qword ptr [r10].OPENFILENAMEW.lpstrFilter, rax
+    lea     rax, [g_vpath]
+    mov     qword ptr [r10].OPENFILENAMEW.lpstrFile, rax
+    mov     dword ptr [r10].OPENFILENAMEW.nMaxFile, 1024
+    mov     dword ptr [r10].OPENFILENAMEW.nFilterIndex, 1
+    mov     dword ptr [r10].OPENFILENAMEW.Flags, OFN_FILEMUSTEXIST or OFN_PATHMUSTEXIST or OFN_HIDEREADONLY or OFN_EXPLORER
+    WINCALL GetOpenFileNameW, addr g_ofn
+    test    eax, eax
+    jz      goa_rollback                       ; cancelled
+    lea     rax, [g_vpath]                     ; unlock the picked vault: TPM, else password
+    mov     qword ptr [g_cfg_in], rax
+    call    gui_try_tpm_auto
+    test    eax, eax
+    jnz     goa_loaded
+    WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_UNLOCK, qword ptr [rbp-24], addr unlock_proc, 0
+    cmp     rax, 1
+    jne     goa_rollback
+goa_loaded:
+    lea     rcx, [g_vpath]                     ; name the new tab from the basename
+    call    gui_basename
+    mov     ecx, dword ptr [g_vault_cur]
+    lea     rdx, [g_imgfn_w]
+    call    vault_ctx_setname
+    mov     rcx, qword ptr [rbp-24]            ; repopulate for the new vault + repaint tabs
+    mov     edx, dword ptr [g_vault_cur]
+    call    gui_switch_vault
+    jmp     goa_done
+goa_rollback:
+    mov     eax, dword ptr [g_vault_n]         ; drop the claimed slot
+    dec     eax
+    mov     dword ptr [g_vault_n], eax
+    mov     ecx, dword ptr [rbp-32]            ; restore the previous vault (g_vpath + state)
+    call    vault_ctx_front
+goa_done:
+    FRAME_EPILOG
+    ret
+gui_open_additional endp
+
 ; =============================================================================
 ; vault_proc - DLG_VAULT dialog procedure (raw frame).
 ; =============================================================================
@@ -10460,6 +10578,8 @@ vp_cmd_fixed:
     je      vp_menu
     cmp     eax, IDC_SO_LIST                  ; search-overlay results
     je      vp_so_list
+    cmp     eax, IDC_V_TABS                   ; multi-vault tab strip click
+    je      vp_tabclick
     cmp     eax, IDC_V_LIST
     je      vp_list
     cmp     eax, IDC_V_ADDFIELD
@@ -10651,6 +10771,12 @@ vp_so_list:
     jne     vp_handled
     mov     rcx, qword ptr [rbp-8]
     call    search_overlay_activate
+    jmp     vp_handled
+vp_tabclick:
+    test    r10d, r10d                        ; BN_CLICKED only
+    jnz     vp_handled
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_tab_click
     jmp     vp_handled
 vp_focusin:
     cmp     dword ptr [g_editmode], 0
