@@ -326,8 +326,14 @@ IDC_T_NEW           equ 293             ; dock: new item
 IDC_T_GEN           equ 294             ; dock: password generator
 IDC_T_SET           equ 295             ; dock: settings
 IDC_T_SEARCH        equ 296             ; title-bar search pill
+IDC_SO_PANEL        equ 297             ; search overlay: framed backdrop
+IDC_SO_EDIT         equ 298             ; search overlay: query edit
+IDC_SO_LIST         equ 299             ; search overlay: owner-draw results list
 DOCKBTN_W           equ 34              ; title-bar dock button width
 SEARCHPILL_W        equ 200             ; title-bar search pill width
+SO_W                equ 360             ; search overlay width (px)
+SO_EDITH            equ 26              ; search overlay edit height (px)
+SO_LISTH            equ 300             ; search overlay results height (px)
 LINK_BLUE           equ 00E08C3Ch        ; COLORREF (RGB 60,140,224) hyperlink blue
 WM_MEASUREITEM      equ 2Ch
 WM_COMPAREITEM      equ 39h
@@ -386,6 +392,20 @@ LB_ADDSTRING        equ 180h
 LB_RESETCONTENT     equ 184h
 LB_INITSTORAGE      equ 1A8h            ; pre-allocate item storage for large lists
 LB_SETCURSEL        equ 186h
+LB_GETCURSEL        equ 188h
+LB_GETCOUNT         equ 18Bh
+LBN_DBLCLK          equ 2
+VK_RETURN_          equ 0Dh
+VK_ESCAPE_          equ 1Bh
+VK_UP_              equ 26h
+VK_DOWN_            equ 28h
+WM_GETDLGCODE_      equ 0087h
+DLGC_WANTALLKEYS_   equ 0004h
+LBS_NOTIFY_         equ 0001h
+LBS_SORT_           equ 0002h
+LBS_OWNERDRAWFIXED_ equ 0010h
+LBS_NOINTEGRALHEIGHT_ equ 0100h
+WS_VSCROLL_         equ 00200000h
 LB_GETCURSEL        equ 188h
 LB_GETITEMRECT      equ 198h            ; item bounding rect (recycle-glyph hit-test)
 GWL_USERDATA        equ -21             ; button accent tag (theme_drawitem primary)
@@ -954,6 +974,12 @@ cls_button label word
     dw 'B','u','t','t','o','n', 0
 cls_static label word
     dw 'S','t','a','t','i','c', 0
+cls_listbox label word
+    dw 'L','i','s','t','B','o','x', 0
+WSTR so_cue, <Search all entries...>
+w_empty     dw 0
+align 4
+g_so_ids    dd IDC_SO_PANEL, IDC_SO_EDIT, IDC_SO_LIST
 cls_tooltip label word
     dw 't','o','o','l','t','i','p','s','_','c','l','a','s','s','3','2', 0
 WSTR gl_t_theme, <Theme / colour scheme>
@@ -1217,6 +1243,7 @@ g_reqbuf    dw 768 dup (?)            ; formatted password-requirements callout 
 g_numtmp    db 16 dup (?)             ; scratch for uint-to-decimal
 g_vault_lock dd ?                     ; 1 = vault path set by HKLM (locked)
 g_menu_open  dd ?                     ; 1 = settings overlay is showing
+g_so_open    dd ?                     ; 1 = title-bar search overlay is showing
 g_revealed  dd ?
 g_clip_seq  dd ?                      ; clipboard sequence number at last copy
 g_clip_secs dd ?                      ; auto-clear timeout in seconds (0 = off); HKLM>HKCU>20
@@ -1813,61 +1840,69 @@ unlock_proc endp
 ; gui_poplist(rcx = hdlg) - clear and repopulate the entry list from the vault.
 ; =============================================================================
 gui_poplist proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_V_LIST
+    mov     r8d, IDC_V_SEARCH
+    call    poplist_into
+    FRAME_EPILOG
+    ret
+gui_poplist endp
+
+; poplist_into(rcx=hdlg, edx=listId, r8d=queryEditId) - clear & fuzzy-fill an
+;   owner-draw entry list from the vault, reading the query from queryEditId.
+;   Backs both the sidebar (IDC_V_LIST/IDC_V_SEARCH) and the search overlay.
+poplist_into proc frame
     FRAME_PROLOG 96
     mov     qword ptr [rbp-24], rcx
-    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_RESETCONTENT, 0, 0
-    ; read the search query and upper-case it for case-insensitive matching
-    WINCALL GetDlgItemTextW, qword ptr [rbp-24], IDC_V_SEARCH, addr g_search_w, 255
+    mov     dword ptr [rbp-64], edx              ; listId
+    mov     dword ptr [rbp-68], r8d              ; queryId
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], dword ptr [rbp-64], LB_RESETCONTENT, 0, 0
+    WINCALL GetDlgItemTextW, qword ptr [rbp-24], dword ptr [rbp-68], addr g_search_w, 255
     mov     dword ptr [rbp-56], eax              ; query length (chars)
     mov     dword ptr [g_search_len], eax        ; publish for the score-aware sort
     test    eax, eax
-    jz      gp_nofold
+    jz      pi_nofold
     WINCALL CharUpperBuffW, addr g_search_w, dword ptr [rbp-56]
-gp_nofold:
+pi_nofold:
     call    vault_count
     mov     dword ptr [rbp-32], eax              ; count
-    ; pre-allocate the listbox's internal item storage so a 5000-entry bulk fill
-    ; does not repeatedly reallocate (plan 35: smooth large-vault handling).  The
-    ; owner-draw listbox already virtualizes painting; this just speeds the load.
     mov     r10d, eax
     imul    r10d, r10d, 8                        ; ~8 bytes of storage per item
-    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_INITSTORAGE, \
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], dword ptr [rbp-64], LB_INITSTORAGE, \
             dword ptr [rbp-32], r10
     mov     dword ptr [rbp-40], 0               ; index
-gp_loop:
+pi_loop:
     mov     eax, dword ptr [rbp-40]
     cmp     eax, dword ptr [rbp-32]
-    jae     gp_done
+    jae     pi_done
     mov     ecx, dword ptr [rbp-40]             ; trash filter: show deleted iff in trash view
     call    gui_entry_is_deleted
     cmp     eax, dword ptr [g_trash_view]
-    jne     gp_next
+    jne     pi_next
     cmp     dword ptr [rbp-56], 0               ; empty query -> show everything
-    je      gp_show
+    je      pi_show
     mov     ecx, dword ptr [rbp-40]
     call    gui_entry_fuzzy                      ; eax = best fuzzy score, or -1
     mov     r10d, dword ptr [rbp-40]             ; cache the score for the sort (idx<CAP)
     cmp     r10d, SCORE_CAP
-    jae     gp_scored
+    jae     pi_scored
     lea     r11, [g_entry_score]
     mov     dword ptr [r11+r10*4], eax
-gp_scored:
+pi_scored:
     test    eax, eax                             ; -1 = no match -> skip
-    js      gp_next
-gp_show:
-    ; owner-draw list: the item data IS the vault index; WM_COMPAREITEM sorts by
-    ; title, WM_DRAWITEM renders the icon card.  Pass the index as a DWORD so the
-    ; 64-bit LPARAM is zero-extended (the slot is a dword; a qword read would take
-    ; the uninitialized 4 bytes above it into the stored item data).
-    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_ADDSTRING, 0, \
+    js      pi_next
+pi_show:
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], dword ptr [rbp-64], LB_ADDSTRING, 0, \
             dword ptr [rbp-40]
-gp_next:
+pi_next:
     inc     dword ptr [rbp-40]
-    jmp     gp_loop
-gp_done:
+    jmp     pi_loop
+pi_done:
     FRAME_EPILOG
     ret
-gui_poplist endp
+poplist_into endp
 
 ; =============================================================================
 ; Owner-draw entry list: icon-tile cards (glyph + title + subtitle)
@@ -9578,6 +9613,247 @@ frame_build proc frame
 frame_build endp
 
 ; =============================================================================
+; Title-bar search overlay (redesign A2): a blended dropdown under the search
+; pill with a query edit + owner-draw results list.  Built as hidden dialog
+; children so it rides the existing WM_DRAWITEM / WM_COMMAND / WM_CTLCOLOR flow.
+; =============================================================================
+
+; search_overlay_build(rcx=hdlg) - create the panel/edit/list (hidden).  Called
+;   from vp_init after frame_build so the overlay sits topmost.
+search_overlay_build proc frame
+    FRAME_PROLOG 128
+    mov     qword ptr [rbp-24], rcx
+    WINCALL mk_ctl, qword ptr [rbp-24], IDC_SO_PANEL, addr cls_static, 0, \
+            SS_OWNERDRAW_, 0, 0, 10, 10
+    WINCALL mk_ctl, qword ptr [rbp-24], IDC_SO_EDIT, addr cls_edit, 0, \
+            ES_AUTOHSCROLL_, 0, 0, 10, 10
+    mov     qword ptr [rbp-32], rax
+    WINCALL SendMessageW, qword ptr [rbp-32], EM_SETCUEBANNER, 1, addr so_cue
+    WINCALL SetWindowSubclass, qword ptr [rbp-32], addr search_overlay_editsub, 0, \
+            qword ptr [rbp-24]
+    WINCALL mk_ctl, qword ptr [rbp-24], IDC_SO_LIST, addr cls_listbox, 0, \
+            LBS_OWNERDRAWFIXED_ or LBS_SORT_ or LBS_NOTIFY_ or LBS_NOINTEGRALHEIGHT_ or WS_VSCROLL_, \
+            0, 0, 10, 10
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [g_so_ids]
+    mov     r8d, 3
+    mov     r9d, SW_HIDE
+    call    gui_show_ids
+    FRAME_EPILOG
+    ret
+search_overlay_build endp
+
+; search_overlay_open(rcx=hdlg) - position the dropdown under the pill, show it,
+;   populate with all entries, and focus the query edit.
+search_overlay_open proc frame
+    FRAME_PROLOG 144                           ; spill must clear the pill/client rects (down to -112)
+    mov     qword ptr [rbp-24], rcx
+    cmp     dword ptr [g_so_open], 0
+    jne     soo_focus
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_T_SEARCH
+    mov     qword ptr [rbp-32], rax
+    WINCALL GetWindowRect, qword ptr [rbp-32], addr rbp-80   ; L-80 T-76 R-72 B-68
+    WINCALL MapWindowPoints, 0, qword ptr [rbp-24], addr rbp-80, 2
+    WINCALL GetClientRect, qword ptr [rbp-24], addr rbp-112  ; R at -104
+    mov     eax, dword ptr [rbp-80]           ; x = pill left
+    mov     dword ptr [rbp-40], eax
+    mov     eax, dword ptr [rbp-104]          ; clamp x to clientW - SO_W - 4
+    sub     eax, SO_W
+    sub     eax, 4
+    cmp     dword ptr [rbp-40], eax
+    jle     @F
+    mov     dword ptr [rbp-40], eax
+@@: cmp     dword ptr [rbp-40], 4
+    jge     @F
+    mov     dword ptr [rbp-40], 4
+@@: mov     eax, dword ptr [rbp-68]           ; y = pill bottom + 2
+    add     eax, 2
+    mov     dword ptr [rbp-44], eax
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_SO_PANEL
+    WINCALL MoveWindow, rax, dword ptr [rbp-40], dword ptr [rbp-44], SO_W, SO_EDITH+SO_LISTH, 0
+    mov     eax, dword ptr [rbp-40]           ; edit inset
+    add     eax, 6
+    mov     dword ptr [rbp-48], eax
+    mov     eax, dword ptr [rbp-44]
+    add     eax, 4
+    mov     dword ptr [rbp-52], eax
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_SO_EDIT
+    WINCALL MoveWindow, rax, dword ptr [rbp-48], dword ptr [rbp-52], SO_W-12, 18, 0
+    mov     eax, dword ptr [rbp-40]           ; list under the edit
+    add     eax, 4
+    mov     dword ptr [rbp-48], eax
+    mov     eax, dword ptr [rbp-44]
+    add     eax, SO_EDITH
+    mov     dword ptr [rbp-52], eax
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_SO_LIST
+    WINCALL MoveWindow, rax, dword ptr [rbp-48], dword ptr [rbp-52], SO_W-8, SO_LISTH, 0
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_SO_EDIT, addr w_empty
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [g_so_ids]
+    mov     r8d, 3
+    mov     r9d, SW_SHOW
+    call    gui_show_ids
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_SO_LIST
+    mov     r8d, IDC_SO_EDIT
+    call    poplist_into
+    mov     dword ptr [g_so_open], 1
+soo_focus:
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_SO_EDIT
+    WINCALL SetFocus, rax
+    FRAME_EPILOG
+    ret
+search_overlay_open endp
+
+; search_overlay_close(rcx=hdlg) - hide the dropdown, return focus to the dialog.
+search_overlay_close proc frame
+    FRAME_PROLOG 32
+    mov     qword ptr [rbp-24], rcx
+    cmp     dword ptr [g_so_open], 0
+    je      soc_done
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [g_so_ids]
+    mov     r8d, 3
+    mov     r9d, SW_HIDE
+    call    gui_show_ids
+    mov     dword ptr [g_so_open], 0
+    WINCALL InvalidateRect, qword ptr [rbp-24], 0, 1   ; repaint the area it covered
+    WINCALL SetFocus, qword ptr [rbp-24]
+soc_done:
+    FRAME_EPILOG
+    ret
+search_overlay_close endp
+
+; search_overlay_movesel(rcx=hdlg, edx=delta) - move the results selection.
+search_overlay_movesel proc frame
+    FRAME_PROLOG 64                            ; spill must clear delta at -32 / new at -40
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-32], edx
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_SO_LIST, LB_GETCOUNT, 0, 0
+    test    eax, eax
+    jz      som_done
+    mov     dword ptr [rbp-36], eax           ; count
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_SO_LIST, LB_GETCURSEL, 0, 0
+    add     eax, dword ptr [rbp-32]           ; cur(-1 if none) + delta
+    test    eax, eax
+    jns     @F
+    xor     eax, eax
+@@: cmp     eax, dword ptr [rbp-36]
+    jl      @F
+    mov     eax, dword ptr [rbp-36]
+    dec     eax
+@@: mov     dword ptr [rbp-40], eax
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_SO_LIST, LB_SETCURSEL, \
+            dword ptr [rbp-40], 0
+som_done:
+    FRAME_EPILOG
+    ret
+search_overlay_movesel endp
+
+; search_overlay_activate(rcx=hdlg) - open the selected result: sync the sidebar
+;   selection to it, load its detail, close the overlay.
+search_overlay_activate proc frame
+    FRAME_PROLOG 80                            ; spill must clear locals down to -44
+    mov     qword ptr [rbp-24], rcx
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_SO_LIST, LB_GETCURSEL, 0, 0
+    cmp     eax, LB_ERR
+    je      soa_done
+    mov     dword ptr [rbp-32], eax           ; selected row
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_SO_LIST, LB_GETITEMDATA, \
+            dword ptr [rbp-32], 0
+    mov     dword ptr [rbp-36], eax           ; entry index
+    mov     rcx, qword ptr [rbp-24]
+    call    search_overlay_close
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_GETCOUNT, 0, 0
+    mov     dword ptr [rbp-40], eax
+    mov     dword ptr [rbp-44], 0             ; scan the sidebar for the same entry
+soa_scan:
+    mov     eax, dword ptr [rbp-44]
+    cmp     eax, dword ptr [rbp-40]
+    jae     soa_show
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_GETITEMDATA, \
+            dword ptr [rbp-44], 0
+    cmp     eax, dword ptr [rbp-36]
+    jne     soa_next
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_SETCURSEL, \
+            dword ptr [rbp-44], 0
+    jmp     soa_show
+soa_next:
+    inc     dword ptr [rbp-44]
+    jmp     soa_scan
+soa_show:
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-36]
+    call    gui_showdetail
+    mov     rcx, qword ptr [rbp-24]
+    xor     edx, edx
+    call    gui_set_editmode
+soa_done:
+    FRAME_EPILOG
+    ret
+search_overlay_activate endp
+
+; search_overlay_editsub - SUBCLASSPROC on the query edit: Esc closes, Enter
+;   activates, Up/Down move the results selection.  dwRefData = hdlg ([rbp+56]).
+search_overlay_editsub proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], rdx
+    mov     qword ptr [rbp-40], r8
+    mov     qword ptr [rbp-48], r9
+    cmp     rdx, WM_GETDLGCODE_               ; claim Enter/Esc/arrows from IsDialogMessage
+    je      ses_dlgcode
+    cmp     rdx, WM_KEYDOWN_
+    jne     ses_def
+    mov     r10d, r8d
+    cmp     r10d, VK_ESCAPE_
+    je      ses_esc
+    cmp     r10d, VK_RETURN_
+    je      ses_enter
+    cmp     r10d, VK_DOWN_
+    je      ses_down
+    cmp     r10d, VK_UP_
+    je      ses_up
+ses_def:
+    WINCALL DefSubclassProc, qword ptr [rbp-24], qword ptr [rbp-32], qword ptr [rbp-40], \
+            qword ptr [rbp-48]
+    FRAME_EPILOG
+    ret
+ses_dlgcode:
+    WINCALL DefSubclassProc, qword ptr [rbp-24], qword ptr [rbp-32], qword ptr [rbp-40], \
+            qword ptr [rbp-48]
+    or      eax, DLGC_WANTALLKEYS_
+    FRAME_EPILOG
+    ret
+ses_esc:
+    mov     rcx, qword ptr [rbp+56]
+    call    search_overlay_close
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+ses_enter:
+    mov     rcx, qword ptr [rbp+56]
+    call    search_overlay_activate
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+ses_down:
+    mov     rcx, qword ptr [rbp+56]
+    mov     edx, 1
+    call    search_overlay_movesel
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+ses_up:
+    mov     rcx, qword ptr [rbp+56]
+    mov     edx, -1
+    call    search_overlay_movesel
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+search_overlay_editsub endp
+
+; =============================================================================
 ; vault_proc - DLG_VAULT dialog procedure (raw frame).
 ; =============================================================================
 vault_proc proc
@@ -9661,8 +9937,8 @@ vp_domax:
     xor     eax, eax
     jmp     vp_ret
 vp_searchfocus:
-    WINCALL GetDlgItem, qword ptr [rbp-8], IDC_V_SEARCH
-    WINCALL SetFocus, rax
+    mov     rcx, qword ptr [rbp-8]           ; open the blended search overlay
+    call    search_overlay_open
     xor     eax, eax
     jmp     vp_ret
 vp_minmax:
@@ -9751,6 +10027,8 @@ vp_tdraw:
     cmp     eax, IDC_V_MNOPREV               ; disable-attachment-preview toggle
     je      vp_tdraw_tnoprev
     cmp     eax, IDC_V_LIST                   ; the entry list = icon cards
+    je      vp_tdraw_list
+    cmp     eax, IDC_SO_LIST                  ; search-overlay results = same cards
     je      vp_tdraw_list
     cmp     eax, IDC_V_HEADER                 ; detail-pane header (tile + title)
     je      vp_tdraw_header
@@ -10018,6 +10296,8 @@ vp_init:
     call    frame_grow
     mov     rcx, qword ptr [rbp-8]
     call    frame_build
+    mov     rcx, qword ptr [rbp-8]            ; build the (hidden) search overlay, topmost
+    call    search_overlay_build
     mov     rcx, qword ptr [rbp-8]            ; record control rects for responsive resize
     call    gui_anchor_init
     xor     eax, eax                          ; we set focus ourselves -> return FALSE
@@ -10034,6 +10314,8 @@ vp_cmd:
     jne     vp_cmd_disp
     cmp     eax, IDC_V_SEARCH                 ; query changed -> re-filter the list
     je      vp_searchchg
+    cmp     eax, IDC_SO_EDIT                  ; overlay query changed -> refilter results
+    je      vp_so_change
     cmp     eax, IDC_V_TITLE
     je      vp_setdirty
     cmp     eax, IDC_DYN_BASE                 ; any runtime row value/label edit
@@ -10059,6 +10341,8 @@ vp_cmd_fixed:
     je      vp_gen_standalone
     cmp     eax, IDC_T_SET
     je      vp_menu
+    cmp     eax, IDC_SO_LIST                  ; search-overlay results
+    je      vp_so_list
     cmp     eax, IDC_V_LIST
     je      vp_list
     cmp     eax, IDC_V_ADDFIELD
@@ -10238,6 +10522,18 @@ vp_searchchg:
 vp_search_now:
     mov     rcx, qword ptr [rbp-8]            ; refilter the entry list immediately
     call    gui_poplist
+    jmp     vp_handled
+vp_so_change:
+    mov     rcx, qword ptr [rbp-8]            ; overlay: refilter the results list live
+    mov     edx, IDC_SO_LIST
+    mov     r8d, IDC_SO_EDIT
+    call    poplist_into
+    jmp     vp_handled
+vp_so_list:
+    cmp     r10d, LBN_DBLCLK                  ; double-click a result -> open it
+    jne     vp_handled
+    mov     rcx, qword ptr [rbp-8]
+    call    search_overlay_activate
     jmp     vp_handled
 vp_focusin:
     cmp     dword ptr [g_editmode], 0

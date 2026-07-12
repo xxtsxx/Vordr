@@ -55,6 +55,7 @@ extern BeginPaint:proc
 extern EndPaint:proc
 extern DrawTextW:proc
 extern FillRect:proc
+extern FrameRect:proc
 extern GetWindowTextW:proc
 extern GetClassNameW:proc
 extern GetWindowLongPtrW:proc
@@ -1326,6 +1327,11 @@ theme_drawitem proc frame
     cmp     eax, 5
     jne     tdi_notstatic
     WINCALL FillRect, qword ptr [rbp-32], addr rbp-80, qword ptr [g_br_bg]
+    mov     eax, dword ptr [rcx+4]            ; CtlID: 297 = search-overlay panel -> add a frame
+    cmp     eax, 297
+    jne     tdi_static_done
+    WINCALL FrameRect, qword ptr [rbp-32], addr rbp-80, qword ptr [g_br_frame]
+tdi_static_done:
     mov     eax, 1
     FRAME_EPILOG
     ret
