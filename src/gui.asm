@@ -111,6 +111,7 @@ externdef g_uline_br:qword
 externdef g_uline_ctl2:dword
 externdef g_uline_br2:qword
 externdef g_cfg_in:qword
+externdef g_rollback:dword              ; vault.asm: 1 if the unlocked file is a rollback
 externdef g_cfg_pass:byte
 externdef g_cfg_title:qword
 externdef g_cfg_user:qword
@@ -634,6 +635,9 @@ WSTR s_badpw,       <Password must be 1..1024 UTF-8 bytes.>
 WSTR s_wrongpw,     <Wrong master password.>
 WSTR s_corrupt,     <Not a Vordr vault or the file is corrupt.>
 WSTR s_io,          <Cannot read or write that file.>
+WSTR s_rollback,    <This vault is older than the last one saved on this PC. It may be a restored backup or a rollback. Open it anyway?>
+WSTR s_rbabort,     <Unlock aborted (older vault).>
+WSTR t_rbtitle,     <Vault rollback warning>
 WSTR s_createfail,  <Could not create the vault (I/O or out of memory).>
 WSTR s_notitle,     <An entry needs a title.>
 WSTR s_nofieldroom, <No room for more fields on this record - remove one first.>
@@ -1317,6 +1321,19 @@ gu_open:
     call    gui_wipepw
     cmp     dword ptr [rbp-32], 0
     jne     gu_fail
+    ; anti-rollback: this vault is older than the last one saved on this machine
+    cmp     dword ptr [g_rollback], 0
+    je      gu_norb
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr s_rollback, addr t_rbtitle, \
+            <MB_YESNO or MB_ICONWARNING>
+    cmp     eax, IDYES
+    je      gu_norb
+    call    vault_lock                      ; user declined -> lock and stay on the dialog
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [s_rbabort]
+    call    gui_status
+    jmp     gu_done
+gu_norb:
     ; first opened the auto-default vault -> record its path in HKCU
     cmp     dword ptr [g_is_default], 0
     je      gu_success

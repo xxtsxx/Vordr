@@ -48,6 +48,7 @@ extern cmd_vfuzz:proc                   ; vault record-parser fuzzer (vault.asm)
 extern cmd_zfuzz:proc                   ; zip-import parser fuzzer (zipimport.asm)
 extern cmd_bktest:proc                  ; atomic-save + backup rotation probe (vault.asm)
 extern cmd_mactest:proc                 ; full-file MAC tamper-detection probe (vault.asm)
+extern cmd_rbtest:proc                  ; anti-rollback detection probe (vault.asm)
 extern read_file:proc
 ifdef DBG_TRACE
 extern cmd_redteam:proc                 ; fault-injection self-test (redteam.asm)
@@ -179,6 +180,7 @@ WSTR w_vfuzz,    <vfuzz>
 WSTR w_fuzzzip,  <fuzzzip>
 WSTR w_bktest,   <bktest>
 WSTR w_mactest,  <mactest>
+WSTR w_rbtest,   <rbtest>
 WSTR w_trtest,   <trtest>
 WSTR w_securedesk, <securedesk>
 WSTR wpw_exp,    <VordrExp1234>
@@ -223,6 +225,7 @@ cmd_table label CMDENT
     CMDENT { w_fuzzzip,   cmd_zfuzz,     0, 0 }   ; zip-import parser structural fuzzer
     CMDENT { w_bktest,    cmd_bktest,    1, 0 }   ; atomic-save + backup-rotation probe
     CMDENT { w_mactest,   cmd_mactest,   1, 0 }   ; full-file MAC tamper-detection probe
+    CMDENT { w_rbtest,    cmd_rbtest,    1, 0 }   ; anti-rollback detection probe
     CMDENT { w_trtest,    cmd_trtest,    0, 0 }   ; trash timestamp/threshold KAT
     CMDENT { w_securedesk, cmd_securedesk, 0, 0 } ; show a dialog on the private desktop (plan 4 spike)
 ifdef DBG_TRACE
