@@ -274,38 +274,6 @@ theme_boot proc frame
 theme_boot endp
 
 ; =============================================================================
-; theme_remake_fonts() - delete + recreate the three theme fonts through the
-;   shared factory, so a live font-size change (plan 29) rescales them too.
-; =============================================================================
-public theme_remake_fonts
-theme_remake_fonts proc frame
-    FRAME_PROLOG 48
-    lea     rcx, [g_font_big]
-    call    theme_del_gdi
-    lea     rcx, [g_font_icon]
-    call    theme_del_gdi
-    lea     rcx, [g_font_totp]
-    call    theme_del_gdi
-    mov     ecx, -18
-    mov     edx, 100
-    lea     r8, [td_font]
-    call    mk_font
-    mov     qword ptr [g_font_big], rax
-    mov     ecx, -18
-    mov     edx, 100
-    lea     r8, [td_iconfont]
-    call    mk_font
-    mov     qword ptr [g_font_icon], rax
-    mov     ecx, -16
-    mov     edx, 600
-    lea     r8, [td_font]
-    call    mk_font
-    mov     qword ptr [g_font_totp], rax
-    FRAME_EPILOG
-    ret
-theme_remake_fonts endp
-
-; =============================================================================
 ; theme_del_gdi(rcx = &handle) - DeleteObject the handle if non-zero, then 0 it.
 ; =============================================================================
 theme_del_gdi proc frame
