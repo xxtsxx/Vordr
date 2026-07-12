@@ -674,7 +674,7 @@ WSTR g_unlock_title,   <Vordr - Unlock vault>
 WSTR s_createfail,  <Could not create the vault (I/O or out of memory).>
 WSTR s_notitle,     <An entry needs a title.>
 WSTR s_nofieldroom, <No room for more fields on this record - remove one first.>
-WSTR s_resealfail,  <Saved in memory but writing to disk failed.>
+WSTR s_resealfail,  <Unable to write to the vault file - it may be read-only or locked by another program. Your changes are kept in memory; try saving again.>
 WSTR t_overwrite,   <Vordr - vault already exists>
 WSTR m_overwrite,   <A vault file already exists at this location. Creating a new vault will PERMANENTLY destroy it and every entry it holds. Overwrite it?>
 WSTR s_kept,        <Existing vault kept. Cancel, or use "Create new..." to choose a different file.>
@@ -1304,6 +1304,7 @@ g_imgpath     dw 1024 dup (?)             ; import/export file path (wide)
 g_valblob   dw 32768 dup (?)          ; commit scratch: field values, NUL-joined
 g_lblblob   dw 4096 dup (?)           ; commit scratch: custom labels, NUL-joined
 g_rlabel    dw 128 dup (?)            ; per-row label read scratch
+g_grouptxt  dw 128 dup (?)            ; group-heading title read scratch (paint)
 g_extw      dw 20 dup (?)             ; scratch: an attachment's extension, lowercased
 align 8
 g_ofn       OPENFILENAMEW <>
@@ -3072,10 +3073,30 @@ gfc_lp:
             dword ptr [rbp-80], dword ptr [rbp-76], 10, 10
     jmp     gfc_next
 gfc_group:
-    ; a section heading: draw a hairline rule along its baseline (the title text
-    ; is shown by the heading's edit control above the rule)
+    ; section heading: in view mode paint the title as dim text + a hairline rule
+    ; along the baseline (edit mode shows the title edit instead, rule only)
     mov     eax, dword ptr [r10+FD_Y]
+    mov     dword ptr [rbp-100], eax           ; row top
     add     eax, dword ptr [r10+FD_H]
+    mov     dword ptr [rbp-104], eax           ; row bottom
+    cmp     dword ptr [g_editmode], 0
+    jne     gfc_grp_rule
+    mov     ecx, dword ptr [rbp-64]            ; the heading's title control
+    mov     edx, DS_VALUE
+    call    dynid
+    WINCALL GetDlgItemTextW, qword ptr [rbp-32], eax, addr g_grouptxt, 128
+    WINCALL SetBkMode, qword ptr [rbp-24], 1   ; TRANSPARENT
+    WINCALL SetTextColor, qword ptr [rbp-24], dword ptr [g_col_textdim]
+    mov     eax, dword ptr [rbp-100]
+    mov     dword ptr [rbp-84], eax            ; T
+    add     eax, 12
+    mov     dword ptr [rbp-76], eax            ; B
+    mov     dword ptr [rbp-88], 176            ; L
+    mov     dword ptr [rbp-80], 460            ; R
+    WINCALL MapDialogRect, qword ptr [rbp-32], addr rbp-88
+    WINCALL DrawTextW, qword ptr [rbp-24], addr g_grouptxt, -1, addr rbp-88, DT_NAMEFLAGS
+gfc_grp_rule:
+    mov     eax, dword ptr [rbp-104]
     mov     dword ptr [rbp-76], eax            ; B = row bottom
     sub     eax, 1
     mov     dword ptr [rbp-84], eax            ; T = 1 DLU rule
@@ -6277,6 +6298,18 @@ grl_val_flat:
     mov     r9d, dword ptr [rbp-60]
     WINCALL move_ctl, rcx, rdx, r8d, r9d, dword ptr [rbp-76], dword ptr [rbp-48]
 grl_val_done:
+    ; a group heading shows its title as a painted section header in view mode;
+    ; hide its edit there and reveal it only when editing
+    mov     r10, qword ptr [rbp-32]
+    cmp     dword ptr [r10+FD_KIND], VF_GROUP
+    jne     grl_grphide_done
+    mov     rcx, qword ptr [r10+FD_HANDLES+DS_VALUE*8]
+    xor     edx, edx                            ; SW_HIDE (view mode)
+    cmp     dword ptr [g_editmode], 0
+    je      @F
+    mov     edx, 5                              ; SW_SHOW (edit mode)
+@@: call    ShowWindow
+grl_grphide_done:
     ; top-right cluster on the label row: Reveal | Copy | Generate | Trash
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
