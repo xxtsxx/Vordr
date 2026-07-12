@@ -393,18 +393,24 @@ malformed-input crashes before an attacker does.
 
 ### 34. Faster unlock: parallel KAT gate
 **Goal:** Run the startup self-test KATs across worker threads to cut launch latency.
-**Status (2026-07):** Step 1 (measurement) is already covered by the `bench` verb,
-which times an Argon2id derivation in ms and confirms Argon2 dominates the ~1.15 s
-`selftest` wall time. Steps 2–3 (the threaded gate) are **deferred**, and this is a
-deliberate call, not an oversight: the only heavy KATs are Argon2id, and
-`argon2id_hash` is **non-reentrant** — it writes shared process-static scratch
-(`g_b2bctx`, `g_hbuf`, `g_inp`, `g_addr`; 34 references). Running those KATs
-concurrently would race on that scratch, so parallelization first requires making
-the KDF reentrant (per-call scratch), a large, delicate edit to security-critical
-code. A single green `selftest` run proves KDF correctness but NOT race-freedom nor
-that the gate still *fails closed* if a worker hangs — properties that need review,
-not a marathon-tail rewrite. Prerequisite: reentrant Argon2 + a fail-closed
-watchdog design, on its own reviewed branch.
+**Status (2026-07): step 1 done — measurement invalidates the premise; steps 2–3
+would regress launch and are intentionally not built.** Step 1 (measure) was run:
+- Every KAT uses tiny fixed test-vector parameters — the Argon2id KATs run at
+  `m_cost = 32` KiB (`selftest.asm`), not a production memory cost.
+- `genpw` (a trivial verb) and `selftest` (all KATs) have the *same* wall time
+  (~1060 ms vs ~1019 ms over 3 runs each) — i.e. the KATs contribute **~0 ms** of
+  measurable compute; the ~1 s is process-startup overhead (PE load, subsystem
+  init, `hardening_init`), which threading the KATs cannot touch.
+
+So the plan's assumption ("Argon2id will dominate") does not hold here. There is no
+heavy KAT to parallelize; spawning `min(cores,4)` worker threads would add
+`CreateThread`/join overhead (each ~ms) to a body that already costs ~0 ms, making
+launch *slower*, and would put concurrency onto a security-critical fail-closed
+gate whose one heavy primitive (`argon2id_hash`) is non-reentrant (shared static
+scratch, 34 refs) — all downside, no measurable upside. Steps 2–3 are therefore
+correctly not implemented. If the KAT parameters were ever raised to production
+cost, revisit with: reentrant Argon2 (per-call scratch) + a default-FAIL watchdog
+gate, on its own reviewed branch.
 
 ### 35. Sidebar virtualization for large vaults
 **Goal:** 5,000-entry vault scrolls smoothly; tiles are drawn, not created, per row.
