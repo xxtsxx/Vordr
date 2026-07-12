@@ -934,6 +934,8 @@ WSTR st_onedrive,   <OneDrive>
 WSTR st_documents,  <Documents>
 f_iconname label word
     dw 'S','e','g','o','e',' ','F','l','u','e','n','t',' ','I','c','o','n','s', 0
+f_symbol label word
+    dw 'S','e','g','o','e',' ','U','I',' ','S','y','m','b','o','l', 0
 f_segoeui label word
     dw 'S','e','g','o','e',' ','U','I', 0
 align 4
@@ -1182,6 +1184,7 @@ g_titlefont   dq ?                         ; detail-header title (large semibold
 g_chevfont    dq ?                         ; small Fluent icons for flat reorder chevrons
 g_monofont    dq ?                         ; monospace font for the colored password readout
 g_phonfont    dq ?                         ; small monospace font for the phonetic columns
+g_symfont     dq ?                         ; Segoe UI Symbol - the recycle glyph in recover mode
 g_sub_w       dw 512 dup (?)               ; subtitle scratch (wide)
 g_cmpbuf      db 256 dup (?)               ; title-A copy for WM_COMPAREITEM
 g_imp_msgw    dw 160 dup (?)               ; CSV-import result message scratch (wide)
@@ -1817,6 +1820,11 @@ gui_make_listfonts proc frame
     lea     r8, [f_mono]
     call    mk_font
     mov     qword ptr [g_phonfont], rax
+    mov     ecx, -16                            ; Segoe UI Symbol for the recycle glyph
+    mov     edx, 400
+    lea     r8, [f_symbol]
+    call    mk_font
+    mov     qword ptr [g_symfont], rax
 mlf_done:
     FRAME_EPILOG
     ret
@@ -2465,10 +2473,10 @@ gli_subdone:
     ; it restores that entry (see gui_trash_glyph_hit).  Otherwise, the fav star.
     cmp     dword ptr [g_trash_view], 0
     je      gli_fav
-    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_chevfont]
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_symfont]
     mov     qword ptr [rbp-104], rax
     WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_accent]
-    mov     word ptr [g_glyph_w], 0E72Ch                          ; Refresh / recycle
+    mov     word ptr [g_glyph_w], 267Bh                           ; recycle symbol
     mov     word ptr [g_glyph_w+2], 0
     mov     eax, dword ptr [rbp-56]
     sub     eax, 24
