@@ -4808,9 +4808,28 @@ ghost_subclass proc frame
     je      gsc_move
     cmp     rdx, WM_MOUSELEAVE_
     je      gsc_leave
+    cmp     rdx, WM_CHAR_
+    je      gsc_char
 gsc_def:
     WINCALL DefSubclassProc, qword ptr [rbp-24], qword ptr [rbp-32], qword ptr [rbp-40], \
             qword ptr [rbp-48]
+    FRAME_EPILOG
+    ret
+gsc_char:
+    ; type-to-search: a printable key while a ghost button has focus jumps to the
+    ; search box (only the vault dialog has one; harmless elsewhere)
+    cmp     qword ptr [rbp-40], 20h
+    jb      gsc_def
+    WINCALL GetParent, qword ptr [rbp-24]
+    mov     qword ptr [rbp-56], rax
+    WINCALL GetDlgItem, qword ptr [rbp-56], IDC_V_SEARCH
+    mov     qword ptr [rbp-64], rax
+    test    rax, rax
+    jz      gsc_def
+    WINCALL SetFocus, qword ptr [rbp-64]
+    WINCALL SendMessageW, qword ptr [rbp-64], WM_CHAR_, qword ptr [rbp-40], \
+            qword ptr [rbp-48]
+    xor     eax, eax
     FRAME_EPILOG
     ret
 gsc_move:
