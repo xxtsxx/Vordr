@@ -925,6 +925,7 @@ cls_static label word
 cls_tooltip label word
     dw 't','o','o','l','t','i','p','s','_','c','l','a','s','s','3','2', 0
 WSTR gl_t_theme, <Theme / colour scheme>
+WSTR gt_more, <More>
 kl_user label word
     dw 'U','s','e','r','n','a','m','e', 0
 kl_secret label word
@@ -4630,10 +4631,38 @@ row_mk endp
 ; the glyph + hover state ride in GWL_USERDATA (glyph<<16 | hover<<8 | style 2).
 ; =============================================================================
 
+; ghost_attach(rcx=parent, rdx=button hwnd, r8d=glyph, r9=name/tooltip wstr).
+;   Turn an already-created BS_OWNERDRAW button into a ghost button: set the
+;   userdata glyph+style, install the hover subclass, and register a tooltip.
+;   Used both by ghost_make and to convert existing (RC) toolbar buttons.
+ghost_attach proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx             ; parent
+    mov     qword ptr [rbp-32], rdx             ; button hwnd
+    mov     dword ptr [rbp-40], r8d             ; glyph
+    mov     qword ptr [rbp-48], r9              ; name/tip
+    mov     eax, dword ptr [rbp-40]             ; userdata = glyph<<16 | GHOST_STYLE
+    shl     eax, 16
+    or      eax, GHOST_STYLE_
+    mov     edx, eax                            ; zero-extends into rdx
+    WINCALL SetWindowLongPtrW, qword ptr [rbp-32], GWL_USERDATA, rdx
+    WINCALL SetWindowSubclass, qword ptr [rbp-32], addr ghost_subclass, 0, 0
+    mov     rcx, qword ptr [rbp-48]             ; register a tooltip if a name was given
+    test    rcx, rcx
+    jz      ga_done
+    mov     rcx, qword ptr [rbp-24]
+    mov     rdx, qword ptr [rbp-32]
+    mov     r8, qword ptr [rbp-48]
+    call    ghost_tip_add
+ga_done:
+    FRAME_EPILOG
+    ret
+ghost_attach endp
+
 ; ghost_make(rcx=hdlg, edx=id, r8d=glyph, r9=name/tooltip wstr) -> rax=hwnd.
 ;   Placeholder geometry; the layout pass positions it.
 ghost_make proc frame
-    FRAME_PROLOG 128
+    FRAME_PROLOG 128                            ; room for the 9-arg mk_ctl WINCALL spill
     mov     qword ptr [rbp-24], rcx
     mov     dword ptr [rbp-28], edx
     mov     dword ptr [rbp-32], r8d
@@ -4641,20 +4670,11 @@ ghost_make proc frame
     WINCALL mk_ctl, qword ptr [rbp-24], dword ptr [rbp-28], addr cls_button, \
             qword ptr [rbp-40], BS_OWNERDRAW_ or WS_TABSTOP_, 0, 0, 16, 14
     mov     qword ptr [rbp-48], rax             ; hwnd
-    mov     eax, dword ptr [rbp-32]             ; userdata = glyph<<16 | GHOST_STYLE
-    shl     eax, 16
-    or      eax, GHOST_STYLE_
-    mov     edx, eax                            ; zero-extends into rdx
-    WINCALL SetWindowLongPtrW, qword ptr [rbp-48], GWL_USERDATA, rdx
-    WINCALL SetWindowSubclass, qword ptr [rbp-48], addr ghost_subclass, 0, 0
-    mov     rcx, qword ptr [rbp-40]             ; register a tooltip if a name was given
-    test    rcx, rcx
-    jz      gm_done
-    mov     rcx, qword ptr [rbp-24]
-    mov     rdx, qword ptr [rbp-48]
-    mov     r8, qword ptr [rbp-40]
-    call    ghost_tip_add
-gm_done:
+    mov     rcx, qword ptr [rbp-24]             ; parent
+    mov     rdx, qword ptr [rbp-48]             ; button
+    mov     r8d, dword ptr [rbp-32]             ; glyph
+    mov     r9, qword ptr [rbp-40]              ; name/tip
+    call    ghost_attach
     mov     rax, qword ptr [rbp-48]
     FRAME_EPILOG
     ret
@@ -9052,6 +9072,12 @@ vp_init:
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_REMOVE, addr wb_rem
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_OVFL, addr wb_more
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_FAV, addr wb_star
+    WINCALL GetDlgItem, qword ptr [rbp-8], IDC_V_OVFL   ; header "..." -> frameless ghost
+    mov     rcx, qword ptr [rbp-8]
+    mov     rdx, rax
+    mov     r8d, GLY_MORE
+    lea     r9, [gt_more]
+    call    ghost_attach
     mov     dword ptr [g_trash_view], 0       ; start in the vault (not the trash) view
     mov     dword ptr [g_deleted_state], 0
     call    gui_purge_trash                   ; drop entries trashed > 30 days ago
