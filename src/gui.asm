@@ -849,6 +849,8 @@ wb_star label word
     dw 0E734h, 0                                 ; FavoriteStar (outline = not favorite)
 wb_starf label word
     dw 0E735h, 0                                 ; FavoriteStarFill (favorited)
+wb_recycle label word
+    dw 267Bh, 0                                  ; recycle ♻ (recover mode: restore)
 fav_one label word
     dw '1', 0                                    ; VF_FAV marker value
 pht_lbl db 'Password'                            ; gui_phtest scratch (headless probe)
@@ -1820,7 +1822,7 @@ gui_make_listfonts proc frame
     lea     r8, [f_mono]
     call    mk_font
     mov     qword ptr [g_phonfont], rax
-    mov     ecx, -16                            ; Segoe UI Symbol for the recycle glyph
+    mov     ecx, -22                            ; Segoe UI Symbol for the recycle glyph (large)
     mov     edx, 400
     lea     r8, [f_symbol]
     call    mk_font
@@ -2475,12 +2477,12 @@ gli_subdone:
     je      gli_fav
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_symfont]
     mov     qword ptr [rbp-104], rax
-    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_accent]
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_text]
     mov     word ptr [g_glyph_w], 267Bh                           ; recycle symbol
     mov     word ptr [g_glyph_w+2], 0
     mov     eax, dword ptr [rbp-56]
-    sub     eax, 24
-    mov     dword ptr [rbp-152], eax                              ; rect L = R-24
+    sub     eax, 32
+    mov     dword ptr [rbp-152], eax                              ; rect L = R-32
     mov     eax, dword ptr [rbp-48]
     add     eax, 4
     mov     dword ptr [rbp-148], eax
@@ -8033,10 +8035,17 @@ tr_fail:
     ret
 gui_trtest endp
 
-; gui_update_fav_glyph(rcx=hdlg) - set the star button glyph from g_fav_state.
+; gui_update_fav_glyph(rcx=hdlg) - set the header button glyph.  In recover mode
+;   the favorite (star) button becomes a recycle (♻) button that restores the
+;   shown entry; otherwise it reflects g_fav_state (outline / filled star).
 gui_update_fav_glyph proc frame
     FRAME_PROLOG 48
     mov     qword ptr [rbp-24], rcx
+    cmp     dword ptr [g_trash_view], 0
+    je      guf_star
+    lea     rax, [wb_recycle]                    ; recover mode -> recycle button
+    jmp     guf_set
+guf_star:
     lea     rax, [wb_star]                       ; outline (not favorite)
     cmp     dword ptr [g_fav_state], 0
     je      guf_set
@@ -9178,6 +9187,13 @@ vp_iconpick:
 vp_fav:
     cmp     dword ptr [g_cur_idx], 0             ; only with an entry shown
     jl      vp_handled
+    cmp     dword ptr [g_trash_view], 0          ; recover mode: the button restores
+    je      vp_fav_toggle
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, dword ptr [g_cur_idx]
+    call    gui_restore_entry
+    jmp     vp_handled
+vp_fav_toggle:
     mov     eax, dword ptr [g_fav_state]         ; toggle favorite
     xor     eax, 1
     mov     dword ptr [g_fav_state], eax
