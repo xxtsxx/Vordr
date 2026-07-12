@@ -39,6 +39,7 @@ extern do_init:proc
 extern vault_unlock:proc
 extern vault_lock:proc
 extern vault_reseal:proc
+extern vault_ext_changed:proc           ; vault.asm: on-disk file changed since load?
 extern vault_add_entry:proc
 extern vault_remove_at:proc
 extern vault_count:proc
@@ -123,6 +124,9 @@ externdef g_cfg_totp:qword
 ; ---- Win32 -------------------------------------------------------------------
 extern GetModuleHandleW:proc
 extern ExitProcess:proc
+extern CreateMutexW:proc
+extern GetLastError:proc
+extern FindWindowW:proc
 extern MessageBoxW:proc
 extern DialogBoxParamW:proc
 ; secure-desktop (anti-keylogger) master-password entry
@@ -638,6 +642,11 @@ WSTR s_io,          <Cannot read or write that file.>
 WSTR s_rollback,    <This vault is older than the last one saved on this PC. It may be a restored backup or a rollback. Open it anyway?>
 WSTR s_rbabort,     <Unlock aborted (older vault).>
 WSTR t_rbtitle,     <Vault rollback warning>
+WSTR s_extchg,      <The vault file changed on disk since you opened it. Another program or copy may have written it. Overwrite with your changes?>
+WSTR t_exttitle,    <Vault changed on disk>
+WSTR g_singleton_name, <VordrSingletonMutex_v1>
+WSTR g_vault_title,    <Vordr - Vault>
+WSTR g_unlock_title,   <Vordr - Unlock vault>
 WSTR s_createfail,  <Could not create the vault (I/O or out of memory).>
 WSTR s_notitle,     <An entry needs a title.>
 WSTR s_nofieldroom, <No room for more fields on this record - remove one first.>
@@ -4204,6 +4213,16 @@ gui_commit proc frame
     mov     qword ptr [rbp-24], rcx
     cmp     dword ptr [g_cur_idx], 0
     jl      gco_done                          ; nothing selected
+    ; external-change guard: warn before overwriting a file another program or
+    ; instance rewrote since we loaded it (checked before touching any state).
+    call    vault_ext_changed
+    test    eax, eax
+    jz      gco_noext
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr s_extchg, addr t_exttitle, \
+            <MB_YESNO or MB_ICONWARNING>
+    cmp     eax, IDYES
+    jne     gco_done                          ; declined -> keep both, do not save
+gco_noext:
     mov     rcx, qword ptr [rbp-24]
     call    gui_gather
     call    gui_tile_expand                   ; tile placeholder -> one field per file
@@ -12880,6 +12899,23 @@ ws_gui:
     call    run_selftest
     test    eax, eax
     jnz     ws_stfail_gui
+    ; single-instance guard: two GUIs on one vault would clobber each other's
+    ; saves.  If the named mutex already exists, focus the running window + exit.
+    WINCALL CreateMutexW, 0, 1, addr g_singleton_name
+    call    GetLastError
+    cmp     eax, 183                        ; ERROR_ALREADY_EXISTS
+    jne     ws_gui_go
+    WINCALL FindWindowW, 0, addr g_vault_title
+    test    rax, rax
+    jnz     ws_gui_focus
+    WINCALL FindWindowW, 0, addr g_unlock_title
+    test    rax, rax
+    jz      ws_gui_exit
+ws_gui_focus:
+    WINCALL SetForegroundWindow, rax
+ws_gui_exit:
+    WINCALL ExitProcess, 0
+ws_gui_go:
     mov     dword ptr [g_gui_active], 1      ; enable the crash-time apology box
     call    gui_main
     WINCALL ExitProcess, 0
