@@ -17,9 +17,13 @@
 ; =============================================================================
 
 include macros.inc
+include glyphs.inc
 
 ; ---- startup helpers ---------------------------------------------------------
 extern cpu_gate:proc
+extern SetWindowSubclass:proc
+extern DefSubclassProc:proc
+extern TrackMouseEvent:proc
 extern hardening_init:proc
 extern crash_install:proc               ; hardening.asm: arm crash containment
 externdef g_gui_active:dword            ; hardening.asm: gate the crash apology box
@@ -194,6 +198,7 @@ extern CheckDlgButton:proc
 extern GetDlgCtrlID:proc
 extern GetKeyState:proc
 extern SetWindowLongPtrW:proc
+extern GetWindowLongPtrW:proc
 extern CallWindowProcW:proc
 extern LoadCursorW:proc
 extern SetCursor:proc
@@ -268,7 +273,19 @@ WM_TIMER            equ 113h
 WM_INITDIALOG       equ 110h
 WM_SETFONT          equ 30h
 WM_MOUSEWHEEL       equ 20Ah
+WM_MOUSEMOVE_       equ 200h
+WM_MOUSELEAVE_      equ 2A3h
 WM_COMMAND          equ 111h
+; ghost buttons (frameless glyph controls: theme_drawitem tdi_ghost path)
+GHOST_STYLE_        equ 2               ; GWL_USERDATA style byte
+TME_LEAVE_          equ 2
+CW_USEDEFAULT_      equ 80000000h
+TTS_ALWAYSTIP_      equ 1
+TTS_NOPREFIX_       equ 2
+TTF_IDISHWND_       equ 1
+TTF_SUBCLASS_       equ 10h
+TTM_ADDTOOLW_       equ 432h            ; WM_USER+50
+TTM_SETMAXTIPW_     equ 418h            ; WM_USER+24
 WM_PAINT            equ 0Fh
 WM_SETCURSOR        equ 20h
 WM_ERASEBKGND       equ 14h
@@ -850,7 +867,7 @@ wb_star label word
 wb_starf label word
     dw 0E735h, 0                                 ; FavoriteStarFill (favorited)
 wb_recycle label word
-    dw 267Bh, 0                                  ; recycle ♻ (recover mode: restore)
+    dw 267Bh, 0                                  ; recycle â™» (recover mode: restore)
 fav_one label word
     dw '1', 0                                    ; VF_FAV marker value
 pht_lbl db 'Password'                            ; gui_phtest scratch (headless probe)
@@ -905,6 +922,9 @@ cls_button label word
     dw 'B','u','t','t','o','n', 0
 cls_static label word
     dw 'S','t','a','t','i','c', 0
+cls_tooltip label word
+    dw 't','o','o','l','t','i','p','s','_','c','l','a','s','s','3','2', 0
+WSTR gl_t_theme, <Theme / colour scheme>
 kl_user label word
     dw 'U','s','e','r','n','a','m','e', 0
 kl_secret label word
@@ -1174,6 +1194,7 @@ g_rowpw_w     dw 512 dup (?)               ; revealed secret text for the color 
 g_wordtmp     dw 32 dup (?)                ; one resolved phonetic word (scratch)
 g_content_h   dd ?                        ; field-form content bottom (DLU) after layout
 g_dlgfont     dq ?                        ; the vault dialog's font (for runtime ctls)
+g_tooltip     dq ?                        ; shared tooltip window for ghost buttons (0 = none)
 g_totp_row    dd ?                        ; row index of the TOTP field (-1 = none)
 g_totp_codehwnd dq ?                      ; live-code display control of the TOTP row
 g_totp_barhwnd  dq ?                      ; drain-bar control of the TOTP row
@@ -1590,6 +1611,11 @@ up_init:
     call    theme_attach
     mov     rcx, qword ptr [rbp-8]
     call    gui_set_winicon
+    mov     rcx, qword ptr [rbp-8]              ; ghost-button foundation demo (top-left glyph)
+    mov     edx, 990
+    mov     r8d, GLY_SETTINGS
+    lea     r9, [gl_t_theme]
+    call    ghost_make
     ; cue-banner label shown inside the (borderless) password box
     sub     rsp, 48
     mov     rcx, qword ptr [rbp-8]
@@ -1623,9 +1649,25 @@ up_cmd:
     je      up_unlock
     cmp     eax, IDC_U_PATH                 ; click the storage location -> browse
     je      up_pickvault
+    cmp     eax, 990                        ; ghost theme button -> cycle colour scheme
+    je      up_cyclescheme
     cmp     eax, IDCANCEL
     je      up_cancel
     xor     eax, eax
+    jmp     up_ret
+up_cyclescheme:
+    cmp     dword ptr [g_scheme_lock], 0    ; respect an HKLM-forced scheme
+    jne     up_cs_done
+    mov     eax, dword ptr [g_scheme]
+    inc     eax
+    cmp     eax, 9                          ; SCHEME_COUNT (theme.asm)
+    jb      @F
+    xor     eax, eax
+@@: mov     dword ptr [g_scheme], eax
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_apply_scheme
+up_cs_done:
+    mov     eax, 1
     jmp     up_ret
 up_pickvault:
     mov     rcx, qword ptr [rbp-8]
@@ -4580,6 +4622,128 @@ row_mk proc frame
     FRAME_EPILOG
     ret
 row_mk endp
+
+; =============================================================================
+; Ghost buttons - frameless glyph-only controls (see docs/REDESIGN_PLAN.md 1.2).
+; Rendered by theme_drawitem's tdi_ghost path: bare Fluent/Symbol glyph, a subtle
+; rounded hover halo, and a tooltip.  Window text stays a readable name (MSAA);
+; the glyph + hover state ride in GWL_USERDATA (glyph<<16 | hover<<8 | style 2).
+; =============================================================================
+
+; ghost_make(rcx=hdlg, edx=id, r8d=glyph, r9=name/tooltip wstr) -> rax=hwnd.
+;   Placeholder geometry; the layout pass positions it.
+ghost_make proc frame
+    FRAME_PROLOG 128
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-28], edx
+    mov     dword ptr [rbp-32], r8d
+    mov     qword ptr [rbp-40], r9
+    WINCALL mk_ctl, qword ptr [rbp-24], dword ptr [rbp-28], addr cls_button, \
+            qword ptr [rbp-40], BS_OWNERDRAW_ or WS_TABSTOP_, 0, 0, 16, 14
+    mov     qword ptr [rbp-48], rax             ; hwnd
+    mov     eax, dword ptr [rbp-32]             ; userdata = glyph<<16 | GHOST_STYLE
+    shl     eax, 16
+    or      eax, GHOST_STYLE_
+    mov     edx, eax                            ; zero-extends into rdx
+    WINCALL SetWindowLongPtrW, qword ptr [rbp-48], GWL_USERDATA, rdx
+    WINCALL SetWindowSubclass, qword ptr [rbp-48], addr ghost_subclass, 0, 0
+    mov     rcx, qword ptr [rbp-40]             ; register a tooltip if a name was given
+    test    rcx, rcx
+    jz      gm_done
+    mov     rcx, qword ptr [rbp-24]
+    mov     rdx, qword ptr [rbp-48]
+    mov     r8, qword ptr [rbp-40]
+    call    ghost_tip_add
+gm_done:
+    mov     rax, qword ptr [rbp-48]
+    FRAME_EPILOG
+    ret
+ghost_make endp
+
+; ghost_subclass - SUBCLASSPROC: track hover for the halo.  WM_MOUSEMOVE sets the
+;   hover bit + arms WM_MOUSELEAVE; WM_MOUSELEAVE clears it; both repaint.
+ghost_subclass proc frame
+    FRAME_PROLOG 112
+    mov     qword ptr [rbp-24], rcx             ; hwnd
+    mov     qword ptr [rbp-32], rdx             ; msg
+    mov     qword ptr [rbp-40], r8              ; wParam
+    mov     qword ptr [rbp-48], r9              ; lParam
+    cmp     rdx, WM_MOUSEMOVE_
+    je      gsc_move
+    cmp     rdx, WM_MOUSELEAVE_
+    je      gsc_leave
+gsc_def:
+    WINCALL DefSubclassProc, qword ptr [rbp-24], qword ptr [rbp-32], qword ptr [rbp-40], \
+            qword ptr [rbp-48]
+    FRAME_EPILOG
+    ret
+gsc_move:
+    WINCALL GetWindowLongPtrW, qword ptr [rbp-24], GWL_USERDATA
+    test    eax, 0FF00h                         ; already hovering -> nothing to do
+    jnz     gsc_def
+    or      eax, 100h                           ; set hover byte
+    mov     edx, eax
+    WINCALL SetWindowLongPtrW, qword ptr [rbp-24], GWL_USERDATA, rdx
+    mov     dword ptr [rbp-80], 16              ; TRACKMOUSEEVENT{cbSize,dwFlags,hwnd,hover}
+    mov     dword ptr [rbp-76], TME_LEAVE_
+    mov     rax, qword ptr [rbp-24]
+    mov     qword ptr [rbp-72], rax
+    mov     dword ptr [rbp-64], 0
+    WINCALL TrackMouseEvent, addr rbp-80
+    WINCALL InvalidateRect, qword ptr [rbp-24], 0, 0
+    jmp     gsc_def
+gsc_leave:
+    WINCALL GetWindowLongPtrW, qword ptr [rbp-24], GWL_USERDATA
+    and     eax, 0FFFF00FFh                     ; clear hover byte
+    mov     edx, eax
+    WINCALL SetWindowLongPtrW, qword ptr [rbp-24], GWL_USERDATA, rdx
+    WINCALL InvalidateRect, qword ptr [rbp-24], 0, 0
+    jmp     gsc_def
+ghost_subclass endp
+
+; ghost_tip_create(rcx=parent) - lazily create the shared tooltip window.
+ghost_tip_create proc frame
+    FRAME_PROLOG 128
+    mov     qword ptr [rbp-24], rcx
+    cmp     qword ptr [g_tooltip], 0
+    jne     gtc_done
+    WINCALL CreateWindowExW, 0, addr cls_tooltip, 0, \
+            WS_POPUP or TTS_ALWAYSTIP_ or TTS_NOPREFIX_, \
+            CW_USEDEFAULT_, CW_USEDEFAULT_, CW_USEDEFAULT_, CW_USEDEFAULT_, \
+            qword ptr [rbp-24], 0, qword ptr [g_hinst], 0
+    mov     qword ptr [g_tooltip], rax
+    WINCALL SendMessageW, qword ptr [g_tooltip], TTM_SETMAXTIPW_, 0, 300
+gtc_done:
+    FRAME_EPILOG
+    ret
+ghost_tip_create endp
+
+; ghost_tip_add(rcx=parent, rdx=tool hwnd, r8=text) - register a subclass tooltip.
+ghost_tip_add proc frame
+    FRAME_PROLOG 144
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], rdx
+    mov     qword ptr [rbp-40], r8
+    mov     rcx, qword ptr [rbp-24]
+    call    ghost_tip_create
+    mov     dword ptr [rbp-104], 38h            ; TOOLINFOW cbSize (through lpszText)
+    mov     dword ptr [rbp-100], TTF_IDISHWND_ or TTF_SUBCLASS_
+    mov     rax, qword ptr [rbp-24]
+    mov     qword ptr [rbp-96], rax             ; hwnd = parent
+    mov     rax, qword ptr [rbp-32]
+    mov     qword ptr [rbp-88], rax             ; uId = tool hwnd
+    xor     eax, eax
+    mov     dword ptr [rbp-80], eax             ; rect = 0 (ignored for IDISHWND)
+    mov     dword ptr [rbp-76], eax
+    mov     dword ptr [rbp-72], eax
+    mov     dword ptr [rbp-68], eax
+    mov     qword ptr [rbp-64], 0               ; hinst = 0
+    mov     rax, qword ptr [rbp-40]
+    mov     qword ptr [rbp-56], rax             ; lpszText
+    WINCALL SendMessageW, qword ptr [g_tooltip], TTM_ADDTOOLW_, 0, addr rbp-104
+    FRAME_EPILOG
+    ret
+ghost_tip_add endp
 
 ; kind_label(edx=kind) -> rax = wide default-label ptr.  Leaf.
 kind_label proc
@@ -8036,7 +8200,7 @@ tr_fail:
 gui_trtest endp
 
 ; gui_update_fav_glyph(rcx=hdlg) - set the header button glyph.  In recover mode
-;   the favorite (star) button becomes a recycle (♻) button that restores the
+;   the favorite (star) button becomes a recycle (â™») button that restores the
 ;   shown entry; otherwise it reflects g_fav_state (outline / filled star).
 gui_update_fav_glyph proc frame
     FRAME_PROLOG 48

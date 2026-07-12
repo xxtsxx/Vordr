@@ -159,6 +159,10 @@ g_col_dark  dd 1
 g_col_side  dd 00342A26h                  ; sidebar (list + search) panel colour
 g_col_filebadge dd 00544A3Ah              ; attachment/file chip fill (distinct from bg/panel)
 g_col_accent2 dd 00FFC24Ch                ; secondary accent (two-tone gradient end)
+public g_col_hover
+g_col_hover dd 002C2C2Ch                  ; ghost-button hover halo: bg blended ~10% toward text
+                                          ;   (computed per scheme in theme_set_scheme, NOT in the
+                                          ;   15-dword schemes table above - keep it out of the copy)
 SCHEME_DW   equ 15                        ; dwords per scheme row
 SCHEME_COUNT equ 9
 schemes label dword
@@ -193,6 +197,8 @@ g_br_btnsel dq 0
 g_br_accent dq 0                            ; Fluent accent fill (primary button)
 g_br_accsel dq 0                            ; Fluent accent fill pressed
 g_br_dim    dq 0                            ; #C8C8C8 (toggle off thumb)
+public g_br_hover
+g_br_hover  dq 0                            ; ghost-button hover halo fill (g_col_hover)
 g_pen_bd    dq 0
 g_pen_acc   dq 0
 g_pen_focus dq 0                            ; 2px accent focus underline
@@ -323,6 +329,8 @@ theme_rebrush proc frame
     call    theme_del_gdi
     lea     rcx, [g_br_dim]
     call    theme_del_gdi
+    lea     rcx, [g_br_hover]
+    call    theme_del_gdi
     lea     rcx, [g_pen_bd]
     call    theme_del_gdi
     lea     rcx, [g_pen_acc]
@@ -347,6 +355,8 @@ theme_rebrush proc frame
     mov     qword ptr [g_br_accsel], rax
     WINCALL CreateSolidBrush, dword ptr [g_col_textdim]
     mov     qword ptr [g_br_dim], rax
+    WINCALL CreateSolidBrush, dword ptr [g_col_hover]
+    mov     qword ptr [g_br_hover], rax
     WINCALL CreatePen, PS_SOLID, 1, dword ptr [g_col_border]
     mov     qword ptr [g_pen_bd], rax
     WINCALL CreatePen, PS_SOLID, 1, dword ptr [g_col_accent]
@@ -383,6 +393,29 @@ tss_cp:
     inc     eax
     jmp     tss_cp
 tss_done:
+    ; hover halo = g_col_bg blended ~10% toward g_col_text, per channel.  Works for
+    ; both dark (lightens) and light (darkens) schemes = a subtle contrast lift.
+    mov     r8d, dword ptr [g_col_bg]
+    mov     r9d, dword ptr [g_col_text]
+    xor     r10d, r10d                         ; result accumulator
+    xor     ecx, ecx                           ; channel shift (0,8,16)
+tss_hv:
+    mov     eax, r8d                           ; bg channel byte
+    shr     eax, cl
+    movzx   eax, al
+    imul    eax, eax, 230
+    mov     edx, r9d                           ; text channel byte
+    shr     edx, cl
+    movzx   edx, dl
+    imul    edx, edx, 26
+    add     eax, edx
+    shr     eax, 8                             ; /256
+    shl     eax, cl
+    or      r10d, eax
+    add     ecx, 8
+    cmp     ecx, 24
+    jb      tss_hv
+    mov     dword ptr [g_col_hover], r10d
     call    theme_rebrush
     FRAME_EPILOG
     ret
@@ -1315,6 +1348,10 @@ tdi_notstatic:
     je      tdi_group
     ; ---------- push button (Fluent: accent primary / neutral standard) ------
     WINCALL GetWindowLongPtrW, qword ptr [rbp-40], GWL_USERDATA
+    mov     qword ptr [rbp-128], rax          ; save userdata (ghost: glyph<<16 | hover<<8 | 2)
+    movzx   ecx, al                           ; style byte: 0 standard, 1 accent, 2 ghost
+    cmp     ecx, 2
+    je      tdi_ghost
     test    rax, rax
     jnz     tdi_accent
     ; standard button - control fill + hairline stroke + light text
@@ -1393,6 +1430,45 @@ tdi_drawglyph:
     ret
 tdi_dt:
     WINCALL DrawTextW, qword ptr [rbp-32], addr g_txtbuf, -1, addr rbp-80, DT_CFLAGS
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+    ; ---------- ghost button (frameless glyph; hover halo) --------------------
+    ; userdata = glyph(bits16-31) | hover(byte1) | style 2(byte0).  The window
+    ; text stays a readable name (MSAA/tooltip); the glyph is drawn from userdata.
+tdi_ghost:
+    WINCALL FillRect, qword ptr [rbp-32], addr rbp-80, qword ptr [g_br_bg]
+    mov     eax, dword ptr [rbp-128]
+    test    eax, 0FF00h                        ; hover bit set?
+    jz      tdi_ghost_glyph
+    WINCALL GetStockObject, 8                  ; NULL_PEN -> borderless halo
+    WINCALL SelectObject, qword ptr [rbp-32], rax
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_br_hover]
+    WINCALL RoundRect, qword ptr [rbp-32], dword ptr [rbp-80], dword ptr [rbp-76], \
+            dword ptr [rbp-72], dword ptr [rbp-68], 8, 8
+tdi_ghost_glyph:
+    mov     eax, dword ptr [rbp-128]
+    shr     eax, 16
+    movzx   eax, ax                            ; glyph codepoint
+    test    eax, eax
+    jz      tdi_ghost_done                     ; no glyph -> bare hover area
+    mov     word ptr [g_txtbuf], ax
+    mov     word ptr [g_txtbuf+2], 0
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_text]
+    mov     eax, dword ptr [rbp-128]
+    shr     eax, 16
+    movzx   eax, ax
+    cmp     eax, 0E000h                        ; PUA -> Fluent icons, else Segoe UI Symbol
+    jb      tdi_ghost_sym
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_font_icon]
+    jmp     tdi_ghost_draw
+tdi_ghost_sym:
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_font_sym]
+tdi_ghost_draw:
+    mov     qword ptr [rbp-112], rax           ; old font
+    WINCALL DrawTextW, qword ptr [rbp-32], addr g_txtbuf, -1, addr rbp-80, DT_CFLAGS
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-112]
+tdi_ghost_done:
     mov     eax, 1
     FRAME_EPILOG
     ret
