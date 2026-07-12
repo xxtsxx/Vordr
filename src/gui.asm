@@ -603,6 +603,7 @@ IDC_V_TIMES  equ 236          ; created/modified timestamps line (below the last
 IDC_V_FAV    equ 237          ; header favorite (star) toggle
 IDC_V_CANCEL equ 238          ; "Cancel" button (edit mode, discards edits)
 IDC_V_DONE   equ 271          ; trash view: "Done" (exit recover mode); accent button
+IDC_V_GENERATE equ 273        ; sidebar dock: standalone password generator
 FIELD_AREA_BOTTOM equ 292        ; rows may not grow past here (DLU; Add-field is at 296)
 ; Win32 window styles (gui.asm builds controls at runtime; the RC gets these
 ; from windows.h, but this module needs the numeric values).
@@ -928,6 +929,7 @@ WSTR gt_fav, <Favorite>
 WSTR gt_new, <New item>
 WSTR gt_edit, <Edit entry>
 WSTR gt_rem, <Delete entry>
+WSTR gt_gen, <Generate password>
 kl_user label word
     dw 'U','s','e','r','n','a','m','e', 0
 kl_secret label word
@@ -9391,6 +9393,12 @@ vp_init:
     mov     r8d, GLY_DELETE
     lea     r9, [gt_rem]
     call    ghost_attach
+    WINCALL GetDlgItem, qword ptr [rbp-8], IDC_V_GENERATE ; sidebar dock: generate -> ghost
+    mov     rcx, qword ptr [rbp-8]
+    mov     rdx, rax
+    mov     r8d, GLY_GENERATE
+    lea     r9, [gt_gen]
+    call    ghost_attach
     WINCALL GetDlgItem, qword ptr [rbp-8], IDC_V_LIST    ; type-to-search: keystrokes on
     WINCALL SetWindowSubclass, rax, addr search_type_subclass, 0, 0   ;  the list -> search box
     mov     dword ptr [g_trash_view], 0       ; start in the vault (not the trash) view
@@ -9459,6 +9467,8 @@ vp_cmd_fixed:
     je      vp_addfield
     cmp     eax, IDC_V_ADD
     je      vp_add
+    cmp     eax, IDC_V_GENERATE
+    je      vp_gen_standalone
     cmp     eax, IDC_V_EDIT
     je      vp_edit
     cmp     eax, IDC_V_SAVE
@@ -9842,6 +9852,16 @@ vpd_del:
     mov     edx, eax
     mov     rcx, qword ptr [rbp-8]
     call    gui_row_delete
+    jmp     vp_handled
+vp_gen_standalone:
+    ; sidebar dock: open the password generator with no target field (standalone)
+    mov     dword ptr [g_pg_target], -1
+    cmp     dword ptr [g_pg_len], 0
+    jne     @F
+    mov     dword ptr [g_pg_len], 16
+    mov     dword ptr [g_pg_style], 0
+    mov     dword ptr [g_pg_opt], PWCLASS_U or PWCLASS_L or PWCLASS_D
+@@: WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_PWGEN, qword ptr [rbp-8], addr pwgen_proc, 0
     jmp     vp_handled
 vp_add:
     ; adding a new entry discards any unsaved inline edits to the current one
