@@ -52,6 +52,7 @@ extern vault_ctx_open:proc
 extern vault_ctx_front:proc
 extern vault_ctx_setname:proc
 extern vault_ctx_nameptr:proc
+extern vault_ctx_close:proc
 externdef g_vault_n:dword
 externdef g_vault_cur:dword
 extern vault_title_at:proc
@@ -9947,11 +9948,31 @@ gdt_glyph:
     mov     eax, dword ptr [rbp-116]
     mov     dword ptr [rbp-100], eax
     mov     eax, dword ptr [rbp-112]
-    sub     eax, 6
+    sub     eax, 22                            ; leave room for the close x
     mov     dword ptr [rbp-96], eax
     mov     eax, dword ptr [rbp-108]
     mov     dword ptr [rbp-92], eax
     WINCALL DrawTextW, qword ptr [rbp-32], qword ptr [rbp-64], -1, addr rbp-104, 24h
+    cmp     dword ptr [g_vault_n], 1           ; close x (only with >1 vault)
+    jbe     gdt_next
+    mov     word ptr [rbp-136], GLY_CLOSE
+    mov     word ptr [rbp-134], 0
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_textdim]
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_font_icon]
+    mov     qword ptr [rbp-56], rax
+    mov     eax, dword ptr [rbp-112]
+    sub     eax, 20
+    mov     dword ptr [rbp-104], eax
+    mov     eax, dword ptr [rbp-116]
+    mov     dword ptr [rbp-100], eax
+    mov     eax, dword ptr [rbp-112]
+    sub     eax, 4
+    mov     dword ptr [rbp-96], eax
+    mov     eax, dword ptr [rbp-108]
+    mov     dword ptr [rbp-92], eax
+    WINCALL DrawTextW, qword ptr [rbp-32], addr rbp-136, -1, addr rbp-104, 25h
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-56]
+gdt_next:
     mov     eax, dword ptr [rbp-44]
     add     eax, TAB_W
     mov     dword ptr [rbp-44], eax
@@ -10009,6 +10030,20 @@ gui_tab_click proc frame
     mov     dword ptr [rbp-32], eax
     cmp     eax, dword ptr [g_vault_n]
     jae     gtc_add
+    cmp     dword ptr [g_vault_n], 1           ; close-x region? (only with >1 vault)
+    jbe     gtc_switch
+    mov     eax, dword ptr [rbp-40]            ; x
+    mov     ecx, dword ptr [rbp-32]
+    imul    ecx, ecx, TAB_W
+    sub     eax, ecx                           ; xInTab
+    cmp     eax, TAB_W - 22
+    jl      gtc_switch
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-32]
+    call    gui_close_vault
+    jmp     gtc_done
+gtc_switch:
+    mov     eax, dword ptr [rbp-32]
     cmp     eax, dword ptr [g_vault_cur]
     je      gtc_done                           ; already fronted
     mov     rcx, qword ptr [rbp-24]
@@ -10080,6 +10115,41 @@ goa_done:
     FRAME_EPILOG
     ret
 gui_open_additional endp
+
+; gui_close_vault(rcx=hdlg, edx=idx) - close a vault tab: securely wipe its key +
+;   decrypted body, compact the ctx array, adjust the fronted index, repaint.
+;   Closing the last remaining vault locks everything (the normal WM_CLOSE path).
+gui_close_vault proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-32], edx
+    cmp     dword ptr [g_vault_n], 2
+    jae     gcv_multi
+    WINCALL PostMessageW, qword ptr [rbp-24], WM_CLOSE, 0, 0   ; last vault -> lock all
+    jmp     gcv_done
+gcv_multi:
+    mov     eax, dword ptr [rbp-32]           ; closing the fronted vault? switch away first
+    cmp     eax, dword ptr [g_vault_cur]
+    jne     gcv_drop
+    mov     eax, dword ptr [rbp-32]           ; neighbor = (idx ? idx-1 : 1)
+    test    eax, eax
+    jnz     @F
+    mov     eax, 1
+    jmp     gcv_tgt
+@@: dec     eax
+gcv_tgt:
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, eax
+    call    gui_switch_vault                  ; snapshots the closing vault into its slot
+gcv_drop:
+    mov     ecx, dword ptr [rbp-32]           ; wipe + compact + adjust cur (vault.asm)
+    call    vault_ctx_close
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_V_TABS
+    WINCALL InvalidateRect, rax, 0, 1
+gcv_done:
+    FRAME_EPILOG
+    ret
+gui_close_vault endp
 
 ; =============================================================================
 ; vault_proc - DLG_VAULT dialog procedure (raw frame).

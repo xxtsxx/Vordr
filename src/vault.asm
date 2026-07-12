@@ -2244,6 +2244,63 @@ vault_ctx_nameptr proc
     ret
 vault_ctx_nameptr endp
 
+; vault_ctx_close(ecx=idx) - remove open-vault context idx: securely wipe its
+;   master key + decrypted body, compact the g_vaults array, wipe the trailing
+;   slot's key copy, and shift g_vault_cur down if it was above idx.  The caller
+;   must first front a different vault if idx is the currently-fronted one.
+public vault_ctx_close
+vault_ctx_close proc frame
+    FRAME_PROLOG 48
+    mov     dword ptr [rbp-24], ecx
+    mov     ecx, dword ptr [rbp-24]
+    call    vault_ctx_slotptr
+    mov     qword ptr [rbp-32], rax
+    lea     rcx, [rax + VSLOT.s_vkey]         ; wipe master key
+    mov     edx, 32
+    call    secure_zero
+    mov     r10, qword ptr [rbp-32]           ; wipe decrypted body (its own alloc)
+    mov     rcx, qword ptr [r10 + VSLOT.s_body_ptr]
+    test    rcx, rcx
+    jz      vcc_compact
+    mov     edx, dword ptr [r10 + VSLOT.s_body_len]
+    call    secure_zero
+vcc_compact:
+    mov     eax, dword ptr [rbp-24]           ; shift slots [idx+1 .. n-1] down one
+    mov     dword ptr [rbp-40], eax
+vcc_shift:
+    mov     eax, dword ptr [g_vault_n]
+    dec     eax
+    cmp     dword ptr [rbp-40], eax
+    jae     vcc_shifted
+    mov     ecx, dword ptr [rbp-40]
+    call    vault_ctx_slotptr
+    mov     qword ptr [rbp-48], rax           ; dst
+    mov     ecx, dword ptr [rbp-40]
+    inc     ecx
+    call    vault_ctx_slotptr                 ; src
+    mov     rcx, qword ptr [rbp-48]
+    mov     rdx, rax
+    mov     r8d, sizeof VSLOT
+    call    copy_bytes
+    inc     dword ptr [rbp-40]
+    jmp     vcc_shift
+vcc_shifted:
+    dec     dword ptr [g_vault_n]
+    mov     ecx, dword ptr [g_vault_n]        ; wipe the excluded trailing slot's key copy
+    call    vault_ctx_slotptr
+    lea     rcx, [rax + VSLOT.s_vkey]
+    mov     edx, 32
+    call    secure_zero
+    mov     eax, dword ptr [g_vault_cur]      ; cur > idx -> shift down with the array
+    cmp     eax, dword ptr [rbp-24]
+    jle     vcc_done
+    dec     eax
+    mov     dword ptr [g_vault_cur], eax
+vcc_done:
+    FRAME_EPILOG
+    ret
+vault_ctx_close endp
+
 ; ---------------------------------------------------------------------------
 ; Availability retry state machine (redesign item 9).  Leaf procs; the caller
 ; supplies "now" (GetTickCount64) so the machine is deterministic to test.
