@@ -218,7 +218,6 @@ extern RedrawWindow:proc
 extern InitCommonControlsEx:proc
 extern pw_metrics:proc
 extern theme_boot:proc
-extern theme_remake_fonts:proc          ; theme.asm: rebuild theme fonts at new size
 extern theme_attach:proc
 extern theme_tick:proc
 extern theme_paint:proc
@@ -336,6 +335,8 @@ LB_RESETCONTENT     equ 184h
 LB_INITSTORAGE      equ 1A8h            ; pre-allocate item storage for large lists
 LB_SETCURSEL        equ 186h
 LB_GETCURSEL        equ 188h
+LB_GETITEMRECT      equ 198h            ; item bounding rect (recycle-glyph hit-test)
+GWL_USERDATA        equ -21             ; button accent tag (theme_drawitem primary)
 LB_GETCOUNT         equ 18Bh
 LB_GETITEMDATA      equ 199h
 LB_ERR              equ -1
@@ -408,8 +409,6 @@ IDC_V_MNOPREV    equ 264              ; disable-attachment-preview toggle
 IDC_V_MNOPREVINFO equ 265            ; "Disable attachment preview" info (i)
 IDC_V_MTHEME equ 240                  ; color-scheme cycle button (settings)
 IDC_V_MTHEMEL equ 241                 ; "Color scheme" label
-IDC_V_MFONT  equ 242                  ; font-size cycle button (settings)
-IDC_V_MFONTL equ 243                  ; "Font size" label
 IDC_V_COLORPW equ 244                 ; overlay: colored revealed secret (owner-draw)
 IDC_V_MEXPORT equ 245                 ; "Export all secrets to Excel" button (settings)
 IDC_V_MIMPORT equ 246                 ; "Import..." button (auto-detects CSV / xlsx)
@@ -584,7 +583,7 @@ MAX_TABS     equ 16           ; distinct labels (tabs) shown in the history brow
 IDC_V_TIMES  equ 236          ; created/modified timestamps line (below the last row)
 IDC_V_FAV    equ 237          ; header favorite (star) toggle
 IDC_V_CANCEL equ 238          ; "Cancel" button (edit mode, discards edits)
-IDC_V_RESTORE equ 271         ; detail: restore the shown trashed entry (trash view only)
+IDC_V_DONE   equ 271          ; trash view: "Done" (exit recover mode); accent button
 FIELD_AREA_BOTTOM equ 292        ; rows may not grow past here (DLU; Add-field is at 296)
 ; Win32 window styles (gui.asm builds controls at runtime; the RC gets these
 ; from windows.h, but this module needs the numeric values).
@@ -652,9 +651,6 @@ WSTR s_rbabort,     <Unlock aborted (older vault).>
 WSTR t_rbtitle,     <Vault rollback warning>
 WSTR s_extchg,      <The vault file changed on disk since you opened it. Another program or copy may have written it. Overwrite with your changes?>
 WSTR t_exttitle,    <Vault changed on disk>
-WSTR fs_small,      <Small>
-WSTR fs_med,        <Medium>
-WSTR fs_large,      <Large>
 WSTR g_singleton_name, <VordrSingletonMutex_v1>
 WSTR g_vault_title,    <Vordr - Vault>
 WSTR g_unlock_title,   <Vordr - Unlock vault>
@@ -884,7 +880,6 @@ lay_band     dd 14, 0, 18                         ; label band: card(top) vs 0=f
 lay_itemh    dd 42, 30, 58                         ; list-item pixel height (index 0 used)
 pref_scheme dw 'u','i','_','s','c','h','e','m','e',0
 pref_layout dw 'u','i','_','l','a','y','o','u','t',0
-pref_fontsz dw 'u','i','_','f','o','n','t','s','i','z','e',0
 align 8
 align 4
 ; class accent colors (index 0 upper / 2 digit / 3 symbol; lowercase uses g_col_text)
@@ -1039,7 +1034,6 @@ g_menu_ids label dword ; controls menu IDs which are hidden and displayed betwee
     dd IDC_V_MBACK, IDC_V_MTITLE, IDC_V_MPOLL, IDC_V_MLENL, IDC_V_MLEN
     dd IDC_V_MCLSL, IDC_V_MCLS, IDC_V_MTPM, IDC_V_MTPML, IDC_V_MTPMINFO
     dd IDC_V_MTHEMEL, IDC_V_MTHEME, IDC_V_MEXPORT
-    dd IDC_V_MFONTL, IDC_V_MFONT
     dd IDC_V_MIMPORT
     dd IDC_V_MNOHISTL, IDC_V_MNOHIST, IDC_V_MNOPHONL, IDC_V_MNOPHON
     dd IDC_V_MSECDL, IDC_V_MSECD, IDC_V_MSECINFO
@@ -1047,7 +1041,7 @@ g_menu_ids label dword ; controls menu IDs which are hidden and displayed betwee
     dd IDC_V_MIDLEL, IDC_V_MIDLE, IDC_V_MWLKL, IDC_V_MWLK
     dd IDC_V_MNOPREVL, IDC_V_MNOPREV, IDC_V_MNOPREVINFO
     dd IDC_V_MTOUTS
-MENU_ID_COUNT equ 33
+MENU_ID_COUNT equ 31
 
 .data?
 align 8
@@ -1170,9 +1164,7 @@ g_pick_glyph  dd ?                         ; icon picker working selection (glyp
 g_pick_color  dd ?                         ; icon picker working selection (color)
 g_layout      dd ?                         ; UI layout/density index (0 comfortable)
 public g_fontdelta
-g_fontdelta   dd ?                         ; font-size delta in px (S=-2, M=0, L=+3)
-g_fontsize    dd ?                         ; font-size index 0=Small 1=Medium 2=Large
-g_fontsz_lock dd ?                         ; HKLM policy lock (unused; parity w/ cfg_get)
+g_fontdelta   dd ?                         ; font-size delta in px (fixed 0 = Medium)
 g_colorpw_row dd ?                         ; row whose revealed secret is colored (-1=none)
 g_rowpw_w     dw 512 dup (?)               ; revealed secret text for the color overlay
 g_wordtmp     dw 32 dup (?)                ; one resolved phonetic word (scratch)
@@ -2469,6 +2461,31 @@ gui_draw_listitem proc frame
     WINCALL DrawTextW, qword ptr [rbp-32], addr g_sub_w, -1, addr rbp-152, 8024h
 gli_subdone:
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-104]   ; restore font
+    ; trash (recover) view: a recycle glyph on each item's right edge - clicking
+    ; it restores that entry (see gui_trash_glyph_hit).  Otherwise, the fav star.
+    cmp     dword ptr [g_trash_view], 0
+    je      gli_fav
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_chevfont]
+    mov     qword ptr [rbp-104], rax
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_accent]
+    mov     word ptr [g_glyph_w], 0E72Ch                          ; Refresh / recycle
+    mov     word ptr [g_glyph_w+2], 0
+    mov     eax, dword ptr [rbp-56]
+    sub     eax, 24
+    mov     dword ptr [rbp-152], eax                              ; rect L = R-24
+    mov     eax, dword ptr [rbp-48]
+    add     eax, 4
+    mov     dword ptr [rbp-148], eax
+    mov     eax, dword ptr [rbp-56]
+    sub     eax, 4
+    mov     dword ptr [rbp-144], eax                              ; rect R = R-4
+    mov     eax, dword ptr [rbp-64]
+    sub     eax, 4
+    mov     dword ptr [rbp-140], eax                              ; rect B
+    WINCALL DrawTextW, qword ptr [rbp-32], addr g_glyph_w, -1, addr rbp-152, 025h
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-104]
+    jmp     gli_done
+gli_fav:
     ; favorite marker: a small gold star on the card's right edge
     mov     ecx, dword ptr [rbp-80]
     call    gui_entry_is_fav
@@ -7721,91 +7738,9 @@ gui_save_prefs proc frame
     FRAME_PROLOG 48
     WINCALL cfg_set_dword_hkcu, addr pref_scheme, dword ptr [g_scheme]
     WINCALL cfg_set_dword_hkcu, addr pref_layout, dword ptr [g_layout]
-    WINCALL cfg_set_dword_hkcu, addr pref_fontsz, dword ptr [g_fontsize]
     FRAME_EPILOG
     ret
 gui_save_prefs endp
-
-; gui_fontsize_map() - map g_fontsize (0/1/2) to the pixel delta g_fontdelta.
-gui_fontsize_map proc
-    mov     eax, dword ptr [g_fontsize]
-    mov     dword ptr [g_fontdelta], 0          ; Medium (default)
-    cmp     eax, 0
-    jne     @F
-    mov     dword ptr [g_fontdelta], -2         ; Small
-    ret
-@@: cmp     eax, 2
-    jne     gfm_done
-    mov     dword ptr [g_fontdelta], 3          ; Large
-gfm_done:
-    ret
-gui_fontsize_map endp
-
-; gui_del_font(rcx = &HFONT) - DeleteObject the handle if non-zero, then zero it.
-gui_del_font proc frame
-    FRAME_PROLOG 32
-    mov     qword ptr [rbp-24], rcx
-    mov     rax, qword ptr [rcx]
-    test    rax, rax
-    jz      gdf_zero
-    WINCALL DeleteObject, rax
-gdf_zero:
-    mov     rax, qword ptr [rbp-24]
-    mov     qword ptr [rax], 0
-    FRAME_EPILOG
-    ret
-gui_del_font endp
-
-; gui_set_fontbtn(rcx = hdlg) - label the font-size button Small/Medium/Large.
-gui_set_fontbtn proc frame
-    FRAME_PROLOG 48
-    mov     qword ptr [rbp-24], rcx
-    lea     rax, [fs_med]
-    cmp     dword ptr [g_fontsize], 0
-    jne     @F
-    lea     rax, [fs_small]
-    jmp     gsf_set
-@@: cmp     dword ptr [g_fontsize], 2
-    jne     gsf_set
-    lea     rax, [fs_large]
-gsf_set:
-    mov     qword ptr [rbp-32], rax
-    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_MFONT, qword ptr [rbp-32]
-    FRAME_EPILOG
-    ret
-gui_set_fontbtn endp
-
-; gui_apply_fontsize(rcx = hdlg) - recreate every cached font at the new size and
-;   relay out.  All fonts flow from the mk_font factory, so they pick up g_fontdelta.
-gui_apply_fontsize proc frame
-    FRAME_PROLOG 48
-    mov     qword ptr [rbp-24], rcx
-    lea     rcx, [g_iconfont]
-    call    gui_del_font
-    lea     rcx, [g_cardfont]
-    call    gui_del_font
-    lea     rcx, [g_subfont]
-    call    gui_del_font
-    lea     rcx, [g_titlefont]
-    call    gui_del_font
-    lea     rcx, [g_chevfont]
-    call    gui_del_font
-    lea     rcx, [g_monofont]
-    call    gui_del_font
-    lea     rcx, [g_phonfont]
-    call    gui_del_font
-    lea     rcx, [g_welcomefont]
-    call    gui_del_font
-    call    gui_make_listfonts                  ; rebuild (handles are 0 now)
-    call    gui_make_welcomefont
-    call    theme_remake_fonts                  ; the 3 theme fonts too
-    mov     rcx, qword ptr [rbp-24]
-    call    gui_set_fontbtn
-    mov     rcx, qword ptr [rbp-24]
-    call    gui_apply_scheme                    ; relayout + redraw with the new fonts
-    FRAME_EPILOG
-    ret
-gui_apply_fontsize endp
 
 ; gui_load_prefs() - load the persisted UI scheme + layout (clamped to range).
 gui_load_prefs proc frame
@@ -7816,12 +7751,6 @@ gui_load_prefs proc frame
     mov     eax, GUI_SCHEME_GRUVBOX
 @@: mov     dword ptr [g_scheme], eax
     mov     dword ptr [g_layout], 0             ; Comfortable is the only layout
-    WINCALL cfg_get_dword, addr pref_fontsz, 1, addr g_fontsz_lock   ; default Medium
-    cmp     eax, 3                              ; clamp 0..2
-    jb      @F
-    mov     eax, 1
-@@: mov     dword ptr [g_fontsize], eax
-    call    gui_fontsize_map                    ; -> g_fontdelta (applied at font creation)
     FRAME_EPILOG
     ret
 gui_load_prefs endp
@@ -8145,7 +8074,7 @@ gui_enter_trash proc frame
     mov     rcx, qword ptr [rbp-24]
     call    gui_poplist
     mov     rcx, qword ptr [rbp-24]
-    call    gui_update_restore_btn
+    call    gui_update_done_btn
     call    gui_first_deleted
     cmp     eax, 0
     jl      get_done
@@ -8171,28 +8100,90 @@ gui_leave_trash proc frame
     call    gui_rows_clear
     WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_TITLE, 0
     mov     rcx, qword ptr [rbp-24]
-    call    gui_update_restore_btn
+    call    gui_update_done_btn
     mov     rcx, qword ptr [rbp-24]
     call    gui_poplist
     FRAME_EPILOG
     ret
 gui_leave_trash endp
 
-; gui_update_restore_btn(rcx = hdlg) - show the Restore button only in trash view.
-gui_update_restore_btn proc frame
+; gui_update_done_btn(rcx = hdlg) - show the highlighted "Done" button (exit
+;   recover mode) only in trash view, and tag it as the accent/primary button.
+gui_update_done_btn proc frame
     FRAME_PROLOG 48
     mov     qword ptr [rbp-24], rcx
-    mov     edx, IDC_V_RESTORE
+    mov     edx, IDC_V_DONE
     call    GetDlgItem
+    mov     qword ptr [rbp-32], rax             ; Done hwnd
+    WINCALL SetWindowLongPtrW, rax, GWL_USERDATA, 1   ; theme_drawitem -> accent primary
     mov     r8d, SW_HIDE
     cmp     dword ptr [g_trash_view], 0
-    je      gur_show
+    je      gud_show
     mov     r8d, SW_SHOW
-gur_show:
-    WINCALL ShowWindow, rax, r8d
+gud_show:
+    WINCALL ShowWindow, qword ptr [rbp-32], r8d
     FRAME_EPILOG
     ret
-gui_update_restore_btn endp
+gui_update_done_btn endp
+
+; gui_trash_glyph_hit(rcx = hdlg) -> eax = 1 if the mouse cursor is over the
+;   recycle glyph (right ~24 px) of the currently selected list item.  Used to
+;   turn a click on that glyph into a per-item restore.
+gui_trash_glyph_hit proc frame
+    FRAME_PROLOG 96
+    ; [rbp-32]=list hwnd  [rbp-40]=sel idx  RECT@[rbp-72]  POINT@[rbp-80]
+    mov     qword ptr [rbp-24], rcx
+    mov     edx, IDC_V_LIST
+    call    GetDlgItem
+    mov     qword ptr [rbp-32], rax
+    WINCALL SendMessageW, qword ptr [rbp-32], LB_GETCURSEL, 0, 0
+    cmp     eax, -1                             ; LB_ERR
+    je      gtgh_no
+    mov     dword ptr [rbp-40], eax
+    WINCALL SendMessageW, qword ptr [rbp-32], LB_GETITEMRECT, dword ptr [rbp-40], addr rbp-72
+    WINCALL GetCursorPos, addr rbp-80
+    WINCALL ScreenToClient, qword ptr [rbp-32], addr rbp-80
+    mov     eax, dword ptr [rbp-64]             ; rc.right
+    sub     eax, 24
+    cmp     dword ptr [rbp-80], eax             ; pt.x >= rc.right-24 ?
+    jl      gtgh_no
+    mov     eax, dword ptr [rbp-76]             ; pt.y
+    cmp     eax, dword ptr [rbp-68]             ; >= rc.top ?
+    jl      gtgh_no
+    cmp     eax, dword ptr [rbp-60]             ; < rc.bottom ?
+    jge     gtgh_no
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gtgh_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gui_trash_glyph_hit endp
+
+; gui_restore_entry(rcx = hdlg, edx = vault index) - restore one trashed entry:
+;   load it into the detail, clear its VF_DELETED marker, reseal, then refresh
+;   the recover list (staying in recover mode).
+gui_restore_entry proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-32], edx
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-32]
+    call    gui_showdetail                      ; load the entry so gui_commit rebuilds it
+    mov     dword ptr [g_deleted_state], 0       ; clear the deleted marker + reseal
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_commit
+    mov     dword ptr [g_dirty], 0
+    mov     dword ptr [g_cur_idx], -1            ; it left the trash: clear the detail
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_rows_clear
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_TITLE, 0
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_poplist                          ; refresh the recover list
+    FRAME_EPILOG
+    ret
+gui_restore_entry endp
 
 ; gui_addfield_menu(rcx=hdlg) - popup the field-type palette at the cursor.
 gui_addfield_menu proc frame
@@ -8861,8 +8852,6 @@ vp_init:
     call    gui_apply_scheme
     mov     rcx, qword ptr [rbp-8]
     call    gui_apply_layout
-    mov     rcx, qword ptr [rbp-8]            ; label the font-size button (Small/Medium/Large)
-    call    gui_set_fontbtn
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_V_SEARCH, EM_SETCUEBANNER, 1, addr cue_search
     mov     dword ptr [g_cur_idx], -1         ; no entry selected yet
     mov     dword ptr [g_colorpw_row], -1
@@ -8929,16 +8918,14 @@ vp_cmd_fixed:
     je      ve_save                           ; discard edits, back to view mode
     cmp     eax, IDC_V_REMOVE
     je      vp_remove
-    cmp     eax, IDC_V_RESTORE
-    je      vp_restore
+    cmp     eax, IDC_V_DONE
+    je      vp_done
     cmp     eax, IDC_V_LOCK
     je      vp_lock
     cmp     eax, IDC_V_MENU
     je      vp_menu
     cmp     eax, IDC_V_MTHEME
     je      vp_theme
-    cmp     eax, IDC_V_MFONT
-    je      vp_fontsize
     cmp     eax, IDC_V_MEXPORT
     je      vp_export
     cmp     eax, IDC_V_MIMPORT
@@ -9147,18 +9134,6 @@ vp_theme:
     call    gui_apply_scheme
     call    gui_save_prefs
     jmp     vp_handled
-vp_fontsize:
-    mov     eax, dword ptr [g_fontsize]         ; cycle Small/Medium/Large
-    inc     eax
-    cmp     eax, 3
-    jb      @F
-    xor     eax, eax
-@@: mov     dword ptr [g_fontsize], eax
-    call    gui_fontsize_map
-    mov     rcx, qword ptr [rbp-8]
-    call    gui_apply_fontsize
-    call    gui_save_prefs
-    jmp     vp_handled
 vp_export:
     mov     rcx, qword ptr [rbp-8]
     call    gui_export
@@ -9220,6 +9195,17 @@ vp_list:
     ; switching entries discards any unsaved inline edits (edits are only
     ; persisted by an explicit Save)
     mov     dword ptr [g_dirty], 0
+    ; recover mode: a click on the row's recycle glyph restores that entry
+    cmp     dword ptr [g_trash_view], 0
+    je      vl_load
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_trash_glyph_hit
+    test    eax, eax
+    jz      vl_load
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, dword ptr [rbp-16]
+    call    gui_restore_entry
+    jmp     vp_handled
 vl_load:
     mov     rcx, qword ptr [rbp-8]
     mov     edx, dword ptr [rbp-16]
@@ -9485,14 +9471,8 @@ vpr_teardown:
     xor     edx, edx
     call    gui_set_editmode
     jmp     vp_handled
-vp_restore:
-    cmp     dword ptr [g_cur_idx], 0         ; restore the shown trashed entry
-    jl      vp_handled
-    mov     dword ptr [g_deleted_state], 0   ; clear the marker + reseal
-    mov     rcx, qword ptr [rbp-8]
-    call    gui_commit
-    mov     dword ptr [g_dirty], 0
-    mov     rcx, qword ptr [rbp-8]           ; recovered -> back to the vault view
+vp_done:
+    mov     rcx, qword ptr [rbp-8]           ; "Done" -> leave recover mode
     call    gui_leave_trash
     jmp     vp_handled
 vp_lock:
