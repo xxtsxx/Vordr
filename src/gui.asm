@@ -83,6 +83,9 @@ externdef g_zi_stg_n:dword              ; staged entry count
 extern ze_free:proc
 externdef g_zbuf:qword
 extern ShellExecuteW:proc
+extern DragAcceptFiles:proc
+extern DragQueryFileW:proc
+extern DragFinish:proc
 extern GetTempPathW:proc
 extern GetClientRect:proc
 extern DeleteFileW:proc
@@ -319,6 +322,7 @@ SEARCH_MS           equ 300                ; refilter only after 0.3 s of no key
 IDLE_TIMER          equ 4                  ; timer id for the auto-lock idle poll
 IDLE_POLL_MS        equ 30000              ; check system idle time every 30 s
 WM_WTSSESSION_CHANGE equ 02B1h             ; session notification (Win+L etc.)
+WM_DROPFILES         equ 0233h             ; Explorer file drop (drag-and-drop attach)
 WTS_SESSION_LOCK    equ 7                  ; wparam: the workstation locked
 SEARCH_DEBOUNCE_MIN equ 200               ; ...but only when the list exceeds this many entries
 SCORE_CAP           equ 8192              ; entries beyond this index score 0 (ranking cap)
@@ -5653,6 +5657,92 @@ gtpa_done:
     ret
 gui_tile_palette_add endp
 
+; gui_tile_add_cur(rcx = hdlg) -> eax = 1 if the file at g_imgpath was read,
+;   encrypted+staged, and appended to the attachments tile (0 if read failed,
+;   staging failed, or the tile is already full).  Shared by Choose and drop.
+gui_tile_add_cur proc frame
+    FRAME_PROLOG 48
+    lea     rcx, [g_imgpath]
+    lea     rdx, [g_imgbuf]
+    lea     r8, [g_imgbuflen]
+    call    read_file
+    test    eax, eax
+    jnz     gtac_no
+    lea     rcx, [g_imgpath]
+    call    gui_basename                            ; -> g_imgfn_w
+    mov     rcx, qword ptr [g_imgbuf]
+    mov     rdx, qword ptr [g_imgbuflen]
+    lea     r8, [g_imgstageref]
+    call    attach_stage
+    test    eax, eax
+    jnz     gtac_free_no
+    lea     rcx, [g_imgstageref]
+    lea     rdx, [g_imgfn_w]
+    call    tf_append                               ; 1 = tile full (MAX_TFILES)
+    test    eax, eax
+    jnz     gtac_free_no
+    mov     dword ptr [g_dirty], 1
+    mov     rcx, qword ptr [g_imgbuf]
+    mov     rdx, qword ptr [g_imgbuflen]
+    call    mem_free
+    mov     qword ptr [g_imgbuf], 0
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gtac_free_no:
+    mov     rcx, qword ptr [g_imgbuf]
+    mov     rdx, qword ptr [g_imgbuflen]
+    call    mem_free
+    mov     qword ptr [g_imgbuf], 0
+gtac_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gui_tile_add_cur endp
+
+; gui_drop_files(rcx = hdlg, rdx = HDROP) - attach every dropped file to the
+;   attachments tile (edit mode), creating the tile row on the first file.  The
+;   MAX_TFILES cap is enforced by tf_append inside gui_tile_add_cur.
+gui_drop_files proc frame
+    FRAME_PROLOG 64
+    ; [rbp-24]=hdlg [rbp-32]=hdrop [rbp-40]=count [rbp-44]=i
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], rdx
+    WINCALL DragQueryFileW, qword ptr [rbp-32], 0FFFFFFFFh, 0, 0
+    mov     dword ptr [rbp-40], eax
+    mov     dword ptr [rbp-44], 0
+gdf_loop:
+    mov     eax, dword ptr [rbp-44]
+    cmp     eax, dword ptr [rbp-40]
+    jae     gdf_finish
+    WINCALL DragQueryFileW, qword ptr [rbp-32], dword ptr [rbp-44], \
+            addr g_imgpath, MAX_PATH_CHARS
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_tile_add_cur
+    inc     dword ptr [rbp-44]
+    jmp     gdf_loop
+gdf_finish:
+    WINCALL DragFinish, qword ptr [rbp-32]
+    call    tf_find_row                             ; existing tile?
+    cmp     eax, -1
+    jne     gdf_relayout
+    cmp     dword ptr [g_tilefile_n], 0
+    je      gdf_ret
+    mov     rcx, qword ptr [rbp-24]                 ; first file: create the tile row
+    mov     edx, VF_FILE
+    xor     r8d, r8d
+    call    gui_addfield_one
+    jmp     gdf_ret
+gdf_relayout:
+    mov     dword ptr [rbp-48], eax
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-48]
+    call    gui_tile_relayout
+gdf_ret:
+    FRAME_EPILOG
+    ret
+gui_drop_files endp
+
 ; move_ctl(rcx=hdlg, rdx=hwnd, r8d=dlux, r9d=dluy, [+48]=dluw, [+56]=dluh)
 ;   Map the DLU rect to pixels and MoveWindow the control.  No-op if hwnd=0.
 move_ctl proc frame
@@ -8327,6 +8417,8 @@ vault_proc proc
     je      vp_timer
     cmp     rdx, WM_WTSSESSION_CHANGE
     je      vp_wts
+    cmp     rdx, WM_DROPFILES
+    je      vp_drop
     cmp     rdx, WM_PAINT
     je      vp_tpaint
     cmp     rdx, WM_ERASEBKGND
@@ -8351,6 +8443,15 @@ vault_proc proc
     jmp     vp_ret
 vp_tcolor:
     call    gui_ctlcolor                     ; theme + link-blue for view-mode URL values
+    jmp     vp_ret
+vp_drop:
+    cmp     dword ptr [g_editmode], 0        ; only accept drops while editing an entry
+    je      vp_drop_ret
+    mov     rcx, qword ptr [rbp-8]           ; hdlg
+    mov     rdx, r8                          ; wParam = HDROP
+    call    gui_drop_files
+vp_drop_ret:
+    xor     eax, eax
     jmp     vp_ret
 vp_tdraw_list:
     mov     rcx, r9
@@ -8580,6 +8681,7 @@ vp_t_search:
 vp_init:
     mov     rax, qword ptr [rbp-8]            ; remember the window for the tray toggle
     mov     qword ptr [g_vaulthwnd], rax
+    WINCALL DragAcceptFiles, qword ptr [rbp-8], 1   ; accept Explorer file drops
     mov     rcx, qword ptr [rbp-8]           ; Vordr shield in the title bar
     call    gui_set_winicon
     call    gui_make_listfonts               ; entry-list icon/title/subtitle fonts
