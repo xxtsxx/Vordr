@@ -8120,9 +8120,35 @@ gui_leave_trash proc frame
     call    gui_update_done_btn
     mov     rcx, qword ptr [rbp-24]
     call    gui_poplist
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_update_fav_glyph                ; recycle -> star (g_trash_view=0 now)
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_detail_clear                    ; empty the detail pane, deselect the list
     FRAME_EPILOG
     ret
 gui_leave_trash endp
+
+; gui_detail_clear(rcx = hdlg) - reset the detail pane to the no-entry state:
+;   clear the times/title, hide the header tile + fav/recycle button, and clear
+;   the list selection.  Caller has already set g_cur_idx = -1.
+gui_detail_clear proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    call    gui_show_times                      ; clears the times (g_cur_idx = -1)
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_TITLE, 0
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_V_HEADER
+    call    GetDlgItem
+    WINCALL ShowWindow, rax, SW_HIDE
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_V_FAV
+    call    GetDlgItem
+    WINCALL ShowWindow, rax, SW_HIDE
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_SETCURSEL, \
+            -1, 0
+    FRAME_EPILOG
+    ret
+gui_detail_clear endp
 
 ; gui_update_done_btn(rcx = hdlg) - show the highlighted "Done" button (exit
 ;   recover mode) only in trash view, and tag it as the accent/primary button.
@@ -8195,9 +8221,10 @@ gui_restore_entry proc frame
     mov     dword ptr [g_cur_idx], -1            ; it left the trash: clear the detail
     mov     rcx, qword ptr [rbp-24]
     call    gui_rows_clear
-    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_TITLE, 0
     mov     rcx, qword ptr [rbp-24]
     call    gui_poplist                          ; refresh the recover list
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_detail_clear                     ; empty the detail (no stale entry shown)
     FRAME_EPILOG
     ret
 gui_restore_entry endp
