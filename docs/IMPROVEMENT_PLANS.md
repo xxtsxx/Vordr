@@ -418,11 +418,19 @@ bolt on — and one of them is architectural, not a judgment call:
    fast-fail. So **nothing here is thread-safe today** — not because of one KDF,
    but because a core mitigation assumes single-threaded execution.
 
-Safe parallelization therefore requires first moving the shadow stack + stack
-canary to per-thread storage (TLS) *and* making Argon2 reentrant — a foundational
-change to the security-mitigation layer that must be designed and reviewed on its
-own branch, not bolted onto a fail-closed gate for zero measurable launch win.
-Steps 2–3 are correctly not implemented.
+**Implemented (`pkat` verb):** the fail-closed thread-pool gate machinery IS
+built — `cmd_pkat` spawns `min(cores,4)` worker threads, each result slot starts
+FAIL and is cleared only by an all-pass worker, and a watchdog-bounded
+`WaitForMultipleObjects` (10 s, WAIT_ALL) treats a hung/never-reporting worker as
+failure. Given blocker #3, the KAT calls run under a critical section (one thread
+in shadow-stack code at a time → correct LIFO use, no race), so this delivers the
+thread-pool + fail-closed + watchdog structure and is verified end to end
+(`run_all`), but the compute is serialized rather than truly parallel. Turning
+that serialization into real parallel speedup is the remaining follow-up and needs
+the foundational change — per-thread shadow stack + stack canary (TLS) and
+reentrant Argon2 — which must be designed and reviewed on its own branch. It is
+deliberately not bolted on here, because for these ~0 ms KATs it would add cost
+and risk to a security-critical path for no measurable launch win.
 
 ### 35. Sidebar virtualization for large vaults
 **Goal:** 5,000-entry vault scrolls smoothly; tiles are drawn, not created, per row.
@@ -435,8 +443,10 @@ independent of entry count); and a real LISTBOX provides arrow-key selection and
 MSAA/Narrator names for free. A hand-rolled owner-draw scroll surface (step 2)
 would *replace* a working, OS-virtualized control with more code and fewer built-in
 features — a regression, not an improvement — so it is intentionally not done.
-(One future tune-up if 5k load latency ever bites: `LBS_SORT` sorts on every insert;
-a bulk pre-sorted fill would cut load time, but painting is already virtualized.)
+**Implemented:** the one concrete large-vault tune-up — `gui_poplist` now issues
+`LB_INITSTORAGE` (sized from `vault_count`) before the bulk fill, so a 5000-entry
+load pre-allocates the listbox's item storage instead of reallocating per insert.
+That is the real, non-regressive gain here; the painting was already virtualized.
 
 ### 36. Crash containment without secret leakage
 **Goal:** On any unhandled exception: wipe secrets, show a minimal apology box, and ensure NO

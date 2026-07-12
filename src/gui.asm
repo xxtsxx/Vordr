@@ -333,6 +333,7 @@ FZ_BASE             equ 1                 ; fuzzy score per matched char
 LBN_SELCHANGE       equ 1
 LB_ADDSTRING        equ 180h
 LB_RESETCONTENT     equ 184h
+LB_INITSTORAGE      equ 1A8h            ; pre-allocate item storage for large lists
 LB_SETCURSEL        equ 186h
 LB_GETCURSEL        equ 188h
 LB_GETCOUNT         equ 18Bh
@@ -1678,6 +1679,13 @@ gui_poplist proc frame
 gp_nofold:
     call    vault_count
     mov     dword ptr [rbp-32], eax              ; count
+    ; pre-allocate the listbox's internal item storage so a 5000-entry bulk fill
+    ; does not repeatedly reallocate (plan 35: smooth large-vault handling).  The
+    ; owner-draw listbox already virtualizes painting; this just speeds the load.
+    mov     r10d, eax
+    imul    r10d, r10d, 8                        ; ~8 bytes of storage per item
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_INITSTORAGE, \
+            dword ptr [rbp-32], r10
     mov     dword ptr [rbp-40], 0               ; index
 gp_loop:
     mov     eax, dword ptr [rbp-40]
