@@ -953,6 +953,7 @@ WSTR tm_login,  <Login>
 WSTR tm_card,   <Credit card>
 WSTR tm_ident,  <Identity>
 WSTR tm_note,   <Secure note>
+WSTR tm_blank,  <Blank>
 WSTR lbl_holder,   <Cardholder>
 WSTR lbl_cardno,   <Card number>
 WSTR lbl_expiry,   <Expiry>
@@ -982,8 +983,10 @@ tmpl_ident label qword
 tmpl_note label qword
     dq 1
     dq VF_NOTES, 0
+tmpl_blank label qword
+    dq 0                                         ; Title only
 tmpl_table label qword
-    dq tmpl_login, tmpl_card, tmpl_ident, tmpl_note
+    dq tmpl_login, tmpl_card, tmpl_ident, tmpl_note, tmpl_blank
 tag_xw label word
     dw 0D7h, 0                             ; multiplication sign, used as the tag 'x'
 verb_open label word
@@ -8576,6 +8579,8 @@ gui_pick_template proc frame
     WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 2, addr tm_card
     WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 3, addr tm_ident
     WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 4, addr tm_note
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_SEPARATOR, 0, 0
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 5, addr tm_blank
     mov     rcx, qword ptr [rbp-32]
     call    gui_menu_dark
     mov     qword ptr [rbp-64], rax
