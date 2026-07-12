@@ -48,6 +48,7 @@ extern GetFileAttributesW:proc
 extern blake2b_init:proc
 extern blake2b_update:proc
 extern blake2b_final:proc
+extern blake2b_hash:proc
 extern tpm_seal:proc
 extern tpm_unseal:proc
 extern tpm_delete:proc
@@ -189,6 +190,8 @@ CSTR mt_bad, "mactest: FAIL",13,10
 CSTR mt_leak,"mactest: FAIL (file-MAC did not catch the trailer tamper)",13,10
 CSTR rb_ok,  "rbtest: PASS (older counter flagged, current one not)",13,10
 CSTR rb_bad, "rbtest: FAIL",13,10
+CSTR xc_ok,  "xctest: PASS (external header change detected)",13,10
+CSTR xc_bad, "xctest: FAIL",13,10
 CSTR e_io,      "error: cannot read/write the vault file",13,10
 CSTR e_oom,     "error: out of memory",13,10
 CSTR m_created, "vault created.",13,10
@@ -214,6 +217,8 @@ public g_rollback
 g_rollback  dd ?                            ; 1 if this file's counter < the HKCU mirror
 g_ctr_io    dq ?                            ; reg_ctr_get/set scratch (u64 counter)
 g_fmac_len  dq ?                            ; 0 (legacy) or FMAC_TRAILER for this image
+g_ext_size  dq ?                            ; on-disk size snapshotted at load/save
+g_ext_hash  db 32 dup (?)                   ; BLAKE2b of the header snapshotted then
 align 16
 g_fmac_ctx  db 256 dup (?)                  ; BLAKE2B_CTX scratch (216 used)
 g_fmac_out  db 32 dup (?)                   ; computed file MAC
@@ -569,6 +574,74 @@ vault_file_mac proc frame
 vault_file_mac endp
 
 ; ===========================================================================
+; vault_ext_snapshot(rcx = on-disk size) - record (size, BLAKE2b of the header)
+;   for the file we just loaded or wrote, so a later external change (a sync
+;   tool or a second instance rewriting the file) can be detected before we
+;   overwrite it.  Called after every unlock and every successful save.
+; ===========================================================================
+public vault_ext_snapshot
+vault_ext_snapshot proc frame
+    FRAME_PROLOG 32
+    mov     qword ptr [g_ext_size], rcx
+    lea     rcx, [g_hdr]
+    mov     rdx, VH_TOTAL
+    lea     r8, [g_ext_hash]
+    mov     r9, 32
+    call    blake2b_hash
+    FRAME_EPILOG
+    ret
+vault_ext_snapshot endp
+
+; ===========================================================================
+; vault_ext_changed() -> eax = 1 if the vault file on disk no longer matches the
+;   snapshot (size or header changed, or it can't be read), else 0.  A fresh
+;   salt/nonce is written on every save, so any rewrite by another writer flips
+;   the header hash.  Best-effort tripwire against silent clobbering.
+; ===========================================================================
+public vault_ext_changed
+vault_ext_changed proc frame
+    FRAME_PROLOG 64
+    ; [rbp-24]=buf [rbp-32]=size [rbp-40]=compare result
+    mov     rcx, qword ptr [g_cfg_in]
+    lea     rdx, [rbp-24]
+    lea     r8, [rbp-32]
+    call    read_file
+    test    eax, eax
+    jnz     vxc_changed                         ; unreadable/moved -> treat as changed
+    mov     rax, qword ptr [rbp-32]
+    cmp     rax, qword ptr [g_ext_size]
+    jne     vxc_free_changed
+    cmp     rax, VH_TOTAL
+    jb      vxc_free_changed
+    mov     rcx, qword ptr [rbp-24]             ; hash the current header
+    mov     rdx, VH_TOTAL
+    lea     r8, [g_fmac_out]                    ; scratch (32 bytes)
+    mov     r9, 32
+    call    blake2b_hash
+    lea     rcx, [g_fmac_out]
+    lea     rdx, [g_ext_hash]
+    mov     r8, 32
+    call    ct_memcmp                           ; 0 = header unchanged
+    mov     dword ptr [rbp-40], eax
+    mov     rcx, qword ptr [rbp-24]
+    mov     rdx, qword ptr [rbp-32]
+    call    mem_free
+    cmp     dword ptr [rbp-40], 0
+    jne     vxc_changed
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+vxc_free_changed:
+    mov     rcx, qword ptr [rbp-24]
+    mov     rdx, qword ptr [rbp-32]
+    call    mem_free
+vxc_changed:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+vault_ext_changed endp
+
+; ===========================================================================
 ; vault_rotate_backups() - before the atomic replace, roll the CURRENT vault
 ;   file into a ring of BAK_GENS generations: bak2->bak3, bak1->bak2, then copy
 ;   the live file to bak1.  A crash mid-save can thus never lose the vault - the
@@ -757,6 +830,8 @@ vsw_swap:
     lea     rdx, [g_ctr_io]
     mov     r8d, 8
     call    reg_ctr_set
+    mov     rcx, qword ptr [g_filesize]         ; re-snapshot: this save is now baseline
+    call    vault_ext_snapshot
     mov     eax, dword ptr [rbp-24]
     FRAME_EPILOG
     ret
@@ -951,6 +1026,8 @@ vu_ctset:
     ; keep the file image resident: attachment ciphertext lives in it.  Build the
     ; id->ciphertext index from the attachments section.
     call    attach_index_build
+    mov     rcx, qword ptr [g_filesize]         ; snapshot for external-change detection
+    call    vault_ext_snapshot
     xor     eax, eax
     FRAME_EPILOG
     ret
@@ -2064,6 +2141,81 @@ rb_fail:
     FRAME_EPILOG
     ret
 cmd_rbtest endp
+
+; ===========================================================================
+; cmd_xctest <path> - prove external-change detection (plan 38).  Create a vault
+;   (snapshots itself), confirm no change is reported; externally flip a header
+;   byte and confirm a change IS reported; recreate the vault (re-baselines) and
+;   confirm no change again.  exit 0 = pass.
+; ===========================================================================
+LANDING_PAD
+public cmd_xctest
+cmd_xctest proc frame
+    FRAME_PROLOG 48
+    ; [rbp-24]=buf [rbp-32]=size
+    lea     r10, [g_argv]
+    mov     rax, qword ptr [r10+16]
+    mov     qword ptr [g_cfg_in], rax
+    lea     r10, [bk_pw]
+    lea     r11, [g_cfg_pass]
+    xor     ecx, ecx
+xc_pwcp:
+    mov     al, byte ptr [r10+rcx]
+    mov     byte ptr [r11+rcx], al
+    test    al, al
+    jz      xc_pwd
+    inc     ecx
+    cmp     ecx, 32
+    jb      xc_pwcp
+xc_pwd:
+    mov     dword ptr [g_cfg_passlen], 9
+    mov     dword ptr [g_cfg_t], 1
+    mov     dword ptr [g_cfg_m], 8192
+    call    do_init                             ; creates + snapshots
+    test    eax, eax
+    jnz     xc_fail
+    call    vault_ext_changed                   ; unchanged -> 0
+    test    eax, eax
+    jnz     xc_fail
+    ; externally rewrite a header byte
+    mov     rcx, qword ptr [g_cfg_in]
+    lea     rdx, [rbp-24]
+    lea     r8, [rbp-32]
+    call    read_file
+    test    eax, eax
+    jnz     xc_fail
+    mov     r10, qword ptr [rbp-24]
+    xor     byte ptr [r10+10], 0FFh             ; flip a salt byte
+    mov     rcx, qword ptr [g_cfg_in]
+    mov     rdx, qword ptr [rbp-24]
+    mov     r8, qword ptr [rbp-32]
+    call    write_file
+    mov     rcx, qword ptr [rbp-24]
+    mov     rdx, qword ptr [rbp-32]
+    call    mem_free
+    call    vault_ext_changed                   ; changed -> 1
+    cmp     eax, 1
+    jne     xc_fail
+    call    do_init                             ; recreate -> re-baseline the snapshot
+    test    eax, eax
+    jnz     xc_fail
+    call    vault_ext_changed                   ; unchanged again -> 0
+    test    eax, eax
+    jnz     xc_fail
+    lea     rcx, [xc_ok]
+    mov     edx, xc_ok_len
+    call    print_a
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+xc_fail:
+    lea     rcx, [xc_bad]
+    mov     edx, xc_bad_len
+    call    print_a
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_xctest endp
 
 
 ; ===========================================================================
