@@ -185,6 +185,8 @@ extern WriteFile:proc
 extern FlushFileBuffers:proc
 extern CreateDirectoryW:proc
 extern ShowWindow:proc
+extern IsZoomed:proc
+extern EnumChildWindows:proc
 extern MoveWindow:proc
 extern GetWindowRect:proc
 extern MapWindowPoints:proc
@@ -305,6 +307,19 @@ WM_DRAWITEM         equ 2Bh
 GWLP_WNDPROC        equ -4
 IDC_HAND            equ 32649
 HTCLIENT            equ 1
+; --- custom title-bar frame (redesign A1/A2/A3) -------------------------------
+WM_NCHITTEST_       equ 84h
+HTCAPTION           equ 2
+DWLP_MSGRESULT_     equ 0
+SW_MINIMIZE_        equ 6
+SW_MAXIMIZE_        equ 3
+SW_RESTORE_         equ 9
+SWP_FRAME_          equ 16h              ; SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE
+TBAR_H              equ 32               ; custom title-bar strip height (px)
+CAPBTN_W            equ 44               ; caption (min/max/close) button width
+IDC_T_MIN           equ 290             ; caption: minimize
+IDC_T_MAX           equ 291             ; caption: maximize / restore
+IDC_T_CLOSE         equ 292             ; caption: close
 LINK_BLUE           equ 00E08C3Ch        ; COLORREF (RGB 60,140,224) hyperlink blue
 WM_MEASUREITEM      equ 2Ch
 WM_COMPAREITEM      equ 39h
@@ -940,6 +955,9 @@ WSTR gt_new, <New item>
 WSTR gt_edit, <Edit entry>
 WSTR gt_rem, <Delete entry>
 WSTR gt_gen, <Generate password>
+WSTR gt_min, <Minimize>
+WSTR gt_max, <Maximize>
+WSTR gt_close, <Close>
 kl_user label word
     dw 'U','s','e','r','n','a','m','e', 0
 kl_secret label word
@@ -9329,6 +9347,147 @@ msv_done:
 gui_menu_save endp
 
 ; =============================================================================
+; Custom title-bar frame helpers (redesign A1).  The vault window drops
+; WS_CAPTION and grows a TBAR_H strip at the top of its client area: existing
+; content is shifted down into place at init, and the strip hosts the caption
+; buttons (min/max/close) plus the search box and control dock.  Dragging the
+; empty strip moves the window (HTCAPTION from frame_hittest); WS_THICKFRAME
+; still resizes from the borders.
+; =============================================================================
+
+; frame_hittest(rcx=hdlg, r9=lParam screen POINT) -> eax=1 when the cursor is in
+;   the empty title strip (DWLP_MSGRESULT set to HTCAPTION), else 0 (default).
+frame_hittest proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    movsx   eax, r9w                           ; screen x
+    mov     dword ptr [rbp-40], eax
+    mov     r10, r9
+    sar     r10, 16
+    movsx   eax, r10w                          ; screen y
+    mov     dword ptr [rbp-36], eax            ; POINT{x=[rbp-40], y=[rbp-36]}
+    WINCALL ScreenToClient, qword ptr [rbp-24], addr rbp-40
+    mov     eax, dword ptr [rbp-36]            ; client y
+    cmp     eax, 0
+    jl      fht_no
+    cmp     eax, TBAR_H
+    jge     fht_no
+    WINCALL SetWindowLongPtrW, qword ptr [rbp-24], DWLP_MSGRESULT_, HTCAPTION
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+fht_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+frame_hittest endp
+
+; frame_shift_cb(rcx=child, rdx=parent) - EnumChildWindows callback: move one
+;   child down by TBAR_H so the reclaimed caption space becomes the title strip.
+frame_shift_cb proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], rdx
+    WINCALL GetWindowRect, qword ptr [rbp-24], addr rbp-64   ; L-64 T-60 R-56 B-52
+    WINCALL MapWindowPoints, 0, qword ptr [rbp-32], addr rbp-64, 2
+    mov     eax, dword ptr [rbp-56]            ; w = R - L
+    sub     eax, dword ptr [rbp-64]
+    mov     dword ptr [rbp-68], eax
+    mov     eax, dword ptr [rbp-52]            ; h = B - T
+    sub     eax, dword ptr [rbp-60]
+    mov     dword ptr [rbp-72], eax
+    mov     eax, dword ptr [rbp-60]            ; newY = T + TBAR_H
+    add     eax, TBAR_H
+    mov     dword ptr [rbp-76], eax
+    WINCALL MoveWindow, qword ptr [rbp-24], dword ptr [rbp-64], dword ptr [rbp-76], \
+            dword ptr [rbp-68], dword ptr [rbp-72], 1
+    mov     eax, 1                             ; continue enumeration
+    FRAME_EPILOG
+    ret
+frame_shift_cb endp
+
+; frame_shift(rcx=hdlg) - shift every existing child down into place.
+frame_shift proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    WINCALL EnumChildWindows, qword ptr [rbp-24], addr frame_shift_cb, qword ptr [rbp-24]
+    FRAME_EPILOG
+    ret
+frame_shift endp
+
+; frame_grow(rcx=hdlg) - grow the window height by TBAR_H so the shifted content
+;   keeps its size and the new strip is pure gain at the top.
+frame_grow proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    WINCALL GetWindowRect, qword ptr [rbp-24], addr rbp-48   ; L-48 T-44 R-40 B-36
+    mov     eax, dword ptr [rbp-40]            ; w = R - L
+    sub     eax, dword ptr [rbp-48]
+    mov     dword ptr [rbp-52], eax
+    mov     eax, dword ptr [rbp-36]            ; h = B - T + TBAR_H
+    sub     eax, dword ptr [rbp-44]
+    add     eax, TBAR_H
+    mov     dword ptr [rbp-56], eax
+    WINCALL SetWindowPos, qword ptr [rbp-24], 0, 0, 0, dword ptr [rbp-52], \
+            dword ptr [rbp-56], SWP_FRAME_
+    FRAME_EPILOG
+    ret
+frame_grow endp
+
+; frame_layout(rcx=hdlg) - right-align the caption buttons in the title strip.
+;   Called at build time and on WM_SIZE.
+frame_layout proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx
+    WINCALL GetClientRect, qword ptr [rbp-24], addr rbp-48   ; R at [rbp-40]
+    mov     eax, dword ptr [rbp-40]
+    mov     dword ptr [rbp-52], eax            ; client width
+    mov     eax, dword ptr [rbp-52]            ; xClose = W - CAPBTN_W
+    sub     eax, CAPBTN_W
+    mov     dword ptr [rbp-56], eax
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_T_CLOSE
+    WINCALL MoveWindow, rax, dword ptr [rbp-56], 0, CAPBTN_W, TBAR_H, 1
+    mov     eax, dword ptr [rbp-52]            ; xMax = W - 2*CAPBTN_W
+    sub     eax, CAPBTN_W*2
+    mov     dword ptr [rbp-56], eax
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_T_MAX
+    WINCALL MoveWindow, rax, dword ptr [rbp-56], 0, CAPBTN_W, TBAR_H, 1
+    mov     eax, dword ptr [rbp-52]            ; xMin = W - 3*CAPBTN_W
+    sub     eax, CAPBTN_W*3
+    mov     dword ptr [rbp-56], eax
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_T_MIN
+    WINCALL MoveWindow, rax, dword ptr [rbp-56], 0, CAPBTN_W, TBAR_H, 1
+    FRAME_EPILOG
+    ret
+frame_layout endp
+
+; frame_build(rcx=hdlg) - create the caption ghost buttons, then lay them out.
+;   Called from vp_init AFTER frame_shift/frame_grow so they are not shifted.
+frame_build proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_T_MIN
+    mov     r8d, GLY_MIN
+    lea     r9, [gt_min]
+    call    ghost_make
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_T_MAX
+    mov     r8d, GLY_MAX
+    lea     r9, [gt_max]
+    call    ghost_make
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_T_CLOSE
+    mov     r8d, GLY_CLOSE
+    lea     r9, [gt_close]
+    call    ghost_make
+    mov     rcx, qword ptr [rbp-24]
+    call    frame_layout
+    FRAME_EPILOG
+    ret
+frame_build endp
+
+; =============================================================================
 ; vault_proc - DLG_VAULT dialog procedure (raw frame).
 ; =============================================================================
 vault_proc proc
@@ -9372,14 +9531,43 @@ vault_proc proc
     je      vp_size
     cmp     rdx, WM_GETMINMAXINFO_
     je      vp_minmax
+    cmp     rdx, WM_NCHITTEST_
+    je      vp_nchit
     xor     eax, eax
     jmp     vp_ret
 vp_tcolor:
     call    gui_ctlcolor                     ; theme + link-blue for view-mode URL values
     jmp     vp_ret
+vp_nchit:
+    mov     rcx, qword ptr [rbp-8]           ; custom frame: drag the empty title strip
+    call    frame_hittest                    ;   (r9 already = lParam screen point)
+    test    eax, eax
+    jz      vp_nchit_def
+    mov     eax, 1                           ; handled: DWLP_MSGRESULT = HTCAPTION
+    jmp     vp_ret
+vp_nchit_def:
+    xor     eax, eax                         ; not in strip -> DefDlgProc default hittest
+    jmp     vp_ret
 vp_size:
     mov     rcx, qword ptr [rbp-8]           ; responsive reflow of anchored controls
     call    gui_reflow
+    mov     rcx, qword ptr [rbp-8]           ; keep the caption buttons right-aligned
+    call    frame_layout
+    xor     eax, eax
+    jmp     vp_ret
+vp_min:
+    WINCALL ShowWindow, qword ptr [rbp-8], SW_MINIMIZE_
+    xor     eax, eax
+    jmp     vp_ret
+vp_maxtoggle:
+    WINCALL IsZoomed, qword ptr [rbp-8]
+    test    eax, eax
+    jz      vp_domax
+    WINCALL ShowWindow, qword ptr [rbp-8], SW_RESTORE_
+    xor     eax, eax
+    jmp     vp_ret
+vp_domax:
+    WINCALL ShowWindow, qword ptr [rbp-8], SW_MAXIMIZE_
     xor     eax, eax
     jmp     vp_ret
 vp_minmax:
@@ -9630,6 +9818,7 @@ vp_t_search:
 vp_init:
     mov     rax, qword ptr [rbp-8]            ; remember the window for the tray toggle
     mov     qword ptr [g_vaulthwnd], rax
+    WINCALL SetWindowTextW, qword ptr [rbp-8], addr g_vault_title  ; taskbar/Alt-Tab + single-instance FindWindow
     WINCALL DragAcceptFiles, qword ptr [rbp-8], 1   ; accept Explorer file drops
     mov     rcx, qword ptr [rbp-8]           ; Vordr shield in the title bar
     call    gui_set_winicon
@@ -9725,6 +9914,12 @@ vp_init:
     mov     rcx, rax
     call    SetFocus
     add     rsp, 32
+    mov     rcx, qword ptr [rbp-8]            ; custom frame: shift content below the strip,
+    call    frame_shift                       ;   grow to preserve size, then build the strip
+    mov     rcx, qword ptr [rbp-8]
+    call    frame_grow
+    mov     rcx, qword ptr [rbp-8]
+    call    frame_build
     mov     rcx, qword ptr [rbp-8]            ; record control rects for responsive resize
     call    gui_anchor_init
     xor     eax, eax                          ; we set focus ourselves -> return FALSE
@@ -9752,6 +9947,12 @@ vp_cmd_disp:
     jnz     vp_handled                        ;   an edit's stray notifs (EN_UPDATE, EN_MAXTEXT,
     jmp     vp_dyn                            ;   ...) must never fire a row button action
 vp_cmd_fixed:
+    cmp     eax, IDC_T_CLOSE                  ; custom caption buttons
+    je      vp_close
+    cmp     eax, IDC_T_MIN
+    je      vp_min
+    cmp     eax, IDC_T_MAX
+    je      vp_maxtoggle
     cmp     eax, IDC_V_LIST
     je      vp_list
     cmp     eax, IDC_V_ADDFIELD
@@ -13915,6 +14116,9 @@ gui_main proc frame
     call    tpm_available
     mov     dword ptr [g_tpm_present], eax
     call    gui_load_policy
+ifdef DBG_SHOW
+    mov     dword ptr [g_secunlock], 0      ; debug: use the normal desktop so the GUI is inspectable
+endif
     call    gui_resolve_vault
     ; ---- register + create the hidden tray-owner window --------------------
     lea     rcx, [g_wc]
@@ -13933,6 +14137,9 @@ gui_main proc frame
     mov     qword ptr [g_trayhwnd], rax
     mov     rcx, rax
     call    gui_tray_add
+ifdef DBG_SHOW
+    WINCALL PostMessageW, qword ptr [g_trayhwnd], WM_TRAYICON, 0, WM_LBUTTONUP  ; auto-open the vault
+endif
     ; ---- message loop (start minimised to the tray) -----------------------
 gm_msg:
     WINCALL GetMessageW, addr g_msg, 0, 0, 0
