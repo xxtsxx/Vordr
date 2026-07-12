@@ -201,6 +201,7 @@ public g_font_icon
 g_font_icon dq 0                            ; Segoe Fluent Icons (PUA glyph buttons)
 public g_font_totp
 g_font_totp dq 0                            ; slightly larger font for the TOTP code
+g_font_sym  dq 0                            ; Segoe UI Symbol (recycle ♻ button glyph)
 g_frame_hdc dq 0                            ; EnumChildWindows frame-draw context
 g_frame_par dq 0
 ; Optional per-control focus-underline colour override (used by the export
@@ -230,6 +231,8 @@ td_font label word                      ; toolbar glyph font face
     dw 'S','e','g','o','e',' ','U','I',0
 td_iconfont label word                  ; Fluent icon font (PUA glyphs e.g. trashcan)
     dw 'S','e','g','o','e',' ','F','l','u','e','n','t',' ','I','c','o','n','s',0
+td_symfont label word                   ; Segoe UI Symbol (recycle ♻)
+    dw 'S','e','g','o','e',' ','U','I',' ','S','y','m','b','o','l',0
 
 .data?
 align 16
@@ -269,6 +272,12 @@ theme_boot proc frame
     lea     r8, [td_font]
     call    mk_font
     mov     qword ptr [g_font_totp], rax
+    ; large Segoe UI Symbol for the recycle-button glyph (♻ U+267B)
+    mov     ecx, -20
+    mov     edx, 400
+    lea     r8, [td_symfont]
+    call    mk_font
+    mov     qword ptr [g_font_sym], rax
     FRAME_EPILOG
     ret
 theme_boot endp
@@ -1363,9 +1372,14 @@ tdi_tcol:
     movzx   eax, word ptr [g_txtbuf]
     test    eax, eax                          ; empty caption -> default
     jz      tdi_dt
+    cmp     eax, 267Bh                        ; recycle ♻ -> Segoe UI Symbol
+    je      tdi_symfont
     cmp     eax, 0E000h
     jb      tdi_bigfont
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_font_icon]
+    jmp     tdi_drawglyph
+tdi_symfont:
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_font_sym]
     jmp     tdi_drawglyph
 tdi_bigfont:
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_font_big]
