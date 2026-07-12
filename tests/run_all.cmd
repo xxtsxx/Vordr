@@ -141,6 +141,9 @@ if not "!errorlevel!"=="0" ( echo   fuzzzip: FAIL ^(exit !errorlevel!, zip-impor
 bin\vordr.exe bktest "%WORK%\bk.vault" > "%WORK%\bktest.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   bktest: FAIL ^(exit !errorlevel!, atomic-save/backup rotation^) & set RT=FAIL )
 
+bin\vordr.exe mactest "%WORK%\mac.vault" > "%WORK%\mactest.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   mactest: FAIL ^(exit !errorlevel!, full-file MAC tamper detection^) & set RT=FAIL )
+
 set R_ROUNDTRIP=!RT!
 call :now T1
 set /a T_ROUNDTRIP=!T1!-!T0!
