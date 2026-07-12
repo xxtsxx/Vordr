@@ -38,6 +38,7 @@ extern mem_alloc:proc
 extern mem_free:proc
 extern print_a:proc
 extern print_err:proc
+extern print_u64:proc
 extern WideCharToMultiByte:proc
 extern GetSystemTimeAsFileTime:proc
 extern tpm_seal:proc
@@ -138,12 +139,34 @@ align 4
 kat_img      dd 7                              ; {u32 len, raw bytes} for VFL_RAW
 kat_img_b    db 089h,'P','N','G',000h,001h,0FFh   ; binary incl NUL + high byte
 kat_exp_img  db 089h,'P','N','G',000h,001h,0FFh
+; --- vfuzz fixture: one valid two-field entry the parser fuzzer mutates ------
+align 4
+vfz_fix label byte
+    dd  1                               ; entry_count
+    db  16 dup(41h)                     ; id
+    dq  0                               ; created FILETIME
+    dq  0                               ; modified FILETIME
+    dd  2                               ; field_count
+    dw  VF_TITLE
+    dd  4
+    db  'A','c','c','t'
+    dw  VF_SECRET
+    dd  5
+    db  's','3','c','r','3'
+vfz_fix_end label byte
+VFZ_FIX_LEN equ vfz_fix_end - vfz_fix
+VFZ_ITERS   equ 100000
+CSTR vfz_m1, "vfuzz: "
+CSTR vfz_m2, " iters  "
+CSTR vfz_m3, " parsed  "
+CSTR vfz_m4, " rejected  0 crashes",13,10
 CSTR e_io,      "error: cannot read/write the vault file",13,10
 CSTR e_oom,     "error: out of memory",13,10
 CSTR m_created, "vault created.",13,10
 
 .data?
 align 16
+g_vfz_rng   dq ?                       ; vfuzz xorshift64 state (dbg/test only)
 g_kat_body  db 512 dup (?)             ; scratch body for the field-serialization KAT
 public g_vkey
 g_vkey      db 32 dup (?)
@@ -690,6 +713,11 @@ vu_ctset:
     jnz     vu_auth
     mov     rax, qword ptr [rbp-24]
     mov     qword ptr [g_body_len], rax
+    ; fail closed if the (now authenticated) record stream is structurally
+    ; malformed, so the trusting accessors never walk past the buffer.
+    call    vault_body_validate
+    test    eax, eax
+    jnz     vu_auth
     ; keep the file image resident: attachment ciphertext lives in it.  Build the
     ; id->ciphertext index from the attachments section.
     call    attach_index_build
@@ -1282,6 +1310,284 @@ ffi_none:
     xor     edx, edx
     ret
 find_field_in endp
+
+; ===========================================================================
+; vault_body_validate() -> eax = 0 if the plaintext body (g_body_ptr /
+;   g_body_len) is a well-formed entry/field stream fully contained within
+;   g_body_len; eax = 1 if any count or length field would drive a walk past
+;   the buffer.  The trusting accessors (vault_entry_len / find_field_in) read
+;   in-band lengths WITHOUT re-bounding, so this runs once right after gcm_open
+;   succeeds and fails the unlock closed on a malformed stream - defence in
+;   depth even though GCM already authenticates the plaintext.  Leaf; every
+;   step is bounded, so a hostile count/length can only cause an early reject,
+;   never a long loop.  Layout: u32 entry_count, then per entry
+;   { id16, created8, modified8, u32 field_count, {u16 type,u32 len,bytes}* }.
+; ===========================================================================
+public vault_body_validate
+vault_body_validate proc frame
+    FRAME_PROLOG 64
+    ; [rbp-24]=body ptr  [rbp-32]=body_len  [rbp-40]=offset
+    ; [rbp-48]=entries remaining  [rbp-56]=fields remaining
+    mov     r10, qword ptr [g_body_ptr]
+    test    r10, r10
+    jz      vbv_bad
+    mov     qword ptr [rbp-24], r10
+    mov     r11, qword ptr [g_body_len]
+    mov     qword ptr [rbp-32], r11
+    cmp     r11, 4                              ; must hold at least the u32 count
+    jb      vbv_bad
+    mov     eax, dword ptr [r10]                ; entry_count
+    mov     dword ptr [rbp-48], eax
+    mov     qword ptr [rbp-40], 4               ; first entry begins after the count
+vbv_entry:
+    mov     eax, dword ptr [rbp-48]
+    test    eax, eax
+    jz      vbv_tail
+    mov     rcx, qword ptr [rbp-40]
+    lea     rdx, [rcx+36]                       ; entry header = id16+c8+m8+fc4
+    cmp     rdx, qword ptr [rbp-32]
+    ja      vbv_bad
+    mov     r10, qword ptr [rbp-24]
+    mov     eax, dword ptr [r10+rcx+32]         ; field_count
+    mov     dword ptr [rbp-56], eax
+    add     rcx, 36
+    mov     qword ptr [rbp-40], rcx             ; -> first field
+vbv_field:
+    mov     eax, dword ptr [rbp-56]
+    test    eax, eax
+    jz      vbv_entrynext
+    mov     rcx, qword ptr [rbp-40]
+    lea     rdx, [rcx+6]                        ; room for the {u16 type,u32 len} header
+    cmp     rdx, qword ptr [rbp-32]
+    ja      vbv_bad
+    mov     r10, qword ptr [rbp-24]
+    movzx   eax, word ptr [r10+rcx]             ; raw type (kind | flags)
+    mov     r8d, dword ptr [r10+rcx+2]          ; field len (zero-extended into r8)
+    lea     rdx, [rcx+6]
+    add     rdx, r8                             ; field end offset
+    cmp     rdx, qword ptr [rbp-32]             ; whole field within the body?
+    ja      vbv_bad
+    test    eax, VF_LABELED                     ; labelled field: {u16 labellen, label, value}
+    jz      vbv_fadv
+    cmp     r8, 2
+    jb      vbv_bad                             ; no room for the labellen prefix
+    movzx   eax, word ptr [r10+rcx+6]           ; labellen
+    add     eax, 2
+    cmp     rax, r8                             ; 2 + labellen must fit inside the field
+    ja      vbv_bad
+vbv_fadv:
+    mov     rcx, qword ptr [rbp-40]
+    add     rcx, 6
+    add     rcx, r8
+    mov     qword ptr [rbp-40], rcx
+    dec     dword ptr [rbp-56]
+    jmp     vbv_field
+vbv_entrynext:
+    dec     dword ptr [rbp-48]
+    jmp     vbv_entry
+vbv_tail:
+    ; the walk must consume the body exactly - a reseal writes no slack, and a
+    ; shortfall would mean a bogus (too-small) count hid trailing records.
+    mov     rcx, qword ptr [rbp-40]
+    cmp     rcx, qword ptr [rbp-32]
+    jne     vbv_bad
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+vbv_bad:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+vault_body_validate endp
+
+; vfz_rand() -> rax = next xorshift64 value (updates g_vfz_rng).  Leaf; rcx dead.
+vfz_rand proc
+    mov     rax, qword ptr [g_vfz_rng]
+    mov     rcx, rax
+    shl     rcx, 13
+    xor     rax, rcx
+    mov     rcx, rax
+    shr     rcx, 7
+    xor     rax, rcx
+    mov     rcx, rax
+    shl     rcx, 17
+    xor     rax, rcx
+    mov     qword ptr [g_vfz_rng], rax
+    ret
+vfz_rand endp
+
+; ===========================================================================
+; cmd_vfuzz - in-proc structural fuzzer for the vault record parser (plan 30).
+;   Deterministically xorshift-mutates a copy of a valid one-entry body
+;   (bit flips, random byte sets, TLV length/count smashes, truncations),
+;   then runs vault_body_validate + the trusting accessors on it VFZ_ITERS
+;   times.  Every malformed body must be cleanly rejected or cleanly parsed -
+;   never an access violation.  Prints the parsed/rejected split; exit 0 = the
+;   run completed (a crash would fail-fast the process, so reaching the end
+;   with exit 0 IS the pass).  No positional args; fixed seed for reproducibility.
+; ===========================================================================
+LANDING_PAD
+public cmd_vfuzz
+cmd_vfuzz proc frame
+    FRAME_PROLOG 112
+    ; [rbp-16]=buf [rbp-32]=iters [rbp-40]=parsed [rbp-48]=rejected
+    ; [rbp-56]=curlen [rbp-64]=n [rbp-72]=i [rbp-80]=outlen scratch [rbp-88]=nmut
+    mov     rax, 243F6A8885A308D3h                       ; fixed seed
+    mov     qword ptr [g_vfz_rng], rax
+    mov     rcx, VFZ_FIX_LEN
+    call    mem_alloc
+    test    rax, rax
+    jz      vfz_oom
+    mov     qword ptr [rbp-16], rax
+    mov     qword ptr [g_body_ptr], rax
+    mov     qword ptr [rbp-40], 0                        ; parsed
+    mov     qword ptr [rbp-48], 0                        ; rejected
+    mov     qword ptr [rbp-32], VFZ_ITERS
+vfz_iter:
+    cmp     qword ptr [rbp-32], 0
+    je      vfz_report
+    ; restore the pristine fixture into the working buffer
+    mov     r11, qword ptr [rbp-16]
+    lea     r10, [vfz_fix]
+    xor     r8, r8
+vfz_restore:
+    mov     al, byte ptr [r10+r8]
+    mov     byte ptr [r11+r8], al
+    inc     r8
+    cmp     r8, VFZ_FIX_LEN
+    jb      vfz_restore
+    mov     qword ptr [rbp-56], VFZ_FIX_LEN              ; curlen
+    ; apply (rand & 3) + 1 mutations
+    call    vfz_rand
+    and     rax, 3
+    inc     rax
+    mov     qword ptr [rbp-88], rax
+vfz_mut:
+    cmp     qword ptr [rbp-88], 0
+    je      vfz_run
+    mov     rax, qword ptr [rbp-56]                      ; curlen
+    test    rax, rax
+    jz      vfz_mutnext                                  ; nothing to mutate at len 0
+    call    vfz_rand
+    mov     rcx, rax                                     ; rcx = r (kept across the op)
+    xor     edx, edx
+    div     qword ptr [rbp-56]                           ; rdx = off = r mod curlen
+    mov     r8, rdx                                      ; off
+    mov     rax, rcx
+    shr     rax, 2
+    and     rax, 3                                       ; op selector
+    cmp     rax, 0
+    je      vfz_flip
+    cmp     rax, 1
+    je      vfz_set
+    cmp     rax, 2
+    je      vfz_trunc
+    ; op 3: smash a u32 (targets TLV length + count fields) if it fits
+    mov     rax, r8
+    add     rax, 4
+    cmp     rax, qword ptr [rbp-56]
+    ja      vfz_mutnext
+    mov     r9, qword ptr [rbp-16]
+    add     r9, r8
+    mov     rax, rcx
+    shr     rax, 8
+    mov     dword ptr [r9], eax
+    jmp     vfz_mutnext
+vfz_flip:
+    mov     r9, qword ptr [rbp-16]
+    add     r9, r8
+    mov     rax, rcx
+    and     rax, 7
+    mov     r10, 1
+    mov     rcx, rax
+    shl     r10, cl
+    mov     al, byte ptr [r9]
+    xor     al, r10b
+    mov     byte ptr [r9], al
+    jmp     vfz_mutnext
+vfz_set:
+    mov     r9, qword ptr [rbp-16]
+    add     r9, r8
+    mov     rax, rcx
+    shr     rax, 8
+    mov     byte ptr [r9], al
+    jmp     vfz_mutnext
+vfz_trunc:
+    mov     rax, rcx
+    shr     rax, 8
+    xor     edx, edx
+    mov     r10, VFZ_FIX_LEN + 1
+    div     r10                                          ; rdx = 0..VFZ_FIX_LEN
+    mov     qword ptr [rbp-56], rdx
+vfz_mutnext:
+    dec     qword ptr [rbp-88]
+    jmp     vfz_mut
+vfz_run:
+    mov     rax, qword ptr [rbp-56]
+    mov     qword ptr [g_body_len], rax
+    call    vault_body_validate
+    test    eax, eax
+    jz      vfz_parsed
+    inc     qword ptr [rbp-48]                           ; rejected
+    jmp     vfz_next
+vfz_parsed:
+    inc     qword ptr [rbp-40]
+    ; validated body: exercise the trusting accessors so any mismatch between
+    ; the validator's model and find_field_in surfaces as a crash here.
+    call    vault_count
+    mov     dword ptr [rbp-64], eax
+    mov     qword ptr [rbp-72], 0
+vfz_walk:
+    mov     eax, dword ptr [rbp-64]
+    cmp     qword ptr [rbp-72], rax
+    jae     vfz_next
+    mov     rcx, qword ptr [rbp-72]
+    call    vault_entry_ptr
+    mov     rcx, qword ptr [rbp-72]
+    lea     rdx, [rbp-80]
+    call    vault_title_at
+    mov     rcx, qword ptr [rbp-72]
+    mov     edx, VF_SECRET
+    lea     r8, [rbp-80]
+    call    vault_field_at
+    mov     rcx, qword ptr [rbp-72]
+    mov     edx, VF_URL
+    lea     r8, [rbp-80]
+    call    vault_field_at
+    inc     qword ptr [rbp-72]
+    jmp     vfz_walk
+vfz_next:
+    dec     qword ptr [rbp-32]
+    jmp     vfz_iter
+vfz_report:
+    lea     rcx, [vfz_m1]
+    mov     edx, vfz_m1_len
+    call    print_a
+    mov     rcx, VFZ_ITERS
+    call    print_u64
+    lea     rcx, [vfz_m2]
+    mov     edx, vfz_m2_len
+    call    print_a
+    mov     rcx, qword ptr [rbp-40]
+    call    print_u64
+    lea     rcx, [vfz_m3]
+    mov     edx, vfz_m3_len
+    call    print_a
+    mov     rcx, qword ptr [rbp-48]
+    call    print_u64
+    lea     rcx, [vfz_m4]
+    mov     edx, vfz_m4_len
+    call    print_a
+    mov     qword ptr [g_body_ptr], 0                    ; heap buf, not secmem: unref it
+    mov     qword ptr [g_body_len], 0
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+vfz_oom:
+    mov     eax, EXIT_OOM
+    FRAME_EPILOG
+    ret
+cmd_vfuzz endp
 
 
 ; ===========================================================================

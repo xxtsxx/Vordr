@@ -129,6 +129,9 @@ if not "!errorlevel!"=="0" ( echo   fztest: FAIL ^(exit !errorlevel!, fuzzy scor
 bin\vordr.exe trtest > "%WORK%\trtest.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   trtest: FAIL ^(exit !errorlevel!, trash timestamp/threshold KAT^) & set RT=FAIL )
 
+bin\vordr.exe vfuzz > "%WORK%\vfuzz.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   vfuzz: FAIL ^(exit !errorlevel!, vault parser fuzzer crashed^) & set RT=FAIL )
+
 set R_ROUNDTRIP=!RT!
 call :now T1
 set /a T_ROUNDTRIP=!T1!-!T0!
