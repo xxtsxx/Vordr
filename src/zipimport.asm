@@ -29,6 +29,8 @@ extern WideCharToMultiByte:proc
 extern attach_reset:proc
 extern attach_stage:proc
 extern vault_build_entry:proc
+extern print_a:proc
+extern print_u64:proc
 externdef g_ae_dk:byte
 externdef g_field_list:qword
 externdef g_field_n:dword
@@ -45,6 +47,7 @@ MEMREC      equ 32                        ; {nameptr8, namelen4, _4, dataptr8, u
 
 .data?
 align 8
+g_zfz_rng   dq ?                          ; fuzzzip xorshift64 state (dbg/test only)
 g_zi_end    dq ?                          ; raw end
 g_zi_pwptr  dq ?                          ; UTF-8 pw ptr (= g_zi_u8pw)
 g_zi_pwlen  dd ?
@@ -89,6 +92,33 @@ zl_type     db '"type":'
 zl_label    db ',"label":'
 zl_value    db ',"value":'
 
+; --- fuzzzip fixture: a minimal WinZip-AES STORED local header for vordr.json
+; (usize=4 so the whole member region {salt16, verify2, cipher4, hmac10} = 32B
+; of data sits inside the buffer), then an EOCD signature to end the scan. -----
+align 4
+zfz_fix label byte
+    dd  04034b50h                         ; local file header signature
+    dw  20                                ; version needed
+    dw  1                                 ; flags (bit0 = encrypted)
+    dw  99                                ; method = AE-x
+    dw  0, 0                              ; mod time, mod date
+    dd  0                                 ; crc32
+    dd  32                                ; csize = 18 hdr + 4 cipher + 10 hmac
+    dd  4                                 ; usize (cipher length)
+    dw  10                                ; namelen
+    dw  0                                 ; extralen
+    db  'v','o','r','d','r','.','j','s','o','n'
+    db  32 dup (0AAh)                     ; member data (garbage salt/verify/cipher/hmac)
+    dd  06054b50h                         ; EOCD signature -> stops zi_scan
+    db  18 dup (0)                        ; EOCD remainder (pad)
+zfz_fix_end label byte
+ZFZ_FIX_LEN equ zfz_fix_end - zfz_fix
+ZFZ_ITERS   equ 100000
+CSTR zfz_m1, "fuzzzip: "
+CSTR zfz_m2, " iters  "
+CSTR zfz_m3, " scanned  "
+CSTR zfz_m4, " rejected  0 crashes",13,10
+
 .code
 
 ; =============================================================================
@@ -121,6 +151,17 @@ zs_lp:
     add     rax, r8
     add     rax, r9
     mov     qword ptr [rbp-40], rax             ; dataptr
+    ; Bounds: the whole member region {salt16, verify2, cipher[usize], hmac10}
+    ; must lie inside the raw buffer.  usize/dataptr come straight from the
+    ; attacker's header - without this a hostile usize would drive zi_decrypt's
+    ; HMAC read (pre-auth) and in-place CTR write past the end (OOB read/write).
+    ; A malformed member ends the scan (like an unrecognised signature does).
+    mov     rax, qword ptr [rbp-40]             ; dataptr
+    mov     ecx, dword ptr [rbp-32]             ; usize (zero-extended into rcx)
+    add     rax, rcx
+    add     rax, 28                             ; 18-byte header + 10-byte HMAC tag
+    cmp     rax, qword ptr [g_zi_end]
+    ja      zs_done
     ; record
     mov     eax, r10d
     imul    eax, eax, MEMREC
@@ -968,5 +1009,191 @@ zi_abort proc frame
     FRAME_EPILOG
     ret
 zi_abort endp
+
+; zfz_rand() -> rax = next xorshift64 value (updates g_zfz_rng).  Leaf; rcx dead.
+zfz_rand proc
+    mov     rax, qword ptr [g_zfz_rng]
+    mov     rcx, rax
+    shl     rcx, 13
+    xor     rax, rcx
+    mov     rcx, rax
+    shr     rcx, 7
+    xor     rax, rcx
+    mov     rcx, rax
+    shl     rcx, 17
+    xor     rax, rcx
+    mov     qword ptr [g_zfz_rng], rax
+    ret
+zfz_rand endp
+
+; =============================================================================
+; cmd_zfuzz - structural fuzzer for the ZIP import parser (plan 31).  The
+;   .vaultz format is STORED-only AES-zip (no DEFLATE, so there is no inflate
+;   path to fuzz); the attacker-controlled surface is zi_scan, which reads
+;   local-header size fields with no crypto gate in front of it.  This
+;   deterministically xorshift-mutates a copy of a valid vordr.json local
+;   header (bit flips, byte sets, TLV size/namelen smashes, truncations),
+;   runs zi_scan, then touches the last byte of every recorded member's
+;   decrypt region {salt,verify,cipher[usize],hmac} - the exact bytes
+;   zi_decrypt would read/write.  With zi_scan's bounds guard every touch is
+;   in-range; a guard regression (or a memory-bomb usize) would fault here.
+;   ZFZ_ITERS iterations, fixed seed, exit 0 = completed with no crash.
+; =============================================================================
+LANDING_PAD
+public cmd_zfuzz
+cmd_zfuzz proc frame
+    FRAME_PROLOG 112
+    ; [rbp-16]=buf [rbp-32]=iters [rbp-40]=scanned [rbp-48]=rejected
+    ; [rbp-56]=curlen [rbp-64]=nmut [rbp-72]=member i [rbp-80]=n
+    mov     rax, 9E3779B97F4A7C15h                        ; fixed seed
+    mov     qword ptr [g_zfz_rng], rax
+    mov     rcx, ZFZ_FIX_LEN
+    call    mem_alloc
+    test    rax, rax
+    jz      zfz_oom
+    mov     qword ptr [rbp-16], rax
+    mov     qword ptr [rbp-40], 0                          ; scanned
+    mov     qword ptr [rbp-48], 0                          ; rejected
+    mov     qword ptr [rbp-32], ZFZ_ITERS
+zfz_iter:
+    cmp     qword ptr [rbp-32], 0
+    je      zfz_report
+    mov     r11, qword ptr [rbp-16]                        ; restore pristine fixture
+    lea     r10, [zfz_fix]
+    xor     r8, r8
+zfz_restore:
+    mov     al, byte ptr [r10+r8]
+    mov     byte ptr [r11+r8], al
+    inc     r8
+    cmp     r8, ZFZ_FIX_LEN
+    jb      zfz_restore
+    mov     qword ptr [rbp-56], ZFZ_FIX_LEN                ; curlen
+    call    zfz_rand
+    and     rax, 3
+    inc     rax
+    mov     qword ptr [rbp-64], rax
+zfz_mut:
+    cmp     qword ptr [rbp-64], 0
+    je      zfz_run
+    mov     rax, qword ptr [rbp-56]
+    test    rax, rax
+    jz      zfz_mutnext
+    call    zfz_rand
+    mov     rcx, rax                                       ; r
+    xor     edx, edx
+    div     qword ptr [rbp-56]                             ; rdx = off = r mod curlen
+    mov     r8, rdx
+    mov     rax, rcx
+    shr     rax, 2
+    and     rax, 3
+    cmp     rax, 0
+    je      zfz_flip
+    cmp     rax, 1
+    je      zfz_set
+    cmp     rax, 2
+    je      zfz_trunc
+    mov     rax, r8                                        ; op 3: smash a u32
+    add     rax, 4
+    cmp     rax, qword ptr [rbp-56]
+    ja      zfz_mutnext
+    mov     r9, qword ptr [rbp-16]
+    add     r9, r8
+    mov     rax, rcx
+    shr     rax, 8
+    mov     dword ptr [r9], eax
+    jmp     zfz_mutnext
+zfz_flip:
+    mov     r9, qword ptr [rbp-16]
+    add     r9, r8
+    mov     rax, rcx
+    and     rax, 7
+    mov     r10, 1
+    mov     rcx, rax
+    shl     r10, cl
+    mov     al, byte ptr [r9]
+    xor     al, r10b
+    mov     byte ptr [r9], al
+    jmp     zfz_mutnext
+zfz_set:
+    mov     r9, qword ptr [rbp-16]
+    add     r9, r8
+    mov     rax, rcx
+    shr     rax, 8
+    mov     byte ptr [r9], al
+    jmp     zfz_mutnext
+zfz_trunc:
+    mov     rax, rcx
+    shr     rax, 8
+    xor     edx, edx
+    mov     r10, ZFZ_FIX_LEN + 1
+    div     r10
+    mov     qword ptr [rbp-56], rdx
+zfz_mutnext:
+    dec     qword ptr [rbp-64]
+    jmp     zfz_mut
+zfz_run:
+    mov     rcx, qword ptr [rbp-16]
+    mov     edx, dword ptr [rbp-56]
+    call    zi_scan                                        ; -> eax = member count
+    mov     dword ptr [rbp-80], eax
+    test    eax, eax
+    jz      zfz_rej
+    inc     qword ptr [rbp-40]                             ; scanned (>=1 member)
+    mov     qword ptr [rbp-72], 0
+zfz_walk:
+    mov     eax, dword ptr [rbp-80]
+    cmp     qword ptr [rbp-72], rax
+    jae     zfz_next
+    mov     eax, dword ptr [rbp-72]
+    imul    eax, eax, MEMREC
+    lea     r10, [g_zi_mem]
+    add     r10, rax                                       ; -> member record
+    ; touch the last byte of the decrypt region: dataptr + usize + 27
+    mov     rax, qword ptr [r10+16]                        ; dataptr
+    mov     ecx, dword ptr [r10+24]                        ; usize
+    add     rax, rcx
+    movzx   edx, byte ptr [rax+27]                         ; faults if guard is wrong
+    ; touch the last name byte: nameptr + namelen - 1 (bounded by dataptr<=end)
+    mov     ecx, dword ptr [r10+8]                         ; namelen
+    test    ecx, ecx
+    jz      zfz_walknext
+    mov     rax, qword ptr [r10+0]                         ; nameptr
+    add     rax, rcx
+    movzx   edx, byte ptr [rax-1]
+zfz_walknext:
+    inc     qword ptr [rbp-72]
+    jmp     zfz_walk
+zfz_rej:
+    inc     qword ptr [rbp-48]
+zfz_next:
+    dec     qword ptr [rbp-32]
+    jmp     zfz_iter
+zfz_report:
+    lea     rcx, [zfz_m1]
+    mov     edx, zfz_m1_len
+    call    print_a
+    mov     rcx, ZFZ_ITERS
+    call    print_u64
+    lea     rcx, [zfz_m2]
+    mov     edx, zfz_m2_len
+    call    print_a
+    mov     rcx, qword ptr [rbp-40]
+    call    print_u64
+    lea     rcx, [zfz_m3]
+    mov     edx, zfz_m3_len
+    call    print_a
+    mov     rcx, qword ptr [rbp-48]
+    call    print_u64
+    lea     rcx, [zfz_m4]
+    mov     edx, zfz_m4_len
+    call    print_a
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+zfz_oom:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_zfuzz endp
 
 end
