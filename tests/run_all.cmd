@@ -138,6 +138,9 @@ if not "!errorlevel!"=="0" ( echo   vfuzz: FAIL ^(exit !errorlevel!, vault parse
 bin\vordr.exe fuzzzip > "%WORK%\fuzzzip.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   fuzzzip: FAIL ^(exit !errorlevel!, zip-import parser fuzzer crashed^) & set RT=FAIL )
 
+bin\vordr.exe bktest "%WORK%\bk.vault" > "%WORK%\bktest.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   bktest: FAIL ^(exit !errorlevel!, atomic-save/backup rotation^) & set RT=FAIL )
+
 set R_ROUNDTRIP=!RT!
 call :now T1
 set /a T_ROUNDTRIP=!T1!-!T0!

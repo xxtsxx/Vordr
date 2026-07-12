@@ -34,6 +34,9 @@ extern secmem_free:proc
 extern read_file:proc
 extern write_file:proc
 extern file_rename:proc
+extern MoveFileExW:proc
+extern CopyFileW:proc
+extern DeleteFileW:proc
 extern mem_alloc:proc
 extern mem_free:proc
 extern print_a:proc
@@ -41,6 +44,7 @@ extern print_err:proc
 extern print_u64:proc
 extern WideCharToMultiByte:proc
 extern GetSystemTimeAsFileTime:proc
+extern GetFileAttributesW:proc
 extern tpm_seal:proc
 extern tpm_unseal:proc
 extern tpm_delete:proc
@@ -49,6 +53,7 @@ extern reg_tpm_get:proc
 extern reg_tpm_del:proc
 
 externdef g_cfg_in:qword
+externdef g_argv:qword
 externdef g_cfg_pass:byte
 externdef g_cfg_passlen:dword
 externdef g_cfg_t:dword
@@ -104,6 +109,8 @@ VH_KCV          equ 64
 VH_TOTAL        equ 80          ; header + KCV (= GCM AAD)
 VAULT_BODY_MAX  equ 16777216    ; 16 MiB plaintext cap (record fields only)
 CONV_CAP        equ 16384
+MOVEFILE_REPLACE_EXISTING equ 1
+BAK_GENS        equ 3           ; rotated backup generations (.bak1 .. .bak3)
 
 ; --- large-attachment section (separate part of the vault file) --------------
 ; The record body stays small: a VF_IMAGE field's value is a 68-byte AttachRef,
@@ -160,6 +167,9 @@ CSTR vfz_m1, "vfuzz: "
 CSTR vfz_m2, " iters  "
 CSTR vfz_m3, " parsed  "
 CSTR vfz_m4, " rejected  0 crashes",13,10
+bk_pw       db "vordrtest", 0
+CSTR bk_ok,  "bktest: PASS (bak1..3 rotated and bak1 opens)",13,10
+CSTR bk_bad, "bktest: FAIL (backup missing or unopenable)",13,10
 CSTR e_io,      "error: cannot read/write the vault file",13,10
 CSTR e_oom,     "error: out of memory",13,10
 CSTR m_created, "vault created.",13,10
@@ -196,6 +206,8 @@ g_conv      db CONV_CAP dup (?)
 g_convlabel db MAX_LABEL_BYTES dup (?)        ; utf8 label scratch (va_field_labeled)
 align 2
 g_tmppath   dw MAX_PATH_CHARS dup (?)        ; "<vault>.tmp" for atomic replace
+g_bak_a     dw MAX_PATH_CHARS dup (?)        ; backup-rotation path scratch (from)
+g_bak_b     dw MAX_PATH_CHARS dup (?)        ; backup-rotation path scratch (to)
 g_ts        dq ?                ; GetSystemTimeAsFileTime scratch
 seed_title_w dw 80 dup (?)      ; seedtest scratch: entry field strings (wide)
 seed_user_w  dw 96 dup (?)
@@ -464,6 +476,74 @@ vk_kcv_ok proc frame
 vk_kcv_ok endp
 
 ; ===========================================================================
+; vault_mkbak(rcx = out wide buf, dl = digit char) - write "<g_cfg_in>.bak<d>"
+;   into the caller's buffer.  Leaf; clobbers rax/r8/r10/r11, preserves rdx.
+; ===========================================================================
+vault_mkbak proc
+    mov     r10, qword ptr [g_cfg_in]
+    mov     r11, rcx
+    xor     r8, r8
+vmb_cp:
+    mov     ax, word ptr [r10+r8*2]
+    mov     word ptr [r11+r8*2], ax
+    test    ax, ax
+    jz      vmb_suf
+    inc     r8
+    cmp     r8, MAX_PATH_CHARS-8
+    jb      vmb_cp
+vmb_suf:
+    mov     word ptr [r11+r8*2], '.'
+    inc     r8
+    mov     word ptr [r11+r8*2], 'b'
+    inc     r8
+    mov     word ptr [r11+r8*2], 'a'
+    inc     r8
+    mov     word ptr [r11+r8*2], 'k'
+    inc     r8
+    movzx   eax, dl
+    mov     word ptr [r11+r8*2], ax
+    inc     r8
+    mov     word ptr [r11+r8*2], 0
+    ret
+vault_mkbak endp
+
+; ===========================================================================
+; vault_rotate_backups() - before the atomic replace, roll the CURRENT vault
+;   file into a ring of BAK_GENS generations: bak2->bak3, bak1->bak2, then copy
+;   the live file to bak1.  A crash mid-save can thus never lose the vault - the
+;   old copy survives as bak1.  Every step is best-effort (a missing generation
+;   is fine); on the very first save g_cfg_in does not exist yet so the copy is
+;   a harmless no-op.  Frame proc; no failure is fatal to the save.
+; ===========================================================================
+vault_rotate_backups proc frame
+    FRAME_PROLOG 48
+    lea     rcx, [g_bak_a]                      ; delete the oldest (bak3)
+    mov     dl, '0' + BAK_GENS
+    call    vault_mkbak
+    WINCALL DeleteFileW, addr g_bak_a
+    lea     rcx, [g_bak_a]                      ; bak2 -> bak3
+    mov     dl, '0' + BAK_GENS - 1
+    call    vault_mkbak
+    lea     rcx, [g_bak_b]
+    mov     dl, '0' + BAK_GENS
+    call    vault_mkbak
+    WINCALL MoveFileExW, addr g_bak_a, addr g_bak_b, MOVEFILE_REPLACE_EXISTING
+    lea     rcx, [g_bak_a]                      ; bak1 -> bak2
+    mov     dl, '1'
+    call    vault_mkbak
+    lea     rcx, [g_bak_b]
+    mov     dl, '2'
+    call    vault_mkbak
+    WINCALL MoveFileExW, addr g_bak_a, addr g_bak_b, MOVEFILE_REPLACE_EXISTING
+    lea     rcx, [g_bak_a]                      ; live vault -> bak1 (overwrite)
+    mov     dl, '1'
+    call    vault_mkbak
+    WINCALL CopyFileW, qword ptr [g_cfg_in], addr g_bak_a, 0
+    FRAME_EPILOG
+    ret
+vault_rotate_backups endp
+
+; ===========================================================================
 ; vault_seal_write() - seal g_body (g_body_len bytes) under g_vkey with a fresh
 ;   nonce already placed in g_hdr, build the file image, write it to g_cfg_in.
 ;   -> eax = 0 / EXIT_IO / EXIT_OOM.
@@ -556,6 +636,8 @@ vsw_pdone:
     call    write_file
     test    eax, eax
     jnz     vsw_io
+    ; roll the current file into .bak1..N before we overwrite it (best-effort)
+    call    vault_rotate_backups
     ; atomic replace: rename temp -> the real vault path
     lea     rcx, [g_tmppath]
     mov     rdx, qword ptr [g_cfg_in]
@@ -1590,6 +1672,87 @@ vfz_oom:
     FRAME_EPILOG
     ret
 cmd_vfuzz endp
+
+; ===========================================================================
+; cmd_bktest <path> - headless proof of atomic save + backup rotation (plan 37).
+;   Creates the vault BAK_GENS+1 times at the same path (fast KDF); each save
+;   after the first rolls the live file into .bak1..N.  Then it asserts every
+;   generation exists and re-opens .bak1 with the master password to prove a
+;   rotated backup is a complete, valid vault.  exit 0 = pass.
+; ===========================================================================
+LANDING_PAD
+public cmd_bktest
+cmd_bktest proc frame
+    FRAME_PROLOG 64
+    ; [rbp-24]=counter [rbp-32]=saved path [rbp-40]=unlock result
+    lea     r10, [g_argv]
+    mov     rax, qword ptr [r10+16]             ; argv[2] = vault path
+    mov     qword ptr [g_cfg_in], rax
+    lea     r10, [bk_pw]                        ; fixed test password
+    lea     r11, [g_cfg_pass]
+    xor     ecx, ecx
+bk_pwcp:
+    mov     al, byte ptr [r10+rcx]
+    mov     byte ptr [r11+rcx], al
+    test    al, al
+    jz      bk_pwd
+    inc     ecx
+    cmp     ecx, 32
+    jb      bk_pwcp
+bk_pwd:
+    mov     dword ptr [g_cfg_passlen], 9
+    mov     dword ptr [g_cfg_t], 1              ; fast KDF for the test
+    mov     dword ptr [g_cfg_m], 8192
+    mov     dword ptr [rbp-24], 0
+bk_loop:
+    call    do_init
+    test    eax, eax
+    jnz     bk_fail
+    inc     dword ptr [rbp-24]
+    cmp     dword ptr [rbp-24], BAK_GENS+1
+    jb      bk_loop
+    mov     dword ptr [rbp-24], 1               ; assert bak1..N exist
+bk_chk:
+    cmp     dword ptr [rbp-24], BAK_GENS
+    ja      bk_open
+    lea     rcx, [g_bak_a]
+    mov     edx, dword ptr [rbp-24]
+    add     edx, '0'
+    call    vault_mkbak
+    WINCALL GetFileAttributesW, addr g_bak_a
+    cmp     eax, -1                             ; INVALID_FILE_ATTRIBUTES
+    je      bk_fail
+    inc     dword ptr [rbp-24]
+    jmp     bk_chk
+bk_open:
+    mov     rax, qword ptr [g_cfg_in]           ; open bak1 to prove it is valid
+    mov     qword ptr [rbp-32], rax
+    lea     rcx, [g_bak_a]
+    mov     dl, '1'
+    call    vault_mkbak
+    lea     rax, [g_bak_a]
+    mov     qword ptr [g_cfg_in], rax
+    call    vault_unlock
+    mov     dword ptr [rbp-40], eax
+    call    vault_lock
+    mov     rax, qword ptr [rbp-32]             ; restore the real path
+    mov     qword ptr [g_cfg_in], rax
+    cmp     dword ptr [rbp-40], 0
+    jne     bk_fail
+    lea     rcx, [bk_ok]
+    mov     edx, bk_ok_len
+    call    print_a
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+bk_fail:
+    lea     rcx, [bk_bad]
+    mov     edx, bk_bad_len
+    call    print_a
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_bktest endp
 
 
 ; ===========================================================================
