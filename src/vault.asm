@@ -21,6 +21,9 @@
 
 include macros.inc
 
+externdef g_vpath:word                  ; multi-vault: file identity, snapshotted per ctx
+externdef g_is_default:dword
+externdef g_vault_lock:dword
 extern argon2id_hash:proc
 extern gcm_seal:proc
 extern gcm_open:proc
@@ -165,6 +168,10 @@ VSLOT struct
     s_pad       dd ?
     s_newatt    db MAX_ATT * 32 dup(?)
     s_attidx    db MAX_ATT * 32 dup(?)
+    s_vpath     db 2048 dup(?)              ; file identity: g_vpath contents (per-ctx save target)
+    s_is_default dd ?
+    s_vault_lock dd ?
+    s_pad2      dd ?
     s_name      db 128 dup(?)               ; tab display name (wide, NUL-term); set at open,
                                             ;   not part of the swapped live state
 VSLOT ends
@@ -2022,6 +2029,16 @@ vault_snapshot proc frame
     mov     dword ptr [r10+VSLOT.s_newatt_n], eax
     mov     eax, dword ptr [g_attidx_n]
     mov     dword ptr [r10+VSLOT.s_attidx_n], eax
+    mov     rcx, qword ptr [rbp-24]              ; file identity: g_vpath -> slot
+    add     rcx, VSLOT.s_vpath
+    lea     rdx, [g_vpath]
+    mov     r8d, 2048
+    call    copy_bytes
+    mov     r10, qword ptr [rbp-24]
+    mov     eax, dword ptr [g_is_default]
+    mov     dword ptr [r10+VSLOT.s_is_default], eax
+    mov     eax, dword ptr [g_vault_lock]
+    mov     dword ptr [r10+VSLOT.s_vault_lock], eax
     FRAME_EPILOG
     ret
 vault_snapshot endp
@@ -2080,6 +2097,16 @@ vault_restore proc frame
     mov     dword ptr [g_newatt_n], eax
     mov     eax, dword ptr [r10+VSLOT.s_attidx_n]
     mov     dword ptr [g_attidx_n], eax
+    lea     rcx, [g_vpath]                       ; file identity: slot -> g_vpath
+    mov     rdx, qword ptr [rbp-24]
+    add     rdx, VSLOT.s_vpath
+    mov     r8d, 2048
+    call    copy_bytes
+    mov     r10, qword ptr [rbp-24]
+    mov     eax, dword ptr [r10+VSLOT.s_is_default]
+    mov     dword ptr [g_is_default], eax
+    mov     eax, dword ptr [r10+VSLOT.s_vault_lock]
+    mov     dword ptr [g_vault_lock], eax
     FRAME_EPILOG
     ret
 vault_restore endp
@@ -2317,6 +2344,9 @@ cmd_mvtest proc frame
     mov     dword ptr [g_rollback], 0A1A1A1A1h
     mov     dword ptr [g_newatt_n], 0B2B2B2B2h
     mov     dword ptr [g_attidx_n], 0C3C3C3C3h
+    mov     word ptr [g_vpath], 1234h
+    mov     dword ptr [g_is_default], 71717171h
+    mov     dword ptr [g_vault_lock], 82828282h
     lea     rcx, [g_mvslot]
     call    vault_snapshot
     ; clobber everything to zero
@@ -2348,6 +2378,9 @@ cmd_mvtest proc frame
     mov     dword ptr [g_rollback], eax
     mov     dword ptr [g_newatt_n], eax
     mov     dword ptr [g_attidx_n], eax
+    mov     word ptr [g_vpath], ax
+    mov     dword ptr [g_is_default], eax
+    mov     dword ptr [g_vault_lock], eax
     lea     rcx, [g_mvslot]
     call    vault_restore
     ; verify each field
@@ -2397,6 +2430,12 @@ cmd_mvtest proc frame
     cmp     dword ptr [g_newatt_n], 0B2B2B2B2h
     jne     mvt_fail
     cmp     dword ptr [g_attidx_n], 0C3C3C3C3h
+    jne     mvt_fail
+    cmp     word ptr [g_vpath], 1234h
+    jne     mvt_fail
+    cmp     dword ptr [g_is_default], 71717171h
+    jne     mvt_fail
+    cmp     dword ptr [g_vault_lock], 82828282h
     jne     mvt_fail
     xor     eax, eax
     FRAME_EPILOG
@@ -2453,6 +2492,8 @@ mpl_vkd:
     mov     qword ptr [g_body_ptr], rax
     mov     qword ptr [g_save_counter], rax
     mov     dword ptr [g_rollback], eax     ; low 32 bits = seed replicated 4x
+    mov     word ptr [g_vpath], r8w         ; file-identity fields (per-ctx)
+    mov     dword ptr [g_is_default], eax
     ret
 mv_plant endp
 
@@ -2495,6 +2536,10 @@ mck_vkd:
     cmp     qword ptr [g_save_counter], rax
     jne     mck_bad
     cmp     dword ptr [g_rollback], eax
+    jne     mck_bad
+    cmp     word ptr [g_vpath], r8w
+    jne     mck_bad
+    cmp     dword ptr [g_is_default], eax
     jne     mck_bad
     xor     eax, eax
     ret

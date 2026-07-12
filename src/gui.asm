@@ -1280,6 +1280,7 @@ g_match_w   dw EBUF*2 dup (?)         ; scratch: a field value/label folded for 
 align 4
 g_search_len dd ?                     ; active query length in chars (0 = no query -> title sort)
 g_entry_score dd SCORE_CAP dup (?)    ; fuzzy score per vault index (for score-descending sort)
+public g_vpath, g_is_default, g_vault_lock  ; multi-vault: snapshotted per ctx (vault.asm)
 g_vpath     dw 1024 dup (?)        ; chosen vault path (wide, NUL-terminated)
 g_xlpw      dw 256 dup (?)         ; export password (wide; wiped after use)
 g_xlpw2     dw 256 dup (?)         ; export confirm password (wide; wiped)
