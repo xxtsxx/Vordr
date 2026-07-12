@@ -863,11 +863,7 @@ wb_copy label word
 wb_more label word
     dw 0E712h, 0                                 ; More (header overflow menu)
 wb_star label word
-    dw 0E734h, 0                                 ; FavoriteStar (outline = not favorite)
-wb_starf label word
-    dw 0E735h, 0                                 ; FavoriteStarFill (favorited)
-wb_recycle label word
-    dw 267Bh, 0                                  ; recycle â™» (recover mode: restore)
+    dw 0E734h, 0                                 ; FavoriteStar (MSAA name for the fav button)
 fav_one label word
     dw '1', 0                                    ; VF_FAV marker value
 pht_lbl db 'Password'                            ; gui_phtest scratch (headless probe)
@@ -926,6 +922,7 @@ cls_tooltip label word
     dw 't','o','o','l','t','i','p','s','_','c','l','a','s','s','3','2', 0
 WSTR gl_t_theme, <Theme / colour scheme>
 WSTR gt_more, <More>
+WSTR gt_fav, <Favorite>
 kl_user label word
     dw 'U','s','e','r','n','a','m','e', 0
 kl_secret label word
@@ -4659,6 +4656,30 @@ ga_done:
     ret
 ghost_attach endp
 
+; ghost_set_glyph(rcx=hdlg, edx=ctlid, r8d=glyph) - change a ghost button's glyph
+;   (bits 16-31 of userdata), preserving its hover/style bits, and repaint.
+ghost_set_glyph proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-28], edx
+    mov     dword ptr [rbp-32], r8d
+    WINCALL GetDlgItem, qword ptr [rbp-24], dword ptr [rbp-28]
+    mov     qword ptr [rbp-40], rax
+    test    rax, rax
+    jz      gsg_done
+    WINCALL GetWindowLongPtrW, qword ptr [rbp-40], GWL_USERDATA
+    and     eax, 0FFFFh                         ; keep hover+style, clear glyph
+    mov     edx, dword ptr [rbp-32]
+    shl     edx, 16
+    or      eax, edx                            ; new glyph in bits 16-31
+    mov     edx, eax
+    WINCALL SetWindowLongPtrW, qword ptr [rbp-40], GWL_USERDATA, rdx
+    WINCALL InvalidateRect, qword ptr [rbp-40], 0, 1
+gsg_done:
+    FRAME_EPILOG
+    ret
+ghost_set_glyph endp
+
 ; ghost_make(rcx=hdlg, edx=id, r8d=glyph, r9=name/tooltip wstr) -> rax=hwnd.
 ;   Placeholder geometry; the layout pass positions it.
 ghost_make proc frame
@@ -8227,15 +8248,17 @@ gui_update_fav_glyph proc frame
     mov     qword ptr [rbp-24], rcx
     cmp     dword ptr [g_trash_view], 0
     je      guf_star
-    lea     rax, [wb_recycle]                    ; recover mode -> recycle button
+    mov     r8d, GLY_RECYCLE                      ; recover mode -> recycle glyph (Segoe Symbol)
     jmp     guf_set
 guf_star:
-    lea     rax, [wb_star]                       ; outline (not favorite)
+    mov     r8d, GLY_FAV_OFF                      ; outline (not favorite)
     cmp     dword ptr [g_fav_state], 0
     je      guf_set
-    lea     rax, [wb_starf]                      ; filled (favorite)
+    mov     r8d, GLY_FAV_ON                       ; filled (favorite)
 guf_set:
-    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_FAV, rax
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_V_FAV
+    call    ghost_set_glyph
     FRAME_EPILOG
     ret
 gui_update_fav_glyph endp
@@ -9077,6 +9100,12 @@ vp_init:
     mov     rdx, rax
     mov     r8d, GLY_MORE
     lea     r9, [gt_more]
+    call    ghost_attach
+    WINCALL GetDlgItem, qword ptr [rbp-8], IDC_V_FAV    ; header favorite -> frameless ghost
+    mov     rcx, qword ptr [rbp-8]                       ;   (dynamic glyph via ghost_set_glyph)
+    mov     rdx, rax
+    mov     r8d, GLY_FAV_OFF
+    lea     r9, [gt_fav]
     call    ghost_attach
     mov     dword ptr [g_trash_view], 0       ; start in the vault (not the trash) view
     mov     dword ptr [g_deleted_state], 0
