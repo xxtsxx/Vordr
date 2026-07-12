@@ -47,6 +47,13 @@ extern vault_ext_changed:proc           ; vault.asm: on-disk file changed since 
 extern vault_add_entry:proc
 extern vault_remove_at:proc
 extern vault_count:proc
+extern vault_ctx_reset:proc
+extern vault_ctx_open:proc
+extern vault_ctx_front:proc
+extern vault_ctx_setname:proc
+extern vault_ctx_nameptr:proc
+externdef g_vault_n:dword
+externdef g_vault_cur:dword
 extern vault_title_at:proc
 extern vault_field_at:proc
 extern vault_entry_ptr:proc
@@ -329,6 +336,8 @@ IDC_T_SEARCH        equ 296             ; title-bar search pill
 IDC_SO_PANEL        equ 297             ; search overlay: framed backdrop
 IDC_SO_EDIT         equ 298             ; search overlay: query edit
 IDC_SO_LIST         equ 299             ; search overlay: owner-draw results list
+IDC_V_TABS          equ 300             ; multi-vault tab strip (owner-draw)
+TAB_W               equ 130             ; per-vault tab width (px)
 DOCKBTN_W           equ 34              ; title-bar dock button width
 SEARCHPILL_W        equ 200             ; title-bar search pill width
 SO_W                equ 360             ; search overlay width (px)
@@ -9528,6 +9537,12 @@ frame_layout proc frame
     mov     dword ptr [rbp-64], eax
     WINCALL GetDlgItem, qword ptr [rbp-24], IDC_T_SEARCH
     WINCALL MoveWindow, rax, dword ptr [rbp-64], 5, SEARCHPILL_W, 22, 1
+    ; tab strip: left edge (x=4) to just left of the pill
+    mov     eax, dword ptr [rbp-64]
+    sub     eax, 12
+    mov     dword ptr [rbp-68], eax            ; tab area width
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_V_TABS
+    WINCALL MoveWindow, rax, 4, 0, dword ptr [rbp-68], TBAR_H, 1
     FRAME_EPILOG
     ret
 frame_layout endp
@@ -9563,8 +9578,11 @@ frame_maxinfo endp
 ; frame_build(rcx=hdlg) - create the caption ghost buttons, then lay them out.
 ;   Called from vp_init AFTER frame_shift/frame_grow so they are not shifted.
 frame_build proc frame
-    FRAME_PROLOG 48
+    FRAME_PROLOG 128                            ; room for the 9-arg mk_ctl spill
     mov     qword ptr [rbp-24], rcx
+    WINCALL mk_ctl, qword ptr [rbp-24], IDC_V_TABS, addr cls_button, 0, \
+            BS_OWNERDRAW_, 0, 0, 10, 10        ; multi-vault tab strip (owner-draw)
+    mov     rcx, qword ptr [rbp-24]
     mov     rcx, qword ptr [rbp-24]
     mov     edx, IDC_T_MIN
     mov     r8d, GLY_MIN
@@ -9853,6 +9871,97 @@ ses_up:
     ret
 search_overlay_editsub endp
 
+; gui_draw_tabs(rcx=lpdis) - paint the multi-vault tab strip: one tab per open
+;   vault (lock glyph + display name), the fronted vault highlighted.
+gui_draw_tabs proc frame
+    FRAME_PROLOG 160
+    mov     qword ptr [rbp-24], rcx
+    mov     r10, rcx
+    mov     rax, qword ptr [r10+32]
+    mov     qword ptr [rbp-32], rax           ; hDC
+    mov     eax, dword ptr [r10+40]           ; control rect
+    mov     dword ptr [rbp-80], eax
+    mov     eax, dword ptr [r10+44]
+    mov     dword ptr [rbp-76], eax
+    mov     eax, dword ptr [r10+48]
+    mov     dword ptr [rbp-72], eax
+    mov     eax, dword ptr [r10+52]
+    mov     dword ptr [rbp-68], eax
+    WINCALL CreateSolidBrush, dword ptr [g_col_bg]
+    mov     qword ptr [rbp-48], rax
+    WINCALL FillRect, qword ptr [rbp-32], addr rbp-80, qword ptr [rbp-48]
+    WINCALL DeleteObject, qword ptr [rbp-48]
+    WINCALL SetBkMode, qword ptr [rbp-32], 1  ; TRANSPARENT
+    mov     dword ptr [rbp-40], 0             ; i
+    mov     dword ptr [rbp-44], 0             ; x
+gdt_loop:
+    mov     eax, dword ptr [rbp-40]
+    cmp     eax, dword ptr [g_vault_n]
+    jae     gdt_done
+    mov     eax, dword ptr [rbp-44]           ; tab rect
+    mov     dword ptr [rbp-120], eax
+    mov     dword ptr [rbp-116], 0
+    add     eax, TAB_W
+    mov     dword ptr [rbp-112], eax
+    mov     eax, dword ptr [rbp-68]
+    mov     dword ptr [rbp-108], eax
+    mov     eax, dword ptr [rbp-40]           ; active tab -> panel fill
+    cmp     eax, dword ptr [g_vault_cur]
+    jne     gdt_txtcol
+    WINCALL CreateSolidBrush, dword ptr [g_col_panel]
+    mov     qword ptr [rbp-48], rax
+    WINCALL FillRect, qword ptr [rbp-32], addr rbp-120, qword ptr [rbp-48]
+    WINCALL DeleteObject, qword ptr [rbp-48]
+gdt_txtcol:
+    mov     eax, dword ptr [rbp-40]
+    cmp     eax, dword ptr [g_vault_cur]
+    jne     gdt_dim
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_text]
+    jmp     gdt_glyph
+gdt_dim:
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_textdim]
+gdt_glyph:
+    mov     word ptr [rbp-136], GLY_VAULT     ; glyph scratch (stack-local)
+    mov     word ptr [rbp-134], 0
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_font_icon]
+    mov     qword ptr [rbp-56], rax           ; old font
+    mov     eax, dword ptr [rbp-120]
+    add     eax, 6
+    mov     dword ptr [rbp-104], eax
+    mov     eax, dword ptr [rbp-116]
+    mov     dword ptr [rbp-100], eax
+    mov     eax, dword ptr [rbp-120]
+    add     eax, 22
+    mov     dword ptr [rbp-96], eax
+    mov     eax, dword ptr [rbp-108]
+    mov     dword ptr [rbp-92], eax
+    WINCALL DrawTextW, qword ptr [rbp-32], addr rbp-136, -1, addr rbp-104, 24h
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-56]
+    mov     ecx, dword ptr [rbp-40]           ; tab name
+    call    vault_ctx_nameptr
+    mov     qword ptr [rbp-64], rax
+    mov     eax, dword ptr [rbp-120]
+    add     eax, 24
+    mov     dword ptr [rbp-104], eax
+    mov     eax, dword ptr [rbp-116]
+    mov     dword ptr [rbp-100], eax
+    mov     eax, dword ptr [rbp-112]
+    sub     eax, 6
+    mov     dword ptr [rbp-96], eax
+    mov     eax, dword ptr [rbp-108]
+    mov     dword ptr [rbp-92], eax
+    WINCALL DrawTextW, qword ptr [rbp-32], qword ptr [rbp-64], -1, addr rbp-104, 24h
+    mov     eax, dword ptr [rbp-44]
+    add     eax, TAB_W
+    mov     dword ptr [rbp-44], eax
+    inc     dword ptr [rbp-40]
+    jmp     gdt_loop
+gdt_done:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gui_draw_tabs endp
+
 ; =============================================================================
 ; vault_proc - DLG_VAULT dialog procedure (raw frame).
 ; =============================================================================
@@ -10030,6 +10139,8 @@ vp_tdraw:
     je      vp_tdraw_list
     cmp     eax, IDC_SO_LIST                  ; search-overlay results = same cards
     je      vp_tdraw_list
+    cmp     eax, IDC_V_TABS                   ; multi-vault tab strip
+    je      vp_tdraw_tabs
     cmp     eax, IDC_V_HEADER                 ; detail-pane header (tile + title)
     je      vp_tdraw_header
     cmp     eax, IDC_V_ICON                   ; edit-mode icon tile before the title
@@ -10060,6 +10171,11 @@ vp_tdraw_header:
 vp_tdraw_icon:
     mov     rcx, r9
     call    gui_draw_iconbtn
+    mov     eax, 1
+    jmp     vp_ret
+vp_tdraw_tabs:
+    mov     rcx, r9
+    call    gui_draw_tabs
     mov     eax, 1
     jmp     vp_ret
 vp_tdraw_colorpw:
@@ -14064,7 +14180,17 @@ go_create_res:
     cmp     rax, 1
     jne     go_reset
 go_vault:
+    cmp     dword ptr [g_vault_n], 0         ; register the fronted vault as tab 0 (once)
+    jne     go_vault_show
+    call    vault_ctx_open
+    lea     rcx, [g_vpath]
+    call    gui_basename                    ; basename -> g_imgfn_w
+    xor     ecx, ecx
+    lea     rdx, [g_imgfn_w]
+    call    vault_ctx_setname
+go_vault_show:
     WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_VAULT, qword ptr [rbp-24], addr vault_proc, 0
+    call    vault_ctx_reset                 ; leaving the vault -> forget open contexts
     call    vault_lock                      ; wipe body + key, minimise to tray
     call    gui_clipclear
     call    gui_resolve_vault               ; refresh create/open state for next time
@@ -14522,6 +14648,7 @@ ifdef DBG_SHOW
     mov     dword ptr [g_secunlock], 0      ; debug: use the normal desktop so the GUI is inspectable
 endif
     call    gui_resolve_vault
+    call    vault_ctx_reset                 ; multi-vault: no open contexts yet (cur = -1)
     ; ---- register + create the hidden tray-owner window --------------------
     lea     rcx, [g_wc]
     mov     edx, 80

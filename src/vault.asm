@@ -165,6 +165,8 @@ VSLOT struct
     s_pad       dd ?
     s_newatt    db MAX_ATT * 32 dup(?)
     s_attidx    db MAX_ATT * 32 dup(?)
+    s_name      db 128 dup(?)               ; tab display name (wide, NUL-term); set at open,
+                                            ;   not part of the swapped live state
 VSLOT ends
 
 MAX_VAULTS      equ 8           ; simultaneously-open vaults (redesign items 6/7/9)
@@ -2178,6 +2180,42 @@ vcf_no_current:
     FRAME_EPILOG
     ret
 vault_ctx_front endp
+
+; vault_ctx_setname(ecx=idx, rdx=src wide name) - store a tab display name
+;   (<=63 wide chars, NUL-terminated).  Leaf.
+public vault_ctx_setname
+vault_ctx_setname proc
+    mov     eax, ecx
+    imul    rax, rax, sizeof VSLOT
+    lea     r10, [g_vaults]
+    add     rax, r10
+    add     rax, VSLOT.s_name                 ; rax = dst
+    xor     r9d, r9d
+vcsn_lp:
+    cmp     r9d, 63
+    jae     vcsn_end
+    movzx   r8d, word ptr [rdx + r9*2]
+    mov     word ptr [rax + r9*2], r8w
+    test    r8w, r8w
+    jz      vcsn_done
+    inc     r9d
+    jmp     vcsn_lp
+vcsn_end:
+    mov     word ptr [rax + r9*2], 0
+vcsn_done:
+    ret
+vault_ctx_setname endp
+
+; vault_ctx_nameptr(ecx=idx) -> rax = &g_vaults[idx].s_name.  Leaf.
+public vault_ctx_nameptr
+vault_ctx_nameptr proc
+    mov     eax, ecx
+    imul    rax, rax, sizeof VSLOT
+    lea     rcx, [g_vaults]
+    add     rax, rcx
+    add     rax, VSLOT.s_name
+    ret
+vault_ctx_nameptr endp
 
 ; ---------------------------------------------------------------------------
 ; Availability retry state machine (redesign item 9).  Leaf procs; the caller
