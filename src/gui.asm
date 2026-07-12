@@ -187,6 +187,8 @@ extern CreateDirectoryW:proc
 extern ShowWindow:proc
 extern IsZoomed:proc
 extern EnumChildWindows:proc
+extern MonitorFromWindow:proc
+extern GetMonitorInfoW:proc
 extern MoveWindow:proc
 extern GetWindowRect:proc
 extern MapWindowPoints:proc
@@ -320,6 +322,10 @@ CAPBTN_W            equ 44               ; caption (min/max/close) button width
 IDC_T_MIN           equ 290             ; caption: minimize
 IDC_T_MAX           equ 291             ; caption: maximize / restore
 IDC_T_CLOSE         equ 292             ; caption: close
+IDC_T_NEW           equ 293             ; dock: new item
+IDC_T_GEN           equ 294             ; dock: password generator
+IDC_T_SET           equ 295             ; dock: settings
+DOCKBTN_W           equ 34              ; title-bar dock button width
 LINK_BLUE           equ 00E08C3Ch        ; COLORREF (RGB 60,140,224) hyperlink blue
 WM_MEASUREITEM      equ 2Ch
 WM_COMPAREITEM      equ 39h
@@ -958,6 +964,7 @@ WSTR gt_gen, <Generate password>
 WSTR gt_min, <Minimize>
 WSTR gt_max, <Maximize>
 WSTR gt_close, <Close>
+WSTR gt_settings, <Settings>
 kl_user label word
     dw 'U','s','e','r','n','a','m','e', 0
 kl_secret label word
@@ -9385,7 +9392,7 @@ frame_hittest endp
 ; frame_shift_cb(rcx=child, rdx=parent) - EnumChildWindows callback: move one
 ;   child down by TBAR_H so the reclaimed caption space becomes the title strip.
 frame_shift_cb proc frame
-    FRAME_PROLOG 96
+    FRAME_PROLOG 128                            ; spill area must clear the locals (down to -76)
     mov     qword ptr [rbp-24], rcx
     mov     qword ptr [rbp-32], rdx
     WINCALL GetWindowRect, qword ptr [rbp-24], addr rbp-64   ; L-64 T-60 R-56 B-52
@@ -9418,7 +9425,7 @@ frame_shift endp
 ; frame_grow(rcx=hdlg) - grow the window height by TBAR_H so the shifted content
 ;   keeps its size and the new strip is pure gain at the top.
 frame_grow proc frame
-    FRAME_PROLOG 64
+    FRAME_PROLOG 128                            ; spill area must clear the locals (down to -56)
     mov     qword ptr [rbp-24], rcx
     WINCALL GetWindowRect, qword ptr [rbp-24], addr rbp-48   ; L-48 T-44 R-40 B-36
     mov     eax, dword ptr [rbp-40]            ; w = R - L
@@ -9437,7 +9444,7 @@ frame_grow endp
 ; frame_layout(rcx=hdlg) - right-align the caption buttons in the title strip.
 ;   Called at build time and on WM_SIZE.
 frame_layout proc frame
-    FRAME_PROLOG 96
+    FRAME_PROLOG 128                            ; spill area must clear the locals (down to -60)
     mov     qword ptr [rbp-24], rcx
     WINCALL GetClientRect, qword ptr [rbp-24], addr rbp-48   ; R at [rbp-40]
     mov     eax, dword ptr [rbp-40]
@@ -9457,9 +9464,56 @@ frame_layout proc frame
     mov     dword ptr [rbp-56], eax
     WINCALL GetDlgItem, qword ptr [rbp-24], IDC_T_MIN
     WINCALL MoveWindow, rax, dword ptr [rbp-56], 0, CAPBTN_W, TBAR_H, 1
+    ; dock: New / Generate / Settings, left of the caption buttons
+    mov     eax, dword ptr [rbp-52]            ; dock right edge = xMin
+    sub     eax, CAPBTN_W*3
+    mov     dword ptr [rbp-60], eax
+    mov     eax, dword ptr [rbp-60]            ; Settings = edge - DOCKBTN_W
+    sub     eax, DOCKBTN_W
+    mov     dword ptr [rbp-56], eax
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_T_SET
+    WINCALL MoveWindow, rax, dword ptr [rbp-56], 0, DOCKBTN_W, TBAR_H, 1
+    mov     eax, dword ptr [rbp-60]            ; Generate = edge - 2*DOCKBTN_W
+    sub     eax, DOCKBTN_W*2
+    mov     dword ptr [rbp-56], eax
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_T_GEN
+    WINCALL MoveWindow, rax, dword ptr [rbp-56], 0, DOCKBTN_W, TBAR_H, 1
+    mov     eax, dword ptr [rbp-60]            ; New = edge - 3*DOCKBTN_W
+    sub     eax, DOCKBTN_W*3
+    mov     dword ptr [rbp-56], eax
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_T_NEW
+    WINCALL MoveWindow, rax, dword ptr [rbp-56], 0, DOCKBTN_W, TBAR_H, 1
     FRAME_EPILOG
     ret
 frame_layout endp
+
+; frame_maxinfo(rcx=hdlg, rdx=MINMAXINFO*) - constrain the maximized size/position
+;   to the monitor work area, so the borderless window does not cover the taskbar.
+frame_maxinfo proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], rdx
+    WINCALL MonitorFromWindow, qword ptr [rbp-24], 2   ; MONITOR_DEFAULTTONEAREST
+    mov     qword ptr [rbp-40], rax
+    mov     dword ptr [rbp-96], 40             ; MONITORINFO.cbSize
+    WINCALL GetMonitorInfoW, qword ptr [rbp-40], addr rbp-96
+    ; rcMonitor L-92 T-88 R-84 B-80 ; rcWork L-76 T-72 R-68 B-64
+    mov     r10, qword ptr [rbp-32]            ; MINMAXINFO
+    mov     eax, dword ptr [rbp-68]            ; ptMaxSize.x = work width
+    sub     eax, dword ptr [rbp-76]
+    mov     dword ptr [r10+8], eax
+    mov     eax, dword ptr [rbp-64]            ; ptMaxSize.y = work height
+    sub     eax, dword ptr [rbp-72]
+    mov     dword ptr [r10+12], eax
+    mov     eax, dword ptr [rbp-76]            ; ptMaxPosition.x = work.L - monitor.L
+    sub     eax, dword ptr [rbp-92]
+    mov     dword ptr [r10+16], eax
+    mov     eax, dword ptr [rbp-72]            ; ptMaxPosition.y = work.T - monitor.T
+    sub     eax, dword ptr [rbp-88]
+    mov     dword ptr [r10+20], eax
+    FRAME_EPILOG
+    ret
+frame_maxinfo endp
 
 ; frame_build(rcx=hdlg) - create the caption ghost buttons, then lay them out.
 ;   Called from vp_init AFTER frame_shift/frame_grow so they are not shifted.
@@ -9480,6 +9534,21 @@ frame_build proc frame
     mov     edx, IDC_T_CLOSE
     mov     r8d, GLY_CLOSE
     lea     r9, [gt_close]
+    call    ghost_make
+    mov     rcx, qword ptr [rbp-24]             ; dock: New / Generate / Settings
+    mov     edx, IDC_T_NEW
+    mov     r8d, GLY_NEW
+    lea     r9, [gt_new]
+    call    ghost_make
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_T_GEN
+    mov     r8d, GLY_GENERATE
+    lea     r9, [gt_gen]
+    call    ghost_make
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_T_SET
+    mov     r8d, GLY_SETTINGS
+    lea     r9, [gt_settings]
     call    ghost_make
     mov     rcx, qword ptr [rbp-24]
     call    frame_layout
@@ -9574,11 +9643,14 @@ vp_minmax:
     mov     r10, r9                          ; MINMAXINFO: ptMinTrackSize at +24
     mov     eax, dword ptr [g_base_winw]
     test    eax, eax
-    jz      vp_minmax_ret                    ; not recorded yet -> leave default
+    jz      vp_minmax_max                    ; not recorded yet -> leave min default
     mov     dword ptr [r10+24], eax
     mov     eax, dword ptr [g_base_winh]
     mov     dword ptr [r10+28], eax
-vp_minmax_ret:
+vp_minmax_max:
+    mov     rcx, qword ptr [rbp-8]           ; keep maximize inside the work area
+    mov     rdx, r9                          ;   (borderless would cover the taskbar)
+    call    frame_maxinfo
     xor     eax, eax
     jmp     vp_ret
 vp_drop:
@@ -9953,6 +10025,12 @@ vp_cmd_fixed:
     je      vp_min
     cmp     eax, IDC_T_MAX
     je      vp_maxtoggle
+    cmp     eax, IDC_T_NEW                    ; title-bar control dock
+    je      vp_add
+    cmp     eax, IDC_T_GEN
+    je      vp_gen_standalone
+    cmp     eax, IDC_T_SET
+    je      vp_menu
     cmp     eax, IDC_V_LIST
     je      vp_list
     cmp     eax, IDC_V_ADDFIELD
