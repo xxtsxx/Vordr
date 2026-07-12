@@ -944,6 +944,10 @@ kl_image label word
     dw 'I','m','a','g','e', 0
 kl_file label word
     dw 'F','i','l','e', 0
+kl_group label word
+    dw 'G','r','o','u','p',' ','h','e','a','d','i','n','g', 0
+kl_spacer label word
+    dw 'S','p','a','c','e','r', 0
 tag_xw label word
     dw 0D7h, 0                             ; multiplication sign, used as the tag 'x'
 verb_open label word
@@ -4911,6 +4915,10 @@ gra_zero:
     add     r10, rax
     mov     eax, dword ptr [rbp-32]
     mov     dword ptr [r10+FD_KIND], eax
+    cmp     eax, VF_SPACER                       ; layout blocks carry no editable label
+    je      gra_spacer
+    cmp     eax, VF_GROUP
+    je      gra_group
     ; label (editable, kind's default caption)
     mov     edx, dword ptr [rbp-32]
     call    kind_label
@@ -4970,6 +4978,12 @@ gra_totp:
             SS_OWNERDRAW_
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_COPY, addr cls_button, addr wb_copy, \
             BS_OWNERDRAW_
+    jmp     gra_reorder
+gra_group:
+    WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_VALUE, addr cls_edit, 0, \
+            ES_AUTOHSCROLL_ or WS_TABSTOP_       ; the section title (rendered as a heading)
+    jmp     gra_reorder
+gra_spacer:                                      ; a blank gap - no controls, just height
 gra_reorder:
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_UP, addr cls_button, addr wb_up, \
             BS_OWNERDRAW_
@@ -6104,9 +6118,20 @@ grl_row:
     mov     dword ptr [rbp-44], 27               ; rowH (card = label band 14 + value)
     mov     dword ptr [rbp-48], 11               ; valH
     cmp     eax, VF_NOTES
-    jne     grl_chkimg
+    jne     grl_chkblock
     mov     dword ptr [rbp-44], 54
     mov     dword ptr [rbp-48], 40
+    jmp     grl_setyh
+grl_chkblock:
+    cmp     eax, VF_SPACER                       ; layout block: a small blank gap
+    jne     grl_chkgroup
+    mov     dword ptr [rbp-44], 16
+    jmp     grl_setyh
+grl_chkgroup:
+    cmp     eax, VF_GROUP                        ; layout block: a section heading
+    jne     grl_chkimg
+    mov     dword ptr [rbp-44], 22
+    mov     dword ptr [rbp-48], 12
     jmp     grl_setyh
 grl_chkimg:
     cmp     eax, VF_IMAGE                        ; attachments tile: height grows with
@@ -7088,7 +7113,15 @@ gui_palette_add proc frame
     je      gpa_attach                          ; attachments tile (pick files -> tags)
     cmp     ecx, 9
     je      gpa_attach
-    mov     edx, VF_TEXT                        ; 7 = custom (empty label)
+    cmp     ecx, 10                             ; group heading (layout block)
+    jne     @F
+    mov     edx, VF_GROUP
+    jmp     gpa_go
+@@: cmp     ecx, 11                             ; spacer (layout block)
+    jne     @F
+    mov     edx, VF_SPACER
+    jmp     gpa_go
+@@: mov     edx, VF_TEXT                        ; 7 = custom (empty label)
 gpa_go:
     mov     rcx, qword ptr [rbp-24]
     call    gui_addfield_one
@@ -8460,6 +8493,8 @@ gui_addfield_menu proc frame
 gam_totp:
     WINCALL AppendMenuW, qword ptr [rbp-32], dword ptr [rbp-40], 6, addr kl_totp
     WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 9, addr kl_file
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 10, addr kl_group
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 11, addr kl_spacer
     mov     rcx, qword ptr [rbp-32]              ; tint the menu background
     call    gui_menu_dark
     mov     qword ptr [rbp-64], rax
