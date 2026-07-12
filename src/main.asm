@@ -45,6 +45,7 @@ extern gui_trtest:proc                  ; trash timestamp/threshold probe (gui.a
 extern cmd_secscan:proc                 ; secret-wipe page-scan probe (secmem.asm)
 extern cmd_securedesk:proc              ; secure-desktop spike (gui.asm)
 extern cmd_vfuzz:proc                   ; vault record-parser fuzzer (vault.asm)
+extern cmd_zfuzz:proc                   ; zip-import parser fuzzer (zipimport.asm)
 extern read_file:proc
 ifdef DBG_TRACE
 extern cmd_redteam:proc                 ; fault-injection self-test (redteam.asm)
@@ -172,6 +173,7 @@ WSTR w_secscan,  <secscan>
 WSTR w_tmptest,  <tmptest>
 WSTR w_fztest,   <fztest>
 WSTR w_vfuzz,    <vfuzz>
+WSTR w_fuzzzip,  <fuzzzip>
 WSTR w_trtest,   <trtest>
 WSTR w_securedesk, <securedesk>
 WSTR wpw_exp,    <VordrExp1234>
@@ -212,16 +214,17 @@ cmd_table label CMDENT
     CMDENT { w_tmptest,   cmd_tmptest,   0, 0 }   ; secure temp-file lifecycle probe
     CMDENT { w_fztest,    cmd_fztest,    0, 0 }   ; fuzzy-search scoring KAT
     CMDENT { w_vfuzz,     cmd_vfuzz,     0, 0 }   ; vault record-parser structural fuzzer
+    CMDENT { w_fuzzzip,   cmd_zfuzz,     0, 0 }   ; zip-import parser structural fuzzer
     CMDENT { w_trtest,    cmd_trtest,    0, 0 }   ; trash timestamp/threshold KAT
     CMDENT { w_securedesk, cmd_securedesk, 0, 0 } ; show a dialog on the private desktop (plan 4 spike)
 ifdef DBG_TRACE
     CMDENT { w_redteam,   cmd_redteam,   1, 0 }   ; fault-injection self-test (dbg)
     CMDENT { w_tpmtest,   cmd_tpmtest,   0, 0 }   ; TPM round-trip probe (dbg)
     CMDENT { w_cttest,    cmd_cttest,    0, 0 }   ; ct_memcmp timing probe (dbg)
-CMD_COUNT equ 15
-else
-CMD_COUNT equ 12
 endif
+; Derive the count from the table's actual size so adding a CMDENT never needs a
+; manual bump (a stale count silently drops trailing verbs to GUI fall-through).
+CMD_COUNT equ ($ - cmd_table) / (sizeof CMDENT)
 
 .data?
 ifdef DBG_TRACE
