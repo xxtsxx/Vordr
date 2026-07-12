@@ -676,7 +676,7 @@ WSTR g_unlock_title,   <Vordr - Unlock vault>
 WSTR s_createfail,  <Could not create the vault (I/O or out of memory).>
 WSTR s_notitle,     <An entry needs a title.>
 WSTR s_nofieldroom, <No room for more fields on this record - remove one first.>
-WSTR s_resealfail,  <Unable to write to the vault file - it may be read-only or locked by another program. Your changes are kept in memory; try saving again.>
+WSTR s_resealfail,  <Unable to write to the vault file - it may be read-only or locked by another program. Your changes are kept in memory. Retry saving now?>
 WSTR t_overwrite,   <Vordr - vault already exists>
 WSTR m_overwrite,   <A vault file already exists at this location. Creating a new vault will PERMANENTLY destroy it and every entry it holds. Overwrite it?>
 WSTR s_kept,        <Existing vault kept. Cancel, or use "Create new..." to choose a different file.>
@@ -4472,6 +4472,7 @@ gco_nocarry:
     call    vault_build_entry
     test    eax, eax
     jnz     gco_done
+gco_reseal:
     call    vault_reseal
     test    eax, eax
     jnz     gco_resealerr
@@ -4491,7 +4492,10 @@ gco_notitle:
     FRAME_EPILOG
     ret
 gco_resealerr:
-    WINCALL gui_msgbox, qword ptr [rbp-24], addr s_resealfail, addr t_err, <MB_OK or MB_ICONERROR>
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr s_resealfail, addr t_err, \
+            <MB_YESNO or MB_ICONWARNING>
+    cmp     eax, IDYES                          ; Yes -> retry the write (file may be unlocked now)
+    je      gco_reseal
 gco_done:
     mov     dword ptr [g_dirty], 0
     FRAME_EPILOG
