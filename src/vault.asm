@@ -143,6 +143,30 @@ ARF_SIZE        equ 68
 ATT_ENThDR      equ 24          ; on-disk entry header = id16 + u64 ctlen
 MAX_ATT         equ 512         ; index / pending-table capacity
 
+; multi-vault state slot (redesign items 6/7/9): a complete open-vault state, so
+; several vaults can be held decrypted at once and switched between.  The heap
+; pointers (body/filebuf) stay valid because an open vault's buffers are not freed.
+VSLOT struct
+    s_vkey      db 32 dup(?)
+    s_hdr       db VH_TOTAL dup(?)
+    s_ext_hash  db 32 dup(?)
+    s_body_ptr  dq ?
+    s_body_len  dq ?
+    s_save_ctr  dq ?
+    s_fmac_len  dq ?
+    s_ext_size  dq ?
+    s_filebuf   dq ?
+    s_filesize  dq ?
+    s_att_start dq ?
+    s_att_total dq ?
+    s_rollback  dd ?
+    s_newatt_n  dd ?
+    s_attidx_n  dd ?
+    s_pad       dd ?
+    s_newatt    db MAX_ATT * 32 dup(?)
+    s_attidx    db MAX_ATT * 32 dup(?)
+VSLOT ends
+
 .const
 vst_src     db "vault-kat-test!!"      ; 16-byte plaintext for vault_selftest
 ; --- field-serialization KAT (labeled + duplicate fields) ------------------
@@ -198,6 +222,7 @@ CSTR m_created, "vault created.",13,10
 
 .data?
 align 16
+g_mvslot    db (sizeof VSLOT) dup (?)  ; multi-vault: one held vault-state slot (probe/scratch)
 g_vfz_rng   dq ?                       ; vfuzz xorshift64 state (dbg/test only)
 g_kat_body  db 512 dup (?)             ; scratch body for the field-serialization KAT
 public g_vkey
@@ -1898,6 +1923,276 @@ vfz_oom:
 cmd_vfuzz endp
 
 ; ===========================================================================
+; copy_bytes(rcx=dst, rdx=src, r8d=len) - byte copy using volatile regs only.  Leaf.
+copy_bytes proc
+    xor     r9d, r9d
+cpb_lp:
+    cmp     r9d, r8d
+    jae     cpb_done
+    mov     al, byte ptr [rdx+r9]
+    mov     byte ptr [rcx+r9], al
+    inc     r9d
+    jmp     cpb_lp
+cpb_done:
+    ret
+copy_bytes endp
+
+; vault_snapshot(rcx = VSLOT*) - copy the live open-vault state into the slot so
+;   another vault can be made active.  Additive: no existing path changed.
+public vault_snapshot
+vault_snapshot proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [g_vkey]
+    mov     r8d, 32
+    call    copy_bytes
+    mov     rcx, qword ptr [rbp-24]
+    add     rcx, VSLOT.s_hdr
+    lea     rdx, [g_hdr]
+    mov     r8d, VH_TOTAL
+    call    copy_bytes
+    mov     rcx, qword ptr [rbp-24]
+    add     rcx, VSLOT.s_ext_hash
+    lea     rdx, [g_ext_hash]
+    mov     r8d, 32
+    call    copy_bytes
+    mov     rcx, qword ptr [rbp-24]
+    add     rcx, VSLOT.s_newatt
+    lea     rdx, [g_newatt]
+    mov     r8d, MAX_ATT * 32
+    call    copy_bytes
+    mov     rcx, qword ptr [rbp-24]
+    add     rcx, VSLOT.s_attidx
+    lea     rdx, [g_attidx]
+    mov     r8d, MAX_ATT * 32
+    call    copy_bytes
+    mov     r10, qword ptr [rbp-24]
+    mov     rax, qword ptr [g_body_ptr]
+    mov     qword ptr [r10+VSLOT.s_body_ptr], rax
+    mov     rax, qword ptr [g_body_len]
+    mov     qword ptr [r10+VSLOT.s_body_len], rax
+    mov     rax, qword ptr [g_save_counter]
+    mov     qword ptr [r10+VSLOT.s_save_ctr], rax
+    mov     rax, qword ptr [g_fmac_len]
+    mov     qword ptr [r10+VSLOT.s_fmac_len], rax
+    mov     rax, qword ptr [g_ext_size]
+    mov     qword ptr [r10+VSLOT.s_ext_size], rax
+    mov     rax, qword ptr [g_filebuf]
+    mov     qword ptr [r10+VSLOT.s_filebuf], rax
+    mov     rax, qword ptr [g_filesize]
+    mov     qword ptr [r10+VSLOT.s_filesize], rax
+    mov     rax, qword ptr [g_att_start]
+    mov     qword ptr [r10+VSLOT.s_att_start], rax
+    mov     rax, qword ptr [g_att_total]
+    mov     qword ptr [r10+VSLOT.s_att_total], rax
+    mov     eax, dword ptr [g_rollback]
+    mov     dword ptr [r10+VSLOT.s_rollback], eax
+    mov     eax, dword ptr [g_newatt_n]
+    mov     dword ptr [r10+VSLOT.s_newatt_n], eax
+    mov     eax, dword ptr [g_attidx_n]
+    mov     dword ptr [r10+VSLOT.s_attidx_n], eax
+    FRAME_EPILOG
+    ret
+vault_snapshot endp
+
+; vault_restore(rcx = VSLOT*) - make the slot's vault state the live one.
+public vault_restore
+vault_restore proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    lea     rcx, [g_vkey]
+    mov     rdx, qword ptr [rbp-24]
+    mov     r8d, 32
+    call    copy_bytes
+    lea     rcx, [g_hdr]
+    mov     rdx, qword ptr [rbp-24]
+    add     rdx, VSLOT.s_hdr
+    mov     r8d, VH_TOTAL
+    call    copy_bytes
+    lea     rcx, [g_ext_hash]
+    mov     rdx, qword ptr [rbp-24]
+    add     rdx, VSLOT.s_ext_hash
+    mov     r8d, 32
+    call    copy_bytes
+    lea     rcx, [g_newatt]
+    mov     rdx, qword ptr [rbp-24]
+    add     rdx, VSLOT.s_newatt
+    mov     r8d, MAX_ATT * 32
+    call    copy_bytes
+    lea     rcx, [g_attidx]
+    mov     rdx, qword ptr [rbp-24]
+    add     rdx, VSLOT.s_attidx
+    mov     r8d, MAX_ATT * 32
+    call    copy_bytes
+    mov     r10, qword ptr [rbp-24]
+    mov     rax, qword ptr [r10+VSLOT.s_body_ptr]
+    mov     qword ptr [g_body_ptr], rax
+    mov     rax, qword ptr [r10+VSLOT.s_body_len]
+    mov     qword ptr [g_body_len], rax
+    mov     rax, qword ptr [r10+VSLOT.s_save_ctr]
+    mov     qword ptr [g_save_counter], rax
+    mov     rax, qword ptr [r10+VSLOT.s_fmac_len]
+    mov     qword ptr [g_fmac_len], rax
+    mov     rax, qword ptr [r10+VSLOT.s_ext_size]
+    mov     qword ptr [g_ext_size], rax
+    mov     rax, qword ptr [r10+VSLOT.s_filebuf]
+    mov     qword ptr [g_filebuf], rax
+    mov     rax, qword ptr [r10+VSLOT.s_filesize]
+    mov     qword ptr [g_filesize], rax
+    mov     rax, qword ptr [r10+VSLOT.s_att_start]
+    mov     qword ptr [g_att_start], rax
+    mov     rax, qword ptr [r10+VSLOT.s_att_total]
+    mov     qword ptr [g_att_total], rax
+    mov     eax, dword ptr [r10+VSLOT.s_rollback]
+    mov     dword ptr [g_rollback], eax
+    mov     eax, dword ptr [r10+VSLOT.s_newatt_n]
+    mov     dword ptr [g_newatt_n], eax
+    mov     eax, dword ptr [r10+VSLOT.s_attidx_n]
+    mov     dword ptr [g_attidx_n], eax
+    FRAME_EPILOG
+    ret
+vault_restore endp
+
+; cmd_mvtest - headless probe: plant a distinct sentinel in every open-vault state
+;   field, snapshot, clobber every field to zero, restore, and verify each field
+;   came back.  Proves vault_snapshot/vault_restore cover the complete state (a
+;   missed field would stay zero -> fail).  Exit 0 = pass.
+LANDING_PAD
+public cmd_mvtest
+cmd_mvtest proc frame
+    FRAME_PROLOG 48
+    mov     byte ptr [g_vkey], 0AAh
+    mov     byte ptr [g_hdr], 0BBh
+    mov     byte ptr [g_ext_hash], 0CCh
+    mov     byte ptr [g_newatt], 0DDh
+    mov     byte ptr [g_attidx], 0EEh
+    mov     byte ptr [g_newatt + MAX_ATT*32 - 1], 44h   ; last byte too
+    mov     byte ptr [g_attidx + MAX_ATT*32 - 1], 55h
+    mov     rax, 1111111111111111h
+    mov     qword ptr [g_body_ptr], rax
+    mov     rax, 2222222222222222h
+    mov     qword ptr [g_body_len], rax
+    mov     rax, 3333333333333333h
+    mov     qword ptr [g_save_counter], rax
+    mov     rax, 4444444444444444h
+    mov     qword ptr [g_fmac_len], rax
+    mov     rax, 5555555555555555h
+    mov     qword ptr [g_ext_size], rax
+    mov     rax, 6666666666666666h
+    mov     qword ptr [g_filebuf], rax
+    mov     rax, 7777777777777777h
+    mov     qword ptr [g_filesize], rax
+    mov     rax, 8888888888888888h
+    mov     qword ptr [g_att_start], rax
+    mov     rax, 9999999999999999h
+    mov     qword ptr [g_att_total], rax
+    mov     dword ptr [g_rollback], 0A1A1A1A1h
+    mov     dword ptr [g_newatt_n], 0B2B2B2B2h
+    mov     dword ptr [g_attidx_n], 0C3C3C3C3h
+    lea     rcx, [g_mvslot]
+    call    vault_snapshot
+    ; clobber everything to zero
+    lea     rcx, [g_vkey]
+    mov     edx, 32
+    call    mvt_zero
+    lea     rcx, [g_hdr]
+    mov     edx, VH_TOTAL
+    call    mvt_zero
+    lea     rcx, [g_ext_hash]
+    mov     edx, 32
+    call    mvt_zero
+    lea     rcx, [g_newatt]
+    mov     edx, MAX_ATT * 32
+    call    mvt_zero
+    lea     rcx, [g_attidx]
+    mov     edx, MAX_ATT * 32
+    call    mvt_zero
+    xor     eax, eax
+    mov     qword ptr [g_body_ptr], rax
+    mov     qword ptr [g_body_len], rax
+    mov     qword ptr [g_save_counter], rax
+    mov     qword ptr [g_fmac_len], rax
+    mov     qword ptr [g_ext_size], rax
+    mov     qword ptr [g_filebuf], rax
+    mov     qword ptr [g_filesize], rax
+    mov     qword ptr [g_att_start], rax
+    mov     qword ptr [g_att_total], rax
+    mov     dword ptr [g_rollback], eax
+    mov     dword ptr [g_newatt_n], eax
+    mov     dword ptr [g_attidx_n], eax
+    lea     rcx, [g_mvslot]
+    call    vault_restore
+    ; verify each field
+    cmp     byte ptr [g_vkey], 0AAh
+    jne     mvt_fail
+    cmp     byte ptr [g_hdr], 0BBh
+    jne     mvt_fail
+    cmp     byte ptr [g_ext_hash], 0CCh
+    jne     mvt_fail
+    cmp     byte ptr [g_newatt], 0DDh
+    jne     mvt_fail
+    cmp     byte ptr [g_attidx], 0EEh
+    jne     mvt_fail
+    cmp     byte ptr [g_newatt + MAX_ATT*32 - 1], 44h
+    jne     mvt_fail
+    cmp     byte ptr [g_attidx + MAX_ATT*32 - 1], 55h
+    jne     mvt_fail
+    mov     rax, 1111111111111111h
+    cmp     qword ptr [g_body_ptr], rax
+    jne     mvt_fail
+    mov     rax, 2222222222222222h
+    cmp     qword ptr [g_body_len], rax
+    jne     mvt_fail
+    mov     rax, 3333333333333333h
+    cmp     qword ptr [g_save_counter], rax
+    jne     mvt_fail
+    mov     rax, 4444444444444444h
+    cmp     qword ptr [g_fmac_len], rax
+    jne     mvt_fail
+    mov     rax, 5555555555555555h
+    cmp     qword ptr [g_ext_size], rax
+    jne     mvt_fail
+    mov     rax, 6666666666666666h
+    cmp     qword ptr [g_filebuf], rax
+    jne     mvt_fail
+    mov     rax, 7777777777777777h
+    cmp     qword ptr [g_filesize], rax
+    jne     mvt_fail
+    mov     rax, 8888888888888888h
+    cmp     qword ptr [g_att_start], rax
+    jne     mvt_fail
+    mov     rax, 9999999999999999h
+    cmp     qword ptr [g_att_total], rax
+    jne     mvt_fail
+    cmp     dword ptr [g_rollback], 0A1A1A1A1h
+    jne     mvt_fail
+    cmp     dword ptr [g_newatt_n], 0B2B2B2B2h
+    jne     mvt_fail
+    cmp     dword ptr [g_attidx_n], 0C3C3C3C3h
+    jne     mvt_fail
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+mvt_fail:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_mvtest endp
+
+; mvt_zero(rcx=ptr, edx=len) - zero a buffer (probe helper).  Leaf, volatile regs.
+mvt_zero proc
+    xor     r9d, r9d
+mvz_lp:
+    cmp     r9d, edx
+    jae     mvz_done
+    mov     byte ptr [rcx+r9], 0
+    inc     r9d
+    jmp     mvz_lp
+mvz_done:
+    ret
+mvt_zero endp
+
 ; cmd_bktest <path> - headless proof of atomic save + backup rotation (plan 37).
 ;   Creates the vault BAK_GENS+1 times at the same path (fast KDF); each save
 ;   after the first rolls the live file into .bak1..N.  Then it asserts every
