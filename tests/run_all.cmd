@@ -150,6 +150,9 @@ if not "!errorlevel!"=="0" ( echo   rbtest: FAIL ^(exit !errorlevel!, anti-rollb
 bin\vordr.exe xctest "%WORK%\xc.vault" > "%WORK%\xctest.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   xctest: FAIL ^(exit !errorlevel!, external-change detection^) & set RT=FAIL )
 
+bin\vordr.exe pkat > "%WORK%\pkat.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   pkat: FAIL ^(exit !errorlevel!, parallel fail-closed KAT gate^) & set RT=FAIL )
+
 set R_ROUNDTRIP=!RT!
 call :now T1
 set /a T_ROUNDTRIP=!T1!-!T0!

@@ -50,6 +50,7 @@ extern cmd_bktest:proc                  ; atomic-save + backup rotation probe (v
 extern cmd_mactest:proc                 ; full-file MAC tamper-detection probe (vault.asm)
 extern cmd_rbtest:proc                  ; anti-rollback detection probe (vault.asm)
 extern cmd_xctest:proc                  ; external-change detection probe (vault.asm)
+extern cmd_pkat:proc                    ; parallel fail-closed KAT gate (selftest.asm)
 extern read_file:proc
 ifdef DBG_TRACE
 extern cmd_redteam:proc                 ; fault-injection self-test (redteam.asm)
@@ -183,6 +184,7 @@ WSTR w_bktest,   <bktest>
 WSTR w_mactest,  <mactest>
 WSTR w_rbtest,   <rbtest>
 WSTR w_xctest,   <xctest>
+WSTR w_pkat,     <pkat>
 WSTR w_trtest,   <trtest>
 WSTR w_securedesk, <securedesk>
 WSTR wpw_exp,    <VordrExp1234>
@@ -229,6 +231,7 @@ cmd_table label CMDENT
     CMDENT { w_mactest,   cmd_mactest,   1, 0 }   ; full-file MAC tamper-detection probe
     CMDENT { w_rbtest,    cmd_rbtest,    1, 0 }   ; anti-rollback detection probe
     CMDENT { w_xctest,    cmd_xctest,    1, 0 }   ; external-change detection probe
+    CMDENT { w_pkat,      cmd_pkat,      0, 0 }   ; parallel fail-closed KAT gate
     CMDENT { w_trtest,    cmd_trtest,    0, 0 }   ; trash timestamp/threshold KAT
     CMDENT { w_securedesk, cmd_securedesk, 0, 0 } ; show a dialog on the private desktop (plan 4 spike)
 ifdef DBG_TRACE
