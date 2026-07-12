@@ -277,6 +277,8 @@ WM_MOUSEWHEEL       equ 20Ah
 WM_MOUSEMOVE_       equ 200h
 WM_MOUSELEAVE_      equ 2A3h
 WM_CHAR_            equ 102h
+WM_KEYDOWN_         equ 100h
+VK_CONTROL_         equ 11h
 WM_COMMAND          equ 111h
 ; ghost buttons (frameless glyph controls: theme_drawitem tdi_ghost path)
 GHOST_STYLE_        equ 2               ; GWL_USERDATA style byte
@@ -4812,9 +4814,20 @@ ghost_subclass proc frame
     je      gsc_leave
     cmp     rdx, WM_CHAR_
     je      gsc_char
+    cmp     rdx, WM_KEYDOWN_
+    je      gsc_key
 gsc_def:
     WINCALL DefSubclassProc, qword ptr [rbp-24], qword ptr [rbp-32], qword ptr [rbp-40], \
             qword ptr [rbp-48]
+    FRAME_EPILOG
+    ret
+gsc_key:
+    mov     rcx, qword ptr [rbp-24]            ; Ctrl+shortcuts from a focused ghost button
+    mov     edx, r8d
+    call    vault_ctrl_key
+    test    eax, eax
+    jz      gsc_def
+    xor     eax, eax
     FRAME_EPILOG
     ret
 gsc_char:
@@ -4905,12 +4918,66 @@ ghost_tip_add endp
 ; search_type_subclass - SUBCLASSPROC on the sidebar list: type-to-search.  When
 ;   a printable character is typed while the list has focus (no edit focused),
 ;   move focus to the search box and forward the character there (redesign A2).
+; vault_ctrl_key(rcx=ctl hwnd, edx=vk) -> eax 1 if a Ctrl+shortcut was handled.
+;   Ctrl+K focus search, Ctrl+N new, Ctrl+G generate, Ctrl+L lock (redesign A2/E4).
+vault_ctrl_key proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-28], edx
+    WINCALL GetKeyState, VK_CONTROL_
+    test    ax, 8000h
+    jz      vck_no
+    WINCALL GetParent, qword ptr [rbp-24]
+    mov     qword ptr [rbp-40], rax
+    mov     eax, dword ptr [rbp-28]
+    cmp     eax, 4Bh                           ; 'K' -> focus the search box
+    jne     vck_chkn
+    WINCALL GetDlgItem, qword ptr [rbp-40], IDC_V_SEARCH
+    test    rax, rax
+    jz      vck_no
+    WINCALL SetFocus, rax
+    jmp     vck_yes
+vck_chkn:
+    cmp     eax, 4Eh                           ; 'N' -> new item
+    jne     @F
+    mov     dword ptr [rbp-44], IDC_V_ADD
+    jmp     vck_post
+@@: cmp     eax, 47h                           ; 'G' -> generate
+    jne     @F
+    mov     dword ptr [rbp-44], IDC_V_GENERATE
+    jmp     vck_post
+@@: cmp     eax, 4Ch                           ; 'L' -> lock
+    jne     vck_no
+    mov     dword ptr [rbp-44], IDC_V_LOCK
+vck_post:
+    WINCALL PostMessageW, qword ptr [rbp-40], WM_COMMAND, qword ptr [rbp-44], 0
+vck_yes:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+vck_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+vault_ctrl_key endp
+
 search_type_subclass proc frame
     FRAME_PROLOG 80
     mov     qword ptr [rbp-24], rcx            ; hwnd (list)
     mov     qword ptr [rbp-32], rdx            ; msg
     mov     qword ptr [rbp-40], r8             ; wParam (char)
     mov     qword ptr [rbp-48], r9             ; lParam
+    cmp     rdx, WM_KEYDOWN_
+    jne     sts_notkey
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, r8d
+    call    vault_ctrl_key
+    test    eax, eax
+    jz      sts_def
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+sts_notkey:
     cmp     rdx, WM_CHAR_
     jne     sts_def
     cmp     r8, 20h                            ; printable (space and up)?
