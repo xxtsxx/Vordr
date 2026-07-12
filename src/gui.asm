@@ -3018,6 +3018,11 @@ gfc_lp:
     imul    eax, eax, DESCSZ
     lea     r10, [g_fields]
     add     r10, rax
+    mov     ecx, dword ptr [r10+FD_KIND]       ; layout blocks (heading / gap) get no card
+    cmp     ecx, VF_GROUP
+    je      gfc_next
+    cmp     ecx, VF_SPACER
+    je      gfc_next
     mov     eax, dword ptr [r10+FD_Y]
     mov     dword ptr [rbp-84], eax            ; T
     add     eax, dword ptr [r10+FD_H]
@@ -3027,6 +3032,7 @@ gfc_lp:
     WINCALL MapDialogRect, qword ptr [rbp-32], addr rbp-88
     WINCALL RoundRect, qword ptr [rbp-24], dword ptr [rbp-88], dword ptr [rbp-84], \
             dword ptr [rbp-80], dword ptr [rbp-76], 10, 10
+gfc_next:
     inc     dword ptr [rbp-64]
     jmp     gfc_lp
 gfc_done:
