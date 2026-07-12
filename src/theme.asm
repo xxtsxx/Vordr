@@ -272,8 +272,9 @@ theme_boot proc frame
     lea     r8, [td_font]
     call    mk_font
     mov     qword ptr [g_font_totp], rax
-    ; large Segoe UI Symbol for the recycle-button glyph (♻ U+267B)
-    mov     ecx, -20
+    ; Segoe UI Symbol for the recycle-button glyph (♻ U+267B); sized to the
+    ; small header button so DT_VCENTER lands it centered like the star icon
+    mov     ecx, -15
     mov     edx, 400
     lea     r8, [td_symfont]
     call    mk_font
