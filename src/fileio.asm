@@ -10,6 +10,8 @@
 include macros.inc
 
 extern CreateFileW:proc
+extern GetLastError:proc
+extern Sleep:proc
 extern ReadFile:proc
 extern WriteFile:proc
 extern GetFileSizeEx:proc
@@ -212,17 +214,47 @@ write_file endp
 ; file_rename(rcx = from, rdx = to) -> eax 0/EXIT_IO  (atomic replace).
 ;   WRITE_THROUGH flushes the rename itself to disk before returning, so the
 ;   directory entry can't be lost in a crash after we think the save succeeded.
+;   The write lock on the target is held only for this call.  If the target is
+;   momentarily locked by another program (sync tool, second instance), retry
+;   once a second for up to 10s before giving up rather than losing the save
+;   (redesign B2).  Only sharing/lock/access errors are retried; other errors
+;   fail immediately.  (Blocking retry; a non-blocking WM_TIMER variant with UI
+;   feedback is a planned follow-up.)
 public file_rename
 file_rename proc frame
     FRAME_PROLOG 48
-    WINCALL MoveFileExW, rcx, rdx, <MOVEFILE_REPLACE_EXISTING or MOVEFILE_WRITE_THROUGH>
+    mov     qword ptr [rbp-24], rcx             ; from
+    mov     qword ptr [rbp-32], rdx             ; to
+    mov     dword ptr [rbp-40], 0               ; attempt count
+frn_try:
+    WINCALL MoveFileExW, qword ptr [rbp-24], qword ptr [rbp-32], \
+            <MOVEFILE_REPLACE_EXISTING or MOVEFILE_WRITE_THROUGH>
     test    eax, eax
-    jz      frn_io
-    xor     eax, eax
+    jnz     frn_ok
+    call    GetLastError                        ; read the failure reason immediately
+    cmp     eax, 32                             ; ERROR_SHARING_VIOLATION
+    je      frn_retry
+    cmp     eax, 33                             ; ERROR_LOCK_VIOLATION
+    je      frn_retry
+    cmp     eax, 5                              ; ERROR_ACCESS_DENIED
+    je      frn_retry
+    mov     eax, EXIT_IO                        ; other error -> fail now
     FRAME_EPILOG
     ret
+frn_retry:
+    mov     eax, dword ptr [rbp-40]
+    inc     eax
+    mov     dword ptr [rbp-40], eax
+    cmp     eax, 10                             ; 10 attempts (~9s) then give up
+    jae     frn_io
+    WINCALL Sleep, 1000
+    jmp     frn_try
 frn_io:
     mov     eax, EXIT_IO
+    FRAME_EPILOG
+    ret
+frn_ok:
+    xor     eax, eax
     FRAME_EPILOG
     ret
 file_rename endp
