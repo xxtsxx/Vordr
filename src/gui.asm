@@ -187,6 +187,7 @@ extern CreateDirectoryW:proc
 extern ShowWindow:proc
 extern MoveWindow:proc
 extern GetWindowRect:proc
+extern MapWindowPoints:proc
 extern ScreenToClient:proc
 extern SetWindowPos:proc
 extern DrawTextW:proc
@@ -279,6 +280,13 @@ WM_MOUSELEAVE_      equ 2A3h
 WM_CHAR_            equ 102h
 WM_KEYDOWN_         equ 100h
 VK_CONTROL_         equ 11h
+WM_SIZE_            equ 5
+WM_GETMINMAXINFO_   equ 24h
+; resize-anchor flags (gui_reflow)
+ANCH_STRETCHW       equ 1
+ANCH_STRETCHH       equ 2
+ANCH_RIGHT          equ 4
+ANCH_BOTTOM         equ 8
 WM_COMMAND          equ 111h
 ; ghost buttons (frameless glyph controls: theme_drawitem tdi_ghost path)
 GHOST_STYLE_        equ 2               ; GWL_USERDATA style byte
@@ -993,6 +1001,22 @@ tmpl_blank label qword
     dq 0                                         ; Title only
 tmpl_table label qword
     dq tmpl_login, tmpl_card, tmpl_ident, tmpl_note, tmpl_blank
+; resize anchors (redesign 1.3): {control id, anchor flags} for gui_reflow
+g_anchor_def label dword
+    dd IDC_V_MBACK,    ANCH_STRETCHW or ANCH_STRETCHH
+    dd IDC_V_LIST,     ANCH_STRETCHH
+    dd IDC_V_SEARCH,   ANCH_BOTTOM
+    dd IDC_V_REMOVE,   ANCH_BOTTOM
+    dd IDC_V_HEADER,   ANCH_STRETCHW
+    dd IDC_V_TITLE,    ANCH_STRETCHW
+    dd IDC_V_TIMES,    ANCH_STRETCHW
+    dd IDC_V_FAV,      ANCH_RIGHT
+    dd IDC_V_OVFL,     ANCH_RIGHT
+    dd IDC_V_ADDFIELD, ANCH_BOTTOM
+    dd IDC_V_CANCEL,   ANCH_RIGHT or ANCH_BOTTOM
+    dd IDC_V_SAVE,     ANCH_RIGHT or ANCH_BOTTOM
+    dd IDC_V_LOCK,     ANCH_RIGHT or ANCH_BOTTOM
+ANCHOR_N equ 13
 tag_xw label word
     dw 0D7h, 0                             ; multiplication sign, used as the tag 'x'
 verb_open label word
@@ -1314,6 +1338,11 @@ g_valblob   dw 32768 dup (?)          ; commit scratch: field values, NUL-joined
 g_lblblob   dw 4096 dup (?)           ; commit scratch: custom labels, NUL-joined
 g_rlabel    dw 128 dup (?)            ; per-row label read scratch
 g_grouptxt  dw 128 dup (?)            ; group-heading title read scratch (paint)
+g_base_cx   dd ?                      ; vault client size recorded at init (resize anchors)
+g_base_cy   dd ?
+g_base_winw dd ?                      ; vault window size recorded at init (min-track size)
+g_base_winh dd ?
+g_anchor_rect dd ANCHOR_N*4 dup (?)   ; per-control initial client {x,y,w,h}
 g_extw      dw 20 dup (?)             ; scratch: an attachment's extension, lowercased
 align 8
 g_ofn       OPENFILENAMEW <>
@@ -3125,6 +3154,124 @@ gfc_ret:
     FRAME_EPILOG
     ret
 gui_draw_field_cards endp
+
+; gui_anchor_init(rcx=hdlg) - record the vault client + window size and each
+;   anchored control's initial client rect, so gui_reflow can resize responsively
+;   (redesign 1.3).  Called once from vp_init after the layout is settled.
+gui_anchor_init proc frame
+    FRAME_PROLOG 144
+    mov     qword ptr [rbp-24], rcx
+    WINCALL GetClientRect, qword ptr [rbp-24], addr rbp-48
+    mov     eax, dword ptr [rbp-40]           ; right = client width
+    mov     dword ptr [g_base_cx], eax
+    mov     eax, dword ptr [rbp-36]           ; bottom = client height
+    mov     dword ptr [g_base_cy], eax
+    WINCALL GetWindowRect, qword ptr [rbp-24], addr rbp-48
+    mov     eax, dword ptr [rbp-40]
+    sub     eax, dword ptr [rbp-48]
+    mov     dword ptr [g_base_winw], eax
+    mov     eax, dword ptr [rbp-36]
+    sub     eax, dword ptr [rbp-44]
+    mov     dword ptr [g_base_winh], eax
+    mov     dword ptr [rbp-52], 0             ; i
+gai_lp:
+    mov     eax, dword ptr [rbp-52]
+    cmp     eax, ANCHOR_N
+    jae     gai_done
+    imul    eax, eax, 8
+    lea     r10, [g_anchor_def]
+    mov     eax, dword ptr [r10+rax]          ; id
+    mov     dword ptr [rbp-56], eax
+    WINCALL GetDlgItem, qword ptr [rbp-24], dword ptr [rbp-56]
+    mov     qword ptr [rbp-64], rax
+    test    rax, rax
+    jz      gai_next
+    WINCALL GetWindowRect, qword ptr [rbp-64], addr rbp-96
+    WINCALL MapWindowPoints, 0, qword ptr [rbp-24], addr rbp-96, 2
+    mov     eax, dword ptr [rbp-52]
+    imul    eax, eax, 16
+    lea     r11, [g_anchor_rect]
+    add     r11, rax
+    mov     eax, dword ptr [rbp-96]           ; L -> x
+    mov     dword ptr [r11+0], eax
+    mov     eax, dword ptr [rbp-92]           ; T -> y
+    mov     dword ptr [r11+4], eax
+    mov     eax, dword ptr [rbp-88]           ; R - L -> w
+    sub     eax, dword ptr [rbp-96]
+    mov     dword ptr [r11+8], eax
+    mov     eax, dword ptr [rbp-84]           ; B - T -> h
+    sub     eax, dword ptr [rbp-92]
+    mov     dword ptr [r11+12], eax
+gai_next:
+    inc     dword ptr [rbp-52]
+    jmp     gai_lp
+gai_done:
+    FRAME_EPILOG
+    ret
+gui_anchor_init endp
+
+; gui_reflow(rcx=hdlg) - reposition anchored controls for the current client size
+;   (WM_SIZE).  Each control moves/stretches by the delta from the recorded base
+;   size per its anchor flags.  The detail rows keep their own (fixed) layout.
+gui_reflow proc frame
+    FRAME_PROLOG 144
+    mov     qword ptr [rbp-24], rcx
+    cmp     dword ptr [g_base_cx], 0          ; not recorded yet -> nothing to do
+    je      grf_done
+    WINCALL GetClientRect, qword ptr [rbp-24], addr rbp-48
+    mov     eax, dword ptr [rbp-40]
+    sub     eax, dword ptr [g_base_cx]
+    mov     dword ptr [rbp-52], eax           ; dW
+    mov     eax, dword ptr [rbp-36]
+    sub     eax, dword ptr [g_base_cy]
+    mov     dword ptr [rbp-56], eax           ; dH
+    mov     dword ptr [rbp-60], 0             ; i
+grf_lp:
+    mov     eax, dword ptr [rbp-60]
+    cmp     eax, ANCHOR_N
+    jae     grf_done
+    imul    eax, eax, 8
+    lea     r10, [g_anchor_def]
+    mov     ecx, dword ptr [r10+rax]          ; id
+    mov     dword ptr [rbp-64], ecx
+    mov     edx, dword ptr [r10+rax+4]        ; flags
+    mov     dword ptr [rbp-68], edx
+    mov     eax, dword ptr [rbp-60]
+    imul    eax, eax, 16
+    lea     r11, [g_anchor_rect]
+    add     r11, rax
+    mov     eax, dword ptr [r11+0]            ; nx = x (+dW if RIGHT)
+    test    dword ptr [rbp-68], ANCH_RIGHT
+    jz      @F
+    add     eax, dword ptr [rbp-52]
+@@: mov     dword ptr [rbp-72], eax
+    mov     eax, dword ptr [r11+4]            ; ny = y (+dH if BOTTOM)
+    test    dword ptr [rbp-68], ANCH_BOTTOM
+    jz      @F
+    add     eax, dword ptr [rbp-56]
+@@: mov     dword ptr [rbp-76], eax
+    mov     eax, dword ptr [r11+8]            ; nw = w (+dW if STRETCHW)
+    test    dword ptr [rbp-68], ANCH_STRETCHW
+    jz      @F
+    add     eax, dword ptr [rbp-52]
+@@: mov     dword ptr [rbp-80], eax
+    mov     eax, dword ptr [r11+12]           ; nh = h (+dH if STRETCHH)
+    test    dword ptr [rbp-68], ANCH_STRETCHH
+    jz      @F
+    add     eax, dword ptr [rbp-56]
+@@: mov     dword ptr [rbp-84], eax
+    WINCALL GetDlgItem, qword ptr [rbp-24], dword ptr [rbp-64]
+    test    rax, rax
+    jz      grf_next
+    WINCALL MoveWindow, rax, dword ptr [rbp-72], dword ptr [rbp-76], \
+            dword ptr [rbp-80], dword ptr [rbp-84], 1
+grf_next:
+    inc     dword ptr [rbp-60]
+    jmp     grf_lp
+grf_done:
+    FRAME_EPILOG
+    ret
+gui_reflow endp
 
 ; gui_draw_flatchevron(rcx=lpdis) - draw a reorder chevron as a bare dim glyph on
 ;   the dialog bg (no button chrome).  Up for DS_UP, down otherwise.
@@ -9166,10 +9313,30 @@ vault_proc proc
     je      vp_tcolor
     cmp     rdx, WM_CTLCOLORSTATIC
     je      vp_tcolor
+    cmp     rdx, WM_SIZE_
+    je      vp_size
+    cmp     rdx, WM_GETMINMAXINFO_
+    je      vp_minmax
     xor     eax, eax
     jmp     vp_ret
 vp_tcolor:
     call    gui_ctlcolor                     ; theme + link-blue for view-mode URL values
+    jmp     vp_ret
+vp_size:
+    mov     rcx, qword ptr [rbp-8]           ; responsive reflow of anchored controls
+    call    gui_reflow
+    xor     eax, eax
+    jmp     vp_ret
+vp_minmax:
+    mov     r10, r9                          ; MINMAXINFO: ptMinTrackSize at +24
+    mov     eax, dword ptr [g_base_winw]
+    test    eax, eax
+    jz      vp_minmax_ret                    ; not recorded yet -> leave default
+    mov     dword ptr [r10+24], eax
+    mov     eax, dword ptr [g_base_winh]
+    mov     dword ptr [r10+28], eax
+vp_minmax_ret:
+    xor     eax, eax
     jmp     vp_ret
 vp_drop:
     cmp     dword ptr [g_editmode], 0        ; only accept drops while editing an entry
@@ -9503,6 +9670,8 @@ vp_init:
     mov     rcx, rax
     call    SetFocus
     add     rsp, 32
+    mov     rcx, qword ptr [rbp-8]            ; record control rects for responsive resize
+    call    gui_anchor_init
     xor     eax, eax                          ; we set focus ourselves -> return FALSE
     jmp     vp_ret
 vp_cmd:
