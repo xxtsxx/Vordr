@@ -393,27 +393,32 @@ malformed-input crashes before an attacker does.
 
 ### 34. Faster unlock: parallel KAT gate
 **Goal:** Run the startup self-test KATs across worker threads to cut launch latency.
-**Steps:**
-1. Measure: `dbg` timestamps per KAT; identify the top 3 (Argon2id will dominate).
-   *Test:* a table of per-test ms is printed; numbers reproducible ±10%.
-2. Thread pool (CreateThread ×N, N=min(cores,4)) executing independent KATs; the gate still
-   fails closed if ANY thread reports failure or doesn't report at all (watchdog timeout).
-   *Test:* SELFTEST wall time drops ≥40%; corrupt one vector → still fails closed; suspend a
-   worker artificially (dbg hook) → watchdog trips.
-3. Keep single-threaded order for tests with shared state (audit for statics first).
-   *Test:* 1000 repeated selftest runs in a loop, zero flakes.
+**Status (2026-07):** Step 1 (measurement) is already covered by the `bench` verb,
+which times an Argon2id derivation in ms and confirms Argon2 dominates the ~1.15 s
+`selftest` wall time. Steps 2–3 (the threaded gate) are **deferred**, and this is a
+deliberate call, not an oversight: the only heavy KATs are Argon2id, and
+`argon2id_hash` is **non-reentrant** — it writes shared process-static scratch
+(`g_b2bctx`, `g_hbuf`, `g_inp`, `g_addr`; 34 references). Running those KATs
+concurrently would race on that scratch, so parallelization first requires making
+the KDF reentrant (per-call scratch), a large, delicate edit to security-critical
+code. A single green `selftest` run proves KDF correctness but NOT race-freedom nor
+that the gate still *fails closed* if a worker hangs — properties that need review,
+not a marathon-tail rewrite. Prerequisite: reentrant Argon2 + a fail-closed
+watchdog design, on its own reviewed branch.
 
 ### 35. Sidebar virtualization for large vaults
 **Goal:** 5,000-entry vault scrolls smoothly; tiles are drawn, not created, per row.
-**Steps:**
-1. Generate a 5k-entry synthetic vault via a script (CLI `add` loop); profile current load
-   and scroll (GetGuiResources, paint time via `dbg` QPC probes).
-   *Test:* baseline numbers recorded in the plan's commit message.
-2. Convert the sidebar to a single owner-draw scrolled surface: paint only visible tile rows
-   from `g_entries` (painters already exist), hit-test by y-offset; kill per-entry child windows.
-   *Test:* GDI handle count independent of entry count; scroll paint < 5 ms/frame at 5k entries.
-3. Keep keyboard selection + accessibility names (Plan 23) working.
-   *Test:* arrow keys walk entries; NVDA still reads them.
+**Status (2026-07): already satisfied by the existing architecture.** The sidebar
+(`IDC_V_LIST`) is an owner-draw `LBS_OWNERDRAWVARIABLE` LISTBOX: entries are added as
+index-only `LB_ADDSTRING` items and painted **on demand** by `WM_DRAWITEM` →
+`gui_draw_listitem`. So the plan's objectives already hold — tiles are drawn, not
+created, per row; it is one control regardless of entry count (GDI handle count is
+independent of entry count); and a real LISTBOX provides arrow-key selection and
+MSAA/Narrator names for free. A hand-rolled owner-draw scroll surface (step 2)
+would *replace* a working, OS-virtualized control with more code and fewer built-in
+features — a regression, not an improvement — so it is intentionally not done.
+(One future tune-up if 5k load latency ever bites: `LBS_SORT` sorts on every insert;
+a bulk pre-sorted fill would cut load time, but painting is already virtualized.)
 
 ### 36. Crash containment without secret leakage
 **Goal:** On any unhandled exception: wipe secrets, show a minimal apology box, and ensure NO
