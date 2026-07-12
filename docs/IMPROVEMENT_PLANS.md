@@ -402,15 +402,27 @@ would regress launch and are intentionally not built.** Step 1 (measure) was run
   measurable compute; the ~1 s is process-startup overhead (PE load, subsystem
   init, `hardening_init`), which threading the KATs cannot touch.
 
-So the plan's assumption ("Argon2id will dominate") does not hold here. There is no
-heavy KAT to parallelize; spawning `min(cores,4)` worker threads would add
-`CreateThread`/join overhead (each ~ms) to a body that already costs ~0 ms, making
-launch *slower*, and would put concurrency onto a security-critical fail-closed
-gate whose one heavy primitive (`argon2id_hash`) is non-reentrant (shared static
-scratch, 34 refs) — all downside, no measurable upside. Steps 2–3 are therefore
-correctly not implemented. If the KAT parameters were ever raised to production
-cost, revisit with: reentrant Argon2 (per-call scratch) + a default-FAIL watchdog
-gate, on its own reviewed branch.
+Three independent, code-verified blockers make the threaded gate infeasible to
+bolt on — and one of them is architectural, not a judgment call:
+
+1. **No benefit.** The KATs cost ~0 ms; the ~1 s is process startup, which
+   threading the KATs cannot touch. Worker `CreateThread`/join overhead would
+   make launch *slower*.
+2. **`argon2id_hash` is non-reentrant** — shared static scratch (`g_b2bctx`,
+   `g_hbuf`, `g_inp`, `g_addr`; 34 refs).
+3. **The software shadow stack is process-global.** Every `FRAME_PROLOG` proc
+   (i.e. essentially every proc in the codebase, including every crypto KAT)
+   does a non-atomic read-modify-write on the single global `g_sstk_index` /
+   `g_sstk_base` (hardening.asm). Running *any* of them on two threads at once
+   races that RMW → shadow-stack corruption or a false `FF_SHADOW_STACK`
+   fast-fail. So **nothing here is thread-safe today** — not because of one KDF,
+   but because a core mitigation assumes single-threaded execution.
+
+Safe parallelization therefore requires first moving the shadow stack + stack
+canary to per-thread storage (TLS) *and* making Argon2 reentrant — a foundational
+change to the security-mitigation layer that must be designed and reviewed on its
+own branch, not bolted onto a fail-closed gate for zero measurable launch win.
+Steps 2–3 are correctly not implemented.
 
 ### 35. Sidebar virtualization for large vaults
 **Goal:** 5,000-entry vault scrolls smoothly; tiles are drawn, not created, per row.
