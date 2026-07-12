@@ -3269,9 +3269,62 @@ grf_next:
     inc     dword ptr [rbp-60]
     jmp     grf_lp
 grf_done:
+    mov     rcx, qword ptr [rbp-24]           ; also stretch the detail value columns
+    call    gui_stretch_rows
     FRAME_EPILOG
     ret
 gui_reflow endp
+
+; gui_stretch_rows(rcx=hdlg) - widen each field row's value control by the window's
+;   horizontal growth from the base size, so the modular detail pane's fields grow
+;   with the window (redesign responsive detail pane).  Called from gui_reflow and
+;   at the end of gui_rows_layout so it survives a relayout.
+gui_stretch_rows proc frame
+    FRAME_PROLOG 144
+    mov     qword ptr [rbp-24], rcx
+    cmp     dword ptr [g_base_cx], 0
+    je      gsr_done
+    WINCALL GetClientRect, qword ptr [rbp-24], addr rbp-48
+    mov     eax, dword ptr [rbp-40]
+    sub     eax, dword ptr [g_base_cx]
+    mov     dword ptr [rbp-52], eax           ; dW
+    cmp     eax, 0
+    jle     gsr_done                          ; narrower/equal -> keep the base widths
+    mov     dword ptr [rbp-56], 0             ; row i
+gsr_lp:
+    mov     eax, dword ptr [rbp-56]
+    cmp     eax, dword ptr [g_field_count]
+    jae     gsr_done
+    mov     ecx, eax
+    mov     edx, DS_VALUE
+    call    dynid
+    mov     dword ptr [rbp-60], eax
+    WINCALL GetDlgItem, qword ptr [rbp-24], dword ptr [rbp-60]
+    mov     qword ptr [rbp-64], rax
+    test    rax, rax
+    jz      gsr_next
+    WINCALL GetWindowRect, qword ptr [rbp-64], addr rbp-96
+    WINCALL MapWindowPoints, 0, qword ptr [rbp-24], addr rbp-96, 2
+    mov     eax, dword ptr [rbp-96]           ; nx = L
+    mov     dword ptr [rbp-68], eax
+    mov     eax, dword ptr [rbp-92]           ; ny = T
+    mov     dword ptr [rbp-72], eax
+    mov     eax, dword ptr [rbp-88]           ; nw = (R - L) + dW
+    sub     eax, dword ptr [rbp-96]
+    add     eax, dword ptr [rbp-52]
+    mov     dword ptr [rbp-76], eax
+    mov     eax, dword ptr [rbp-84]           ; nh = B - T
+    sub     eax, dword ptr [rbp-92]
+    mov     dword ptr [rbp-80], eax
+    WINCALL MoveWindow, qword ptr [rbp-64], dword ptr [rbp-68], dword ptr [rbp-72], \
+            dword ptr [rbp-76], dword ptr [rbp-80], 1
+gsr_next:
+    inc     dword ptr [rbp-56]
+    jmp     gsr_lp
+gsr_done:
+    FRAME_EPILOG
+    ret
+gui_stretch_rows endp
 
 ; gui_draw_flatchevron(rcx=lpdis) - draw a reorder chevron as a bare dim glyph on
 ;   the dialog bg (no button chrome).  Up for DS_UP, down otherwise.
@@ -6769,6 +6822,8 @@ grl_done:
     mov     eax, dword ptr [rbp-40]              ; content bottom incl. the timestamps line
     add     eax, 12
     mov     dword ptr [g_content_h], eax
+    mov     rcx, qword ptr [rbp-24]              ; keep value columns elastic after relayout
+    call    gui_stretch_rows
     ; repaint just the detail pane (not the whole window) so the sidebar card's
     ; border/shadow don't flicker when rows are laid out
     mov     rcx, qword ptr [rbp-24]
