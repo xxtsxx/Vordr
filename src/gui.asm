@@ -3005,6 +3005,8 @@ gui_draw_field_cards proc frame
     je      gfc_ret
     WINCALL CreateSolidBrush, dword ptr [g_col_panel]   ; card fill (active scheme)
     mov     qword ptr [rbp-40], rax
+    WINCALL CreateSolidBrush, dword ptr [g_col_frame]   ; group-heading rule colour
+    mov     qword ptr [rbp-96], rax
     WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-40]
     mov     qword ptr [rbp-48], rax            ; old brush
     WINCALL GetStockObject, 8                  ; NULL_PEN
@@ -3020,7 +3022,7 @@ gfc_lp:
     add     r10, rax
     mov     ecx, dword ptr [r10+FD_KIND]       ; layout blocks (heading / gap) get no card
     cmp     ecx, VF_GROUP
-    je      gfc_next
+    je      gfc_group
     cmp     ecx, VF_SPACER
     je      gfc_next
     mov     eax, dword ptr [r10+FD_Y]
@@ -3032,6 +3034,19 @@ gfc_lp:
     WINCALL MapDialogRect, qword ptr [rbp-32], addr rbp-88
     WINCALL RoundRect, qword ptr [rbp-24], dword ptr [rbp-88], dword ptr [rbp-84], \
             dword ptr [rbp-80], dword ptr [rbp-76], 10, 10
+    jmp     gfc_next
+gfc_group:
+    ; a section heading: draw a hairline rule along its baseline (the title text
+    ; is shown by the heading's edit control above the rule)
+    mov     eax, dword ptr [r10+FD_Y]
+    add     eax, dword ptr [r10+FD_H]
+    mov     dword ptr [rbp-76], eax            ; B = row bottom
+    sub     eax, 1
+    mov     dword ptr [rbp-84], eax            ; T = 1 DLU rule
+    mov     dword ptr [rbp-88], 176            ; L
+    mov     dword ptr [rbp-80], 460            ; R
+    WINCALL MapDialogRect, qword ptr [rbp-32], addr rbp-88
+    WINCALL FillRect, qword ptr [rbp-24], addr rbp-88, qword ptr [rbp-96]
 gfc_next:
     inc     dword ptr [rbp-64]
     jmp     gfc_lp
@@ -3039,6 +3054,7 @@ gfc_done:
     WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-48]   ; restore brush
     WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-56]   ; restore pen
     WINCALL DeleteObject, qword ptr [rbp-40]
+    WINCALL DeleteObject, qword ptr [rbp-96]                       ; group-rule brush
 gfc_ret:
     FRAME_EPILOG
     ret
