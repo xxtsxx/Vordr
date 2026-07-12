@@ -175,6 +175,7 @@ extern GetDlgItem:proc
 extern GetFocus:proc
 extern CharUpperBuffW:proc
 extern SetFocus:proc
+extern GetParent:proc
 extern SetDlgItemInt:proc
 extern GetDlgItemInt:proc
 extern GetFileAttributesW:proc
@@ -275,6 +276,7 @@ WM_SETFONT          equ 30h
 WM_MOUSEWHEEL       equ 20Ah
 WM_MOUSEMOVE_       equ 200h
 WM_MOUSELEAVE_      equ 2A3h
+WM_CHAR_            equ 102h
 WM_COMMAND          equ 111h
 ; ghost buttons (frameless glyph controls: theme_drawitem tdi_ghost path)
 GHOST_STYLE_        equ 2               ; GWL_USERDATA style byte
@@ -4875,6 +4877,38 @@ ghost_tip_add proc frame
     ret
 ghost_tip_add endp
 
+; search_type_subclass - SUBCLASSPROC on the sidebar list: type-to-search.  When
+;   a printable character is typed while the list has focus (no edit focused),
+;   move focus to the search box and forward the character there (redesign A2).
+search_type_subclass proc frame
+    FRAME_PROLOG 80
+    mov     qword ptr [rbp-24], rcx            ; hwnd (list)
+    mov     qword ptr [rbp-32], rdx            ; msg
+    mov     qword ptr [rbp-40], r8             ; wParam (char)
+    mov     qword ptr [rbp-48], r9             ; lParam
+    cmp     rdx, WM_CHAR_
+    jne     sts_def
+    cmp     r8, 20h                            ; printable (space and up)?
+    jb      sts_def
+    WINCALL GetParent, qword ptr [rbp-24]
+    mov     qword ptr [rbp-56], rax
+    WINCALL GetDlgItem, qword ptr [rbp-56], IDC_V_SEARCH
+    mov     qword ptr [rbp-64], rax
+    test    rax, rax
+    jz      sts_def
+    WINCALL SetFocus, qword ptr [rbp-64]
+    WINCALL SendMessageW, qword ptr [rbp-64], WM_CHAR_, qword ptr [rbp-40], \
+            qword ptr [rbp-48]
+    xor     eax, eax                           ; consumed
+    FRAME_EPILOG
+    ret
+sts_def:
+    WINCALL DefSubclassProc, qword ptr [rbp-24], qword ptr [rbp-32], qword ptr [rbp-40], \
+            qword ptr [rbp-48]
+    FRAME_EPILOG
+    ret
+search_type_subclass endp
+
 ; kind_label(edx=kind) -> rax = wide default-label ptr.  Leaf.
 kind_label proc
     cmp     edx, VF_USERNAME
@@ -9334,6 +9368,8 @@ vp_init:
     mov     r8d, GLY_DELETE
     lea     r9, [gt_rem]
     call    ghost_attach
+    WINCALL GetDlgItem, qword ptr [rbp-8], IDC_V_LIST    ; type-to-search: keystrokes on
+    WINCALL SetWindowSubclass, rax, addr search_type_subclass, 0, 0   ;  the list -> search box
     mov     dword ptr [g_trash_view], 0       ; start in the vault (not the trash) view
     mov     dword ptr [g_deleted_state], 0
     call    gui_purge_trash                   ; drop entries trashed > 30 days ago
