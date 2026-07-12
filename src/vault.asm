@@ -45,6 +45,9 @@ extern print_u64:proc
 extern WideCharToMultiByte:proc
 extern GetSystemTimeAsFileTime:proc
 extern GetFileAttributesW:proc
+extern blake2b_init:proc
+extern blake2b_update:proc
+extern blake2b_final:proc
 extern tpm_seal:proc
 extern tpm_unseal:proc
 extern tpm_delete:proc
@@ -122,6 +125,13 @@ BAK_GENS        equ 3           ; rotated backup generations (.bak1 .. .bak3)
 ;   trailer = [u32 ATT_MAGIC][u64 entries_len]   (present only when >=1 image)
 ATT_MAGIC       equ 54544156h   ; "VATT"
 ATT_TRAILER     equ 12          ; sizeof trailer
+; Full-file MAC + anti-rollback trailer (plan 4/3), appended after everything
+; else.  Additive + backward compatible: legacy vaults simply lack the magic.
+;   [u64 save_counter][32-byte BLAKE2b-keyed MAC over the whole file + counter]
+;   [u32 FMAC_MAGIC]
+FMAC_MAGIC      equ 43414D56h   ; "VMAC"
+FMAC_MACLEN     equ 32
+FMAC_TRAILER    equ 8 + FMAC_MACLEN + 4   ; counter + mac + magic = 44
 ARF_ID          equ 0           ; AttachRef: 16-byte attachment id
 ARF_KEY         equ 16          ;            32-byte AES-256 key
 ARF_NONCE       equ 48          ;            12-byte GCM nonce
@@ -168,8 +178,13 @@ CSTR vfz_m2, " iters  "
 CSTR vfz_m3, " parsed  "
 CSTR vfz_m4, " rejected  0 crashes",13,10
 bk_pw       db "vordrtest", 0
+fmac_domain db "vordr-file-mac-v1"          ; MAC domain-separation prefix
+FMAC_DOMLEN equ 17
 CSTR bk_ok,  "bktest: PASS (bak1..3 rotated and bak1 opens)",13,10
 CSTR bk_bad, "bktest: FAIL (backup missing or unopenable)",13,10
+CSTR mt_ok,  "mactest: PASS (counter tamper rejected, restore opens)",13,10
+CSTR mt_bad, "mactest: FAIL",13,10
+CSTR mt_leak,"mactest: FAIL (file-MAC did not catch the trailer tamper)",13,10
 CSTR e_io,      "error: cannot read/write the vault file",13,10
 CSTR e_oom,     "error: out of memory",13,10
 CSTR m_created, "vault created.",13,10
@@ -189,6 +204,12 @@ public g_body_ptr
 g_body_ptr  dq ?
 public g_body_len
 g_body_len  dq ?
+public g_save_counter
+g_save_counter dq ?                         ; monotonic save number (anti-rollback)
+g_fmac_len  dq ?                            ; 0 (legacy) or FMAC_TRAILER for this image
+align 16
+g_fmac_ctx  db 256 dup (?)                  ; BLAKE2B_CTX scratch (216 used)
+g_fmac_out  db 32 dup (?)                   ; computed file MAC
 g_filebuf   dq ?
 g_filesize  dq ?
 g_outbuf    dq ?
@@ -508,6 +529,39 @@ vmb_suf:
 vault_mkbak endp
 
 ; ===========================================================================
+; vault_file_mac(rcx = data ptr, rdx = data len, r8 = out 32-byte) - keyed MAC
+;   over the whole file image (+ trailing counter).  BLAKE2b is not length-
+;   extendable, so prefix-keying MAC = BLAKE2b(domain || g_vkey || data) is a
+;   sound MAC; the domain string separates it from any other use of the key.
+; ===========================================================================
+vault_file_mac proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx             ; data
+    mov     qword ptr [rbp-32], rdx             ; len
+    mov     qword ptr [rbp-40], r8              ; out
+    lea     rcx, [g_fmac_ctx]
+    mov     edx, FMAC_MACLEN
+    call    blake2b_init
+    lea     rcx, [g_fmac_ctx]                   ; domain-separation prefix
+    lea     rdx, [fmac_domain]
+    mov     r8, FMAC_DOMLEN
+    call    blake2b_update
+    lea     rcx, [g_fmac_ctx]                   ; key material (the vault key)
+    lea     rdx, [g_vkey]
+    mov     r8, 32
+    call    blake2b_update
+    lea     rcx, [g_fmac_ctx]                   ; the file image + counter
+    mov     rdx, qword ptr [rbp-24]
+    mov     r8, qword ptr [rbp-32]
+    call    blake2b_update
+    lea     rcx, [g_fmac_ctx]
+    mov     rdx, qword ptr [rbp-40]
+    call    blake2b_final
+    FRAME_EPILOG
+    ret
+vault_file_mac endp
+
+; ===========================================================================
 ; vault_rotate_backups() - before the atomic replace, roll the CURRENT vault
 ;   file into a ring of BAK_GENS generations: bak2->bak3, bak1->bak2, then copy
 ;   the live file to bak1.  A crash mid-save can thus never lose the vault - the
@@ -549,16 +603,18 @@ vault_rotate_backups endp
 ;   -> eax = 0 / EXIT_IO / EXIT_OOM.
 ; ===========================================================================
 vault_seal_write proc frame
-    FRAME_PROLOG 48
-    ; [rbp-32] = attachment section bytes (entries + trailer)
+    FRAME_PROLOG 80
+    ; [rbp-32] = attachment section bytes (entries + trailer)  [rbp-40] = base len
     xor     ecx, ecx                            ; emit=0: size the attachment section
     xor     edx, edx
     call    attach_build
     mov     qword ptr [rbp-32], rax
-    ; total = VH_TOTAL + body_len + 16 + attachment section
+    ; base image = VH_TOTAL + body_len + 16 + attachment section
     mov     rax, qword ptr [g_body_len]
     add     rax, VH_TOTAL + 16
     add     rax, qword ptr [rbp-32]
+    mov     qword ptr [rbp-40], rax             ; base length (before the MAC trailer)
+    add     rax, FMAC_TRAILER                   ; + [u64 counter][32 MAC][u32 magic]
     mov     qword ptr [g_outlen], rax
     mov     rcx, rax
     call    mem_alloc
@@ -607,6 +663,31 @@ vsw_hcpy:
     add     rdx, qword ptr [g_body_len]
     call    attach_build
 vsw_write:
+    ; --- full-file MAC + anti-rollback trailer (plan 4/3) ------------------
+    ; layout at offset base: [u64 counter][32 MAC over image+counter][u32 magic]
+    inc     qword ptr [g_save_counter]          ; monotonic: this save's number
+    mov     r10, qword ptr [g_outbuf]
+    add     r10, qword ptr [rbp-40]             ; -> trailer start (= base offset)
+    mov     rax, qword ptr [g_save_counter]
+    mov     qword ptr [r10], rax                ; write the counter
+    mov     rcx, qword ptr [g_outbuf]           ; MAC over image + counter
+    mov     rdx, qword ptr [rbp-40]
+    add     rdx, 8                              ; len = base + 8 (counter)
+    lea     r8, [g_fmac_out]
+    call    vault_file_mac
+    mov     r10, qword ptr [g_outbuf]           ; copy MAC after the counter
+    add     r10, qword ptr [rbp-40]
+    add     r10, 8
+    lea     r11, [g_fmac_out]
+    xor     r8, r8
+vsw_maccp:
+    mov     al, byte ptr [r11+r8]
+    mov     byte ptr [r10+r8], al
+    inc     r8
+    cmp     r8, FMAC_MACLEN
+    jb      vsw_maccp
+    mov     dword ptr [r10+FMAC_MACLEN], FMAC_MAGIC
+    mov     qword ptr [g_fmac_len], FMAC_TRAILER
     ; --- atomic write: build temp path = g_cfg_in + ".tmp" -----------------
     mov     r10, qword ptr [g_cfg_in]
     lea     r11, [g_tmppath]
@@ -732,9 +813,45 @@ vu_havekey:
     call    vk_kcv_ok
     test    eax, eax
     jnz     vu_locked
-    ; detect the attachments trailer at the end of the file (absent = old format)
+    ; --- full-file MAC + anti-rollback trailer (plan 4/3) ------------------
+    ; If the file ends in FMAC_MAGIC, verify the keyed MAC over everything before
+    ; it (defence in depth over GCM: catches truncation / splicing of the
+    ; attachment section) and read the save counter.  g_fmac_len then hides the
+    ; trailer from all end-relative offset math below.  Legacy files lack it.
+    mov     qword ptr [g_fmac_len], 0
+    mov     qword ptr [g_save_counter], 0
+    mov     rax, qword ptr [g_filesize]
+    cmp     rax, VH_TOTAL + 4 + 16 + FMAC_TRAILER
+    jb      vu_nofmac
+    mov     r11, qword ptr [g_filebuf]
+    add     r11, rax
+    cmp     dword ptr [r11-4], FMAC_MAGIC       ; magic at the very end?
+    jne     vu_nofmac
+    mov     rcx, qword ptr [g_filebuf]          ; MAC over image + counter
+    mov     rdx, rax
+    sub     rdx, FMAC_MACLEN + 4                ; data len = filesize - 36
+    lea     r8, [g_fmac_out]
+    call    vault_file_mac
+    lea     rcx, [g_fmac_out]                   ; constant-time compare vs stored MAC
+    mov     r11, qword ptr [g_filebuf]
+    add     r11, qword ptr [g_filesize]
+    sub     r11, FMAC_MACLEN + 4
+    mov     rdx, r11
+    mov     r8, FMAC_MACLEN
+    call    ct_memcmp
+    test    eax, eax
+    jnz     vu_auth                             ; file MAC mismatch = tamper
+    mov     r11, qword ptr [g_filebuf]          ; read the save counter
+    add     r11, qword ptr [g_filesize]
+    sub     r11, FMAC_TRAILER
+    mov     rax, qword ptr [r11]
+    mov     qword ptr [g_save_counter], rax
+    mov     qword ptr [g_fmac_len], FMAC_TRAILER
+vu_nofmac:
+    ; detect the attachments trailer at the end of the base image (absent = old)
     mov     qword ptr [g_att_total], 0
     mov     rax, qword ptr [g_filesize]
+    sub     rax, qword ptr [g_fmac_len]         ; effective end = image without MAC
     cmp     rax, VH_TOTAL + 4 + 16 + ATT_TRAILER
     jb      vu_ctlen
     mov     r11, qword ptr [g_filebuf]
@@ -749,8 +866,9 @@ vu_havekey:
     ja      vu_ctlen                            ; implausible -> ignore
     mov     qword ptr [g_att_total], r9
 vu_ctlen:
-    ; body ciphertext length = filesize - 80 - 16 - (att_total + trailer)
+    ; body ciphertext length = effective_end - 80 - 16 - (att_total + trailer)
     mov     rax, qword ptr [g_filesize]
+    sub     rax, qword ptr [g_fmac_len]
     sub     rax, VH_TOTAL + 16
     mov     r9, qword ptr [g_att_total]
     test    r9, r9
@@ -939,6 +1057,7 @@ va_field endp
 public do_init
 do_init proc frame
     FRAME_PROLOG 48
+    mov     qword ptr [g_save_counter], 0       ; fresh vault: first save is counter 1
     ; build header
     mov     dword ptr [g_hdr+0], VAULT_MAGIC
     mov     dword ptr [g_hdr+4], VAULT_VERSION
@@ -1753,6 +1872,100 @@ bk_fail:
     FRAME_EPILOG
     ret
 cmd_bktest endp
+
+; ===========================================================================
+; cmd_mactest <path> - prove the full-file MAC catches tampering the trailer
+;   (plan 4).  Create a vault, then flip a byte in the save-counter - a region
+;   GCM does NOT authenticate - and confirm the unlock now fails; restore the
+;   byte and confirm it opens again.  exit 0 = pass.
+; ===========================================================================
+LANDING_PAD
+public cmd_mactest
+cmd_mactest proc frame
+    FRAME_PROLOG 64
+    ; [rbp-24]=filebuf [rbp-32]=filesize [rbp-40]=result
+    lea     r10, [g_argv]
+    mov     rax, qword ptr [r10+16]
+    mov     qword ptr [g_cfg_in], rax
+    lea     r10, [bk_pw]
+    lea     r11, [g_cfg_pass]
+    xor     ecx, ecx
+mt_pwcp:
+    mov     al, byte ptr [r10+rcx]
+    mov     byte ptr [r11+rcx], al
+    test    al, al
+    jz      mt_pwd
+    inc     ecx
+    cmp     ecx, 32
+    jb      mt_pwcp
+mt_pwd:
+    mov     dword ptr [g_cfg_passlen], 9
+    mov     dword ptr [g_cfg_t], 1
+    mov     dword ptr [g_cfg_m], 8192
+    call    do_init
+    test    eax, eax
+    jnz     mt_fail
+    ; read the freshly written file so we can tamper it on disk
+    mov     rcx, qword ptr [g_cfg_in]
+    lea     rdx, [rbp-24]
+    lea     r8, [rbp-32]
+    call    read_file
+    test    eax, eax
+    jnz     mt_fail
+    ; flip a byte inside the save counter (offset = size - FMAC_TRAILER)
+    mov     r10, qword ptr [rbp-24]
+    add     r10, qword ptr [rbp-32]
+    sub     r10, FMAC_TRAILER
+    xor     byte ptr [r10], 0FFh
+    mov     rcx, qword ptr [g_cfg_in]
+    mov     rdx, qword ptr [rbp-24]
+    mov     r8, qword ptr [rbp-32]
+    call    write_file
+    call    vault_unlock                        ; must FAIL (MAC mismatch)
+    mov     dword ptr [rbp-40], eax
+    test    eax, eax
+    jz      mt_leaked                           ; opened a tampered file -> MAC missed it
+    ; restore the byte and confirm the vault opens again
+    mov     r10, qword ptr [rbp-24]
+    add     r10, qword ptr [rbp-32]
+    sub     r10, FMAC_TRAILER
+    xor     byte ptr [r10], 0FFh
+    mov     rcx, qword ptr [g_cfg_in]
+    mov     rdx, qword ptr [rbp-24]
+    mov     r8, qword ptr [rbp-32]
+    call    write_file
+    call    vault_unlock
+    mov     dword ptr [rbp-40], eax
+    call    vault_lock
+    mov     rcx, qword ptr [rbp-24]
+    mov     rdx, qword ptr [rbp-32]
+    call    mem_free
+    cmp     dword ptr [rbp-40], 0
+    jne     mt_fail                             ; restored file must open
+    lea     rcx, [mt_ok]
+    mov     edx, mt_ok_len
+    call    print_a
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+mt_leaked:
+    mov     rcx, qword ptr [rbp-24]
+    mov     rdx, qword ptr [rbp-32]
+    call    mem_free
+    lea     rcx, [mt_leak]
+    mov     edx, mt_leak_len
+    call    print_a
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+mt_fail:
+    lea     rcx, [mt_bad]
+    mov     edx, mt_bad_len
+    call    print_a
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_mactest endp
 
 
 ; ===========================================================================
@@ -2849,16 +3062,19 @@ attach_index_build endp
 public attach_rescan
 attach_rescan proc frame
     FRAME_PROLOG 48
+    mov     rax, qword ptr [g_filesize]         ; [rbp-24] = effective end (no MAC)
+    sub     rax, qword ptr [g_fmac_len]
+    mov     qword ptr [rbp-24], rax
     mov     rax, qword ptr [g_body_len]
     add     rax, VH_TOTAL + 16
     mov     qword ptr [g_att_start], rax        ; att_start = 80 + bodyct + 16
     mov     qword ptr [g_att_total], 0
     mov     rax, qword ptr [g_att_start]
     add     rax, ATT_TRAILER
-    cmp     rax, qword ptr [g_filesize]
+    cmp     rax, qword ptr [rbp-24]
     ja      ars_build
     mov     r11, qword ptr [g_filebuf]
-    add     r11, qword ptr [g_filesize]
+    add     r11, qword ptr [rbp-24]
     sub     r11, ATT_TRAILER
     cmp     dword ptr [r11], ATT_MAGIC
     jne     ars_build
@@ -2866,7 +3082,7 @@ attach_rescan proc frame
     mov     rax, qword ptr [g_att_start]
     add     rax, r9
     add     rax, ATT_TRAILER
-    cmp     rax, qword ptr [g_filesize]
+    cmp     rax, qword ptr [rbp-24]
     jne     ars_build                           ; inconsistent -> ignore
     mov     qword ptr [g_att_total], r9
 ars_build:
