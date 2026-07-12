@@ -3181,6 +3181,12 @@ gui_draw_field_cards proc frame
     WINCALL GetStockObject, 8                  ; NULL_PEN
     WINCALL SelectObject, qword ptr [rbp-24], rax
     mov     qword ptr [rbp-56], rax            ; old pen
+    WINCALL GetClientRect, qword ptr [rbp-32], addr rbp-160   ; elastic: widen cards by dW
+    mov     eax, dword ptr [rbp-152]           ; client right = width (left is 0)
+    sub     eax, dword ptr [g_base_cx]         ; dW = width - base (matches gui_stretch_rows)
+    jns     @F
+    xor     eax, eax                           ; narrower than base -> no stretch
+@@: mov     dword ptr [rbp-112], eax           ; dW (pixels, >= 0)
     mov     dword ptr [rbp-64], 0              ; row i
 gfc_lp:
     mov     eax, dword ptr [rbp-64]
@@ -3201,6 +3207,8 @@ gfc_lp:
     mov     dword ptr [rbp-88], 214            ; L (156 + VDX_DLU)
     mov     dword ptr [rbp-80], 472            ; R (414 + VDX_DLU)
     WINCALL MapDialogRect, qword ptr [rbp-32], addr rbp-88
+    mov     eax, dword ptr [rbp-112]           ; stretch the card to the widened pane
+    add     dword ptr [rbp-80], eax
     WINCALL RoundRect, qword ptr [rbp-24], dword ptr [rbp-88], dword ptr [rbp-84], \
             dword ptr [rbp-80], dword ptr [rbp-76], 10, 10
     jmp     gfc_next
@@ -3226,6 +3234,8 @@ gfc_group:
     mov     dword ptr [rbp-88], 176            ; L
     mov     dword ptr [rbp-80], 460            ; R
     WINCALL MapDialogRect, qword ptr [rbp-32], addr rbp-88
+    mov     eax, dword ptr [rbp-112]           ; stretch heading text room to the widened pane
+    add     dword ptr [rbp-80], eax
     WINCALL DrawTextW, qword ptr [rbp-24], addr g_grouptxt, -1, addr rbp-88, DT_NAMEFLAGS
 gfc_grp_rule:
     mov     eax, dword ptr [rbp-104]
@@ -3235,6 +3245,8 @@ gfc_grp_rule:
     mov     dword ptr [rbp-88], 176            ; L
     mov     dword ptr [rbp-80], 460            ; R
     WINCALL MapDialogRect, qword ptr [rbp-32], addr rbp-88
+    mov     eax, dword ptr [rbp-112]           ; stretch the hairline rule to the widened pane
+    add     dword ptr [rbp-80], eax
     WINCALL FillRect, qword ptr [rbp-24], addr rbp-88, qword ptr [rbp-96]
 gfc_next:
     inc     dword ptr [rbp-64]
@@ -3365,6 +3377,7 @@ grf_next:
 grf_done:
     mov     rcx, qword ptr [rbp-24]           ; also stretch the detail value columns
     call    gui_stretch_rows
+    WINCALL InvalidateRect, qword ptr [rbp-24], 0, 1   ; repaint the field cards at the new width
     FRAME_EPILOG
     ret
 gui_reflow endp
