@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""deadcode.py - static dead-symbol detector for Vordr's MASM sources.
+
+Replaces the manual dead-symbol sweeps from the code-cleanup audits with a
+repeatable tool.  It reads every src/*.asm file, collects the symbols each one
+*defines* (procs, data labels, and equ/textequ constants), then pools every
+identifier *referenced* anywhere across all sources.  A defined symbol whose
+name never appears as a reference is dead code.
+
+Why source, not obj/*.lst: build.cmd does not clean obj/, so stale listings
+from deleted modules (bloom.lst, csvimport.lst, ...) linger there and would
+produce phantom results.  The sources are the ground truth and need no build.
+
+References are pooled across ALL files, so a proc defined in one module and
+called from another counts as live.  A symbol used only through a macro still
+appears - Vordr's macros (WINCALL, WSTR, CALL_GUARDED, ...) take the symbol
+name as a literal argument, so the name token is present in the source text.
+
+Categories: proc | data | equ | macro.  --only <cat> narrows the report.
+Exit code = number of dead symbols found (minus the allowlist), so
+"build strict" can gate on it.  Usage:
+    python tools\\deadcode.py [--src DIR] [--only proc|data|equ|macro] [-v]
+"""
+import re, glob, os, sys, argparse
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DEF_SRC = os.path.normpath(os.path.join(HERE, "..", "src"))
+
+# Symbols that are live but referenced only from OUTSIDE the .asm sources
+# (the linker, the build script, or the resource compiler).  Anything reached
+# through an in-source call/dispatch table (cmd_* verbs, window/dialog procs
+# via addr/offset, selftest sub-procs) already shows up as a reference and does
+# NOT belong here.
+ALLOWLIST = {
+    "wstart",          # /entry:wstart in build.cmd - the PE entry point
+    "kat_img_b",       # payload bytes read by adjacency to kat_img (dd len; bytes
+                       # follow) in the field-serialization KAT - live data, the
+                       # label just isn't named.  Same idea as a struct field.
+}
+
+# MASM identifiers: letter/_/$/?/@ then letter/digit/_/$/?/@.  Matches both the
+# definition names and the reference tokens.
+IDENT = r'[A-Za-z_$?@][A-Za-z0-9_$?@]*'
+RE_TOKEN = re.compile(IDENT)
+RE_DEF = re.compile(
+    r'^\s*(' + IDENT + r')\s+(proc|macro|equ|textequ|label|d[bwdq]|d[ft]|real[48]|tbyte)\b',
+    re.I)
+# STRUCT/UNION open a layout block; every field inside defines an offset, not a
+# removable symbol, so those lines are skipped for BOTH def and ref collection.
+RE_STRUCT_OPEN = re.compile(r'^\s*' + IDENT + r'\s+(struct|union)\b', re.I)
+RE_STRUCT_END = re.compile(r'^\s*(' + IDENT + r')\s+ends\b', re.I)
+# "<name> endp" closes a proc; the leading name is a bookkeeping marker paired
+# with the def, NOT a reference - counting it would make every proc look live.
+RE_ENDP = re.compile(r'^\s*(' + IDENT + r')\s+endp\b', re.I)
+KIND_MAP = {"proc": "proc", "macro": "macro", "equ": "equ", "textequ": "equ"}
+# equ/textequ names with a resource-id prefix mirror vordr.rc's #defines (the
+# gui.asm block is explicitly commented "MUST match vordr.rc").  Their true
+# reference is the resource script, not asm code, so an unused one is expected,
+# not dead.  They are reported under the "rcid" category but never gated.
+RE_RCID = re.compile(r'^(IDC_|DLG_|IDD_|IDD|IDR_|IDS_|IDB_|IDI_|DLG)', re.I)
+# Categories the strict gate counts (proc/data/equ/macro).  "rcid" is advisory.
+GATED = {"proc", "data", "equ", "macro"}
+
+
+def strip_line(l):
+    """Drop the ; comment and blank out quoted-string contents so string bytes
+    like db \"vault-kat\" never masquerade as identifier references."""
+    out = []
+    q = None
+    for c in l:
+        if q:
+            if c == q:
+                q = None
+            # swallow string body
+        elif c in "'\"":
+            q = c
+        elif c == ';':
+            break
+        else:
+            out.append(c)
+    return ''.join(out)
+
+
+def kind_of(directive):
+    d = directive.lower()
+    return KIND_MAP.get(d, "data")   # label / db / dw / dd / dq / real* -> data
+
+
+def scan(paths):
+    defs = {}        # name -> (file, lineno, kind)
+    refs = set()     # every identifier used anywhere
+    for path in paths:
+        fname = os.path.basename(path)
+        in_struct = False
+        for n, raw in enumerate(open(path, encoding='latin-1'), 1):
+            s = strip_line(raw.rstrip('\n'))
+            if not s.strip():
+                continue
+            if in_struct:
+                # inside a STRUCT/UNION: fields are layout, not symbols.  Watch
+                # only for the matching "<name> ends".
+                if RE_STRUCT_END.match(s):
+                    in_struct = False
+                continue
+            if RE_STRUCT_OPEN.match(s):
+                # the struct/union type name itself is a real symbol; record it
+                # and enter skip mode for the body.
+                nm = RE_TOKEN.match(s.strip()).group(0)
+                defs.setdefault(nm, (fname, n, "data"))
+                in_struct = True
+                continue
+            me = RE_ENDP.match(s)
+            if me:
+                # count tokens after the proc name (usually none), never the name
+                refs.update(RE_TOKEN.findall(s[me.end(1):]))
+                continue
+            m = RE_DEF.match(s)
+            if m:
+                name, directive = m.group(1), m.group(2)
+                kind = kind_of(directive)
+                if kind == "equ" and RE_RCID.match(name):
+                    kind = "rcid"
+                # first definition wins; keep its location for the report
+                defs.setdefault(name, (fname, n, kind))
+                # the rest of the def line can still reference other symbols
+                # (equ RHS, label type, dd initialiser) - count those, but not
+                # the symbol being defined (its leading token).
+                rest = s[m.end(1):]
+                refs.update(RE_TOKEN.findall(rest))
+            else:
+                refs.update(RE_TOKEN.findall(s))
+    return defs, refs
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--src", default=DEF_SRC)
+    ap.add_argument("--only", choices=["proc", "data", "equ", "macro", "rcid"])
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="list allowlisted-but-dead symbols too")
+    args = ap.parse_args()
+
+    paths = sorted(glob.glob(os.path.join(args.src, "*.asm")))
+    defs, refs = scan(paths)
+
+    dead = []
+    for name, (fname, line, kind) in sorted(defs.items(), key=lambda kv: (kv[1][0], kv[1][1])):
+        if name in refs:
+            continue
+        if args.only and kind != args.only:
+            continue
+        allow = name in ALLOWLIST
+        if allow and not args.verbose:
+            continue
+        dead.append((fname, line, kind, name, allow))
+
+    gated = 0        # counts toward the exit code (proc/data/equ/macro)
+    advisory = 0     # rcid: reported, never gated
+    for fname, line, kind, name, allow in dead:
+        tag = " (allowlisted)" if allow else ""
+        label = "unused rcid" if kind == "rcid" else f"dead {kind}"
+        if not allow:
+            if kind in GATED:
+                gated += 1
+            else:
+                advisory += 1
+        print(f"[{label}] {fname}:{line} {name}{tag}")
+
+    n_def = len(defs)
+    extra = f", {advisory} advisory rcid" if advisory else ""
+    print(f"deadcode: {gated} dead / {n_def} symbols{extra} "
+          f"({'clean' if gated == 0 else 'DEAD CODE PRESENT'})")
+    sys.exit(min(gated, 255))
+
+
+if __name__ == "__main__":
+    main()

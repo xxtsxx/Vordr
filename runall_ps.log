@@ -1,0 +1,13 @@
+=== stage: build (release, strict framecheck) ===
+=== stage: selftest ===
+=== stage: roundtrip (seedtest / atgen / zitest / phtest / secscan / tmptest) ===
+  zitest: imported 1 entries - ok
+
+============ run_all summary ============
+  stage        result   seconds
+  redteam      skip     -
+  build        PASS     1
+  selftest     PASS     0
+  roundtrip    PASS     4
+=========================================
+ALL STAGES PASSED 

@@ -17,6 +17,13 @@ extern GetModuleHandleW:proc
 extern rng_fill:proc                    ; random.asm: rcx=buf, rdx=len -> eax=1 ok
 extern print_a:proc                     ; console.asm (cttest probe)
 extern print_u64:proc
+extern secmem_panic_wipe:proc           ; secmem.asm: zero every live secret buffer
+extern SetUnhandledExceptionFilter:proc
+extern AddVectoredExceptionHandler:proc
+extern SetErrorMode:proc
+extern TerminateProcess:proc
+extern GetCurrentProcess:proc
+extern MessageBoxW:proc
 
 MEM_COMMIT          equ 1000h
 MEM_RESERVE         equ 2000h
@@ -55,6 +62,25 @@ g_sstk_base     dq 0
 g_sstk_index    dq 0
 g_cpu_features  dd 0
 g_heap_gen      dd 1                    ; global generation counter
+public g_gui_active
+g_gui_active    dd 0                    ; 1 once the GUI is up (crash apology box)
+
+SEM_FAILCRITICALERRORS  equ 1
+SEM_NOGPFAULTERRORBOX   equ 2
+MB_OK_          equ 0
+MB_ICONERROR_   equ 10h
+
+.const
+crash_apology label word
+    dw 'V','o','r','d','r',' ','h','i','t',' ','a',' ','f','a','t','a','l',' ','e'
+    dw 'r','r','o','r',' ','a','n','d',' ','m','u','s','t',' ','c','l','o','s','e'
+    dw '.',' ','Y','o','u','r',' ','s','e','c','r','e','t','s',' ','w','e','r','e'
+    dw ' ','w','i','p','e','d',' ','f','r','o','m',' ','m','e','m','o','r','y','.', 0
+crash_title label word
+    dw 'V','o','r','d','r', 0
+ifdef DBG_TRACE
+CSTR crash_bc, "crash: unhandled exception - wiping secrets, terminating",13,10
+endif
 
 .code
 
@@ -65,6 +91,82 @@ public sstk_overflow_fail
 sstk_overflow_fail proc
     FASTFAIL FF_SHADOW_STACK
 sstk_overflow_fail endp
+
+; =============================================================================
+; crash_contain() - the shared crash-containment action: wipe every live secret
+;   buffer, print a dbg breadcrumb, show a one-line apology (GUI only), then
+;   terminate the process hard.  No secret can reach a WER minidump or
+;   hibernation image, and the OS never runs its dump writer for this fault.
+;   Never returns.
+; =============================================================================
+crash_contain proc frame
+    FRAME_PROLOG 32
+    call    secmem_panic_wipe                   ; secrets gone before anything else
+ifdef DBG_TRACE
+    lea     rcx, [crash_bc]
+    mov     edx, crash_bc_len
+    call    print_a
+endif
+    cmp     dword ptr [g_gui_active], 0          ; apology box only when a GUI is up
+    je      cc_kill                             ; (headless CLI never blocks on a modal)
+    WINCALL MessageBoxW, 0, addr crash_apology, addr crash_title, \
+            <MB_OK_ or MB_ICONERROR_>
+cc_kill:
+    WINCALL GetCurrentProcess
+    WINCALL TerminateProcess, rax, 0C0000409h
+    FRAME_EPILOG                                ; unreached
+    ret
+crash_contain endp
+
+; =============================================================================
+; crash_veh(rcx = PEXCEPTION_POINTERS) -> LONG.  Vectored exception handler,
+;   the PRIMARY containment path: it runs first-chance, so it fires before any
+;   OS dump writer and even when a monitor/debugger owns the last-chance filter.
+;   It only acts on error-severity (0xCxxxxxxx) codes - access violations,
+;   stack-buffer-overrun fastfails, illegal instructions, etc. - and passes
+;   benign first-chance events (guard-page stack growth 0x80000001, single-step)
+;   straight through with EXCEPTION_CONTINUE_SEARCH so normal execution is
+;   untouched.  On a fatal code it never returns (crash_contain terminates).
+; =============================================================================
+crash_veh proc frame
+    FRAME_PROLOG 32
+    mov     rax, qword ptr [rcx]                ; -> EXCEPTION_RECORD
+    mov     eax, dword ptr [rax]                ; ExceptionCode
+    and     eax, 0F0000000h                     ; severity nibble
+    cmp     eax, 0C0000000h                     ; ERROR severity => fatal
+    jne     cv_pass
+    call    crash_contain                       ; wipe + terminate (no return)
+cv_pass:
+    xor     eax, eax                            ; EXCEPTION_CONTINUE_SEARCH
+    FRAME_EPILOG
+    ret
+crash_veh endp
+
+; crash_filter(rcx = PEXCEPTION_POINTERS) -> LONG.  Backup last-chance filter
+;   for environments where a VEH is not reached; same containment action.
+crash_filter proc frame
+    FRAME_PROLOG 32
+    call    crash_contain
+    xor     eax, eax                            ; EXCEPTION_CONTINUE_SEARCH (unreached)
+    FRAME_EPILOG
+    ret
+crash_filter endp
+
+; =============================================================================
+; crash_install() - arm crash containment.  Suppresses the WER fault UI for
+;   this process (SetErrorMode, no registry change), installs the vectored
+;   handler as the first-chance responder, and the top-level filter as backup.
+;   Call once, early in wstart, before any secret exists.
+; =============================================================================
+public crash_install
+crash_install proc frame
+    FRAME_PROLOG 32
+    WINCALL SetErrorMode, <SEM_FAILCRITICALERRORS or SEM_NOGPFAULTERRORBOX>
+    WINCALL AddVectoredExceptionHandler, 1, addr crash_veh
+    WINCALL SetUnhandledExceptionFilter, addr crash_filter
+    FRAME_EPILOG
+    ret
+crash_install endp
 
 ; =============================================================================
 ; hardening_init - must be the first call made by the entry point.

@@ -19,10 +19,13 @@ extern VirtualAlloc:proc
 extern VirtualFree:proc
 extern MoveFileExW:proc
 extern DeleteFileW:proc
+extern CopyFileW:proc
+extern FlushFileBuffers:proc
 extern GetDiskFreeSpaceExW:proc
 extern secure_zero:proc
 
 MOVEFILE_REPLACE_EXISTING equ 1
+MOVEFILE_WRITE_THROUGH    equ 8
 
 GENERIC_READ        equ 80000000h
 GENERIC_WRITE       equ 40000000h
@@ -176,6 +179,10 @@ write_file proc frame
         sub     qword ptr [rbp-56], r10
     xENDW
 wf_ok:
+    ; force the bytes to the disk before we close (and, upstream, rename over the
+    ; live vault): without this the temp file can still be in the cache when the
+    ; atomic replace happens, so a power cut would leave a truncated vault.
+    WINCALL FlushFileBuffers, qword ptr [rbp-40]
     WINCALL CloseHandle, qword ptr [rbp-40]
     xor     eax, eax
     jmp     wf_done
@@ -201,11 +208,13 @@ write_file endp
 
 
 
-; file_rename(rcx = from, rdx = to) -> eax 0/EXIT_IO  (atomic replace)
+; file_rename(rcx = from, rdx = to) -> eax 0/EXIT_IO  (atomic replace).
+;   WRITE_THROUGH flushes the rename itself to disk before returning, so the
+;   directory entry can't be lost in a crash after we think the save succeeded.
 public file_rename
 file_rename proc frame
     FRAME_PROLOG 48
-    WINCALL MoveFileExW, rcx, rdx, MOVEFILE_REPLACE_EXISTING
+    WINCALL MoveFileExW, rcx, rdx, <MOVEFILE_REPLACE_EXISTING or MOVEFILE_WRITE_THROUGH>
     test    eax, eax
     jz      frn_io
     xor     eax, eax

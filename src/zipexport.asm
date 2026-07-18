@@ -1368,47 +1368,6 @@ bp32_over:
     ret
 buf_pu32 endp
 
-; buf_pu64(rcx=desc, rdx=val)                                                  leaf
-buf_pu64 proc
-    mov     rax, qword ptr [rcx+8]
-    mov     r9, rax
-    add     r9, 8
-    cmp     r9, qword ptr [rcx+16]
-    ja      bp64_over
-    mov     r10, qword ptr [rcx]
-    mov     qword ptr [r10+rax], rdx
-    add     qword ptr [rcx+8], 8
-    ret
-bp64_over:
-    mov     byte ptr [g_xl_err], 1
-    ret
-buf_pu64 endp
-
-; buf_zero(rcx=desc, rdx=count) - append count zero bytes                      leaf
-buf_zero proc
-    test    rdx, rdx
-    jz      bz_ret
-    mov     rax, qword ptr [rcx+8]
-    mov     r9, rax
-    add     r9, rdx
-    cmp     r9, qword ptr [rcx+16]
-    ja      bz_over
-    mov     r10, qword ptr [rcx]
-    add     r10, rax
-    xor     r11, r11
-bz_lp:
-    mov     byte ptr [r10+r11], 0
-    inc     r11
-    cmp     r11, rdx
-    jb      bz_lp
-    add     qword ptr [rcx+8], rdx
-bz_ret:
-    ret
-bz_over:
-    mov     byte ptr [g_xl_err], 1
-    ret
-buf_zero endp
-
 ; buf_putcstr(rcx=desc, rdx=cstr)                                              leaf
 buf_putcstr proc
 bpc_lp:

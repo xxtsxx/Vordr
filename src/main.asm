@@ -40,8 +40,17 @@ extern log_result:proc
 extern do_bench:proc                    ; benchmark (bench.asm)
 extern gui_phtest:proc                  ; pw-history capture probe (gui.asm)
 extern gui_tmptest:proc                 ; secure temp-file lifecycle probe (gui.asm)
+extern fuzzy_score:proc                 ; fuzzy-search scoring (gui.asm)
+extern gui_trtest:proc                  ; trash timestamp/threshold probe (gui.asm)
 extern cmd_secscan:proc                 ; secret-wipe page-scan probe (secmem.asm)
 extern cmd_securedesk:proc              ; secure-desktop spike (gui.asm)
+extern cmd_vfuzz:proc                   ; vault record-parser fuzzer (vault.asm)
+extern cmd_zfuzz:proc                   ; zip-import parser fuzzer (zipimport.asm)
+extern cmd_bktest:proc                  ; atomic-save + backup rotation probe (vault.asm)
+extern cmd_mactest:proc                 ; full-file MAC tamper-detection probe (vault.asm)
+extern cmd_rbtest:proc                  ; anti-rollback detection probe (vault.asm)
+extern cmd_xctest:proc                  ; external-change detection probe (vault.asm)
+extern cmd_pkat:proc                    ; parallel fail-closed KAT gate (selftest.asm)
 extern read_file:proc
 ifdef DBG_TRACE
 extern cmd_redteam:proc                 ; fault-injection self-test (redteam.asm)
@@ -116,6 +125,7 @@ g_field_list        dq 3*MAX_FIELDS dup (0)
 
 .data?
 public g_cfg_pass, g_positionals, g_poscount
+public g_argv
 g_argv          dq MAX_ARGS dup (?)
 g_argbuf        dw ARGBUF_CHARS dup (?)
 g_gen_buf       db 160 dup (?)           ; genpw: sample output buffer
@@ -167,12 +177,22 @@ WSTR w_zitest,   <zitest>
 WSTR w_phtest,   <phtest>
 WSTR w_secscan,  <secscan>
 WSTR w_tmptest,  <tmptest>
+WSTR w_fztest,   <fztest>
+WSTR w_vfuzz,    <vfuzz>
+WSTR w_fuzzzip,  <fuzzzip>
+WSTR w_bktest,   <bktest>
+WSTR w_mactest,  <mactest>
+WSTR w_rbtest,   <rbtest>
+WSTR w_xctest,   <xctest>
+WSTR w_pkat,     <pkat>
+WSTR w_trtest,   <trtest>
 WSTR w_securedesk, <securedesk>
 WSTR wpw_exp,    <VordrExp1234>
 ifdef DBG_TRACE
 WSTR w_redteam,  <redteam>
 WSTR w_tpmtest,  <tpmtest>
 WSTR w_cttest,   <cttest>
+WSTR w_crashme,  <crashme>
 endif
 WSTR w_opt_m,    <-m>
 WSTR w_opt_t,    <-t>
@@ -204,15 +224,25 @@ cmd_table label CMDENT
     CMDENT { w_phtest,    cmd_phtest,    0, 0 }   ; headless pw-history capture probe
     CMDENT { w_secscan,   cmd_secscan,   0, 0 }   ; secret-wipe page-scan probe
     CMDENT { w_tmptest,   cmd_tmptest,   0, 0 }   ; secure temp-file lifecycle probe
+    CMDENT { w_fztest,    cmd_fztest,    0, 0 }   ; fuzzy-search scoring KAT
+    CMDENT { w_vfuzz,     cmd_vfuzz,     0, 0 }   ; vault record-parser structural fuzzer
+    CMDENT { w_fuzzzip,   cmd_zfuzz,     0, 0 }   ; zip-import parser structural fuzzer
+    CMDENT { w_bktest,    cmd_bktest,    1, 0 }   ; atomic-save + backup-rotation probe
+    CMDENT { w_mactest,   cmd_mactest,   1, 0 }   ; full-file MAC tamper-detection probe
+    CMDENT { w_rbtest,    cmd_rbtest,    1, 0 }   ; anti-rollback detection probe
+    CMDENT { w_xctest,    cmd_xctest,    1, 0 }   ; external-change detection probe
+    CMDENT { w_pkat,      cmd_pkat,      0, 0 }   ; parallel fail-closed KAT gate
+    CMDENT { w_trtest,    cmd_trtest,    0, 0 }   ; trash timestamp/threshold KAT
     CMDENT { w_securedesk, cmd_securedesk, 0, 0 } ; show a dialog on the private desktop (plan 4 spike)
 ifdef DBG_TRACE
     CMDENT { w_redteam,   cmd_redteam,   1, 0 }   ; fault-injection self-test (dbg)
     CMDENT { w_tpmtest,   cmd_tpmtest,   0, 0 }   ; TPM round-trip probe (dbg)
     CMDENT { w_cttest,    cmd_cttest,    0, 0 }   ; ct_memcmp timing probe (dbg)
-CMD_COUNT equ 13
-else
-CMD_COUNT equ 10
+    CMDENT { w_crashme,   cmd_crashme,   0, 0 }   ; deliberate AV -> crash-containment (dbg)
 endif
+; Derive the count from the table's actual size so adding a CMDENT never needs a
+; manual bump (a stale count silently drops trailing verbs to GUI fall-through).
+CMD_COUNT equ ($ - cmd_table) / (sizeof CMDENT)
 
 .data?
 ifdef DBG_TRACE
@@ -1083,6 +1113,130 @@ cmd_tmptest proc frame
     FRAME_EPILOG
     ret
 cmd_tmptest endp
+
+; fuzzy_score KAT strings (upper-cased, since fuzzy_score assumes pre-folded input)
+WSTR fz_gm,        <GM>
+WSTR fz_gmail,     <GMAIL>
+WSTR fz_gmwk,      <GMWK>
+WSTR fz_gmailwork, <GMAIL WORK>
+WSTR fz_agmb,      <AGMB>
+WSTR fz_empty,     <>
+WSTR fz_any,       <ANYTHING>
+WSTR fz_workgmail, <WORK GMAIL ACCOUNT>
+WSTR fz_gmailwrk,  <GMAIL WRK>
+WSTR fz_zz,        <ZZ>
+CSTR fzt_ok,   "fztest: PASS (fuzzy scoring + ranking)",13,10
+CSTR fzt_bad,  "fztest: FAIL",13,10
+
+; cmd_fztest - fuzzy-search scoring known-answer test.  exit 0 = pass.
+;   [rbp-24] holds score(GM,GMAIL) while the ordering comparison runs.
+LANDING_PAD
+cmd_fztest proc frame
+    FRAME_PROLOG 32
+    lea     rcx, [fz_gm]                    ; match: "GM" in "GMAIL"
+    lea     rdx, [fz_gmail]
+    call    fuzzy_score
+    test    eax, eax
+    js      fzt_fail
+    lea     rcx, [fz_gmwk]                  ; nomatch: "GMWK" (no W in "GMAIL")
+    lea     rdx, [fz_gmail]
+    call    fuzzy_score
+    test    eax, eax
+    jns     fzt_fail
+    lea     rcx, [fz_gmwk]                  ; match: "GMWK" in "GMAIL WORK"
+    lea     rdx, [fz_gmailwork]
+    call    fuzzy_score
+    test    eax, eax
+    js      fzt_fail
+    lea     rcx, [fz_empty]                 ; empty needle matches anything (score 0)
+    lea     rdx, [fz_any]
+    call    fuzzy_score
+    test    eax, eax
+    js      fzt_fail
+    lea     rcx, [fz_gmailwrk]              ; nomatch: term "WRK" absent from "GMAIL"
+    lea     rdx, [fz_gmail]
+    call    fuzzy_score
+    test    eax, eax
+    jns     fzt_fail
+    lea     rcx, [fz_gmailwrk]              ; match: both terms in "WORK GMAIL ACCOUNT"
+    lea     rdx, [fz_workgmail]
+    call    fuzzy_score
+    test    eax, eax
+    js      fzt_fail
+    lea     rcx, [fz_zz]                    ; nomatch: "ZZ" absent
+    lea     rdx, [fz_gmail]
+    call    fuzzy_score
+    test    eax, eax
+    jns     fzt_fail
+    lea     rcx, [fz_gm]                    ; ordering: word-start+contiguous beats mid-word
+    lea     rdx, [fz_gmail]
+    call    fuzzy_score
+    mov     dword ptr [rbp-24], eax         ; score(GM,GMAIL)
+    lea     rcx, [fz_gm]
+    lea     rdx, [fz_agmb]
+    call    fuzzy_score                     ; score(GM,AGMB)
+    cmp     dword ptr [rbp-24], eax
+    jle     fzt_fail                        ; GMAIL must rank strictly higher
+    lea     rcx, [fzt_ok]
+    mov     edx, fzt_ok_len
+    call    print_a
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+fzt_fail:
+    lea     rcx, [fzt_bad]
+    mov     edx, fzt_bad_len
+    call    print_a
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_fztest endp
+
+ifdef DBG_TRACE
+; cmd_crashme - deliberately fault to exercise crash containment (plan 36).  It
+;   plants a sentinel into the master-password buffer, then writes through a null
+;   pointer.  The unhandled exception must reach crash_filter, which wipes every
+;   secret (secmem_panic_wipe) and terminates with no WER dump.  Never returns.
+LANDING_PAD
+cmd_crashme proc frame
+    FRAME_PROLOG 32
+    lea     r10, [g_cfg_pass]                   ; plant a recognizable secret
+    mov     byte ptr [r10+0], 'S'
+    mov     byte ptr [r10+1], 'E'
+    mov     byte ptr [r10+2], 'C'
+    mov     dword ptr [g_cfg_passlen], 3
+    xor     rax, rax                            ; deliberate null-pointer write -> AV
+    mov     byte ptr [rax], 0
+    xor     eax, eax                            ; unreachable
+    FRAME_EPILOG
+    ret
+cmd_crashme endp
+endif
+
+CSTR trt_ok,   "trtest: PASS (trash timestamp + 30-day purge threshold)",13,10
+CSTR trt_bad,  "trtest: FAIL",13,10
+
+; cmd_trtest - trash timestamp encode/decode + purge-threshold KAT.  exit 0 = pass.
+LANDING_PAD
+cmd_trtest proc frame
+    FRAME_PROLOG 32
+    call    gui_trtest
+    test    eax, eax
+    jnz     trt_fail
+    lea     rcx, [trt_ok]
+    mov     edx, trt_ok_len
+    call    print_a
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+trt_fail:
+    lea     rcx, [trt_bad]
+    mov     edx, trt_bad_len
+    call    print_a
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_trtest endp
 
 ; =============================================================================
 ; is_cli_command -> eax = 1 if argv[1] names a known command verb, else 0.
