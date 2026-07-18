@@ -52,7 +52,10 @@ for %%c in (canary shadow dlpv overflow bounds typemagic heaptag iat) do (
     set /a HI="(!RC! >> 16) & 0xFFFF"
     set OK=0
     if !HI! equ 64222 set OK=1
-    if "%%c"=="iat" if !RC! equ -1073741819 set OK=1
+    rem iat corrupts the (locked) IAT -> the call faults with a raw AV, which the
+    rem crash-containment VEH now catches, wipes secrets, and terminates with
+    rem 0xC0000409 (-1073740791).  The control still fired; the fault is contained.
+    if "%%c"=="iat" if !RC! equ -1073740791 set OK=1
     if !OK!==1 (
         echo   redteam %%c: fired ^(exit !RC!^) - ok
     ) else (
@@ -122,6 +125,33 @@ if not "!errorlevel!"=="0" ( echo   secscan: FAIL ^(exit !errorlevel!, secret re
 
 bin\vordr.exe tmptest > "%WORK%\tmptest.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   tmptest: FAIL ^(exit !errorlevel!, temp file not wiped+deleted^) & set RT=FAIL )
+
+bin\vordr.exe fztest > "%WORK%\fztest.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   fztest: FAIL ^(exit !errorlevel!, fuzzy scoring KAT^) & set RT=FAIL )
+
+bin\vordr.exe trtest > "%WORK%\trtest.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   trtest: FAIL ^(exit !errorlevel!, trash timestamp/threshold KAT^) & set RT=FAIL )
+
+bin\vordr.exe vfuzz > "%WORK%\vfuzz.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   vfuzz: FAIL ^(exit !errorlevel!, vault parser fuzzer crashed^) & set RT=FAIL )
+
+bin\vordr.exe fuzzzip > "%WORK%\fuzzzip.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   fuzzzip: FAIL ^(exit !errorlevel!, zip-import parser fuzzer crashed^) & set RT=FAIL )
+
+bin\vordr.exe bktest "%WORK%\bk.vault" > "%WORK%\bktest.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   bktest: FAIL ^(exit !errorlevel!, atomic-save/backup rotation^) & set RT=FAIL )
+
+bin\vordr.exe mactest "%WORK%\mac.vault" > "%WORK%\mactest.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   mactest: FAIL ^(exit !errorlevel!, full-file MAC tamper detection^) & set RT=FAIL )
+
+bin\vordr.exe rbtest "%WORK%\rb.vault" > "%WORK%\rbtest.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   rbtest: FAIL ^(exit !errorlevel!, anti-rollback detection^) & set RT=FAIL )
+
+bin\vordr.exe xctest "%WORK%\xc.vault" > "%WORK%\xctest.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   xctest: FAIL ^(exit !errorlevel!, external-change detection^) & set RT=FAIL )
+
+bin\vordr.exe pkat > "%WORK%\pkat.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   pkat: FAIL ^(exit !errorlevel!, parallel fail-closed KAT gate^) & set RT=FAIL )
 
 set R_ROUNDTRIP=!RT!
 call :now T1

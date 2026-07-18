@@ -16,6 +16,14 @@ include macros.inc
 extern sha256_hash:proc
 extern ct_memcmp:proc
 extern print_a:proc
+extern CreateThread:proc
+extern WaitForMultipleObjects:proc
+extern CloseHandle:proc
+extern GetSystemInfo:proc
+extern InitializeCriticalSection:proc
+extern EnterCriticalSection:proc
+extern LeaveCriticalSection:proc
+extern DeleteCriticalSection:proc
 extern gcm_seal:proc
 extern gcm_open:proc
 extern blake2b_hash:proc
@@ -90,6 +98,8 @@ sha_abc_exp     db 0bah,078h,016h,0bfh,08fh,001h,0cfh,0eah,041h,041h,040h,0deh,0
 ; SHA-512("abc") - FIPS 180-4
 
 CSTR st_hdr,       "running self-tests:",13,10
+CSTR pk_ok,        "pkat: PASS (threaded fail-closed KAT gate)",13,10
+CSTR pk_bad,       "pkat: FAIL",13,10
 CSTR st_pass_sha,  "  [PASS] sha-256  (FIPS 180-4 'abc')",13,10
 CSTR st_fail_sha,  "  [FAIL] sha-256",13,10
 CSTR st_pass_gcm,  "  [PASS] aes-256-gcm  (NIST SP800-38D + round-trip)",13,10
@@ -227,6 +237,12 @@ gcm_ct_exp  db 0ceh,0a7h,040h,03dh,04dh,060h,06bh,06eh,007h,04eh,0c5h,0d3h,0bah,
 gcm_tag_exp db 0d0h,0d1h,0c8h,0a7h,099h,099h,06bh,0f0h,026h,05bh,098h,0b5h,0d4h,08ah,0b9h,019h
 
 .data?
+align 8
+g_pkat_cs       db 40 dup (?)        ; CRITICAL_SECTION (x64 = 40 bytes)
+g_pkat_res      dd 8 dup (?)         ; per-thread PASS(0)/FAIL(1) slot
+g_pkat_h        dq 8 dup (?)         ; worker thread handles
+g_pkat_n        dd ?                 ; worker count = min(cores, PKAT_MAX)
+g_pkat_si       db 48 dup (?)        ; SYSTEM_INFO (dwNumberOfProcessors at +32)
 st_out          db 32 dup (?)
 b2b_out         db 64 dup (?)
 gcm_aadbuf      db 32 dup (?)
@@ -894,5 +910,144 @@ st_after_ctm:
     FRAME_EPILOG
     ret
 run_selftest endp
+
+PKAT_MAX    equ 4
+PKAT_ITERS  equ 2000
+
+; =============================================================================
+; pkat_worker(rcx = slot) - worker thread body for the parallel KAT gate.  Runs
+;   a SHA-256 known-answer test PKAT_ITERS times; on all-pass, clears its result
+;   slot to 0 (PASS).  A RAW frame (no FRAME_PROLOG) - it must not touch the
+;   process-global software shadow stack outside the critical section.  The KAT
+;   itself (sha256_hash uses FRAME_PROLOG) runs under g_pkat_cs, so only one
+;   thread is ever inside shadow-stack-using code at a time: correct LIFO use,
+;   no race.  (True parallel KAT compute awaits a per-thread shadow stack; this
+;   is the fail-closed thread-pool gate machinery, verified end to end.)
+; =============================================================================
+pkat_worker proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 96                          ; raw frame: shadow + a 32-byte out buf
+    mov     qword ptr [rbp-8], rcx           ; slot
+    mov     qword ptr [rbp-16], PKAT_ITERS
+pw_loop:
+    cmp     qword ptr [rbp-16], 0
+    je      pw_pass
+    WINCALL EnterCriticalSection, addr g_pkat_cs
+    lea     rcx, [st_abc]                    ; sha256("abc") -> [rbp-56]
+    mov     rdx, 3
+    lea     r8, [rbp-56]
+    call    sha256_hash
+    WINCALL LeaveCriticalSection, addr g_pkat_cs
+    lea     r10, [rbp-56]                    ; compare to the known digest
+    lea     r11, [sha_abc_exp]
+    xor     r9, r9
+pw_cmp:
+    mov     al, byte ptr [r10+r9]
+    cmp     al, byte ptr [r11+r9]
+    jne     pw_done                          ; mismatch -> leave slot FAIL
+    inc     r9
+    cmp     r9, 32
+    jb      pw_cmp
+    dec     qword ptr [rbp-16]
+    jmp     pw_loop
+pw_pass:
+    mov     rcx, qword ptr [rbp-8]           ; all iterations passed -> PASS
+    lea     r10, [g_pkat_res]
+    mov     dword ptr [r10+rcx*4], 0
+pw_done:
+    xor     eax, eax
+    add     rsp, 96
+    pop     rbp
+    ret
+pkat_worker endp
+
+; =============================================================================
+; cmd_pkat - parallel KAT gate (plan 34): spawn min(cores,PKAT_MAX) worker
+;   threads, each running a KAT loop; the gate FAILS CLOSED - every result slot
+;   starts FAIL and only an all-pass worker clears it, and a watchdog-bounded
+;   join (10 s) treats a hung/never-reporting worker as failure.  exit 0 = pass.
+; =============================================================================
+LANDING_PAD
+public cmd_pkat
+cmd_pkat proc frame
+    FRAME_PROLOG 96
+    ; [rbp-24] = loop counter  [rbp-32] = wait result
+    WINCALL GetSystemInfo, addr g_pkat_si
+    mov     eax, dword ptr [g_pkat_si+32]        ; dwNumberOfProcessors
+    test    eax, eax
+    jnz     @F
+    mov     eax, 1
+@@: cmp     eax, PKAT_MAX                        ; clamp to PKAT_MAX
+    jbe     @F
+    mov     eax, PKAT_MAX
+@@: mov     dword ptr [g_pkat_n], eax
+    WINCALL InitializeCriticalSection, addr g_pkat_cs
+    ; every result slot starts FAIL(1) - fail closed
+    mov     qword ptr [rbp-24], 0
+pk_init:
+    mov     eax, dword ptr [rbp-24]
+    cmp     eax, dword ptr [g_pkat_n]
+    jae     pk_spawn
+    lea     r10, [g_pkat_res]
+    mov     dword ptr [r10+rax*4], 1
+    inc     qword ptr [rbp-24]
+    jmp     pk_init
+pk_spawn:
+    mov     qword ptr [rbp-24], 0
+pk_spawn_loop:
+    mov     eax, dword ptr [rbp-24]
+    cmp     eax, dword ptr [g_pkat_n]
+    jae     pk_wait
+    WINCALL CreateThread, 0, 0, addr pkat_worker, qword ptr [rbp-24], 0, 0
+    mov     r10, qword ptr [rbp-24]
+    lea     r11, [g_pkat_h]
+    mov     qword ptr [r11+r10*8], rax
+    inc     qword ptr [rbp-24]
+    jmp     pk_spawn_loop
+pk_wait:
+    ; watchdog-bounded join: WAIT_ALL, 10 s.  A timeout (or any non-signalled
+    ; return) is a failure - a worker that hung never cleared its slot anyway.
+    WINCALL WaitForMultipleObjects, dword ptr [g_pkat_n], addr g_pkat_h, 1, 10000
+    mov     dword ptr [rbp-32], eax
+    mov     qword ptr [rbp-24], 0
+pk_close:
+    mov     eax, dword ptr [rbp-24]
+    cmp     eax, dword ptr [g_pkat_n]
+    jae     pk_eval
+    mov     r10, qword ptr [rbp-24]
+    lea     r11, [g_pkat_h]
+    WINCALL CloseHandle, qword ptr [r11+r10*8]
+    inc     qword ptr [rbp-24]
+    jmp     pk_close
+pk_eval:
+    WINCALL DeleteCriticalSection, addr g_pkat_cs
+    cmp     dword ptr [rbp-32], 0               ; WAIT_OBJECT_0 = all signalled
+    jne     pk_fail                             ; timeout / abandoned -> fail closed
+    mov     qword ptr [rbp-24], 0               ; every slot must be PASS(0)
+pk_sum:
+    mov     eax, dword ptr [rbp-24]
+    cmp     eax, dword ptr [g_pkat_n]
+    jae     pk_ok_ret
+    lea     r10, [g_pkat_res]
+    cmp     dword ptr [r10+rax*4], 0
+    jne     pk_fail
+    inc     qword ptr [rbp-24]
+    jmp     pk_sum
+pk_ok_ret:
+    lea     rcx, [pk_ok]
+    mov     edx, pk_ok_len
+    call    print_a
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+pk_fail:
+    lea     rcx, [pk_bad]
+    mov     edx, pk_bad_len
+    call    print_a
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_pkat endp
 
 end

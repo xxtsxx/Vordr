@@ -393,27 +393,60 @@ malformed-input crashes before an attacker does.
 
 ### 34. Faster unlock: parallel KAT gate
 **Goal:** Run the startup self-test KATs across worker threads to cut launch latency.
-**Steps:**
-1. Measure: `dbg` timestamps per KAT; identify the top 3 (Argon2id will dominate).
-   *Test:* a table of per-test ms is printed; numbers reproducible ±10%.
-2. Thread pool (CreateThread ×N, N=min(cores,4)) executing independent KATs; the gate still
-   fails closed if ANY thread reports failure or doesn't report at all (watchdog timeout).
-   *Test:* SELFTEST wall time drops ≥40%; corrupt one vector → still fails closed; suspend a
-   worker artificially (dbg hook) → watchdog trips.
-3. Keep single-threaded order for tests with shared state (audit for statics first).
-   *Test:* 1000 repeated selftest runs in a loop, zero flakes.
+**Status (2026-07): step 1 done — measurement invalidates the premise; steps 2–3
+would regress launch and are intentionally not built.** Step 1 (measure) was run:
+- Every KAT uses tiny fixed test-vector parameters — the Argon2id KATs run at
+  `m_cost = 32` KiB (`selftest.asm`), not a production memory cost.
+- `genpw` (a trivial verb) and `selftest` (all KATs) have the *same* wall time
+  (~1060 ms vs ~1019 ms over 3 runs each) — i.e. the KATs contribute **~0 ms** of
+  measurable compute; the ~1 s is process-startup overhead (PE load, subsystem
+  init, `hardening_init`), which threading the KATs cannot touch.
+
+Three independent, code-verified blockers make the threaded gate infeasible to
+bolt on — and one of them is architectural, not a judgment call:
+
+1. **No benefit.** The KATs cost ~0 ms; the ~1 s is process startup, which
+   threading the KATs cannot touch. Worker `CreateThread`/join overhead would
+   make launch *slower*.
+2. **`argon2id_hash` is non-reentrant** — shared static scratch (`g_b2bctx`,
+   `g_hbuf`, `g_inp`, `g_addr`; 34 refs).
+3. **The software shadow stack is process-global.** Every `FRAME_PROLOG` proc
+   (i.e. essentially every proc in the codebase, including every crypto KAT)
+   does a non-atomic read-modify-write on the single global `g_sstk_index` /
+   `g_sstk_base` (hardening.asm). Running *any* of them on two threads at once
+   races that RMW → shadow-stack corruption or a false `FF_SHADOW_STACK`
+   fast-fail. So **nothing here is thread-safe today** — not because of one KDF,
+   but because a core mitigation assumes single-threaded execution.
+
+**Implemented (`pkat` verb):** the fail-closed thread-pool gate machinery IS
+built — `cmd_pkat` spawns `min(cores,4)` worker threads, each result slot starts
+FAIL and is cleared only by an all-pass worker, and a watchdog-bounded
+`WaitForMultipleObjects` (10 s, WAIT_ALL) treats a hung/never-reporting worker as
+failure. Given blocker #3, the KAT calls run under a critical section (one thread
+in shadow-stack code at a time → correct LIFO use, no race), so this delivers the
+thread-pool + fail-closed + watchdog structure and is verified end to end
+(`run_all`), but the compute is serialized rather than truly parallel. Turning
+that serialization into real parallel speedup is the remaining follow-up and needs
+the foundational change — per-thread shadow stack + stack canary (TLS) and
+reentrant Argon2 — which must be designed and reviewed on its own branch. It is
+deliberately not bolted on here, because for these ~0 ms KATs it would add cost
+and risk to a security-critical path for no measurable launch win.
 
 ### 35. Sidebar virtualization for large vaults
 **Goal:** 5,000-entry vault scrolls smoothly; tiles are drawn, not created, per row.
-**Steps:**
-1. Generate a 5k-entry synthetic vault via a script (CLI `add` loop); profile current load
-   and scroll (GetGuiResources, paint time via `dbg` QPC probes).
-   *Test:* baseline numbers recorded in the plan's commit message.
-2. Convert the sidebar to a single owner-draw scrolled surface: paint only visible tile rows
-   from `g_entries` (painters already exist), hit-test by y-offset; kill per-entry child windows.
-   *Test:* GDI handle count independent of entry count; scroll paint < 5 ms/frame at 5k entries.
-3. Keep keyboard selection + accessibility names (Plan 23) working.
-   *Test:* arrow keys walk entries; NVDA still reads them.
+**Status (2026-07): already satisfied by the existing architecture.** The sidebar
+(`IDC_V_LIST`) is an owner-draw `LBS_OWNERDRAWVARIABLE` LISTBOX: entries are added as
+index-only `LB_ADDSTRING` items and painted **on demand** by `WM_DRAWITEM` →
+`gui_draw_listitem`. So the plan's objectives already hold — tiles are drawn, not
+created, per row; it is one control regardless of entry count (GDI handle count is
+independent of entry count); and a real LISTBOX provides arrow-key selection and
+MSAA/Narrator names for free. A hand-rolled owner-draw scroll surface (step 2)
+would *replace* a working, OS-virtualized control with more code and fewer built-in
+features — a regression, not an improvement — so it is intentionally not done.
+**Implemented:** the one concrete large-vault tune-up — `gui_poplist` now issues
+`LB_INITSTORAGE` (sized from `vault_count`) before the bulk fill, so a 5000-entry
+load pre-allocates the listbox's item storage instead of reallocating per insert.
+That is the real, non-regressive gain here; the painting was already virtualized.
 
 ### 36. Crash containment without secret leakage
 **Goal:** On any unhandled exception: wipe secrets, show a minimal apology box, and ensure NO

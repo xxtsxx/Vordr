@@ -21,6 +21,8 @@ include macros.inc
 ; ---- startup helpers ---------------------------------------------------------
 extern cpu_gate:proc
 extern hardening_init:proc
+extern crash_install:proc               ; hardening.asm: arm crash containment
+externdef g_gui_active:dword            ; hardening.asm: gate the crash apology box
 extern con_init:proc
 extern con_attach_parent:proc
 extern iat_lockdown:proc
@@ -37,6 +39,7 @@ extern do_init:proc
 extern vault_unlock:proc
 extern vault_lock:proc
 extern vault_reseal:proc
+extern vault_ext_changed:proc           ; vault.asm: on-disk file changed since load?
 extern vault_add_entry:proc
 extern vault_remove_at:proc
 extern vault_count:proc
@@ -80,6 +83,9 @@ externdef g_zi_stg_n:dword              ; staged entry count
 extern ze_free:proc
 externdef g_zbuf:qword
 extern ShellExecuteW:proc
+extern DragAcceptFiles:proc
+extern DragQueryFileW:proc
+extern DragFinish:proc
 extern GetTempPathW:proc
 extern GetClientRect:proc
 extern DeleteFileW:proc
@@ -109,6 +115,7 @@ externdef g_uline_br:qword
 externdef g_uline_ctl2:dword
 externdef g_uline_br2:qword
 externdef g_cfg_in:qword
+externdef g_rollback:dword              ; vault.asm: 1 if the unlocked file is a rollback
 externdef g_cfg_pass:byte
 externdef g_cfg_title:qword
 externdef g_cfg_user:qword
@@ -120,6 +127,9 @@ externdef g_cfg_totp:qword
 ; ---- Win32 -------------------------------------------------------------------
 extern GetModuleHandleW:proc
 extern ExitProcess:proc
+extern CreateMutexW:proc
+extern GetLastError:proc
+extern FindWindowW:proc
 extern MessageBoxW:proc
 extern DialogBoxParamW:proc
 ; secure-desktop (anti-keylogger) master-password entry
@@ -252,7 +262,6 @@ IDYES               equ 6
 IDNO                equ 7
 IDOK                equ 1
 IDCANCEL            equ 2
-DS_CENTER           equ 0800h
 
 WM_CLOSE            equ 10h
 WM_TIMER            equ 113h
@@ -313,13 +322,21 @@ SEARCH_MS           equ 300                ; refilter only after 0.3 s of no key
 IDLE_TIMER          equ 4                  ; timer id for the auto-lock idle poll
 IDLE_POLL_MS        equ 30000              ; check system idle time every 30 s
 WM_WTSSESSION_CHANGE equ 02B1h             ; session notification (Win+L etc.)
+WM_DROPFILES         equ 0233h             ; Explorer file drop (drag-and-drop attach)
 WTS_SESSION_LOCK    equ 7                  ; wparam: the workstation locked
 SEARCH_DEBOUNCE_MIN equ 200               ; ...but only when the list exceeds this many entries
+SCORE_CAP           equ 8192              ; entries beyond this index score 0 (ranking cap)
+FZ_WORDSTART        equ 16                ; fuzzy bonus: char matched at a word start
+FZ_CONTIG           equ 8                 ; fuzzy bonus: char contiguous with the previous match
+FZ_BASE             equ 1                 ; fuzzy score per matched char
 LBN_SELCHANGE       equ 1
 LB_ADDSTRING        equ 180h
 LB_RESETCONTENT     equ 184h
+LB_INITSTORAGE      equ 1A8h            ; pre-allocate item storage for large lists
 LB_SETCURSEL        equ 186h
 LB_GETCURSEL        equ 188h
+LB_GETITEMRECT      equ 198h            ; item bounding rect (recycle-glyph hit-test)
+GWL_USERDATA        equ -21             ; button accent tag (theme_drawitem primary)
 LB_GETCOUNT         equ 18Bh
 LB_GETITEMDATA      equ 199h
 LB_ERR              equ -1
@@ -566,6 +583,7 @@ MAX_TABS     equ 16           ; distinct labels (tabs) shown in the history brow
 IDC_V_TIMES  equ 236          ; created/modified timestamps line (below the last row)
 IDC_V_FAV    equ 237          ; header favorite (star) toggle
 IDC_V_CANCEL equ 238          ; "Cancel" button (edit mode, discards edits)
+IDC_V_DONE   equ 271          ; trash view: "Done" (exit recover mode); accent button
 FIELD_AREA_BOTTOM equ 292        ; rows may not grow past here (DLU; Add-field is at 296)
 ; Win32 window styles (gui.asm builds controls at runtime; the RC gets these
 ; from windows.h, but this module needs the numeric values).
@@ -618,12 +636,24 @@ WSTR t_err,         <Vordr - error>
 WSTR m_nocpu,       <This CPU lacks required features (AES-NI / PCLMULQDQ / SSE4.1) - cannot run.>
 WSTR m_stfail,      <Self-test FAILED - refusing to run. The binary may be corrupt.>
 WSTR t_remove,      <Remove this entry?>
+WSTR t_trash,       <Move this entry to the trash? It can be restored for 30 days.>
+WSTR t_delforever,  <Permanently delete this entry? This cannot be undone.>
+WSTR t_notrash,     <There are no deleted items to recover.>
+WSTR t_recover_ttl, <Recover items>
 WSTR s_pickvault,   <Select or create a vault file first.>
 WSTR s_nopw,        <Enter the master password.>
 WSTR s_badpw,       <Password must be 1..1024 UTF-8 bytes.>
 WSTR s_wrongpw,     <Wrong master password.>
 WSTR s_corrupt,     <Not a Vordr vault or the file is corrupt.>
 WSTR s_io,          <Cannot read or write that file.>
+WSTR s_rollback,    <This vault is older than the last one saved on this PC. It may be a restored backup or a rollback. Open it anyway?>
+WSTR s_rbabort,     <Unlock aborted (older vault).>
+WSTR t_rbtitle,     <Vault rollback warning>
+WSTR s_extchg,      <The vault file changed on disk since you opened it. Another program or copy may have written it. Overwrite with your changes?>
+WSTR t_exttitle,    <Vault changed on disk>
+WSTR g_singleton_name, <VordrSingletonMutex_v1>
+WSTR g_vault_title,    <Vordr - Vault>
+WSTR g_unlock_title,   <Vordr - Unlock vault>
 WSTR s_createfail,  <Could not create the vault (I/O or out of memory).>
 WSTR s_notitle,     <An entry needs a title.>
 WSTR s_nofieldroom, <No room for more fields on this record - remove one first.>
@@ -819,6 +849,8 @@ wb_star label word
     dw 0E734h, 0                                 ; FavoriteStar (outline = not favorite)
 wb_starf label word
     dw 0E735h, 0                                 ; FavoriteStarFill (favorited)
+wb_recycle label word
+    dw 267Bh, 0                                  ; recycle ♻ (recover mode: restore)
 fav_one label word
     dw '1', 0                                    ; VF_FAV marker value
 pht_lbl db 'Password'                            ; gui_phtest scratch (headless probe)
@@ -904,6 +936,8 @@ WSTR st_onedrive,   <OneDrive>
 WSTR st_documents,  <Documents>
 f_iconname label word
     dw 'S','e','g','o','e',' ','F','l','u','e','n','t',' ','I','c','o','n','s', 0
+f_symbol label word
+    dw 'S','e','g','o','e',' ','U','I',' ','S','y','m','b','o','l', 0
 f_segoeui label word
     dw 'S','e','g','o','e',' ','U','I', 0
 align 4
@@ -963,6 +997,10 @@ om_read label word
     dw 'R','e','a','d',' ','p','a','s','s','w','o','r','d', 0
 om_history label word
     dw 'S','h','o','w',' ','h','i','s','t','o','r','y', 0
+om_recover label word
+    dw 'R','e','c','o','v','e','r',' ','i','t','e','m','s', 2026h, 0
+om_leavetrash label word
+    dw 'R','e','t','u','r','n',' ','t','o',' ','v','a','u','l','t', 0
 t_created label word
     dw 'C','r','e','a','t','e','d',' ', 0
 t_modified label word
@@ -1081,6 +1119,9 @@ g_vaulthwnd dq ?                      ; the open DLG_VAULT window (0 when not sh
 align 2
 g_search_w  dw 512 dup (?)            ; current search query (wide, upper-cased)
 g_match_w   dw EBUF*2 dup (?)         ; scratch: a field value/label folded for matching
+align 4
+g_search_len dd ?                     ; active query length in chars (0 = no query -> title sort)
+g_entry_score dd SCORE_CAP dup (?)    ; fuzzy score per vault index (for score-descending sort)
 g_vpath     dw 1024 dup (?)        ; chosen vault path (wide, NUL-terminated)
 g_xlpw      dw 256 dup (?)         ; export password (wide; wiped after use)
 g_xlpw2     dw 256 dup (?)         ; export confirm password (wide; wiped)
@@ -1113,6 +1154,10 @@ g_url_origproc dq ?                  ; original EDIT wndproc (URL fields subclas
 g_fields      db MAXROWS*DESCSZ dup (?)   ; row descriptors
 g_field_count dd ?                        ; live row count
 g_fav_state   dd ?                         ; current entry is a favorite (0/1)
+g_deleted_state dd ?                       ; current entry is soft-deleted / in trash (0/1)
+g_trash_view  dd ?                         ; sidebar shows the trash (deleted entries) instead
+align 2
+g_deleted_ft  dw 20 dup (?)                ; VF_DELETED value: 16 wide hex FILETIME + NUL
 g_icon_set    dd ?                         ; current entry has a custom icon override (0/1)
 g_icon_glyph  dd ?                         ; override glyph codepoint (when g_icon_set)
 g_icon_color  dd ?                         ; override tile COLORREF   (when g_icon_set)
@@ -1122,6 +1167,8 @@ g_icon_valw   dw 20 dup (?)                ; scratch wide "GGGGCCCCCCCC" for sav
 g_pick_glyph  dd ?                         ; icon picker working selection (glyph)
 g_pick_color  dd ?                         ; icon picker working selection (color)
 g_layout      dd ?                         ; UI layout/density index (0 comfortable)
+public g_fontdelta
+g_fontdelta   dd ?                         ; font-size delta in px (fixed 0 = Medium)
 g_colorpw_row dd ?                         ; row whose revealed secret is colored (-1=none)
 g_rowpw_w     dw 512 dup (?)               ; revealed secret text for the color overlay
 g_wordtmp     dw 32 dup (?)                ; one resolved phonetic word (scratch)
@@ -1139,6 +1186,7 @@ g_titlefont   dq ?                         ; detail-header title (large semibold
 g_chevfont    dq ?                         ; small Fluent icons for flat reorder chevrons
 g_monofont    dq ?                         ; monospace font for the colored password readout
 g_phonfont    dq ?                         ; small monospace font for the phonetic columns
+g_symfont     dq ?                         ; Segoe UI Symbol - the recycle glyph in recover mode
 g_sub_w       dw 512 dup (?)               ; subtitle scratch (wide)
 g_cmpbuf      db 256 dup (?)               ; title-A copy for WM_COMPAREITEM
 g_imp_msgw    dw 160 dup (?)               ; CSV-import result message scratch (wide)
@@ -1296,6 +1344,19 @@ gu_open:
     call    gui_wipepw
     cmp     dword ptr [rbp-32], 0
     jne     gu_fail
+    ; anti-rollback: this vault is older than the last one saved on this machine
+    cmp     dword ptr [g_rollback], 0
+    je      gu_norb
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr s_rollback, addr t_rbtitle, \
+            <MB_YESNO or MB_ICONWARNING>
+    cmp     eax, IDYES
+    je      gu_norb
+    call    vault_lock                      ; user declined -> lock and stay on the dialog
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [s_rbabort]
+    call    gui_status
+    jmp     gu_done
+gu_norb:
     ; first opened the auto-default vault -> record its path in HKCU
     cmp     dword ptr [g_is_default], 0
     je      gu_success
@@ -1608,23 +1669,41 @@ gui_poplist proc frame
     ; read the search query and upper-case it for case-insensitive matching
     WINCALL GetDlgItemTextW, qword ptr [rbp-24], IDC_V_SEARCH, addr g_search_w, 255
     mov     dword ptr [rbp-56], eax              ; query length (chars)
+    mov     dword ptr [g_search_len], eax        ; publish for the score-aware sort
     test    eax, eax
     jz      gp_nofold
     WINCALL CharUpperBuffW, addr g_search_w, dword ptr [rbp-56]
 gp_nofold:
     call    vault_count
     mov     dword ptr [rbp-32], eax              ; count
+    ; pre-allocate the listbox's internal item storage so a 5000-entry bulk fill
+    ; does not repeatedly reallocate (plan 35: smooth large-vault handling).  The
+    ; owner-draw listbox already virtualizes painting; this just speeds the load.
+    mov     r10d, eax
+    imul    r10d, r10d, 8                        ; ~8 bytes of storage per item
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_INITSTORAGE, \
+            dword ptr [rbp-32], r10
     mov     dword ptr [rbp-40], 0               ; index
 gp_loop:
     mov     eax, dword ptr [rbp-40]
     cmp     eax, dword ptr [rbp-32]
     jae     gp_done
+    mov     ecx, dword ptr [rbp-40]             ; trash filter: show deleted iff in trash view
+    call    gui_entry_is_deleted
+    cmp     eax, dword ptr [g_trash_view]
+    jne     gp_next
     cmp     dword ptr [rbp-56], 0               ; empty query -> show everything
     je      gp_show
     mov     ecx, dword ptr [rbp-40]
-    call    gui_entry_matches
-    test    eax, eax
-    jz      gp_next
+    call    gui_entry_fuzzy                      ; eax = best fuzzy score, or -1
+    mov     r10d, dword ptr [rbp-40]             ; cache the score for the sort (idx<CAP)
+    cmp     r10d, SCORE_CAP
+    jae     gp_scored
+    lea     r11, [g_entry_score]
+    mov     dword ptr [r11+r10*4], eax
+gp_scored:
+    test    eax, eax                             ; -1 = no match -> skip
+    js      gp_next
 gp_show:
     ; owner-draw list: the item data IS the vault index; WM_COMPAREITEM sorts by
     ; title, WM_DRAWITEM renders the icon card.  Pass the index as a DWORD so the
@@ -1648,10 +1727,13 @@ gui_poplist endp
 ; gui_make_welcomefont() - lazily build the larger body font for the create
 ;   dialog's welcome text.  Its own frame: the 14-arg CreateFontW needs the room.
 gui_make_welcomefont proc frame
-    FRAME_PROLOG 112
+    FRAME_PROLOG 48
     cmp     qword ptr [g_welcomefont], 0
     jne     mwf_done
-    WINCALL CreateFontW, -15, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, addr f_segoeui
+    mov     ecx, -15
+    mov     edx, 400
+    lea     r8, [f_segoeui]
+    call    mk_font
     mov     qword ptr [g_welcomefont], rax
 mwf_done:
     FRAME_EPILOG
@@ -1683,34 +1765,104 @@ gui_center_ok proc frame
     ret
 gui_center_ok endp
 
+; mk_font(ecx = base pixel height (negative), edx = weight, r8 = facename ptr)
+;   -> rax = HFONT.  THE font factory: every CreateFontW routes through here so
+;   the S/M/L font-size setting (g_fontdelta) scales the whole UI at once.
+;   Heights are negative character heights, so a positive delta grows the font.
+public mk_font
+mk_font proc frame
+    FRAME_PROLOG 160                             ; room for the 14-arg CreateFontW spill
+    movsxd  rax, ecx
+    sub     eax, dword ptr [g_fontdelta]         ; delta>0 -> more negative -> taller
+    mov     dword ptr [rbp-24], eax              ; adjusted height
+    mov     dword ptr [rbp-32], edx              ; weight
+    mov     qword ptr [rbp-40], r8               ; facename
+    WINCALL CreateFontW, dword ptr [rbp-24], 0, 0, 0, dword ptr [rbp-32], \
+            0, 0, 0, 1, 0, 0, 5, 0, qword ptr [rbp-40]
+    FRAME_EPILOG
+    ret
+mk_font endp
+
 gui_make_listfonts proc frame
-    FRAME_PROLOG 112
+    FRAME_PROLOG 48
     cmp     qword ptr [g_iconfont], 0
     jne     mlf_done
-    WINCALL CreateFontW, -19, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, addr f_iconname
+    mov     ecx, -19
+    mov     edx, 400
+    lea     r8, [f_iconname]
+    call    mk_font
     mov     qword ptr [g_iconfont], rax
-    WINCALL CreateFontW, -14, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, addr f_segoeui
+    mov     ecx, -14
+    mov     edx, 600
+    lea     r8, [f_segoeui]
+    call    mk_font
     mov     qword ptr [g_cardfont], rax
-    WINCALL CreateFontW, -12, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, addr f_segoeui
+    mov     ecx, -12
+    mov     edx, 400
+    lea     r8, [f_segoeui]
+    call    mk_font
     mov     qword ptr [g_subfont], rax
-    WINCALL CreateFontW, -21, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, addr f_segoeui
+    mov     ecx, -21
+    mov     edx, 600
+    lea     r8, [f_segoeui]
+    call    mk_font
     mov     qword ptr [g_titlefont], rax
-    WINCALL CreateFontW, -11, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, addr f_iconname
+    mov     ecx, -11
+    mov     edx, 400
+    lea     r8, [f_iconname]
+    call    mk_font
     mov     qword ptr [g_chevfont], rax
-    WINCALL CreateFontW, -24, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, addr f_mono
+    mov     ecx, -24
+    mov     edx, 600
+    lea     r8, [f_mono]
+    call    mk_font
     mov     qword ptr [g_monofont], rax
-    WINCALL CreateFontW, -12, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, addr f_mono
+    mov     ecx, -12
+    mov     edx, 400
+    lea     r8, [f_mono]
+    call    mk_font
     mov     qword ptr [g_phonfont], rax
+    mov     ecx, -22                            ; Segoe UI Symbol for the recycle glyph (large)
+    mov     edx, 400
+    lea     r8, [f_symbol]
+    call    mk_font
+    mov     qword ptr [g_symfont], rax
 mlf_done:
     FRAME_EPILOG
     ret
 gui_make_listfonts endp
+
+; gtc_score(ecx = entry index) -> eax = cached fuzzy score (0 when idx >= SCORE_CAP).
+;   Leaf helper for the score-aware sort.
+gtc_score proc
+    cmp     ecx, SCORE_CAP
+    jae     gts_zero
+    lea     rax, [g_entry_score]
+    mov     eax, dword ptr [rax+rcx*4]
+    ret
+gts_zero:
+    xor     eax, eax
+    ret
+gtc_score endp
 
 ; gui_title_cmp(ecx=idxA, edx=idxB) -> eax = -1/0/1 (case-insensitive title order).
 gui_title_cmp proc frame
     FRAME_PROLOG 96
     mov     dword ptr [rbp-24], ecx
     mov     dword ptr [rbp-28], edx
+    ; with an active search query, rank by fuzzy score (descending); ties -> title
+    cmp     dword ptr [g_search_len], 0
+    je      gtc_favcheck
+    mov     ecx, dword ptr [rbp-24]
+    call    gtc_score
+    mov     r8d, eax                             ; scoreA
+    mov     ecx, dword ptr [rbp-28]
+    call    gtc_score                            ; eax = scoreB
+    cmp     r8d, eax
+    jg      gtc_lt                               ; A higher score -> A first
+    jl      gtc_gt
+    jmp     gtc_bytitle                          ; equal score -> alphabetical
+gtc_favcheck:
     ; favorites sort ahead of everything else; ties fall through to the title
     mov     ecx, dword ptr [rbp-24]
     call    gui_entry_is_fav
@@ -2319,6 +2471,31 @@ gui_draw_listitem proc frame
     WINCALL DrawTextW, qword ptr [rbp-32], addr g_sub_w, -1, addr rbp-152, 8024h
 gli_subdone:
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-104]   ; restore font
+    ; trash (recover) view: a recycle glyph on each item's right edge - clicking
+    ; it restores that entry (see gui_trash_glyph_hit).  Otherwise, the fav star.
+    cmp     dword ptr [g_trash_view], 0
+    je      gli_fav
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_symfont]
+    mov     qword ptr [rbp-104], rax
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_text]
+    mov     word ptr [g_glyph_w], 267Bh                           ; recycle symbol
+    mov     word ptr [g_glyph_w+2], 0
+    mov     eax, dword ptr [rbp-56]
+    sub     eax, 32
+    mov     dword ptr [rbp-152], eax                              ; rect L = R-32
+    mov     eax, dword ptr [rbp-48]
+    add     eax, 4
+    mov     dword ptr [rbp-148], eax
+    mov     eax, dword ptr [rbp-56]
+    sub     eax, 4
+    mov     dword ptr [rbp-144], eax                              ; rect R = R-4
+    mov     eax, dword ptr [rbp-64]
+    sub     eax, 4
+    mov     dword ptr [rbp-140], eax                              ; rect B
+    WINCALL DrawTextW, qword ptr [rbp-32], addr g_glyph_w, -1, addr rbp-152, 025h
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-104]
+    jmp     gli_done
+gli_fav:
     ; favorite marker: a small gold star on the card's right edge
     mov     ecx, dword ptr [rbp-80]
     call    gui_entry_is_fav
@@ -2975,6 +3152,154 @@ wf_no:
     ret
 wide_find endp
 
+; fuzzy_score(rcx = needle wide, rdx = hay wide; both NUL-terminated, pre-folded to
+;   upper case) -> eax = match score (>=0), or -1 if the needle does not match.
+;   The needle is split on spaces into terms; EVERY term must appear in the hay as
+;   an ordered subsequence (terms themselves are order-independent - each is scanned
+;   from the start of the hay).  Bonuses: word-start (FZ_WORDSTART), contiguity with
+;   the previous matched char (FZ_CONTIG), plus FZ_BASE per char.  Empty needle -> 0.
+;   Leaf; clobbers rax/r8/r9/r10/r11.  rcx/rdx preserved conceptually (rcx advances
+;   via r10, rdx stays as the hay base).
+public fuzzy_score
+fuzzy_score proc
+    xor     eax, eax                         ; score accumulator
+    mov     r10, rcx                         ; needle cursor
+    mov     r8, rdx                          ; hay cursor (starts at base)
+    mov     r9d, -1                          ; prev matched position (chars) in hay
+fz_need:
+    movzx   ecx, word ptr [r10]
+    test    cx, cx
+    jz      fz_ok                            ; needle consumed -> success
+    cmp     cx, ' '
+    jne     fz_find
+    add     r10, 2                           ; term separator: reset hay scan, new term
+    mov     r8, rdx
+    mov     r9d, -1
+    jmp     fz_need
+fz_find:
+    movzx   r11d, word ptr [r8]
+    test    r11w, r11w
+    jz      fz_nomatch                       ; hay ended before this term char -> fail
+    cmp     r11w, cx
+    je      fz_hit
+    add     r8, 2
+    jmp     fz_find
+fz_hit:
+    add     eax, FZ_BASE
+    mov     r11, r8                          ; pos = (cursor - base) / 2
+    sub     r11, rdx
+    shr     r11, 1                           ; r11 = matched char position
+    test    r11, r11
+    jz      fz_ws                            ; position 0 -> word start
+    mov     ecx, dword ptr [rdx+r11*2-2]     ; hay[pos-1]
+    cmp     cx, ' '
+    je      fz_ws
+    cmp     cx, '-'
+    je      fz_ws
+    cmp     cx, '_'
+    je      fz_ws
+    cmp     cx, '/'
+    je      fz_ws
+    cmp     cx, '.'
+    je      fz_ws
+    cmp     cx, ':'
+    je      fz_ws
+    jmp     fz_ctg
+fz_ws:
+    add     eax, FZ_WORDSTART
+fz_ctg:
+    mov     ecx, r9d
+    inc     ecx
+    cmp     r11d, ecx                        ; pos == prev+1 -> contiguous
+    jne     fz_adv
+    add     eax, FZ_CONTIG
+fz_adv:
+    mov     r9d, r11d                        ; prev = pos
+    add     r8, 2                            ; advance hay + needle
+    add     r10, 2
+    jmp     fz_need
+fz_ok:
+    ret
+fz_nomatch:
+    mov     eax, -1
+    ret
+fuzzy_score endp
+
+; gui_entry_fuzzy(ecx = entry index) -> eax = best fuzzy score across the entry's
+;   non-sensitive fields (value + custom label), or -1 if nothing matched g_search_w.
+;   Mirrors gui_entry_matches but scores instead of boolean-matching.
+gui_entry_fuzzy proc frame
+    FRAME_PROLOG 112
+    mov     dword ptr [rbp-24], ecx              ; idx
+    mov     dword ptr [rbp-96], -1               ; best score
+    call    vault_field_count                    ; ecx still = idx
+    mov     dword ptr [rbp-32], eax              ; n
+    mov     dword ptr [rbp-40], 0               ; j
+gef_loop:
+    mov     eax, dword ptr [rbp-40]
+    cmp     eax, dword ptr [rbp-32]
+    jae     gef_done
+    mov     ecx, dword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-40]
+    lea     r8, [rbp-88]                         ; out: -88 kind,-80 lblptr,-72 lbllen,
+    call    vault_field_get                      ;      -64 valptr,-56 vallen
+    test    eax, eax
+    jz      gef_next
+    mov     eax, dword ptr [rbp-88]              ; kind
+    cmp     eax, VF_SECRET                       ; sensitive -> never searched
+    je      gef_next
+    cmp     eax, VF_TOTP
+    je      gef_next
+    mov     rcx, qword ptr [rbp-64]              ; value ptr
+    mov     edx, dword ptr [rbp-56]             ; value len
+    call    gef_field
+    cmp     eax, dword ptr [rbp-96]
+    jle     gef_trylabel
+    mov     dword ptr [rbp-96], eax
+gef_trylabel:
+    mov     rax, qword ptr [rbp-72]             ; label len
+    test    rax, rax
+    jz      gef_next
+    mov     rcx, qword ptr [rbp-80]             ; label ptr
+    mov     edx, dword ptr [rbp-72]
+    call    gef_field
+    cmp     eax, dword ptr [rbp-96]
+    jle     gef_next
+    mov     dword ptr [rbp-96], eax
+gef_next:
+    inc     dword ptr [rbp-40]
+    jmp     gef_loop
+gef_done:
+    mov     eax, dword ptr [rbp-96]
+    FRAME_EPILOG
+    ret
+gui_entry_fuzzy endp
+
+; gef_field(rcx = utf8 ptr, edx = byte len) -> eax = fuzzy score of the folded text
+;   against g_search_w, or -1.  Converts to wide in g_match_w, upper-cases, scores.
+gef_field proc frame
+    FRAME_PROLOG 32
+    test    rcx, rcx
+    jz      gff_no
+    test    edx, edx
+    jz      gff_no
+    lea     r8, [g_match_w]
+    mov     r9d, EBUF*2-1
+    call    gui_towide                           ; eax = wide chars written
+    test    eax, eax
+    jz      gff_no
+    WINCALL CharUpperBuffW, addr g_match_w, eax
+    lea     rcx, [g_search_w]
+    lea     rdx, [g_match_w]
+    call    fuzzy_score
+    FRAME_EPILOG
+    ret
+gff_no:
+    mov     eax, -1
+    FRAME_EPILOG
+    ret
+gef_field endp
+
 ; gui_lb_seldata(rcx = hdlg) -> eax = vault index of the selected row (its item
 ;   data), or -1 if nothing is selected.
 gui_lb_seldata proc frame
@@ -3082,6 +3407,23 @@ gui_showdetail proc frame
     mov     ecx, dword ptr [rbp-32]           ; favorite state for this entry
     call    gui_entry_is_fav
     mov     dword ptr [g_fav_state], eax
+    mov     ecx, dword ptr [rbp-32]           ; soft-delete (trash) state for this entry
+    call    gui_entry_is_deleted
+    mov     dword ptr [g_deleted_state], eax
+    test    eax, eax
+    jz      gsd_nodel
+    mov     ecx, dword ptr [rbp-32]           ; preserve the original deletion timestamp
+    mov     edx, VF_DELETED
+    lea     r8, [rbp-48]
+    call    vault_field_at
+    test    rax, rax
+    jz      gsd_nodel
+    mov     rcx, rax
+    mov     edx, dword ptr [rbp-48]
+    lea     r8, [g_deleted_ft]
+    mov     r9d, 17
+    call    gui_towide
+gsd_nodel:
     mov     ecx, dword ptr [rbp-32]           ; custom icon override for this entry
     call    gui_entry_icon
     mov     dword ptr [g_icon_set], eax
@@ -3134,6 +3476,8 @@ gsd_floop:
     je      gsd_fnext
     cmp     eax, VF_PWHIST                       ; archived old password: not a row
     je      gsd_pwhist
+    cmp     eax, VF_DELETED                      ; soft-delete marker: not a row
+    je      gsd_fnext
     cmp     eax, VF_IMAGE                        ; attachments collapse into one tile
     je      gsd_attach
     cmp     eax, VF_FILE
@@ -3605,6 +3949,19 @@ gg_done:
     mov     qword ptr [r11+16], rax              ; value "1"
     inc     dword ptr [rbp-32]
 gg_favdone:
+    ; append the reserved soft-delete marker (trash) when set
+    cmp     dword ptr [g_deleted_state], 0
+    je      gg_deldone
+    mov     eax, dword ptr [rbp-32]
+    imul    eax, eax, 24
+    lea     r11, [g_field_list]
+    add     r11, rax
+    mov     qword ptr [r11+0], VF_DELETED
+    mov     qword ptr [r11+8], 0                 ; no label
+    lea     rax, [g_deleted_ft]
+    mov     qword ptr [r11+16], rax              ; value = 16 hex FILETIME
+    inc     dword ptr [rbp-32]
+gg_deldone:
     ; append the custom icon override when set
     cmp     dword ptr [g_icon_set], 0
     je      gg_icondone
@@ -3949,6 +4306,16 @@ gui_commit proc frame
     mov     qword ptr [rbp-24], rcx
     cmp     dword ptr [g_cur_idx], 0
     jl      gco_done                          ; nothing selected
+    ; external-change guard: warn before overwriting a file another program or
+    ; instance rewrote since we loaded it (checked before touching any state).
+    call    vault_ext_changed
+    test    eax, eax
+    jz      gco_noext
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr s_extchg, addr t_exttitle, \
+            <MB_YESNO or MB_ICONWARNING>
+    cmp     eax, IDYES
+    jne     gco_done                          ; declined -> keep both, do not save
+gco_noext:
     mov     rcx, qword ptr [rbp-24]
     call    gui_gather
     call    gui_tile_expand                   ; tile placeholder -> one field per file
@@ -5379,6 +5746,92 @@ gtpa_done:
     ret
 gui_tile_palette_add endp
 
+; gui_tile_add_cur(rcx = hdlg) -> eax = 1 if the file at g_imgpath was read,
+;   encrypted+staged, and appended to the attachments tile (0 if read failed,
+;   staging failed, or the tile is already full).  Shared by Choose and drop.
+gui_tile_add_cur proc frame
+    FRAME_PROLOG 48
+    lea     rcx, [g_imgpath]
+    lea     rdx, [g_imgbuf]
+    lea     r8, [g_imgbuflen]
+    call    read_file
+    test    eax, eax
+    jnz     gtac_no
+    lea     rcx, [g_imgpath]
+    call    gui_basename                            ; -> g_imgfn_w
+    mov     rcx, qword ptr [g_imgbuf]
+    mov     rdx, qword ptr [g_imgbuflen]
+    lea     r8, [g_imgstageref]
+    call    attach_stage
+    test    eax, eax
+    jnz     gtac_free_no
+    lea     rcx, [g_imgstageref]
+    lea     rdx, [g_imgfn_w]
+    call    tf_append                               ; 1 = tile full (MAX_TFILES)
+    test    eax, eax
+    jnz     gtac_free_no
+    mov     dword ptr [g_dirty], 1
+    mov     rcx, qword ptr [g_imgbuf]
+    mov     rdx, qword ptr [g_imgbuflen]
+    call    mem_free
+    mov     qword ptr [g_imgbuf], 0
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gtac_free_no:
+    mov     rcx, qword ptr [g_imgbuf]
+    mov     rdx, qword ptr [g_imgbuflen]
+    call    mem_free
+    mov     qword ptr [g_imgbuf], 0
+gtac_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gui_tile_add_cur endp
+
+; gui_drop_files(rcx = hdlg, rdx = HDROP) - attach every dropped file to the
+;   attachments tile (edit mode), creating the tile row on the first file.  The
+;   MAX_TFILES cap is enforced by tf_append inside gui_tile_add_cur.
+gui_drop_files proc frame
+    FRAME_PROLOG 64
+    ; [rbp-24]=hdlg [rbp-32]=hdrop [rbp-40]=count [rbp-44]=i
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], rdx
+    WINCALL DragQueryFileW, qword ptr [rbp-32], 0FFFFFFFFh, 0, 0
+    mov     dword ptr [rbp-40], eax
+    mov     dword ptr [rbp-44], 0
+gdf_loop:
+    mov     eax, dword ptr [rbp-44]
+    cmp     eax, dword ptr [rbp-40]
+    jae     gdf_finish
+    WINCALL DragQueryFileW, qword ptr [rbp-32], dword ptr [rbp-44], \
+            addr g_imgpath, MAX_PATH_CHARS
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_tile_add_cur
+    inc     dword ptr [rbp-44]
+    jmp     gdf_loop
+gdf_finish:
+    WINCALL DragFinish, qword ptr [rbp-32]
+    call    tf_find_row                             ; existing tile?
+    cmp     eax, -1
+    jne     gdf_relayout
+    cmp     dword ptr [g_tilefile_n], 0
+    je      gdf_ret
+    mov     rcx, qword ptr [rbp-24]                 ; first file: create the tile row
+    mov     edx, VF_FILE
+    xor     r8d, r8d
+    call    gui_addfield_one
+    jmp     gdf_ret
+gdf_relayout:
+    mov     dword ptr [rbp-48], eax
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-48]
+    call    gui_tile_relayout
+gdf_ret:
+    FRAME_EPILOG
+    ret
+gui_drop_files endp
+
 ; move_ctl(rcx=hdlg, rdx=hwnd, r8d=dlux, r9d=dluy, [+48]=dluw, [+56]=dluh)
 ;   Map the DLU rect to pixels and MoveWindow the control.  No-op if hwnd=0.
 move_ctl proc frame
@@ -6572,6 +7025,13 @@ gui_overflow_menu proc frame
     mov     qword ptr [rbp-32], rax
     test    rax, rax
     jz      gom_done
+    cmp     dword ptr [g_trash_view], 0          ; trash view: only "Return to vault"
+    je      gom_vault
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 8, addr om_leavetrash
+    jmp     gom_track
+gom_vault:
+    cmp     dword ptr [g_cur_idx], 0             ; entry-scoped items only with a shown entry
+    jl      gom_recover
     WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 1, addr om_copypw
     WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 2, addr om_copyuser
     cmp     dword ptr [g_no_phonetic], 0         ; "Disable phonetic reader" -> hide it
@@ -6582,6 +7042,10 @@ gui_overflow_menu proc frame
     WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 5, addr om_history
 @@: WINCALL AppendMenuW, qword ptr [rbp-32], MF_SEPARATOR, 0, 0
     WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 3, addr om_delete
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_SEPARATOR, 0, 0
+gom_recover:
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 7, addr om_recover
+gom_track:
     mov     rcx, qword ptr [rbp-32]              ; tint the menu background
     call    gui_menu_dark
     mov     qword ptr [rbp-64], rax              ; bg brush (delete after tracking)
@@ -6593,6 +7057,25 @@ gui_overflow_menu proc frame
     mov     dword ptr [rbp-44], eax              ; chosen id
     WINCALL DestroyMenu, qword ptr [rbp-32]
     WINCALL DeleteObject, qword ptr [rbp-64]
+    cmp     dword ptr [rbp-44], 7               ; "Recover items" -> enter trash view
+    jne     gom_notrecover
+    call    gui_first_deleted
+    cmp     eax, 0
+    jge     gom_dorecover
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr t_notrash, addr t_recover_ttl, \
+            MB_OK or MB_ICONINFORMATION
+    jmp     gom_done
+gom_dorecover:
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_enter_trash
+    jmp     gom_done
+gom_notrecover:
+    cmp     dword ptr [rbp-44], 8               ; "Return to vault" -> leave trash view
+    jne     gom_not8
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_leave_trash
+    jmp     gom_done
+gom_not8:
     cmp     dword ptr [rbp-44], 3
     jne     gom_notdel
     WINCALL PostMessageW, qword ptr [rbp-24], WM_COMMAND, IDC_V_REMOVE, 0
@@ -7377,10 +7860,192 @@ gui_entry_is_fav proc frame
     ret
 gui_entry_is_fav endp
 
-; gui_update_fav_glyph(rcx=hdlg) - set the star button glyph from g_fav_state.
+; gui_entry_is_deleted(ecx=idx) -> eax = 1 if the entry carries a VF_DELETED marker
+;   (soft-deleted / in the trash).  Leaf-ish wrapper over vault_field_at.
+gui_entry_is_deleted proc frame
+    FRAME_PROLOG 48
+    mov     edx, VF_DELETED
+    lea     r8, [rbp-24]
+    call    vault_field_at                      ; rax = ptr or 0
+    xor     ecx, ecx
+    test    rax, rax
+    setnz   cl
+    mov     eax, ecx
+    FRAME_EPILOG
+    ret
+gui_entry_is_deleted endp
+
+; gui_ft_hex16(rcx = value qword, rdx = dst wide) - format the 64-bit value as 16
+;   uppercase hex wide chars (high nibble first) + a NUL.  Leaf.
+gui_ft_hex16 proc
+    mov     r9, rcx                             ; value (ecx will be clobbered by shift)
+    xor     r8d, r8d                            ; i
+fh_lp:
+    mov     r10d, 15
+    sub     r10d, r8d                           ; nibble index high->low
+    lea     ecx, [r10*4]                        ; shift amount
+    mov     rax, r9
+    shr     rax, cl
+    and     eax, 0Fh
+    cmp     al, 10
+    jb      fh_dec
+    add     al, 'A'-10
+    jmp     fh_emit
+fh_dec:
+    add     al, '0'
+fh_emit:
+    movzx   eax, al
+    mov     word ptr [rdx+r8*2], ax
+    inc     r8d
+    cmp     r8d, 16
+    jb      fh_lp
+    mov     word ptr [rdx+r8*2], 0              ; NUL
+    ret
+gui_ft_hex16 endp
+
+; gui_hex16_to_ft(rcx = utf8/ascii hex ptr, >= 16 chars) -> rax = parsed 64-bit value.
+;   Stops at 16 chars; non-hex bytes contribute 0.  Leaf.
+gui_hex16_to_ft proc
+    xor     rax, rax
+    xor     r8d, r8d
+hf_lp:
+    movzx   r9d, byte ptr [rcx+r8]
+    shl     rax, 4
+    cmp     r9b, '0'
+    jb      hf_skip
+    cmp     r9b, '9'
+    ja      hf_alpha
+    sub     r9d, '0'
+    or      rax, r9
+    jmp     hf_skip
+hf_alpha:
+    or      r9d, 20h                            ; fold to lower
+    cmp     r9b, 'a'
+    jb      hf_skip
+    cmp     r9b, 'f'
+    ja      hf_skip
+    sub     r9d, 'a'-10
+    or      rax, r9
+hf_skip:
+    inc     r8d
+    cmp     r8d, 16
+    jb      hf_lp
+    ret
+gui_hex16_to_ft endp
+
+; gui_set_deleted_now() - stamp g_deleted_ft with the current time (16 wide hex).
+gui_set_deleted_now proc frame
+    FRAME_PROLOG 48
+    lea     rcx, [rbp-40]                       ; FILETIME (8 bytes)
+    call    GetSystemTimeAsFileTime
+    mov     rcx, qword ptr [rbp-40]
+    lea     rdx, [g_deleted_ft]
+    call    gui_ft_hex16
+    FRAME_EPILOG
+    ret
+gui_set_deleted_now endp
+
+; gui_purge_trash() -> eax = count of entries permanently removed.  Walks the vault
+;   high->low, hard-removing any VF_DELETED entry whose timestamp is older than 30
+;   days.  Reseals if anything was purged.  Called once at unlock.
+gui_purge_trash proc frame
+    FRAME_PROLOG 64
+    ; [rbp-24] now-ft, [rbp-32] purged count, [rbp-40] index
+    lea     rcx, [rbp-56]
+    call    GetSystemTimeAsFileTime
+    mov     rax, qword ptr [rbp-56]
+    mov     qword ptr [rbp-24], rax             ; now (FILETIME)
+    mov     dword ptr [rbp-32], 0
+    call    vault_count
+    mov     dword ptr [rbp-40], eax             ; i = count
+pt_loop:
+    cmp     dword ptr [rbp-40], 0
+    jle     pt_done
+    dec     dword ptr [rbp-40]                  ; i-- (walk downward)
+    mov     ecx, dword ptr [rbp-40]
+    mov     edx, VF_DELETED
+    lea     r8, [rbp-64]                        ; &vallen
+    call    vault_field_at                      ; rax = value ptr (0 if not deleted)
+    test    rax, rax
+    jz      pt_loop
+    cmp     qword ptr [rbp-64], 16              ; need a full 16-hex timestamp
+    jb      pt_loop
+    mov     rcx, rax
+    call    gui_hex16_to_ft                     ; rax = deletion FILETIME
+    mov     r10, qword ptr [rbp-24]
+    sub     r10, rax                            ; age in FILETIME units
+    mov     rax, 25920000000000                 ; 30 days * 24h * 3600s * 1e7 (100ns)
+    cmp     r10, rax
+    jbe     pt_loop                             ; younger than 30 days -> keep
+    mov     ecx, dword ptr [rbp-40]             ; expired -> hard remove
+    call    vault_remove_at
+    inc     dword ptr [rbp-32]
+    jmp     pt_loop
+pt_done:
+    cmp     dword ptr [rbp-32], 0
+    je      pt_ret
+    call    vault_reseal
+pt_ret:
+    mov     eax, dword ptr [rbp-32]
+    FRAME_EPILOG
+    ret
+gui_purge_trash endp
+
+.const
+tr_hex_upper db "0123456789ABCDEF"
+tr_hex_lower db "0123456789abcdef"
+.code
+; gui_trtest() -> eax = 0 pass / 1 fail.  Headless probe for the trash timestamp
+;   encode/decode and the 30-day purge threshold (the computational core of the
+;   soft-delete lifecycle).
+public gui_trtest
+gui_trtest proc frame
+    FRAME_PROLOG 96
+    lea     rcx, [tr_hex_upper]                  ; parse 16 upper hex -> 0x0123456789ABCDEF
+    call    gui_hex16_to_ft
+    mov     r10, 0123456789ABCDEFh
+    cmp     rax, r10
+    jne     tr_fail
+    lea     rcx, [tr_hex_lower]                  ; lowercase must parse identically
+    call    gui_hex16_to_ft
+    cmp     rax, r10
+    jne     tr_fail
+    mov     rcx, 0ABh                            ; format 0xAB -> "00000000000000AB"
+    lea     rdx, [rbp-64]
+    call    gui_ft_hex16
+    cmp     word ptr [rbp-64], '0'               ; first nibble char
+    jne     tr_fail
+    cmp     word ptr [rbp-64+28], 'A'            ; char[14]
+    jne     tr_fail
+    cmp     word ptr [rbp-64+30], 'B'            ; char[15]
+    jne     tr_fail
+    mov     rax, 34560000000000                  ; 40-day age exceeds the 30-day threshold
+    mov     r10, 25920000000000
+    cmp     rax, r10
+    jbe     tr_fail
+    mov     rax, 8640000000000                   ; 10-day age is under the threshold
+    cmp     rax, r10
+    ja      tr_fail
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+tr_fail:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gui_trtest endp
+
+; gui_update_fav_glyph(rcx=hdlg) - set the header button glyph.  In recover mode
+;   the favorite (star) button becomes a recycle (♻) button that restores the
+;   shown entry; otherwise it reflects g_fav_state (outline / filled star).
 gui_update_fav_glyph proc frame
     FRAME_PROLOG 48
     mov     qword ptr [rbp-24], rcx
+    cmp     dword ptr [g_trash_view], 0
+    je      guf_star
+    lea     rax, [wb_recycle]                    ; recover mode -> recycle button
+    jmp     guf_set
+guf_star:
     lea     rax, [wb_star]                       ; outline (not favorite)
     cmp     dword ptr [g_fav_state], 0
     je      guf_set
@@ -7390,6 +8055,179 @@ guf_set:
     FRAME_EPILOG
     ret
 gui_update_fav_glyph endp
+
+; gui_first_deleted() -> eax = index of the first trashed entry, or -1 if none.
+gui_first_deleted proc frame
+    FRAME_PROLOG 48
+    call    vault_count
+    mov     dword ptr [rbp-24], eax
+    mov     dword ptr [rbp-32], 0
+gfd_loop:
+    mov     eax, dword ptr [rbp-32]
+    cmp     eax, dword ptr [rbp-24]
+    jae     gfd_none
+    mov     ecx, dword ptr [rbp-32]
+    call    gui_entry_is_deleted
+    test    eax, eax
+    jnz     gfd_hit
+    inc     dword ptr [rbp-32]
+    jmp     gfd_loop
+gfd_hit:
+    mov     eax, dword ptr [rbp-32]
+    FRAME_EPILOG
+    ret
+gfd_none:
+    mov     eax, -1
+    FRAME_EPILOG
+    ret
+gui_first_deleted endp
+
+; gui_enter_trash(rcx = hdlg) - switch the sidebar into the trash (recover) view,
+;   auto-showing the first deleted entry so Restore is immediately usable.
+gui_enter_trash proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [g_trash_view], 1
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_poplist
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_update_done_btn
+    call    gui_first_deleted
+    cmp     eax, 0
+    jl      get_done
+    mov     rcx, qword ptr [rbp-24]           ; show the first trashed entry
+    mov     edx, eax
+    call    gui_showdetail
+    mov     rcx, qword ptr [rbp-24]
+    xor     edx, edx
+    call    gui_set_editmode
+get_done:
+    FRAME_EPILOG
+    ret
+gui_enter_trash endp
+
+; gui_leave_trash(rcx = hdlg) - return the sidebar to the normal vault view.
+gui_leave_trash proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [g_trash_view], 0
+    mov     dword ptr [g_cur_idx], -1
+    mov     dword ptr [g_totp_on], 0
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_rows_clear
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_TITLE, 0
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_update_done_btn
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_poplist
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_update_fav_glyph                ; recycle -> star (g_trash_view=0 now)
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_detail_clear                    ; empty the detail pane, deselect the list
+    FRAME_EPILOG
+    ret
+gui_leave_trash endp
+
+; gui_detail_clear(rcx = hdlg) - reset the detail pane to the no-entry state:
+;   clear the times/title, hide the header tile + fav/recycle button, and clear
+;   the list selection.  Caller has already set g_cur_idx = -1.
+gui_detail_clear proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    call    gui_show_times                      ; clears the times (g_cur_idx = -1)
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_TITLE, 0
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_V_HEADER
+    call    GetDlgItem
+    WINCALL ShowWindow, rax, SW_HIDE
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_V_FAV
+    call    GetDlgItem
+    WINCALL ShowWindow, rax, SW_HIDE
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_SETCURSEL, \
+            -1, 0
+    FRAME_EPILOG
+    ret
+gui_detail_clear endp
+
+; gui_update_done_btn(rcx = hdlg) - show the highlighted "Done" button (exit
+;   recover mode) only in trash view, and tag it as the accent/primary button.
+gui_update_done_btn proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    mov     edx, IDC_V_DONE
+    call    GetDlgItem
+    mov     qword ptr [rbp-32], rax             ; Done hwnd
+    WINCALL SetWindowLongPtrW, rax, GWL_USERDATA, 1   ; theme_drawitem -> accent primary
+    mov     r8d, SW_HIDE
+    cmp     dword ptr [g_trash_view], 0
+    je      gud_show
+    mov     r8d, SW_SHOW
+gud_show:
+    WINCALL ShowWindow, qword ptr [rbp-32], r8d
+    FRAME_EPILOG
+    ret
+gui_update_done_btn endp
+
+; gui_trash_glyph_hit(rcx = hdlg) -> eax = 1 if the mouse cursor is over the
+;   recycle glyph (right ~24 px) of the currently selected list item.  Used to
+;   turn a click on that glyph into a per-item restore.
+gui_trash_glyph_hit proc frame
+    FRAME_PROLOG 96
+    ; [rbp-32]=list hwnd  [rbp-40]=sel idx  RECT@[rbp-72]  POINT@[rbp-80]
+    mov     qword ptr [rbp-24], rcx
+    mov     edx, IDC_V_LIST
+    call    GetDlgItem
+    mov     qword ptr [rbp-32], rax
+    WINCALL SendMessageW, qword ptr [rbp-32], LB_GETCURSEL, 0, 0
+    cmp     eax, -1                             ; LB_ERR
+    je      gtgh_no
+    mov     dword ptr [rbp-40], eax
+    WINCALL SendMessageW, qword ptr [rbp-32], LB_GETITEMRECT, dword ptr [rbp-40], addr rbp-72
+    WINCALL GetCursorPos, addr rbp-80
+    WINCALL ScreenToClient, qword ptr [rbp-32], addr rbp-80
+    mov     eax, dword ptr [rbp-64]             ; rc.right
+    sub     eax, 24
+    cmp     dword ptr [rbp-80], eax             ; pt.x >= rc.right-24 ?
+    jl      gtgh_no
+    mov     eax, dword ptr [rbp-76]             ; pt.y
+    cmp     eax, dword ptr [rbp-68]             ; >= rc.top ?
+    jl      gtgh_no
+    cmp     eax, dword ptr [rbp-60]             ; < rc.bottom ?
+    jge     gtgh_no
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gtgh_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gui_trash_glyph_hit endp
+
+; gui_restore_entry(rcx = hdlg, edx = vault index) - restore one trashed entry:
+;   load it into the detail, clear its VF_DELETED marker, reseal, then refresh
+;   the recover list (staying in recover mode).
+gui_restore_entry proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-32], edx
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-32]
+    call    gui_showdetail                      ; load the entry so gui_commit rebuilds it
+    mov     dword ptr [g_deleted_state], 0       ; clear the deleted marker + reseal
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_commit
+    mov     dword ptr [g_dirty], 0
+    mov     dword ptr [g_cur_idx], -1            ; it left the trash: clear the detail
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_rows_clear
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_poplist                          ; refresh the recover list
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_detail_clear                     ; empty the detail (no stale entry shown)
+    FRAME_EPILOG
+    ret
+gui_restore_entry endp
 
 ; gui_addfield_menu(rcx=hdlg) - popup the field-type palette at the cursor.
 gui_addfield_menu proc frame
@@ -7764,6 +8602,8 @@ vault_proc proc
     je      vp_timer
     cmp     rdx, WM_WTSSESSION_CHANGE
     je      vp_wts
+    cmp     rdx, WM_DROPFILES
+    je      vp_drop
     cmp     rdx, WM_PAINT
     je      vp_tpaint
     cmp     rdx, WM_ERASEBKGND
@@ -7788,6 +8628,15 @@ vault_proc proc
     jmp     vp_ret
 vp_tcolor:
     call    gui_ctlcolor                     ; theme + link-blue for view-mode URL values
+    jmp     vp_ret
+vp_drop:
+    cmp     dword ptr [g_editmode], 0        ; only accept drops while editing an entry
+    je      vp_drop_ret
+    mov     rcx, qword ptr [rbp-8]           ; hdlg
+    mov     rdx, r8                          ; wParam = HDROP
+    call    gui_drop_files
+vp_drop_ret:
+    xor     eax, eax
     jmp     vp_ret
 vp_tdraw_list:
     mov     rcx, r9
@@ -8017,6 +8866,7 @@ vp_t_search:
 vp_init:
     mov     rax, qword ptr [rbp-8]            ; remember the window for the tray toggle
     mov     qword ptr [g_vaulthwnd], rax
+    WINCALL DragAcceptFiles, qword ptr [rbp-8], 1   ; accept Explorer file drops
     mov     rcx, qword ptr [rbp-8]           ; Vordr shield in the title bar
     call    gui_set_winicon
     call    gui_make_listfonts               ; entry-list icon/title/subtitle fonts
@@ -8038,6 +8888,9 @@ vp_init:
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_REMOVE, addr wb_rem
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_OVFL, addr wb_more
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_FAV, addr wb_star
+    mov     dword ptr [g_trash_view], 0       ; start in the vault (not the trash) view
+    mov     dword ptr [g_deleted_state], 0
+    call    gui_purge_trash                   ; drop entries trashed > 30 days ago
     call    gui_load_prefs                    ; apply persisted color scheme + layout
     mov     rcx, qword ptr [rbp-8]
     call    gui_apply_scheme
@@ -8109,6 +8962,8 @@ vp_cmd_fixed:
     je      ve_save                           ; discard edits, back to view mode
     cmp     eax, IDC_V_REMOVE
     je      vp_remove
+    cmp     eax, IDC_V_DONE
+    je      vp_done
     cmp     eax, IDC_V_LOCK
     je      vp_lock
     cmp     eax, IDC_V_MENU
@@ -8335,10 +9190,8 @@ vp_mnoprevinfo:
     WINCALL gui_msgbox, qword ptr [rbp-8], addr m_noprevinfo, addr t_noprevinfo, \
             <MB_OK or MB_ICONINFORMATION>
     jmp     vp_handled
-vp_ovfl:
-    cmp     dword ptr [g_cur_idx], 0             ; only with an entry shown
-    jl      vp_handled
-    mov     rcx, qword ptr [rbp-8]
+vp_ovfl:                                        ; menu opens even with no entry shown
+    mov     rcx, qword ptr [rbp-8]               ; (so "Recover items" stays reachable)
     call    gui_overflow_menu
     jmp     vp_handled
 vp_iconpick:
@@ -8361,6 +9214,13 @@ vp_iconpick:
 vp_fav:
     cmp     dword ptr [g_cur_idx], 0             ; only with an entry shown
     jl      vp_handled
+    cmp     dword ptr [g_trash_view], 0          ; recover mode: the button restores
+    je      vp_fav_toggle
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, dword ptr [g_cur_idx]
+    call    gui_restore_entry
+    jmp     vp_handled
+vp_fav_toggle:
     mov     eax, dword ptr [g_fav_state]         ; toggle favorite
     xor     eax, 1
     mov     dword ptr [g_fav_state], eax
@@ -8386,6 +9246,17 @@ vp_list:
     ; switching entries discards any unsaved inline edits (edits are only
     ; persisted by an explicit Save)
     mov     dword ptr [g_dirty], 0
+    ; recover mode: a click on the row's recycle glyph restores that entry
+    cmp     dword ptr [g_trash_view], 0
+    je      vl_load
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_trash_glyph_hit
+    test    eax, eax
+    jz      vl_load
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, dword ptr [rbp-16]
+    call    gui_restore_entry
+    jmp     vp_handled
 vl_load:
     mov     rcx, qword ptr [rbp-8]
     mov     edx, dword ptr [rbp-16]
@@ -8615,12 +9486,24 @@ vsr_view:
 vp_remove:
     cmp     dword ptr [g_cur_idx], 0
     jl      vp_handled
-    WINCALL gui_msgbox, qword ptr [rbp-8], addr t_remove, addr t_err, <MB_YESNO or MB_ICONQUESTION>
+    cmp     dword ptr [g_trash_view], 0
+    jne     vpr_forever                      ; already in trash -> permanent delete
+    WINCALL gui_msgbox, qword ptr [rbp-8], addr t_trash, addr t_err, <MB_YESNO or MB_ICONQUESTION>
+    cmp     eax, IDYES
+    jne     vp_handled
+    mov     dword ptr [g_deleted_state], 1   ; soft-delete: mark VF_DELETED + reseal
+    call    gui_set_deleted_now
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_commit
+    jmp     vpr_teardown
+vpr_forever:
+    WINCALL gui_msgbox, qword ptr [rbp-8], addr t_delforever, addr t_err, <MB_YESNO or MB_ICONWARNING>
     cmp     eax, IDYES
     jne     vp_handled
     mov     ecx, dword ptr [g_cur_idx]
     call    vault_remove_at
     call    vault_reseal
+vpr_teardown:
     mov     rcx, qword ptr [rbp-8]
     call    gui_poplist
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_TITLE, 0
@@ -8634,9 +9517,14 @@ vp_remove:
     add     rsp, 32
     mov     dword ptr [g_cur_idx], -1
     mov     dword ptr [g_dirty], 0
+    mov     dword ptr [g_deleted_state], 0
     mov     rcx, qword ptr [rbp-8]            ; back to view mode
     xor     edx, edx
     call    gui_set_editmode
+    jmp     vp_handled
+vp_done:
+    mov     rcx, qword ptr [rbp-8]           ; "Done" -> leave recover mode
+    call    gui_leave_trash
     jmp     vp_handled
 vp_lock:
 vp_close:
@@ -12267,6 +13155,7 @@ wstart proc
     call    hardening_init
     test    eax, eax
     jz      ws_oom
+    call    crash_install                   ; arm crash containment before any secrets exist
     call    parse_cmdline
     call    is_cli_command
     test    eax, eax
@@ -12309,6 +13198,24 @@ ws_gui:
     call    run_selftest
     test    eax, eax
     jnz     ws_stfail_gui
+    ; single-instance guard: two GUIs on one vault would clobber each other's
+    ; saves.  If the named mutex already exists, focus the running window + exit.
+    WINCALL CreateMutexW, 0, 1, addr g_singleton_name
+    call    GetLastError
+    cmp     eax, 183                        ; ERROR_ALREADY_EXISTS
+    jne     ws_gui_go
+    WINCALL FindWindowW, 0, addr g_vault_title
+    test    rax, rax
+    jnz     ws_gui_focus
+    WINCALL FindWindowW, 0, addr g_unlock_title
+    test    rax, rax
+    jz      ws_gui_exit
+ws_gui_focus:
+    WINCALL SetForegroundWindow, rax
+ws_gui_exit:
+    WINCALL ExitProcess, 0
+ws_gui_go:
+    mov     dword ptr [g_gui_active], 1      ; enable the crash-time apology box
     call    gui_main
     WINCALL ExitProcess, 0
 ws_stfail_gui:

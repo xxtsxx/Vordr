@@ -38,6 +38,9 @@ cfg_subkey label word
 tpm_subkey label word
     dw 'S','O','F','T','W','A','R','E', 5Ch, 'V','o','r','d','r', 5Ch
     dw 'T','P','M','-','U','n','l','o','c','k', 0
+ctr_subkey label word
+    dw 'S','O','F','T','W','A','R','E', 5Ch, 'V','o','r','d','r', 5Ch
+    dw 'R','o','l','l','b','a','c','k', 0
 cfg_value label word
     dw 'v','a','u','l','t', 0
 cfg_fname label word
@@ -516,5 +519,65 @@ rtd_done:
     FRAME_EPILOG
     ret
 reg_tpm_del endp
+
+; ===========================================================================
+; Anti-rollback counter mirror (plan 3): last-seen save_counter per vault path,
+; under HKCU\...\Vordr\Rollback.  A user-writable mirror is only a tripwire (an
+; attacker who can restore an old vault can usually also clear this), but it
+; reliably catches accidental restores and sync mishaps.
+;   reg_ctr_set(rcx = value name, rdx = data ptr, r8d = len) -> eax = 1/0
+;   reg_ctr_get(rcx = value name, rdx = outbuf, r8d = cap)   -> eax = bytes read
+; ===========================================================================
+public reg_ctr_set
+reg_ctr_set proc frame
+    FRAME_PROLOG 128
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], rdx
+    mov     dword ptr [rbp-40], r8d
+    WINCALL RegCreateKeyExW, qword ptr [g_hkcu], addr ctr_subkey, 0, 0, 0, \
+            KEY_WRITE, 0, addr g_cfg_khan, 0
+    test    eax, eax
+    jnz     rcs_fail
+    WINCALL RegSetValueExW, qword ptr [g_cfg_khan], qword ptr [rbp-24], 0, \
+            REG_BINARY, qword ptr [rbp-32], dword ptr [rbp-40]
+    mov     dword ptr [rbp-48], eax
+    WINCALL RegCloseKey, qword ptr [g_cfg_khan]
+    cmp     dword ptr [rbp-48], 0
+    jne     rcs_fail
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+rcs_fail:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+reg_ctr_set endp
+
+public reg_ctr_get
+reg_ctr_get proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], rdx
+    mov     dword ptr [rbp-40], r8d
+    WINCALL RegOpenKeyExW, qword ptr [g_hkcu], addr ctr_subkey, 0, KEY_READ, \
+            addr g_cfg_khan
+    test    eax, eax
+    jnz     rcg_no
+    mov     eax, dword ptr [rbp-40]
+    mov     dword ptr [g_cfg_cb], eax
+    WINCALL RegQueryValueExW, qword ptr [g_cfg_khan], qword ptr [rbp-24], 0, 0, \
+            qword ptr [rbp-32], addr g_cfg_cb
+    mov     dword ptr [rbp-48], eax
+    WINCALL RegCloseKey, qword ptr [g_cfg_khan]
+    cmp     dword ptr [rbp-48], 0
+    jne     rcg_no
+    mov     eax, dword ptr [g_cfg_cb]
+    FRAME_EPILOG
+    ret
+rcg_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+reg_ctr_get endp
 
 end

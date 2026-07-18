@@ -38,6 +38,7 @@ extern SetStretchBltMode:proc
 extern CreateSolidBrush:proc
 extern CreatePen:proc
 extern CreateFontW:proc
+extern mk_font:proc                     ; gui.asm: font factory (applies g_fontdelta)
 extern SetTextColor:proc
 extern SetBkColor:proc
 extern SetBkMode:proc
@@ -200,6 +201,7 @@ public g_font_icon
 g_font_icon dq 0                            ; Segoe Fluent Icons (PUA glyph buttons)
 public g_font_totp
 g_font_totp dq 0                            ; slightly larger font for the TOTP code
+g_font_sym  dq 0                            ; Segoe UI Symbol (recycle ♻ button glyph)
 g_frame_hdc dq 0                            ; EnumChildWindows frame-draw context
 g_frame_par dq 0
 ; Optional per-control focus-underline colour override (used by the export
@@ -229,6 +231,8 @@ td_font label word                      ; toolbar glyph font face
     dw 'S','e','g','o','e',' ','U','I',0
 td_iconfont label word                  ; Fluent icon font (PUA glyphs e.g. trashcan)
     dw 'S','e','g','o','e',' ','F','l','u','e','n','t',' ','I','c','o','n','s',0
+td_symfont label word                   ; Segoe UI Symbol (recycle ♻)
+    dw 'S','e','g','o','e',' ','U','I',' ','S','y','m','b','o','l',0
 
 .data?
 align 16
@@ -247,18 +251,34 @@ g_clsbuf    dw 16 dup (?)               ; control class name (Static vs Edit)
 ; =============================================================================
 public theme_boot
 theme_boot proc frame
-    FRAME_PROLOG 112                          ; room for the 14-arg CreateFontW
+    FRAME_PROLOG 48
     mov     ecx, dword ptr [g_scheme]         ; build brushes/pens from the active scheme
     call    theme_set_scheme
     ; large semibold font for the small toolbar symbol buttons (+ pencil)
-    WINCALL CreateFontW, -18, 0, 0, 0, 100, 0, 0, 0, 1, 0, 0, 5, 0, addr td_font
+    mov     ecx, -18
+    mov     edx, 100
+    lea     r8, [td_font]
+    call    mk_font                           ; the shared font factory (applies S/M/L)
     mov     qword ptr [g_font_big], rax
     ; Fluent icon font for PUA glyph buttons (the trashcan)
-    WINCALL CreateFontW, -18, 0, 0, 0, 100, 0, 0, 0, 1, 0, 0, 5, 0, addr td_iconfont
+    mov     ecx, -18
+    mov     edx, 100
+    lea     r8, [td_iconfont]
+    call    mk_font
     mov     qword ptr [g_font_icon], rax
     ; slightly larger semibold font for the live TOTP code box
-    WINCALL CreateFontW, -16, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, addr td_font
+    mov     ecx, -16
+    mov     edx, 600
+    lea     r8, [td_font]
+    call    mk_font
     mov     qword ptr [g_font_totp], rax
+    ; Segoe UI Symbol for the recycle-button glyph (♻ U+267B); sized to the
+    ; small header button so DT_VCENTER lands it centered like the star icon
+    mov     ecx, -15
+    mov     edx, 400
+    lea     r8, [td_symfont]
+    call    mk_font
+    mov     qword ptr [g_font_sym], rax
     FRAME_EPILOG
     ret
 theme_boot endp
@@ -1353,9 +1373,14 @@ tdi_tcol:
     movzx   eax, word ptr [g_txtbuf]
     test    eax, eax                          ; empty caption -> default
     jz      tdi_dt
+    cmp     eax, 267Bh                        ; recycle ♻ -> Segoe UI Symbol
+    je      tdi_symfont
     cmp     eax, 0E000h
     jb      tdi_bigfont
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_font_icon]
+    jmp     tdi_drawglyph
+tdi_symfont:
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_font_sym]
     jmp     tdi_drawglyph
 tdi_bigfont:
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_font_big]
