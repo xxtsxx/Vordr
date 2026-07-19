@@ -40,6 +40,18 @@ now documented as canonical), D4 (`tools/idcheck.py` gates rc↔asm ID sync in
 strict builds), D5 (SDK version resolved at build time). All removed from
 this file.
 
+**Done 2026-07-19 (redesign merge, 2c9f744):** the `Vordr_ALT` redesign branch
+(36 commits) was merged and the fork deleted. Landed: custom borderless frame
+with title-bar search control + command dock, ghost buttons, resizable window
+with anchor reflow, read-only-by-default opens + save retry with error dialog,
+per-vault availability state machine, `VAULTCTX`/VSLOT multi-vault contexts
+with a tab strip and cross-vault search, modular details pane (heading dock,
+VF_GROUP/VF_SPACER blocks, entry templates), Ctrl+K/N/G/L shortcuts, and the
+mvtest/mvswitch/avtest gate probes. E8 (multi-vault) and F2 (resizable window)
+removed from this file as done; the remaining redesign items are group R.
+The reverted virtual-scroll commits were secured on branch `recovered-scroll`
+before the fork was deleted.
+
 House rules:
 
 - Plan IDs are stable: `C4` stays `C4` when other plans are completed or added.
@@ -121,6 +133,9 @@ nothing.
 ## E. Features (all verified absent)
 
 ### E6. Vault health dashboard
+(The redesign's cheap precursor — weak/reused dot indicators inline on sidebar
+tiles — can ship first and shares the same analysis pass.)
+
 1. Analysis pass: strength buckets (existing `gui_pw_strength` core),
    exact-duplicates via BLAKE2b, age via pw-history timestamps; dbg `health`
    verb prints counts for a scripted 10-entry vault — exact match.
@@ -129,16 +144,10 @@ nothing.
 3. Sidebar badge with the worst-bucket count. *Test:* fix one weak password →
    badge decrements after save.
 
-### E8. Multiple vaults / switcher
-1. HKCU MRU (max 5, paths only — no secrets). *Test:* open two vaults in
-   sequence → MRU shows both in order.
-2. "Switch vault…" → full lock+wipe → file picker or MRU → unlock dialog.
-   *Test:* A→B→A shows the right entries; a dbg memory scan after lock finds
-   no residue of the previous master key.
-3. Dirty-guard: refuse switching with unsaved edits (Save/Discard/Cancel).
-   *Test:* Cancel keeps state intact.
-
 ### E9. Read-only mode
+(The redesign's B1 landed read-only-by-default opens with full share masks, so
+this is now nearly free.)
+
 1. `--ro` flag + an unlock-dialog checkbox set `g_readonly`. *Test:* dbg trace
    shows the flag.
 2. Gate every mutation entry point (save, add, delete, import, history purge);
@@ -170,23 +179,57 @@ AES zips are rejected. There is no inflate in this repo — sibling project
    stacked, all fade; GDI handle count stable over 100 toasts.
 3. Settings toggle. *Test:* off → old behavior only.
 
-### F2. Resizable main window
-1. WS_THICKFRAME + WM_GETMINMAXINFO (min = current 484×350 layout). *Test:*
-   resizes; can't shrink below the old layout.
-2. Reflow in WM_SIZE: sidebar fixed width, detail pane fills. *Test:* no
-   clipped/overlapping controls from 800×600 to 2560×1440.
-3. Persist WINDOWPLACEMENT in HKCU, restored clamped to a live monitor.
-   *Test:* restart restores position; saved off-screen coords still yield an
-   on-screen window.
-
 ### F4. Mnemonics & keyboard audit
 Tab order/Enter/Esc largely come free from the dialog manager; zero `&`
-mnemonics exist anywhere.
+mnemonics exist anywhere. The redesign landed Ctrl+K/N/G/L; complete the table
+(Ctrl+O open vault, Ctrl+W close tab, Ctrl+Tab cycle, F2 edit, Del → trash,
+Esc closes overlay → edit → clears search in that order).
 
 1. Per-dialog audit table (tab order, default button, Esc). *Test:* the table
    has no unreachable-control rows after fixes.
 2. `&`-accelerators where owner-draw painters can render underscores. *Test:*
    Alt+letter activates each marked control.
+
+---
+
+## R. Redesign remainder
+
+Folded in from `docs/REDESIGN_PLAN.md` (the standalone doc was merged into
+this file and deleted). The redesign landed with merge 2c9f744: custom frame +
+title-bar search & dock, ghost buttons, resizable reflow, the B1–B3 IO
+contract, multi-vault contexts/tabs/cross-vault search, modular details pane
+(groups/spacers/templates), and Ctrl+K/N/G/L shortcuts. What remains:
+
+### R1. Detail-pane virtual scroll
+The scroll resurrection did not land with the merge. The reverted work is
+secured in-repo on branch `recovered-scroll` (18c747e virtual-scroll field
+list, b47fd3b drop the room cap); anchor reflow + elastic widths did land.
+
+1. Cherry-pick the two commits and adapt them to the anchor-reflow layout;
+   pixel viewport from the detail rect. *Test:* a 25-field entry on a 350-px
+   window scrolls cleanly with no paint over the header/dock; RUNALL.
+2. Precision wheel accumulation + PgUp/PgDn/Home/End when the pane has focus.
+
+### R2. Command palette (Ctrl+Shift+P)
+The landed title-bar overlay in command mode (`>` prefix): Lock, Switch
+vault, New item, Export, Import, Settings, theme switching, Trash view.
+*Test:* every command fires; fuzzy ranks correctly; Esc closes.
+
+### R3. DPI audit
+Revived by the redesign (supersedes the 2026-07-18 scope cut of the old F3).
+The layout engine already scales; sweep painters for hardcoded px through a
+`dpi_scale` (MulDiv) helper; recreate fonts on WM_DPICHANGED. *Test:* 100% vs
+200% screenshots — chips, underlines, icons all scale.
+
+### R4. Sidebar niceties
+Per-vault entry counts on tabs; tag chips row under search results; alphabet
+fast-scroll on >200 entries. *Test:* 5k vault fast-scrolls to the right letter.
+
+### R5. Session restore
+Reopen the same tab set (paths from MRU) at next unlock, each tab showing a
+locked placeholder until its password is supplied (click → secure unlock for
+that vault). *Test:* two vaults open, lock, unlock → two placeholders; one
+unlocks inline.
 
 ---
 
