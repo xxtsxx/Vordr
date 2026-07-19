@@ -11,14 +11,17 @@ Heap secrets go through `secmem_alloc`, which VirtualLock's on allocation.
 
 | Buffer | Location | Size | Holds | Locked by | Wiped at |
 |---|---|---|---|---|---|
-| `g_cfg_pass` | main.asm:118 | 1025 B | master password (UTF-8) | `sec_lock_statics` | main.asm:812, main.asm:1205 (`secure_zero`) |
-| `g_vkey` | vault.asm:169 | 32 B | derived vault key | `sec_lock_statics` | vault.asm:778 (`vault_lock`) |
-| `g_pwbuf` | gui.asm:1051 | 2048 B | unlock/create password field (wide) | `sec_lock_statics` | gui.asm:8728 (+ 1240/8340/8423/8551/8698) |
-| `g_pw2buf` | gui.asm:1052 | 2048 B | confirm-password field (wide) | `sec_lock_statics` | gui.asm:8728 |
-| `g_secret_w` | gui.asm:1054 | 16384 B | revealed secret for reveal/copy (wide) | `sec_lock_statics` | gui.asm:8221 (`vp_close`) |
-| `g_e_totp` | gui.asm:1055 | 512 B | entry-form TOTP key (wide) | `sec_lock_statics` | gui.asm:8227 |
-| `g_totp_b32` | gui.asm:1059 | 256 B | selected entry TOTP key (UTF-8) | `sec_lock_statics` | gui.asm:8224, gui.asm:3255 |
-| vault body | `secmem_alloc` (vault.asm:683 et al.) | ≤ `VAULT_BODY_MAX` | decrypted entries (all field plaintext, incl. archived pw-history) | `secmem_alloc` (VirtualLock) | `secmem_free` (`secure_zero` before release) |
+| `g_cfg_pass` | main.asm (`.data?`) | 1025 B | master password (UTF-8) | `sec_lock_statics` | `gui_wipepw` (gui.asm, after each unlock/create attempt), `start` / `wstart` (process exit) — all `secure_zero` |
+| `g_vkey` | vault.asm (`.data?`) | 32 B | derived vault key | `sec_lock_statics` | `vault_lock` (vault.asm) |
+| `g_pwbuf` | gui.asm (`.data?`) | 2048 B | unlock/create password field (wide) | `sec_lock_statics` | `password_to_utf8` (main.asm, wipes the wide source after conversion), `gui_wipepw_create`, `gui_xlpw_strength` (gui.asm) |
+| `g_pw2buf` | gui.asm (`.data?`) | 2048 B | confirm-password field (wide) | `sec_lock_statics` | `gui_wipepw_create`, `gui_xlpw_strength` (gui.asm) |
+| `g_secret_w` | gui.asm (`.data?`) | 16384 B | revealed secret for reveal/copy (wide) | `sec_lock_statics` | `vault_proc` close/lock path (gui.asm) |
+| `g_e_totp` | gui.asm (`.data?`) | 512 B | entry-form TOTP key (wide) | `sec_lock_statics` | `vault_proc` close/lock path (gui.asm) |
+| `g_totp_b32` | gui.asm (`.data?`) | 256 B | selected entry TOTP key (UTF-8) | `sec_lock_statics` | `vault_proc` close/lock path (gui.asm) |
+| vault body | `secmem_alloc` (called from `vault_unlock` / `do_init`, vault.asm) | ≤ `VAULT_BODY_MAX` | decrypted entries (all field plaintext, incl. archived pw-history) | `secmem_alloc` (VirtualLock) | `secmem_free` (`secure_zero` before release) |
+
+Every static buffer above is additionally wiped on the crash-containment path
+by `secmem_panic_wipe` (secmem.asm), which the VEH runs before terminating.
 
 ## Accepted exceptions (documented, intentionally not locked)
 
@@ -28,9 +31,12 @@ Heap secrets go through `secmem_alloc`, which VirtualLock's on allocation.
   pressure, so it is not locked. It holds intermediate Argon2 mixing blocks
   (not the password or key directly), and is `secure_zero`'d then `VirtualFree`d
   at the end of every `argon2id_hash` call.
-- **Export scratch** (zipexport.asm) — the plaintext CSV/JSON assembled during
-  "Export all secrets" is transient and wiped after the archive is encrypted;
-  it exists only for the duration of an explicit export.
+- **Export scratch** (zipexport.asm) — the plaintext `vordr.json` assembled
+  during "Export all secrets" is transient: `ze_compose` releases it with
+  `mem_free` (which `secure_zero`s before `VirtualFree`), the archive buffer
+  and AES key material are wiped in `ze_free`, and the UTF-8 export-password
+  copy is wiped in `ze_compose`. It exists only for the duration of an
+  explicit export.
 - **`g_conv_w`** (gui.asm) — transient UTF-8→wide display scratch, overwritten
   on each use; never the sole copy of a secret at rest.
 - **Attachment decrypt-to-temp** (gui.asm `gui_tag_open`) — opening an attachment
@@ -38,9 +44,10 @@ Heap secrets go through `secmem_alloc`, which VirtualLock's on allocation.
   for the ShellExecute hand-off). This is *not* left to the OS: every such path is
   tracked in `g_tempfiles` and, on vault lock/exit, `gui_temp_purge` overwrites
   the file's whole length with zeros, `FlushFileBuffers`, then `DeleteFileW`
-  (plan 8; regression-tested by the `tmptest` verb). The **Disable attachment
-  preview** setting (`NoPreview`) suppresses the temp file entirely — attachments
-  are then download-only, so no plaintext copy is ever written outside the vault.
+  (secure temp-file tracking; regression-tested by the `tmptest` verb). The
+  **Disable attachment preview** setting (`NoPreview`) suppresses the temp file
+  entirely — attachments are then download-only, so no plaintext copy is ever
+  written outside the vault.
 
 No "unknown" rows: every secret buffer above is either locked or listed as an
 accepted exception with its rationale.
@@ -60,14 +67,14 @@ ways).
 
 | Site | Compares | Via |
 |---|---|---|
-| vault unlock KCV | recomputed KCV vs stored (vault.asm) | `ct_memcmp` |
-| AES-GCM tag check | computed vs stored tag (aesgcm.asm) | `ct_memcmp` |
-| TPM unseal check | unsealed key check value (tpm.asm) | `ct_memcmp` |
-| vault/attach self-test KATs | decrypted output vs expected (vault.asm) | `ct_memcmp` |
+| vault unlock KCV | recomputed KCV vs stored (`vk_kcv_ok`, vault.asm) | `ct_memcmp` |
+| AES-GCM tag check | computed vs stored tag (`gcm_open`, aesgcm.asm) | `ct_memcmp` |
+| TPM-unsealed vault key | recomputed KCV vs stored after unseal — the TPM path reuses the same `vk_kcv_ok` check in vault.asm (the only `ct_memcmp` inside tpm.asm itself is the dbg-only `cmd_tpmtest` probe) | `ct_memcmp` |
+| vault/attach self-test KATs | decrypted output vs expected (`vault_selftest`, `vault_field_selftest`, `attach_selftest`, vault.asm) | `ct_memcmp` |
 | .vaultz import pw verifier | PBKDF2-derived 2 bytes vs stored (zipimport.asm `zi_decrypt`) | `ct_memcmp` |
 | .vaultz import HMAC tag | HMAC-SHA1[:10] vs stored (zipimport.asm `zi_decrypt`) | `ct_memcmp` |
 | create/change password confirm | `g_pwbuf` vs `g_pw2buf` (gui.asm `gui_pw_match`) | `gui_wstr_eq` |
-| export password confirm | `g_xlpw` vs `g_xlpw2` (gui.asm) | `gui_wstr_eq` |
+| export password confirm | `g_xlpw` vs `g_xlpw2` (gui.asm `xlpw_proc`) | `gui_wstr_eq` |
 | pw-history set-diff | old secret value vs new on save (gui.asm `gui_pwhist_capture`) | `gui_wstr_eq` |
 
 ### Not secret-dependent (early-exit is fine)

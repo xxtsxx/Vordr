@@ -733,38 +733,6 @@ aeb_last:
 aes_ecb_block endp
 
 ; =============================================================================
-; aes_ecb_decrypt(rcx=rk, rdx=io16, r8=Nr) - decrypt one block in place (AES-NI).
-; Uses the SAME forward key schedule as aes_ecb_block, applying InvMixColumns
-; (aesimc) to the middle round keys on the fly (Intel's equivalent inverse
-; cipher).  Needed for AES-CBC decryption of agile-encrypted .xlsx workbooks.
-; =============================================================================
-public aes_ecb_decrypt
-aes_ecb_decrypt proc frame
-    FRAME_PROLOG 32
-    movdqu  xmm0, xmmword ptr [rdx]
-    mov     r10, r8
-    shl     r10, 4
-    movdqu  xmm1, xmmword ptr [rcx+r10]       ; rk[Nr] (last round key)
-    pxor    xmm0, xmm1                        ; initial whitening
-    mov     rax, r8
-    dec     rax                               ; round = Nr-1 .. 1
-adb_round:
-    test    rax, rax
-    jle     adb_last
-    mov     r10, rax
-    shl     r10, 4
-    movdqu  xmm1, xmmword ptr [rcx+r10]
-    aesimc  xmm1, xmm1                        ; InvMixColumns on the round key
-    aesdec  xmm0, xmm1
-    dec     rax
-    jmp     adb_round
-adb_last:
-    movdqu  xmm1, xmmword ptr [rcx]           ; rk[0]
-    aesdeclast xmm0, xmm1
-    movdqu  xmmword ptr [rdx], xmm0
-    FRAME_EPILOG
-    ret
-aes_ecb_decrypt endp
 
 ; =============================================================================
 ; aes_ctr_xor(rcx=rk, rdx=data, r8=len, r9=ctr16, [rbp+48]=Nr)

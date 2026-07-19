@@ -6,21 +6,14 @@
 ; default paint uses it.  Brushes/pens/fonts are (re)built by theme_rebrush from
 ; the active colour scheme (theme_set_scheme, cycled by the settings menu).
 ;
-; NOTE: a procedural "aurora" animation path also lives here (bg_render + sin_lut
-; into a DIB, driven by a WM_TIMER through theme_tick, blitted by theme_paint).
-; It is currently INACTIVE: the DIB is never created (g_bits stays 0), so both
-; theme_tick and theme_paint short-circuit to the flat fill.  It is retained,
-; guarded and harmless, pending a decision to either wire it up or remove it.
-;
 ; All procs touch only volatile registers (rax/rcx/rdx/r8-r11) so they unwind
 ; cleanly back through the OS dialog callbacks without saving rbx/rsi/rdi/r12-15.
 ;
 ; Public surface (called from gui.asm dialog procs):
 ;   theme_boot                      - one-time: build the colour scheme + brushes
-;   theme_attach(hwnd, defid)       - per dialog: dark titlebar, bg, anim timer
+;   theme_attach(hwnd, defid)       - per dialog: dark titlebar + bg
 ;   theme_paint(hwnd)               - WM_PAINT: flat fill / sidebar card
 ;   theme_erase        -> 1         - WM_ERASEBKGND: paint the dark background
-;   theme_tick(hwnd)               - WM_TIMER(THEME_TIMER): advance + invalidate
 ;   theme_ctlcolor(hwnd,msg,hdc,hctl) -> HBRUSH  - WM_CTLCOLOR* dark colours
 ;   theme_drawitem(lpdis) -> 1      - WM_DRAWITEM: owner-draw buttons/groupboxes
 ; =============================================================================
@@ -28,13 +21,8 @@
 include macros.inc
 
 ; ---- imports ----------------------------------------------------------------
-extern CreateDIBSection:proc
-extern CreateCompatibleDC:proc
-extern DeleteDC:proc
 extern DeleteObject:proc
 extern SelectObject:proc
-extern StretchBlt:proc
-extern SetStretchBltMode:proc
 extern CreateSolidBrush:proc
 extern CreatePen:proc
 extern CreateFontW:proc
@@ -50,7 +38,6 @@ extern SelectClipRgn:proc
 extern Ellipse:proc
 
 extern GetClientRect:proc
-extern InvalidateRect:proc
 extern BeginPaint:proc
 extern EndPaint:proc
 extern DrawTextW:proc
@@ -60,7 +47,6 @@ extern GetClassNameW:proc
 extern GetWindowLongPtrW:proc
 extern SetWindowLongPtrW:proc
 extern GetDlgItem:proc
-extern SetTimer:proc
 extern RedrawWindow:proc
 extern SendMessageW:proc
 extern EnumChildWindows:proc
@@ -75,17 +61,13 @@ extern GetParent:proc
 extern g_vaulthwnd:qword              ; the DLG_VAULT window (sidebar card only there)
 IDC_V_SEARCH_TH equ 232               ; = IDC_V_SEARCH in gui.asm (sidebar search box)
 extern IsWindowVisible:proc
-extern GetSystemInfo:proc
-extern GetSystemPowerStatus:proc
 extern DwmSetWindowAttribute:proc
-extern CreateDXGIFactory1:proc
 
 ; ---- message / api constants ------------------------------------------------
 WM_CTLCOLOREDIT     equ 133h
 WM_CTLCOLORLISTBOX  equ 134h
 WM_CTLCOLORSTATIC   equ 138h
 DM_SETDEFID         equ 401h
-THEME_TIMER         equ 9
 GWL_STYLE           equ -16
 GWL_EXSTYLE         equ -20
 GWL_USERDATA        equ -21                  ; 1 = Fluent accent (primary) button
@@ -98,8 +80,6 @@ DWMWA_CORNER        equ 33                   ; DWMWA_WINDOW_CORNER_PREFERENCE
 DWMWCP_ROUND        equ 2                    ; rounded corners (Fluent)
 DWMWA_CAPTION_COLOR equ 35                   ; title-bar fill (Win11; older: E_INVALIDARG, ignored)
 DWMWA_TEXT_COLOR    equ 36                   ; title-bar text
-SRCCOPY             equ 0CC0020h
-HALFTONE            equ 4
 NULL_BRUSH          equ 5
 PS_SOLID            equ 0
 WHITE_BRUSH         equ 0
@@ -117,27 +97,9 @@ DT_LFLAGS           equ 24h                 ; DT_LEFT|DT_VCENTER|DT_SINGLELINE
 ; further down); only text-on-accent stays constant.
 COL_ONACC    equ 00000000h                  ; text on accent fill          #000000
 
-; aurora-borealis tuning: vertical curtains rising from the horizon, a star
-;   field above, slow drift.  Darker than a flat glow.
-CK1 equ 5                                ; curtain streak frequencies (per column)
-CK2 equ 9
-CK3 equ 2                                ; broad envelope
-CSTREAK equ 430                          ; streak emphasis threshold (of 765)
-FKY equ 6                                ; fine filament freqs (shimmer texture)
-FKX equ 3
-
-; internal-resolution caps per tier
-BW_MAX equ 480
-
 .data
 align 8
-; IID_IDXGIFactory1 {770aae78-f26f-4dba-a829-253c83d1b387}
-g_overlay   dd 0
-g_phase     dd 0
-g_bw        dd 0
-g_bh        dd 0
-g_memdc     dq 0
-g_bits      dq 0
+g_overlay   dd 0                            ; 1 while the settings overlay is open
 ; ---- runtime-selectable colour scheme -------------------------------------
 ; g_col_* are 13 consecutive dwords (order matches each schemes[] row).
 public g_scheme, g_col_bg, g_col_panel, g_col_text, g_col_textdim, g_col_frame, g_col_dark
@@ -236,8 +198,6 @@ td_symfont label word                   ; Segoe UI Symbol (recycle ♻)
 
 .data?
 align 16
-sin_lut     db 256 dup (?)
-glow_x      db BW_MAX dup (?)
 g_txtbuf    dw 160 dup (?)
 g_clsbuf    dw 16 dup (?)               ; control class name (Static vs Edit)
 
@@ -387,217 +347,6 @@ tss_done:
     FRAME_EPILOG
     ret
 theme_set_scheme endp
-
-; =============================================================================
-; bg_render - paint the aurora-borealis background into g_bits for g_phase:
-;   a star field over a very dark sky, with green->teal->violet curtains rising
-;   from the horizon (bottom).  No callees -> volatiles + locals only.
-; =============================================================================
-bg_render proc frame
-    FRAME_PROLOG 160
-    ; [rbp-24] rowptr [rbp-32] y    [rbp-40] rise [rbp-48] tintR [rbp-56] tintG
-    ; [rbp-64] tintB  [rbp-72] baseR [rbp-80] baseG [rbp-88] baseB
-    ; [rbp-96] x      [rbp-104] a    [rbp-112] pixaddr [rbp-120] star [rbp-128] t
-    mov     ecx, dword ptr [g_bw]
-    test    ecx, ecx
-    jz      br_done
-    ; ---- per-frame curtain[x] (vertical streak intensity) -> glow_x ----------
-    lea     r10, [sin_lut]
-    lea     r11, [glow_x]
-    xor     r8d, r8d
-brx:
-    mov     eax, r8d
-    imul    eax, CK1
-    add     eax, dword ptr [g_phase]
-    and     eax, 255
-    movzx   ecx, byte ptr [r10 + rax]        ; s1
-    mov     eax, r8d
-    imul    eax, CK2
-    sub     eax, dword ptr [g_phase]
-    and     eax, 255
-    movzx   r9d, byte ptr [r10 + rax]        ; s2
-    add     ecx, r9d
-    mov     eax, r8d
-    imul    eax, CK3
-    and     eax, 255
-    movzx   r9d, byte ptr [r10 + rax]        ; s3 (broad envelope)
-    add     ecx, r9d                          ; 0..765
-    sub     ecx, CSTREAK
-    jns     brx_pos
-    xor     ecx, ecx
-brx_pos:
-    imul    ecx, 3
-    shr     ecx, 2                            ; *0.75 -> emphasise streaks
-    cmp     ecx, 255
-    jbe     brx_cap
-    mov     ecx, 255
-brx_cap:
-    mov     byte ptr [r11 + r8], cl
-    inc     r8d
-    cmp     r8d, dword ptr [g_bw]
-    jb      brx
-    ; ---- pixels -------------------------------------------------------------
-    mov     rax, qword ptr [g_bits]
-    mov     qword ptr [rbp-24], rax          ; rowptr
-    mov     dword ptr [rbp-32], 0            ; y
-    lea     r10, [glow_x]
-    lea     r11, [sin_lut]
-br_yloop:
-    mov     r8d, dword ptr [rbp-32]
-    cmp     r8d, dword ptr [g_bh]
-    jae     br_done
-    ; t = y*256/bh (vertical position 0=top .. 255=horizon)
-    mov     eax, r8d
-    shl     eax, 8
-    cdq
-    idiv    dword ptr [g_bh]
-    mov     dword ptr [rbp-128], eax          ; t
-    ; rise = clamp((t-90)*256/165, 0, 255) - aurora envelope, 0 up top
-    sub     eax, 90
-    jns     bry_r0
-    xor     eax, eax
-bry_r0:
-    shl     eax, 8
-    mov     ecx, 165
-    cdq
-    idiv    ecx
-    cmp     eax, 255
-    jbe     bry_r1
-    mov     eax, 255
-bry_r1:
-    mov     dword ptr [rbp-40], eax           ; rise
-    ; up = 255 - t  (height above horizon)
-    mov     ecx, 255
-    sub     ecx, dword ptr [rbp-128]          ; up
-    mov     eax, ecx                          ; tintR = 15 + up*70/256
-    imul    eax, 70
-    shr     eax, 8
-    add     eax, 15
-    mov     dword ptr [rbp-48], eax
-    mov     eax, ecx                          ; tintG = 210 - up*60/256
-    imul    eax, 60
-    shr     eax, 8
-    mov     edx, 210
-    sub     edx, eax
-    mov     dword ptr [rbp-56], edx
-    mov     eax, ecx                          ; tintB = 70 + up*90/256
-    imul    eax, 90
-    shr     eax, 8
-    add     eax, 70
-    mov     dword ptr [rbp-64], eax
-    ; very dark sky base: B=4+t*14/256 G=2+t*8/256 R=1+t*5/256
-    mov     eax, dword ptr [rbp-128]
-    imul    eax, 14
-    shr     eax, 8
-    add     eax, 4
-    mov     dword ptr [rbp-88], eax           ; baseB
-    mov     eax, dword ptr [rbp-128]
-    imul    eax, 8
-    shr     eax, 8
-    add     eax, 2
-    mov     dword ptr [rbp-80], eax           ; baseG
-    mov     eax, dword ptr [rbp-128]
-    imul    eax, 5
-    shr     eax, 8
-    add     eax, 1
-    mov     dword ptr [rbp-72], eax           ; baseR
-    mov     dword ptr [rbp-96], 0            ; x
-br_xloop:
-    mov     edx, dword ptr [rbp-96]          ; x
-    mov     r8d, dword ptr [rbp-32]          ; y
-    mov     rcx, qword ptr [rbp-24]
-    lea     rax, [rcx + rdx*4]
-    mov     qword ptr [rbp-112], rax          ; pixaddr
-    ; a = curtain[x] * rise / 256, then modulated by a fine filament
-    movzx   eax, byte ptr [r10 + rdx]
-    imul    eax, dword ptr [rbp-40]
-    shr     eax, 8                            ; 0..255
-    mov     ecx, r8d
-    imul    ecx, FKY
-    mov     r9d, edx
-    imul    r9d, FKX
-    add     ecx, r9d
-    add     ecx, dword ptr [g_phase]
-    and     ecx, 255
-    movzx   ecx, byte ptr [r11 + rcx]         ; filament 0..255
-    shr     ecx, 1
-    add     ecx, 150                          ; 150..277
-    imul    eax, ecx
-    shr     eax, 8
-    cmp     eax, 255
-    jbe     br_acap
-    mov     eax, 255
-br_acap:
-    mov     dword ptr [rbp-104], eax          ; a
-    ; --- star (upper sky only, where the aurora is faint) ---
-    mov     dword ptr [rbp-120], 0
-    cmp     dword ptr [rbp-40], 130
-    jae     br_nostar
-    mov     eax, dword ptr [rbp-96]
-    imul    eax, 374761393
-    mov     ecx, r8d
-    imul    ecx, 668265263
-    add     eax, ecx
-    mov     ecx, eax
-    shr     ecx, 13
-    xor     eax, ecx
-    imul    eax, 1274126177
-    mov     ecx, eax
-    shr     ecx, 8
-    and     ecx, 1023
-    jnz     br_nostar                          ; ~1/1024 pixels is a star
-    shr     eax, 18
-    and     eax, 7Fh
-    add     eax, 110
-    mov     dword ptr [rbp-120], eax
-br_nostar:
-    ; --- compose channels (base + aurora tint + star), cap 255 ---
-    mov     eax, dword ptr [rbp-104]
-    imul    eax, dword ptr [rbp-48]           ; tintR
-    shr     eax, 10
-    add     eax, dword ptr [rbp-72]
-    add     eax, dword ptr [rbp-120]
-    cmp     eax, 255
-    jbe     br_rok
-    mov     eax, 255
-br_rok:
-    mov     rcx, qword ptr [rbp-112]
-    mov     byte ptr [rcx+2], al              ; R
-    mov     eax, dword ptr [rbp-104]
-    imul    eax, dword ptr [rbp-56]           ; tintG
-    shr     eax, 10
-    add     eax, dword ptr [rbp-80]
-    add     eax, dword ptr [rbp-120]
-    cmp     eax, 255
-    jbe     br_gok
-    mov     eax, 255
-br_gok:
-    mov     byte ptr [rcx+1], al              ; G
-    mov     eax, dword ptr [rbp-104]
-    imul    eax, dword ptr [rbp-64]           ; tintB
-    shr     eax, 10
-    add     eax, dword ptr [rbp-88]
-    add     eax, dword ptr [rbp-120]
-    cmp     eax, 255
-    jbe     br_bok
-    mov     eax, 255
-br_bok:
-    mov     byte ptr [rcx+0], al              ; B
-    mov     byte ptr [rcx+3], 0
-    inc     dword ptr [rbp-96]
-    mov     eax, dword ptr [rbp-96]
-    cmp     eax, dword ptr [g_bw]
-    jb      br_xloop
-    mov     eax, dword ptr [g_bw]
-    shl     eax, 2
-    add     qword ptr [rbp-24], rax
-    inc     dword ptr [rbp-32]
-    jmp     br_yloop
-br_done:
-    FRAME_EPILOG
-    ret
-bg_render endp
-
 
 ; theme_dark_cb(rcx=hwnd, rdx=lparam) -> BOOL - give each control the explorer
 ;   theme so its scrollbars/borders match the scheme: DarkMode_Explorer for dark
@@ -889,23 +638,6 @@ taf_two:
     ret
 theme_accent_fill endp
 
-; =============================================================================
-; theme_tick(rcx=hwnd)
-; =============================================================================
-public theme_tick
-theme_tick proc frame
-    FRAME_PROLOG 48
-    mov     qword ptr [rbp-24], rcx
-    cmp     qword ptr [g_bits], 0
-    je      tt_done
-    inc     dword ptr [g_phase]
-    call    bg_render
-    WINCALL InvalidateRect, qword ptr [rbp-24], 0, 0
-tt_done:
-    FRAME_EPILOG
-    ret
-theme_tick endp
-
 ; col_darken(ecx=col, edx=factor[0..256]) -> eax = per-channel col*factor/256   leaf
 col_darken proc
     movzx   eax, cl
@@ -992,40 +724,12 @@ theme_sidecard proc frame
 theme_sidecard endp
 
 ; =============================================================================
-; theme_paint(rcx=hwnd) -> 1
+; theme_paint(rcx=hwnd) -> 0 ("unhandled") - the flat background comes from
+;   theme_erase (WM_ERASEBKGND); the default paint pass draws controls over it.
 ; =============================================================================
 public theme_paint
 theme_paint proc frame
     FRAME_PROLOG 224
-    ; [rbp-24] hwnd  [rbp-32] hdc  PAINTSTRUCT @ [rbp-120] (72)  RECT @ [rbp-152]
-    mov     qword ptr [rbp-24], rcx
-    cmp     qword ptr [g_bits], 0
-    je      tp_flat
-    WINCALL BeginPaint, qword ptr [rbp-24], addr rbp-120
-    mov     qword ptr [rbp-32], rax           ; hdc
-    WINCALL GetClientRect, qword ptr [rbp-24], addr rbp-152
-    WINCALL SetStretchBltMode, qword ptr [rbp-32], HALFTONE
-    WINCALL StretchBlt, qword ptr [rbp-32], 0, 0, dword ptr [rbp-152+8], dword ptr [rbp-152+12], \
-            qword ptr [g_memdc], 0, 0, dword ptr [g_bw], dword ptr [g_bh], SRCCOPY
-    ; when the settings overlay is open, paint an opaque dark backdrop over the
-    ; aurora so the (transparent) menu controls read against a solid page
-    cmp     dword ptr [g_overlay], 0
-    jne     tp_ovl
-    mov     rax, qword ptr [rbp-24]           ; sidebar card only on the vault window
-    cmp     rax, qword ptr [g_vaulthwnd]
-    jne     tp_done
-    mov     rcx, qword ptr [rbp-24]           ; else draw the sidebar card
-    mov     rdx, qword ptr [rbp-32]
-    call    theme_sidecard
-    jmp     tp_done
-tp_ovl:
-    WINCALL FillRect, qword ptr [rbp-32], addr rbp-152, qword ptr [g_br_bg]
-tp_done:
-    WINCALL EndPaint, qword ptr [rbp-24], addr rbp-120
-    mov     eax, 1
-    FRAME_EPILOG
-    ret
-tp_flat:
     xor     eax, eax
     FRAME_EPILOG
     ret
@@ -1201,13 +905,6 @@ te_noside:
 theme_erase endp
 
 ; =============================================================================
-; theme_backdrop -> HBRUSH - opaque dark brush for the burger-menu backdrop.
-; =============================================================================
-public theme_backdrop
-theme_backdrop proc
-    mov     rax, qword ptr [g_br_bg]
-    ret
-theme_backdrop endp
 
 ; =============================================================================
 ; theme_ctlcolor(rcx=hwnd, rdx=msg, r8=hdc, r9=hctl) -> HBRUSH

@@ -221,7 +221,7 @@ STYLE DS_CENTER | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Vordr - Export all secrets"
 FONT 9, "Segoe UI"
 BEGIN
-    LTEXT "This writes EVERY entry (including passwords and TOTP secrets) into one Excel file, protected only by the password you choose below. Store it safely and delete it when done.", IDC_XP_WARN, 16, 12, 232, 40, 0
+    LTEXT "This writes the selected entries (including passwords and TOTP secrets) into one encrypted .vaultz archive (WinZip AE-2), protected only by the password you choose below. Store it safely and delete it when done.", IDC_XP_WARN, 16, 12, 232, 40, 0
     EDITTEXT IDC_XP_PW, 16, 60, 232, 12, ES_PASSWORD | ES_AUTOHSCROLL | NOT WS_BORDER, 0
     EDITTEXT IDC_XP_PW2, 16, 80, 232, 12, ES_PASSWORD | ES_AUTOHSCROLL | NOT WS_BORDER, 0
     PUSHBUTTON "Export", IDOK, 134, 104, 54, 18, BS_OWNERDRAW

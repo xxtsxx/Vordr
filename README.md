@@ -35,9 +35,12 @@ plainly:
   clear, clipboard-history exclusion, temp-file wiping, an option to disable
   previews entirely) but cannot remove them.
 - **Rollback of the whole file.** Any tampering *inside* the file breaks
-  authentication, but an attacker who replaces the vault with an older, intact
-  copy of itself is currently not detected (an anti-rollback counter is
-  planned; see *Risk assessment*).
+  authentication, and an attacker who replaces the vault with an older, intact
+  copy is flagged too: every save bumps a counter whose last-seen value is
+  mirrored on this machine (HKCU), so an out-of-date vault triggers a loud
+  warning at unlock. The mirror is per-machine — a vault restored onto a fresh
+  machine has nothing to compare against, and an attacker who rolls back both
+  the file *and* the registry mirror stays invisible (see *Risk assessment*).
 
 ### Importance of a strong master password
 
@@ -75,7 +78,7 @@ you should be able to **verify** it:
   HTTP, no telemetry, no update check anywhere in the binary. Your secrets
   cannot phone home because there is nothing to phone with.
 - **The threat model is stated honestly**, including the gaps (no external
-  audit yet, no anti-rollback yet, single-writer file assumption).
+  audit yet, single-writer file assumption).
 - **The hardening is proven, not asserted.** A fault-injection test suite
   (`redteam`) deliberately triggers each exploit-mitigation control and fails
   the build if any of them does not fire.
@@ -146,7 +149,7 @@ ever sees ciphertext.
 |---|---|---|
 | Vault sealing (AEAD) | AES-256-GCM (AES-NI + PCLMULQDQ GHASH) | NIST SP 800-38D |
 | Key derivation | Argon2id, t=3, m=512 MiB, p=1 | RFC 9106 |
-| Argon2 core hash | BLAKE2b (AVX2) | RFC 7693 |
+| Argon2 core hash | BLAKE2b (scalar 64-bit; AVX2 is used only inside Argon2's compressor) | RFC 7693 |
 | Key-check value / hashing | SHA-256 (SHA-NI) | FIPS 180-4 |
 | TOTP codes | HOTP/TOTP over HMAC-SHA-1, base32 keys | RFC 4226 / 6238 / 4648 |
 | `.vaultz` export/import | WinZip AE-2: PBKDF2-HMAC-SHA1, AES-256-CTR, HMAC-SHA1 | interop standard |
@@ -228,8 +231,8 @@ Entries are composable: username, secret, URL, notes, TOTP key, and any number
 of custom-labeled fields, plus encrypted file attachments shown as a tag list.
 Secrets get strength badges, color-coded reveal, a phonetic read-out popup, and
 a generator (random / passphrase / pronounceable / PIN / hex) with a live
-entropy estimate. The UI has nine color schemes, adjustable density, search-as-
-you-type, favorites, per-entry icons, and a tray icon; it locks to the tray.
+entropy estimate. The UI has nine color schemes, search-as-you-type,
+favorites, per-entry icons, and a tray icon; it locks to the tray.
 
 ### Password policy
 
@@ -242,11 +245,13 @@ password and surfaced in the generator. Registry values `PwMinLen`,
 
 Optional fast unlock (default **on** when a TPM is present; `TpmUnlock`): the
 vault key is wrapped to an RSA-2048-OAEP key that lives inside this machine's
-TPM (Microsoft Platform Crypto Provider) and is stored as a per-vault sidecar
-file. The sidecar is useless on any other machine — the private key never
-leaves the TPM. This is strictly **OR-mode convenience**: the master password
-always works everywhere, and deleting the TPM key or the sidecar only costs
-the shortcut. See *Risk assessment* for the trade-offs.
+TPM (Microsoft Platform Crypto Provider), and the wrapped blob is stored in
+the registry under `HKCU\SOFTWARE\Vordr\TPM-Unlock` (one value per vault,
+named by the vault's path). The blob is useless on any other machine — the
+private key never leaves the TPM. This is strictly **OR-mode convenience**:
+the master password always works everywhere, and deleting the TPM key or the
+registry value only costs the shortcut. See *Risk assessment* for the
+trade-offs.
 
 ### Secure unlock
 
@@ -303,8 +308,11 @@ not exported.
 ### OneDrive storage
 
 On first run Vordr proposes `%OneDrive%\Vordr\vault.vordr` as the default
-location when OneDrive is present (falling back to Documents), and the unlock
-dialog shows where the vault lives. This is a deliberate availability
+location, but only when OneDrive is actually in use — a linked sync account
+with a matching `UserFolder` exists. The `%OneDrive%` variable alone is not
+enough: on a machine where the sync client was never linked, Vordr falls back
+to `Documents\Vordr\vault.vordr` rather than wake the dormant client. The
+unlock dialog shows where the vault lives. This is a deliberate availability
 trade-off: the synced file gives you an off-machine backup for free, and the
 provider only ever sees ciphertext — confidentiality and integrity are
 enforced by the format, not the transport. What a sync provider *could* do is
@@ -371,10 +379,12 @@ and enforced in CI on every push:
 
 **Explicitly not defended:** kernel-level or admin-level compromise while
 unlocked, DMA/firmware/hardware attackers, coercion, and a weak master
-password. **Known gaps, planned:** whole-file rollback detection (an attacker
-— or a malicious sync provider — replacing the vault with an older intact
-version is not detected today) and a single full-file MAC over everything
-including the attachment trailer. No external audit has been performed.
+password. Whole-file rollback detection (a monotonic save counter mirrored on
+this machine, warned on at unlock) and a single full-file MAC over everything
+including the attachment trailer (a keyed BLAKE2b trailer, so truncation or
+record-splicing fails the unlock) are both implemented — the remaining caveat
+is that rollback evidence lives per-machine, not in the vault. No external
+audit has been performed.
 
 ### Analysis of quantum resistance
 
@@ -388,11 +398,11 @@ quantum-hardened by construction, not by patching.
 
 The one asterisk is **TPM unlock**, which wraps the vault key with RSA-2048 —
 a Shor-vulnerable algorithm. Perspective matters: the wrapped blob is a local
-sidecar bound to one machine's TPM, not something transmitted or published,
-and an attacker with a future quantum computer *and* your sidecar file still
-learns nothing without also having had access to your machine. If your threat
-model includes harvest-now-decrypt-later adversaries collecting your local
-files, disable TPM unlock; the vault itself remains safe either way.
+registry value bound to one machine's TPM, not something transmitted or
+published, and an attacker with a future quantum computer *and* a copy of that
+registry value still learns nothing without the TPM it was wrapped to. If your
+threat model includes harvest-now-decrypt-later adversaries collecting your
+local data, disable TPM unlock; the vault itself remains safe either way.
 
 ### TPM unlock and the risk of forgetting the master password
 
@@ -400,9 +410,9 @@ TPM unlock creates a human risk precisely because it works well: if the TPM
 opens your vault every day, you may not type the master password for months —
 and unused passwords are forgotten. The TPM cannot save you then: a dead
 motherboard, a cleared TPM, a Windows reinstall, or simply moving to a new
-machine all invalidate the sidecar, and the master password becomes the only
-way in. **There is no recovery** (see above). If you enable TPM unlock, write
-the master password down and store it physically securely, or schedule
+machine all invalidate the stored blob, and the master password becomes the
+only way in. **There is no recovery** (see above). If you enable TPM unlock,
+write the master password down and store it physically securely, or schedule
 yourself to type it periodically. This trade-off is the reason TPM unlock is
 convenience-only and never the sole factor.
 

@@ -8,7 +8,9 @@ rem              the process with a 0xFADExx fail-fast code (iat: raw AV).
 rem              Skipped with --quick.
 rem   build      release build via build.cmd strict (framecheck FATALs gate it)
 rem   selftest   bin\vordr.exe selftest must print "all self-tests passed"
-rem   roundtrip  seedtest -> atgen -> zitest -> phtest headless probes
+rem   roundtrip  headless probes: seedtest -> atgen -> zitest -> phtest ->
+rem              secscan -> tmptest -> fztest -> trtest -> vfuzz -> fuzzzip ->
+rem              bktest -> mactest -> rbtest -> xctest -> pkat
 rem
 rem Usage: tests\run_all.cmd [--quick]
 rem Exit:  0 = all stages passed, 1 = at least one FAIL (see the summary table).
@@ -97,7 +99,7 @@ set /a T_SELFTEST=!T1!-!T0!
 
 rem -------------------------------------------------------------- roundtrip --
 call :now T0
-echo === stage: roundtrip (seedtest / atgen / zitest / phtest / secscan / tmptest) ===
+echo === stage: roundtrip (seedtest / atgen / zitest / phtest / secscan / tmptest / fztest / trtest / vfuzz / fuzzzip / bktest / mactest / rbtest / xctest / pkat) ===
 set RT=PASS
 
 bin\vordr.exe seedtest "%WORK%\rt.vault" > "%WORK%\seedtest.log" 2>&1

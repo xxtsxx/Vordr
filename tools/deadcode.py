@@ -36,6 +36,15 @@ ALLOWLIST = {
     "kat_img_b",       # payload bytes read by adjacency to kat_img (dd len; bytes
                        # follow) in the field-serialization KAT - live data, the
                        # label just isn't named.  Same idea as a struct field.
+    "_load_config_used",  # loadcfg.asm: the PE load-config marker the linker
+                       # looks up by name - referenced by the tool, not by code.
+    "VAULT_HDR",       # macros.inc: the vault wire-format layout, kept as the
+                       # in-code ground truth next to docs/formats.md (accessed
+                       # via VH_* offset equs, not as a type).
+    # macros.inc library families: complete by design, exercised as needed -
+    # deleting the unused members just means re-adding them on next use.
+    "CHECK_SUB_OVF", "CHECK_MUL_OVF",
+    "xELSE", "xELIF", "xWHILET", "xWHILEZ", "xCONTINUE",
 }
 
 # MASM identifiers: letter/_/$/?/@ then letter/digit/_/$/?/@.  Matches both the
@@ -52,6 +61,11 @@ RE_STRUCT_END = re.compile(r'^\s*(' + IDENT + r')\s+ends\b', re.I)
 # "<name> endp" closes a proc; the leading name is a bookkeeping marker paired
 # with the def, NOT a reference - counting it would make every proc look live.
 RE_ENDP = re.compile(r'^\s*(' + IDENT + r')\s+endp\b', re.I)
+# public/extern/externdef lines name a symbol but do not USE it.  Counting them
+# as references makes every public symbol self-immortal (the hole that hid the
+# ze_build_csv corpse): a public proc with zero callers must read as dead.
+# Real uses (call/WINCALL/addr/lea) still produce their own tokens elsewhere.
+RE_DIRECTIVE = re.compile(r'^\s*(public|extern|externdef)\b', re.I)
 KIND_MAP = {"proc": "proc", "macro": "macro", "equ": "equ", "textequ": "equ"}
 # equ/textequ names with a resource-id prefix mirror vordr.rc's #defines (the
 # gui.asm block is explicitly commented "MUST match vordr.rc").  Their true
@@ -109,6 +123,8 @@ def scan(paths):
                 defs.setdefault(nm, (fname, n, "data"))
                 in_struct = True
                 continue
+            if RE_DIRECTIVE.match(s):
+                continue           # public/extern/externdef: declaration, not use
             me = RE_ENDP.match(s)
             if me:
                 # count tokens after the proc name (usually none), never the name
@@ -141,6 +157,9 @@ def main():
     args = ap.parse_args()
 
     paths = sorted(glob.glob(os.path.join(args.src, "*.asm")))
+    inc = os.path.join(args.src, "macros.inc")     # macros reference symbols
+    if os.path.exists(inc):                        # (FRAME_PROLOG/FASTFAIL) that
+        paths.append(inc)                          # look dead without it
     defs, refs = scan(paths)
 
     dead = []

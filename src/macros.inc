@@ -68,9 +68,9 @@ KCV_LEN             equ 16         ; key-check value bytes (SHA-256(key) prefix)
 ; Vordr vault file format (see docs/formats.md).  A fixed 80-byte header (the
 ; 64-byte parameter block plus a 16-byte key-check value) is used verbatim as
 ; the GCM AAD.  The KCV = SHA-256(key)[0..15] lets a wrong master password be
-; rejected right after the KDF (and makes the scheme key-committing).  Each
-; write uses a fresh CSPRNG salt/nonce and is committed atomically via a temp
-; file + MoveFileExW.
+; rejected right after the KDF (and makes the scheme key-committing).  The
+; salt is generated once at vault creation; each save refreshes only the
+; CSPRNG nonce and is committed atomically via a temp file + MoveFileExW.
 ; ---------------------------------------------------------------------------
 VAULT_MAGIC         equ 52445256h  ; "VRDR" little-endian  - the single vault file
 VAULT_VERSION       equ 1
