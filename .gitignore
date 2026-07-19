@@ -1,4 +1,4 @@
-# Build outputs (regenerable via build.cmd / build-gui.cmd)
+# Build outputs (regenerable via build.cmd)
 /bin/
 /obj/
 *.obj
@@ -14,12 +14,10 @@
 *~
 
 # Encrypted/plaintext working data — never commit user data
-*.mrk
-/checkpoints/
-/ztest/         # encrypted-zip test fixtures (regenerated via pyzipper)
 *.zip
 
-# diagnostic outputs (imgtest/thumbtest/pvtest)
-thumb_out.png
-pvtmp.pdf
+# Local run logs and registry exports — diagnostic artifacts, never commit
+*.log
+*.reg
+
 tools/__pycache__/

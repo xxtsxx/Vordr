@@ -6,10 +6,12 @@
 ; opens the GUI - the only place the vault and secrets are ever handled, so a
 ; master password or secret never appears on the command line.
 ;
-; The GUI uses three dialog-resource templates (DLG_UNLOCK / DLG_VAULT /
-; DLG_ENTRY in vordr.rc).  The vault is unlocked ONCE (key in g_vkey, body in
-; locked memory); the dialogs read entries and mutate the in-memory body, then
-; re-seal to disk via the vault session API (vault_unlock/reseal/add/remove/...).
+; The GUI uses twelve dialog-resource templates (vordr.rc): unlock, create,
+; vault, message, about, password readout, icon picker, generator, history,
+; select/export, export-password and import-password.  The vault is unlocked
+; ONCE (key in g_vkey, body in locked memory); the dialogs read entries and
+; mutate the in-memory body, then re-seal to disk via the vault session API
+; (vault_unlock/reseal/add/remove/...).
 ;
 ; Dialog procs are RAW frames (no FRAME_PROLOG): they are OS callbacks, so the
 ; software shadow stack must not be touched across them.  The helper procs they
@@ -40,7 +42,6 @@ extern vault_unlock:proc
 extern vault_lock:proc
 extern vault_reseal:proc
 extern vault_ext_changed:proc           ; vault.asm: on-disk file changed since load?
-extern vault_add_entry:proc
 extern vault_remove_at:proc
 extern vault_count:proc
 extern vault_title_at:proc
@@ -175,7 +176,7 @@ extern SetDlgItemInt:proc
 extern GetDlgItemInt:proc
 extern GetFileAttributesW:proc
 extern SetFileAttributesW:proc
-extern CreateFileW:proc                   ; secure temp-file wipe (plan 8)
+extern CreateFileW:proc                   ; secure temp-file wipe
 extern WriteFile:proc
 extern FlushFileBuffers:proc
 extern CreateDirectoryW:proc
@@ -219,7 +220,6 @@ extern InitCommonControlsEx:proc
 extern pw_metrics:proc
 extern theme_boot:proc
 extern theme_attach:proc
-extern theme_tick:proc
 extern theme_paint:proc
 extern theme_erase:proc
 extern theme_ctlcolor:proc
@@ -228,7 +228,6 @@ extern theme_toggle:proc
 extern theme_toggle_labeled:proc
 extern theme_progressbar:proc
 extern g_font_totp:qword
-extern theme_backdrop:proc
 extern theme_overlay:proc
 ; --- system-tray / message-loop imports ---------------------------------------
 extern Shell_NotifyIconW:proc
@@ -284,7 +283,6 @@ WM_CTLCOLORLISTBOX  equ 134h
 WM_CTLCOLORBTN      equ 135h
 WM_CTLCOLORDLG      equ 136h
 WM_CTLCOLORSTATIC   equ 138h
-THEME_TIMER         equ 9
 EM_SETCUEBANNER     equ 1501h
 ; ---- system tray / window-loop -----------------------------------------------
 WM_DESTROY          equ 2
@@ -410,8 +408,8 @@ IDC_V_MNOPREVINFO equ 265            ; "Disable attachment preview" info (i)
 IDC_V_MTHEME equ 240                  ; color-scheme cycle button (settings)
 IDC_V_MTHEMEL equ 241                 ; "Color scheme" label
 IDC_V_COLORPW equ 244                 ; overlay: colored revealed secret (owner-draw)
-IDC_V_MEXPORT equ 245                 ; "Export all secrets to Excel" button (settings)
-IDC_V_MIMPORT equ 246                 ; "Import..." button (auto-detects CSV / xlsx)
+IDC_V_MEXPORT equ 245                 ; "Export secrets..." button (.vaultz archive)
+IDC_V_MIMPORT equ 246                 ; "Import..." button (Vordr .vaultz archives)
 IDC_V_MEXPZIP equ 247                 ; "Export to encrypted ZIP" button (settings)
 DLG_ICON      equ 740                 ; icon picker (glyph grid + colour swatches)
 IDC_I_PREV    equ 850                 ; icon picker: live preview tile
@@ -514,7 +512,7 @@ DESCSZ      equ 480            ; 16 + 16 handles*8 + 328 arf blob + 8 reserved (
 ; into one row backed by g_tilefiles (see the tf_* helpers).  Each file entry is
 ; {AttachRef[68], filename wide (NUL-terminated, <=129 wchars)}.
 MAX_TFILES  equ 24             ; <= MAX_FIELDS minus the other fields of an entry
-; secure temp-file tracking (plan 8): every attachment decrypted to %TEMP% is
+; secure temp-file tracking: every attachment decrypted to %TEMP% is
 ; recorded here and, on vault lock/exit, overwritten with zeros then deleted.
 MAX_TEMPFILES equ 16           ; tracked decrypt-to-temp files per session
 TEMP_PATHW    equ 300          ; wide chars reserved per temp path
@@ -629,11 +627,11 @@ OPENFILENAMEW ends
 
 .const
 ; ---- ASCII (console) diagnostics --------------------------------------------
-CSTR c_nocpu,   "error: CPU lacks required features (AES-NI/PCLMULQDQ/SSE4.1)",13,10
+CSTR c_nocpu,   "error: CPU lacks required features (AES-NI/PCLMULQDQ/SSE4.1/SHA-NI)",13,10
 CSTR c_stfail,  "SELFTEST FAILURE - refusing to run",13,10
 ; ---- wide message-box strings (WSTR: no commas) -----------------------------
 WSTR t_err,         <Vordr - error>
-WSTR m_nocpu,       <This CPU lacks required features (AES-NI / PCLMULQDQ / SSE4.1) - cannot run.>
+WSTR m_nocpu,       <This CPU lacks required features (AES-NI / PCLMULQDQ / SSE4.1 / SHA-NI) - cannot run.>
 WSTR m_stfail,      <Self-test FAILED - refusing to run. The binary may be corrupt.>
 WSTR t_remove,      <Remove this entry?>
 WSTR t_trash,       <Move this entry to the trash? It can be restored for 30 days.>
@@ -654,6 +652,7 @@ WSTR t_exttitle,    <Vault changed on disk>
 WSTR g_singleton_name, <VordrSingletonMutex_v1>
 WSTR g_vault_title,    <Vordr - Vault>
 WSTR g_unlock_title,   <Vordr - Unlock vault>
+WSTR g_create_title,   <Vordr - Set master password>
 WSTR s_createfail,  <Could not create the vault (I/O or out of memory).>
 WSTR s_notitle,     <An entry needs a title.>
 WSTR s_nofieldroom, <No room for more fields on this record - remove one first.>
@@ -788,8 +787,10 @@ secdesk_name label word                          ; private desktop for password 
 WSTR cf_hist_name,  <CanIncludeInClipboardHistory>
 WSTR cf_cloud_name, <CanUploadToCloudClipboard>
 WSTR cf_excl_name,  <ExcludeClipboardContentFromMonitorProcessing>
+ifdef DBG_TRACE
 WSTR sd_spike_ttl, <Secure desktop>
 WSTR sd_spike_txt, <This dialog is running on a private, isolated Vordr desktop. Same-session keyloggers and screen-scrapers cannot see it. Click OK to return to your normal desktop.>
+endif
 WSTR xp_mm_title,    <Export all secrets>
 WSTR imp_xls_wrongpw,<Could not open the workbook - the password was incorrect.>
 WSTR imp_g_title,    <Import>
@@ -1189,7 +1190,7 @@ g_phonfont    dq ?                         ; small monospace font for the phonet
 g_symfont     dq ?                         ; Segoe UI Symbol - the recycle glyph in recover mode
 g_sub_w       dw 512 dup (?)               ; subtitle scratch (wide)
 g_cmpbuf      db 256 dup (?)               ; title-A copy for WM_COMPAREITEM
-g_imp_msgw    dw 160 dup (?)               ; CSV-import result message scratch (wide)
+g_imp_msgw    dw 160 dup (?)               ; import result message scratch (wide)
 g_pg_len      dd ?                         ; password-generator: length
 g_pg_style    dd ?                         ;   PWS_* style
 g_pg_opt      dd ?                         ;   class mask + PWO_* flags
@@ -1536,8 +1537,6 @@ unlock_proc proc
     je      up_terase
     cmp     rdx, WM_DRAWITEM
     je      up_tdraw
-    cmp     rdx, WM_TIMER
-    je      up_ttimer
     cmp     rdx, WM_CTLCOLOREDIT
     je      up_tcolor
     cmp     rdx, WM_CTLCOLORLISTBOX
@@ -1573,13 +1572,6 @@ up_tdraw:
 up_tdraw_def:
     mov     rcx, r9
     call    theme_drawitem
-    jmp     up_ret
-up_ttimer:
-    cmp     r8d, THEME_TIMER
-    jne     up_tunh
-    mov     rcx, qword ptr [rbp-8]
-    call    theme_tick
-    mov     eax, 1
     jmp     up_ret
 up_tunh:
     xor     eax, eax
@@ -1677,7 +1669,7 @@ gp_nofold:
     call    vault_count
     mov     dword ptr [rbp-32], eax              ; count
     ; pre-allocate the listbox's internal item storage so a 5000-entry bulk fill
-    ; does not repeatedly reallocate (plan 35: smooth large-vault handling).  The
+    ; does not repeatedly reallocate (large-vault sidebar work).  The
     ; owner-draw listbox already virtualizes painting; this just speeds the load.
     mov     r10d, eax
     imul    r10d, r10d, 8                        ; ~8 bytes of storage per item
@@ -8599,7 +8591,7 @@ vault_proc proc
     cmp     rdx, WM_CLOSE
     je      vp_close
     cmp     rdx, WM_TIMER
-    je      vp_timer
+    je      vp_timer_clip
     cmp     rdx, WM_WTSSESSION_CHANGE
     je      vp_wts
     cmp     rdx, WM_DROPFILES
@@ -8794,12 +8786,6 @@ vp_tdraw_def:
     mov     rcx, r9
     call    theme_drawitem
     jmp     vp_ret
-vp_timer:
-    cmp     r8d, THEME_TIMER
-    jne     vp_timer_clip
-    mov     rcx, qword ptr [rbp-8]
-    call    theme_tick
-    jmp     vp_handled
 vp_timer_clip:
     cmp     r8d, CLIP_TIMER
     je      vp_t_clip
@@ -10195,8 +10181,6 @@ create_proc proc
     je      cp_terase
     cmp     rdx, WM_DRAWITEM
     je      cp_tdraw
-    cmp     rdx, WM_TIMER
-    je      cp_ttimer
     cmp     rdx, WM_CTLCOLOREDIT
     je      cp_tcolor
     cmp     rdx, WM_CTLCOLORLISTBOX
@@ -10222,13 +10206,6 @@ cp_terase:
 cp_tdraw:
     mov     rcx, r9
     call    theme_drawitem
-    jmp     cp_ret
-cp_ttimer:
-    cmp     r8d, THEME_TIMER
-    jne     cp_tunh
-    mov     rcx, qword ptr [rbp-8]
-    call    theme_tick
-    mov     eax, 1
     jmp     cp_ret
 cp_tunh:
     xor     eax, eax
@@ -10588,8 +10565,6 @@ select_proc proc
     je      sel_erase
     cmp     rdx, WM_DRAWITEM
     je      sel_draw
-    cmp     rdx, WM_TIMER
-    je      sel_timer
     xor     eax, eax
     jmp     sel_ret
 sel_col:
@@ -10608,13 +10583,6 @@ sel_erase:
 sel_draw:
     mov     rcx, r9                              ; owner-draw buttons (All/None/OK/Cancel)
     call    theme_drawitem
-    mov     eax, 1
-    jmp     sel_ret
-sel_timer:
-    cmp     r8d, THEME_TIMER
-    jne     sel_unh
-    mov     rcx, qword ptr [rbp-8]
-    call    theme_tick
     mov     eax, 1
     jmp     sel_ret
 sel_unh:
@@ -11182,8 +11150,6 @@ pwhist_proc proc
     je      ph_draw
     cmp     rdx, WM_MOUSEWHEEL
     je      ph_wheel
-    cmp     rdx, WM_TIMER
-    je      ph_timer
     xor     eax, eax
     jmp     ph_ret
 ph_col:
@@ -11240,13 +11206,6 @@ ph_wheel_set:
     WINCALL GetDlgItem, qword ptr [rbp-8], IDC_PH_LIST
     WINCALL InvalidateRect, rax, 0, 1
 ph_wheel_done:
-    mov     eax, 1
-    jmp     ph_ret
-ph_timer:
-    cmp     r8d, THEME_TIMER
-    jne     ph_unh
-    mov     rcx, qword ptr [rbp-8]
-    call    theme_tick
     mov     eax, 1
     jmp     ph_ret
 ph_unh:
@@ -11349,11 +11308,10 @@ gu32_wl:
 gui_u32w endp
 
 ; =============================================================================
-; gui_import(rcx = hdlg) -> eax = entries imported.  Pick any supported file and
-;   auto-detect its format from the leading bytes: "PK" -> unencrypted .xlsx;
-;   OLE2 magic (D0 CF 11 E0) -> encrypted .xlsx (prompt for the workbook
-;   password); otherwise CSV (delimiter auto-detected).  Appends every row/entry,
-;   reseals and refreshes.
+; gui_import(rcx = hdlg) -> eax = entries imported.  Pick a .vaultz file: the
+;   only accepted format is a Vordr WinZip-AES archive (PK + method 99); the
+;   password is prompted via DLG_IMPPW, then zi_stage decrypts vordr.json and
+;   the entries are appended, resealed and refreshed.
 ; =============================================================================
 public gui_import
 gui_import proc frame
@@ -11650,8 +11608,6 @@ pwgen_proc proc
     je      pp_erase
     cmp     rdx, WM_DRAWITEM
     je      pp_draw
-    cmp     rdx, WM_TIMER
-    je      pp_timer
     xor     eax, eax
     jmp     pp_ret
 pp_col:
@@ -11695,13 +11651,6 @@ pp_d_tog:
     and     edx, dword ptr [g_pg_opt]          ; state = option bit (nonzero = on)
     mov     rcx, r9
     call    theme_toggle_labeled
-    jmp     pp_ret
-pp_timer:
-    cmp     r8d, THEME_TIMER
-    jne     pp_unh
-    mov     rcx, qword ptr [rbp-8]
-    call    theme_tick
-    mov     eax, 1
     jmp     pp_ret
 pp_unh:
     xor     eax, eax
@@ -11924,8 +11873,6 @@ xlpw_proc proc
     je      xpp_erase
     cmp     rdx, WM_DRAWITEM
     je      xpp_draw
-    cmp     rdx, WM_TIMER
-    je      xpp_timer
     xor     eax, eax
     jmp     xpp_ret
 xpp_col:
@@ -11943,13 +11890,6 @@ xpp_erase:
 xpp_draw:
     mov     rcx, r9
     call    theme_drawitem
-    jmp     xpp_ret
-xpp_timer:
-    cmp     r8d, THEME_TIMER
-    jne     xpp_unh
-    mov     rcx, qword ptr [rbp-8]
-    call    theme_tick
-    mov     eax, 1
     jmp     xpp_ret
 xpp_unh:
     xor     eax, eax
@@ -12062,9 +12002,9 @@ xpp_ret:
 xlpw_proc endp
 
 ; =============================================================================
-; imppw_proc - DLG_IMPPW dialog procedure: prompt for an existing workbook
-;   password (single field, no confirm, no policy check) to open an encrypted
-;   .xlsx for import.  Fills g_xlpw / g_xlpwlen.  Raw frame.
+; imppw_proc - DLG_IMPPW dialog procedure: prompt for the archive password
+;   (single field, no confirm, no policy check) to open a Vordr WinZip-AES
+;   .vaultz for import.  Fills g_xlpw / g_xlpwlen.  Raw frame.
 ; =============================================================================
 imppw_proc proc
     push    rbp
@@ -12089,8 +12029,6 @@ imppw_proc proc
     je      ipp_erase
     cmp     rdx, WM_DRAWITEM
     je      ipp_draw
-    cmp     rdx, WM_TIMER
-    je      ipp_timer
     xor     eax, eax
     jmp     ipp_ret
 ipp_col:
@@ -12108,13 +12046,6 @@ ipp_erase:
 ipp_draw:
     mov     rcx, r9
     call    theme_drawitem
-    jmp     ipp_ret
-ipp_timer:
-    cmp     r8d, THEME_TIMER
-    jne     ipp_unh
-    mov     rcx, qword ptr [rbp-8]
-    call    theme_tick
-    mov     eax, 1
     jmp     ipp_ret
 ipp_unh:
     xor     eax, eax
@@ -12311,8 +12242,6 @@ icon_proc proc
     je      ic_paint
     cmp     rdx, WM_ERASEBKGND
     je      ic_erase
-    cmp     rdx, WM_TIMER
-    je      ic_timer
     xor     eax, eax
     jmp     ic_ret
 ic_col:
@@ -12326,13 +12255,6 @@ ic_erase:
     mov     rcx, r8
     mov     rdx, qword ptr [rbp-8]
     call    theme_erase
-    jmp     ic_ret
-ic_timer:
-    cmp     r8d, THEME_TIMER
-    jne     ic_unh
-    mov     rcx, qword ptr [rbp-8]
-    call    theme_tick
-    mov     eax, 1
     jmp     ic_ret
 ic_unh:
     xor     eax, eax
@@ -12593,9 +12515,9 @@ gss_ret:
     ret
 gui_secdesk_show endp
 
-; cmd_securedesk - Plan 4 Step 1 spike: bring up a themed dialog on the private
-;   desktop, so the desktop-switch mechanism can be eyeballed before it is wired
-;   into the real unlock flow.  eax = 0.
+ifdef DBG_TRACE
+; cmd_securedesk - private-desktop spike dialog (dbg builds only): brings up a
+;   themed dialog on the isolated desktop to eyeball the switch mechanism.
 public cmd_securedesk
 LANDING_PAD
 cmd_securedesk proc frame
@@ -12615,6 +12537,7 @@ cmd_securedesk proc frame
     FRAME_EPILOG
     ret
 cmd_securedesk endp
+endif
 
 ; =============================================================================
 ; gui_open(rcx = owner hwnd) - run the create/unlock -> vault flow, then lock and
@@ -13199,7 +13122,8 @@ ws_gui:
     test    eax, eax
     jnz     ws_stfail_gui
     ; single-instance guard: two GUIs on one vault would clobber each other's
-    ; saves.  If the named mutex already exists, focus the running window + exit.
+    ; saves.  If the named mutex already exists, surface the running instance
+    ; (focus its open dialog, or ask its tray window to open the flow), then exit.
     WINCALL CreateMutexW, 0, 1, addr g_singleton_name
     call    GetLastError
     cmp     eax, 183                        ; ERROR_ALREADY_EXISTS
@@ -13209,7 +13133,17 @@ ws_gui:
     jnz     ws_gui_focus
     WINCALL FindWindowW, 0, addr g_unlock_title
     test    rax, rax
+    jnz     ws_gui_focus
+    WINCALL FindWindowW, 0, addr g_create_title
+    test    rax, rax
+    jnz     ws_gui_focus
+    ; no dialog is up: the running instance is sitting in the tray - post it an
+    ; Open command so IT shows the unlock/create flow, instead of dying silently
+    WINCALL FindWindowW, addr tray_cls, 0
+    test    rax, rax
     jz      ws_gui_exit
+    WINCALL PostMessageW, rax, WM_COMMAND, IDM_OPEN, 0
+    jmp     ws_gui_exit
 ws_gui_focus:
     WINCALL SetForegroundWindow, rax
 ws_gui_exit:

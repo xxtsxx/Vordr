@@ -4,7 +4,9 @@
 #   1. dbg build + all 8 redteam fault-injection cases (0xFADE fail-fast codes)
 #   2. strict release build (framecheck FATALs fail the build)
 #   3. selftest ("all self-tests passed")
-#   4. headless roundtrip: seedtest -> atgen -> zitest -> phtest
+#   4. headless roundtrip: seedtest -> atgen -> zitest -> phtest -> secscan ->
+#      tmptest -> fztest -> trtest -> vfuzz -> fuzzzip -> bktest -> mactest ->
+#      rbtest -> xctest -> pkat
 #
 # windows-latest ships VS (ml64/link/rc) and Python; ilammy/msvc-dev-cmd puts
 # the x64 toolchain on PATH the same way a "x64 Native Tools" prompt does.

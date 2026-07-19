@@ -3,7 +3,8 @@
 ; -----------------------------------------------------------------------------
 ; Wraps the vault's 32-byte master key to a TPM-resident RSA key (CNG
 ; "Microsoft Platform Crypto Provider") so it can be released again only on THIS
-; machine.  The wrapped blob is kept in a per-vault sidecar; the master password
+; machine.  The wrapped blob lives in the registry (HKCU\SOFTWARE\Vordr\
+; TPM-Unlock, one value per vault path); the master password
 ; still opens the vault on any machine, so this is pure convenience (OR mode) and
 ; never the sole factor - losing the TPM only costs the fast-unlock shortcut.
 ;

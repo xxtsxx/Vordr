@@ -128,7 +128,7 @@ BAK_GENS        equ 3           ; rotated backup generations (.bak1 .. .bak3)
 ;   trailer = [u32 ATT_MAGIC][u64 entries_len]   (present only when >=1 image)
 ATT_MAGIC       equ 54544156h   ; "VATT"
 ATT_TRAILER     equ 12          ; sizeof trailer
-; Full-file MAC + anti-rollback trailer (plan 4/3), appended after everything
+; Full-file MAC + anti-rollback trailer, appended after everything
 ; else.  Additive + backward compatible: legacy vaults simply lack the magic.
 ;   [u64 save_counter][32-byte BLAKE2b-keyed MAC over the whole file + counter]
 ;   [u32 FMAC_MAGIC]
@@ -743,7 +743,7 @@ vsw_hcpy:
     add     rdx, qword ptr [g_body_len]
     call    attach_build
 vsw_write:
-    ; --- full-file MAC + anti-rollback trailer (plan 4/3) ------------------
+    ; --- full-file MAC + anti-rollback trailer ------------------
     ; layout at offset base: [u64 counter][32 MAC over image+counter][u32 magic]
     inc     qword ptr [g_save_counter]          ; monotonic: this save's number
     mov     r10, qword ptr [g_outbuf]
@@ -903,7 +903,7 @@ vu_havekey:
     call    vk_kcv_ok
     test    eax, eax
     jnz     vu_locked
-    ; --- full-file MAC + anti-rollback trailer (plan 4/3) ------------------
+    ; --- full-file MAC + anti-rollback trailer ------------------
     ; If the file ends in FMAC_MAGIC, verify the keyed MAC over everything before
     ; it (defence in depth over GCM: catches truncation / splicing of the
     ; attachment section) and read the save counter.  g_fmac_len then hides the
@@ -1098,63 +1098,6 @@ vl_wipe:
 vault_lock endp
 
 ; ===========================================================================
-; va_field(rcx = type, rdx = wideZ value) -> eax = 1 if a field was appended,
-;   0 if the value pointer was NULL/empty.  Fastfails on body overflow.
-;   Appends { u16 type, u32 len, utf8 bytes } at g_body[g_body_len].
-; ===========================================================================
-va_field proc frame
-    FRAME_PROLOG 48
-    ; [rbp-24]=type [rbp-32]=len
-    test    rdx, rdx
-    jz      vf_skip
-    mov     qword ptr [rbp-24], rcx
-    mov     rcx, rdx
-    lea     rdx, [g_conv]
-    mov     r8d, CONV_CAP
-    call    conv_w2u
-    test    eax, eax
-    jz      vf_skip
-    mov     ecx, eax
-    mov     qword ptr [rbp-32], rcx     ; len (zero-extended)
-    ; bounds: g_body_len + 6 + len <= VAULT_BODY_MAX
-    mov     r10, qword ptr [g_body_len]
-    add     r10, 6
-    add     r10, qword ptr [rbp-32]
-    cmp     r10, VAULT_BODY_MAX
-    ja      vf_overflow
-    ; write header
-    mov     r11, qword ptr [g_body_ptr]
-    add     r11, qword ptr [g_body_len]
-    mov     rax, qword ptr [rbp-24]
-    mov     word ptr [r11], ax
-    mov     eax, dword ptr [rbp-32]
-    mov     dword ptr [r11+2], eax
-    ; copy bytes
-    add     r11, 6
-    lea     r9, [g_conv]
-    xor     r8, r8
-vf_copy:
-    cmp     r8, qword ptr [rbp-32]
-    jae     vf_copydone
-    mov     al, byte ptr [r9+r8]
-    mov     byte ptr [r11+r8], al
-    inc     r8
-    jmp     vf_copy
-vf_copydone:
-    mov     rax, qword ptr [g_body_len]
-    add     rax, 6
-    add     rax, qword ptr [rbp-32]
-    mov     qword ptr [g_body_len], rax
-    mov     eax, 1
-    FRAME_EPILOG
-    ret
-vf_skip:
-    xor     eax, eax
-    FRAME_EPILOG
-    ret
-vf_overflow:
-    FASTFAIL FF_BOUNDS
-va_field endp
 
 ; ===========================================================================
 ; do_init - create a new empty vault at g_cfg_in.
@@ -1725,7 +1668,7 @@ vfz_rand proc
 vfz_rand endp
 
 ; ===========================================================================
-; cmd_vfuzz - in-proc structural fuzzer for the vault record parser (plan 30).
+; cmd_vfuzz - in-proc structural fuzzer for the vault record parser.
 ;   Deterministically xorshift-mutates a copy of a valid one-entry body
 ;   (bit flips, random byte sets, TLV length/count smashes, truncations),
 ;   then runs vault_body_validate + the trusting accessors on it VFZ_ITERS
@@ -1898,7 +1841,7 @@ vfz_oom:
 cmd_vfuzz endp
 
 ; ===========================================================================
-; cmd_bktest <path> - headless proof of atomic save + backup rotation (plan 37).
+; cmd_bktest <path> - headless proof of atomic save + backup rotation.
 ;   Creates the vault BAK_GENS+1 times at the same path (fast KDF); each save
 ;   after the first rolls the live file into .bak1..N.  Then it asserts every
 ;   generation exists and re-opens .bak1 with the master password to prove a
@@ -1980,7 +1923,7 @@ cmd_bktest endp
 
 ; ===========================================================================
 ; cmd_mactest <path> - prove the full-file MAC catches tampering the trailer
-;   (plan 4).  Create a vault, then flip a byte in the save-counter - a region
+;  .  Create a vault, then flip a byte in the save-counter - a region
 ;   GCM does NOT authenticate - and confirm the unlock now fails; restore the
 ;   byte and confirm it opens again.  exit 0 = pass.
 ; ===========================================================================
@@ -2073,7 +2016,7 @@ mt_fail:
 cmd_mactest endp
 
 ; ===========================================================================
-; cmd_rbtest <path> - prove anti-rollback detection (plan 3).  Create a vault
+; cmd_rbtest <path> - prove anti-rollback detection.  Create a vault
 ;   (counter 1, mirror 1), force the HKCU mirror ahead to 5, and confirm the
 ;   next unlock flags g_rollback; then set the mirror back to 1 and confirm a
 ;   fresh unlock does NOT flag it.  exit 0 = pass.
@@ -2143,7 +2086,7 @@ rb_fail:
 cmd_rbtest endp
 
 ; ===========================================================================
-; cmd_xctest <path> - prove external-change detection (plan 38).  Create a vault
+; cmd_xctest <path> - prove external-change detection.  Create a vault
 ;   (snapshots itself), confirm no change is reported; externally flip a header
 ;   byte and confirm a change IS reported; recreate the vault (re-baselines) and
 ;   confirm no change again.  exit 0 = pass.
@@ -2691,79 +2634,6 @@ vfa_none:
     ret
 vault_field_at endp
 
-; vault_add_entry() - append one entry to the in-memory body from the
-;   g_cfg_title/user/secret/url/notes wide pointers (set by the GUI).  Does NOT
-;   reseal.  -> eax = 0 ok / EXIT_NOSPACE if full / EXIT_USAGE if no title.
-public vault_add_entry
-vault_add_entry proc frame
-    FRAME_PROLOG 64
-    ; [rbp-32] = entry start, [rbp-40] = field count
-    cmp     qword ptr [g_cfg_title], 0
-    je      vae_fail
-    mov     rax, qword ptr [g_body_len]
-    add     rax, 36
-    cmp     rax, VAULT_BODY_MAX
-    ja      vae_full
-    mov     r11, qword ptr [g_body_ptr]
-    add     r11, qword ptr [g_body_len]
-    mov     qword ptr [rbp-32], r11
-    mov     rcx, r11
-    mov     edx, 16
-    call    rng_fill                    ; id = 16 random bytes
-    test    eax, eax
-    jz      vae_fail
-    lea     rcx, [g_ts]
-    call    GetSystemTimeAsFileTime
-    mov     r11, qword ptr [rbp-32]
-    mov     rax, qword ptr [g_ts]
-    mov     qword ptr [r11+16], rax     ; created
-    mov     qword ptr [r11+24], rax     ; modified
-    mov     dword ptr [r11+32], 0       ; field_count placeholder
-    mov     rax, qword ptr [g_body_len]
-    add     rax, 36
-    mov     qword ptr [g_body_len], rax
-    mov     dword ptr [rbp-40], 0
-    mov     ecx, VF_TITLE
-    mov     rdx, qword ptr [g_cfg_title]
-    call    va_field
-    add     dword ptr [rbp-40], eax
-    mov     ecx, VF_USERNAME
-    mov     rdx, qword ptr [g_cfg_user]
-    call    va_field
-    add     dword ptr [rbp-40], eax
-    mov     ecx, VF_SECRET
-    mov     rdx, qword ptr [g_cfg_secret]
-    call    va_field
-    add     dword ptr [rbp-40], eax
-    mov     ecx, VF_URL
-    mov     rdx, qword ptr [g_cfg_url]
-    call    va_field
-    add     dword ptr [rbp-40], eax
-    mov     ecx, VF_NOTES
-    mov     rdx, qword ptr [g_cfg_notes]
-    call    va_field
-    add     dword ptr [rbp-40], eax
-    mov     ecx, VF_TOTP
-    mov     rdx, qword ptr [g_cfg_totp]
-    call    va_field
-    add     dword ptr [rbp-40], eax
-    mov     r11, qword ptr [rbp-32]
-    mov     eax, dword ptr [rbp-40]
-    mov     dword ptr [r11+32], eax
-    mov     r11, qword ptr [g_body_ptr]
-    inc     dword ptr [r11]             ; entry_count++
-    xor     eax, eax
-    FRAME_EPILOG
-    ret
-vae_full:
-    mov     eax, EXIT_NOSPACE
-    FRAME_EPILOG
-    ret
-vae_fail:
-    mov     eax, EXIT_USAGE
-    FRAME_EPILOG
-    ret
-vault_add_entry endp
 
 ; ===========================================================================
 ; va_field_labeled(rcx = base type, rdx = label wide ptr (0/empty = none),

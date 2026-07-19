@@ -1027,7 +1027,7 @@ zfz_rand proc
 zfz_rand endp
 
 ; =============================================================================
-; cmd_zfuzz - structural fuzzer for the ZIP import parser (plan 31).  The
+; cmd_zfuzz - structural fuzzer for the ZIP import parser.  The
 ;   .vaultz format is STORED-only AES-zip (no DEFLATE, so there is no inflate
 ;   path to fuzz); the attacker-controlled surface is zi_scan, which reads
 ;   local-header size fields with no crypto gate in front of it.  This

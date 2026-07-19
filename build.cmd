@@ -4,8 +4,9 @@ rem build.cmd - assemble and link the single hybrid vordr.exe (password mgr).
 rem
 rem ONE executable serves both roles: it is linked /subsystem:windows with the
 rem GUI entry point (wstart), but wstart runs the full CLI when argv[1] is a
-rem known verb (init/add/get/list/edit/remove/gen/selftest/bench).  Otherwise it
-rem opens the windowed front-end.  Every launch runs the self-test gate first and
+rem known verb (selftest/bench/genpw/seedtest/... - diagnostics only; never a
+rem vault path, password, or secret).  Otherwise it opens the windowed
+rem front-end.  Every launch runs the self-test gate first and
 rem fails closed.  See src\gui.asm:wstart.
 rem
 rem Run from a
@@ -32,7 +33,7 @@ rem Optional args (combinable):
 rem   build nohw   link WITHOUT /CETCOMPAT (software mitigations only)
 rem   build dbg    add startup breadcrumb trace + per-primitive debug dumps,
 rem                the `redteam` fault-injection self-test, and FF-code-in-exit
-rem                (0xFADE<code>) for the security test harness (tests/redteam.py)
+rem                (0xFADE<code>) for the security test harness (tests\run_all.cmd)
 rem ---------------------------------------------------------------------------
 set GUARDFLAGS=/CETCOMPAT
 set ASMEXTRA=
@@ -69,6 +70,8 @@ rem framecheck: static scan for WINCALL stack-arg spills that overflow a proc's
 rem frame (the raw-dialog-proc return-address-smash class, see
 rem tools\framecheck.py).  Advisory by default; "build strict" makes a FATAL
 rem finding fail the build.  Skipped silently when python is not on PATH.
+rem idcheck (tools\idcheck.py) and deadcode (tools\deadcode.py) gate the same
+rem way: rc/asm control-ID mismatches / dead symbols fail a strict build.
 rem ---------------------------------------------------------------------------
 where python >nul 2>nul
 if errorlevel 1 goto :nofc
@@ -80,6 +83,15 @@ if errorlevel 1 (
         goto :failed
     )
     echo framecheck: WARNING - fatal findings above; build continues. Use "build strict" to gate.
+)
+echo === idcheck ===
+python tools\idcheck.py
+if errorlevel 1 (
+    if "%STRICT%"=="1" (
+        echo idcheck: rc/asm ID mismatch - failing strict build
+        goto :failed
+    )
+    echo idcheck: WARNING - ID mismatches above; build continues. Use "build strict" to gate.
 )
 echo === deadcode ===
 python tools\deadcode.py
@@ -102,13 +114,20 @@ for %%f in (%SOURCES%) do (
 )
 
 rem ---------------------------------------------------------------------------
-rem Windows SDK paths (adjust the version here if the SDK is updated).  The tools
+rem Windows SDK paths.  The version is resolved at build time: the newest 10.*
+rem dir under the SDK's Lib (dir /o-n = newest name first) wins, with the
+rem pinned version as fallback if the enumeration finds nothing.  The tools
 rem (ml64/rc/link) must be on PATH; passing the SDK include dirs to rc.exe
 rem explicitly means this script builds from a plain prompt too, not only from an
 rem "x64 Native Tools Command Prompt" that pre-sets the INCLUDE variable.
 rem ---------------------------------------------------------------------------
 set SDKROOT=C:\Program Files (x86)\Windows Kits\10
 set SDKVER=10.0.26100.0
+for /f %%v in ('dir /b /ad /o-n "%SDKROOT%\Lib\10.*" 2^>nul') do (
+    set SDKVER=%%v
+    goto :sdkver_done
+)
+:sdkver_done
 set SDKLIB=%SDKROOT%\Lib\%SDKVER%\um\x64
 set SDKBIN=%SDKROOT%\bin\%SDKVER%\x64
 set SDKINC=%SDKROOT%\Include\%SDKVER%
@@ -132,7 +151,7 @@ echo === mitigation check (optional, needs dumpbin) ===
 dumpbin /headers bin\vordr.exe | findstr /i "Dynamic NX Guard CET High" 2>nul
 
 if "%REPRO%"=="1" (
-    echo === release SHA-256 (publish + verify against a fresh rebuild) ===
+    echo === release SHA-256 ^(publish + verify against a fresh rebuild^) ===
     certutil -hashfile bin\vordr.exe SHA256 | findstr /r "^[0-9a-f]"
 )
 

@@ -3,9 +3,9 @@
 ; -----------------------------------------------------------------------------
 ; Every command's outcome is appended as one UTF-8 text line to a log file:
 ;
-;   2026-06-29 14:23:01  INFO   add: completed successfully
-;   2026-06-29 14:23:05  WARN   get: authentication failed (wrong password or tampered data)
-;   2026-06-29 14:23:09  ERROR  list: I/O error
+;   2026-06-29 14:23:01  INFO   seedtest: completed successfully
+;   2026-06-29 14:23:05  WARN   zitest: authentication failed (wrong password or tampered data)
+;   2026-06-29 14:23:09  ERROR  bktest: I/O error
 ;
 ; Default path is %LOCALAPPDATA%\Vordr\vordr.log (per-user, always writable);
 ; override with `--log-file PATH`.  Logging is OFF by default; opt in (and pick

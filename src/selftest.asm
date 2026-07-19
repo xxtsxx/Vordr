@@ -963,7 +963,7 @@ pw_done:
 pkat_worker endp
 
 ; =============================================================================
-; cmd_pkat - parallel KAT gate (plan 34): spawn min(cores,PKAT_MAX) worker
+; cmd_pkat - parallel KAT gate: spawn min(cores,PKAT_MAX) worker
 ;   threads, each running a KAT loop; the gate FAILS CLOSED - every result slot
 ;   starts FAIL and only an all-pass worker clears it, and a watchdog-bounded
 ;   join (10 s) treats a hung/never-reporting worker as failure.  exit 0 = pass.

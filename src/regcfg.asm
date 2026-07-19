@@ -19,6 +19,7 @@ extern RegCreateKeyExW:proc
 extern RegSetValueExW:proc
 extern RegDeleteValueW:proc
 extern RegCloseKey:proc
+extern RegEnumKeyExW:proc
 extern SHGetFolderPathW:proc
 extern GetEnvironmentVariableW:proc
 extern CreateDirectoryW:proc
@@ -49,6 +50,11 @@ env_onedrive label word
     dw 'O','n','e','D','r','i','v','e', 0
 onedrive_sub label word
     dw 5Ch,'V','o','r','d','r', 0
+od_accounts label word
+    dw 'S','O','F','T','W','A','R','E', 5Ch, 'M','i','c','r','o','s','o','f','t'
+    dw 5Ch, 'O','n','e','D','r','i','v','e', 5Ch, 'A','c','c','o','u','n','t','s', 0
+od_userfolder label word
+    dw 'U','s','e','r','F','o','l','d','e','r', 0
 align 8
 g_hklm  dq 080000002h            ; HKEY_LOCAL_MACHINE (as a clean 64-bit value)
 g_hkcu  dq 080000001h            ; HKEY_CURRENT_USER
@@ -60,6 +66,8 @@ g_cfg_khan  dq ?                 ; open key handle
 align 2
 cc_od       dw 1024 dup (?)      ; %OneDrive% root (cfg_classify_path scratch)
 cc_docs     dw 1024 dup (?)      ; Documents root (cfg_classify_path scratch)
+od_namebuf  dw 256 dup (?)       ; account subkey name (cfg_od_linked)
+od_ufbuf    dw 1024 dup (?)      ; UserFolder value (cfg_od_linked)
 
 .code
 
@@ -281,10 +289,96 @@ rsv_fail:
     ret
 reg_save_vault endp
 
+; cfg_wstr_ieq(rcx = a wide, rdx = b wide) -> eax = 1 if equal, case-folded
+;   (ASCII A-Z only, enough for filesystem paths).  Leaf proc.
+cfg_wstr_ieq proc
+cieq_lp:
+    movzx   eax, word ptr [rcx]
+    movzx   r10d, word ptr [rdx]
+    lea     r11d, [rax-'A']
+    cmp     r11d, 25
+    ja      @F
+    add     eax, 32
+@@: lea     r11d, [r10-'A']
+    cmp     r11d, 25
+    ja      @F
+    add     r10d, 32
+@@: cmp     eax, r10d
+    jne     cieq_ne
+    test    eax, eax
+    jz      cieq_eq
+    add     rcx, 2
+    add     rdx, 2
+    jmp     cieq_lp
+cieq_eq:
+    mov     eax, 1
+    ret
+cieq_ne:
+    xor     eax, eax
+    ret
+cfg_wstr_ieq endp
+
+; ===========================================================================
+; cfg_od_linked(rcx = %OneDrive% root wide) -> eax = 1 if OneDrive is actually
+;   IN USE here, else 0.  "In use" = some account under
+;   HKCU\SOFTWARE\Microsoft\OneDrive\Accounts carries a UserFolder value that
+;   matches the env-var root.  A dormant OneDrive (the env var exists on every
+;   Win11 box, but the sync client was never linked) leaves only stub account
+;   keys with no UserFolder value - and writing into such a folder can wake the
+;   sync client (logon prompts, placeholder weirdness), so it must not be
+;   trusted with the vault.
+; ===========================================================================
+cfg_od_linked proc frame
+    FRAME_PROLOG 144                         ; locals to -80 + spill room for the
+                                           ;  8-arg RegEnumKeyExW (args 5+ land at
+                                           ;  [rbp-alloc+32..] - must not overlap
+                                           ;  the live in-out params)
+    mov     qword ptr [rbp-24], rcx              ; candidate root
+    mov     dword ptr [rbp-32], 0                ; enum index
+    WINCALL RegOpenKeyExW, qword ptr [g_hkcu], addr od_accounts, 0, KEY_READ, addr g_cfg_khan
+    test    eax, eax
+    jnz     col_no                               ; no Accounts key -> not in use
+col_enum:
+    mov     dword ptr [rbp-48], 255              ; cch name (in chars, in/out)
+    WINCALL RegEnumKeyExW, qword ptr [g_cfg_khan], dword ptr [rbp-32], addr od_namebuf, \
+            addr rbp-48, 0, 0, 0, 0
+    test    eax, eax
+    jnz     col_close                            ; no more accounts
+    WINCALL RegOpenKeyExW, qword ptr [g_cfg_khan], addr od_namebuf, 0, KEY_READ, addr rbp-56
+    test    eax, eax
+    jnz     col_next
+    mov     dword ptr [rbp-72], 2048             ; cbData = 1024 chars * 2
+    WINCALL RegQueryValueExW, qword ptr [rbp-56], addr od_userfolder, 0, addr rbp-64, \
+            addr od_ufbuf, addr rbp-72
+    mov     dword ptr [rbp-80], eax
+    WINCALL RegCloseKey, qword ptr [rbp-56]
+    cmp     dword ptr [rbp-80], 0
+    jne     col_next                             ; stub account: no UserFolder
+    lea     rcx, [od_ufbuf]
+    mov     rdx, qword ptr [rbp-24]
+    call    cfg_wstr_ieq
+    test    eax, eax
+    jz      col_next
+    WINCALL RegCloseKey, qword ptr [g_cfg_khan]  ; linked account for this root
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+col_next:
+    inc     dword ptr [rbp-32]
+    jmp     col_enum
+col_close:
+    WINCALL RegCloseKey, qword ptr [g_cfg_khan]
+col_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+cfg_od_linked endp
+
 ; ===========================================================================
 ; cfg_default_vault(rcx=dst wide) -> eax = 1/0.  Prefers a OneDrive-synced
 ;   location ("%OneDrive%\Vordr\vault.vordr", creating the Vordr folder) when
-;   OneDrive is in use; otherwise falls back to "<Documents>\vault.vordr".
+;   OneDrive is actually linked on this machine (cfg_od_linked); otherwise
+;   falls back to "<Documents>\Vordr\vault.vordr".
 ; ===========================================================================
 public cfg_default_vault
 cfg_default_vault proc frame
@@ -296,6 +390,12 @@ cfg_default_vault proc frame
     jz      cdv_docs
     cmp     eax, 980                          ; too long to fit -> use Documents
     jae     cdv_docs
+    ; the env var alone is not enough: require a linked sync account too,
+    ; otherwise a dormant OneDrive would capture the vault
+    mov     rcx, qword ptr [rbp-24]
+    call    cfg_od_linked
+    test    eax, eax
+    jz      cdv_docs
     ; dst = "%OneDrive%"; append "\Vordr"
     mov     r8d, eax                          ; char count (zero-extended)
     mov     r11, qword ptr [rbp-24]
@@ -521,7 +621,7 @@ rtd_done:
 reg_tpm_del endp
 
 ; ===========================================================================
-; Anti-rollback counter mirror (plan 3): last-seen save_counter per vault path,
+; Anti-rollback counter mirror: last-seen save_counter per vault path,
 ; under HKCU\...\Vordr\Rollback.  A user-writable mirror is only a tripwire (an
 ; attacker who can restore an old vault can usually also clear this), but it
 ; reliably catches accidental restores and sync mishaps.

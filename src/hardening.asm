@@ -24,6 +24,10 @@ extern SetErrorMode:proc
 extern TerminateProcess:proc
 extern GetCurrentProcess:proc
 extern MessageBoxW:proc
+extern CreateFileW:proc
+extern WriteFile:proc
+extern CloseHandle:proc
+extern GetTempPathW:proc
 
 MEM_COMMIT          equ 1000h
 MEM_RESERVE         equ 2000h
@@ -64,11 +68,23 @@ g_cpu_features  dd 0
 g_heap_gen      dd 1                    ; global generation counter
 public g_gui_active
 g_gui_active    dd 0                    ; 1 once the GUI is up (crash apology box)
+g_crash_code    dq 0                    ; last exception code (crash breadcrumb)
+g_crash_addr    dq 0                    ; last exception address
+g_crash_base    dq 0                    ; image base at crash time (RVA math)
+g_crash_info    dq 2 dup (0)            ; ExceptionInformation[0..1] (op, data addr)
+g_crash_regs    dq 10 dup (0)           ; rax rcx rdx rbx rsp rbp rsi rdi rip r8
+g_crash_h       dq 0                    ; breadcrumb file handle
+g_crash_nw      dd 0                    ; WriteFile bytes-written out
+g_crash_dumped  db 0                    ; reentry guard: dump once
+align 2
+g_crashpath     dw 260 dup (?)          ; %TEMP%\vordr_crash.bin
 
 SEM_FAILCRITICALERRORS  equ 1
 SEM_NOGPFAULTERRORBOX   equ 2
 MB_OK_          equ 0
 MB_ICONERROR_   equ 10h
+GENERIC_WRITE_  equ 40000000h
+CREATE_ALWAYS_  equ 2
 
 .const
 crash_apology label word
@@ -78,6 +94,8 @@ crash_apology label word
     dw ' ','w','i','p','e','d',' ','f','r','o','m',' ','m','e','m','o','r','y','.', 0
 crash_title label word
     dw 'V','o','r','d','r', 0
+crash_fname label word
+    dw 'v','o','r','d','r','_','c','r','a','s','h','.','b','i','n', 0
 ifdef DBG_TRACE
 CSTR crash_bc, "crash: unhandled exception - wiping secrets, terminating",13,10
 endif
@@ -100,7 +118,7 @@ sstk_overflow_fail endp
 ;   Never returns.
 ; =============================================================================
 crash_contain proc frame
-    FRAME_PROLOG 32
+    FRAME_PROLOG 64
     call    secmem_panic_wipe                   ; secrets gone before anything else
 ifdef DBG_TRACE
     lea     rcx, [crash_bc]
@@ -131,16 +149,91 @@ crash_contain endp
 crash_veh proc frame
     FRAME_PROLOG 32
     mov     rax, qword ptr [rcx]                ; -> EXCEPTION_RECORD
+    mov     r10d, dword ptr [rax]
+    mov     dword ptr [g_crash_code], r10d      ; ExceptionCode
+    mov     r10, qword ptr [rax+16]
+    mov     qword ptr [g_crash_addr], r10       ; ExceptionAddress
+    cmp     dword ptr [rax+24], 2               ; NumberParameters >= 2?
+    jb      cv_noinfo
+    mov     r10, qword ptr [rax+32]
+    mov     qword ptr [g_crash_info], r10       ; ExceptionInformation[0]
+    mov     r10, qword ptr [rax+40]
+    mov     qword ptr [g_crash_info+8], r10     ; ExceptionInformation[1] (data addr)
+cv_noinfo:
+    mov     rax, qword ptr [rcx+8]              ; -> CONTEXT
+    mov     r10, qword ptr [rax+78h]
+    mov     qword ptr [g_crash_regs+0], r10     ; rax
+    mov     r10, qword ptr [rax+80h]
+    mov     qword ptr [g_crash_regs+8], r10     ; rcx
+    mov     r10, qword ptr [rax+88h]
+    mov     qword ptr [g_crash_regs+16], r10    ; rdx
+    mov     r10, qword ptr [rax+90h]
+    mov     qword ptr [g_crash_regs+24], r10    ; rbx
+    mov     r10, qword ptr [rax+98h]
+    mov     qword ptr [g_crash_regs+32], r10    ; rsp
+    mov     r10, qword ptr [rax+0A0h]
+    mov     qword ptr [g_crash_regs+40], r10    ; rbp
+    mov     r10, qword ptr [rax+0A8h]
+    mov     qword ptr [g_crash_regs+48], r10    ; rsi
+    mov     r10, qword ptr [rax+0B0h]
+    mov     qword ptr [g_crash_regs+56], r10    ; rdi
+    mov     r10, qword ptr [rax+0F8h]
+    mov     qword ptr [g_crash_regs+64], r10    ; rip
+    mov     r10, qword ptr [rax+0B8h]
+    mov     qword ptr [g_crash_regs+72], r10    ; r8
+    mov     rax, qword ptr [rcx]                ; -> EXCEPTION_RECORD
     mov     eax, dword ptr [rax]                ; ExceptionCode
     and     eax, 0F0000000h                     ; severity nibble
     cmp     eax, 0C0000000h                     ; ERROR severity => fatal
     jne     cv_pass
+    call    crash_dump                          ; breadcrumb FIRST (survives a
+                                                ;  containment-step failure)
     call    crash_contain                       ; wipe + terminate (no return)
 cv_pass:
     xor     eax, eax                            ; EXCEPTION_CONTINUE_SEARCH
     FRAME_EPILOG
     ret
 crash_veh endp
+
+; crash_dump() - best-effort crash breadcrumb: %TEMP%\vordr_crash.bin =
+;   {code, addr, base, ExceptionInformation[0..1], regs[10]}.  Runs BEFORE the
+;   wipe/apology so the record survives even if a later containment step fails.
+;   Static data only - no secret can leak through this file.
+crash_dump proc frame
+    FRAME_PROLOG 64
+    cmp     byte ptr [g_crash_dumped], 0
+    jne     cd_ret
+    mov     byte ptr [g_crash_dumped], 1
+    WINCALL GetTempPathW, 260, addr g_crashpath
+    test    rax, rax
+    jz      cd_ret
+    lea     r10, [g_crashpath]
+cd_scan:
+    cmp     word ptr [r10], 0
+    je      cd_app
+    add     r10, 2
+    jmp     cd_scan
+cd_app:
+    lea     r11, [crash_fname]
+cd_cp:
+    mov     ax, word ptr [r11]
+    mov     word ptr [r10], ax
+    add     r10, 2
+    add     r11, 2
+    test    ax, ax
+    jnz     cd_cp
+    WINCALL CreateFileW, addr g_crashpath, GENERIC_WRITE_, 0, 0, CREATE_ALWAYS_, 0, 0
+    cmp     rax, -1
+    je      cd_ret
+    mov     qword ptr [g_crash_h], rax
+    WINCALL GetModuleHandleW, 0
+    mov     qword ptr [g_crash_base], rax
+    WINCALL WriteFile, qword ptr [g_crash_h], addr g_crash_code, 120, addr g_crash_nw, 0
+    WINCALL CloseHandle, qword ptr [g_crash_h]
+cd_ret:
+    FRAME_EPILOG
+    ret
+crash_dump endp
 
 ; crash_filter(rcx = PEXCEPTION_POINTERS) -> LONG.  Backup last-chance filter
 ;   for environments where a VEH is not reached; same containment action.

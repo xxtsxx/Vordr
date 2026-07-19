@@ -40,7 +40,6 @@ ZE_CAP      equ 32*1024*1024
 ZE_MAXFILE  equ 512
 ZE_NAMEPOOL equ 512*1024             ; persistent copies of every entry's name
 ZJ_PFX_MAX  equ 200                  ; max bytes of a title used as a folder name
-CSV_ATT_CAP equ 4096                 ; max bytes for one row's joined attachment paths
 PBKDF2_ITERS equ 1000
 
 .data?
@@ -445,18 +444,14 @@ zj_flabel db ',"label":',0
 zj_fvalue db ',"value":',0
 zj_jsonname db "vordr.json"
 zj_defname  db "attachment.bin"
-csv_hdr   db "title,username,password,url,notes,totp,attachments",13,10,0
-csv_kinds db VF_TITLE, VF_USERNAME, VF_SECRET, VF_URL, VF_NOTES, VF_TOTP
 hexdig    db "0123456789abcdef"
 
 .data?
 g_json      dq 3 dup (?)             ; {ptr,len,cap} for the fields JSON
-g_csvbuf    dq 3 dup (?)             ; {ptr,len,cap} for the CSV text
 g_ze_u8pw   db 512 dup (?)           ; wide->UTF-8 export password scratch
 g_zj_fld    db 40 dup (?)            ; vault_field_get out struct
 g_zj_fn     db 512 dup (?)           ; attachment filename (UTF-8)
 g_zj_path   db 768 dup (?)           ; "<title-folder>/<filename>" zip path
-g_csv_att   db CSV_ATT_CAP dup (?)   ; one row's '|'-joined attachment paths (CSV)
 
 .code
 
@@ -832,7 +827,7 @@ ze_att_zippath endp
 ;   vault to the open archive (ze_reset + ze_set_pw must precede).  Each blob is
 ;   decrypted to plaintext and added as "<secret title>/<filename>" (so all of a
 ;   record's attachments land in one folder), then wiped + freed.  The same path
-;   is recorded in the data file by ze_build_json / ze_build_csv (ze_att_zippath).
+;   is recorded in the data file by ze_build_json (ze_att_zippath).
 ; =============================================================================
 public ze_add_attachments
 ze_add_attachments proc frame
@@ -901,334 +896,12 @@ zea_fin:
 ze_add_attachments endp
 
 ; =============================================================================
-; ze_export_all(rcx = utf8 pw, edx = pwlen) -> eax 0/err.  Builds the finished
-;   encrypted archive in g_zbuf: vordr.json (all text fields) + every attachment.
-; =============================================================================
-public ze_export_all
-ze_export_all proc frame
-    FRAME_PROLOG 48
-    mov     qword ptr [rbp-24], rcx
-    mov     dword ptr [rbp-32], edx
-    call    ze_reset
-    test    eax, eax
-    jnz     zea_err
-    mov     rcx, qword ptr [rbp-24]
-    mov     edx, dword ptr [rbp-32]
-    call    ze_set_pw
-    call    ze_build_json
-    test    eax, eax
-    jnz     zea_err
-    lea     rcx, [zj_jsonname]
-    mov     edx, 10
-    lea     r10, [g_json]
-    mov     r8, qword ptr [r10]
-    mov     r9, qword ptr [r10+8]
-    call    ze_add_file
-    lea     r10, [g_json]                       ; free the JSON (already copied in)
-    mov     rcx, qword ptr [r10]
-    mov     rdx, qword ptr [r10+16]
-    call    mem_free
-    call    ze_add_attachments
-    test    eax, eax
-    jnz     zea_err
-    call    ze_finish
-    xor     eax, eax
-    FRAME_EPILOG
-    ret
-zea_err:
-    mov     eax, 1
-    FRAME_EPILOG
-    ret
-ze_export_all endp
+
+
+
 
 ; =============================================================================
-; ze_csv_cell(rcx = g_csvbuf, rdx = ptr, r8 = len) - append one RFC-4180 CSV
-;   cell.  If the value contains a quote, comma, CR or LF it is wrapped in double
-;   quotes with internal quotes doubled; otherwise the raw bytes are copied.
-; =============================================================================
-ze_csv_cell proc frame
-    FRAME_PROLOG 64
-    mov     qword ptr [rbp-24], rcx             ; buf
-    mov     qword ptr [rbp-32], rdx             ; ptr
-    mov     qword ptr [rbp-40], r8              ; len
-    ; ---- scan for characters that force quoting ----
-    xor     r10d, r10d                          ; index
-    xor     r11d, r11d                          ; needQuote
-cc_scan:
-    cmp     r10, qword ptr [rbp-40]
-    jae     cc_scandone
-    mov     rax, qword ptr [rbp-32]
-    movzx   eax, byte ptr [rax+r10]
-    cmp     eax, '"'
-    je      cc_need
-    cmp     eax, ','
-    je      cc_need
-    cmp     eax, 13
-    je      cc_need
-    cmp     eax, 10
-    je      cc_need
-    jmp     cc_scannext
-cc_need:
-    mov     r11d, 1
-cc_scannext:
-    inc     r10
-    jmp     cc_scan
-cc_scandone:
-    test    r11d, r11d
-    jnz     cc_quoted
-    ; ---- plain: raw bytes ----
-    mov     rcx, qword ptr [rbp-24]
-    mov     rdx, qword ptr [rbp-32]
-    mov     r8d, dword ptr [rbp-40]
-    call    buf_putn
-    FRAME_EPILOG
-    ret
-cc_quoted:
-    mov     rcx, qword ptr [rbp-24]             ; opening quote
-    mov     dl, '"'
-    call    buf_putb
-    xor     r10d, r10d
-cc_qlp:
-    cmp     r10, qword ptr [rbp-40]
-    jae     cc_qdone
-    mov     rax, qword ptr [rbp-32]
-    movzx   eax, byte ptr [rax+r10]
-    mov     dword ptr [rbp-48], eax
-    cmp     eax, '"'
-    jne     cc_qput
-    mov     rcx, qword ptr [rbp-24]             ; double an embedded quote
-    mov     dl, '"'
-    call    buf_putb
-cc_qput:
-    mov     rcx, qword ptr [rbp-24]
-    mov     dl, byte ptr [rbp-48]
-    call    buf_putb
-    inc     r10
-    jmp     cc_qlp
-cc_qdone:
-    mov     rcx, qword ptr [rbp-24]             ; closing quote
-    mov     dl, '"'
-    call    buf_putb
-    FRAME_EPILOG
-    ret
-ze_csv_cell endp
 
-; =============================================================================
-; ze_csv_field(ecx = entry, edx = kind) -> rax = value ptr, rdx = len (0/0 none).
-;   Returns the first field of the given base kind for the entry.
-; =============================================================================
-ze_csv_field proc frame
-    FRAME_PROLOG 48
-    mov     dword ptr [rbp-24], ecx             ; entry
-    mov     dword ptr [rbp-28], edx             ; kind
-    mov     ecx, dword ptr [rbp-24]
-    call    vault_field_count
-    mov     dword ptr [rbp-32], eax             ; fc
-    mov     dword ptr [rbp-36], 0               ; f
-cf_lp:
-    mov     eax, dword ptr [rbp-36]
-    cmp     eax, dword ptr [rbp-32]
-    jae     cf_none
-    mov     ecx, dword ptr [rbp-24]
-    mov     edx, dword ptr [rbp-36]
-    lea     r8, [g_zj_fld]
-    call    vault_field_get
-    test    eax, eax
-    jz      cf_next
-    mov     eax, dword ptr [g_zj_fld]
-    cmp     eax, dword ptr [rbp-28]
-    jne     cf_next
-    mov     rax, qword ptr [g_zj_fld+24]        ; value ptr
-    mov     rdx, qword ptr [g_zj_fld+32]        ; value len
-    FRAME_EPILOG
-    ret
-cf_next:
-    inc     dword ptr [rbp-36]
-    jmp     cf_lp
-cf_none:
-    xor     eax, eax
-    xor     edx, edx
-    FRAME_EPILOG
-    ret
-ze_csv_field endp
-
-; =============================================================================
-; ze_csv_attcell(ecx = entry) -> eax = byte length in g_csv_att.  Builds a single
-;   CSV cell value = every image/file attachment's ZIP path for the entry, joined
-;   with '|' (empty when the entry has no attachments).  Capped at CSV_ATT_CAP.
-; =============================================================================
-ze_csv_attcell proc frame
-    FRAME_PROLOG 64
-    mov     dword ptr [rbp-24], ecx             ; entry
-    mov     dword ptr [rbp-28], 0               ; out length
-    mov     ecx, dword ptr [rbp-24]
-    call    vault_field_count
-    mov     dword ptr [rbp-32], eax             ; fc
-    mov     dword ptr [rbp-36], 0               ; f
-    mov     dword ptr [rbp-40], 0               ; attachments emitted so far
-cac_lp:
-    mov     eax, dword ptr [rbp-36]
-    cmp     eax, dword ptr [rbp-32]
-    jae     cac_done
-    mov     ecx, dword ptr [rbp-24]
-    mov     edx, dword ptr [rbp-36]
-    lea     r8, [g_zj_fld]
-    call    vault_field_get
-    test    eax, eax
-    jz      cac_next
-    mov     eax, dword ptr [g_zj_fld]
-    cmp     eax, VF_IMAGE_
-    je      cac_att
-    cmp     eax, VF_FILE_
-    je      cac_att
-    jmp     cac_next
-cac_att:
-    cmp     dword ptr [rbp-40], 0               ; '|' separator between attachments
-    je      cac_nosep
-    mov     eax, dword ptr [rbp-28]
-    cmp     eax, CSV_ATT_CAP-1
-    jae     cac_next                            ; full -> stop appending
-    lea     r10, [g_csv_att]
-    mov     byte ptr [r10+rax], '|'
-    inc     dword ptr [rbp-28]
-cac_nosep:
-    inc     dword ptr [rbp-40]
-    mov     ecx, dword ptr [rbp-24]             ; build "<title>/<filename>"
-    mov     rdx, qword ptr [g_zj_fld+24]
-    mov     r8d, dword ptr [g_zj_fld+32]
-    call    ze_att_zippath                      ; eax = pathlen, path in g_zj_path
-    mov     ecx, dword ptr [rbp-28]             ; dst offset
-    mov     edx, eax                            ; pathlen
-    mov     r9d, CSV_ATT_CAP                    ; clamp to remaining capacity
-    sub     r9d, ecx
-    cmp     edx, r9d
-    jbe     cac_cpok
-    mov     edx, r9d
-cac_cpok:
-    lea     r10, [g_csv_att]
-    add     r10, rcx
-    lea     r11, [g_zj_path]
-    xor     r8d, r8d
-cac_cp:
-    cmp     r8d, edx
-    jae     cac_cpd
-    mov     al, byte ptr [r11+r8]
-    mov     byte ptr [r10+r8], al
-    inc     r8d
-    jmp     cac_cp
-cac_cpd:
-    add     dword ptr [rbp-28], edx
-cac_next:
-    inc     dword ptr [rbp-36]
-    jmp     cac_lp
-cac_done:
-    mov     eax, dword ptr [rbp-28]
-    FRAME_EPILOG
-    ret
-ze_csv_attcell endp
-
-; =============================================================================
-; ze_build_csv() -> eax 0/err.  Builds g_csvbuf: a UTF-8 CSV (BOM + header row)
-;   with one row per entry and the columns title,username,password,url,notes,totp,
-;   attachments (the last = '|'-joined ZIP paths).  The text columns round-trip
-;   through the CSV importer's header keywords.
-; =============================================================================
-public ze_build_csv
-ze_build_csv proc frame
-    FRAME_PROLOG 48
-    mov     rcx, JSON_CAP
-    call    mem_alloc
-    test    rax, rax
-    jz      bc_err
-    lea     r10, [g_csvbuf]
-    mov     qword ptr [r10], rax
-    mov     qword ptr [r10+8], 0
-    mov     qword ptr [r10+16], JSON_CAP
-    lea     rcx, [g_csvbuf]                     ; UTF-8 BOM (EF BB BF) for Excel
-    mov     dl, 0EFh
-    call    buf_putb
-    lea     rcx, [g_csvbuf]
-    mov     dl, 0BBh
-    call    buf_putb
-    lea     rcx, [g_csvbuf]
-    mov     dl, 0BFh
-    call    buf_putb
-    lea     rcx, [g_csvbuf]
-    lea     rdx, [csv_hdr]
-    call    buf_putcstr
-    call    vault_count
-    mov     dword ptr [rbp-24], eax             ; n
-    mov     dword ptr [rbp-28], 0               ; e
-bc_elp:
-    mov     eax, dword ptr [rbp-28]
-    cmp     eax, dword ptr [rbp-24]
-    jae     bc_done
-    mov     dword ptr [rbp-32], 0               ; col
-bc_clp:
-    cmp     dword ptr [rbp-32], 6
-    jae     bc_erow
-    cmp     dword ptr [rbp-32], 0
-    je      bc_c0
-    lea     rcx, [g_csvbuf]                     ; column separator
-    mov     dl, ','
-    call    buf_putb
-bc_c0:
-    mov     r10d, dword ptr [rbp-32]
-    lea     r11, [csv_kinds]
-    movzx   edx, byte ptr [r11+r10]             ; kind
-    mov     ecx, dword ptr [rbp-28]             ; entry
-    call    ze_csv_field                        ; rax=ptr, rdx=len (0/0 none)
-    test    rax, rax
-    jz      bc_ncol
-    mov     r8, rdx
-    mov     rdx, rax
-    lea     rcx, [g_csvbuf]
-    call    ze_csv_cell
-bc_ncol:
-    inc     dword ptr [rbp-32]
-    jmp     bc_clp
-bc_erow:
-    lea     rcx, [g_csvbuf]                     ; 7th column: attachments
-    mov     dl, ','
-    call    buf_putb
-    mov     ecx, dword ptr [rbp-28]             ; entry
-    call    ze_csv_attcell                      ; eax = len, cell in g_csv_att
-    test    eax, eax
-    jz      bc_crlf
-    mov     r8, rax
-    lea     rdx, [g_csv_att]
-    lea     rcx, [g_csvbuf]
-    call    ze_csv_cell
-bc_crlf:
-    lea     rcx, [g_csvbuf]                     ; CRLF row terminator
-    mov     dl, 13
-    call    buf_putb
-    lea     rcx, [g_csvbuf]
-    mov     dl, 10
-    call    buf_putb
-    inc     dword ptr [rbp-28]
-    jmp     bc_elp
-bc_done:
-    xor     eax, eax
-    FRAME_EPILOG
-    ret
-bc_err:
-    mov     eax, 1
-    FRAME_EPILOG
-    ret
-ze_build_csv endp
-
-; =============================================================================
-; ze_compose(rcx = wide password ptr, edx = password bytes, r8d = EXP_* format,
-;   r9d = include-attachments flag) -> eax:
-;     0 = an encrypted ZIP is ready in g_zbuf   (caller: write it, then ze_free)
-;     2 = a standalone encrypted .xlsx is ready in g_ole_ptr/g_ole_len
-;         (caller: write it, then xl_encrypt_free + xl_free)
-;     1 = error
-;   Excel with no attachments -> the standalone encrypted workbook (2); every
-;   other combination (CSV, JSON, or any format WITH attachments) is wrapped in
-;   the AES-256 encrypted ZIP (0).
-; =============================================================================
 public ze_compose
 ; ze_compose(rcx = wide pw, edx = pw bytes) -> eax 0 ok / 1 error.  Builds the one
 ;   supported archive: an AES-256 encrypted ZIP holding vordr.json (all tiles of

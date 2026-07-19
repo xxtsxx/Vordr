@@ -43,7 +43,9 @@ extern gui_tmptest:proc                 ; secure temp-file lifecycle probe (gui.
 extern fuzzy_score:proc                 ; fuzzy-search scoring (gui.asm)
 extern gui_trtest:proc                  ; trash timestamp/threshold probe (gui.asm)
 extern cmd_secscan:proc                 ; secret-wipe page-scan probe (secmem.asm)
+ifdef DBG_TRACE
 extern cmd_securedesk:proc              ; secure-desktop spike (gui.asm)
+endif
 extern cmd_vfuzz:proc                   ; vault record-parser fuzzer (vault.asm)
 extern cmd_zfuzz:proc                   ; zip-import parser fuzzer (zipimport.asm)
 extern cmd_bktest:proc                  ; atomic-save + backup rotation probe (vault.asm)
@@ -100,16 +102,6 @@ public g_cfg_loglevel
 g_cfg_loglevel      dd 0            ; log verbosity (0 = none/off by default; see log.asm)
 public g_cfg_logfile
 g_cfg_logfile       dq 0            ; --log-file PATH override (0 = default path)
-
-; --- vault entry fields (populated by the GUI; the CLI never accepts secrets) --
-public g_cfg_title, g_cfg_user, g_cfg_secret, g_cfg_url, g_cfg_notes
-public g_cfg_totp
-g_cfg_title         dq 0
-g_cfg_user          dq 0
-g_cfg_secret        dq 0
-g_cfg_url           dq 0
-g_cfg_notes         dq 0
-g_cfg_totp          dq 0                ; --> wide base32 TOTP secret (GUI)
 
 ; --- modular field list (the GUI composes this; vault_build_entry consumes it) --
 ; g_field_list[] = up to MAX_FIELDS descriptors of 3 qwords each:
@@ -186,7 +178,9 @@ WSTR w_rbtest,   <rbtest>
 WSTR w_xctest,   <xctest>
 WSTR w_pkat,     <pkat>
 WSTR w_trtest,   <trtest>
+ifdef DBG_TRACE
 WSTR w_securedesk, <securedesk>
+endif
 WSTR wpw_exp,    <VordrExp1234>
 ifdef DBG_TRACE
 WSTR w_redteam,  <redteam>
@@ -233,8 +227,8 @@ cmd_table label CMDENT
     CMDENT { w_xctest,    cmd_xctest,    1, 0 }   ; external-change detection probe
     CMDENT { w_pkat,      cmd_pkat,      0, 0 }   ; parallel fail-closed KAT gate
     CMDENT { w_trtest,    cmd_trtest,    0, 0 }   ; trash timestamp/threshold KAT
-    CMDENT { w_securedesk, cmd_securedesk, 0, 0 } ; show a dialog on the private desktop (plan 4 spike)
 ifdef DBG_TRACE
+    CMDENT { w_securedesk, cmd_securedesk, 0, 0 } ; private-desktop spike dialog (dbg)
     CMDENT { w_redteam,   cmd_redteam,   1, 0 }   ; fault-injection self-test (dbg)
     CMDENT { w_tpmtest,   cmd_tpmtest,   0, 0 }   ; TPM round-trip probe (dbg)
     CMDENT { w_cttest,    cmd_cttest,    0, 0 }   ; ct_memcmp timing probe (dbg)
@@ -360,8 +354,10 @@ cpu_gate proc frame
 cg_store:
     mov     dword ptr [g_cpu_features], r10d
     mov     eax, r10d
-    and     eax, CPUF_AESNI or CPUF_PCLMUL or CPUF_SSE41
-    cmp     eax, CPUF_AESNI or CPUF_PCLMUL or CPUF_SSE41
+    ; sha256.asm uses the SHA-NI instructions unconditionally, so a CPU with
+    ; AES-NI but no SHA-NI (Skylake-class) must be refused here, not #UD later
+    and     eax, CPUF_AESNI or CPUF_PCLMUL or CPUF_SSE41 or CPUF_SHANI
+    cmp     eax, CPUF_AESNI or CPUF_PCLMUL or CPUF_SSE41 or CPUF_SHANI
     sete    al
     movzx   eax, al
     pop     rbx
@@ -1193,7 +1189,7 @@ fzt_fail:
 cmd_fztest endp
 
 ifdef DBG_TRACE
-; cmd_crashme - deliberately fault to exercise crash containment (plan 36).  It
+; cmd_crashme - deliberately fault to exercise crash containment.  It
 ;   plants a sentinel into the master-password buffer, then writes through a null
 ;   pointer.  The unhandled exception must reach crash_filter, which wipes every
 ;   secret (secmem_panic_wipe) and terminates with no WER dump.  Never returns.
@@ -1324,7 +1320,7 @@ dp_found:
     mov     r10, qword ptr [rbp-24]
     mov     rax, qword ptr [r10].CMDENT.handler
     CALL_GUARDED rax                    ; DLPV-checked indirect call
-    ; ---- audit log: command name + outcome -> Event Log --------------------
+    ; ---- audit log: command name + outcome -> the Vordr log text file --------
     mov     dword ptr [rbp-32], eax     ; stash exit code (index local is done)
     mov     r10, qword ptr [rbp-24]
     mov     rcx, qword ptr [r10].CMDENT.name_ptr

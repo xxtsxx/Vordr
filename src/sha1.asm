@@ -15,8 +15,6 @@
 
 include macros.inc
 
-SHA1_CTX_SIZE   equ 96
-public SHA1_CTX_SIZE
 
 ; ---------------------------------------------------------------------------
 ; SHA1_ROUND - one round given f in r8d and k in edx.  a..e are the locals at
