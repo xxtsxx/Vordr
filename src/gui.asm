@@ -954,10 +954,12 @@ fav_one label word
     dw '1', 0                                    ; VF_FAV marker value
 pht_lbl db 'Password'                            ; gui_phtest scratch (headless probe)
 pht_old db 'oldpw'
+align 2
 pht_ttl dw 'T', 0
 pht_new dw 'n','e','w','p','w', 0
 pht_loginu  db 'Login'                           ; phtest: a 2nd, different-label field
 pht_stayu   db 'stays'
+align 2
 pht_loginw  dw 'L','o','g','i','n', 0
 pht_staysw  dw 's','t','a','y','s', 0
     even                                         ; wb_gen MUST be word-aligned: an odd
@@ -1374,12 +1376,14 @@ g_xr          db (sizeof XR)*MAX_XR dup(?) ; cross-vault search results (cached 
 g_xr_n        dd ?                          ; number of cross-vault results
 g_xr_active   dd ?                          ; 1 = overlay list is showing cross-vault results
 g_cmpbuf      db 256 dup (?)               ; title-A copy for WM_COMPAREITEM
+align 2
 g_imp_msgw    dw 160 dup (?)               ; import result message scratch (wide)
 g_pg_len      dd ?                         ; password-generator: length
 g_pg_style    dd ?                         ;   PWS_* style
 g_pg_opt      dd ?                         ;   class mask + PWO_* flags
 g_pg_target   dd ?                         ;   secret row to fill on "Use" (-1 = none)
 g_pg_bits     dd ?                         ;   last entropy estimate
+align 2
 g_pg_tmpw     dw 128 dup (?)               ;   scratch for composed control text
 align 4
 g_tilecolor   dd ?                         ; fill color for the next tile draw
@@ -1406,6 +1410,7 @@ g_pworig      db MAX_PWORIG*PWORIG_STRIDE dup (?); original {label,value} per se
 g_pworig_n    dd ?
 g_pwh_scroll  dd ?                               ; history browser: first visible row
 g_pwh_dirty   dd ?                               ; history browser: a purge happened
+align 2
 g_phdate      dw 40 dup (?)                      ; history browser: formatted date scratch
 g_pwh_tab     dd ?                               ; selected tab (0-based)
 g_pwh_ntabs   dd ?                               ; number of distinct-label tabs

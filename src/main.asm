@@ -162,6 +162,7 @@ gl_hex_len    equ $ - gl_hex
 gp_crlf   db 13,10
 CSTR msg_seed_ok, "seeded 5000 realistic test entries.  unlock the vault with password: vordrtest",13,10
 seed_pw   db "vordrtest", 0
+align 2                                   ; keep the verb-name WSTRs even-aligned
 
 WSTR w_selftest, <selftest>
 WSTR w_bench,    <bench>
