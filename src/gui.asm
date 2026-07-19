@@ -877,8 +877,11 @@ WSTR mi_exit,       <Exit>
 WSTR mb_ok,         <OK>
 WSTR mb_yes,        <Yes>
 WSTR mb_no,         <No>
-tray_cls label word
+align 2                                     ; tray_cls must be even-aligned: the
+tray_cls label word                         ;  OS class-name reader faults on odd
     dw 'V','o','r','d','r','T','r','a','y', 0
+dbg_static_cls label word                   ; system class for the no-registration fallback
+    dw 'S','t','a','t','i','c', 0
 tray_wt label word
     dw 'V','o','r','d','r', 0
 secdesk_name label word                          ; private desktop for password entry
@@ -15158,8 +15161,20 @@ endif
     lea     rax, [tray_cls]
     mov     qword ptr [r10+64], rax          ; lpszClassName
     WINCALL RegisterClassW, addr g_wc
+    test    eax, eax
+    jnz     gm_clsok
+    ; RegisterClassW can still fail on exotic machines (error 998); fall back to
+    ; a system class + WNDPROC subclass, which needs no registration at all.
+    WINCALL CreateWindowExW, WS_EX_TOOLWINDOW, addr dbg_static_cls, addr tray_wt, WS_POPUP, \
+            0, 0, 0, 0, 0, 0, qword ptr [g_hinst], 0
+    test    rax, rax
+    jz      gm_trayhwnd                       ; still 0 -> the tray icon just won't show
+    WINCALL SetWindowLongPtrW, rax, GWLP_WNDPROC, addr tray_wndproc
+    jmp     gm_trayhwnd
+gm_clsok:
     WINCALL CreateWindowExW, WS_EX_TOOLWINDOW, addr tray_cls, addr tray_wt, WS_POPUP, \
             0, 0, 0, 0, 0, 0, qword ptr [g_hinst], 0
+gm_trayhwnd:
     mov     qword ptr [g_trayhwnd], rax
     mov     rcx, rax
     call    gui_tray_add
