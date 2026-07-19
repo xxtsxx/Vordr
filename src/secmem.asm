@@ -25,6 +25,8 @@ extern VirtualFree:proc
 extern VirtualLock:proc
 extern VirtualUnlock:proc
 extern secure_zero:proc
+extern vault_slots_lock:proc            ; vault.asm: VirtualLock the g_vaults table
+extern vault_panic_wipe_slots:proc      ; vault.asm: crash-path wipe of slot secrets
 extern GetCurrentProcess:proc
 extern SetProcessWorkingSetSize:proc
 extern rng_fill:proc
@@ -105,6 +107,7 @@ sec_lock_statics proc frame
     lea     rcx, [g_totp_b32]
     mov     edx, 256
     call    sec_lock
+    call    vault_slots_lock                  ; the g_vaults table (slot master keys)
     FRAME_EPILOG
     ret
 sec_lock_statics endp
@@ -143,10 +146,12 @@ secmem_panic_wipe proc frame
     call    secure_zero
     mov     rax, qword ptr [g_body_ptr]         ; decrypted vault body, if resident
     test    rax, rax
-    jz      spw_done
+    jz      spw_slots
     mov     rcx, rax
     mov     rdx, qword ptr [g_body_len]
     call    secure_zero
+spw_slots:
+    call    vault_panic_wipe_slots            ; every open context's key + body
 spw_done:
     FRAME_EPILOG
     ret

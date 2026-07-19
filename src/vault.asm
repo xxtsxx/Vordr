@@ -32,6 +32,7 @@ extern ct_memcmp:proc
 extern rng_fill:proc
 extern secure_zero:proc
 extern secmem_alloc:proc
+extern sec_lock:proc
 extern pwgen_ex:proc
 extern secmem_free:proc
 extern read_file:proc
@@ -1463,6 +1464,7 @@ do_seed endp
 ;   the body and attach_open the pending blob.
 ; ===========================================================================
 .const
+align 2
 ag_title dw 'A','t','t','a','c','h','T','e','s','t',0
 ag_fname dw 'h','e','l','l','o','.','t','x','t',0        ; 10 wide chars incl NUL
 ag_fnam2 dw 'w','o','r','l','d','.','d','a','t',0        ; 10 wide chars incl NUL
@@ -2063,13 +2065,85 @@ vault_restore endp
 ; freed while a vault is open, switching is a pure pointer/state swap.
 ; ---------------------------------------------------------------------------
 
-; vault_ctx_reset() - forget all open vaults (no buffers freed here).  Leaf.
+; vault_ctx_reset() - drop every open context: wipe each slot's master key and
+;   free its resident decrypted body, then clear the table.  Called when the
+;   vault window closes (lock/leave) and at startup - the lock-all path must
+;   never leave another vault's secrets resident.
 public vault_ctx_reset
-vault_ctx_reset proc
+vault_ctx_reset proc frame
+    FRAME_PROLOG 48
+    mov     dword ptr [rbp-24], 0               ; i
+vcr_loop:
+    mov     eax, dword ptr [rbp-24]
+    cmp     eax, MAX_VAULTS
+    jae     vcr_zeroed
+    mov     ecx, dword ptr [rbp-24]
+    call    vault_ctx_slotptr
+    mov     qword ptr [rbp-32], rax             ; slot
+    mov     rcx, rax                            ; wipe the master-key copy
+    add     rcx, VSLOT.s_vkey
+    mov     edx, 32
+    call    secure_zero
+    mov     r10, qword ptr [rbp-32]             ; free + wipe the resident body
+    mov     rcx, qword ptr [r10 + VSLOT.s_body_ptr]
+    test    rcx, rcx
+    jz      vcr_next
+    mov     rdx, qword ptr [r10 + VSLOT.s_body_len]
+    call    secmem_free
+    mov     r10, qword ptr [rbp-32]
+    mov     qword ptr [r10 + VSLOT.s_body_ptr], 0
+vcr_next:
+    inc     dword ptr [rbp-24]
+    jmp     vcr_loop
+vcr_zeroed:
     mov     dword ptr [g_vault_n], 0
     mov     dword ptr [g_vault_cur], -1
+    FRAME_EPILOG
     ret
 vault_ctx_reset endp
+
+; vault_slots_lock() - VirtualLock the whole g_vaults table (every slot's s_vkey
+;   is a master key copy; the table must stay out of the pagefile).
+public vault_slots_lock
+vault_slots_lock proc frame
+    FRAME_PROLOG 32
+    lea     rcx, [g_vaults]
+    mov     edx, (sizeof VSLOT) * MAX_VAULTS
+    call    sec_lock
+    FRAME_EPILOG
+    ret
+vault_slots_lock endp
+
+; vault_panic_wipe_slots() - crash-path wipe of every slot's master key and
+;   resident body bytes (no frees - the heap may already be corrupt).
+public vault_panic_wipe_slots
+vault_panic_wipe_slots proc frame
+    FRAME_PROLOG 48
+    mov     dword ptr [rbp-24], 0               ; i
+vpws_loop:
+    mov     eax, dword ptr [rbp-24]
+    cmp     eax, MAX_VAULTS
+    jae     vpws_done
+    mov     ecx, dword ptr [rbp-24]
+    call    vault_ctx_slotptr
+    mov     qword ptr [rbp-32], rax
+    mov     rcx, rax
+    add     rcx, VSLOT.s_vkey
+    mov     edx, 32
+    call    secure_zero
+    mov     r10, qword ptr [rbp-32]
+    mov     rcx, qword ptr [r10 + VSLOT.s_body_ptr]
+    test    rcx, rcx
+    jz      vpws_next
+    mov     rdx, qword ptr [r10 + VSLOT.s_body_len]
+    call    secure_zero
+vpws_next:
+    inc     dword ptr [rbp-24]
+    jmp     vpws_loop
+vpws_done:
+    FRAME_EPILOG
+    ret
+vault_panic_wipe_slots endp
 
 ; vault_ctx_slotptr(ecx = index) -> rax = &g_vaults[index].  Leaf, no bounds
 ;   check (callers validate against g_vault_n first).

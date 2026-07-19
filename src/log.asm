@@ -78,6 +78,7 @@ CSTR sep_crlf,   13,10
 .data?
 align 16
 g_logline   db LINELEN dup (?)        ; assembled UTF-8 line
+align 2
 g_logpath   dw 1024 dup (?)           ; resolved default log path
 g_systime   db 16 dup (?)             ; SYSTEMTIME
 g_logwrote  dd ?

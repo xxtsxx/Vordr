@@ -160,6 +160,10 @@ crash_veh proc frame
     mov     r10, qword ptr [rax+40]
     mov     qword ptr [g_crash_info+8], r10     ; ExceptionInformation[1] (data addr)
 cv_noinfo:
+ifdef DBG_TRACE
+    ; dbg builds only: capture GP registers for post-mortem analysis.  Never in
+    ; release - at a crash during crypto these can hold key or password bytes,
+    ; and the breadcrumb file is world-readable within the user profile.
     mov     rax, qword ptr [rcx+8]              ; -> CONTEXT
     mov     r10, qword ptr [rax+78h]
     mov     qword ptr [g_crash_regs+0], r10     ; rax
@@ -181,6 +185,7 @@ cv_noinfo:
     mov     qword ptr [g_crash_regs+64], r10    ; rip
     mov     r10, qword ptr [rax+0B8h]
     mov     qword ptr [g_crash_regs+72], r10    ; r8
+endif
     mov     rax, qword ptr [rcx]                ; -> EXCEPTION_RECORD
     mov     eax, dword ptr [rax]                ; ExceptionCode
     and     eax, 0F0000000h                     ; severity nibble
@@ -195,10 +200,12 @@ cv_pass:
     ret
 crash_veh endp
 
-; crash_dump() - best-effort crash breadcrumb: %TEMP%\vordr_crash.bin =
-;   {code, addr, base, ExceptionInformation[0..1], regs[10]}.  Runs BEFORE the
-;   wipe/apology so the record survives even if a later containment step fails.
-;   Static data only - no secret can leak through this file.
+; crash_dump() - best-effort crash breadcrumb: %TEMP%\vordr_crash.bin.  Runs
+;   BEFORE the wipe/apology so the record survives even if a later containment
+;   step fails.  Release writes {code, addr, base, ExceptionInformation[0..1]}
+;   (24 bytes - no secret content); dbg builds append 10 GP registers for
+;   post-mortem analysis (registers may hold key/password bytes at a crash, so
+;   they never ship in a release breadcrumb).
 crash_dump proc frame
     FRAME_PROLOG 64
     cmp     byte ptr [g_crash_dumped], 0
@@ -228,7 +235,11 @@ cd_cp:
     mov     qword ptr [g_crash_h], rax
     WINCALL GetModuleHandleW, 0
     mov     qword ptr [g_crash_base], rax
+ifdef DBG_TRACE
     WINCALL WriteFile, qword ptr [g_crash_h], addr g_crash_code, 120, addr g_crash_nw, 0
+else
+    WINCALL WriteFile, qword ptr [g_crash_h], addr g_crash_code, 24, addr g_crash_nw, 0
+endif
     WINCALL CloseHandle, qword ptr [g_crash_h]
 cd_ret:
     FRAME_EPILOG
