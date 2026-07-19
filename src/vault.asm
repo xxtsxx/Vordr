@@ -21,6 +21,9 @@
 
 include macros.inc
 
+externdef g_vpath:word                  ; multi-vault: file identity, snapshotted per ctx
+externdef g_is_default:dword
+externdef g_vault_lock:dword
 extern argon2id_hash:proc
 extern gcm_seal:proc
 extern gcm_open:proc
@@ -143,6 +146,55 @@ ARF_SIZE        equ 68
 ATT_ENThDR      equ 24          ; on-disk entry header = id16 + u64 ctlen
 MAX_ATT         equ 512         ; index / pending-table capacity
 
+; multi-vault state slot (redesign items 6/7/9): a complete open-vault state, so
+; several vaults can be held decrypted at once and switched between.  The heap
+; pointers (body/filebuf) stay valid because an open vault's buffers are not freed.
+VSLOT struct
+    s_vkey      db 32 dup(?)
+    s_hdr       db VH_TOTAL dup(?)
+    s_ext_hash  db 32 dup(?)
+    s_body_ptr  dq ?
+    s_body_len  dq ?
+    s_save_ctr  dq ?
+    s_fmac_len  dq ?
+    s_ext_size  dq ?
+    s_filebuf   dq ?
+    s_filesize  dq ?
+    s_att_start dq ?
+    s_att_total dq ?
+    s_rollback  dd ?
+    s_newatt_n  dd ?
+    s_attidx_n  dd ?
+    s_pad       dd ?
+    s_newatt    db MAX_ATT * 32 dup(?)
+    s_attidx    db MAX_ATT * 32 dup(?)
+    s_vpath     db 2048 dup(?)              ; file identity: g_vpath contents (per-ctx save target)
+    s_is_default dd ?
+    s_vault_lock dd ?
+    s_pad2      dd ?
+    s_name      db 128 dup(?)               ; tab display name (wide, NUL-term); set at open,
+                                            ;   not part of the swapped live state
+VSLOT ends
+
+MAX_VAULTS      equ 8           ; simultaneously-open vaults (redesign items 6/7/9)
+
+; Availability retry state (redesign item 9): a vault whose file can't be opened
+; (locked/missing) is not displayed; it is retried AVAIL_MAX_TRIES times at
+; AVAIL_INTERVAL_MS spacing, then given up until the user unlocks again.  All
+; time-based procs take "now" (a GetTickCount64 value) explicitly so the state
+; machine is deterministic and headless-testable.
+AVAIL_MAX_TRIES   equ 3
+AVAIL_INTERVAL_MS equ 5000
+AVSTAT_AVAIL      equ 0         ; open/usable, displayed
+AVSTAT_RETRY      equ 1         ; unavailable, auto-retrying
+AVSTAT_GAVEUP     equ 2         ; exhausted retries, dormant until manual unlock
+
+AVSLOT struct
+    av_status   dd ?
+    av_tries    dd ?           ; failed retry attempts so far (0..AVAIL_MAX_TRIES)
+    av_next     dq ?           ; tick deadline of the next retry attempt
+AVSLOT ends
+
 .const
 vst_src     db "vault-kat-test!!"      ; 16-byte plaintext for vault_selftest
 ; --- field-serialization KAT (labeled + duplicate fields) ------------------
@@ -198,6 +250,16 @@ CSTR m_created, "vault created.",13,10
 
 .data?
 align 16
+g_mvslot    db (sizeof VSLOT) dup (?)  ; multi-vault: one held vault-state slot (probe/scratch)
+align 16
+public g_vaults
+public g_vault_n
+public g_vault_cur
+g_vaults    db (sizeof VSLOT) * MAX_VAULTS dup (?) ; multi-vault: per-open-vault held state
+g_vault_n   dd ?                       ; number of open vaults (0..MAX_VAULTS)
+g_vault_cur dd ?                       ; index of the fronted vault, or -1 if none live
+align 8
+g_avslot    db (sizeof AVSLOT) dup (?) ; availability retry state (probe/scratch)
 g_vfz_rng   dq ?                       ; vfuzz xorshift64 state (dbg/test only)
 g_kat_body  db 512 dup (?)             ; scratch body for the field-serialization KAT
 public g_vkey
@@ -1841,6 +1903,808 @@ vfz_oom:
 cmd_vfuzz endp
 
 ; ===========================================================================
+; copy_bytes(rcx=dst, rdx=src, r8d=len) - byte copy using volatile regs only.  Leaf.
+copy_bytes proc
+    xor     r9d, r9d
+cpb_lp:
+    cmp     r9d, r8d
+    jae     cpb_done
+    mov     al, byte ptr [rdx+r9]
+    mov     byte ptr [rcx+r9], al
+    inc     r9d
+    jmp     cpb_lp
+cpb_done:
+    ret
+copy_bytes endp
+
+; vault_snapshot(rcx = VSLOT*) - copy the live open-vault state into the slot so
+;   another vault can be made active.  Additive: no existing path changed.
+public vault_snapshot
+vault_snapshot proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [g_vkey]
+    mov     r8d, 32
+    call    copy_bytes
+    mov     rcx, qword ptr [rbp-24]
+    add     rcx, VSLOT.s_hdr
+    lea     rdx, [g_hdr]
+    mov     r8d, VH_TOTAL
+    call    copy_bytes
+    mov     rcx, qword ptr [rbp-24]
+    add     rcx, VSLOT.s_ext_hash
+    lea     rdx, [g_ext_hash]
+    mov     r8d, 32
+    call    copy_bytes
+    mov     rcx, qword ptr [rbp-24]
+    add     rcx, VSLOT.s_newatt
+    lea     rdx, [g_newatt]
+    mov     r8d, MAX_ATT * 32
+    call    copy_bytes
+    mov     rcx, qword ptr [rbp-24]
+    add     rcx, VSLOT.s_attidx
+    lea     rdx, [g_attidx]
+    mov     r8d, MAX_ATT * 32
+    call    copy_bytes
+    mov     r10, qword ptr [rbp-24]
+    mov     rax, qword ptr [g_body_ptr]
+    mov     qword ptr [r10+VSLOT.s_body_ptr], rax
+    mov     rax, qword ptr [g_body_len]
+    mov     qword ptr [r10+VSLOT.s_body_len], rax
+    mov     rax, qword ptr [g_save_counter]
+    mov     qword ptr [r10+VSLOT.s_save_ctr], rax
+    mov     rax, qword ptr [g_fmac_len]
+    mov     qword ptr [r10+VSLOT.s_fmac_len], rax
+    mov     rax, qword ptr [g_ext_size]
+    mov     qword ptr [r10+VSLOT.s_ext_size], rax
+    mov     rax, qword ptr [g_filebuf]
+    mov     qword ptr [r10+VSLOT.s_filebuf], rax
+    mov     rax, qword ptr [g_filesize]
+    mov     qword ptr [r10+VSLOT.s_filesize], rax
+    mov     rax, qword ptr [g_att_start]
+    mov     qword ptr [r10+VSLOT.s_att_start], rax
+    mov     rax, qword ptr [g_att_total]
+    mov     qword ptr [r10+VSLOT.s_att_total], rax
+    mov     eax, dword ptr [g_rollback]
+    mov     dword ptr [r10+VSLOT.s_rollback], eax
+    mov     eax, dword ptr [g_newatt_n]
+    mov     dword ptr [r10+VSLOT.s_newatt_n], eax
+    mov     eax, dword ptr [g_attidx_n]
+    mov     dword ptr [r10+VSLOT.s_attidx_n], eax
+    mov     rcx, qword ptr [rbp-24]              ; file identity: g_vpath -> slot
+    add     rcx, VSLOT.s_vpath
+    lea     rdx, [g_vpath]
+    mov     r8d, 2048
+    call    copy_bytes
+    mov     r10, qword ptr [rbp-24]
+    mov     eax, dword ptr [g_is_default]
+    mov     dword ptr [r10+VSLOT.s_is_default], eax
+    mov     eax, dword ptr [g_vault_lock]
+    mov     dword ptr [r10+VSLOT.s_vault_lock], eax
+    FRAME_EPILOG
+    ret
+vault_snapshot endp
+
+; vault_restore(rcx = VSLOT*) - make the slot's vault state the live one.
+public vault_restore
+vault_restore proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    lea     rcx, [g_vkey]
+    mov     rdx, qword ptr [rbp-24]
+    mov     r8d, 32
+    call    copy_bytes
+    lea     rcx, [g_hdr]
+    mov     rdx, qword ptr [rbp-24]
+    add     rdx, VSLOT.s_hdr
+    mov     r8d, VH_TOTAL
+    call    copy_bytes
+    lea     rcx, [g_ext_hash]
+    mov     rdx, qword ptr [rbp-24]
+    add     rdx, VSLOT.s_ext_hash
+    mov     r8d, 32
+    call    copy_bytes
+    lea     rcx, [g_newatt]
+    mov     rdx, qword ptr [rbp-24]
+    add     rdx, VSLOT.s_newatt
+    mov     r8d, MAX_ATT * 32
+    call    copy_bytes
+    lea     rcx, [g_attidx]
+    mov     rdx, qword ptr [rbp-24]
+    add     rdx, VSLOT.s_attidx
+    mov     r8d, MAX_ATT * 32
+    call    copy_bytes
+    mov     r10, qword ptr [rbp-24]
+    mov     rax, qword ptr [r10+VSLOT.s_body_ptr]
+    mov     qword ptr [g_body_ptr], rax
+    mov     rax, qword ptr [r10+VSLOT.s_body_len]
+    mov     qword ptr [g_body_len], rax
+    mov     rax, qword ptr [r10+VSLOT.s_save_ctr]
+    mov     qword ptr [g_save_counter], rax
+    mov     rax, qword ptr [r10+VSLOT.s_fmac_len]
+    mov     qword ptr [g_fmac_len], rax
+    mov     rax, qword ptr [r10+VSLOT.s_ext_size]
+    mov     qword ptr [g_ext_size], rax
+    mov     rax, qword ptr [r10+VSLOT.s_filebuf]
+    mov     qword ptr [g_filebuf], rax
+    mov     rax, qword ptr [r10+VSLOT.s_filesize]
+    mov     qword ptr [g_filesize], rax
+    mov     rax, qword ptr [r10+VSLOT.s_att_start]
+    mov     qword ptr [g_att_start], rax
+    mov     rax, qword ptr [r10+VSLOT.s_att_total]
+    mov     qword ptr [g_att_total], rax
+    mov     eax, dword ptr [r10+VSLOT.s_rollback]
+    mov     dword ptr [g_rollback], eax
+    mov     eax, dword ptr [r10+VSLOT.s_newatt_n]
+    mov     dword ptr [g_newatt_n], eax
+    mov     eax, dword ptr [r10+VSLOT.s_attidx_n]
+    mov     dword ptr [g_attidx_n], eax
+    lea     rcx, [g_vpath]                       ; file identity: slot -> g_vpath
+    mov     rdx, qword ptr [rbp-24]
+    add     rdx, VSLOT.s_vpath
+    mov     r8d, 2048
+    call    copy_bytes
+    mov     r10, qword ptr [rbp-24]
+    mov     eax, dword ptr [r10+VSLOT.s_is_default]
+    mov     dword ptr [g_is_default], eax
+    mov     eax, dword ptr [r10+VSLOT.s_vault_lock]
+    mov     dword ptr [g_vault_lock], eax
+    FRAME_EPILOG
+    ret
+vault_restore endp
+
+; ---------------------------------------------------------------------------
+; Multi-vault context manager (redesign items 6/7/9).  The live open-vault
+; globals are always the fronted vault; every other open vault's state sits in
+; its g_vaults[] slot.  vault_ctx_open claims a fresh slot for the vault the
+; caller is about to load; vault_ctx_front swaps which slot is live.  Because a
+; VSLOT captures the heap pointers (body/filebuf) and those buffers are never
+; freed while a vault is open, switching is a pure pointer/state swap.
+; ---------------------------------------------------------------------------
+
+; vault_ctx_reset() - forget all open vaults (no buffers freed here).  Leaf.
+public vault_ctx_reset
+vault_ctx_reset proc
+    mov     dword ptr [g_vault_n], 0
+    mov     dword ptr [g_vault_cur], -1
+    ret
+vault_ctx_reset endp
+
+; vault_ctx_slotptr(ecx = index) -> rax = &g_vaults[index].  Leaf, no bounds
+;   check (callers validate against g_vault_n first).
+public vault_ctx_slotptr
+vault_ctx_slotptr proc
+    mov     eax, ecx                        ; zero-extend index into rax
+    imul    rax, rax, sizeof VSLOT
+    lea     rcx, [g_vaults]
+    add     rax, rcx
+    ret
+vault_ctx_slotptr endp
+
+; vault_ctx_open() -> eax = new vault index, or -1 if MAX_VAULTS reached.  Saves
+;   the currently-fronted vault into its slot; the caller then loads the new
+;   vault into the live globals (fresh slot, nothing to restore).
+public vault_ctx_open
+vault_ctx_open proc frame
+    FRAME_PROLOG 48
+    mov     eax, dword ptr [g_vault_n]
+    cmp     eax, MAX_VAULTS
+    jb      vco_have_room
+    mov     eax, -1
+    FRAME_EPILOG
+    ret
+vco_have_room:
+    cmp     dword ptr [g_vault_cur], 0
+    jl      vco_no_current                  ; -1: nothing live to save
+    mov     ecx, dword ptr [g_vault_cur]
+    call    vault_ctx_slotptr
+    mov     rcx, rax
+    call    vault_snapshot
+vco_no_current:
+    mov     eax, dword ptr [g_vault_n]      ; idx = n
+    mov     dword ptr [rbp-24], eax
+    inc     eax
+    mov     dword ptr [g_vault_n], eax      ; n = n + 1
+    mov     eax, dword ptr [rbp-24]
+    mov     dword ptr [g_vault_cur], eax    ; cur = idx
+    mov     eax, dword ptr [rbp-24]
+    FRAME_EPILOG
+    ret
+vault_ctx_open endp
+
+; vault_ctx_front(ecx = target index) -> eax = 0 ok / 1 bad index.  Snapshots
+;   the live vault into its slot, then restores the target slot into the live
+;   globals.  A no-op if the target is already fronted.
+public vault_ctx_front
+vault_ctx_front proc frame
+    FRAME_PROLOG 48
+    mov     dword ptr [rbp-24], ecx         ; target
+    cmp     ecx, dword ptr [g_vault_n]
+    jb      vcf_valid
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+vcf_valid:
+    mov     eax, dword ptr [rbp-24]
+    cmp     eax, dword ptr [g_vault_cur]
+    jne     vcf_switch
+    xor     eax, eax                        ; already fronted
+    FRAME_EPILOG
+    ret
+vcf_switch:
+    cmp     dword ptr [g_vault_cur], 0
+    jl      vcf_no_current                  ; -1: nothing live to save
+    mov     ecx, dword ptr [g_vault_cur]
+    call    vault_ctx_slotptr
+    mov     rcx, rax
+    call    vault_snapshot
+vcf_no_current:
+    mov     ecx, dword ptr [rbp-24]
+    call    vault_ctx_slotptr
+    mov     rcx, rax
+    call    vault_restore
+    mov     eax, dword ptr [rbp-24]
+    mov     dword ptr [g_vault_cur], eax
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+vault_ctx_front endp
+
+; vault_ctx_setname(ecx=idx, rdx=src wide name) - store a tab display name
+;   (<=63 wide chars, NUL-terminated).  Leaf.
+public vault_ctx_setname
+vault_ctx_setname proc
+    mov     eax, ecx
+    imul    rax, rax, sizeof VSLOT
+    lea     r10, [g_vaults]
+    add     rax, r10
+    add     rax, VSLOT.s_name                 ; rax = dst
+    xor     r9d, r9d
+vcsn_lp:
+    cmp     r9d, 63
+    jae     vcsn_end
+    movzx   r8d, word ptr [rdx + r9*2]
+    mov     word ptr [rax + r9*2], r8w
+    test    r8w, r8w
+    jz      vcsn_done
+    inc     r9d
+    jmp     vcsn_lp
+vcsn_end:
+    mov     word ptr [rax + r9*2], 0
+vcsn_done:
+    ret
+vault_ctx_setname endp
+
+; vault_ctx_nameptr(ecx=idx) -> rax = &g_vaults[idx].s_name.  Leaf.
+public vault_ctx_nameptr
+vault_ctx_nameptr proc
+    mov     eax, ecx
+    imul    rax, rax, sizeof VSLOT
+    lea     rcx, [g_vaults]
+    add     rax, rcx
+    add     rax, VSLOT.s_name
+    ret
+vault_ctx_nameptr endp
+
+; vault_ctx_close(ecx=idx) - remove open-vault context idx: securely wipe its
+;   master key + decrypted body, compact the g_vaults array, wipe the trailing
+;   slot's key copy, and shift g_vault_cur down if it was above idx.  The caller
+;   must first front a different vault if idx is the currently-fronted one.
+public vault_ctx_close
+vault_ctx_close proc frame
+    FRAME_PROLOG 48
+    mov     dword ptr [rbp-24], ecx
+    mov     ecx, dword ptr [rbp-24]
+    call    vault_ctx_slotptr
+    mov     qword ptr [rbp-32], rax
+    lea     rcx, [rax + VSLOT.s_vkey]         ; wipe master key
+    mov     edx, 32
+    call    secure_zero
+    mov     r10, qword ptr [rbp-32]           ; wipe decrypted body (its own alloc)
+    mov     rcx, qword ptr [r10 + VSLOT.s_body_ptr]
+    test    rcx, rcx
+    jz      vcc_compact
+    mov     edx, dword ptr [r10 + VSLOT.s_body_len]
+    call    secure_zero
+vcc_compact:
+    mov     eax, dword ptr [rbp-24]           ; shift slots [idx+1 .. n-1] down one
+    mov     dword ptr [rbp-40], eax
+vcc_shift:
+    mov     eax, dword ptr [g_vault_n]
+    dec     eax
+    cmp     dword ptr [rbp-40], eax
+    jae     vcc_shifted
+    mov     ecx, dword ptr [rbp-40]
+    call    vault_ctx_slotptr
+    mov     qword ptr [rbp-48], rax           ; dst
+    mov     ecx, dword ptr [rbp-40]
+    inc     ecx
+    call    vault_ctx_slotptr                 ; src
+    mov     rcx, qword ptr [rbp-48]
+    mov     rdx, rax
+    mov     r8d, sizeof VSLOT
+    call    copy_bytes
+    inc     dword ptr [rbp-40]
+    jmp     vcc_shift
+vcc_shifted:
+    dec     dword ptr [g_vault_n]
+    mov     ecx, dword ptr [g_vault_n]        ; wipe the excluded trailing slot's key copy
+    call    vault_ctx_slotptr
+    lea     rcx, [rax + VSLOT.s_vkey]
+    mov     edx, 32
+    call    secure_zero
+    mov     eax, dword ptr [g_vault_cur]      ; cur > idx -> shift down with the array
+    cmp     eax, dword ptr [rbp-24]
+    jle     vcc_done
+    dec     eax
+    mov     dword ptr [g_vault_cur], eax
+vcc_done:
+    FRAME_EPILOG
+    ret
+vault_ctx_close endp
+
+; ---------------------------------------------------------------------------
+; Availability retry state machine (redesign item 9).  Leaf procs; the caller
+; supplies "now" (GetTickCount64) so the machine is deterministic to test.
+; ---------------------------------------------------------------------------
+
+; vault_avail_begin(rcx = AVSLOT*, rdx = now) - a vault just went unavailable:
+;   enter RETRY with 0 tries and the first retry due one interval out.
+public vault_avail_begin
+vault_avail_begin proc
+    mov     dword ptr [rcx+AVSLOT.av_status], AVSTAT_RETRY
+    mov     dword ptr [rcx+AVSLOT.av_tries], 0
+    add     rdx, AVAIL_INTERVAL_MS
+    mov     qword ptr [rcx+AVSLOT.av_next], rdx
+    ret
+vault_avail_begin endp
+
+; vault_avail_due(rcx = AVSLOT*, rdx = now) -> eax = 1 if a retry attempt should
+;   run now (RETRY state and the deadline has passed), else 0.
+public vault_avail_due
+vault_avail_due proc
+    xor     eax, eax
+    cmp     dword ptr [rcx+AVSLOT.av_status], AVSTAT_RETRY
+    jne     vad_no
+    cmp     rdx, qword ptr [rcx+AVSLOT.av_next]
+    jb      vad_no
+    mov     eax, 1
+vad_no:
+    ret
+vault_avail_due endp
+
+; vault_avail_fail(rcx = AVSLOT*, rdx = now) - a retry attempt just failed:
+;   count it; after AVAIL_MAX_TRIES give up, else schedule the next interval.
+public vault_avail_fail
+vault_avail_fail proc
+    mov     eax, dword ptr [rcx+AVSLOT.av_tries]
+    inc     eax
+    mov     dword ptr [rcx+AVSLOT.av_tries], eax
+    cmp     eax, AVAIL_MAX_TRIES
+    jb      vaf_reschedule
+    mov     dword ptr [rcx+AVSLOT.av_status], AVSTAT_GAVEUP
+    ret
+vaf_reschedule:
+    add     rdx, AVAIL_INTERVAL_MS
+    mov     qword ptr [rcx+AVSLOT.av_next], rdx
+    ret
+vault_avail_fail endp
+
+; vault_avail_ok(rcx = AVSLOT*) - a retry attempt succeeded: vault is available.
+public vault_avail_ok
+vault_avail_ok proc
+    mov     dword ptr [rcx+AVSLOT.av_status], AVSTAT_AVAIL
+    ret
+vault_avail_ok endp
+
+; vault_avail_unlock(rcx = AVSLOT*, rdx = now) - user asked to unlock again:
+;   restart RETRY from zero, first attempt due immediately.
+public vault_avail_unlock
+vault_avail_unlock proc
+    mov     dword ptr [rcx+AVSLOT.av_status], AVSTAT_RETRY
+    mov     dword ptr [rcx+AVSLOT.av_tries], 0
+    mov     qword ptr [rcx+AVSLOT.av_next], rdx
+    ret
+vault_avail_unlock endp
+
+; cmd_mvtest - headless probe: plant a distinct sentinel in every open-vault state
+;   field, snapshot, clobber every field to zero, restore, and verify each field
+;   came back.  Proves vault_snapshot/vault_restore cover the complete state (a
+;   missed field would stay zero -> fail).  Exit 0 = pass.
+LANDING_PAD
+public cmd_mvtest
+cmd_mvtest proc frame
+    FRAME_PROLOG 48
+    mov     byte ptr [g_vkey], 0AAh
+    mov     byte ptr [g_hdr], 0BBh
+    mov     byte ptr [g_ext_hash], 0CCh
+    mov     byte ptr [g_newatt], 0DDh
+    mov     byte ptr [g_attidx], 0EEh
+    mov     byte ptr [g_newatt + MAX_ATT*32 - 1], 44h   ; last byte too
+    mov     byte ptr [g_attidx + MAX_ATT*32 - 1], 55h
+    mov     rax, 1111111111111111h
+    mov     qword ptr [g_body_ptr], rax
+    mov     rax, 2222222222222222h
+    mov     qword ptr [g_body_len], rax
+    mov     rax, 3333333333333333h
+    mov     qword ptr [g_save_counter], rax
+    mov     rax, 4444444444444444h
+    mov     qword ptr [g_fmac_len], rax
+    mov     rax, 5555555555555555h
+    mov     qword ptr [g_ext_size], rax
+    mov     rax, 6666666666666666h
+    mov     qword ptr [g_filebuf], rax
+    mov     rax, 7777777777777777h
+    mov     qword ptr [g_filesize], rax
+    mov     rax, 8888888888888888h
+    mov     qword ptr [g_att_start], rax
+    mov     rax, 9999999999999999h
+    mov     qword ptr [g_att_total], rax
+    mov     dword ptr [g_rollback], 0A1A1A1A1h
+    mov     dword ptr [g_newatt_n], 0B2B2B2B2h
+    mov     dword ptr [g_attidx_n], 0C3C3C3C3h
+    mov     word ptr [g_vpath], 1234h
+    mov     dword ptr [g_is_default], 71717171h
+    mov     dword ptr [g_vault_lock], 82828282h
+    lea     rcx, [g_mvslot]
+    call    vault_snapshot
+    ; clobber everything to zero
+    lea     rcx, [g_vkey]
+    mov     edx, 32
+    call    mvt_zero
+    lea     rcx, [g_hdr]
+    mov     edx, VH_TOTAL
+    call    mvt_zero
+    lea     rcx, [g_ext_hash]
+    mov     edx, 32
+    call    mvt_zero
+    lea     rcx, [g_newatt]
+    mov     edx, MAX_ATT * 32
+    call    mvt_zero
+    lea     rcx, [g_attidx]
+    mov     edx, MAX_ATT * 32
+    call    mvt_zero
+    xor     eax, eax
+    mov     qword ptr [g_body_ptr], rax
+    mov     qword ptr [g_body_len], rax
+    mov     qword ptr [g_save_counter], rax
+    mov     qword ptr [g_fmac_len], rax
+    mov     qword ptr [g_ext_size], rax
+    mov     qword ptr [g_filebuf], rax
+    mov     qword ptr [g_filesize], rax
+    mov     qword ptr [g_att_start], rax
+    mov     qword ptr [g_att_total], rax
+    mov     dword ptr [g_rollback], eax
+    mov     dword ptr [g_newatt_n], eax
+    mov     dword ptr [g_attidx_n], eax
+    mov     word ptr [g_vpath], ax
+    mov     dword ptr [g_is_default], eax
+    mov     dword ptr [g_vault_lock], eax
+    lea     rcx, [g_mvslot]
+    call    vault_restore
+    ; verify each field
+    cmp     byte ptr [g_vkey], 0AAh
+    jne     mvt_fail
+    cmp     byte ptr [g_hdr], 0BBh
+    jne     mvt_fail
+    cmp     byte ptr [g_ext_hash], 0CCh
+    jne     mvt_fail
+    cmp     byte ptr [g_newatt], 0DDh
+    jne     mvt_fail
+    cmp     byte ptr [g_attidx], 0EEh
+    jne     mvt_fail
+    cmp     byte ptr [g_newatt + MAX_ATT*32 - 1], 44h
+    jne     mvt_fail
+    cmp     byte ptr [g_attidx + MAX_ATT*32 - 1], 55h
+    jne     mvt_fail
+    mov     rax, 1111111111111111h
+    cmp     qword ptr [g_body_ptr], rax
+    jne     mvt_fail
+    mov     rax, 2222222222222222h
+    cmp     qword ptr [g_body_len], rax
+    jne     mvt_fail
+    mov     rax, 3333333333333333h
+    cmp     qword ptr [g_save_counter], rax
+    jne     mvt_fail
+    mov     rax, 4444444444444444h
+    cmp     qword ptr [g_fmac_len], rax
+    jne     mvt_fail
+    mov     rax, 5555555555555555h
+    cmp     qword ptr [g_ext_size], rax
+    jne     mvt_fail
+    mov     rax, 6666666666666666h
+    cmp     qword ptr [g_filebuf], rax
+    jne     mvt_fail
+    mov     rax, 7777777777777777h
+    cmp     qword ptr [g_filesize], rax
+    jne     mvt_fail
+    mov     rax, 8888888888888888h
+    cmp     qword ptr [g_att_start], rax
+    jne     mvt_fail
+    mov     rax, 9999999999999999h
+    cmp     qword ptr [g_att_total], rax
+    jne     mvt_fail
+    cmp     dword ptr [g_rollback], 0A1A1A1A1h
+    jne     mvt_fail
+    cmp     dword ptr [g_newatt_n], 0B2B2B2B2h
+    jne     mvt_fail
+    cmp     dword ptr [g_attidx_n], 0C3C3C3C3h
+    jne     mvt_fail
+    cmp     word ptr [g_vpath], 1234h
+    jne     mvt_fail
+    cmp     dword ptr [g_is_default], 71717171h
+    jne     mvt_fail
+    cmp     dword ptr [g_vault_lock], 82828282h
+    jne     mvt_fail
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+mvt_fail:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_mvtest endp
+
+; mvt_zero(rcx=ptr, edx=len) - zero a buffer (probe helper).  Leaf, volatile regs.
+mvt_zero proc
+    xor     r9d, r9d
+mvz_lp:
+    cmp     r9d, edx
+    jae     mvz_done
+    mov     byte ptr [rcx+r9], 0
+    inc     r9d
+    jmp     mvz_lp
+mvz_done:
+    ret
+mvt_zero endp
+
+; mv_plant(ecx = seed byte in cl) - stamp the live open-vault state with a value
+;   derived only from the seed, across a byte array, both big arrays' head+tail,
+;   and scalar qword/dword fields.  Leaf, volatile regs.  (probe helper)
+mv_plant proc
+    movzx   r8d, cl                         ; seed byte
+    lea     r10, [g_vkey]
+    xor     r9d, r9d
+mpl_vk:
+    cmp     r9d, 32
+    jae     mpl_vkd
+    mov     byte ptr [r10+r9], r8b
+    inc     r9d
+    jmp     mpl_vk
+mpl_vkd:
+    lea     r10, [g_newatt]
+    mov     byte ptr [r10], r8b
+    mov     byte ptr [r10 + MAX_ATT*32 - 1], r8b
+    lea     r10, [g_attidx]
+    mov     byte ptr [r10], r8b
+    mov     byte ptr [r10 + MAX_ATT*32 - 1], r8b
+    movzx   rax, cl                         ; replicate seed across all 8 bytes
+    mov     rdx, rax
+    shl     rdx, 8
+    or      rax, rdx
+    mov     rdx, rax
+    shl     rdx, 16
+    or      rax, rdx
+    mov     rdx, rax
+    shl     rdx, 32
+    or      rax, rdx
+    mov     qword ptr [g_body_ptr], rax
+    mov     qword ptr [g_save_counter], rax
+    mov     dword ptr [g_rollback], eax     ; low 32 bits = seed replicated 4x
+    mov     word ptr [g_vpath], r8w         ; file-identity fields (per-ctx)
+    mov     dword ptr [g_is_default], eax
+    ret
+mv_plant endp
+
+; mv_check(ecx = seed byte in cl) -> eax = 0 match / 1 mismatch.  Verifies every
+;   field mv_plant wrote still carries this seed.  Leaf, volatile regs.
+mv_check proc
+    movzx   r8d, cl
+    lea     r10, [g_vkey]
+    xor     r9d, r9d
+mck_vk:
+    cmp     r9d, 32
+    jae     mck_vkd
+    cmp     byte ptr [r10+r9], r8b
+    jne     mck_bad
+    inc     r9d
+    jmp     mck_vk
+mck_vkd:
+    lea     r10, [g_newatt]
+    cmp     byte ptr [r10], r8b
+    jne     mck_bad
+    cmp     byte ptr [r10 + MAX_ATT*32 - 1], r8b
+    jne     mck_bad
+    lea     r10, [g_attidx]
+    cmp     byte ptr [r10], r8b
+    jne     mck_bad
+    cmp     byte ptr [r10 + MAX_ATT*32 - 1], r8b
+    jne     mck_bad
+    movzx   rax, cl
+    mov     rdx, rax
+    shl     rdx, 8
+    or      rax, rdx
+    mov     rdx, rax
+    shl     rdx, 16
+    or      rax, rdx
+    mov     rdx, rax
+    shl     rdx, 32
+    or      rax, rdx
+    cmp     qword ptr [g_body_ptr], rax
+    jne     mck_bad
+    cmp     qword ptr [g_save_counter], rax
+    jne     mck_bad
+    cmp     dword ptr [g_rollback], eax
+    jne     mck_bad
+    cmp     word ptr [g_vpath], r8w
+    jne     mck_bad
+    cmp     dword ptr [g_is_default], eax
+    jne     mck_bad
+    xor     eax, eax
+    ret
+mck_bad:
+    mov     eax, 1
+    ret
+mv_check endp
+
+; cmd_mvswitch - headless proof of the multi-vault context manager.  Opens two
+;   vault contexts, plants a distinct seed in each, then fronts back and forth
+;   and verifies each front restores exactly that vault's state (no cross-vault
+;   bleed), plus that fronting an out-of-range index is rejected.  exit 0 = pass.
+LANDING_PAD
+public cmd_mvswitch
+cmd_mvswitch proc frame
+    FRAME_PROLOG 48
+    call    vault_ctx_reset
+    call    vault_ctx_open                  ; vault 0 (cur=0)
+    mov     ecx, 05Ah
+    call    mv_plant                        ; live = vault 0 state
+    call    vault_ctx_open                  ; saves vault 0 -> slot0; vault 1 (cur=1)
+    mov     ecx, 0B7h
+    call    mv_plant                        ; live = vault 1 state
+    xor     ecx, ecx                        ; front vault 0
+    call    vault_ctx_front
+    test    eax, eax
+    jnz     mvs_fail
+    mov     ecx, 05Ah
+    call    mv_check                        ; must see vault 0's seed
+    test    eax, eax
+    jnz     mvs_fail
+    mov     ecx, 1                          ; front vault 1
+    call    vault_ctx_front
+    test    eax, eax
+    jnz     mvs_fail
+    mov     ecx, 0B7h
+    call    mv_check                        ; must see vault 1's seed
+    test    eax, eax
+    jnz     mvs_fail
+    xor     ecx, ecx                        ; front vault 0 again
+    call    vault_ctx_front
+    test    eax, eax
+    jnz     mvs_fail
+    mov     ecx, 05Ah
+    call    mv_check
+    test    eax, eax
+    jnz     mvs_fail
+    mov     ecx, dword ptr [g_vault_n]      ; out-of-range front is rejected
+    call    vault_ctx_front
+    cmp     eax, 1
+    jne     mvs_fail
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+mvs_fail:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_mvswitch endp
+
+; cmd_avtest - headless proof of the availability retry state machine (item 9).
+;   Drives a single AVSLOT through the full unavailable->retry->give-up->manual-
+;   unlock->available lifecycle with fixed "now" values and asserts every
+;   transition (status, tries, next-deadline, due-ness).  exit 0 = pass.
+LANDING_PAD
+public cmd_avtest
+cmd_avtest proc frame
+    FRAME_PROLOG 48
+    ; begin at now=0 -> RETRY, tries 0, next 5000
+    lea     rcx, [g_avslot]
+    xor     edx, edx
+    call    vault_avail_begin
+    cmp     dword ptr [g_avslot + AVSLOT.av_status], AVSTAT_RETRY
+    jne     avt_fail
+    cmp     dword ptr [g_avslot + AVSLOT.av_tries], 0
+    jne     avt_fail
+    cmp     qword ptr [g_avslot + AVSLOT.av_next], 5000
+    jne     avt_fail
+    ; not due before the deadline, due at it
+    lea     rcx, [g_avslot]
+    mov     edx, 4999
+    call    vault_avail_due
+    test    eax, eax
+    jnz     avt_fail
+    lea     rcx, [g_avslot]
+    mov     edx, 5000
+    call    vault_avail_due
+    cmp     eax, 1
+    jne     avt_fail
+    ; first retry fails -> tries 1, next 10000, still RETRY
+    lea     rcx, [g_avslot]
+    mov     edx, 5000
+    call    vault_avail_fail
+    cmp     dword ptr [g_avslot + AVSLOT.av_tries], 1
+    jne     avt_fail
+    cmp     dword ptr [g_avslot + AVSLOT.av_status], AVSTAT_RETRY
+    jne     avt_fail
+    cmp     qword ptr [g_avslot + AVSLOT.av_next], 10000
+    jne     avt_fail
+    ; second retry fails -> tries 2, next 15000
+    lea     rcx, [g_avslot]
+    mov     edx, 10000
+    call    vault_avail_due
+    cmp     eax, 1
+    jne     avt_fail
+    lea     rcx, [g_avslot]
+    mov     edx, 10000
+    call    vault_avail_fail
+    cmp     dword ptr [g_avslot + AVSLOT.av_tries], 2
+    jne     avt_fail
+    cmp     qword ptr [g_avslot + AVSLOT.av_next], 15000
+    jne     avt_fail
+    ; third retry fails -> tries 3 -> GAVEUP, no longer due
+    lea     rcx, [g_avslot]
+    mov     edx, 15000
+    call    vault_avail_due
+    cmp     eax, 1
+    jne     avt_fail
+    lea     rcx, [g_avslot]
+    mov     edx, 15000
+    call    vault_avail_fail
+    cmp     dword ptr [g_avslot + AVSLOT.av_tries], 3
+    jne     avt_fail
+    cmp     dword ptr [g_avslot + AVSLOT.av_status], AVSTAT_GAVEUP
+    jne     avt_fail
+    lea     rcx, [g_avslot]
+    mov     edx, 20000
+    call    vault_avail_due
+    test    eax, eax
+    jnz     avt_fail
+    ; manual unlock -> RETRY, tries 0, due immediately
+    lea     rcx, [g_avslot]
+    mov     edx, 20000
+    call    vault_avail_unlock
+    cmp     dword ptr [g_avslot + AVSLOT.av_status], AVSTAT_RETRY
+    jne     avt_fail
+    cmp     dword ptr [g_avslot + AVSLOT.av_tries], 0
+    jne     avt_fail
+    cmp     qword ptr [g_avslot + AVSLOT.av_next], 20000
+    jne     avt_fail
+    lea     rcx, [g_avslot]
+    mov     edx, 20000
+    call    vault_avail_due
+    cmp     eax, 1
+    jne     avt_fail
+    ; success -> AVAIL, never due again
+    lea     rcx, [g_avslot]
+    call    vault_avail_ok
+    cmp     dword ptr [g_avslot + AVSLOT.av_status], AVSTAT_AVAIL
+    jne     avt_fail
+    lea     rcx, [g_avslot]
+    mov     edx, 99999
+    call    vault_avail_due
+    test    eax, eax
+    jnz     avt_fail
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+avt_fail:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_avtest endp
+
+; cmd_bktest <path> - headless proof of atomic save + backup rotation (plan 37).
 ; cmd_bktest <path> - headless proof of atomic save + backup rotation.
 ;   Creates the vault BAK_GENS+1 times at the same path (fast KDF); each save
 ;   after the first rolls the live file into .bak1..N.  Then it asserts every

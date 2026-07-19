@@ -34,6 +34,9 @@ rem   build nohw   link WITHOUT /CETCOMPAT (software mitigations only)
 rem   build dbg    add startup breadcrumb trace + per-primitive debug dumps,
 rem                the `redteam` fault-injection self-test, and FF-code-in-exit
 rem                (0xFADE<code>) for the security test harness (tests\run_all.cmd)
+rem   build guishow  debug-only: launch straight into the vault window (auto-open,
+rem                no secure desktop) instead of starting minimised to the tray, so
+rem                the GUI can be visually inspected.  NEVER ship this build.
 rem ---------------------------------------------------------------------------
 set GUARDFLAGS=/CETCOMPAT
 set ASMEXTRA=
@@ -43,6 +46,7 @@ set REPRO=0
 if "%1"=="" goto :doneargs
 if /i "%1"=="nohw" set GUARDFLAGS=
 if /i "%1"=="dbg" set ASMEXTRA=%ASMEXTRA% /DDBG_TRACE
+if /i "%1"=="guishow" set ASMEXTRA=%ASMEXTRA% /DDBG_SHOW
 if /i "%1"=="strict" set STRICT=1
 if /i "%1"=="release" set REPRO=1
 shift

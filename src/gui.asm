@@ -19,9 +19,13 @@
 ; =============================================================================
 
 include macros.inc
+include glyphs.inc
 
 ; ---- startup helpers ---------------------------------------------------------
 extern cpu_gate:proc
+extern SetWindowSubclass:proc
+extern DefSubclassProc:proc
+extern TrackMouseEvent:proc
 extern hardening_init:proc
 extern crash_install:proc               ; hardening.asm: arm crash containment
 externdef g_gui_active:dword            ; hardening.asm: gate the crash apology box
@@ -44,6 +48,14 @@ extern vault_reseal:proc
 extern vault_ext_changed:proc           ; vault.asm: on-disk file changed since load?
 extern vault_remove_at:proc
 extern vault_count:proc
+extern vault_ctx_reset:proc
+extern vault_ctx_open:proc
+extern vault_ctx_front:proc
+extern vault_ctx_setname:proc
+extern vault_ctx_nameptr:proc
+extern vault_ctx_close:proc
+externdef g_vault_n:dword
+externdef g_vault_cur:dword
 extern vault_title_at:proc
 extern vault_field_at:proc
 extern vault_entry_ptr:proc
@@ -172,6 +184,7 @@ extern GetDlgItem:proc
 extern GetFocus:proc
 extern CharUpperBuffW:proc
 extern SetFocus:proc
+extern GetParent:proc
 extern SetDlgItemInt:proc
 extern GetDlgItemInt:proc
 extern GetFileAttributesW:proc
@@ -181,8 +194,13 @@ extern WriteFile:proc
 extern FlushFileBuffers:proc
 extern CreateDirectoryW:proc
 extern ShowWindow:proc
+extern IsZoomed:proc
+extern EnumChildWindows:proc
+extern MonitorFromWindow:proc
+extern GetMonitorInfoW:proc
 extern MoveWindow:proc
 extern GetWindowRect:proc
+extern MapWindowPoints:proc
 extern ScreenToClient:proc
 extern SetWindowPos:proc
 extern DrawTextW:proc
@@ -195,6 +213,7 @@ extern CheckDlgButton:proc
 extern GetDlgCtrlID:proc
 extern GetKeyState:proc
 extern SetWindowLongPtrW:proc
+extern GetWindowLongPtrW:proc
 extern CallWindowProcW:proc
 extern LoadCursorW:proc
 extern SetCursor:proc
@@ -267,7 +286,29 @@ WM_TIMER            equ 113h
 WM_INITDIALOG       equ 110h
 WM_SETFONT          equ 30h
 WM_MOUSEWHEEL       equ 20Ah
+WM_MOUSEMOVE_       equ 200h
+WM_MOUSELEAVE_      equ 2A3h
+WM_CHAR_            equ 102h
+WM_KEYDOWN_         equ 100h
+VK_CONTROL_         equ 11h
+WM_SIZE_            equ 5
+WM_GETMINMAXINFO_   equ 24h
+; resize-anchor flags (gui_reflow)
+ANCH_STRETCHW       equ 1
+ANCH_STRETCHH       equ 2
+ANCH_RIGHT          equ 4
+ANCH_BOTTOM         equ 8
 WM_COMMAND          equ 111h
+; ghost buttons (frameless glyph controls: theme_drawitem tdi_ghost path)
+GHOST_STYLE_        equ 2               ; GWL_USERDATA style byte
+TME_LEAVE_          equ 2
+CW_USEDEFAULT_      equ 80000000h
+TTS_ALWAYSTIP_      equ 1
+TTS_NOPREFIX_       equ 2
+TTF_IDISHWND_       equ 1
+TTF_SUBCLASS_       equ 10h
+TTM_ADDTOOLW_       equ 432h            ; WM_USER+50
+TTM_SETMAXTIPW_     equ 418h            ; WM_USER+24
 WM_PAINT            equ 0Fh
 WM_SETCURSOR        equ 20h
 WM_ERASEBKGND       equ 14h
@@ -275,6 +316,33 @@ WM_DRAWITEM         equ 2Bh
 GWLP_WNDPROC        equ -4
 IDC_HAND            equ 32649
 HTCLIENT            equ 1
+; --- custom title-bar frame (redesign A1/A2/A3) -------------------------------
+WM_NCHITTEST_       equ 84h
+HTCAPTION           equ 2
+DWLP_MSGRESULT_     equ 0
+SW_MINIMIZE_        equ 6
+SW_MAXIMIZE_        equ 3
+SW_RESTORE_         equ 9
+SWP_FRAME_          equ 16h              ; SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE
+TBAR_H              equ 32               ; custom title-bar strip height (px)
+CAPBTN_W            equ 44               ; caption (min/max/close) button width
+IDC_T_MIN           equ 290             ; caption: minimize
+IDC_T_MAX           equ 291             ; caption: maximize / restore
+IDC_T_CLOSE         equ 292             ; caption: close
+IDC_T_NEW           equ 293             ; dock: new item
+IDC_T_GEN           equ 294             ; dock: password generator
+IDC_T_SET           equ 295             ; dock: settings
+IDC_T_SEARCH        equ 296             ; title-bar search pill
+IDC_SO_PANEL        equ 297             ; search overlay: framed backdrop
+IDC_SO_EDIT         equ 298             ; search overlay: query edit
+IDC_SO_LIST         equ 299             ; search overlay: owner-draw results list
+IDC_V_TABS          equ 300             ; multi-vault tab strip (owner-draw)
+TAB_W               equ 130             ; per-vault tab width (px)
+DOCKBTN_W           equ 34              ; title-bar dock button width
+SEARCHPILL_W        equ 200             ; title-bar search pill width
+SO_W                equ 360             ; search overlay width (px)
+SO_EDITH            equ 26              ; search overlay edit height (px)
+SO_LISTH            equ 300             ; search overlay results height (px)
 LINK_BLUE           equ 00E08C3Ch        ; COLORREF (RGB 60,140,224) hyperlink blue
 WM_MEASUREITEM      equ 2Ch
 WM_COMPAREITEM      equ 39h
@@ -332,6 +400,20 @@ LB_ADDSTRING        equ 180h
 LB_RESETCONTENT     equ 184h
 LB_INITSTORAGE      equ 1A8h            ; pre-allocate item storage for large lists
 LB_SETCURSEL        equ 186h
+LB_GETCURSEL        equ 188h
+LB_GETCOUNT         equ 18Bh
+LBN_DBLCLK          equ 2
+VK_RETURN_          equ 0Dh
+VK_ESCAPE_          equ 1Bh
+VK_UP_              equ 26h
+VK_DOWN_            equ 28h
+WM_GETDLGCODE_      equ 0087h
+DLGC_WANTALLKEYS_   equ 0004h
+LBS_NOTIFY_         equ 0001h
+LBS_SORT_           equ 0002h
+LBS_OWNERDRAWFIXED_ equ 0010h
+LBS_NOINTEGRALHEIGHT_ equ 0100h
+WS_VSCROLL_         equ 00200000h
 LB_GETCURSEL        equ 188h
 LB_GETITEMRECT      equ 198h            ; item bounding rect (recycle-glyph hit-test)
 GWL_USERDATA        equ -21             ; button accent tag (theme_drawitem primary)
@@ -582,6 +664,8 @@ IDC_V_TIMES  equ 236          ; created/modified timestamps line (below the last
 IDC_V_FAV    equ 237          ; header favorite (star) toggle
 IDC_V_CANCEL equ 238          ; "Cancel" button (edit mode, discards edits)
 IDC_V_DONE   equ 271          ; trash view: "Done" (exit recover mode); accent button
+IDC_V_GENERATE equ 273        ; sidebar dock: standalone password generator (retired: hidden, dock replaces)
+IDC_V_HDREDIT  equ 274        ; detail-header edit ghost button (D1 command dock; replaces sidebar "e")
 FIELD_AREA_BOTTOM equ 292        ; rows may not grow past here (DLU; Add-field is at 296)
 ; Win32 window styles (gui.asm builds controls at runtime; the RC gets these
 ; from windows.h, but this module needs the numeric values).
@@ -597,6 +681,21 @@ BS_OWNERDRAW_   equ 000Bh
 SS_OWNERDRAW_   equ 000Dh
 SS_LEFTNOWORDWRAP_ equ 000Ch
 WM_GETFONT      equ 31h
+
+; cross-vault search result (C4): a match with its display data cached, so it can
+; be painted without fronting its home vault.
+MAX_XR      equ 200
+XR struct
+    xr_vault    dd ?
+    xr_entry    dd ?
+    xr_glyph    dd ?
+    xr_color    dd ?
+    xr_score    dd ?
+    xr_pad      dd ?
+    xr_title    dw 64 dup(?)
+    xr_sub      dw 64 dup(?)
+    xr_vname    dw 32 dup(?)
+XR ends
 
 ; OPENFILENAMEW (x64 layout; STRUCT 8 gives the correct natural alignment)
 OPENFILENAMEW struct 8
@@ -656,7 +755,7 @@ WSTR g_create_title,   <Vordr - Set master password>
 WSTR s_createfail,  <Could not create the vault (I/O or out of memory).>
 WSTR s_notitle,     <An entry needs a title.>
 WSTR s_nofieldroom, <No room for more fields on this record - remove one first.>
-WSTR s_resealfail,  <Saved in memory but writing to disk failed.>
+WSTR s_resealfail,  <Unable to write to the vault file - it may be read-only or locked by another program. Your changes are kept in memory. Retry saving now?>
 WSTR t_overwrite,   <Vordr - vault already exists>
 WSTR m_overwrite,   <A vault file already exists at this location. Creating a new vault will PERMANENTLY destroy it and every entry it holds. Overwrite it?>
 WSTR s_kept,        <Existing vault kept. Cancel, or use "Create new..." to choose a different file.>
@@ -847,11 +946,7 @@ wb_copy label word
 wb_more label word
     dw 0E712h, 0                                 ; More (header overflow menu)
 wb_star label word
-    dw 0E734h, 0                                 ; FavoriteStar (outline = not favorite)
-wb_starf label word
-    dw 0E735h, 0                                 ; FavoriteStarFill (favorited)
-wb_recycle label word
-    dw 267Bh, 0                                  ; recycle ♻ (recover mode: restore)
+    dw 0E734h, 0                                 ; FavoriteStar (MSAA name for the fav button)
 fav_one label word
     dw '1', 0                                    ; VF_FAV marker value
 pht_lbl db 'Password'                            ; gui_phtest scratch (headless probe)
@@ -906,6 +1001,26 @@ cls_button label word
     dw 'B','u','t','t','o','n', 0
 cls_static label word
     dw 'S','t','a','t','i','c', 0
+cls_listbox label word
+    dw 'L','i','s','t','B','o','x', 0
+WSTR so_cue, <Search all entries...>
+w_empty     dw 0
+align 4
+g_so_ids    dd IDC_SO_PANEL, IDC_SO_EDIT, IDC_SO_LIST
+cls_tooltip label word
+    dw 't','o','o','l','t','i','p','s','_','c','l','a','s','s','3','2', 0
+WSTR gl_t_theme, <Theme / colour scheme>
+WSTR gt_more, <More>
+WSTR gt_fav, <Favorite>
+WSTR gt_new, <New item>
+WSTR gt_edit, <Edit entry>
+WSTR gt_rem, <Delete entry>
+WSTR gt_gen, <Generate password>
+WSTR gt_min, <Minimize>
+WSTR gt_max, <Maximize>
+WSTR gt_close, <Close>
+WSTR gt_settings, <Settings>
+WSTR wb_search_txt, <Search vault  (Ctrl+K)>
 kl_user label word
     dw 'U','s','e','r','n','a','m','e', 0
 kl_secret label word
@@ -924,6 +1039,66 @@ kl_image label word
     dw 'I','m','a','g','e', 0
 kl_file label word
     dw 'F','i','l','e', 0
+kl_group label word
+    dw 'G','r','o','u','p',' ','h','e','a','d','i','n','g', 0
+kl_spacer label word
+    dw 'S','p','a','c','e','r', 0
+; --- new-entry templates (redesign D4): a pre-built field list per preset ------
+WSTR tm_login,  <Login>
+WSTR tm_card,   <Credit card>
+WSTR tm_ident,  <Identity>
+WSTR tm_note,   <Secure note>
+WSTR tm_blank,  <Blank>
+WSTR lbl_holder,   <Cardholder>
+WSTR lbl_cardno,   <Card number>
+WSTR lbl_expiry,   <Expiry>
+WSTR lbl_cvv,      <CVV>
+WSTR lbl_fullname, <Full name>
+WSTR lbl_phone,    <Phone>
+align 8
+tmpl_login label qword                          ; {count; count x (type, label)} after Title
+    dq 4
+    dq VF_USERNAME, 0
+    dq VF_SECRET, 0
+    dq VF_URL, 0
+    dq VF_NOTES, 0
+tmpl_card label qword
+    dq 5
+    dq VF_TEXT, lbl_holder
+    dq VF_TEXT, lbl_cardno
+    dq VF_TEXT, lbl_expiry
+    dq VF_SECRET, lbl_cvv
+    dq VF_NOTES, 0
+tmpl_ident label qword
+    dq 4
+    dq VF_TEXT, lbl_fullname
+    dq VF_TEXT, kl_email
+    dq VF_TEXT, lbl_phone
+    dq VF_NOTES, 0
+tmpl_note label qword
+    dq 1
+    dq VF_NOTES, 0
+tmpl_blank label qword
+    dq 0                                         ; Title only
+tmpl_table label qword
+    dq tmpl_login, tmpl_card, tmpl_ident, tmpl_note, tmpl_blank
+; resize anchors (redesign 1.3): {control id, anchor flags} for gui_reflow
+g_anchor_def label dword
+    dd IDC_V_MBACK,    ANCH_STRETCHW or ANCH_STRETCHH
+    dd IDC_V_LIST,     ANCH_STRETCHH
+    dd IDC_V_SEARCH,   ANCH_BOTTOM
+    dd IDC_V_REMOVE,   ANCH_BOTTOM
+    dd IDC_V_HEADER,   ANCH_STRETCHW
+    dd IDC_V_TITLE,    ANCH_STRETCHW
+    dd IDC_V_TIMES,    ANCH_STRETCHW
+    dd IDC_V_HDREDIT,  ANCH_RIGHT
+    dd IDC_V_FAV,      ANCH_RIGHT
+    dd IDC_V_OVFL,     ANCH_RIGHT
+    dd IDC_V_ADDFIELD, ANCH_BOTTOM
+    dd IDC_V_CANCEL,   ANCH_RIGHT or ANCH_BOTTOM
+    dd IDC_V_SAVE,     ANCH_RIGHT or ANCH_BOTTOM
+    dd IDC_V_LOCK,     ANCH_RIGHT or ANCH_BOTTOM
+ANCHOR_N equ 14
 tag_xw label word
     dw 0D7h, 0                             ; multiplication sign, used as the tag 'x'
 verb_open label word
@@ -1032,9 +1207,9 @@ g_empty_w label word
 ; control-id groups toggled when the settings overlay opens/closes
 align 4
 g_vault_ids label dword
-    dd IDC_V_LIST, IDC_V_ADD, IDC_V_EDIT, IDC_V_REMOVE, IDC_V_TITLE
+    dd IDC_V_LIST, IDC_V_TITLE
     dd IDC_V_ADDFIELD, IDC_V_SAVE, IDC_V_LOCK, IDC_V_SEARCH
-VAULT_ID_COUNT equ 9
+VAULT_ID_COUNT equ 6
 g_menu_ids label dword ; controls menu IDs which are hidden and displayed between settings and main screen.
     dd IDC_V_MBACK, IDC_V_MTITLE, IDC_V_MPOLL, IDC_V_MLENL, IDC_V_MLEN
     dd IDC_V_MCLSL, IDC_V_MCLS, IDC_V_MTPM, IDC_V_MTPML, IDC_V_MTPMINFO
@@ -1096,6 +1271,7 @@ g_reqbuf    dw 768 dup (?)            ; formatted password-requirements callout 
 g_numtmp    db 16 dup (?)             ; scratch for uint-to-decimal
 g_vault_lock dd ?                     ; 1 = vault path set by HKLM (locked)
 g_menu_open  dd ?                     ; 1 = settings overlay is showing
+g_so_open    dd ?                     ; 1 = title-bar search overlay is showing
 g_revealed  dd ?
 g_clip_seq  dd ?                      ; clipboard sequence number at last copy
 g_clip_secs dd ?                      ; auto-clear timeout in seconds (0 = off); HKLM>HKCU>20
@@ -1123,6 +1299,7 @@ g_match_w   dw EBUF*2 dup (?)         ; scratch: a field value/label folded for 
 align 4
 g_search_len dd ?                     ; active query length in chars (0 = no query -> title sort)
 g_entry_score dd SCORE_CAP dup (?)    ; fuzzy score per vault index (for score-descending sort)
+public g_vpath, g_is_default, g_vault_lock  ; multi-vault: snapshotted per ctx (vault.asm)
 g_vpath     dw 1024 dup (?)        ; chosen vault path (wide, NUL-terminated)
 g_xlpw      dw 256 dup (?)         ; export password (wide; wiped after use)
 g_xlpw2     dw 256 dup (?)         ; export confirm password (wide; wiped)
@@ -1175,6 +1352,7 @@ g_rowpw_w     dw 512 dup (?)               ; revealed secret text for the color 
 g_wordtmp     dw 32 dup (?)                ; one resolved phonetic word (scratch)
 g_content_h   dd ?                        ; field-form content bottom (DLU) after layout
 g_dlgfont     dq ?                        ; the vault dialog's font (for runtime ctls)
+g_tooltip     dq ?                        ; shared tooltip window for ghost buttons (0 = none)
 g_totp_row    dd ?                        ; row index of the TOTP field (-1 = none)
 g_totp_codehwnd dq ?                      ; live-code display control of the TOTP row
 g_totp_barhwnd  dq ?                      ; drain-bar control of the TOTP row
@@ -1189,6 +1367,9 @@ g_monofont    dq ?                         ; monospace font for the colored pass
 g_phonfont    dq ?                         ; small monospace font for the phonetic columns
 g_symfont     dq ?                         ; Segoe UI Symbol - the recycle glyph in recover mode
 g_sub_w       dw 512 dup (?)               ; subtitle scratch (wide)
+g_xr          db (sizeof XR)*MAX_XR dup(?) ; cross-vault search results (cached display data)
+g_xr_n        dd ?                          ; number of cross-vault results
+g_xr_active   dd ?                          ; 1 = overlay list is showing cross-vault results
 g_cmpbuf      db 256 dup (?)               ; title-A copy for WM_COMPAREITEM
 g_imp_msgw    dw 160 dup (?)               ; import result message scratch (wide)
 g_pg_len      dd ?                         ; password-generator: length
@@ -1243,6 +1424,12 @@ g_imgpath     dw 1024 dup (?)             ; import/export file path (wide)
 g_valblob   dw 32768 dup (?)          ; commit scratch: field values, NUL-joined
 g_lblblob   dw 4096 dup (?)           ; commit scratch: custom labels, NUL-joined
 g_rlabel    dw 128 dup (?)            ; per-row label read scratch
+g_grouptxt  dw 128 dup (?)            ; group-heading title read scratch (paint)
+g_base_cx   dd ?                      ; vault client size recorded at init (resize anchors)
+g_base_cy   dd ?
+g_base_winw dd ?                      ; vault window size recorded at init (min-track size)
+g_base_winh dd ?
+g_anchor_rect dd ANCHOR_N*4 dup (?)   ; per-control initial client {x,y,w,h}
 g_extw      dw 20 dup (?)             ; scratch: an attachment's extension, lowercased
 align 8
 g_ofn       OPENFILENAMEW <>
@@ -1582,6 +1769,11 @@ up_init:
     call    theme_attach
     mov     rcx, qword ptr [rbp-8]
     call    gui_set_winicon
+    mov     rcx, qword ptr [rbp-8]              ; ghost-button foundation demo (top-left glyph)
+    mov     edx, 990
+    mov     r8d, GLY_SETTINGS
+    lea     r9, [gl_t_theme]
+    call    ghost_make
     ; cue-banner label shown inside the (borderless) password box
     sub     rsp, 48
     mov     rcx, qword ptr [rbp-8]
@@ -1615,9 +1807,25 @@ up_cmd:
     je      up_unlock
     cmp     eax, IDC_U_PATH                 ; click the storage location -> browse
     je      up_pickvault
+    cmp     eax, 990                        ; ghost theme button -> cycle colour scheme
+    je      up_cyclescheme
     cmp     eax, IDCANCEL
     je      up_cancel
     xor     eax, eax
+    jmp     up_ret
+up_cyclescheme:
+    cmp     dword ptr [g_scheme_lock], 0    ; respect an HKLM-forced scheme
+    jne     up_cs_done
+    mov     eax, dword ptr [g_scheme]
+    inc     eax
+    cmp     eax, 9                          ; SCHEME_COUNT (theme.asm)
+    jb      @F
+    xor     eax, eax
+@@: mov     dword ptr [g_scheme], eax
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_apply_scheme
+up_cs_done:
+    mov     eax, 1
     jmp     up_ret
 up_pickvault:
     mov     rcx, qword ptr [rbp-8]
@@ -1655,17 +1863,32 @@ unlock_proc endp
 ; gui_poplist(rcx = hdlg) - clear and repopulate the entry list from the vault.
 ; =============================================================================
 gui_poplist proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_V_LIST
+    mov     r8d, IDC_V_SEARCH
+    call    poplist_into
+    FRAME_EPILOG
+    ret
+gui_poplist endp
+
+; poplist_into(rcx=hdlg, edx=listId, r8d=queryEditId) - clear & fuzzy-fill an
+;   owner-draw entry list from the vault, reading the query from queryEditId.
+;   Backs both the sidebar (IDC_V_LIST/IDC_V_SEARCH) and the search overlay.
+poplist_into proc frame
     FRAME_PROLOG 96
     mov     qword ptr [rbp-24], rcx
-    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_RESETCONTENT, 0, 0
-    ; read the search query and upper-case it for case-insensitive matching
-    WINCALL GetDlgItemTextW, qword ptr [rbp-24], IDC_V_SEARCH, addr g_search_w, 255
+    mov     dword ptr [rbp-64], edx              ; listId
+    mov     dword ptr [rbp-68], r8d              ; queryId
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], dword ptr [rbp-64], LB_RESETCONTENT, 0, 0
+    WINCALL GetDlgItemTextW, qword ptr [rbp-24], dword ptr [rbp-68], addr g_search_w, 255
     mov     dword ptr [rbp-56], eax              ; query length (chars)
     mov     dword ptr [g_search_len], eax        ; publish for the score-aware sort
     test    eax, eax
-    jz      gp_nofold
+    jz      pi_nofold
     WINCALL CharUpperBuffW, addr g_search_w, dword ptr [rbp-56]
-gp_nofold:
+pi_nofold:
     call    vault_count
     mov     dword ptr [rbp-32], eax              ; count
     ; pre-allocate the listbox's internal item storage so a 5000-entry bulk fill
@@ -1673,43 +1896,39 @@ gp_nofold:
     ; owner-draw listbox already virtualizes painting; this just speeds the load.
     mov     r10d, eax
     imul    r10d, r10d, 8                        ; ~8 bytes of storage per item
-    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_INITSTORAGE, \
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], dword ptr [rbp-64], LB_INITSTORAGE, \
             dword ptr [rbp-32], r10
     mov     dword ptr [rbp-40], 0               ; index
-gp_loop:
+pi_loop:
     mov     eax, dword ptr [rbp-40]
     cmp     eax, dword ptr [rbp-32]
-    jae     gp_done
+    jae     pi_done
     mov     ecx, dword ptr [rbp-40]             ; trash filter: show deleted iff in trash view
     call    gui_entry_is_deleted
     cmp     eax, dword ptr [g_trash_view]
-    jne     gp_next
+    jne     pi_next
     cmp     dword ptr [rbp-56], 0               ; empty query -> show everything
-    je      gp_show
+    je      pi_show
     mov     ecx, dword ptr [rbp-40]
     call    gui_entry_fuzzy                      ; eax = best fuzzy score, or -1
     mov     r10d, dword ptr [rbp-40]             ; cache the score for the sort (idx<CAP)
     cmp     r10d, SCORE_CAP
-    jae     gp_scored
+    jae     pi_scored
     lea     r11, [g_entry_score]
     mov     dword ptr [r11+r10*4], eax
-gp_scored:
+pi_scored:
     test    eax, eax                             ; -1 = no match -> skip
-    js      gp_next
-gp_show:
-    ; owner-draw list: the item data IS the vault index; WM_COMPAREITEM sorts by
-    ; title, WM_DRAWITEM renders the icon card.  Pass the index as a DWORD so the
-    ; 64-bit LPARAM is zero-extended (the slot is a dword; a qword read would take
-    ; the uninitialized 4 bytes above it into the stored item data).
-    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_ADDSTRING, 0, \
+    js      pi_next
+pi_show:
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], dword ptr [rbp-64], LB_ADDSTRING, 0, \
             dword ptr [rbp-40]
-gp_next:
+pi_next:
     inc     dword ptr [rbp-40]
-    jmp     gp_loop
-gp_done:
+    jmp     pi_loop
+pi_done:
     FRAME_EPILOG
     ret
-gui_poplist endp
+poplist_into endp
 
 ; =============================================================================
 ; Owner-draw entry list: icon-tile cards (glyph + title + subtitle)
@@ -2950,11 +3169,19 @@ gui_draw_field_cards proc frame
     je      gfc_ret
     WINCALL CreateSolidBrush, dword ptr [g_col_panel]   ; card fill (active scheme)
     mov     qword ptr [rbp-40], rax
+    WINCALL CreateSolidBrush, dword ptr [g_col_frame]   ; group-heading rule colour
+    mov     qword ptr [rbp-96], rax
     WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-40]
     mov     qword ptr [rbp-48], rax            ; old brush
     WINCALL GetStockObject, 8                  ; NULL_PEN
     WINCALL SelectObject, qword ptr [rbp-24], rax
     mov     qword ptr [rbp-56], rax            ; old pen
+    WINCALL GetClientRect, qword ptr [rbp-32], addr rbp-160   ; elastic: widen cards by dW
+    mov     eax, dword ptr [rbp-152]           ; client right = width (left is 0)
+    sub     eax, dword ptr [g_base_cx]         ; dW = width - base (matches gui_stretch_rows)
+    jns     @F
+    xor     eax, eax                           ; narrower than base -> no stretch
+@@: mov     dword ptr [rbp-112], eax           ; dW (pixels, >= 0)
     mov     dword ptr [rbp-64], 0              ; row i
 gfc_lp:
     mov     eax, dword ptr [rbp-64]
@@ -2963,6 +3190,11 @@ gfc_lp:
     imul    eax, eax, DESCSZ
     lea     r10, [g_fields]
     add     r10, rax
+    mov     ecx, dword ptr [r10+FD_KIND]       ; layout blocks (heading / gap) get no card
+    cmp     ecx, VF_GROUP
+    je      gfc_group
+    cmp     ecx, VF_SPACER
+    je      gfc_next
     mov     eax, dword ptr [r10+FD_Y]
     mov     dword ptr [rbp-84], eax            ; T
     add     eax, dword ptr [r10+FD_H]
@@ -2970,18 +3202,231 @@ gfc_lp:
     mov     dword ptr [rbp-88], 214            ; L (156 + VDX_DLU)
     mov     dword ptr [rbp-80], 472            ; R (414 + VDX_DLU)
     WINCALL MapDialogRect, qword ptr [rbp-32], addr rbp-88
+    mov     eax, dword ptr [rbp-112]           ; stretch the card to the widened pane
+    add     dword ptr [rbp-80], eax
     WINCALL RoundRect, qword ptr [rbp-24], dword ptr [rbp-88], dword ptr [rbp-84], \
             dword ptr [rbp-80], dword ptr [rbp-76], 10, 10
+    jmp     gfc_next
+gfc_group:
+    ; section heading: in view mode paint the title as dim text + a hairline rule
+    ; along the baseline (edit mode shows the title edit instead, rule only)
+    mov     eax, dword ptr [r10+FD_Y]
+    mov     dword ptr [rbp-100], eax           ; row top
+    add     eax, dword ptr [r10+FD_H]
+    mov     dword ptr [rbp-104], eax           ; row bottom
+    cmp     dword ptr [g_editmode], 0
+    jne     gfc_grp_rule
+    mov     ecx, dword ptr [rbp-64]            ; the heading's title control
+    mov     edx, DS_VALUE
+    call    dynid
+    WINCALL GetDlgItemTextW, qword ptr [rbp-32], eax, addr g_grouptxt, 128
+    WINCALL SetBkMode, qword ptr [rbp-24], 1   ; TRANSPARENT
+    WINCALL SetTextColor, qword ptr [rbp-24], dword ptr [g_col_textdim]
+    mov     eax, dword ptr [rbp-100]
+    mov     dword ptr [rbp-84], eax            ; T
+    add     eax, 12
+    mov     dword ptr [rbp-76], eax            ; B
+    mov     dword ptr [rbp-88], 176            ; L
+    mov     dword ptr [rbp-80], 460            ; R
+    WINCALL MapDialogRect, qword ptr [rbp-32], addr rbp-88
+    mov     eax, dword ptr [rbp-112]           ; stretch heading text room to the widened pane
+    add     dword ptr [rbp-80], eax
+    WINCALL DrawTextW, qword ptr [rbp-24], addr g_grouptxt, -1, addr rbp-88, DT_NAMEFLAGS
+gfc_grp_rule:
+    mov     eax, dword ptr [rbp-104]
+    mov     dword ptr [rbp-76], eax            ; B = row bottom
+    sub     eax, 1
+    mov     dword ptr [rbp-84], eax            ; T = 1 DLU rule
+    mov     dword ptr [rbp-88], 176            ; L
+    mov     dword ptr [rbp-80], 460            ; R
+    WINCALL MapDialogRect, qword ptr [rbp-32], addr rbp-88
+    mov     eax, dword ptr [rbp-112]           ; stretch the hairline rule to the widened pane
+    add     dword ptr [rbp-80], eax
+    WINCALL FillRect, qword ptr [rbp-24], addr rbp-88, qword ptr [rbp-96]
+gfc_next:
     inc     dword ptr [rbp-64]
     jmp     gfc_lp
 gfc_done:
     WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-48]   ; restore brush
     WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-56]   ; restore pen
     WINCALL DeleteObject, qword ptr [rbp-40]
+    WINCALL DeleteObject, qword ptr [rbp-96]                       ; group-rule brush
 gfc_ret:
     FRAME_EPILOG
     ret
 gui_draw_field_cards endp
+
+; gui_anchor_init(rcx=hdlg) - record the vault client + window size and each
+;   anchored control's initial client rect, so gui_reflow can resize responsively
+;   (redesign 1.3).  Called once from vp_init after the layout is settled.
+gui_anchor_init proc frame
+    FRAME_PROLOG 144
+    mov     qword ptr [rbp-24], rcx
+    WINCALL GetClientRect, qword ptr [rbp-24], addr rbp-48
+    mov     eax, dword ptr [rbp-40]           ; right = client width
+    mov     dword ptr [g_base_cx], eax
+    mov     eax, dword ptr [rbp-36]           ; bottom = client height
+    mov     dword ptr [g_base_cy], eax
+    WINCALL GetWindowRect, qword ptr [rbp-24], addr rbp-48
+    mov     eax, dword ptr [rbp-40]
+    sub     eax, dword ptr [rbp-48]
+    mov     dword ptr [g_base_winw], eax
+    mov     eax, dword ptr [rbp-36]
+    sub     eax, dword ptr [rbp-44]
+    mov     dword ptr [g_base_winh], eax
+    mov     dword ptr [rbp-52], 0             ; i
+gai_lp:
+    mov     eax, dword ptr [rbp-52]
+    cmp     eax, ANCHOR_N
+    jae     gai_done
+    imul    eax, eax, 8
+    lea     r10, [g_anchor_def]
+    mov     eax, dword ptr [r10+rax]          ; id
+    mov     dword ptr [rbp-56], eax
+    WINCALL GetDlgItem, qword ptr [rbp-24], dword ptr [rbp-56]
+    mov     qword ptr [rbp-64], rax
+    test    rax, rax
+    jz      gai_next
+    WINCALL GetWindowRect, qword ptr [rbp-64], addr rbp-96
+    WINCALL MapWindowPoints, 0, qword ptr [rbp-24], addr rbp-96, 2
+    mov     eax, dword ptr [rbp-52]
+    imul    eax, eax, 16
+    lea     r11, [g_anchor_rect]
+    add     r11, rax
+    mov     eax, dword ptr [rbp-96]           ; L -> x
+    mov     dword ptr [r11+0], eax
+    mov     eax, dword ptr [rbp-92]           ; T -> y
+    mov     dword ptr [r11+4], eax
+    mov     eax, dword ptr [rbp-88]           ; R - L -> w
+    sub     eax, dword ptr [rbp-96]
+    mov     dword ptr [r11+8], eax
+    mov     eax, dword ptr [rbp-84]           ; B - T -> h
+    sub     eax, dword ptr [rbp-92]
+    mov     dword ptr [r11+12], eax
+gai_next:
+    inc     dword ptr [rbp-52]
+    jmp     gai_lp
+gai_done:
+    FRAME_EPILOG
+    ret
+gui_anchor_init endp
+
+; gui_reflow(rcx=hdlg) - reposition anchored controls for the current client size
+;   (WM_SIZE).  Each control moves/stretches by the delta from the recorded base
+;   size per its anchor flags.  The detail rows keep their own (fixed) layout.
+gui_reflow proc frame
+    FRAME_PROLOG 144
+    mov     qword ptr [rbp-24], rcx
+    cmp     dword ptr [g_base_cx], 0          ; not recorded yet -> nothing to do
+    je      grf_done
+    WINCALL GetClientRect, qword ptr [rbp-24], addr rbp-48
+    mov     eax, dword ptr [rbp-40]
+    sub     eax, dword ptr [g_base_cx]
+    mov     dword ptr [rbp-52], eax           ; dW
+    mov     eax, dword ptr [rbp-36]
+    sub     eax, dword ptr [g_base_cy]
+    mov     dword ptr [rbp-56], eax           ; dH
+    mov     dword ptr [rbp-60], 0             ; i
+grf_lp:
+    mov     eax, dword ptr [rbp-60]
+    cmp     eax, ANCHOR_N
+    jae     grf_done
+    imul    eax, eax, 8
+    lea     r10, [g_anchor_def]
+    mov     ecx, dword ptr [r10+rax]          ; id
+    mov     dword ptr [rbp-64], ecx
+    mov     edx, dword ptr [r10+rax+4]        ; flags
+    mov     dword ptr [rbp-68], edx
+    mov     eax, dword ptr [rbp-60]
+    imul    eax, eax, 16
+    lea     r11, [g_anchor_rect]
+    add     r11, rax
+    mov     eax, dword ptr [r11+0]            ; nx = x (+dW if RIGHT)
+    test    dword ptr [rbp-68], ANCH_RIGHT
+    jz      @F
+    add     eax, dword ptr [rbp-52]
+@@: mov     dword ptr [rbp-72], eax
+    mov     eax, dword ptr [r11+4]            ; ny = y (+dH if BOTTOM)
+    test    dword ptr [rbp-68], ANCH_BOTTOM
+    jz      @F
+    add     eax, dword ptr [rbp-56]
+@@: mov     dword ptr [rbp-76], eax
+    mov     eax, dword ptr [r11+8]            ; nw = w (+dW if STRETCHW)
+    test    dword ptr [rbp-68], ANCH_STRETCHW
+    jz      @F
+    add     eax, dword ptr [rbp-52]
+@@: mov     dword ptr [rbp-80], eax
+    mov     eax, dword ptr [r11+12]           ; nh = h (+dH if STRETCHH)
+    test    dword ptr [rbp-68], ANCH_STRETCHH
+    jz      @F
+    add     eax, dword ptr [rbp-56]
+@@: mov     dword ptr [rbp-84], eax
+    WINCALL GetDlgItem, qword ptr [rbp-24], dword ptr [rbp-64]
+    test    rax, rax
+    jz      grf_next
+    WINCALL MoveWindow, rax, dword ptr [rbp-72], dword ptr [rbp-76], \
+            dword ptr [rbp-80], dword ptr [rbp-84], 1
+grf_next:
+    inc     dword ptr [rbp-60]
+    jmp     grf_lp
+grf_done:
+    mov     rcx, qword ptr [rbp-24]           ; also stretch the detail value columns
+    call    gui_stretch_rows
+    WINCALL InvalidateRect, qword ptr [rbp-24], 0, 1   ; repaint the field cards at the new width
+    FRAME_EPILOG
+    ret
+gui_reflow endp
+
+; gui_stretch_rows(rcx=hdlg) - widen each field row's value control by the window's
+;   horizontal growth from the base size, so the modular detail pane's fields grow
+;   with the window (redesign responsive detail pane).  Called from gui_reflow and
+;   at the end of gui_rows_layout so it survives a relayout.
+gui_stretch_rows proc frame
+    FRAME_PROLOG 144
+    mov     qword ptr [rbp-24], rcx
+    cmp     dword ptr [g_base_cx], 0
+    je      gsr_done
+    WINCALL GetClientRect, qword ptr [rbp-24], addr rbp-48
+    mov     eax, dword ptr [rbp-40]
+    sub     eax, dword ptr [g_base_cx]
+    mov     dword ptr [rbp-52], eax           ; dW
+    cmp     eax, 0
+    jle     gsr_done                          ; narrower/equal -> keep the base widths
+    mov     dword ptr [rbp-56], 0             ; row i
+gsr_lp:
+    mov     eax, dword ptr [rbp-56]
+    cmp     eax, dword ptr [g_field_count]
+    jae     gsr_done
+    mov     ecx, eax
+    mov     edx, DS_VALUE
+    call    dynid
+    mov     dword ptr [rbp-60], eax
+    WINCALL GetDlgItem, qword ptr [rbp-24], dword ptr [rbp-60]
+    mov     qword ptr [rbp-64], rax
+    test    rax, rax
+    jz      gsr_next
+    WINCALL GetWindowRect, qword ptr [rbp-64], addr rbp-96
+    WINCALL MapWindowPoints, 0, qword ptr [rbp-24], addr rbp-96, 2
+    mov     eax, dword ptr [rbp-96]           ; nx = L
+    mov     dword ptr [rbp-68], eax
+    mov     eax, dword ptr [rbp-92]           ; ny = T
+    mov     dword ptr [rbp-72], eax
+    mov     eax, dword ptr [rbp-88]           ; nw = (R - L) + dW
+    sub     eax, dword ptr [rbp-96]
+    add     eax, dword ptr [rbp-52]
+    mov     dword ptr [rbp-76], eax
+    mov     eax, dword ptr [rbp-84]           ; nh = B - T
+    sub     eax, dword ptr [rbp-92]
+    mov     dword ptr [rbp-80], eax
+    WINCALL MoveWindow, qword ptr [rbp-64], dword ptr [rbp-68], dword ptr [rbp-72], \
+            dword ptr [rbp-76], dword ptr [rbp-80], 1
+gsr_next:
+    inc     dword ptr [rbp-56]
+    jmp     gsr_lp
+gsr_done:
+    FRAME_EPILOG
+    ret
+gui_stretch_rows endp
 
 ; gui_draw_flatchevron(rcx=lpdis) - draw a reorder chevron as a bare dim glyph on
 ;   the dialog bg (no button chrome).  Up for DS_UP, down otherwise.
@@ -4333,6 +4778,7 @@ gco_nocarry:
     call    vault_build_entry
     test    eax, eax
     jnz     gco_done
+gco_reseal:
     call    vault_reseal
     test    eax, eax
     jnz     gco_resealerr
@@ -4352,7 +4798,10 @@ gco_notitle:
     FRAME_EPILOG
     ret
 gco_resealerr:
-    WINCALL gui_msgbox, qword ptr [rbp-24], addr s_resealfail, addr t_err, <MB_OK or MB_ICONERROR>
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr s_resealfail, addr t_err, \
+            <MB_YESNO or MB_ICONWARNING>
+    cmp     eax, IDYES                          ; Yes -> retry the write (file may be unlocked now)
+    je      gco_reseal
 gco_done:
     mov     dword ptr [g_dirty], 0
     FRAME_EPILOG
@@ -4452,6 +4901,15 @@ sem_addcmd:
     call    ShowWindow
     mov     rcx, qword ptr [rbp-24]           ; favorite star shares the header visibility
     mov     edx, IDC_V_FAV
+    call    GetDlgItem
+    mov     qword ptr [rbp-72], rax
+    mov     eax, dword ptr [rbp-52]
+    xor     eax, SW_SHOW
+    mov     rcx, qword ptr [rbp-72]
+    mov     edx, eax
+    call    ShowWindow
+    mov     rcx, qword ptr [rbp-24]           ; header edit ghost shares the view-mode visibility
+    mov     edx, IDC_V_HDREDIT
     call    GetDlgItem
     mov     qword ptr [rbp-72], rax
     mov     eax, dword ptr [rbp-52]
@@ -4572,6 +5030,287 @@ row_mk proc frame
     FRAME_EPILOG
     ret
 row_mk endp
+
+; =============================================================================
+; Ghost buttons - frameless glyph-only controls (see docs/REDESIGN_PLAN.md 1.2).
+; Rendered by theme_drawitem's tdi_ghost path: bare Fluent/Symbol glyph, a subtle
+; rounded hover halo, and a tooltip.  Window text stays a readable name (MSAA);
+; the glyph + hover state ride in GWL_USERDATA (glyph<<16 | hover<<8 | style 2).
+; =============================================================================
+
+; ghost_attach(rcx=parent, rdx=button hwnd, r8d=glyph, r9=name/tooltip wstr).
+;   Turn an already-created BS_OWNERDRAW button into a ghost button: set the
+;   userdata glyph+style, install the hover subclass, and register a tooltip.
+;   Used both by ghost_make and to convert existing (RC) toolbar buttons.
+ghost_attach proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx             ; parent
+    mov     qword ptr [rbp-32], rdx             ; button hwnd
+    mov     dword ptr [rbp-40], r8d             ; glyph
+    mov     qword ptr [rbp-48], r9              ; name/tip
+    mov     eax, dword ptr [rbp-40]             ; userdata = glyph<<16 | GHOST_STYLE
+    shl     eax, 16
+    or      eax, GHOST_STYLE_
+    mov     edx, eax                            ; zero-extends into rdx
+    WINCALL SetWindowLongPtrW, qword ptr [rbp-32], GWL_USERDATA, rdx
+    WINCALL SetWindowSubclass, qword ptr [rbp-32], addr ghost_subclass, 0, 0
+    mov     rcx, qword ptr [rbp-48]             ; register a tooltip if a name was given
+    test    rcx, rcx
+    jz      ga_done
+    mov     rcx, qword ptr [rbp-24]
+    mov     rdx, qword ptr [rbp-32]
+    mov     r8, qword ptr [rbp-48]
+    call    ghost_tip_add
+ga_done:
+    FRAME_EPILOG
+    ret
+ghost_attach endp
+
+; ghost_set_glyph(rcx=hdlg, edx=ctlid, r8d=glyph) - change a ghost button's glyph
+;   (bits 16-31 of userdata), preserving its hover/style bits, and repaint.
+ghost_set_glyph proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-28], edx
+    mov     dword ptr [rbp-32], r8d
+    WINCALL GetDlgItem, qword ptr [rbp-24], dword ptr [rbp-28]
+    mov     qword ptr [rbp-40], rax
+    test    rax, rax
+    jz      gsg_done
+    WINCALL GetWindowLongPtrW, qword ptr [rbp-40], GWL_USERDATA
+    and     eax, 0FFFFh                         ; keep hover+style, clear glyph
+    mov     edx, dword ptr [rbp-32]
+    shl     edx, 16
+    or      eax, edx                            ; new glyph in bits 16-31
+    mov     edx, eax
+    WINCALL SetWindowLongPtrW, qword ptr [rbp-40], GWL_USERDATA, rdx
+    WINCALL InvalidateRect, qword ptr [rbp-40], 0, 1
+gsg_done:
+    FRAME_EPILOG
+    ret
+ghost_set_glyph endp
+
+; ghost_make(rcx=hdlg, edx=id, r8d=glyph, r9=name/tooltip wstr) -> rax=hwnd.
+;   Placeholder geometry; the layout pass positions it.
+ghost_make proc frame
+    FRAME_PROLOG 128                            ; room for the 9-arg mk_ctl WINCALL spill
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-28], edx
+    mov     dword ptr [rbp-32], r8d
+    mov     qword ptr [rbp-40], r9
+    WINCALL mk_ctl, qword ptr [rbp-24], dword ptr [rbp-28], addr cls_button, \
+            qword ptr [rbp-40], BS_OWNERDRAW_ or WS_TABSTOP_, 0, 0, 16, 14
+    mov     qword ptr [rbp-48], rax             ; hwnd
+    mov     rcx, qword ptr [rbp-24]             ; parent
+    mov     rdx, qword ptr [rbp-48]             ; button
+    mov     r8d, dword ptr [rbp-32]             ; glyph
+    mov     r9, qword ptr [rbp-40]              ; name/tip
+    call    ghost_attach
+    mov     rax, qword ptr [rbp-48]
+    FRAME_EPILOG
+    ret
+ghost_make endp
+
+; ghost_subclass - SUBCLASSPROC: track hover for the halo.  WM_MOUSEMOVE sets the
+;   hover bit + arms WM_MOUSELEAVE; WM_MOUSELEAVE clears it; both repaint.
+ghost_subclass proc frame
+    FRAME_PROLOG 112
+    mov     qword ptr [rbp-24], rcx             ; hwnd
+    mov     qword ptr [rbp-32], rdx             ; msg
+    mov     qword ptr [rbp-40], r8              ; wParam
+    mov     qword ptr [rbp-48], r9              ; lParam
+    cmp     rdx, WM_MOUSEMOVE_
+    je      gsc_move
+    cmp     rdx, WM_MOUSELEAVE_
+    je      gsc_leave
+    cmp     rdx, WM_CHAR_
+    je      gsc_char
+    cmp     rdx, WM_KEYDOWN_
+    je      gsc_key
+gsc_def:
+    WINCALL DefSubclassProc, qword ptr [rbp-24], qword ptr [rbp-32], qword ptr [rbp-40], \
+            qword ptr [rbp-48]
+    FRAME_EPILOG
+    ret
+gsc_key:
+    mov     rcx, qword ptr [rbp-24]            ; Ctrl+shortcuts from a focused ghost button
+    mov     edx, r8d
+    call    vault_ctrl_key
+    test    eax, eax
+    jz      gsc_def
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gsc_char:
+    ; type-to-search: a printable key while a ghost button has focus jumps to the
+    ; search box (only the vault dialog has one; harmless elsewhere)
+    cmp     qword ptr [rbp-40], 20h
+    jb      gsc_def
+    WINCALL GetParent, qword ptr [rbp-24]
+    mov     qword ptr [rbp-56], rax
+    WINCALL GetDlgItem, qword ptr [rbp-56], IDC_V_SEARCH
+    mov     qword ptr [rbp-64], rax
+    test    rax, rax
+    jz      gsc_def
+    WINCALL SetFocus, qword ptr [rbp-64]
+    WINCALL SendMessageW, qword ptr [rbp-64], WM_CHAR_, qword ptr [rbp-40], \
+            qword ptr [rbp-48]
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gsc_move:
+    WINCALL GetWindowLongPtrW, qword ptr [rbp-24], GWL_USERDATA
+    test    eax, 0FF00h                         ; already hovering -> nothing to do
+    jnz     gsc_def
+    or      eax, 100h                           ; set hover byte
+    mov     edx, eax
+    WINCALL SetWindowLongPtrW, qword ptr [rbp-24], GWL_USERDATA, rdx
+    mov     dword ptr [rbp-80], 16              ; TRACKMOUSEEVENT{cbSize,dwFlags,hwnd,hover}
+    mov     dword ptr [rbp-76], TME_LEAVE_
+    mov     rax, qword ptr [rbp-24]
+    mov     qword ptr [rbp-72], rax
+    mov     dword ptr [rbp-64], 0
+    WINCALL TrackMouseEvent, addr rbp-80
+    WINCALL InvalidateRect, qword ptr [rbp-24], 0, 0
+    jmp     gsc_def
+gsc_leave:
+    WINCALL GetWindowLongPtrW, qword ptr [rbp-24], GWL_USERDATA
+    and     eax, 0FFFF00FFh                     ; clear hover byte
+    mov     edx, eax
+    WINCALL SetWindowLongPtrW, qword ptr [rbp-24], GWL_USERDATA, rdx
+    WINCALL InvalidateRect, qword ptr [rbp-24], 0, 0
+    jmp     gsc_def
+ghost_subclass endp
+
+; ghost_tip_create(rcx=parent) - lazily create the shared tooltip window.
+ghost_tip_create proc frame
+    FRAME_PROLOG 128
+    mov     qword ptr [rbp-24], rcx
+    cmp     qword ptr [g_tooltip], 0
+    jne     gtc_done
+    WINCALL CreateWindowExW, 0, addr cls_tooltip, 0, \
+            WS_POPUP or TTS_ALWAYSTIP_ or TTS_NOPREFIX_, \
+            CW_USEDEFAULT_, CW_USEDEFAULT_, CW_USEDEFAULT_, CW_USEDEFAULT_, \
+            qword ptr [rbp-24], 0, qword ptr [g_hinst], 0
+    mov     qword ptr [g_tooltip], rax
+    WINCALL SendMessageW, qword ptr [g_tooltip], TTM_SETMAXTIPW_, 0, 300
+gtc_done:
+    FRAME_EPILOG
+    ret
+ghost_tip_create endp
+
+; ghost_tip_add(rcx=parent, rdx=tool hwnd, r8=text) - register a subclass tooltip.
+ghost_tip_add proc frame
+    FRAME_PROLOG 144
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], rdx
+    mov     qword ptr [rbp-40], r8
+    mov     rcx, qword ptr [rbp-24]
+    call    ghost_tip_create
+    mov     dword ptr [rbp-104], 38h            ; TOOLINFOW cbSize (through lpszText)
+    mov     dword ptr [rbp-100], TTF_IDISHWND_ or TTF_SUBCLASS_
+    mov     rax, qword ptr [rbp-24]
+    mov     qword ptr [rbp-96], rax             ; hwnd = parent
+    mov     rax, qword ptr [rbp-32]
+    mov     qword ptr [rbp-88], rax             ; uId = tool hwnd
+    xor     eax, eax
+    mov     dword ptr [rbp-80], eax             ; rect = 0 (ignored for IDISHWND)
+    mov     dword ptr [rbp-76], eax
+    mov     dword ptr [rbp-72], eax
+    mov     dword ptr [rbp-68], eax
+    mov     qword ptr [rbp-64], 0               ; hinst = 0
+    mov     rax, qword ptr [rbp-40]
+    mov     qword ptr [rbp-56], rax             ; lpszText
+    WINCALL SendMessageW, qword ptr [g_tooltip], TTM_ADDTOOLW_, 0, addr rbp-104
+    FRAME_EPILOG
+    ret
+ghost_tip_add endp
+
+; search_type_subclass - SUBCLASSPROC on the sidebar list: type-to-search.  When
+;   a printable character is typed while the list has focus (no edit focused),
+;   move focus to the search box and forward the character there (redesign A2).
+; vault_ctrl_key(rcx=ctl hwnd, edx=vk) -> eax 1 if a Ctrl+shortcut was handled.
+;   Ctrl+K focus search, Ctrl+N new, Ctrl+G generate, Ctrl+L lock (redesign A2/E4).
+vault_ctrl_key proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-28], edx
+    WINCALL GetKeyState, VK_CONTROL_
+    test    ax, 8000h
+    jz      vck_no
+    WINCALL GetParent, qword ptr [rbp-24]
+    mov     qword ptr [rbp-40], rax
+    mov     eax, dword ptr [rbp-28]
+    cmp     eax, 4Bh                           ; 'K' -> focus the search box
+    jne     vck_chkn
+    WINCALL GetDlgItem, qword ptr [rbp-40], IDC_V_SEARCH
+    test    rax, rax
+    jz      vck_no
+    WINCALL SetFocus, rax
+    jmp     vck_yes
+vck_chkn:
+    cmp     eax, 4Eh                           ; 'N' -> new item
+    jne     @F
+    mov     dword ptr [rbp-44], IDC_V_ADD
+    jmp     vck_post
+@@: cmp     eax, 47h                           ; 'G' -> generate
+    jne     @F
+    mov     dword ptr [rbp-44], IDC_V_GENERATE
+    jmp     vck_post
+@@: cmp     eax, 4Ch                           ; 'L' -> lock
+    jne     vck_no
+    mov     dword ptr [rbp-44], IDC_V_LOCK
+vck_post:
+    WINCALL PostMessageW, qword ptr [rbp-40], WM_COMMAND, qword ptr [rbp-44], 0
+vck_yes:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+vck_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+vault_ctrl_key endp
+
+search_type_subclass proc frame
+    FRAME_PROLOG 80
+    mov     qword ptr [rbp-24], rcx            ; hwnd (list)
+    mov     qword ptr [rbp-32], rdx            ; msg
+    mov     qword ptr [rbp-40], r8             ; wParam (char)
+    mov     qword ptr [rbp-48], r9             ; lParam
+    cmp     rdx, WM_KEYDOWN_
+    jne     sts_notkey
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, r8d
+    call    vault_ctrl_key
+    test    eax, eax
+    jz      sts_def
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+sts_notkey:
+    cmp     rdx, WM_CHAR_
+    jne     sts_def
+    cmp     r8, 20h                            ; printable (space and up)?
+    jb      sts_def
+    WINCALL GetParent, qword ptr [rbp-24]
+    mov     qword ptr [rbp-56], rax
+    WINCALL GetDlgItem, qword ptr [rbp-56], IDC_V_SEARCH
+    mov     qword ptr [rbp-64], rax
+    test    rax, rax
+    jz      sts_def
+    WINCALL SetFocus, qword ptr [rbp-64]
+    WINCALL SendMessageW, qword ptr [rbp-64], WM_CHAR_, qword ptr [rbp-40], \
+            qword ptr [rbp-48]
+    xor     eax, eax                           ; consumed
+    FRAME_EPILOG
+    ret
+sts_def:
+    WINCALL DefSubclassProc, qword ptr [rbp-24], qword ptr [rbp-32], qword ptr [rbp-40], \
+            qword ptr [rbp-48]
+    FRAME_EPILOG
+    ret
+search_type_subclass endp
 
 ; kind_label(edx=kind) -> rax = wide default-label ptr.  Leaf.
 kind_label proc
@@ -4695,6 +5434,10 @@ gra_zero:
     add     r10, rax
     mov     eax, dword ptr [rbp-32]
     mov     dword ptr [r10+FD_KIND], eax
+    cmp     eax, VF_SPACER                       ; layout blocks carry no editable label
+    je      gra_spacer
+    cmp     eax, VF_GROUP
+    je      gra_group
     ; label (editable, kind's default caption)
     mov     edx, dword ptr [rbp-32]
     call    kind_label
@@ -4754,6 +5497,12 @@ gra_totp:
             SS_OWNERDRAW_
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_COPY, addr cls_button, addr wb_copy, \
             BS_OWNERDRAW_
+    jmp     gra_reorder
+gra_group:
+    WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_VALUE, addr cls_edit, 0, \
+            ES_AUTOHSCROLL_ or WS_TABSTOP_       ; the section title (rendered as a heading)
+    jmp     gra_reorder
+gra_spacer:                                      ; a blank gap - no controls, just height
 gra_reorder:
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_UP, addr cls_button, addr wb_up, \
             BS_OWNERDRAW_
@@ -5888,9 +6637,20 @@ grl_row:
     mov     dword ptr [rbp-44], 27               ; rowH (card = label band 14 + value)
     mov     dword ptr [rbp-48], 11               ; valH
     cmp     eax, VF_NOTES
-    jne     grl_chkimg
+    jne     grl_chkblock
     mov     dword ptr [rbp-44], 54
     mov     dword ptr [rbp-48], 40
+    jmp     grl_setyh
+grl_chkblock:
+    cmp     eax, VF_SPACER                       ; layout block: a small blank gap
+    jne     grl_chkgroup
+    mov     dword ptr [rbp-44], 16
+    jmp     grl_setyh
+grl_chkgroup:
+    cmp     eax, VF_GROUP                        ; layout block: a section heading
+    jne     grl_chkimg
+    mov     dword ptr [rbp-44], 22
+    mov     dword ptr [rbp-48], 12
     jmp     grl_setyh
 grl_chkimg:
     cmp     eax, VF_IMAGE                        ; attachments tile: height grows with
@@ -5978,6 +6738,18 @@ grl_val_flat:
     mov     r9d, dword ptr [rbp-60]
     WINCALL move_ctl, rcx, rdx, r8d, r9d, dword ptr [rbp-76], dword ptr [rbp-48]
 grl_val_done:
+    ; a group heading shows its title as a painted section header in view mode;
+    ; hide its edit there and reveal it only when editing
+    mov     r10, qword ptr [rbp-32]
+    cmp     dword ptr [r10+FD_KIND], VF_GROUP
+    jne     grl_grphide_done
+    mov     rcx, qword ptr [r10+FD_HANDLES+DS_VALUE*8]
+    xor     edx, edx                            ; SW_HIDE (view mode)
+    cmp     dword ptr [g_editmode], 0
+    je      @F
+    mov     edx, 5                              ; SW_SHOW (edit mode)
+@@: call    ShowWindow
+grl_grphide_done:
     ; top-right cluster on the label row: Reveal | Copy | Generate | Trash
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
@@ -6161,6 +6933,8 @@ grl_done:
     mov     eax, dword ptr [rbp-40]              ; content bottom incl. the timestamps line
     add     eax, 12
     mov     dword ptr [g_content_h], eax
+    mov     rcx, qword ptr [rbp-24]              ; keep value columns elastic after relayout
+    call    gui_stretch_rows
     ; repaint just the detail pane (not the whole window) so the sidebar card's
     ; border/shadow don't flicker when rows are laid out
     mov     rcx, qword ptr [rbp-24]
@@ -6872,7 +7646,15 @@ gui_palette_add proc frame
     je      gpa_attach                          ; attachments tile (pick files -> tags)
     cmp     ecx, 9
     je      gpa_attach
-    mov     edx, VF_TEXT                        ; 7 = custom (empty label)
+    cmp     ecx, 10                             ; group heading (layout block)
+    jne     @F
+    mov     edx, VF_GROUP
+    jmp     gpa_go
+@@: cmp     ecx, 11                             ; spacer (layout block)
+    jne     @F
+    mov     edx, VF_SPACER
+    jmp     gpa_go
+@@: mov     edx, VF_TEXT                        ; 7 = custom (empty label)
 gpa_go:
     mov     rcx, qword ptr [rbp-24]
     call    gui_addfield_one
@@ -8028,22 +8810,24 @@ tr_fail:
 gui_trtest endp
 
 ; gui_update_fav_glyph(rcx=hdlg) - set the header button glyph.  In recover mode
-;   the favorite (star) button becomes a recycle (♻) button that restores the
+;   the favorite (star) button becomes a recycle (â™») button that restores the
 ;   shown entry; otherwise it reflects g_fav_state (outline / filled star).
 gui_update_fav_glyph proc frame
     FRAME_PROLOG 48
     mov     qword ptr [rbp-24], rcx
     cmp     dword ptr [g_trash_view], 0
     je      guf_star
-    lea     rax, [wb_recycle]                    ; recover mode -> recycle button
+    mov     r8d, GLY_RECYCLE                      ; recover mode -> recycle glyph (Segoe Symbol)
     jmp     guf_set
 guf_star:
-    lea     rax, [wb_star]                       ; outline (not favorite)
+    mov     r8d, GLY_FAV_OFF                      ; outline (not favorite)
     cmp     dword ptr [g_fav_state], 0
     je      guf_set
-    lea     rax, [wb_starf]                      ; filled (favorite)
+    mov     r8d, GLY_FAV_ON                       ; filled (favorite)
 guf_set:
-    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_FAV, rax
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_V_FAV
+    call    ghost_set_glyph
     FRAME_EPILOG
     ret
 gui_update_fav_glyph endp
@@ -8136,6 +8920,10 @@ gui_detail_clear proc frame
     mov     edx, IDC_V_FAV
     call    GetDlgItem
     WINCALL ShowWindow, rax, SW_HIDE
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_V_HDREDIT
+    call    GetDlgItem
+    WINCALL ShowWindow, rax, SW_HIDE
     WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_SETCURSEL, \
             -1, 0
     FRAME_EPILOG
@@ -8221,6 +9009,83 @@ gui_restore_entry proc frame
     ret
 gui_restore_entry endp
 
+; gui_pick_template(rcx=hdlg) -> eax = template index (0..3), or -1 if cancelled.
+;   Pops the new-entry template menu (redesign D4) at the cursor.
+gui_pick_template proc frame
+    FRAME_PROLOG 128
+    mov     qword ptr [rbp-24], rcx
+    WINCALL CreatePopupMenu
+    mov     qword ptr [rbp-32], rax
+    test    rax, rax
+    jz      gpt_cancel
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 1, addr tm_login
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 2, addr tm_card
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 3, addr tm_ident
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 4, addr tm_note
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_SEPARATOR, 0, 0
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 5, addr tm_blank
+    mov     rcx, qword ptr [rbp-32]
+    call    gui_menu_dark
+    mov     qword ptr [rbp-64], rax
+    lea     rcx, [rbp-56]
+    call    GetCursorPos
+    WINCALL SetForegroundWindow, qword ptr [rbp-24]
+    WINCALL TrackPopupMenu, qword ptr [rbp-32], TPM_RETURNCMD or TPM_LEFTALIGN, \
+            dword ptr [rbp-56], dword ptr [rbp-52], 0, qword ptr [rbp-24], 0
+    mov     dword ptr [rbp-44], eax
+    WINCALL DestroyMenu, qword ptr [rbp-32]
+    WINCALL DeleteObject, qword ptr [rbp-64]
+    mov     eax, dword ptr [rbp-44]
+    test    eax, eax
+    jz      gpt_cancel
+    dec     eax                                 ; menu id 1..4 -> index 0..3
+    FRAME_EPILOG
+    ret
+gpt_cancel:
+    mov     eax, -1
+    FRAME_EPILOG
+    ret
+gui_pick_template endp
+
+; gui_build_template(edx = template index) - fill g_field_list from a template:
+;   Title first, then each preset {type, label} with an empty value.  Sets g_field_n.
+gui_build_template proc frame
+    FRAME_PROLOG 48
+    mov     dword ptr [rbp-28], edx
+    lea     r10, [g_field_list]                 ; field 0 = Title "New entry"
+    mov     qword ptr [r10+0], VF_TITLE
+    mov     qword ptr [r10+8], 0
+    lea     rax, [wt_newentry]
+    mov     qword ptr [r10+16], rax
+    mov     eax, dword ptr [rbp-28]
+    lea     r11, [tmpl_table]
+    mov     r11, qword ptr [r11+rax*8]          ; -> template descriptor
+    mov     rcx, qword ptr [r11]                ; extra-field count
+    add     r11, 8
+    mov     edx, 1                              ; k = 1
+gbt_lp:
+    test    rcx, rcx
+    jz      gbt_done
+    mov     eax, edx
+    imul    eax, eax, 24
+    lea     r9, [g_field_list]
+    add     r9, rax                             ; &g_field_list[k]
+    mov     rax, qword ptr [r11+0]              ; type
+    mov     qword ptr [r9+0], rax
+    mov     rax, qword ptr [r11+8]              ; label ptr (0 = default)
+    mov     qword ptr [r9+8], rax
+    lea     rax, [g_empty_w]                    ; value = empty
+    mov     qword ptr [r9+16], rax
+    add     r11, 16
+    inc     edx
+    dec     rcx
+    jmp     gbt_lp
+gbt_done:
+    mov     dword ptr [g_field_n], edx
+    FRAME_EPILOG
+    ret
+gui_build_template endp
+
 ; gui_addfield_menu(rcx=hdlg) - popup the field-type palette at the cursor.
 gui_addfield_menu proc frame
     FRAME_PROLOG 128
@@ -8242,6 +9107,8 @@ gui_addfield_menu proc frame
 gam_totp:
     WINCALL AppendMenuW, qword ptr [rbp-32], dword ptr [rbp-40], 6, addr kl_totp
     WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 9, addr kl_file
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 10, addr kl_group
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 11, addr kl_spacer
     mov     rcx, qword ptr [rbp-32]              ; tint the menu background
     call    gui_menu_dark
     mov     qword ptr [rbp-64], rax
@@ -8577,6 +9444,1040 @@ msv_done:
 gui_menu_save endp
 
 ; =============================================================================
+; Custom title-bar frame helpers (redesign A1).  The vault window drops
+; WS_CAPTION and grows a TBAR_H strip at the top of its client area: existing
+; content is shifted down into place at init, and the strip hosts the caption
+; buttons (min/max/close) plus the search box and control dock.  Dragging the
+; empty strip moves the window (HTCAPTION from frame_hittest); WS_THICKFRAME
+; still resizes from the borders.
+; =============================================================================
+
+; frame_hittest(rcx=hdlg, r9=lParam screen POINT) -> eax=1 when the cursor is in
+;   the empty title strip (DWLP_MSGRESULT set to HTCAPTION), else 0 (default).
+frame_hittest proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    movsx   eax, r9w                           ; screen x
+    mov     dword ptr [rbp-40], eax
+    mov     r10, r9
+    sar     r10, 16
+    movsx   eax, r10w                          ; screen y
+    mov     dword ptr [rbp-36], eax            ; POINT{x=[rbp-40], y=[rbp-36]}
+    WINCALL ScreenToClient, qword ptr [rbp-24], addr rbp-40
+    mov     eax, dword ptr [rbp-36]            ; client y
+    cmp     eax, 0
+    jl      fht_no
+    cmp     eax, TBAR_H
+    jge     fht_no
+    WINCALL SetWindowLongPtrW, qword ptr [rbp-24], DWLP_MSGRESULT_, HTCAPTION
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+fht_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+frame_hittest endp
+
+; frame_shift_cb(rcx=child, rdx=parent) - EnumChildWindows callback: move one
+;   child down by TBAR_H so the reclaimed caption space becomes the title strip.
+frame_shift_cb proc frame
+    FRAME_PROLOG 128                            ; spill area must clear the locals (down to -76)
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], rdx
+    WINCALL GetWindowRect, qword ptr [rbp-24], addr rbp-64   ; L-64 T-60 R-56 B-52
+    WINCALL MapWindowPoints, 0, qword ptr [rbp-32], addr rbp-64, 2
+    mov     eax, dword ptr [rbp-56]            ; w = R - L
+    sub     eax, dword ptr [rbp-64]
+    mov     dword ptr [rbp-68], eax
+    mov     eax, dword ptr [rbp-52]            ; h = B - T
+    sub     eax, dword ptr [rbp-60]
+    mov     dword ptr [rbp-72], eax
+    mov     eax, dword ptr [rbp-60]            ; newY = T + TBAR_H
+    add     eax, TBAR_H
+    mov     dword ptr [rbp-76], eax
+    WINCALL MoveWindow, qword ptr [rbp-24], dword ptr [rbp-64], dword ptr [rbp-76], \
+            dword ptr [rbp-68], dword ptr [rbp-72], 1
+    mov     eax, 1                             ; continue enumeration
+    FRAME_EPILOG
+    ret
+frame_shift_cb endp
+
+; frame_shift(rcx=hdlg) - shift every existing child down into place.
+frame_shift proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    WINCALL EnumChildWindows, qword ptr [rbp-24], addr frame_shift_cb, qword ptr [rbp-24]
+    FRAME_EPILOG
+    ret
+frame_shift endp
+
+; frame_grow(rcx=hdlg) - grow the window height by TBAR_H so the shifted content
+;   keeps its size and the new strip is pure gain at the top.
+frame_grow proc frame
+    FRAME_PROLOG 128                            ; spill area must clear the locals (down to -56)
+    mov     qword ptr [rbp-24], rcx
+    WINCALL GetWindowRect, qword ptr [rbp-24], addr rbp-48   ; L-48 T-44 R-40 B-36
+    mov     eax, dword ptr [rbp-40]            ; w = R - L
+    sub     eax, dword ptr [rbp-48]
+    mov     dword ptr [rbp-52], eax
+    mov     eax, dword ptr [rbp-36]            ; h = B - T + TBAR_H
+    sub     eax, dword ptr [rbp-44]
+    add     eax, TBAR_H
+    mov     dword ptr [rbp-56], eax
+    WINCALL SetWindowPos, qword ptr [rbp-24], 0, 0, 0, dword ptr [rbp-52], \
+            dword ptr [rbp-56], SWP_FRAME_
+    FRAME_EPILOG
+    ret
+frame_grow endp
+
+; frame_layout(rcx=hdlg) - right-align the caption buttons in the title strip.
+;   Called at build time and on WM_SIZE.
+frame_layout proc frame
+    FRAME_PROLOG 128                            ; spill area must clear the locals (down to -60)
+    mov     qword ptr [rbp-24], rcx
+    WINCALL GetClientRect, qword ptr [rbp-24], addr rbp-48   ; R at [rbp-40]
+    mov     eax, dword ptr [rbp-40]
+    mov     dword ptr [rbp-52], eax            ; client width
+    mov     eax, dword ptr [rbp-52]            ; xClose = W - CAPBTN_W
+    sub     eax, CAPBTN_W
+    mov     dword ptr [rbp-56], eax
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_T_CLOSE
+    WINCALL MoveWindow, rax, dword ptr [rbp-56], 0, CAPBTN_W, TBAR_H, 1
+    mov     eax, dword ptr [rbp-52]            ; xMax = W - 2*CAPBTN_W
+    sub     eax, CAPBTN_W*2
+    mov     dword ptr [rbp-56], eax
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_T_MAX
+    WINCALL MoveWindow, rax, dword ptr [rbp-56], 0, CAPBTN_W, TBAR_H, 1
+    mov     eax, dword ptr [rbp-52]            ; xMin = W - 3*CAPBTN_W
+    sub     eax, CAPBTN_W*3
+    mov     dword ptr [rbp-56], eax
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_T_MIN
+    WINCALL MoveWindow, rax, dword ptr [rbp-56], 0, CAPBTN_W, TBAR_H, 1
+    ; dock: New / Generate / Settings, left of the caption buttons
+    mov     eax, dword ptr [rbp-52]            ; dock right edge = xMin
+    sub     eax, CAPBTN_W*3
+    mov     dword ptr [rbp-60], eax
+    mov     eax, dword ptr [rbp-60]            ; Settings = edge - DOCKBTN_W
+    sub     eax, DOCKBTN_W
+    mov     dword ptr [rbp-56], eax
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_T_SET
+    WINCALL MoveWindow, rax, dword ptr [rbp-56], 0, DOCKBTN_W, TBAR_H, 1
+    mov     eax, dword ptr [rbp-60]            ; Generate = edge - 2*DOCKBTN_W
+    sub     eax, DOCKBTN_W*2
+    mov     dword ptr [rbp-56], eax
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_T_GEN
+    WINCALL MoveWindow, rax, dword ptr [rbp-56], 0, DOCKBTN_W, TBAR_H, 1
+    mov     eax, dword ptr [rbp-60]            ; New = edge - 3*DOCKBTN_W
+    sub     eax, DOCKBTN_W*3
+    mov     dword ptr [rbp-56], eax
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_T_NEW
+    WINCALL MoveWindow, rax, dword ptr [rbp-56], 0, DOCKBTN_W, TBAR_H, 1
+    ; search pill: left of the dock, vertically centred in the strip
+    mov     eax, dword ptr [rbp-56]            ; pill right = New left - 12 gap
+    sub     eax, 12
+    sub     eax, SEARCHPILL_W                  ; pill left
+    mov     dword ptr [rbp-64], eax
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_T_SEARCH
+    WINCALL MoveWindow, rax, dword ptr [rbp-64], 5, SEARCHPILL_W, 22, 1
+    ; tab strip: left edge (x=4) to just left of the pill
+    mov     eax, dword ptr [rbp-64]
+    sub     eax, 12
+    mov     dword ptr [rbp-68], eax            ; tab area width
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_V_TABS
+    WINCALL MoveWindow, rax, 4, 0, dword ptr [rbp-68], TBAR_H, 1
+    FRAME_EPILOG
+    ret
+frame_layout endp
+
+; frame_maxinfo(rcx=hdlg, rdx=MINMAXINFO*) - constrain the maximized size/position
+;   to the monitor work area, so the borderless window does not cover the taskbar.
+frame_maxinfo proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], rdx
+    WINCALL MonitorFromWindow, qword ptr [rbp-24], 2   ; MONITOR_DEFAULTTONEAREST
+    mov     qword ptr [rbp-40], rax
+    mov     dword ptr [rbp-96], 40             ; MONITORINFO.cbSize
+    WINCALL GetMonitorInfoW, qword ptr [rbp-40], addr rbp-96
+    ; rcMonitor L-92 T-88 R-84 B-80 ; rcWork L-76 T-72 R-68 B-64
+    mov     r10, qword ptr [rbp-32]            ; MINMAXINFO
+    mov     eax, dword ptr [rbp-68]            ; ptMaxSize.x = work width
+    sub     eax, dword ptr [rbp-76]
+    mov     dword ptr [r10+8], eax
+    mov     eax, dword ptr [rbp-64]            ; ptMaxSize.y = work height
+    sub     eax, dword ptr [rbp-72]
+    mov     dword ptr [r10+12], eax
+    mov     eax, dword ptr [rbp-76]            ; ptMaxPosition.x = work.L - monitor.L
+    sub     eax, dword ptr [rbp-92]
+    mov     dword ptr [r10+16], eax
+    mov     eax, dword ptr [rbp-72]            ; ptMaxPosition.y = work.T - monitor.T
+    sub     eax, dword ptr [rbp-88]
+    mov     dword ptr [r10+20], eax
+    FRAME_EPILOG
+    ret
+frame_maxinfo endp
+
+; frame_build(rcx=hdlg) - create the caption ghost buttons, then lay them out.
+;   Called from vp_init AFTER frame_shift/frame_grow so they are not shifted.
+frame_build proc frame
+    FRAME_PROLOG 128                            ; room for the 9-arg mk_ctl spill
+    mov     qword ptr [rbp-24], rcx
+    WINCALL mk_ctl, qword ptr [rbp-24], IDC_V_TABS, addr cls_button, 0, \
+            BS_OWNERDRAW_, 0, 0, 10, 10        ; multi-vault tab strip (owner-draw)
+    mov     rcx, qword ptr [rbp-24]
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_T_MIN
+    mov     r8d, GLY_MIN
+    lea     r9, [gt_min]
+    call    ghost_make
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_T_MAX
+    mov     r8d, GLY_MAX
+    lea     r9, [gt_max]
+    call    ghost_make
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_T_CLOSE
+    mov     r8d, GLY_CLOSE
+    lea     r9, [gt_close]
+    call    ghost_make
+    mov     rcx, qword ptr [rbp-24]             ; dock: New / Generate / Settings
+    mov     edx, IDC_T_NEW
+    mov     r8d, GLY_NEW
+    lea     r9, [gt_new]
+    call    ghost_make
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_T_GEN
+    mov     r8d, GLY_GENERATE
+    lea     r9, [gt_gen]
+    call    ghost_make
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_T_SET
+    mov     r8d, GLY_SETTINGS
+    lea     r9, [gt_settings]
+    call    ghost_make
+    mov     rcx, qword ptr [rbp-24]             ; search pill: make as a ghost, then
+    mov     edx, IDC_T_SEARCH                    ;   switch its style byte 2 -> 3 so
+    mov     r8d, GLY_SEARCH                      ;   theme_drawitem paints the pill
+    lea     r9, [wb_search_txt]
+    call    ghost_make
+    mov     qword ptr [rbp-32], rax
+    WINCALL GetWindowLongPtrW, qword ptr [rbp-32], GWL_USERDATA
+    and     eax, 0FFFFFF00h
+    or      eax, 3
+    mov     edx, eax
+    WINCALL SetWindowLongPtrW, qword ptr [rbp-32], GWL_USERDATA, rdx
+    mov     rcx, qword ptr [rbp-24]
+    call    frame_layout
+    FRAME_EPILOG
+    ret
+frame_build endp
+
+; =============================================================================
+; Title-bar search overlay (redesign A2): a blended dropdown under the search
+; pill with a query edit + owner-draw results list.  Built as hidden dialog
+; children so it rides the existing WM_DRAWITEM / WM_COMMAND / WM_CTLCOLOR flow.
+; =============================================================================
+
+; search_overlay_build(rcx=hdlg) - create the panel/edit/list (hidden).  Called
+;   from vp_init after frame_build so the overlay sits topmost.
+search_overlay_build proc frame
+    FRAME_PROLOG 128
+    mov     qword ptr [rbp-24], rcx
+    WINCALL mk_ctl, qword ptr [rbp-24], IDC_SO_PANEL, addr cls_static, 0, \
+            SS_OWNERDRAW_, 0, 0, 10, 10
+    WINCALL mk_ctl, qword ptr [rbp-24], IDC_SO_EDIT, addr cls_edit, 0, \
+            ES_AUTOHSCROLL_, 0, 0, 10, 10
+    mov     qword ptr [rbp-32], rax
+    WINCALL SendMessageW, qword ptr [rbp-32], EM_SETCUEBANNER, 1, addr so_cue
+    WINCALL SetWindowSubclass, qword ptr [rbp-32], addr search_overlay_editsub, 0, \
+            qword ptr [rbp-24]
+    WINCALL mk_ctl, qword ptr [rbp-24], IDC_SO_LIST, addr cls_listbox, 0, \
+            LBS_OWNERDRAWFIXED_ or LBS_SORT_ or LBS_NOTIFY_ or LBS_NOINTEGRALHEIGHT_ or WS_VSCROLL_, \
+            0, 0, 10, 10
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [g_so_ids]
+    mov     r8d, 3
+    mov     r9d, SW_HIDE
+    call    gui_show_ids
+    FRAME_EPILOG
+    ret
+search_overlay_build endp
+
+; search_overlay_open(rcx=hdlg) - position the dropdown under the pill, show it,
+;   populate with all entries, and focus the query edit.
+search_overlay_open proc frame
+    FRAME_PROLOG 144                           ; spill must clear the pill/client rects (down to -112)
+    mov     qword ptr [rbp-24], rcx
+    cmp     dword ptr [g_so_open], 0
+    jne     soo_focus
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_T_SEARCH
+    mov     qword ptr [rbp-32], rax
+    WINCALL GetWindowRect, qword ptr [rbp-32], addr rbp-80   ; L-80 T-76 R-72 B-68
+    WINCALL MapWindowPoints, 0, qword ptr [rbp-24], addr rbp-80, 2
+    WINCALL GetClientRect, qword ptr [rbp-24], addr rbp-112  ; R at -104
+    mov     eax, dword ptr [rbp-80]           ; x = pill left
+    mov     dword ptr [rbp-40], eax
+    mov     eax, dword ptr [rbp-104]          ; clamp x to clientW - SO_W - 4
+    sub     eax, SO_W
+    sub     eax, 4
+    cmp     dword ptr [rbp-40], eax
+    jle     @F
+    mov     dword ptr [rbp-40], eax
+@@: cmp     dword ptr [rbp-40], 4
+    jge     @F
+    mov     dword ptr [rbp-40], 4
+@@: mov     eax, dword ptr [rbp-68]           ; y = pill bottom + 2
+    add     eax, 2
+    mov     dword ptr [rbp-44], eax
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_SO_PANEL
+    WINCALL MoveWindow, rax, dword ptr [rbp-40], dword ptr [rbp-44], SO_W, SO_EDITH+SO_LISTH, 0
+    mov     eax, dword ptr [rbp-40]           ; edit inset
+    add     eax, 6
+    mov     dword ptr [rbp-48], eax
+    mov     eax, dword ptr [rbp-44]
+    add     eax, 4
+    mov     dword ptr [rbp-52], eax
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_SO_EDIT
+    WINCALL MoveWindow, rax, dword ptr [rbp-48], dword ptr [rbp-52], SO_W-12, 18, 0
+    mov     eax, dword ptr [rbp-40]           ; list under the edit
+    add     eax, 4
+    mov     dword ptr [rbp-48], eax
+    mov     eax, dword ptr [rbp-44]
+    add     eax, SO_EDITH
+    mov     dword ptr [rbp-52], eax
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_SO_LIST
+    WINCALL MoveWindow, rax, dword ptr [rbp-48], dword ptr [rbp-52], SO_W-8, SO_LISTH, 0
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_SO_EDIT, addr w_empty
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [g_so_ids]
+    mov     r8d, 3
+    mov     r9d, SW_SHOW
+    call    gui_show_ids
+    mov     rcx, qword ptr [rbp-24]
+    call    search_overlay_populate
+    mov     dword ptr [g_so_open], 1
+soo_focus:
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_SO_EDIT
+    WINCALL SetFocus, rax
+    FRAME_EPILOG
+    ret
+search_overlay_open endp
+
+; search_overlay_close(rcx=hdlg) - hide the dropdown, return focus to the dialog.
+search_overlay_close proc frame
+    FRAME_PROLOG 32
+    mov     qword ptr [rbp-24], rcx
+    cmp     dword ptr [g_so_open], 0
+    je      soc_done
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [g_so_ids]
+    mov     r8d, 3
+    mov     r9d, SW_HIDE
+    call    gui_show_ids
+    mov     dword ptr [g_so_open], 0
+    mov     dword ptr [g_xr_active], 0
+    WINCALL InvalidateRect, qword ptr [rbp-24], 0, 1   ; repaint the area it covered
+    WINCALL SetFocus, qword ptr [rbp-24]
+soc_done:
+    FRAME_EPILOG
+    ret
+search_overlay_close endp
+
+; search_overlay_movesel(rcx=hdlg, edx=delta) - move the results selection.
+search_overlay_movesel proc frame
+    FRAME_PROLOG 64                            ; spill must clear delta at -32 / new at -40
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-32], edx
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_SO_LIST, LB_GETCOUNT, 0, 0
+    test    eax, eax
+    jz      som_done
+    mov     dword ptr [rbp-36], eax           ; count
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_SO_LIST, LB_GETCURSEL, 0, 0
+    add     eax, dword ptr [rbp-32]           ; cur(-1 if none) + delta
+    test    eax, eax
+    jns     @F
+    xor     eax, eax
+@@: cmp     eax, dword ptr [rbp-36]
+    jl      @F
+    mov     eax, dword ptr [rbp-36]
+    dec     eax
+@@: mov     dword ptr [rbp-40], eax
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_SO_LIST, LB_SETCURSEL, \
+            dword ptr [rbp-40], 0
+som_done:
+    FRAME_EPILOG
+    ret
+search_overlay_movesel endp
+
+; search_overlay_activate(rcx=hdlg) - open the selected result: sync the sidebar
+;   selection to it, load its detail, close the overlay.
+search_overlay_activate proc frame
+    FRAME_PROLOG 80                            ; spill must clear locals down to -44
+    mov     qword ptr [rbp-24], rcx
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_SO_LIST, LB_GETCURSEL, 0, 0
+    cmp     eax, LB_ERR
+    je      soa_done
+    mov     dword ptr [rbp-32], eax           ; selected row
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_SO_LIST, LB_GETITEMDATA, \
+            dword ptr [rbp-32], 0
+    mov     dword ptr [rbp-36], eax           ; entry index (or xr index in cross-vault mode)
+    cmp     dword ptr [g_xr_active], 0
+    je      soa_close
+    mov     ecx, dword ptr [rbp-36]           ; cross-vault: xr index -> (vault, entry)
+    call    xr_ptr
+    mov     r10, rax
+    mov     eax, dword ptr [r10+XR.xr_entry]
+    mov     dword ptr [rbp-48], eax
+    mov     eax, dword ptr [r10+XR.xr_vault]
+    mov     dword ptr [rbp-52], eax
+    mov     rcx, qword ptr [rbp-24]
+    call    search_overlay_close
+    mov     rcx, qword ptr [rbp-24]           ; front the result's vault (repopulates sidebar)
+    mov     edx, dword ptr [rbp-52]
+    call    gui_switch_vault
+    mov     eax, dword ptr [rbp-48]
+    mov     dword ptr [rbp-36], eax           ; entry to select in the switched-to sidebar
+    jmp     soa_scanstart
+soa_close:
+    mov     rcx, qword ptr [rbp-24]
+    call    search_overlay_close
+soa_scanstart:
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_GETCOUNT, 0, 0
+    mov     dword ptr [rbp-40], eax
+    mov     dword ptr [rbp-44], 0             ; scan the sidebar for the same entry
+soa_scan:
+    mov     eax, dword ptr [rbp-44]
+    cmp     eax, dword ptr [rbp-40]
+    jae     soa_show
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_GETITEMDATA, \
+            dword ptr [rbp-44], 0
+    cmp     eax, dword ptr [rbp-36]
+    jne     soa_next
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_SETCURSEL, \
+            dword ptr [rbp-44], 0
+    jmp     soa_show
+soa_next:
+    inc     dword ptr [rbp-44]
+    jmp     soa_scan
+soa_show:
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-36]
+    call    gui_showdetail
+    mov     rcx, qword ptr [rbp-24]
+    xor     edx, edx
+    call    gui_set_editmode
+soa_done:
+    FRAME_EPILOG
+    ret
+search_overlay_activate endp
+
+; search_overlay_editsub - SUBCLASSPROC on the query edit: Esc closes, Enter
+;   activates, Up/Down move the results selection.  dwRefData = hdlg ([rbp+56]).
+search_overlay_editsub proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], rdx
+    mov     qword ptr [rbp-40], r8
+    mov     qword ptr [rbp-48], r9
+    cmp     rdx, WM_GETDLGCODE_               ; claim Enter/Esc/arrows from IsDialogMessage
+    je      ses_dlgcode
+    cmp     rdx, WM_KEYDOWN_
+    jne     ses_def
+    mov     r10d, r8d
+    cmp     r10d, VK_ESCAPE_
+    je      ses_esc
+    cmp     r10d, VK_RETURN_
+    je      ses_enter
+    cmp     r10d, VK_DOWN_
+    je      ses_down
+    cmp     r10d, VK_UP_
+    je      ses_up
+ses_def:
+    WINCALL DefSubclassProc, qword ptr [rbp-24], qword ptr [rbp-32], qword ptr [rbp-40], \
+            qword ptr [rbp-48]
+    FRAME_EPILOG
+    ret
+ses_dlgcode:
+    WINCALL DefSubclassProc, qword ptr [rbp-24], qword ptr [rbp-32], qword ptr [rbp-40], \
+            qword ptr [rbp-48]
+    or      eax, DLGC_WANTALLKEYS_
+    FRAME_EPILOG
+    ret
+ses_esc:
+    mov     rcx, qword ptr [rbp+56]
+    call    search_overlay_close
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+ses_enter:
+    mov     rcx, qword ptr [rbp+56]
+    call    search_overlay_activate
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+ses_down:
+    mov     rcx, qword ptr [rbp+56]
+    mov     edx, 1
+    call    search_overlay_movesel
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+ses_up:
+    mov     rcx, qword ptr [rbp+56]
+    mov     edx, -1
+    call    search_overlay_movesel
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+search_overlay_editsub endp
+
+; ---- cross-vault search (C4) ------------------------------------------------
+; xr_ptr(ecx=k) -> rax = &g_xr[k].  Leaf.
+xr_ptr proc
+    mov     eax, ecx
+    imul    rax, rax, sizeof XR
+    lea     rcx, [g_xr]
+    add     rax, rcx
+    ret
+xr_ptr endp
+
+; xr_wcopy(rcx=dst wide, rdx=src wide, r8d=max chars) - copy a wide string,
+;   NUL-terminated, capped.  Leaf.
+xr_wcopy proc
+    xor     r9d, r9d
+xwc_lp:
+    cmp     r9d, r8d
+    jae     xwc_end
+    movzx   eax, word ptr [rdx + r9*2]
+    mov     word ptr [rcx + r9*2], ax
+    test    ax, ax
+    jz      xwc_done
+    inc     r9d
+    jmp     xwc_lp
+xwc_end:
+    mov     word ptr [rcx + r9*2], 0
+xwc_done:
+    ret
+xr_wcopy endp
+
+; search_overlay_xfill(rcx=hdlg) - fuzzy-search EVERY open vault, caching each
+;   match's display data (glyph/color/title/subtitle/vault-name) into g_xr so it
+;   can be painted without its home vault being fronted.  Restores the original
+;   fronted vault when done.
+search_overlay_xfill proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx
+    mov     eax, dword ptr [g_vault_cur]      ; remember the fronted vault
+    mov     dword ptr [rbp-28], eax
+    WINCALL GetDlgItemTextW, qword ptr [rbp-24], IDC_SO_EDIT, addr g_search_w, 255
+    mov     dword ptr [rbp-32], eax           ; qlen
+    mov     dword ptr [g_search_len], eax
+    test    eax, eax
+    jz      @F
+    WINCALL CharUpperBuffW, addr g_search_w, dword ptr [rbp-32]
+@@: mov     dword ptr [g_xr_n], 0
+    mov     dword ptr [rbp-36], 0             ; v
+xf_vloop:
+    mov     eax, dword ptr [rbp-36]
+    cmp     eax, dword ptr [g_vault_n]
+    jae     xf_vdone
+    mov     ecx, dword ptr [rbp-36]
+    call    vault_ctx_front                   ; live = vault v
+    mov     ecx, dword ptr [rbp-36]
+    call    vault_ctx_nameptr
+    mov     qword ptr [rbp-88], rax           ; vname ptr (own 8-byte slot; -48 would overlap j at -44)
+    call    vault_count
+    mov     dword ptr [rbp-40], eax           ; cnt
+    mov     dword ptr [rbp-44], 0             ; j
+xf_eloop:
+    mov     eax, dword ptr [rbp-44]
+    cmp     eax, dword ptr [rbp-40]
+    jae     xf_vnext
+    mov     ecx, dword ptr [rbp-44]
+    call    gui_entry_is_deleted
+    test    eax, eax
+    jnz     xf_jnext
+    cmp     dword ptr [rbp-32], 0
+    je      xf_match
+    mov     ecx, dword ptr [rbp-44]
+    call    gui_entry_fuzzy
+    test    eax, eax
+    js      xf_jnext
+    mov     dword ptr [rbp-52], eax
+    jmp     xf_store
+xf_match:
+    mov     dword ptr [rbp-52], 0
+xf_store:
+    mov     eax, dword ptr [g_xr_n]
+    cmp     eax, MAX_XR
+    jae     xf_vdone
+    mov     ecx, eax
+    call    xr_ptr
+    mov     qword ptr [rbp-64], rax
+    mov     r10, rax
+    mov     eax, dword ptr [rbp-36]
+    mov     dword ptr [r10+XR.xr_vault], eax
+    mov     eax, dword ptr [rbp-44]
+    mov     dword ptr [r10+XR.xr_entry], eax
+    mov     eax, dword ptr [rbp-52]
+    mov     dword ptr [r10+XR.xr_score], eax
+    mov     ecx, dword ptr [rbp-44]           ; glyph -> cache
+    call    gui_entry_glyph
+    mov     r10, qword ptr [rbp-64]
+    mov     dword ptr [r10+XR.xr_glyph], eax
+    mov     ecx, dword ptr [rbp-44]           ; color -> cache
+    call    gui_entry_color
+    mov     r10, qword ptr [rbp-64]
+    mov     dword ptr [r10+XR.xr_color], eax
+    mov     ecx, dword ptr [rbp-44]           ; title (utf8) -> wide -> cache
+    lea     rdx, [rbp-72]
+    call    vault_title_at
+    mov     rcx, rax
+    mov     edx, dword ptr [rbp-72]
+    mov     r10, qword ptr [rbp-64]
+    lea     r8, [r10+XR.xr_title]
+    mov     r9d, 62
+    call    gui_towide
+    mov     ecx, dword ptr [rbp-44]           ; subtitle -> g_sub_w -> cache
+    call    gui_entry_subtitle
+    mov     r10, qword ptr [rbp-64]
+    lea     rcx, [r10+XR.xr_sub]
+    lea     rdx, [g_sub_w]
+    mov     r8d, 63
+    call    xr_wcopy
+    mov     r10, qword ptr [rbp-64]           ; vault name -> cache
+    lea     rcx, [r10+XR.xr_vname]
+    mov     rdx, qword ptr [rbp-88]
+    mov     r8d, 31
+    call    xr_wcopy
+    inc     dword ptr [g_xr_n]
+xf_jnext:
+    inc     dword ptr [rbp-44]
+    jmp     xf_eloop
+xf_vnext:
+    inc     dword ptr [rbp-36]
+    jmp     xf_vloop
+xf_vdone:
+    mov     ecx, dword ptr [rbp-28]           ; restore the originally fronted vault
+    call    vault_ctx_front
+    FRAME_EPILOG
+    ret
+search_overlay_xfill endp
+
+; gui_draw_xresult(rcx=lpdis) - paint one cross-vault result card from g_xr
+;   (icon + title + subtitle + right-aligned dim vault name).
+gui_draw_xresult proc frame
+    FRAME_PROLOG 192
+    mov     qword ptr [rbp-24], rcx
+    mov     r10, rcx
+    mov     eax, dword ptr [r10+8]
+    cmp     eax, -1
+    je      gxr_done
+    mov     rax, qword ptr [r10+32]
+    mov     qword ptr [rbp-32], rax           ; hdc
+    mov     eax, dword ptr [r10+40]
+    mov     dword ptr [rbp-40], eax
+    mov     eax, dword ptr [r10+44]
+    mov     dword ptr [rbp-48], eax
+    mov     eax, dword ptr [r10+48]
+    mov     dword ptr [rbp-56], eax
+    mov     eax, dword ptr [r10+52]
+    mov     dword ptr [rbp-64], eax
+    mov     eax, dword ptr [r10+16]
+    mov     dword ptr [rbp-72], eax           ; state
+    mov     eax, dword ptr [r10+56]           ; itemData = xr index
+    cmp     eax, dword ptr [g_xr_n]           ; guard: stale/foreign index -> skip
+    jae     gxr_done
+    mov     ecx, eax
+    call    xr_ptr
+    mov     qword ptr [rbp-80], rax
+    mov     eax, dword ptr [g_col_side]
+    test    dword ptr [rbp-72], 1
+    jz      @F
+    mov     eax, dword ptr [g_col_frame]
+@@: mov     dword ptr [rbp-88], eax
+    WINCALL CreateSolidBrush, dword ptr [rbp-88]
+    mov     qword ptr [rbp-96], rax
+    mov     r10, qword ptr [rbp-24]
+    lea     rdx, [r10+40]
+    WINCALL FillRect, qword ptr [rbp-32], rdx, qword ptr [rbp-96]
+    WINCALL DeleteObject, qword ptr [rbp-96]
+    mov     r10, qword ptr [rbp-80]           ; icon tile
+    mov     eax, dword ptr [r10+XR.xr_color]
+    mov     dword ptr [g_tilecolor], eax
+    mov     eax, dword ptr [r10+XR.xr_glyph]
+    mov     word ptr [g_glyph_w], ax
+    mov     word ptr [g_glyph_w+2], 0
+    mov     rcx, qword ptr [rbp-32]
+    mov     edx, dword ptr [rbp-40]
+    add     edx, 5
+    mov     r8d, dword ptr [rbp-48]
+    add     r8d, 5
+    mov     r9d, 34
+    call    gui_draw_tile
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_cardfont]   ; title
+    mov     qword ptr [rbp-104], rax
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_text]
+    WINCALL SetBkMode, qword ptr [rbp-32], 1
+    mov     eax, dword ptr [rbp-40]
+    add     eax, 46
+    mov     dword ptr [rbp-152], eax
+    mov     eax, dword ptr [rbp-48]
+    add     eax, 4
+    mov     dword ptr [rbp-148], eax
+    mov     eax, dword ptr [rbp-56]
+    sub     eax, 4
+    mov     dword ptr [rbp-144], eax
+    mov     eax, dword ptr [rbp-48]
+    add     eax, 22
+    mov     dword ptr [rbp-140], eax
+    mov     r10, qword ptr [rbp-80]
+    lea     rdx, [r10+XR.xr_title]
+    WINCALL DrawTextW, qword ptr [rbp-32], rdx, -1, addr rbp-152, 8024h
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_subfont]    ; subtitle (dim)
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_textdim]
+    mov     eax, dword ptr [rbp-48]
+    add     eax, 22
+    mov     dword ptr [rbp-148], eax
+    mov     eax, dword ptr [rbp-64]
+    sub     eax, 2
+    mov     dword ptr [rbp-140], eax
+    mov     r10, qword ptr [rbp-80]
+    lea     rdx, [r10+XR.xr_sub]
+    WINCALL DrawTextW, qword ptr [rbp-32], rdx, -1, addr rbp-152, 8024h
+    mov     eax, dword ptr [rbp-40]           ; vault name, right-aligned on the subtitle line
+    add     eax, 100
+    mov     dword ptr [rbp-152], eax
+    mov     eax, dword ptr [rbp-48]
+    add     eax, 22
+    mov     dword ptr [rbp-148], eax
+    mov     eax, dword ptr [rbp-56]
+    sub     eax, 6
+    mov     dword ptr [rbp-144], eax
+    mov     eax, dword ptr [rbp-64]
+    sub     eax, 2
+    mov     dword ptr [rbp-140], eax
+    mov     r10, qword ptr [rbp-80]
+    lea     rdx, [r10+XR.xr_vname]
+    WINCALL DrawTextW, qword ptr [rbp-32], rdx, -1, addr rbp-152, 8026h
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-104]
+gxr_done:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gui_draw_xresult endp
+
+; search_overlay_populate(rcx=hdlg) - fill the overlay results list: cross-vault
+;   (all open vaults, cached) when >1 vault is open, else the current vault.
+search_overlay_populate proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    cmp     dword ptr [g_vault_n], 1
+    jbe     sop_single
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_SO_LIST, LB_RESETCONTENT, 0, 0
+    mov     dword ptr [g_xr_active], 1        ; set AFTER clearing old (entry-index) items
+    mov     rcx, qword ptr [rbp-24]
+    call    search_overlay_xfill
+    mov     dword ptr [rbp-28], 0
+sop_addlp:
+    mov     eax, dword ptr [rbp-28]
+    cmp     eax, dword ptr [g_xr_n]
+    jae     sop_done
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_SO_LIST, LB_ADDSTRING, 0, \
+            dword ptr [rbp-28]
+    inc     dword ptr [rbp-28]
+    jmp     sop_addlp
+sop_single:
+    mov     dword ptr [g_xr_active], 0
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_SO_LIST
+    mov     r8d, IDC_SO_EDIT
+    call    poplist_into
+sop_done:
+    FRAME_EPILOG
+    ret
+search_overlay_populate endp
+
+; gui_draw_tabs(rcx=lpdis) - paint the multi-vault tab strip: one tab per open
+;   vault (lock glyph + display name), the fronted vault highlighted.
+gui_draw_tabs proc frame
+    FRAME_PROLOG 160
+    mov     qword ptr [rbp-24], rcx
+    mov     r10, rcx
+    mov     rax, qword ptr [r10+32]
+    mov     qword ptr [rbp-32], rax           ; hDC
+    mov     eax, dword ptr [r10+40]           ; control rect
+    mov     dword ptr [rbp-80], eax
+    mov     eax, dword ptr [r10+44]
+    mov     dword ptr [rbp-76], eax
+    mov     eax, dword ptr [r10+48]
+    mov     dword ptr [rbp-72], eax
+    mov     eax, dword ptr [r10+52]
+    mov     dword ptr [rbp-68], eax
+    WINCALL CreateSolidBrush, dword ptr [g_col_bg]
+    mov     qword ptr [rbp-48], rax
+    WINCALL FillRect, qword ptr [rbp-32], addr rbp-80, qword ptr [rbp-48]
+    WINCALL DeleteObject, qword ptr [rbp-48]
+    WINCALL SetBkMode, qword ptr [rbp-32], 1  ; TRANSPARENT
+    mov     dword ptr [rbp-40], 0             ; i
+    mov     dword ptr [rbp-44], 0             ; x
+gdt_loop:
+    mov     eax, dword ptr [rbp-40]
+    cmp     eax, dword ptr [g_vault_n]
+    jae     gdt_done
+    mov     eax, dword ptr [rbp-44]           ; tab rect
+    mov     dword ptr [rbp-120], eax
+    mov     dword ptr [rbp-116], 0
+    add     eax, TAB_W
+    mov     dword ptr [rbp-112], eax
+    mov     eax, dword ptr [rbp-68]
+    mov     dword ptr [rbp-108], eax
+    mov     eax, dword ptr [rbp-40]           ; active tab -> panel fill
+    cmp     eax, dword ptr [g_vault_cur]
+    jne     gdt_txtcol
+    WINCALL CreateSolidBrush, dword ptr [g_col_panel]
+    mov     qword ptr [rbp-48], rax
+    WINCALL FillRect, qword ptr [rbp-32], addr rbp-120, qword ptr [rbp-48]
+    WINCALL DeleteObject, qword ptr [rbp-48]
+gdt_txtcol:
+    mov     eax, dword ptr [rbp-40]
+    cmp     eax, dword ptr [g_vault_cur]
+    jne     gdt_dim
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_text]
+    jmp     gdt_glyph
+gdt_dim:
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_textdim]
+gdt_glyph:
+    mov     word ptr [rbp-136], GLY_VAULT     ; glyph scratch (stack-local)
+    mov     word ptr [rbp-134], 0
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_font_icon]
+    mov     qword ptr [rbp-56], rax           ; old font
+    mov     eax, dword ptr [rbp-120]
+    add     eax, 6
+    mov     dword ptr [rbp-104], eax
+    mov     eax, dword ptr [rbp-116]
+    mov     dword ptr [rbp-100], eax
+    mov     eax, dword ptr [rbp-120]
+    add     eax, 22
+    mov     dword ptr [rbp-96], eax
+    mov     eax, dword ptr [rbp-108]
+    mov     dword ptr [rbp-92], eax
+    WINCALL DrawTextW, qword ptr [rbp-32], addr rbp-136, -1, addr rbp-104, 24h
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-56]
+    mov     ecx, dword ptr [rbp-40]           ; tab name
+    call    vault_ctx_nameptr
+    mov     qword ptr [rbp-64], rax
+    mov     eax, dword ptr [rbp-120]
+    add     eax, 24
+    mov     dword ptr [rbp-104], eax
+    mov     eax, dword ptr [rbp-116]
+    mov     dword ptr [rbp-100], eax
+    mov     eax, dword ptr [rbp-112]
+    sub     eax, 22                            ; leave room for the close x
+    mov     dword ptr [rbp-96], eax
+    mov     eax, dword ptr [rbp-108]
+    mov     dword ptr [rbp-92], eax
+    WINCALL DrawTextW, qword ptr [rbp-32], qword ptr [rbp-64], -1, addr rbp-104, 24h
+    cmp     dword ptr [g_vault_n], 1           ; close x (only with >1 vault)
+    jbe     gdt_next
+    mov     word ptr [rbp-136], GLY_CLOSE
+    mov     word ptr [rbp-134], 0
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_textdim]
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_font_icon]
+    mov     qword ptr [rbp-56], rax
+    mov     eax, dword ptr [rbp-112]
+    sub     eax, 20
+    mov     dword ptr [rbp-104], eax
+    mov     eax, dword ptr [rbp-116]
+    mov     dword ptr [rbp-100], eax
+    mov     eax, dword ptr [rbp-112]
+    sub     eax, 4
+    mov     dword ptr [rbp-96], eax
+    mov     eax, dword ptr [rbp-108]
+    mov     dword ptr [rbp-92], eax
+    WINCALL DrawTextW, qword ptr [rbp-32], addr rbp-136, -1, addr rbp-104, 25h
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-56]
+gdt_next:
+    mov     eax, dword ptr [rbp-44]
+    add     eax, TAB_W
+    mov     dword ptr [rbp-44], eax
+    inc     dword ptr [rbp-40]
+    jmp     gdt_loop
+gdt_done:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gui_draw_tabs endp
+
+; gui_switch_vault(rcx=hdlg, edx=idx) - front vault idx and repopulate the UI
+;   (clear search, rebuild the sidebar, select its first entry, repaint tabs).
+gui_switch_vault proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    mov     ecx, edx
+    call    vault_ctx_front                  ; swap live state (incl g_vpath) to vault idx
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_SEARCH, addr w_empty
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_poplist
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_GETCOUNT, 0, 0
+    test    eax, eax
+    jz      gsv_repaint
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_SETCURSEL, 0, 0
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_GETITEMDATA, 0, 0
+    mov     dword ptr [rbp-32], eax
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-32]
+    call    gui_showdetail
+    mov     rcx, qword ptr [rbp-24]
+    xor     edx, edx
+    call    gui_set_editmode
+gsv_repaint:
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_V_TABS
+    WINCALL InvalidateRect, rax, 0, 1
+    FRAME_EPILOG
+    ret
+gui_switch_vault endp
+
+; gui_tab_click(rcx=hdlg) - a click on the tab strip: switch to the clicked tab,
+;   or open an additional vault if the click landed past the last tab.
+gui_tab_click proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    WINCALL GetCursorPos, addr rbp-40         ; POINT{x=[rbp-40], y=[rbp-36]}
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_V_TABS
+    WINCALL ScreenToClient, rax, addr rbp-40
+    mov     eax, dword ptr [rbp-40]           ; client x
+    test    eax, eax
+    js      gtc_done                          ; left of the strip -> ignore
+    xor     edx, edx
+    mov     ecx, TAB_W
+    div     ecx                                ; eax = x / TAB_W
+    mov     dword ptr [rbp-32], eax
+    cmp     eax, dword ptr [g_vault_n]
+    jae     gtc_add
+    cmp     dword ptr [g_vault_n], 1           ; close-x region? (only with >1 vault)
+    jbe     gtc_switch
+    mov     eax, dword ptr [rbp-40]            ; x
+    mov     ecx, dword ptr [rbp-32]
+    imul    ecx, ecx, TAB_W
+    sub     eax, ecx                           ; xInTab
+    cmp     eax, TAB_W - 22
+    jl      gtc_switch
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-32]
+    call    gui_close_vault
+    jmp     gtc_done
+gtc_switch:
+    mov     eax, dword ptr [rbp-32]
+    cmp     eax, dword ptr [g_vault_cur]
+    je      gtc_done                           ; already fronted
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-32]
+    call    gui_switch_vault
+    jmp     gtc_done
+gtc_add:
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_open_additional
+gtc_done:
+    FRAME_EPILOG
+    ret
+gui_tab_click endp
+
+; gui_open_additional(rcx=hdlg) - pick + unlock another vault into a new tab.
+;   Order matters: snapshot the current vault FIRST (its g_vpath is still intact),
+;   then overwrite g_vpath with the picked file and load it.  Rolls back on
+;   cancel / unlock failure by dropping the slot and restoring the previous vault.
+gui_open_additional proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    cmp     dword ptr [g_vault_n], 8          ; MAX_VAULTS
+    jae     goa_done
+    mov     eax, dword ptr [g_vault_cur]
+    mov     dword ptr [rbp-32], eax           ; saved old cur (rollback target)
+    call    vault_ctx_open                    ; snapshot current (correct g_vpath) -> its slot
+    lea     rcx, [g_ofn]
+    mov     edx, sizeof OPENFILENAMEW
+    call    secure_zero
+    lea     r10, [g_ofn]
+    mov     dword ptr [r10].OPENFILENAMEW.lStructSize, sizeof OPENFILENAMEW
+    mov     rax, qword ptr [rbp-24]
+    mov     qword ptr [r10].OPENFILENAMEW.hwndOwner, rax
+    lea     rax, [g_vaultfilter]
+    mov     qword ptr [r10].OPENFILENAMEW.lpstrFilter, rax
+    lea     rax, [g_vpath]
+    mov     qword ptr [r10].OPENFILENAMEW.lpstrFile, rax
+    mov     dword ptr [r10].OPENFILENAMEW.nMaxFile, 1024
+    mov     dword ptr [r10].OPENFILENAMEW.nFilterIndex, 1
+    mov     dword ptr [r10].OPENFILENAMEW.Flags, OFN_FILEMUSTEXIST or OFN_PATHMUSTEXIST or OFN_HIDEREADONLY or OFN_EXPLORER
+    WINCALL GetOpenFileNameW, addr g_ofn
+    test    eax, eax
+    jz      goa_rollback                       ; cancelled
+    lea     rax, [g_vpath]                     ; unlock the picked vault: TPM, else password
+    mov     qword ptr [g_cfg_in], rax
+    call    gui_try_tpm_auto
+    test    eax, eax
+    jnz     goa_loaded
+    WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_UNLOCK, qword ptr [rbp-24], addr unlock_proc, 0
+    cmp     rax, 1
+    jne     goa_rollback
+goa_loaded:
+    lea     rcx, [g_vpath]                     ; name the new tab from the basename
+    call    gui_basename
+    mov     ecx, dword ptr [g_vault_cur]
+    lea     rdx, [g_imgfn_w]
+    call    vault_ctx_setname
+    mov     rcx, qword ptr [rbp-24]            ; repopulate for the new vault + repaint tabs
+    mov     edx, dword ptr [g_vault_cur]
+    call    gui_switch_vault
+    jmp     goa_done
+goa_rollback:
+    mov     eax, dword ptr [g_vault_n]         ; drop the claimed slot
+    dec     eax
+    mov     dword ptr [g_vault_n], eax
+    mov     ecx, dword ptr [rbp-32]            ; restore the previous vault (g_vpath + state)
+    call    vault_ctx_front
+goa_done:
+    FRAME_EPILOG
+    ret
+gui_open_additional endp
+
+; gui_close_vault(rcx=hdlg, edx=idx) - close a vault tab: securely wipe its key +
+;   decrypted body, compact the ctx array, adjust the fronted index, repaint.
+;   Closing the last remaining vault locks everything (the normal WM_CLOSE path).
+gui_close_vault proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-32], edx
+    cmp     dword ptr [g_vault_n], 2
+    jae     gcv_multi
+    WINCALL PostMessageW, qword ptr [rbp-24], WM_CLOSE, 0, 0   ; last vault -> lock all
+    jmp     gcv_done
+gcv_multi:
+    mov     eax, dword ptr [rbp-32]           ; closing the fronted vault? switch away first
+    cmp     eax, dword ptr [g_vault_cur]
+    jne     gcv_drop
+    mov     eax, dword ptr [rbp-32]           ; neighbor = (idx ? idx-1 : 1)
+    test    eax, eax
+    jnz     @F
+    mov     eax, 1
+    jmp     gcv_tgt
+@@: dec     eax
+gcv_tgt:
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, eax
+    call    gui_switch_vault                  ; snapshots the closing vault into its slot
+gcv_drop:
+    mov     ecx, dword ptr [rbp-32]           ; wipe + compact + adjust cur (vault.asm)
+    call    vault_ctx_close
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_V_TABS
+    WINCALL InvalidateRect, rax, 0, 1
+gcv_done:
+    FRAME_EPILOG
+    ret
+gui_close_vault endp
+
+; =============================================================================
 ; vault_proc - DLG_VAULT dialog procedure (raw frame).
 ; =============================================================================
 vault_proc proc
@@ -8616,10 +10517,67 @@ vault_proc proc
     je      vp_tcolor
     cmp     rdx, WM_CTLCOLORSTATIC
     je      vp_tcolor
+    cmp     rdx, WM_SIZE_
+    je      vp_size
+    cmp     rdx, WM_GETMINMAXINFO_
+    je      vp_minmax
+    cmp     rdx, WM_NCHITTEST_
+    je      vp_nchit
     xor     eax, eax
     jmp     vp_ret
 vp_tcolor:
     call    gui_ctlcolor                     ; theme + link-blue for view-mode URL values
+    jmp     vp_ret
+vp_nchit:
+    mov     rcx, qword ptr [rbp-8]           ; custom frame: drag the empty title strip
+    call    frame_hittest                    ;   (r9 already = lParam screen point)
+    test    eax, eax
+    jz      vp_nchit_def
+    mov     eax, 1                           ; handled: DWLP_MSGRESULT = HTCAPTION
+    jmp     vp_ret
+vp_nchit_def:
+    xor     eax, eax                         ; not in strip -> DefDlgProc default hittest
+    jmp     vp_ret
+vp_size:
+    mov     rcx, qword ptr [rbp-8]           ; responsive reflow of anchored controls
+    call    gui_reflow
+    mov     rcx, qword ptr [rbp-8]           ; keep the caption buttons right-aligned
+    call    frame_layout
+    xor     eax, eax
+    jmp     vp_ret
+vp_min:
+    WINCALL ShowWindow, qword ptr [rbp-8], SW_MINIMIZE_
+    xor     eax, eax
+    jmp     vp_ret
+vp_maxtoggle:
+    WINCALL IsZoomed, qword ptr [rbp-8]
+    test    eax, eax
+    jz      vp_domax
+    WINCALL ShowWindow, qword ptr [rbp-8], SW_RESTORE_
+    xor     eax, eax
+    jmp     vp_ret
+vp_domax:
+    WINCALL ShowWindow, qword ptr [rbp-8], SW_MAXIMIZE_
+    xor     eax, eax
+    jmp     vp_ret
+vp_searchfocus:
+    mov     rcx, qword ptr [rbp-8]           ; open the blended search overlay
+    call    search_overlay_open
+    xor     eax, eax
+    jmp     vp_ret
+vp_minmax:
+    mov     r10, r9                          ; MINMAXINFO: ptMinTrackSize at +24
+    mov     eax, dword ptr [g_base_winw]
+    test    eax, eax
+    jz      vp_minmax_max                    ; not recorded yet -> leave min default
+    mov     dword ptr [r10+24], eax
+    mov     eax, dword ptr [g_base_winh]
+    mov     dword ptr [r10+28], eax
+vp_minmax_max:
+    mov     rcx, qword ptr [rbp-8]           ; keep maximize inside the work area
+    mov     rdx, r9                          ;   (borderless would cover the taskbar)
+    call    frame_maxinfo
+    xor     eax, eax
     jmp     vp_ret
 vp_drop:
     cmp     dword ptr [g_editmode], 0        ; only accept drops while editing an entry
@@ -8656,10 +10614,39 @@ vp_measure_menu:
     mov     eax, 1
     jmp     vp_ret
 vp_compare:
-    mov     r10, r9                          ; COMPAREITEMSTRUCT: idx at +24/+40
+    mov     r10, r9                          ; COMPAREITEMSTRUCT: item data at +24/+40
+    cmp     dword ptr [g_xr_active], 0
+    jne     vp_compare_xr
     mov     ecx, dword ptr [r10+24]
     mov     edx, dword ptr [r10+40]
     call    gui_title_cmp
+    jmp     vp_ret
+vp_compare_xr:
+    mov     ecx, dword ptr [r10+24]          ; cross-vault: sort by cached score (desc)
+    cmp     ecx, dword ptr [g_xr_n]          ; guard against foreign item data
+    jae     vpc_eq
+    mov     edx, dword ptr [r10+40]
+    cmp     edx, dword ptr [g_xr_n]
+    jae     vpc_eq
+    call    xr_ptr
+    mov     r11d, dword ptr [rax+XR.xr_score]
+    mov     r10, r9
+    mov     ecx, dword ptr [r10+40]
+    call    xr_ptr
+    mov     eax, dword ptr [rax+XR.xr_score]
+    cmp     r11d, eax
+    jg      vpc_a
+    jl      vpc_b
+    xor     eax, eax
+    jmp     vp_ret
+vpc_a:
+    mov     eax, -1
+    jmp     vp_ret
+vpc_b:
+    mov     eax, 1
+    jmp     vp_ret
+vpc_eq:
+    xor     eax, eax
     jmp     vp_ret
 vp_tpaint:
     mov     rcx, qword ptr [rbp-8]
@@ -8694,6 +10681,10 @@ vp_tdraw:
     je      vp_tdraw_tnoprev
     cmp     eax, IDC_V_LIST                   ; the entry list = icon cards
     je      vp_tdraw_list
+    cmp     eax, IDC_SO_LIST                  ; search-overlay results
+    je      vp_tdraw_solist
+    cmp     eax, IDC_V_TABS                   ; multi-vault tab strip
+    je      vp_tdraw_tabs
     cmp     eax, IDC_V_HEADER                 ; detail-pane header (tile + title)
     je      vp_tdraw_header
     cmp     eax, IDC_V_ICON                   ; edit-mode icon tile before the title
@@ -8724,6 +10715,18 @@ vp_tdraw_header:
 vp_tdraw_icon:
     mov     rcx, r9
     call    gui_draw_iconbtn
+    mov     eax, 1
+    jmp     vp_ret
+vp_tdraw_tabs:
+    mov     rcx, r9
+    call    gui_draw_tabs
+    mov     eax, 1
+    jmp     vp_ret
+vp_tdraw_solist:
+    cmp     dword ptr [g_xr_active], 0        ; cross-vault results use the cached painter
+    je      vp_tdraw_list
+    mov     rcx, r9
+    call    gui_draw_xresult
     mov     eax, 1
     jmp     vp_ret
 vp_tdraw_colorpw:
@@ -8852,6 +10855,7 @@ vp_t_search:
 vp_init:
     mov     rax, qword ptr [rbp-8]            ; remember the window for the tray toggle
     mov     qword ptr [g_vaulthwnd], rax
+    WINCALL SetWindowTextW, qword ptr [rbp-8], addr g_vault_title  ; taskbar/Alt-Tab + single-instance FindWindow
     WINCALL DragAcceptFiles, qword ptr [rbp-8], 1   ; accept Explorer file drops
     mov     rcx, qword ptr [rbp-8]           ; Vordr shield in the title bar
     call    gui_set_winicon
@@ -8874,6 +10878,51 @@ vp_init:
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_REMOVE, addr wb_rem
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_OVFL, addr wb_more
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_FAV, addr wb_star
+    WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_HDREDIT, addr wb_edit
+    WINCALL GetDlgItem, qword ptr [rbp-8], IDC_V_OVFL   ; header "..." -> frameless ghost
+    mov     rcx, qword ptr [rbp-8]
+    mov     rdx, rax
+    mov     r8d, GLY_MORE
+    lea     r9, [gt_more]
+    call    ghost_attach
+    WINCALL GetDlgItem, qword ptr [rbp-8], IDC_V_FAV    ; header favorite -> frameless ghost
+    mov     rcx, qword ptr [rbp-8]                       ;   (dynamic glyph via ghost_set_glyph)
+    mov     rdx, rax
+    mov     r8d, GLY_FAV_OFF
+    lea     r9, [gt_fav]
+    call    ghost_attach
+    WINCALL GetDlgItem, qword ptr [rbp-8], IDC_V_HDREDIT ; header edit -> frameless ghost (D1 dock)
+    mov     rcx, qword ptr [rbp-8]
+    mov     rdx, rax
+    mov     r8d, GLY_EDIT
+    lea     r9, [gt_edit]
+    call    ghost_attach
+    WINCALL GetDlgItem, qword ptr [rbp-8], IDC_V_ADD     ; sidebar toolbar -> frameless ghosts
+    mov     rcx, qword ptr [rbp-8]
+    mov     rdx, rax
+    mov     r8d, GLY_NEW
+    lea     r9, [gt_new]
+    call    ghost_attach
+    WINCALL GetDlgItem, qword ptr [rbp-8], IDC_V_EDIT
+    mov     rcx, qword ptr [rbp-8]
+    mov     rdx, rax
+    mov     r8d, GLY_EDIT
+    lea     r9, [gt_edit]
+    call    ghost_attach
+    WINCALL GetDlgItem, qword ptr [rbp-8], IDC_V_REMOVE
+    mov     rcx, qword ptr [rbp-8]
+    mov     rdx, rax
+    mov     r8d, GLY_DELETE
+    lea     r9, [gt_rem]
+    call    ghost_attach
+    WINCALL GetDlgItem, qword ptr [rbp-8], IDC_V_GENERATE ; sidebar dock: generate -> ghost
+    mov     rcx, qword ptr [rbp-8]
+    mov     rdx, rax
+    mov     r8d, GLY_GENERATE
+    lea     r9, [gt_gen]
+    call    ghost_attach
+    WINCALL GetDlgItem, qword ptr [rbp-8], IDC_V_LIST    ; type-to-search: keystrokes on
+    WINCALL SetWindowSubclass, rax, addr search_type_subclass, 0, 0   ;  the list -> search box
     mov     dword ptr [g_trash_view], 0       ; start in the vault (not the trash) view
     mov     dword ptr [g_deleted_state], 0
     call    gui_purge_trash                   ; drop entries trashed > 30 days ago
@@ -8909,6 +10958,16 @@ vp_init:
     mov     rcx, rax
     call    SetFocus
     add     rsp, 32
+    mov     rcx, qword ptr [rbp-8]            ; custom frame: shift content below the strip,
+    call    frame_shift                       ;   grow to preserve size, then build the strip
+    mov     rcx, qword ptr [rbp-8]
+    call    frame_grow
+    mov     rcx, qword ptr [rbp-8]
+    call    frame_build
+    mov     rcx, qword ptr [rbp-8]            ; build the (hidden) search overlay, topmost
+    call    search_overlay_build
+    mov     rcx, qword ptr [rbp-8]            ; record control rects for responsive resize
+    call    gui_anchor_init
     xor     eax, eax                          ; we set focus ourselves -> return FALSE
     jmp     vp_ret
 vp_cmd:
@@ -8923,6 +10982,8 @@ vp_cmd:
     jne     vp_cmd_disp
     cmp     eax, IDC_V_SEARCH                 ; query changed -> re-filter the list
     je      vp_searchchg
+    cmp     eax, IDC_SO_EDIT                  ; overlay query changed -> refilter results
+    je      vp_so_change
     cmp     eax, IDC_V_TITLE
     je      vp_setdirty
     cmp     eax, IDC_DYN_BASE                 ; any runtime row value/label edit
@@ -8934,13 +10995,35 @@ vp_cmd_disp:
     jnz     vp_handled                        ;   an edit's stray notifs (EN_UPDATE, EN_MAXTEXT,
     jmp     vp_dyn                            ;   ...) must never fire a row button action
 vp_cmd_fixed:
+    cmp     eax, IDC_T_CLOSE                  ; custom caption buttons
+    je      vp_close
+    cmp     eax, IDC_T_MIN
+    je      vp_min
+    cmp     eax, IDC_T_MAX
+    je      vp_maxtoggle
+    cmp     eax, IDC_T_SEARCH                 ; title-bar search pill -> focus the search box
+    je      vp_searchfocus
+    cmp     eax, IDC_T_NEW                    ; title-bar control dock
+    je      vp_add
+    cmp     eax, IDC_T_GEN
+    je      vp_gen_standalone
+    cmp     eax, IDC_T_SET
+    je      vp_menu
+    cmp     eax, IDC_SO_LIST                  ; search-overlay results
+    je      vp_so_list
+    cmp     eax, IDC_V_TABS                   ; multi-vault tab strip click
+    je      vp_tabclick
     cmp     eax, IDC_V_LIST
     je      vp_list
     cmp     eax, IDC_V_ADDFIELD
     je      vp_addfield
     cmp     eax, IDC_V_ADD
     je      vp_add
+    cmp     eax, IDC_V_GENERATE
+    je      vp_gen_standalone
     cmp     eax, IDC_V_EDIT
+    je      vp_edit
+    cmp     eax, IDC_V_HDREDIT                    ; header command-dock edit button
     je      vp_edit
     cmp     eax, IDC_V_SAVE
     je      vp_save
@@ -9111,6 +11194,22 @@ vp_searchchg:
 vp_search_now:
     mov     rcx, qword ptr [rbp-8]            ; refilter the entry list immediately
     call    gui_poplist
+    jmp     vp_handled
+vp_so_change:
+    mov     rcx, qword ptr [rbp-8]            ; overlay: refilter the results list live
+    call    search_overlay_populate
+    jmp     vp_handled
+vp_so_list:
+    cmp     r10d, LBN_DBLCLK                  ; double-click a result -> open it
+    jne     vp_handled
+    mov     rcx, qword ptr [rbp-8]
+    call    search_overlay_activate
+    jmp     vp_handled
+vp_tabclick:
+    test    r10d, r10d                        ; BN_CLICKED only
+    jnz     vp_handled
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_tab_click
     jmp     vp_handled
 vp_focusin:
     cmp     dword ptr [g_editmode], 0
@@ -9324,30 +11423,27 @@ vpd_del:
     mov     rcx, qword ptr [rbp-8]
     call    gui_row_delete
     jmp     vp_handled
+vp_gen_standalone:
+    ; sidebar dock: open the password generator with no target field (standalone)
+    mov     dword ptr [g_pg_target], -1
+    cmp     dword ptr [g_pg_len], 0
+    jne     @F
+    mov     dword ptr [g_pg_len], 16
+    mov     dword ptr [g_pg_style], 0
+    mov     dword ptr [g_pg_opt], PWCLASS_U or PWCLASS_L or PWCLASS_D
+@@: WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_PWGEN, qword ptr [rbp-8], addr pwgen_proc, 0
+    jmp     vp_handled
 vp_add:
     ; adding a new entry discards any unsaved inline edits to the current one
     ; (edits are only persisted by an explicit Save)
     mov     dword ptr [g_dirty], 0
+    mov     rcx, qword ptr [rbp-8]            ; choose a template (Login/Card/Identity/Note)
+    call    gui_pick_template
+    cmp     eax, -1
+    je      vp_handled                       ; menu cancelled -> no new entry
+    mov     edx, eax                         ; build the field list from the template
+    call    gui_build_template
 va_build:
-    ; new record = Title "New entry" + empty Username + Password + Notes (last)
-    lea     r10, [g_field_list]
-    mov     qword ptr [r10+0], VF_TITLE
-    mov     qword ptr [r10+8], 0
-    lea     rax, [wt_newentry]
-    mov     qword ptr [r10+16], rax
-    mov     qword ptr [r10+24], VF_USERNAME
-    mov     qword ptr [r10+32], 0
-    lea     rax, [g_empty_w]
-    mov     qword ptr [r10+40], rax
-    mov     qword ptr [r10+48], VF_SECRET
-    mov     qword ptr [r10+56], 0
-    lea     rax, [g_empty_w]
-    mov     qword ptr [r10+64], rax
-    mov     qword ptr [r10+72], VF_NOTES
-    mov     qword ptr [r10+80], 0
-    lea     rax, [g_empty_w]
-    mov     qword ptr [r10+88], rax
-    mov     dword ptr [g_field_n], 4
     call    vault_build_entry
     test    eax, eax
     jnz     vp_handled
@@ -12581,7 +14677,17 @@ go_create_res:
     cmp     rax, 1
     jne     go_reset
 go_vault:
+    cmp     dword ptr [g_vault_n], 0         ; register the fronted vault as tab 0 (once)
+    jne     go_vault_show
+    call    vault_ctx_open
+    lea     rcx, [g_vpath]
+    call    gui_basename                    ; basename -> g_imgfn_w
+    xor     ecx, ecx
+    lea     rdx, [g_imgfn_w]
+    call    vault_ctx_setname
+go_vault_show:
     WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_VAULT, qword ptr [rbp-24], addr vault_proc, 0
+    call    vault_ctx_reset                 ; leaving the vault -> forget open contexts
     call    vault_lock                      ; wipe body + key, minimise to tray
     call    gui_clipclear
     call    gui_resolve_vault               ; refresh create/open state for next time
@@ -13035,7 +15141,11 @@ gui_main proc frame
     call    tpm_available
     mov     dword ptr [g_tpm_present], eax
     call    gui_load_policy
+ifdef DBG_SHOW
+    mov     dword ptr [g_secunlock], 0      ; debug: use the normal desktop so the GUI is inspectable
+endif
     call    gui_resolve_vault
+    call    vault_ctx_reset                 ; multi-vault: no open contexts yet (cur = -1)
     ; ---- register + create the hidden tray-owner window --------------------
     lea     rcx, [g_wc]
     mov     edx, 80
@@ -13053,6 +15163,9 @@ gui_main proc frame
     mov     qword ptr [g_trayhwnd], rax
     mov     rcx, rax
     call    gui_tray_add
+ifdef DBG_SHOW
+    WINCALL PostMessageW, qword ptr [g_trayhwnd], WM_TRAYICON, 0, WM_LBUTTONUP  ; auto-open the vault
+endif
     ; ---- message loop (start minimised to the tray) -----------------------
 gm_msg:
     WINCALL GetMessageW, addr g_msg, 0, 0, 0

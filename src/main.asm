@@ -52,6 +52,9 @@ extern cmd_bktest:proc                  ; atomic-save + backup rotation probe (v
 extern cmd_mactest:proc                 ; full-file MAC tamper-detection probe (vault.asm)
 extern cmd_rbtest:proc                  ; anti-rollback detection probe (vault.asm)
 extern cmd_xctest:proc                  ; external-change detection probe (vault.asm)
+extern cmd_mvtest:proc                  ; multi-vault state snapshot/restore probe (vault.asm)
+extern cmd_mvswitch:proc                ; multi-vault context switch probe (vault.asm)
+extern cmd_avtest:proc                  ; availability retry state-machine probe (vault.asm)
 extern cmd_pkat:proc                    ; parallel fail-closed KAT gate (selftest.asm)
 extern read_file:proc
 ifdef DBG_TRACE
@@ -178,6 +181,9 @@ WSTR w_rbtest,   <rbtest>
 WSTR w_xctest,   <xctest>
 WSTR w_pkat,     <pkat>
 WSTR w_trtest,   <trtest>
+WSTR w_mvtest,   <mvtest>
+WSTR w_mvswitch, <mvswitch>
+WSTR w_avtest,   <avtest>
 ifdef DBG_TRACE
 WSTR w_securedesk, <securedesk>
 endif
@@ -225,6 +231,9 @@ cmd_table label CMDENT
     CMDENT { w_mactest,   cmd_mactest,   1, 0 }   ; full-file MAC tamper-detection probe
     CMDENT { w_rbtest,    cmd_rbtest,    1, 0 }   ; anti-rollback detection probe
     CMDENT { w_xctest,    cmd_xctest,    1, 0 }   ; external-change detection probe
+    CMDENT { w_mvtest,    cmd_mvtest,    0, 0 }   ; multi-vault snapshot/restore probe
+    CMDENT { w_mvswitch,  cmd_mvswitch,  0, 0 }   ; multi-vault context switch probe
+    CMDENT { w_avtest,    cmd_avtest,    0, 0 }   ; availability retry state-machine probe
     CMDENT { w_pkat,      cmd_pkat,      0, 0 }   ; parallel fail-closed KAT gate
     CMDENT { w_trtest,    cmd_trtest,    0, 0 }   ; trash timestamp/threshold KAT
 ifdef DBG_TRACE
