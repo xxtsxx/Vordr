@@ -4858,6 +4858,33 @@ gui_reload_safe proc frame
     ret
 gui_reload_safe endp
 
+; gui_check_refresh(rcx = hdlg) - C8.4: if the vault changed on disk and we have
+;   no unsaved edit, silently reload it (existing key, no re-KDF) and refresh the
+;   list.  Called from the idle poll.  Skips while editing/dirty so the reload-safe
+;   save path (gui_commit) owns the conflict then.
+gui_check_refresh proc frame
+    FRAME_PROLOG 32
+    mov     qword ptr [rbp-24], rcx
+    call    vault_count                       ; 0 = locked/closed -> nothing to do
+    test    eax, eax
+    jz      gcr2_done
+    cmp     dword ptr [g_editmode], 0          ; editing -> don't disturb the user
+    jne     gcr2_done
+    cmp     dword ptr [g_dirty], 0             ; unsaved change -> defer to the save path
+    jne     gcr2_done
+    call    vault_ext_changed
+    test    eax, eax
+    jz      gcr2_done
+    call    vault_reload
+    test    eax, eax
+    jnz     gcr2_done                          ; reload failed -> leave as is
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_poplist
+gcr2_done:
+    FRAME_EPILOG
+    ret
+gui_check_refresh endp
+
 ; gui_set_editmode(rcx=hdlg, edx=on) - 1 = detail fields editable (edit mode),
 ;   0 = read-only (view).  Toggles EM_SETREADONLY on the six fields and swaps
 ;   the toolbar pencil glyph for a check mark while editing.
@@ -9471,9 +9498,7 @@ msv_idle:
     mov     edx, dword ptr [g_idle_min]
     call    cfg_set_dword_hkcu
 msv_idle_arm:
-    WINCALL KillTimer, qword ptr [rbp-24], IDLE_TIMER   ; re-arm to the new value
-    cmp     dword ptr [g_idle_min], 0
-    je      msv_wlk
+    WINCALL KillTimer, qword ptr [rbp-24], IDLE_TIMER   ; re-arm the poll (auto-lock + C8.4)
     WINCALL SetTimer, qword ptr [rbp-24], IDLE_TIMER, IDLE_POLL_MS, 0
 msv_wlk:
     cmp     dword ptr [g_winlock_lock], 0       ; lock-with-Windows toggle
@@ -10896,7 +10921,9 @@ vp_wts:
     je      vp_handled
     jmp     vp_lock
 vp_t_idle:
-    cmp     dword ptr [g_idle_min], 0         ; setting turned off since arming
+    mov     rcx, qword ptr [rbp-8]            ; C8.4: refresh if the vault changed on disk
+    call    gui_check_refresh                ;   and we have no unsaved edit (silent)
+    cmp     dword ptr [g_idle_min], 0         ; auto-lock: setting turned off since arming
     je      vp_handled
     sub     rsp, 32                           ; one of OUR modal popups active?
     call    GetActiveWindow                   ;   (thread-local; NULL if another app
@@ -11038,10 +11065,7 @@ vp_init:
     call    gui_set_editmode
     ; auto-lock: Win+L notifications (gated by g_winlock on receipt) + idle poll
     WINCALL WTSRegisterSessionNotification, qword ptr [rbp-8], 0  ; NOTIFY_FOR_THIS_SESSION
-    cmp     dword ptr [g_idle_min], 0
-    je      @F
-    WINCALL SetTimer, qword ptr [rbp-8], IDLE_TIMER, IDLE_POLL_MS, 0
-@@:
+    WINCALL SetTimer, qword ptr [rbp-8], IDLE_TIMER, IDLE_POLL_MS, 0  ; poll: auto-lock + C8.4 refresh
     sub     rsp, 32                          ; foreground the window so keystrokes land
     mov     rcx, qword ptr [rbp-8]            ;   here (launched from the tray, it is
     call    SetForegroundWindow              ;   otherwise visible but not active)
