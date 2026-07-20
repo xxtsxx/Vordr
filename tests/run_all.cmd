@@ -9,8 +9,9 @@ rem              Skipped with --quick.
 rem   build      release build via build.cmd strict (framecheck FATALs gate it)
 rem   selftest   bin\vordr.exe selftest must print "all self-tests passed"
 rem   roundtrip  headless probes: seedtest -> atgen -> zitest -> phtest ->
-rem              secscan -> tmptest -> fztest -> trtest -> vfuzz -> fuzzzip ->
-rem              bktest -> mactest -> rbtest -> xctest -> pkat
+rem              secscan -> lktest -> tmptest -> fztest -> trtest -> vfuzz ->
+rem              fuzzzip -> bktest -> mactest -> rbtest -> xctest -> reload ->
+rem              cowrite -> pkat -> mvtest -> mvswitch -> avtest
 rem
 rem Usage: tests\run_all.cmd [--quick]
 rem Exit:  0 = all stages passed, 1 = at least one FAIL (see the summary table).
