@@ -22,7 +22,7 @@ The format follows a strict container discipline:
 
 ---
 
-## Vault file `.vordr` (magic `"VRDR"`, v1)
+## Vault file `.vordr` (magic `"VRDR"`, v2)
 
 One encrypted file holds the entire vault. On unlock it is decrypted into
 `secmem` (VirtualLock'd) memory; on change it is re-sealed and atomically
@@ -33,7 +33,7 @@ replaced.
 
 header (80 bytes, = GCM AAD):
     magic       dd    "VRDR"
-    version     dd    1
+    version     dd    2                      ; v2 = FMAC trailer mandatory
     t_cost      dd    Argon2id passes        (default 3)
     m_cost_kib  dd    Argon2id memory KiB    (default 524288 = 512 MiB)
     lanes       dd    Argon2id parallelism   (1)
@@ -112,8 +112,13 @@ per-vault under `HKCU\SOFTWARE\Vordr\Rollback` (value name = vault path); on
 unlock, a file whose counter is *older* than the mirror sets `g_rollback`
 and the GUI warns — a served-stale-copy / accidental-restore tripwire (a
 user-writable mirror is not a hard boundary, and is documented as such in
-`regcfg.asm`). Legacy vaults without the trailing magic open normally and
-gain the trailer on their next save.
+`regcfg.asm`). **The trailer is mandatory in v2:** `vault_unlock` rejects any
+file whose header version is not the current `VAULT_VERSION`, and independently
+rejects a v2 image that lacks a valid FMAC trailer (`EXIT_AUTH`). This closes a
+downgrade where an attacker stripped the trailer to splice unauthenticated bytes
+into the attachment section (which GCM does not cover). Every save writes the
+trailer, so a well-formed v2 vault always has it; the v1 format (which tolerated
+a missing trailer) is no longer accepted.
 
 ---
 
