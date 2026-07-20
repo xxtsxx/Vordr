@@ -56,6 +56,7 @@ extern cmd_rbtest:proc                  ; anti-rollback detection probe (vault.a
 extern cmd_reload:proc                  ; C8: vault_reload refresh probe (vault.asm)
 extern cmd_cowrite:proc                 ; C8: write-lock exclusivity probe (vault.asm)
 extern cmd_attfuzz:proc                 ; G8: attachment-index fuzzer (vault.asm)
+extern cmd_healthkat:proc               ; E6: vault-health analysis KAT (vault.asm)
 extern cmd_xctest:proc                  ; external-change detection probe (vault.asm)
 extern cmd_mvtest:proc                  ; multi-vault state snapshot/restore probe (vault.asm)
 extern cmd_mvswitch:proc                ; multi-vault context switch probe (vault.asm)
@@ -198,6 +199,7 @@ WSTR w_ro,       <--ro>                  ; E9: GUI read-only launch flag (not a 
 WSTR w_reload,   <reload>                ; C8: vault_reload refresh probe
 WSTR w_cowrite,  <cowrite>               ; C8: write-lock exclusivity probe
 WSTR w_attfuzz,  <attfuzz>               ; G8: attachment-index fuzzer
+WSTR w_healthkat,<healthkat>             ; E6: vault-health analysis KAT
 WSTR w_pkat,     <pkat>
 WSTR w_trtest,   <trtest>
 WSTR w_mvtest,   <mvtest>
@@ -255,6 +257,7 @@ cmd_table label CMDENT
     CMDENT { w_reload,    cmd_reload,    1, 0 }   ; C8: vault_reload refresh probe
     CMDENT { w_cowrite,   cmd_cowrite,   1, 0 }   ; C8: write-lock exclusivity probe
     CMDENT { w_attfuzz,   cmd_attfuzz,   0, 0 }   ; G8: attachment-index fuzzer
+    CMDENT { w_healthkat, cmd_healthkat, 0, 0 }   ; E6: vault-health analysis KAT
     CMDENT { w_mvtest,    cmd_mvtest,    0, 0 }   ; multi-vault snapshot/restore probe
     CMDENT { w_mvswitch,  cmd_mvswitch,  0, 0 }   ; multi-vault context switch probe
     CMDENT { w_avtest,    cmd_avtest,    0, 0 }   ; availability retry state-machine probe

@@ -11,7 +11,7 @@ rem   selftest   bin\vordr.exe selftest must print "all self-tests passed"
 rem   roundtrip  headless probes: seedtest -> atgen -> zitest -> phtest ->
 rem              secscan -> lktest -> tmptest -> fztest -> trtest -> vfuzz ->
 rem              fuzzzip -> bktest -> mactest -> rbtest -> xctest -> reload ->
-rem              cowrite -> pkat -> mvtest -> mvswitch -> avtest
+rem              cowrite -> attfuzz -> healthkat -> pkat -> mvtest -> mvswitch -> avtest
 rem
 rem Usage: tests\run_all.cmd [--quick]
 rem Exit:  0 = all stages passed, 1 = at least one FAIL (see the summary table).
@@ -100,7 +100,7 @@ set /a T_SELFTEST=!T1!-!T0!
 
 rem -------------------------------------------------------------- roundtrip --
 call :now T0
-echo === stage: roundtrip (seedtest / atgen / zitest / phtest / secscan / tmptest / fztest / trtest / vfuzz / fuzzzip / bktest / mactest / rbtest / xctest / reload / pkat / mvtest / mvswitch / avtest) ===
+echo === stage: roundtrip (seedtest / atgen / zitest / phtest / secscan / tmptest / fztest / trtest / vfuzz / fuzzzip / bktest / mactest / rbtest / xctest / reload / attfuzz / healthkat / pkat / mvtest / mvswitch / avtest) ===
 set RT=PASS
 
 bin\vordr.exe seedtest "%WORK%\rt.vault" > "%WORK%\seedtest.log" 2>&1
@@ -164,6 +164,9 @@ if not "!errorlevel!"=="0" ( echo   cowrite: FAIL ^(exit !errorlevel!, write-loc
 
 bin\vordr.exe attfuzz > "%WORK%\attfuzz.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   attfuzz: FAIL ^(exit !errorlevel!, attach_index_build fuzz^) & set RT=FAIL )
+
+bin\vordr.exe healthkat > "%WORK%\healthkat.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   healthkat: FAIL ^(exit !errorlevel!, vault-health analysis counts^) & set RT=FAIL )
 
 bin\vordr.exe pkat > "%WORK%\pkat.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   pkat: FAIL ^(exit !errorlevel!, parallel fail-closed KAT gate^) & set RT=FAIL )
