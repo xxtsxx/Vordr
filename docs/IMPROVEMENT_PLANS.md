@@ -267,17 +267,6 @@ step; `ilammy/msvc-dev-cmd` SHA-pinned; stage-list comments in `run_all.cmd` +
    failure reproduces from its logged seed. *Test:* a seeded failure reproduces
    from the seed in the log. (Pairs with G8's `attfuzz`.)
 
-### G8. Attachment-section + FMAC fuzzer
-The 2026-07-20 audit added `attach_index_build` per-entry bounds and made the
-FMAC trailer mandatory; `vfuzz` mutates the record body, but nothing fuzzes the
-attachment section or the trailer specifically.
-
-1. A dbg probe (`attfuzz`) that seals a vault, then mutates the attachment
-   section (crafted `ctlen`/id, truncation, junk entries) and the FMAC trailer
-   (stripped, bit-flipped) under logged random seeds, asserting `vault_unlock`
-   rejects or safely skips — never crashes or reads OOB. *Test:* add to RUNALL
-   stage 4; a seeded failure reproduces from its seed. Pairs with G7.1.
-
 ---
 
 *Completed plans are removed from this file in the commit that ships them.

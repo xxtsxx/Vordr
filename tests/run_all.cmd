@@ -162,6 +162,9 @@ if not "!errorlevel!"=="0" ( echo   reload: FAIL ^(exit !errorlevel!, vault_relo
 bin\vordr.exe cowrite "%WORK%\cw.vault" > "%WORK%\cowrite.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   cowrite: FAIL ^(exit !errorlevel!, write-lock exclusivity^) & set RT=FAIL )
 
+bin\vordr.exe attfuzz > "%WORK%\attfuzz.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   attfuzz: FAIL ^(exit !errorlevel!, attach_index_build fuzz^) & set RT=FAIL )
+
 bin\vordr.exe pkat > "%WORK%\pkat.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   pkat: FAIL ^(exit !errorlevel!, parallel fail-closed KAT gate^) & set RT=FAIL )
 
