@@ -41,6 +41,8 @@ extern file_rename:proc
 extern MoveFileExW:proc
 extern CopyFileW:proc
 extern DeleteFileW:proc
+extern CreateFileW:proc                 ; C8: <vault>.lock write coordination
+extern CloseHandle:proc
 extern mem_alloc:proc
 extern mem_free:proc
 extern print_a:proc
@@ -247,6 +249,8 @@ CSTR rb_ok,  "rbtest: PASS (older counter flagged, current one not)",13,10
 CSTR rb_bad, "rbtest: FAIL",13,10
 CSTR rl_ok,  "reload: PASS (in-memory body refreshed from disk)",13,10
 CSTR rl_bad, "reload: FAIL",13,10
+CSTR cw_ok,  "cowrite: PASS (write lock is exclusive + reacquirable)",13,10
+CSTR cw_bad, "cowrite: FAIL",13,10
 CSTR xc_ok,  "xctest: PASS (external header change detected)",13,10
 CSTR xc_bad, "xctest: FAIL",13,10
 CSTR e_io,      "error: cannot read/write the vault file",13,10
@@ -287,6 +291,9 @@ g_fmac_len  dq ?                            ; 0 (legacy) or FMAC_TRAILER for thi
 g_ext_size  dq ?                            ; on-disk size snapshotted at load/save
 g_ext_hash  db 32 dup (?)                   ; BLAKE2b of the header snapshotted then
 g_reuse_key dd ?                            ; C8: vault_reload reuses g_vkey (skip Argon2)
+align 8
+g_lock_h    dq ?                            ; C8: <vault>.lock handle (0 = not held)
+g_lock_path dw (MAX_PATH_CHARS + 8) dup (?) ; C8: "<vault>.lock" wide path
 align 16
 g_fmac_ctx  db 256 dup (?)                  ; BLAKE2B_CTX scratch (216 used)
 g_fmac_out  db 32 dup (?)                   ; computed file MAC
@@ -3138,6 +3145,46 @@ rl_fail:
 cmd_reload endp
 
 ; ===========================================================================
+; cmd_cowrite <path> - C8: prove the <vault>.lock write lock is exclusive and
+;   reacquirable.  Acquire (must succeed), acquire again while held (must fail),
+;   release, then re-acquire (must succeed).
+; ===========================================================================
+LANDING_PAD
+public cmd_cowrite
+cmd_cowrite proc frame
+    FRAME_PROLOG 32
+    lea     r10, [g_argv]
+    mov     rax, qword ptr [r10+16]             ; argv[2] = a path (its ".lock" is used)
+    mov     qword ptr [g_cfg_in], rax
+    call    vault_lock_acquire                  ; 1) must acquire
+    cmp     eax, 1
+    jne     cw_fail
+    call    vault_lock_acquire                  ; 2) held -> must fail (exclusive)
+    test    eax, eax
+    jnz     cw_faillk
+    call    vault_lock_release                  ; 3) release
+    call    vault_lock_acquire                  ; 4) must acquire again
+    cmp     eax, 1
+    jne     cw_fail
+    call    vault_lock_release
+    lea     rcx, [cw_ok]
+    mov     edx, cw_ok_len
+    call    print_a
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+cw_faillk:
+    call    vault_lock_release
+cw_fail:
+    lea     rcx, [cw_bad]
+    mov     edx, cw_bad_len
+    call    print_a
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_cowrite endp
+
+; ===========================================================================
 ; cmd_xctest <path> - prove external-change detection.  Create a vault
 ;   (snapshots itself), confirm no change is reported; externally flip a header
 ;   byte and confirm a change IS reported; recreate the vault (re-baselines) and
@@ -3569,27 +3616,114 @@ vault_field_selftest endp
 ; already unlocked (vault_unlock succeeded) unless noted.
 ; ===========================================================================
 
-; vault_reseal() - persist the current in-memory body to disk under a fresh
-;   GCM nonce (key/salt unchanged).  -> eax = 0 / EXIT_IO / EXIT_OOM.
+; ===========================================================================
+; C8: <vault>.lock advisory write lock.  Held only around a save so a vault on a
+;   shared drive has at most one writer at a time.  FILE_FLAG_DELETE_ON_CLOSE
+;   makes a crashed holder's lock vanish when the OS closes the handle; an
+;   orphaned lock (file left but no holder) is reclaimed by DeleteFileW-then-retry,
+;   which fails on a live-held lock so it can never steal an active one.
+; ===========================================================================
+LK_GENERIC_WRITE  equ 40010000h              ; GENERIC_WRITE | DELETE (delete-on-close)
+LK_CREATE_NEW     equ 1
+LK_DELONCLOSE     equ 04000000h              ; FILE_FLAG_DELETE_ON_CLOSE
+
+; vault_lock_acquire() -> eax = 1 if <vault>.lock is now held (g_lock_h), else 0.
+vault_lock_acquire proc frame
+    FRAME_PROLOG 64
+    mov     r10, qword ptr [g_cfg_in]           ; g_lock_path = g_cfg_in + ".lock"
+    lea     r11, [g_lock_path]
+    xor     ecx, ecx
+lka_cp:
+    mov     ax, word ptr [r10+rcx*2]
+    mov     word ptr [r11+rcx*2], ax
+    test    ax, ax
+    jz      lka_cpd
+    inc     ecx
+    cmp     ecx, MAX_PATH_CHARS
+    jb      lka_cp
+lka_cpd:
+    lea     r11, [g_lock_path]
+    lea     r11, [r11+rcx*2]                    ; at the NUL
+    mov     word ptr [r11+0], '.'
+    mov     word ptr [r11+2], 'l'
+    mov     word ptr [r11+4], 'o'
+    mov     word ptr [r11+6], 'c'
+    mov     word ptr [r11+8], 'k'
+    mov     word ptr [r11+10], 0
+    WINCALL CreateFileW, addr g_lock_path, LK_GENERIC_WRITE, 0, 0, LK_CREATE_NEW, LK_DELONCLOSE, 0
+    cmp     rax, -1
+    jne     lka_got
+    WINCALL DeleteFileW, addr g_lock_path       ; reclaim an orphan (fails if live-held)
+    WINCALL CreateFileW, addr g_lock_path, LK_GENERIC_WRITE, 0, 0, LK_CREATE_NEW, LK_DELONCLOSE, 0
+    cmp     rax, -1
+    je      lka_busy
+lka_got:
+    mov     qword ptr [g_lock_h], rax
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+lka_busy:
+    xor     eax, eax                            ; failed - leave g_lock_h untouched
+    FRAME_EPILOG                                ; (never clobber an already-held handle)
+    ret
+vault_lock_acquire endp
+
+; vault_lock_release() - close the lock handle (DELETE_ON_CLOSE removes the file).
+public vault_lock_release
+vault_lock_release proc frame
+    FRAME_PROLOG 32
+    mov     rcx, qword ptr [g_lock_h]
+    test    rcx, rcx
+    jz      lkr_done
+    WINCALL CloseHandle, qword ptr [g_lock_h]
+    mov     qword ptr [g_lock_h], 0
+lkr_done:
+    FRAME_EPILOG
+    ret
+vault_lock_release endp
+
+; vault_reseal() - persist the current in-memory body to disk under a fresh GCM
+;   nonce (key/salt unchanged).  C8: serialized by the <vault>.lock write lock,
+;   and refuses to overwrite a vault another writer changed since we loaded it.
+;   -> eax = 0 / EXIT_OOM / EXIT_CHANGED (reload-safe) / EXIT_BUSY (locked).
 public vault_reseal
 vault_reseal proc frame
-    FRAME_PROLOG 32
+    FRAME_PROLOG 48
     cmp     dword ptr [g_readonly], 0           ; E9: a read-only vault never writes to
     jne     vrs_ro                              ; disk - report success, change nothing
+    call    vault_lock_acquire                  ; C8: brief exclusive write lock
+    test    eax, eax
+    jz      vrs_busy                            ; another instance is saving
+    call    vault_ext_changed                   ; C8: changed under us since load?
+    test    eax, eax
+    jnz     vrs_changed                         ; yes -> do not clobber (reload-safe)
     lea     rcx, [g_hdr+VH_NONCE]
     mov     edx, 12
     call    rng_fill
     test    eax, eax
     jz      vrs_oom
-    call    vault_seal_write
+    call    vault_seal_write                    ; re-snapshots the file on success
+    mov     dword ptr [rbp-24], eax
+    call    vault_lock_release
+    mov     eax, dword ptr [rbp-24]
+    FRAME_EPILOG
+    ret
+vrs_changed:
+    call    vault_lock_release
+    mov     eax, EXIT_CHANGED
+    FRAME_EPILOG
+    ret
+vrs_oom:
+    call    vault_lock_release
+    mov     eax, EXIT_OOM
+    FRAME_EPILOG
+    ret
+vrs_busy:
+    mov     eax, EXIT_BUSY
     FRAME_EPILOG
     ret
 vrs_ro:
     xor     eax, eax
-    FRAME_EPILOG
-    ret
-vrs_oom:
-    mov     eax, EXIT_OOM
     FRAME_EPILOG
     ret
 vault_reseal endp

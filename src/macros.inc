@@ -25,6 +25,8 @@ EXIT_NOCPU          equ 6
 EXIT_SELFTEST       equ 7
 EXIT_NOSPACE        equ 8          ; insufficient free disk space (pre-flight)
 EXIT_LOCKED         equ 9          ; vault is locked / wrong master password
+EXIT_CHANGED        equ 10         ; C8: vault changed on disk since load (reload-safe)
+EXIT_BUSY           equ 11         ; C8: another instance holds the write lock
 
 
 ; ---------------------------------------------------------------------------
