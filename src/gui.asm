@@ -7003,11 +7003,36 @@ guo_bare:
     mov     qword ptr [rbp-48], rax
     jmp     guo_exec
 guo_hasscheme:
+    ; allowlist: only open http:// and https://.  A stored or imported URL field
+    ; could carry file://, a UNC path, javascript:, etc., which ShellExecute would
+    ; launch as click-to-execute in the user's context.  ecx = scheme length.
+    cmp     ecx, 4
+    jb      guo_done
+    cmp     ecx, 5
+    ja      guo_done
+    lea     r10, [g_urlbuf]
+    lea     r11, [url_https]                    ; L"https://": [0..ecx) is "http"/"https"
+    xor     r9d, r9d
+guo_ci_lp:
+    movzx   eax, word ptr [r10+r9*2]
+    or      eax, 20h                            ; ASCII tolower
+    movzx   edx, word ptr [r11+r9*2]
+    cmp     eax, edx
+    jne     guo_done                            ; scheme not http/https -> do not open
+    inc     r9d
+    cmp     r9d, ecx
+    jb      guo_ci_lp
     lea     rax, [g_urlbuf]
     mov     qword ptr [rbp-48], rax
 guo_exec:
     WINCALL ShellExecuteW, 0, addr verb_open, qword ptr [rbp-48], 0, 0, 1
 guo_done:
+    lea     rcx, [g_urlbuf]                     ; URLs may carry internal hosts / tokens
+    mov     edx, 1024*2
+    call    secure_zero
+    lea     rcx, [g_urlbuf2]
+    mov     edx, 1040*2
+    call    secure_zero
     FRAME_EPILOG
     ret
 gui_url_open endp
@@ -8304,6 +8329,11 @@ cph_ovl:
     mov     rcx, rax
     xor     edx, edx
     call    ShowWindow
+    ; wipe the revealed-secret copy so cleartext never lingers past the overlay
+    ; (matches the wipe discipline used for every other secret buffer)
+    lea     rcx, [g_rowpw_w]
+    mov     edx, 512*2
+    call    secure_zero
     FRAME_EPILOG
     ret
 gui_colorpw_hide endp
@@ -11652,6 +11682,9 @@ vp_lock_go:
     call    secure_zero
     lea     rcx, [g_e_totp]
     mov     edx, 512
+    call    secure_zero
+    lea     rcx, [g_rowpw_w]                 ; revealed-row secret (if overlay was up)
+    mov     edx, 512*2
     call    secure_zero
     mov     qword ptr [g_vaulthwnd], 0       ; window going away -> tray reopens it
     WINCALL EndDialog, qword ptr [rbp-8], 0

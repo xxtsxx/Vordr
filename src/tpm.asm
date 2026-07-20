@@ -23,6 +23,7 @@ include macros.inc
 extern NCryptOpenStorageProvider:proc
 extern NCryptOpenKey:proc
 extern NCryptCreatePersistedKey:proc
+extern NCryptSetProperty:proc
 extern NCryptFinalizeKey:proc
 extern NCryptEncrypt:proc
 extern NCryptDecrypt:proc
@@ -37,6 +38,8 @@ NCRYPT_OAEP_SILENT      equ 044h        ; NCRYPT_PAD_OAEP_FLAG | NCRYPT_SILENT_F
 WSTR tpm_prov, <Microsoft Platform Crypto Provider>
 WSTR tpm_alg,  <RSA>
 WSTR tpm_sha,  <SHA256>
+WSTR tpm_lenprop, <Length>              ; NCRYPT_LENGTH_PROPERTY
+tpm_keylen  dd 2048                     ; force RSA-2048 (never the provider default)
 
 .data?
 g_tpm_prov  dq ?                ; NCRYPT_PROV_HANDLE
@@ -103,6 +106,11 @@ tpm_seal proc frame
             addr tpm_alg, qword ptr [rbp-24], 0, 0
     test    eax, eax
     jnz     ts_freeprov
+    ; set the modulus size explicitly BEFORE finalize - the PCP default is
+    ; unspecified and could be weaker than the RSA-2048 the header promises.
+    ; Best-effort: a provider that rejects the property just uses its default.
+    WINCALL NCryptSetProperty, qword ptr [g_tpm_key], addr tpm_lenprop, \
+            addr tpm_keylen, 4, NCRYPT_SILENT_FLAG
     WINCALL NCryptFinalizeKey, qword ptr [g_tpm_key], NCRYPT_SILENT_FLAG
     test    eax, eax
     jnz     ts_freekey

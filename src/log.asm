@@ -186,6 +186,8 @@ lo_default:
     WINCALL GetEnvironmentVariableW, addr w_localappdata, addr g_logpath, 1024
     test    eax, eax
     jz      lo_fail
+    cmp     eax, 1000                   ; value didn't fit (returns required size), or
+    jae     lo_fail                     ; leaves no room for "\Vordr\vordr.log" -> skip
     mov     ecx, eax                    ; dir length (chars)
     lea     rdx, [g_logpath]
     lea     rdx, [rdx + rcx*2]          ; cursor at the NUL
