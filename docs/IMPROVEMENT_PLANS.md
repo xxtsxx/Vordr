@@ -295,30 +295,6 @@ non-passphrase style too.
 
 ---
 
-## F. GUI / UX
-
-### F1. Toast notifications
-(The tray NIF flags are MESSAGE|ICON|TIP only — no balloon/toast exists.)
-
-1. Layered, rounded toast child window, auto-fade via timer, theme brushes;
-   dbg `toast <text>` verb. *Test:* no focus steal (caret stays in an edit).
-2. Wire copy/save/lock events; queue max 3. *Test:* 5 rapid copies → ≤3
-   stacked, all fade; GDI handle count stable over 100 toasts.
-3. Settings toggle. *Test:* off → old behavior only.
-
-### F4. Mnemonics & keyboard audit
-Tab order/Enter/Esc largely come free from the dialog manager; zero `&`
-mnemonics exist anywhere. The redesign landed Ctrl+K/N/G/L; complete the table
-(Ctrl+O open vault, Ctrl+W close tab, Ctrl+Tab cycle, F2 edit, Del → trash,
-Esc closes overlay → edit → clears search in that order).
-
-1. Per-dialog audit table (tab order, default button, Esc). *Test:* the table
-   has no unreachable-control rows after fixes.
-2. `&`-accelerators where owner-draw painters can render underscores. *Test:*
-   Alt+letter activates each marked control.
-
----
-
 ## R. Redesign remainder
 
 Folded in from `docs/REDESIGN_PLAN.md` (the standalone doc was merged into
