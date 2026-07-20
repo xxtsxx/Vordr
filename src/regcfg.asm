@@ -20,6 +20,8 @@ extern RegSetValueExW:proc
 extern RegDeleteValueW:proc
 extern RegCloseKey:proc
 extern RegEnumKeyExW:proc
+extern RegEnumValueW:proc               ; C6: enumerate values to prune legacy names
+extern sha256_hash:proc                 ; C6: hash the per-vault value name
 extern SHGetFolderPathW:proc
 extern GetEnvironmentVariableW:proc
 extern CreateDirectoryW:proc
@@ -30,6 +32,7 @@ REG_BINARY      equ 3
 REG_DWORD       equ 4
 KEY_READ        equ 20019h
 KEY_WRITE       equ 20006h
+KEY_RW          equ 2001Fh          ; KEY_READ or KEY_WRITE (enumerate + delete values)
 CSIDL_PERSONAL  equ 5
 
 .data
@@ -65,6 +68,11 @@ g_cfg_cb    dd ?                 ; RegGetValue/Set byte count
 g_cfg_type  dd ?                 ; RegQueryValueExW value type (REG_SZ check)
 g_cfg_dw    dd ?                 ; REG_DWORD value scratch
 g_cfg_khan  dq ?                 ; open key handle
+g_reg_hdig  db 32 dup (?)        ; C6: SHA-256(vault path), input to the name hash
+align 2
+g_reg_hname dw 33 dup (?)        ; C6: hashed reg value name = 32 hex wide chars + NUL
+align 2
+g_prune_name dw 512 dup (?)      ; C6: RegEnumValueW value-name scratch (legacy prune)
 align 2
 cc_od       dw 1024 dup (?)      ; %OneDrive% root (cfg_classify_path scratch)
 cc_docs     dw 1024 dup (?)      ; Documents root (cfg_classify_path scratch)
@@ -72,6 +80,151 @@ od_namebuf  dw 256 dup (?)       ; account subkey name (cfg_od_linked)
 od_ufbuf    dw 1024 dup (?)      ; UserFolder value (cfg_od_linked)
 
 .code
+
+; ===========================================================================
+; reg_hash_name(rcx = wide value name) -> rax = ptr to the hashed name (wide,
+;   32 hex chars + NUL, in g_reg_hname).  The rollback mirror and TPM blob are
+;   keyed per-vault; using the raw vault PATH as the value name leaks where the
+;   user's vaults live.  Hashing it keeps a stable, fixed-length, non-identifying
+;   name (SHA-256 of the path's UTF-16 bytes, first 128 bits, hex).  Get/set/del
+;   all hash the same path, so they still agree.  (C6. Registry location leak.)
+;   Clobbers volatiles; reads/writes g_reg_hdig / g_reg_hname.
+; ===========================================================================
+reg_hash_name proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx             ; name ptr
+    xor     r11d, r11d                          ; wcslen(name)
+rhn_len:
+    cmp     word ptr [rcx+r11*2], 0
+    je      rhn_lend
+    inc     r11d
+    jmp     rhn_len
+rhn_lend:
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [r11+r11]                      ; byte length = chars * 2
+    lea     r8, [g_reg_hdig]
+    call    sha256_hash
+    ; hex-encode the first 16 digest bytes into g_reg_hname (wide)
+    lea     r10, [g_reg_hdig]
+    lea     r11, [g_reg_hname]
+    xor     ecx, ecx
+rhn_hex:
+    movzx   eax, byte ptr [r10+rcx]
+    mov     edx, eax                            ; high nibble
+    shr     edx, 4
+    cmp     edx, 10
+    jb      rhn_hh
+    add     edx, 'a'-10
+    jmp     rhn_hp
+rhn_hh:
+    add     edx, '0'
+rhn_hp:
+    mov     word ptr [r11+rcx*4], dx
+    mov     edx, eax                            ; low nibble
+    and     edx, 0Fh
+    cmp     edx, 10
+    jb      rhn_lh
+    add     edx, 'a'-10
+    jmp     rhn_lp
+rhn_lh:
+    add     edx, '0'
+rhn_lp:
+    mov     word ptr [r11+rcx*4+2], dx
+    inc     ecx
+    cmp     ecx, 16
+    jb      rhn_hex
+    mov     word ptr [r11+64], 0                ; wide NUL after 32 hex chars
+    lea     rax, [g_reg_hname]
+    FRAME_EPILOG
+    ret
+reg_hash_name endp
+
+; ===========================================================================
+; reg_is_hashed(rcx = wide name) -> eax = 1 iff the name is exactly 32 lowercase
+;   hex chars (the current value-name format), else 0.  Lets the prune below tell
+;   a current hashed value name from a legacy raw-vault-path one.  Leaf.
+; ===========================================================================
+reg_is_hashed proc
+    xor     r10d, r10d
+rih_lp:
+    movzx   eax, word ptr [rcx+r10*2]
+    test    eax, eax
+    je      rih_end
+    cmp     eax, '0'
+    jb      rih_no
+    cmp     eax, '9'
+    jbe     rih_next
+    cmp     eax, 'a'
+    jb      rih_no
+    cmp     eax, 'f'
+    ja      rih_no
+rih_next:
+    inc     r10d
+    cmp     r10d, 33
+    jb      rih_lp
+    jmp     rih_no                              ; > 32 chars -> not our format
+rih_end:
+    cmp     r10d, 32
+    jne     rih_no
+    mov     eax, 1
+    ret
+rih_no:
+    xor     eax, eax
+    ret
+reg_is_hashed endp
+
+; ===========================================================================
+; reg_prune_legacy(rcx = subkey label) - under HKCU\SOFTWARE\Vordr\<subkey>,
+;   delete every value whose name is NOT the current 32-hex hashed form - i.e. a
+;   legacy raw-vault-path value name from before C6, which leaks the vault
+;   location.  Best-effort.  Enumerate at a moving index: on a kept (hashed)
+;   value advance the index; on a deleted value the entries above shift down so
+;   the same index now points at the next one - both cases make progress.
+; ===========================================================================
+reg_prune_legacy proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx             ; subkey label
+    WINCALL RegOpenKeyExW, qword ptr [g_hkcu], qword ptr [rbp-24], 0, KEY_RW, addr g_cfg_khan
+    test    eax, eax
+    jnz     rpl_done                            ; absent -> nothing to prune
+    mov     dword ptr [rbp-32], 0               ; enumeration index
+rpl_loop:
+    mov     dword ptr [g_cfg_cb], 512           ; cchName capacity (chars, incl NUL)
+    WINCALL RegEnumValueW, qword ptr [g_cfg_khan], dword ptr [rbp-32], addr g_prune_name, \
+            addr g_cfg_cb, 0, 0, 0, 0
+    test    eax, eax
+    jnz     rpl_close                           ; ERROR_NO_MORE_ITEMS / error -> stop
+    lea     rcx, [g_prune_name]
+    call    reg_is_hashed
+    test    eax, eax
+    jz      rpl_del
+    inc     dword ptr [rbp-32]                  ; hashed -> keep, advance the index
+    jmp     rpl_loop
+rpl_del:
+    WINCALL RegDeleteValueW, qword ptr [g_cfg_khan], addr g_prune_name
+    jmp     rpl_loop                            ; deleted -> same index = next value
+rpl_close:
+    WINCALL RegCloseKey, qword ptr [g_cfg_khan]
+rpl_done:
+    FRAME_EPILOG
+    ret
+reg_prune_legacy endp
+
+; ===========================================================================
+; reg_prune_all() - prune legacy path-named values from both per-vault subkeys
+;   (rollback mirror + TPM blob).  Called once per unlock so an install that
+;   predates C6 has its leaked vault paths removed on first use.  (C6.)
+; ===========================================================================
+public reg_prune_all
+reg_prune_all proc frame
+    FRAME_PROLOG 32
+    lea     rcx, [ctr_subkey]
+    call    reg_prune_legacy
+    lea     rcx, [tpm_subkey]
+    call    reg_prune_legacy
+    FRAME_EPILOG
+    ret
+reg_prune_all endp
 
 ; ===========================================================================
 ; reg_query_sz(rcx=hkey, rdx=value name, r8=dst, r9d=cap bytes) -> eax = 1 if
@@ -581,9 +734,10 @@ cfg_classify_path endp
 public reg_tpm_set
 reg_tpm_set proc frame
     FRAME_PROLOG 128
-    mov     qword ptr [rbp-24], rcx          ; value name
-    mov     qword ptr [rbp-32], rdx          ; data
+    mov     qword ptr [rbp-32], rdx          ; data (saved before reg_hash_name)
     mov     dword ptr [rbp-40], r8d          ; len
+    call    reg_hash_name                    ; rcx=path -> rax=hashed value name (C6)
+    mov     qword ptr [rbp-24], rax
     WINCALL RegCreateKeyExW, qword ptr [g_hkcu], addr tpm_subkey, 0, 0, 0, \
             KEY_WRITE, 0, addr g_cfg_khan, 0
     test    eax, eax
@@ -606,9 +760,10 @@ reg_tpm_set endp
 public reg_tpm_get
 reg_tpm_get proc frame
     FRAME_PROLOG 96
-    mov     qword ptr [rbp-24], rcx          ; value name
-    mov     qword ptr [rbp-32], rdx          ; outbuf
+    mov     qword ptr [rbp-32], rdx          ; outbuf (saved before reg_hash_name)
     mov     dword ptr [rbp-40], r8d          ; cap
+    call    reg_hash_name                    ; rcx=path -> rax=hashed value name (C6)
+    mov     qword ptr [rbp-24], rax
     WINCALL RegOpenKeyExW, qword ptr [g_hkcu], addr tpm_subkey, 0, KEY_READ, \
             addr g_cfg_khan
     test    eax, eax
@@ -633,7 +788,8 @@ reg_tpm_get endp
 public reg_tpm_del
 reg_tpm_del proc frame
     FRAME_PROLOG 64
-    mov     qword ptr [rbp-24], rcx          ; value name
+    call    reg_hash_name                    ; rcx=path -> rax=hashed value name (C6)
+    mov     qword ptr [rbp-24], rax
     WINCALL RegOpenKeyExW, qword ptr [g_hkcu], addr tpm_subkey, 0, KEY_WRITE, \
             addr g_cfg_khan
     test    eax, eax
@@ -657,9 +813,10 @@ reg_tpm_del endp
 public reg_ctr_set
 reg_ctr_set proc frame
     FRAME_PROLOG 128
-    mov     qword ptr [rbp-24], rcx
-    mov     qword ptr [rbp-32], rdx
-    mov     dword ptr [rbp-40], r8d
+    mov     qword ptr [rbp-32], rdx             ; data (saved before reg_hash_name)
+    mov     dword ptr [rbp-40], r8d             ; len
+    call    reg_hash_name                       ; rcx=path -> rax=hashed value name (C6)
+    mov     qword ptr [rbp-24], rax
     WINCALL RegCreateKeyExW, qword ptr [g_hkcu], addr ctr_subkey, 0, 0, 0, \
             KEY_WRITE, 0, addr g_cfg_khan, 0
     test    eax, eax
@@ -682,9 +839,10 @@ reg_ctr_set endp
 public reg_ctr_get
 reg_ctr_get proc frame
     FRAME_PROLOG 96
-    mov     qword ptr [rbp-24], rcx
-    mov     qword ptr [rbp-32], rdx
-    mov     dword ptr [rbp-40], r8d
+    mov     qword ptr [rbp-32], rdx             ; outbuf (saved before reg_hash_name)
+    mov     dword ptr [rbp-40], r8d             ; cap
+    call    reg_hash_name                       ; rcx=path -> rax=hashed value name (C6)
+    mov     qword ptr [rbp-24], rax
     WINCALL RegOpenKeyExW, qword ptr [g_hkcu], addr ctr_subkey, 0, KEY_READ, \
             addr g_cfg_khan
     test    eax, eax
