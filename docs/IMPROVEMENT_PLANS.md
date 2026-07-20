@@ -154,14 +154,6 @@ vault key.
 path — is fixed by C6: the name is now hashed and legacy path-named values are
 pruned at unlock.)
 
-### C5. Audit-log honesty
-The "audit log" only records CLI diagnostic verbs; GUI unlock/save/export log
-nothing.
-
-1. Log GUI security events (unlock/lock/save/export/import, success and
-   failure) or stop billing it as an audit log. Fix the stale header examples
-   (`add/get/list`) and the "Event Log" comment in `main.asm`. *Test:* a GUI
-   session produces the expected lines; no planted secret appears in any line.
 
 ---
 
