@@ -46,6 +46,8 @@ extern vault_unlock:proc
 extern vault_lock:proc
 extern vault_reload:proc                ; C8: refresh from disk (reload-safe conflict)
 externdef g_seclock_failed:dword        ; C3: a secret buffer stayed pageable
+extern log_result:proc                  ; C5: audit-log a GUI security event
+externdef g_cfg_loglevel:dword          ; C5: audit-log verbosity (from HKCU at GUI start)
 extern vault_reseal:proc
 extern vault_ext_changed:proc           ; vault.asm: on-disk file changed since load?
 extern vault_remove_at:proc
@@ -756,6 +758,11 @@ WSTR t_reloaded,    <Vault reloaded>
 WSTR s_busy,        <Another user is saving this vault right now. Your change is kept in memory - try saving again in a moment.>
 WSTR s_nolock,      <Vordr could not lock all secret buffers into RAM on this system, so decrypted secrets may be written to the pagefile. Consider closing memory-heavy apps.>
 WSTR t_nolock,      <Secrets not pinned to RAM>
+; C5: GUI security-event names for the audit log (log_result classifies the code)
+WSTR ev_unlock,     <gui-unlock>
+WSTR ev_save,       <gui-save>
+WSTR ev_export,     <gui-export>
+WSTR ev_import,     <gui-import>
 WSTR g_singleton_name, <VordrSingletonMutex_v1>
 WSTR g_vault_title,    <Vordr - Vault>
 WSTR g_vault_title_ro, <Vordr - Vault (read-only)>   ; E9: title when opened read-only
@@ -991,6 +998,7 @@ layout_gaps  dd 7, 3, 14                          ; inter-card gap (DLU) per lay
 lay_band     dd 14, 0, 18                         ; label band: card(top) vs 0=flat(left)
 lay_itemh    dd 42, 30, 58                         ; list-item pixel height (index 0 used)
 pref_scheme dw 'u','i','_','s','c','h','e','m','e',0
+pref_loglevel dw 'L','o','g','L','e','v','e','l',0   ; C5: HKCU audit-log verbosity
 pref_layout dw 'u','i','_','l','a','y','o','u','t',0
 align 8
 align 4
@@ -1273,6 +1281,7 @@ g_no_phonetic dd ?                    ; 1 = "Disable phonetic reader" setting on
 public g_readonly
 g_readonly    dd ?                    ; E9: 1 = vault opened read-only (no disk writes)
 g_seclock_warned dd ?                 ; C3: 1 = the "secrets not pinned" warning was shown
+g_loglvl_lock   dd ?                  ; C5: 1 = LogLevel forced by HKLM policy
 g_nohist_lock dd ?                    ; 1 = NoHistory forced by HKLM policy (locked)
 g_nophon_lock dd ?                    ; 1 = NoPhonetic forced by HKLM policy (locked)
 g_pw_compliant dd ?                   ; 1 = create-dialog password meets the policy
@@ -1552,6 +1561,9 @@ gu_pwok:
 gu_open:
     call    vault_unlock                    ; eax = 0 / EXIT_*
     mov     dword ptr [rbp-32], eax
+    lea     rcx, [ev_unlock]                ; C5: audit the unlock outcome
+    mov     edx, eax
+    call    log_result
     call    gui_wipepw
     cmp     dword ptr [rbp-32], 0
     jne     gu_fail
@@ -4810,6 +4822,11 @@ gco_nocarry:
     jnz     gco_done
 gco_reseal:
     call    vault_reseal
+    mov     dword ptr [rbp-32], eax             ; C5: audit the save outcome
+    lea     rcx, [ev_save]
+    mov     edx, eax
+    call    log_result
+    mov     eax, dword ptr [rbp-32]
     test    eax, eax
     jnz     gco_resealerr
     mov     rcx, qword ptr [rbp-24]
@@ -8675,6 +8692,13 @@ gui_load_prefs proc frame
     mov     eax, GUI_SCHEME_GRUVBOX
 @@: mov     dword ptr [g_scheme], eax
     mov     dword ptr [g_layout], 0             ; Comfortable is the only layout
+    ; C5: audit-log verbosity (HKLM > HKCU > 0/off), so GUI security events are
+    ; logged when the operator enables it (0..4; see log.asm LOG_* levels)
+    WINCALL cfg_get_dword, addr pref_loglevel, 0, addr g_loglvl_lock
+    cmp     eax, 4                              ; clamp to LOG_DEBUG
+    jbe     @F
+    xor     eax, eax
+@@: mov     dword ptr [g_cfg_loglevel], eax
     FRAME_EPILOG
     ret
 gui_load_prefs endp
@@ -12980,6 +13004,11 @@ gui_export proc frame
     lea     rcx, [g_xlpw]                        ; wide password + length (bytes)
     mov     edx, dword ptr [g_xlpwlen]
     call    ze_compose                           ; -> encrypted zip in g_zbuf (all tiles, no history)
+    mov     dword ptr [rbp-32], eax             ; C5: audit the export
+    lea     rcx, [ev_export]
+    mov     edx, eax
+    call    log_result
+    mov     eax, dword ptr [rbp-32]
     test    eax, eax
     jnz     gx_composefail
     lea     rax, [g_zipfilter]                   ; pick a .zip save path
@@ -13664,6 +13693,9 @@ gim_commit:
     jmp     gim_done
 gim_ok:
     call    vault_reseal
+    lea     rcx, [ev_import]                    ; C5: audit the import
+    mov     edx, eax
+    call    log_result
     mov     rcx, qword ptr [rbp-24]
     call    gui_poplist
     lea     rcx, [g_imp_msgw]                   ; "Imported N entries."
