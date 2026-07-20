@@ -52,6 +52,22 @@ removed from this file as done; the remaining redesign items are group R.
 The reverted virtual-scroll commits were secured on branch `recovered-scroll`
 before the fork was deleted.
 
+**Done 2026-07-20 (security audit → PR #2, branch `audit-fixes`):** a full-tree
+security + stability audit. Landed: the ZIP import parser is fully bounded (the
+attacker-controlled overflows in `zj_str`, the field loop, `zi_u2w`/
+`zi_stage_title`/`zi_addattach`, and the staged-entry count are all closed);
+opaque attachment ZIP member names (entry titles no longer leak in cleartext);
+overflow-safe `attach_index_build` bounds + an `attach_open` ctlen/ptlen cross-
+check; **the FMAC trailer is now mandatory, with `VAULT_VERSION` bumped to 2**
+(see the Format note); a passphrase-length bound in `pwgen_ex`; secret-wipe gaps
+closed (`g_hbuf`, `g_rowpw_w`, `g_conv`/`g_convlabel`, `g_urlbuf`, and `g_cfg_pass`
+after the startup KAT gate); `argon2id_hash`/`run_selftest` preserve r12/r13/r15;
+`gcm_open` scrubs `outp` on tag mismatch; `reg_query_sz` gets a REG_SZ type-check +
+NUL-termination; an http/https URL allowlist; `base32_decode` fails instead of
+truncating; `write_file`/`log_open` guards; TPM RSA-2048 set explicitly; the
+`pkat` CS-teardown race; dead empty `crc32.asm` removed. Follow-ups the audit
+surfaced are new below: C6, C7, D6, E16, G8 (the deferred CI SHA-pin is G7.3).
+
 House rules:
 
 - Plan IDs are stable: `C4` stays `C4` when other plans are completed or added.
@@ -88,12 +104,16 @@ House rules:
 
 ## Sequencing
 
-- **Format note:** the audit-cleanup merge shipped its format work without a
-  header version bump — a trailing `[u64 save_counter][keyed BLAKE2b MAC]
-  [magic]` block after the VATT trailer, plus a reserved `VF_DELETED` tag; old
-  readers ignore the additions. Any future format addition should follow the
-  same pattern: a new reserved `VF_*` tag that old readers skip (verify the
-  unknown-tag skip path first).
+- **Format note:** the audit-cleanup merge added the FMAC trailer (a trailing
+  `[u64 save_counter][keyed BLAKE2b MAC][magic]` block after the VATT trailer)
+  plus a reserved `VF_DELETED` tag as **v1** additions that old readers ignored.
+  The 2026-07-20 audit made the FMAC trailer **mandatory** and bumped the header
+  to **v2**: `vault_unlock` now rejects any image whose version != `VAULT_VERSION`
+  and any v2 image lacking a valid FMAC (`EXIT_AUTH`), so the attachment section
+  is always authenticated. In-body **field** additions still follow the tolerant
+  pattern — a new reserved `VF_*` tag old readers skip (verify the unknown-tag
+  skip path first) — but any change to authentication or container layout must
+  bump `VAULT_VERSION`, not ride on tag-skipping.
 
 ---
 
@@ -127,6 +147,46 @@ nothing.
    failure) or stop billing it as an audit log. Fix the stale header examples
    (`add/get/list`) and the "Event Log" comment in `main.asm`. *Test:* a GUI
    session produces the expected lines; no planted secret appears in any line.
+
+### C6. Registry location-leak hygiene
+Two HKCU value names are the **full vault path** in cleartext: the anti-rollback
+mirror (`HKCU\SOFTWARE\Vordr\Rollback`, `reg_ctr_get`/`reg_ctr_set` in
+`regcfg.asm`) and — per C4.2 — the TPM blob. Both disclose where a user's vaults
+live and orphan when a vault moves.
+
+1. Hash the value name (e.g. BLAKE2b of the canonical path) for both the rollback
+   mirror and the TPM blob; one shared helper. *Test:* `rbtest` still detects a
+   rollback after the change; the raw path no longer appears under either key.
+2. Prune orphaned values at unlock (shared with the C4.2 orphan-prune pass).
+   *Test:* move a vault → the old value is gone after the next unlock.
+
+### C7. Temp-file exclusive create (atomic-save hardening)
+`write_file` (fileio.asm) creates `<vault>.tmp` with `CREATE_ALWAYS` and no
+exclusive-create / reparse-point check. In a writable shared directory a
+pre-planted `<vault>.tmp` symlink could redirect the save. The vault dir is
+normally user-owned (hence low), but the atomic-write guarantee in `formats.md`
+should hold regardless.
+
+1. Create the temp with `CREATE_NEW` (retry with a fresh unpredictable suffix on
+   collision) and reject a pre-existing reparse point. *Test:* a pre-planted
+   `<vault>.tmp` (plain + symlink) is not followed; `bktest`/`tmptest` stay green.
+
+---
+
+## D. Docs & tooling
+
+### D6. SECRETS.md buffer-table sync
+The 2026-07-20 audit added wipes for `g_hbuf` (Argon2 H0 pre-hash), `g_rowpw_w`
+(reveal-overlay secret), `g_conv`/`g_convlabel` (field value/label scratch) and
+`g_urlbuf`. None appear in `SECRETS.md`'s buffer table or accepted-exceptions
+list, so its "no unknown rows" invariant no longer holds.
+
+1. Add the four buffers with lock status + wipe site. Confirm each one's
+   VirtualLock status — in particular whether `g_rowpw_w` (a revealed plaintext
+   secret) is in `sec_lock_statics`; if it is not, either lock it or list it as a
+   justified transient exception (and, if unlocked, file a C-group lock task).
+   *Test:* every secret buffer in `src/*.asm` maps to a table row or a documented
+   exception (grep audit passes).
 
 ---
 
@@ -165,6 +225,19 @@ AES zips are rejected. There is no inflate in this repo — sibling project
 2. If porting: `inflate.asm` + KAT selftests; the import path dispatches
    method 8 vs 0. *Test:* a 7-Zip-produced deflated AE-2 zip imports
    correctly; RUNALL (incl. the `fuzzzip` stage) green.
+
+### E16. pwgen output-capacity parameter
+The 2026-07-20 audit bounded the passphrase word count (`PWGEN_PP_MAXWORDS`) to
+stop `pwgen_ex` overflowing a caller buffer (the GUI's 260-byte `g_genout`). That
+is a stopgap: `pwgen_ex` still takes no explicit output-capacity argument, so a
+future caller with a small buffer and a large `n` could overflow for a
+non-passphrase style too.
+
+1. Add an `outcap` argument to `pwgen_ex` (and `pwgen`); bound every write; drop
+   the `PWGEN_PP_MAXWORDS` special case. Update all call sites (~12) and their
+   frame sizes. *Test:* a dbg probe requests each style into a deliberately-tiny
+   buffer and gets a clean truncation/refusal, never an overwrite; SELFTEST +
+   `atgen` green.
 
 ---
 
@@ -245,6 +318,17 @@ unlocks inline.
 
 *Test:* the workflow runs green on schedule; a seeded fuzz failure reproduces
 from its logged seed.
+
+### G8. Attachment-section + FMAC fuzzer
+The 2026-07-20 audit added `attach_index_build` per-entry bounds and made the
+FMAC trailer mandatory; `vfuzz` mutates the record body, but nothing fuzzes the
+attachment section or the trailer specifically.
+
+1. A dbg probe (`attfuzz`) that seals a vault, then mutates the attachment
+   section (crafted `ctlen`/id, truncation, junk entries) and the FMAC trailer
+   (stripped, bit-flipped) under logged random seeds, asserting `vault_unlock`
+   rejects or safely skips — never crashes or reads OOB. *Test:* add to RUNALL
+   stage 4; a seeded failure reproduces from its seed. Pairs with G7.1.
 
 ---
 
