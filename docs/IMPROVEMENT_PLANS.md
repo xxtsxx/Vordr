@@ -258,15 +258,14 @@ unlocks inline.
 ## G. Infrastructure & performance
 
 ### G7. CI hardening
-1. Nightly scheduled workflow that runs the `vfuzz`/`fuzzzip` fuzz stages with
-   random logged seeds.
-2. dbg + release build matrix (incl. `build release`).
-3. SHA-pin `ilammy/msvc-dev-cmd` (currently tag-pinned).
-4. Fix the stage-list comments in `run_all.cmd` + `build.yml` (they omit
-   secscan/tmptest and the newer probes).
+**Done (2026-07-21):** nightly `schedule` trigger; the reproducible `build release`
+step; `ilammy/msvc-dev-cmd` SHA-pinned; stage-list comments in `run_all.cmd` +
+`build.yml` corrected.
 
-*Test:* the workflow runs green on schedule; a seeded fuzz failure reproduces
-from its logged seed.
+**Remaining:**
+1. Make `vfuzz`/`fuzzzip` take (and log) an explicit random seed so a nightly
+   failure reproduces from its logged seed. *Test:* a seeded failure reproduces
+   from the seed in the log. (Pairs with G8's `attfuzz`.)
 
 ### G8. Attachment-section + FMAC fuzzer
 The 2026-07-20 audit added `attach_index_build` per-entry bounds and made the
