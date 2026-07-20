@@ -177,16 +177,19 @@ tiles — can ship first and shares the same analysis pass.)
    badge decrements after save.
 
 
-### E15. DEFLATE in zipimport (or a documented limitation)
-Imports accept only Vordr's own STORE-inside-AES exports today; 7-Zip/WinRAR
-AES zips are rejected. There is no inflate in this repo — sibling project
-`myrkr` has a proven puff-style decoder with KATs to port.
+### E15. DEFLATE in zipimport — DONE (documented limitation)
+Imports accept only Vordr's own STORE-inside-AES exports; DEFLATE-compressed
+AES zips (7-Zip/WinRAR default) decrypt but fail to parse. There is no inflate
+in this repo, and zero third-party code is a deliberate constraint (the sibling
+`myrkr` decoder is not present here to port).
 
-1. Decide: port inflate (recommended) or document "imports Vordr exports
-   only" in README + the import dialog. *Test:* the choice is written down.
-2. If porting: `inflate.asm` + KAT selftests; the import path dispatches
-   method 8 vs 0. *Test:* a 7-Zip-produced deflated AE-2 zip imports
-   correctly; RUNALL (incl. the `fuzzzip` stage) green.
+1. *Done — decision: document the limitation.* README "Import and export"
+   now states STORED-only and how to re-create an archive with no compression;
+   the GUI's "no importable entries" message spells out the STORED-only rule.
+2. Porting inflate is deferred (would add a fuzzed pre-auth code path for a
+   convenience the STORE workaround already covers). If revisited: `inflate.asm`
+   + KAT selftests, import dispatches method 8 vs 0, RUNALL incl. `fuzzzip`
+   must stay green.
 
 
 ## R. Redesign remainder
