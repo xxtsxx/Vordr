@@ -438,6 +438,7 @@ IDC_U_UNLOCK equ 105
 IDC_U_STATUS equ 106
 IDC_U_TPM    equ 107
 IDC_U_REMEMBER equ 108
+IDC_U_RONLY  equ 109                  ; E9: "Open read-only" checkbox
 DLG_VAULT    equ 200
 IDC_V_LIST   equ 201
 IDC_V_TITLE  equ 202
@@ -750,6 +751,7 @@ WSTR s_extchg,      <The vault file changed on disk since you opened it. Another
 WSTR t_exttitle,    <Vault changed on disk>
 WSTR g_singleton_name, <VordrSingletonMutex_v1>
 WSTR g_vault_title,    <Vordr - Vault>
+WSTR g_vault_title_ro, <Vordr - Vault (read-only)>   ; E9: title when opened read-only
 WSTR g_unlock_title,   <Vordr - Unlock vault>
 WSTR g_create_title,   <Vordr - Set master password>
 WSTR s_createfail,  <Could not create the vault (I/O or out of memory).>
@@ -1261,6 +1263,8 @@ g_pol_len_lock dd ?                   ; 1 = min-length set by HKLM policy (locke
 g_pol_cls_lock dd ?                   ; 1 = min-classes set by HKLM policy (locked)
 g_no_history  dd ?                    ; 1 = "Do not save history" setting on
 g_no_phonetic dd ?                    ; 1 = "Disable phonetic reader" setting on
+public g_readonly
+g_readonly    dd ?                    ; E9: 1 = vault opened read-only (no disk writes)
 g_nohist_lock dd ?                    ; 1 = NoHistory forced by HKLM policy (locked)
 g_nophon_lock dd ?                    ; 1 = NoPhonetic forced by HKLM policy (locked)
 g_pw_compliant dd ?                   ; 1 = create-dialog password meets the policy
@@ -1507,6 +1511,8 @@ gui_unlock proc frame
     FRAME_PROLOG 48
     mov     qword ptr [rbp-24], rcx
     mov     dword ptr [g_use_tpm], 0        ; password path (not the TPM shortcut)
+    WINCALL IsDlgButtonChecked, qword ptr [rbp-24], IDC_U_RONLY   ; E9: read-only mode
+    mov     dword ptr [g_readonly], eax     ; follows the "Open read-only" checkbox
     cmp     dword ptr [g_vpath_set], 0
     jne     gu_havepath
     mov     rcx, qword ptr [rbp-24]
@@ -1801,6 +1807,14 @@ up_init:
     call    SetDlgItemTextW
 up_init_x:
     add     rsp, 32
+    sub     rsp, 48                          ; E9: reflect the --ro launch flag into
+    mov     rcx, qword ptr [rbp-8]           ; the "Open read-only" checkbox
+    mov     edx, IDC_U_RONLY
+    mov     r8d, 0F1h                        ; BM_SETCHECK
+    mov     r9d, dword ptr [g_readonly]      ; BST_CHECKED(1) / BST_UNCHECKED(0)
+    mov     qword ptr [rsp+32], 0
+    call    SendDlgItemMessageW
+    add     rsp, 48
     mov     eax, 1
     jmp     up_ret
 up_cmd:
@@ -4821,6 +4835,10 @@ gui_commit endp
 ;   the toolbar pencil glyph for a check mark while editing.
 gui_set_editmode proc frame
     FRAME_PROLOG 128
+    cmp     dword ptr [g_readonly], 0           ; E9: read-only never enters edit mode -
+    je      sem_modeok                          ; force view so the edit UI stays hidden
+    xor     edx, edx
+sem_modeok:
     mov     qword ptr [rbp-24], rcx
     mov     dword ptr [rbp-32], edx
     mov     dword ptr [g_editmode], edx
@@ -8762,6 +8780,12 @@ gui_set_deleted_now endp
 ;   days.  Reseals if anything was purged.  Called once at unlock.
 gui_purge_trash proc frame
     FRAME_PROLOG 64
+    cmp     dword ptr [g_readonly], 0           ; E9: no auto-purge on a read-only open
+    je      pt_go
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+pt_go:
     ; [rbp-24] now-ft, [rbp-32] purged count, [rbp-40] index
     lea     rcx, [rbp-56]
     call    GetSystemTimeAsFileTime
@@ -10893,7 +10917,12 @@ vp_t_search:
 vp_init:
     mov     rax, qword ptr [rbp-8]            ; remember the window for the tray toggle
     mov     qword ptr [g_vaulthwnd], rax
-    WINCALL SetWindowTextW, qword ptr [rbp-8], addr g_vault_title  ; taskbar/Alt-Tab + single-instance FindWindow
+    lea     rax, [g_vault_title]                        ; E9: " (read-only)" title suffix
+    cmp     dword ptr [g_readonly], 0
+    je      @F
+    lea     rax, [g_vault_title_ro]
+@@:
+    WINCALL SetWindowTextW, qword ptr [rbp-8], rax  ; taskbar/Alt-Tab (FindWindow still keys on g_vault_title)
     WINCALL DragAcceptFiles, qword ptr [rbp-8], 1   ; accept Explorer file drops
     mov     rcx, qword ptr [rbp-8]           ; Vordr shield in the title bar
     call    gui_set_winicon
@@ -11306,6 +11335,8 @@ vp_export:
     call    gui_export
     jmp     vp_handled
 vp_import:
+    cmp     dword ptr [g_readonly], 0           ; E9: no import in read-only mode
+    jne     vp_handled
     mov     rcx, qword ptr [rbp-8]
     call    gui_import
     jmp     vp_handled
@@ -11335,6 +11366,8 @@ vp_iconpick:
     mov     dword ptr [g_dirty], 1               ; applied on Save
     jmp     vp_handled
 vp_fav:
+    cmp     dword ptr [g_readonly], 0           ; E9: no favorite/restore in read-only
+    jne     vp_handled
     cmp     dword ptr [g_cur_idx], 0             ; only with an entry shown
     jl      vp_handled
     cmp     dword ptr [g_trash_view], 0          ; recover mode: the button restores
@@ -11472,6 +11505,8 @@ vp_gen_standalone:
 @@: WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_PWGEN, qword ptr [rbp-8], addr pwgen_proc, 0
     jmp     vp_handled
 vp_add:
+    cmp     dword ptr [g_readonly], 0           ; E9: no new entry in read-only mode
+    jne     vp_handled
     ; adding a new entry discards any unsaved inline edits to the current one
     ; (edits are only persisted by an explicit Save)
     mov     dword ptr [g_dirty], 0
@@ -11604,6 +11639,8 @@ vsr_view:
     call    gui_set_editmode
     jmp     vp_handled
 vp_remove:
+    cmp     dword ptr [g_readonly], 0           ; E9: no delete in read-only mode
+    jne     vp_handled
     cmp     dword ptr [g_cur_idx], 0
     jl      vp_handled
     cmp     dword ptr [g_trash_view], 0
@@ -11924,6 +11961,7 @@ cd_polok:
     mov     qword ptr [rbp-56], rax
     jmp     cd_status
 cd_doinit:
+    mov     dword ptr [g_readonly], 0        ; E9: a newly created vault is always writable
     lea     rcx, [g_vpath]                   ; make sure the target folder exists
     call    gui_ensure_vault_dir
     call    do_init
