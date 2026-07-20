@@ -142,13 +142,18 @@ House rules:
 
 ## C. Hardening & platform
 
-### C4. TPM unlock hardening
-All ncrypt calls are `NCRYPT_SILENT` — any same-user process can unwrap the
+### C4. TPM unlock hardening — DONE
+All ncrypt calls were `NCRYPT_SILENT` — any same-user process could unwrap the
 vault key.
 
-1. Optional Hello PIN / UI policy on key creation (setting; default
-   unchanged). *Test:* with the policy set, unseal prompts; without, silent as
-   today.
+1. *Done.* Opt-in `TpmRequireHello` setting (HKLM > HKCU DWORD, default 0 =
+   today's silent behavior). When set, `tpm_seal` stamps an `NCRYPT_UI_POLICY`
+   (`NCRYPT_UI_PROTECT_KEY_FLAG`) on the key at creation and `tpm_unseal` drops
+   `NCRYPT_SILENT_FLAG` / `NCRYPT_OAEP_SILENT` so Windows may surface a
+   Hello/PIN prompt. Best-effort: a provider that rejects the policy just leaves
+   the key silent. *Note:* the prompting path can't be runtime-verified in this
+   environment (no TPM+Hello); gated off by default so existing TPM unlock is
+   byte-for-byte unchanged.
 
 (The former blob-hygiene item — the TPM registry value name was the full vault
 path — is fixed by C6: the name is now hashed and legacy path-named values are
