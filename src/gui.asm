@@ -10972,6 +10972,13 @@ vp_t_search:
 vp_init:
     mov     rax, qword ptr [rbp-8]            ; remember the window for the tray toggle
     mov     qword ptr [g_vaulthwnd], rax
+    WINCALL GetFileAttributesW, addr g_vpath  ; C8.5: a read-only vault FILE forces
+    cmp     eax, -1                           ; read-only mode (it can't be written anyway)
+    je      @F
+    test    eax, 1                            ; FILE_ATTRIBUTE_READONLY
+    jz      @F
+    mov     dword ptr [g_readonly], 1
+@@:
     lea     rax, [g_vault_title]                        ; E9: " (read-only)" title suffix
     cmp     dword ptr [g_readonly], 0
     je      @F
