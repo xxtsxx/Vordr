@@ -756,6 +756,12 @@ public argon2id_hash
 argon2id_hash proc frame
     FRAME_PROLOG 64
     mov     qword ptr [rbp-24], rcx     ; req
+    ; preserve callee-saved registers used as scratch below (r12=ref-block ptr,
+    ; r13=prev-block ptr, r15=pseudo-random word).  These slots sit above the
+    ; 32-byte callee shadow and are not touched by any call this proc makes.
+    mov     qword ptr [rbp-32], r12
+    mov     qword ptr [rbp-40], r13
+    mov     qword ptr [rbp-48], r15
 
     ; ---- read params -------------------------------------------------------
     mov     eax, dword ptr [rcx].ARGON2REQ.lanes
@@ -1256,6 +1262,12 @@ endif
     mov     r9, 1024
     call    blake2b_long
 
+    ; wipe the key-equivalent pre-hash H0 (g_hbuf, 80 bytes) - together with the
+    ; public salt it is sufficient to reproduce the derived key, so it must not
+    ; linger in .data? after the KDF completes.
+    lea     rcx, [g_hbuf]
+    mov     edx, 80
+    call    secure_zero
     ; wipe + free arena
     mov     rcx, qword ptr [g_arena]
     mov     rdx, qword ptr [g_mb]
@@ -1267,10 +1279,20 @@ endif
     call    VirtualFree
 
     xor     eax, eax
+    mov     r12, qword ptr [rbp-32]     ; restore callee-saved registers
+    mov     r13, qword ptr [rbp-40]
+    mov     r15, qword ptr [rbp-48]
     FRAME_EPILOG
     ret
 a2_fail:
+    ; H0 is written before the arena allocation, so wipe it on this path too
+    lea     rcx, [g_hbuf]
+    mov     edx, 80
+    call    secure_zero
     mov     eax, 1
+    mov     r12, qword ptr [rbp-32]     ; restore callee-saved registers
+    mov     r13, qword ptr [rbp-40]
+    mov     r15, qword ptr [rbp-48]
     FRAME_EPILOG
     ret
 argon2id_hash endp

@@ -39,7 +39,6 @@ CP_UTF8_    equ 65001
 ZE_CAP      equ 32*1024*1024
 ZE_MAXFILE  equ 512
 ZE_NAMEPOOL equ 512*1024             ; persistent copies of every entry's name
-ZJ_PFX_MAX  equ 200                  ; max bytes of a title used as a folder name
 PBKDF2_ITERS equ 1000
 
 .data?
@@ -691,67 +690,9 @@ zbj_err:
 ze_build_json endp
 
 ; =============================================================================
-; ze_pathsan(rcx = src, edx = srclen, r8 = dst) -> eax = dst length.  Copy src
-;   into dst as a path-safe folder name: bytes that are path-reserved (/ \ : * ?
-;   " < > |) or control (<0x20) become '_', capped at ZJ_PFX_MAX, trailing dots
-;   and spaces trimmed, empty -> "_".  Byte-wise, so UTF-8 (>=0x80) is preserved.
-; =============================================================================
-ze_pathsan proc
-    cmp     edx, ZJ_PFX_MAX
-    jbe     ps_cap
-    mov     edx, ZJ_PFX_MAX
-ps_cap:
-    xor     r9d, r9d                             ; i
-ps_lp:
-    cmp     r9d, edx
-    jae     ps_done
-    movzx   eax, byte ptr [rcx+r9]
-    cmp     eax, 20h
-    jb      ps_bad
-    cmp     eax, '/'
-    je      ps_bad
-    cmp     eax, '\'
-    je      ps_bad
-    cmp     eax, ':'
-    je      ps_bad
-    cmp     eax, '*'
-    je      ps_bad
-    cmp     eax, '?'
-    je      ps_bad
-    cmp     eax, '"'
-    je      ps_bad
-    cmp     eax, '<'
-    je      ps_bad
-    cmp     eax, '>'
-    je      ps_bad
-    cmp     eax, '|'
-    je      ps_bad
-    jmp     ps_put
-ps_bad:
-    mov     eax, '_'
-ps_put:
-    mov     byte ptr [r8+r9], al
-    inc     r9d
-    jmp     ps_lp
-ps_done:
-    test    r9d, r9d                             ; trim trailing '.' / ' '
-    jz      ps_empty
-    movzx   eax, byte ptr [r8+r9-1]
-    cmp     eax, '.'
-    je      ps_trimdec
-    cmp     eax, ' '
-    je      ps_trimdec
-    jmp     ps_ret
-ps_trimdec:
-    dec     r9d
-    jmp     ps_done
-ps_empty:
-    mov     byte ptr [r8], '_'
-    mov     r9d, 1
-ps_ret:
-    mov     eax, r9d
-    ret
-ze_pathsan endp
+; (ze_pathsan was removed: attachment folders are now opaque 8-hex entry ids built
+;  inline in ze_att_zippath, so no user-controlled text - and in particular no
+;  entry title - is ever placed in a cleartext ZIP member name.)
 
 ; =============================================================================
 ; ze_att_zippath(ecx = entry index, rdx = attachment value ptr, r8d = value len)
@@ -790,18 +731,34 @@ azp_dcp:
     mov     eax, 14
 azp_havefn:
     mov     dword ptr [rbp-48], eax             ; fnlen
-    ; ---- sanitized title folder + '/' into g_zj_path ----
-    mov     ecx, dword ptr [rbp-24]
-    lea     rdx, [rbp-64]                        ; &titlelen
-    call    vault_title_at                      ; rax = title ptr (UTF-8)
-    mov     rcx, rax
-    mov     edx, dword ptr [rbp-64]
-    lea     r8, [g_zj_path]
-    call    ze_pathsan                          ; eax = folder-name length
+    ; ---- opaque per-entry folder (8 hex of the entry index) + '/' ----
+    ; The entry TITLE must never appear in a cleartext ZIP member name (WinZip-AES
+    ; leaves member names unencrypted, so a title folder leaked secrets like "Swiss
+    ; Bank" to anyone holding the archive).  A unique but non-identifying id keeps
+    ; the JSON reference and the actual member name in agreement (both come from
+    ; here) while disclosing nothing; the real title stays inside encrypted json.
+    mov     eax, dword ptr [rbp-24]             ; entry index
     lea     r10, [g_zj_path]
-    mov     byte ptr [r10+rax], '/'
-    inc     eax
-    mov     dword ptr [rbp-56], eax             ; prefix length
+    mov     ecx, 8                              ; 8 hex digits, most-significant first
+azp_hex:
+    mov     edx, eax
+    shr     edx, 28
+    and     edx, 0Fh
+    cmp     edx, 10
+    jb      azp_hd
+    add     edx, 'a'-10
+    jmp     azp_hput
+azp_hd:
+    add     edx, '0'
+azp_hput:
+    mov     byte ptr [r10], dl
+    inc     r10
+    shl     eax, 4
+    dec     ecx
+    jnz     azp_hex
+    mov     byte ptr [r10], '/'
+    mov     eax, 9                              ; prefix length = 8 hex + '/'
+    mov     dword ptr [rbp-56], eax
     ; ---- append the filename bytes ----
     lea     r10, [g_zj_path]
     add     r10, rax
@@ -880,7 +837,10 @@ zea_att:
     mov     r8, qword ptr [rbp-80]
     mov     r9, qword ptr [rbp-72]
     call    ze_add_file
-    mov     rcx, qword ptr [rbp-80]              ; free plaintext (holds secret bytes)
+    mov     rcx, qword ptr [rbp-80]              ; wipe plaintext (holds secret bytes)
+    mov     rdx, qword ptr [rbp-72]              ; before returning it to the heap
+    call    secure_zero
+    mov     rcx, qword ptr [rbp-80]
     mov     rdx, qword ptr [rbp-72]
     call    mem_free
 zea_fnext:
@@ -930,6 +890,10 @@ ze_compose proc frame
     mov     r8, qword ptr [r10]
     mov     r9, qword ptr [r10+8]
     call    ze_add_file
+    lea     r10, [g_json]                       ; wipe the plaintext json (every field value
+    mov     rcx, qword ptr [r10]                ; of every exported entry) before freeing it
+    mov     rdx, qword ptr [r10+16]
+    call    secure_zero
     lea     r10, [g_json]
     mov     rcx, qword ptr [r10]
     mov     rdx, qword ptr [r10+16]
