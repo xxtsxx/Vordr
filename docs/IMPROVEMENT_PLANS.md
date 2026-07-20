@@ -142,14 +142,6 @@ House rules:
 
 ## C. Hardening & platform
 
-### C3. VirtualLock failure policy
-`secmem_alloc` ignores a failed `sec_lock` — the secret stays pageable,
-silently.
-
-1. Decide fail-closed (refuse unlock) vs loud one-time warning; implement.
-   *Test:* a forced-failure dbg hook exercises the chosen path; SELFTEST
-   unaffected.
-
 ### C4. TPM unlock hardening
 All ncrypt calls are `NCRYPT_SILENT` — any same-user process can unwrap the
 vault key.

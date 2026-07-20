@@ -125,6 +125,9 @@ if not "!errorlevel!"=="1" ( echo   phtest: FAIL ^(exit !errorlevel!, expected 1
 bin\vordr.exe secscan > "%WORK%\secscan.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   secscan: FAIL ^(exit !errorlevel!, secret residue after wipe^) & set RT=FAIL )
 
+bin\vordr.exe lktest > "%WORK%\lktest.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   lktest: FAIL ^(exit !errorlevel!, VirtualLock failure detection^) & set RT=FAIL )
+
 bin\vordr.exe tmptest > "%WORK%\tmptest.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   tmptest: FAIL ^(exit !errorlevel!, temp file not wiped+deleted^) & set RT=FAIL )
 

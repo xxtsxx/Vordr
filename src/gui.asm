@@ -45,6 +45,7 @@ extern do_init:proc
 extern vault_unlock:proc
 extern vault_lock:proc
 extern vault_reload:proc                ; C8: refresh from disk (reload-safe conflict)
+externdef g_seclock_failed:dword        ; C3: a secret buffer stayed pageable
 extern vault_reseal:proc
 extern vault_ext_changed:proc           ; vault.asm: on-disk file changed since load?
 extern vault_remove_at:proc
@@ -752,6 +753,8 @@ WSTR t_exttitle,    <Vault changed on disk>
 WSTR s_reloaded,    <This vault was changed by someone else and has been reloaded from disk. Your change was not saved - re-apply it and save again.>
 WSTR t_reloaded,    <Vault reloaded>
 WSTR s_busy,        <Another user is saving this vault right now. Your change is kept in memory - try saving again in a moment.>
+WSTR s_nolock,      <Vordr could not lock all secret buffers into RAM on this system, so decrypted secrets may be written to the pagefile. Consider closing memory-heavy apps.>
+WSTR t_nolock,      <Secrets not pinned to RAM>
 WSTR g_singleton_name, <VordrSingletonMutex_v1>
 WSTR g_vault_title,    <Vordr - Vault>
 WSTR g_vault_title_ro, <Vordr - Vault (read-only)>   ; E9: title when opened read-only
@@ -1268,6 +1271,7 @@ g_no_history  dd ?                    ; 1 = "Do not save history" setting on
 g_no_phonetic dd ?                    ; 1 = "Disable phonetic reader" setting on
 public g_readonly
 g_readonly    dd ?                    ; E9: 1 = vault opened read-only (no disk writes)
+g_seclock_warned dd ?                 ; C3: 1 = the "secrets not pinned" warning was shown
 g_nohist_lock dd ?                    ; 1 = NoHistory forced by HKLM policy (locked)
 g_nophon_lock dd ?                    ; 1 = NoPhonetic forced by HKLM policy (locked)
 g_pw_compliant dd ?                   ; 1 = create-dialog password meets the policy
@@ -10985,6 +10989,13 @@ vp_init:
     lea     rax, [g_vault_title_ro]
 @@:
     WINCALL SetWindowTextW, qword ptr [rbp-8], rax  ; taskbar/Alt-Tab (FindWindow still keys on g_vault_title)
+    cmp     dword ptr [g_seclock_failed], 0   ; C3: one-time "secrets not pinned to RAM" warning
+    je      @F
+    cmp     dword ptr [g_seclock_warned], 0
+    jne     @F
+    mov     dword ptr [g_seclock_warned], 1
+    WINCALL gui_msgbox, qword ptr [rbp-8], addr s_nolock, addr t_nolock, <MB_OK or MB_ICONWARNING>
+@@:
     WINCALL DragAcceptFiles, qword ptr [rbp-8], 1   ; accept Explorer file drops
     mov     rcx, qword ptr [rbp-8]           ; Vordr shield in the title bar
     call    gui_set_winicon
