@@ -178,6 +178,8 @@ write_file proc frame
         test    eax, eax
         jz      wf_io_close                      ; I/O error -> cleanup
         mov     r10d, dword ptr [rbp-64]
+        test    r10d, r10d
+        jz      wf_io_close                      ; 0 bytes written -> stop (no spin)
         add     qword ptr [rbp-48], r10
         sub     qword ptr [rbp-56], r10
     xENDW

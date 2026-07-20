@@ -97,7 +97,8 @@ b32_acc:
     and     eax, 0FFh
     mov     rdx, qword ptr [rbp-40]
     cmp     rdx, qword ptr [rbp-32]
-    jae     b32_loop                        ; no room: drop (cap is generous)
+    jae     b32_bad                         ; over cap: fail (0) rather than silently
+                                            ; truncate the secret into a wrong TOTP key
     mov     rcx, qword ptr [rbp-24]
     mov     byte ptr [rcx+rdx], al
     inc     qword ptr [rbp-40]

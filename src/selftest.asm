@@ -15,6 +15,7 @@ include macros.inc
 
 extern sha256_hash:proc
 extern ct_memcmp:proc
+extern secure_zero:proc
 extern print_a:proc
 extern CreateThread:proc
 extern WaitForMultipleObjects:proc
@@ -312,6 +313,11 @@ endm
 public run_selftest
 run_selftest proc frame
     FRAME_PROLOG 96
+    ; preserve callee-saved registers used as scratch below (r12/r13/r15).  These
+    ; slots sit above the 32-byte callee shadow and are untouched by any call here.
+    mov     qword ptr [rbp-48], r12
+    mov     qword ptr [rbp-56], r13
+    mov     qword ptr [rbp-64], r15
     ; [rbp-24] = failure count
     mov     dword ptr [g_st_verbose], ecx
     mov     qword ptr [rbp-24], 0
@@ -905,8 +911,18 @@ st_ctm_fail:
     STPRINT st_fail_ctm, st_fail_ctm_len
     inc     qword ptr [rbp-24]
 st_after_ctm:
+    ; scrub the KAT's test-password state.  run_selftest is the startup gate
+    ; (wstart runs it on every launch), so it must not leave a stale constant
+    ; password + non-zero length in g_cfg_pass for the unlock flow to inherit.
+    lea     rcx, [g_cfg_pass]
+    mov     edx, MAX_PASSWORD_BYTES+1
+    call    secure_zero
+    mov     dword ptr [g_cfg_passlen], 0
 
     mov     rax, qword ptr [rbp-24]
+    mov     r12, qword ptr [rbp-48]     ; restore callee-saved registers
+    mov     r13, qword ptr [rbp-56]
+    mov     r15, qword ptr [rbp-64]
     FRAME_EPILOG
     ret
 run_selftest endp
@@ -1021,9 +1037,12 @@ pk_close:
     inc     qword ptr [rbp-24]
     jmp     pk_close
 pk_eval:
-    WINCALL DeleteCriticalSection, addr g_pkat_cs
+    ; only destroy the CS once EVERY worker finished (WAIT_OBJECT_0).  On a timeout
+    ; a worker may still be alive and could enter a deleted CS (UB), so leak it -
+    ; the process exits (ExitProcess) immediately after pkat returns.
     cmp     dword ptr [rbp-32], 0               ; WAIT_OBJECT_0 = all signalled
     jne     pk_fail                             ; timeout / abandoned -> fail closed
+    WINCALL DeleteCriticalSection, addr g_pkat_cs
     mov     qword ptr [rbp-24], 0               ; every slot must be PASS(0)
 pk_sum:
     mov     eax, dword ptr [rbp-24]
