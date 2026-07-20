@@ -40,6 +40,7 @@ externdef g_vkey:byte               ; derived vault key (vault.asm)
 externdef g_pwbuf:byte              ; unlock/create password field (gui.asm)
 externdef g_pw2buf:byte             ; confirm-password field (gui.asm)
 externdef g_secret_w:byte           ; revealed secret for reveal/copy (gui.asm)
+externdef g_rowpw_w:byte            ; reveal-overlay secret copy (gui.asm)
 externdef g_e_totp:byte             ; entry-form TOTP key (gui.asm)
 externdef g_totp_b32:byte           ; selected entry TOTP key (gui.asm)
 externdef g_body_ptr:qword          ; decrypted vault body arena (vault.asm)
@@ -113,6 +114,9 @@ sec_lock_statics proc frame
     call    sec_lock
     lea     rcx, [g_secret_w]
     mov     edx, 16384
+    call    sec_lock
+    lea     rcx, [g_rowpw_w]                   ; D6: lock the reveal-overlay copy too
+    mov     edx, 512*2
     call    sec_lock
     lea     rcx, [g_e_totp]
     mov     edx, 512

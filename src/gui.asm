@@ -1364,6 +1364,7 @@ g_layout      dd ?                         ; UI layout/density index (0 comforta
 public g_fontdelta
 g_fontdelta   dd ?                         ; font-size delta in px (fixed 0 = Medium)
 g_colorpw_row dd ?                         ; row whose revealed secret is colored (-1=none)
+public g_rowpw_w
 g_rowpw_w     dw 512 dup (?)               ; revealed secret text for the color overlay
 g_wordtmp     dw 32 dup (?)                ; one resolved phonetic word (scratch)
 g_content_h   dd ?                        ; field-form content bottom (DLU) after layout

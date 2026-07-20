@@ -165,23 +165,6 @@ nothing.
 
 ---
 
-## D. Docs & tooling
-
-### D6. SECRETS.md buffer-table sync
-The 2026-07-20 audit added wipes for `g_hbuf` (Argon2 H0 pre-hash), `g_rowpw_w`
-(reveal-overlay secret), `g_conv`/`g_convlabel` (field value/label scratch) and
-`g_urlbuf`. None appear in `SECRETS.md`'s buffer table or accepted-exceptions
-list, so its "no unknown rows" invariant no longer holds.
-
-1. Add the four buffers with lock status + wipe site. Confirm each one's
-   VirtualLock status — in particular whether `g_rowpw_w` (a revealed plaintext
-   secret) is in `sec_lock_statics`; if it is not, either lock it or list it as a
-   justified transient exception (and, if unlocked, file a C-group lock task).
-   *Test:* every secret buffer in `src/*.asm` maps to a table row or a documented
-   exception (grep audit passes).
-
----
-
 ## E. Features (all verified absent)
 
 ### E6. Vault health dashboard
