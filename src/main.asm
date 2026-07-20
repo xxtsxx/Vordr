@@ -52,6 +52,7 @@ extern cmd_zfuzz:proc                   ; zip-import parser fuzzer (zipimport.as
 extern cmd_bktest:proc                  ; atomic-save + backup rotation probe (vault.asm)
 extern cmd_mactest:proc                 ; full-file MAC tamper-detection probe (vault.asm)
 extern cmd_rbtest:proc                  ; anti-rollback detection probe (vault.asm)
+extern cmd_reload:proc                  ; C8: vault_reload refresh probe (vault.asm)
 extern cmd_xctest:proc                  ; external-change detection probe (vault.asm)
 extern cmd_mvtest:proc                  ; multi-vault state snapshot/restore probe (vault.asm)
 extern cmd_mvswitch:proc                ; multi-vault context switch probe (vault.asm)
@@ -182,6 +183,7 @@ WSTR w_mactest,  <mactest>
 WSTR w_rbtest,   <rbtest>
 WSTR w_xctest,   <xctest>
 WSTR w_ro,       <--ro>                  ; E9: GUI read-only launch flag (not a verb)
+WSTR w_reload,   <reload>                ; C8: vault_reload refresh probe
 WSTR w_pkat,     <pkat>
 WSTR w_trtest,   <trtest>
 WSTR w_mvtest,   <mvtest>
@@ -234,6 +236,7 @@ cmd_table label CMDENT
     CMDENT { w_mactest,   cmd_mactest,   1, 0 }   ; full-file MAC tamper-detection probe
     CMDENT { w_rbtest,    cmd_rbtest,    1, 0 }   ; anti-rollback detection probe
     CMDENT { w_xctest,    cmd_xctest,    1, 0 }   ; external-change detection probe
+    CMDENT { w_reload,    cmd_reload,    1, 0 }   ; C8: vault_reload refresh probe
     CMDENT { w_mvtest,    cmd_mvtest,    0, 0 }   ; multi-vault snapshot/restore probe
     CMDENT { w_mvswitch,  cmd_mvswitch,  0, 0 }   ; multi-vault context switch probe
     CMDENT { w_avtest,    cmd_avtest,    0, 0 }   ; availability retry state-machine probe
