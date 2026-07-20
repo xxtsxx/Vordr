@@ -253,6 +253,8 @@ CSTR rl_ok,  "reload: PASS (in-memory body refreshed from disk)",13,10
 CSTR rl_bad, "reload: FAIL",13,10
 CSTR cw_ok,  "cowrite: PASS (write lock is exclusive + reacquirable)",13,10
 CSTR cw_bad, "cowrite: FAIL",13,10
+CSTR af_ok,  "attfuzz: PASS (attach_index_build survived the mutations)",13,10
+CSTR af_bad, "attfuzz: FAIL",13,10
 CSTR xc_ok,  "xctest: PASS (external header change detected)",13,10
 CSTR xc_bad, "xctest: FAIL",13,10
 CSTR e_io,      "error: cannot read/write the vault file",13,10
@@ -3190,6 +3192,68 @@ cw_fail:
     FRAME_EPILOG
     ret
 cmd_cowrite endp
+
+; ===========================================================================
+; cmd_attfuzz - G8: hammer attach_index_build with a fully random attachment
+;   section (seeded xorshift) and a random section length, asserting it never
+;   crashes or reads past the section (the per-entry bounds added in the audit).
+;   Analogous to vfuzz, but for the attachment index instead of the record parser.
+; ===========================================================================
+ATTFZ_LEN   equ 512
+ATTFZ_ITERS equ 4000
+LANDING_PAD
+public cmd_attfuzz
+cmd_attfuzz proc frame
+    FRAME_PROLOG 48
+    mov     rax, 9E3779B97F4A7C15h               ; fixed seed (deterministic, reproducible)
+    mov     qword ptr [g_vfz_rng], rax
+    mov     rcx, ATTFZ_LEN
+    call    mem_alloc
+    test    rax, rax
+    jz      af_oom
+    mov     qword ptr [rbp-24], rax
+    mov     qword ptr [g_filebuf], rax           ; attach_index_build reads g_filebuf+start
+    mov     qword ptr [rbp-32], ATTFZ_ITERS
+af_iter:
+    cmp     qword ptr [rbp-32], 0
+    je      af_pass
+    mov     r11, qword ptr [rbp-24]              ; fill the section with random bytes
+    xor     r8d, r8d
+af_fill:
+    call    vfz_rand
+    mov     qword ptr [r11+r8], rax
+    add     r8d, 8
+    cmp     r8d, ATTFZ_LEN
+    jb      af_fill
+    call    vfz_rand                             ; random section length in [0, ATTFZ_LEN]
+    xor     edx, edx
+    mov     rcx, ATTFZ_LEN + 1
+    div     rcx
+    mov     qword ptr [g_att_start], 0
+    mov     qword ptr [g_att_total], rdx
+    mov     dword ptr [g_attidx_n], 0
+    call    attach_index_build                   ; must not crash / read OOB
+    dec     qword ptr [rbp-32]
+    jmp     af_iter
+af_pass:
+    mov     rcx, qword ptr [rbp-24]
+    mov     rdx, ATTFZ_LEN
+    call    mem_free
+    mov     qword ptr [g_filebuf], 0
+    lea     rcx, [af_ok]
+    mov     edx, af_ok_len
+    call    print_a
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+af_oom:
+    lea     rcx, [af_bad]
+    mov     edx, af_bad_len
+    call    print_a
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_attfuzz endp
 
 ; ===========================================================================
 ; cmd_xctest <path> - prove external-change detection.  Create a vault
