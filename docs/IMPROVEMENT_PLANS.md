@@ -164,17 +164,26 @@ pruned at unlock.)
 
 ## E. Features (all verified absent)
 
-### E6. Vault health dashboard
-(The redesign's cheap precursor — weak/reused dot indicators inline on sidebar
-tiles — can ship first and shares the same analysis pass.)
+### E6. Vault health dashboard — mostly DONE
 
-1. Analysis pass: strength buckets (existing `gui_pw_strength` core),
-   exact-duplicates via BLAKE2b, age via pw-history timestamps; dbg `health`
-   verb prints counts for a scripted 10-entry vault — exact match.
-2. Dashboard dialog; clicking a row jumps to the entry. *Test:* navigation
-   highlights the right tile.
-3. Sidebar badge with the worst-bucket count. *Test:* fix one weak password →
-   badge decrements after save.
+1. *Done.* `vault_health(out)` fills `{weak, reused, old, total}`: weak =
+   `< 12` code points or `< 3` character classes (`vh_pw_weak`); reused =
+   VF_SECRET byte-identical to another entry (BLAKE2b-128); old = modified over
+   365 days ago. Fixed, policy-independent thresholds keep headless counts
+   deterministic. `healthkat` verb asserts the counts against a hand-built
+   10-entry fixture (weak=4 reused=6 old=2 total=10) — wired into RUNALL.
+2. *Done (as a summary).* Ctrl+H runs `gui_show_health`, which calls
+   `vault_health` on the open vault and shows a message box with the four
+   counts (`gui_wstrcpy`/`gui_u32w`-composed). The richer version — a modeless
+   dialog whose rows jump to the offending entry — is a follow-up (**R-new**).
+3. *Done (weak only).* Sidebar tiles now show a red bullet on the right edge
+   when the entry's password is weak (`gui_draw_listitem`, normal view). Reused
+   and stale dots + a worst-bucket count badge are the follow-up in R-new.
+
+**Remaining (folded to a follow-up):** a modeless health dialog with
+click-to-navigate rows, and reused/stale tile indicators + a count badge. These
+need a cached per-entry classification with invalidation on edit/save; deferred
+because they can't be verified in a headless environment. Tracked as **R6**.
 
 
 ### E15. DEFLATE in zipimport — DONE (documented limitation)
@@ -230,6 +239,14 @@ Reopen the same tab set (paths from MRU) at next unlock, each tab showing a
 locked placeholder until its password is supplied (click → secure unlock for
 that vault). *Test:* two vaults open, lock, unlock → two placeholders; one
 unlocks inline.
+
+### R6. Vault-health dashboard, richer (from E6)
+E6 shipped the analysis pass (`vault_health` + `healthkat`), a Ctrl+H summary
+box, and a weak-password tile dot. Remaining: a modeless health dialog whose
+rows jump to the offending entry, plus reused/stale tile indicators and a
+worst-bucket count badge. Needs a cached per-entry classification invalidated
+on edit/save (the summary recomputes on demand today). *Test:* fix one weak
+password → badge decrements after save; clicking a row highlights its tile.
 
 ---
 

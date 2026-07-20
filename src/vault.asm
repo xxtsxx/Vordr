@@ -3913,6 +3913,7 @@ HSTRIDE           equ 17                            ; {digest16, haspw1} per ent
 ;   Weak = fewer than HEALTH_MINLEN bytes, or fewer than HEALTH_MINCLASS of
 ;   {lower, upper, digit, other} present.  (Byte length over-counts multi-byte
 ;   UTF-8, which only makes a password look stronger - never falsely weak.)
+public vh_pw_weak
 vh_pw_weak proc frame
     FRAME_PROLOG 32
     xor     r10d, r10d                  ; class bitmask

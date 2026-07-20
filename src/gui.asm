@@ -52,6 +52,7 @@ extern vault_reseal:proc
 extern vault_ext_changed:proc           ; vault.asm: on-disk file changed since load?
 extern vault_remove_at:proc
 extern vault_count:proc
+extern vault_health:proc                ; E6: {weak,reused,old,total} analysis
 extern vault_ctx_reset:proc
 extern vault_ctx_open:proc
 extern vault_ctx_front:proc
@@ -62,6 +63,7 @@ externdef g_vault_n:dword
 externdef g_vault_cur:dword
 extern vault_title_at:proc
 extern vault_field_at:proc
+extern vh_pw_weak:proc                  ; E6: weak-password predicate (rcx=bytes,edx=len)
 extern vault_entry_ptr:proc
 extern g_carry_created:qword
 extern pwgen_ex:proc
@@ -912,6 +914,14 @@ endif
 WSTR xp_mm_title,    <Export all secrets>
 WSTR imp_xls_wrongpw,<Could not open the workbook - the password was incorrect.>
 WSTR imp_g_title,    <Import>
+; E6: vault-health summary (Ctrl+H) - labels chained with gui_wstrcpy/gui_u32w
+WSTR t_health,       <Vordr - vault health>
+WSTR hb_l1,          <Entries: >
+WSTR hb_l2,          <Weak passwords: >
+WSTR hb_l3,          <Reused passwords: >
+WSTR hb_l4,          <Unchanged over a year: >
+WSTR hb_locked,      <Unlock a vault first to see its health.>
+hb_crlf  dw 13,10,0
 WSTR imp_g_pre,      <Imported >
 WSTR imp_g_post,     < entries.>
 WSTR imp_g_none,     <No importable entries were found. Vordr imports uncompressed (STORED) AES-zip members only - re-create hand-built archives with no compression.>
@@ -1404,6 +1414,7 @@ g_xr_active   dd ?                          ; 1 = overlay list is showing cross-
 g_cmpbuf      db 256 dup (?)               ; title-A copy for WM_COMPAREITEM
 align 2
 g_imp_msgw    dw 160 dup (?)               ; import result message scratch (wide)
+g_health_msgw dw 200 dup (?)               ; E6: vault-health summary scratch (wide)
 g_pg_len      dd ?                         ; password-generator: length
 g_pg_style    dd ?                         ;   PWS_* style
 g_pg_opt      dd ?                         ;   class mask + PWO_* flags
@@ -2729,6 +2740,41 @@ gui_draw_listitem proc frame
     WINCALL DrawTextW, qword ptr [rbp-32], addr g_sub_w, -1, addr rbp-152, 8024h
 gli_subdone:
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-104]   ; restore font
+    ; E6: weak-password dot on the card's right edge (normal view only).  Reuses
+    ; the tested vault_field_at + vh_pw_weak; a red bullet just left of the star.
+    cmp     dword ptr [g_trash_view], 0
+    jne     gli_weakdone
+    mov     ecx, dword ptr [rbp-80]                               ; entry index
+    mov     edx, VF_SECRET
+    lea     r8, [rbp-136]                                         ; len scratch (free now)
+    call    vault_field_at
+    test    rax, rax
+    jz      gli_weakdone
+    mov     rcx, rax
+    mov     edx, dword ptr [rbp-136]
+    call    vh_pw_weak
+    test    eax, eax
+    jz      gli_weakdone
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_symfont]
+    mov     qword ptr [rbp-104], rax
+    WINCALL SetTextColor, qword ptr [rbp-32], 03B3BEFh            ; red (weak)
+    mov     word ptr [g_glyph_w], 2022h                           ; bullet
+    mov     word ptr [g_glyph_w+2], 0
+    mov     eax, dword ptr [rbp-56]
+    sub     eax, 38
+    mov     dword ptr [rbp-152], eax                              ; L = R-38
+    mov     eax, dword ptr [rbp-48]
+    add     eax, 4
+    mov     dword ptr [rbp-148], eax                              ; T
+    mov     eax, dword ptr [rbp-56]
+    sub     eax, 22
+    mov     dword ptr [rbp-144], eax                              ; R = R-22
+    mov     eax, dword ptr [rbp-48]
+    add     eax, 22
+    mov     dword ptr [rbp-140], eax                              ; B
+    WINCALL DrawTextW, qword ptr [rbp-32], addr g_glyph_w, -1, addr rbp-152, 025h
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-104]
+gli_weakdone:
     ; trash (recover) view: a recycle glyph on each item's right edge - clicking
     ; it restores that entry (see gui_trash_glyph_hit).  Otherwise, the fav star.
     cmp     dword ptr [g_trash_view], 0
@@ -5359,7 +5405,8 @@ ghost_tip_add endp
 ;   a printable character is typed while the list has focus (no edit focused),
 ;   move focus to the search box and forward the character there (redesign A2).
 ; vault_ctrl_key(rcx=ctl hwnd, edx=vk) -> eax 1 if a Ctrl+shortcut was handled.
-;   Ctrl+K focus search, Ctrl+N new, Ctrl+G generate, Ctrl+L lock (redesign A2/E4).
+;   Ctrl+K focus search, Ctrl+N new, Ctrl+G generate, Ctrl+H health, Ctrl+L lock
+;   (redesign A2/E4; Ctrl+H is E6).
 vault_ctrl_key proc frame
     FRAME_PROLOG 64
     mov     qword ptr [rbp-24], rcx
@@ -5386,6 +5433,11 @@ vck_chkn:
     jne     @F
     mov     dword ptr [rbp-44], IDC_V_GENERATE
     jmp     vck_post
+@@: cmp     eax, 48h                           ; 'H' -> vault-health summary (E6)
+    jne     @F
+    mov     rcx, qword ptr [rbp-40]            ; parent hwnd
+    call    gui_show_health
+    jmp     vck_yes
 @@: cmp     eax, 4Ch                           ; 'L' -> lock
     jne     vck_no
     mov     dword ptr [rbp-44], IDC_V_LOCK
@@ -13620,6 +13672,64 @@ gu32_wl:
     FRAME_EPILOG
     ret
 gui_u32w endp
+
+; ===========================================================================
+; gui_show_health(rcx = parent hwnd) - E6 dashboard: run vault_health on the
+;   open vault and show a summary message box (weak / reused / stale counts).
+;   Bound to Ctrl+H.  With no vault open it explains that instead.
+; ===========================================================================
+public gui_show_health
+gui_show_health proc frame
+    FRAME_PROLOG 64
+    ; [rbp-24]=parent  [rbp-48]=weak [rbp-44]=reused [rbp-40]=old [rbp-36]=total
+    mov     qword ptr [rbp-24], rcx
+    lea     rcx, [rbp-48]
+    call    vault_health
+    cmp     dword ptr [rbp-36], 0
+    jne     gsh_build
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr hb_locked, addr t_health, \
+            <MB_OK or MB_ICONINFORMATION>
+    FRAME_EPILOG
+    ret
+gsh_build:
+    lea     rcx, [g_health_msgw]
+    lea     rdx, [hb_l1]
+    call    gui_wstrcpy                         ; "Entries: "
+    mov     ecx, dword ptr [rbp-36]             ; total
+    mov     rdx, rax
+    call    gui_u32w
+    mov     rcx, rax
+    lea     rdx, [hb_crlf]
+    call    gui_wstrcpy
+    mov     rcx, rax
+    lea     rdx, [hb_l2]
+    call    gui_wstrcpy                         ; "Weak passwords: "
+    mov     ecx, dword ptr [rbp-48]             ; weak
+    mov     rdx, rax
+    call    gui_u32w
+    mov     rcx, rax
+    lea     rdx, [hb_crlf]
+    call    gui_wstrcpy
+    mov     rcx, rax
+    lea     rdx, [hb_l3]
+    call    gui_wstrcpy                         ; "Reused passwords: "
+    mov     ecx, dword ptr [rbp-44]             ; reused
+    mov     rdx, rax
+    call    gui_u32w
+    mov     rcx, rax
+    lea     rdx, [hb_crlf]
+    call    gui_wstrcpy
+    mov     rcx, rax
+    lea     rdx, [hb_l4]
+    call    gui_wstrcpy                         ; "Unchanged over a year: "
+    mov     ecx, dword ptr [rbp-40]             ; old
+    mov     rdx, rax
+    call    gui_u32w
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr g_health_msgw, addr t_health, \
+            <MB_OK or MB_ICONINFORMATION>
+    FRAME_EPILOG
+    ret
+gui_show_health endp
 
 ; =============================================================================
 ; gui_import(rcx = hdlg) -> eax = entries imported.  Pick a .vaultz file: the
