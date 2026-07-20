@@ -4891,6 +4891,27 @@ gcr2_done:
     ret
 gui_check_refresh endp
 
+; gui_ro_disable_btns(rcx = hdlg) - E9: grey out the mutation buttons that stay
+;   visible in view mode (New / Edit / Delete / Favorite / header-edit) so a
+;   read-only vault reads as read-only.  The click handlers are already gated;
+;   this is the matching visual state.
+gui_ro_disable_btns proc frame
+    FRAME_PROLOG 32
+    mov     qword ptr [rbp-24], rcx
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_V_ADD
+    WINCALL EnableWindow, rax, 0
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_V_EDIT
+    WINCALL EnableWindow, rax, 0
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_V_REMOVE
+    WINCALL EnableWindow, rax, 0
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_V_FAV
+    WINCALL EnableWindow, rax, 0
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_V_HDREDIT
+    WINCALL EnableWindow, rax, 0
+    FRAME_EPILOG
+    ret
+gui_ro_disable_btns endp
+
 ; gui_set_editmode(rcx=hdlg, edx=on) - 1 = detail fields editable (edit mode),
 ;   0 = read-only (view).  Toggles EM_SETREADONLY on the six fields and swaps
 ;   the toolbar pencil glyph for a check mark while editing.
@@ -5811,6 +5832,8 @@ pwh_append endp
 ; pwh_remove(ecx = index) - purge one history entry (shift the tail down).
 pwh_remove proc frame
     FRAME_PROLOG 48
+    cmp     dword ptr [g_readonly], 0           ; E9: no history purge in read-only mode
+    jne     pwr_done
     mov     dword ptr [rbp-24], ecx
     cmp     ecx, dword ptr [g_pwhist_n]
     jae     pwr_done
@@ -11083,6 +11106,11 @@ vp_init:
     mov     rcx, qword ptr [rbp-8]            ; start in view mode (fields locked)
     xor     edx, edx
     call    gui_set_editmode
+    cmp     dword ptr [g_readonly], 0         ; E9: grey out mutation buttons if read-only
+    je      @F
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_ro_disable_btns
+@@:
     ; auto-lock: Win+L notifications (gated by g_winlock on receipt) + idle poll
     WINCALL WTSRegisterSessionNotification, qword ptr [rbp-8], 0  ; NOTIFY_FOR_THIS_SESSION
     WINCALL SetTimer, qword ptr [rbp-8], IDLE_TIMER, IDLE_POLL_MS, 0  ; poll: auto-lock + C8.4 refresh
