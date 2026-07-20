@@ -44,6 +44,7 @@ extern password_to_utf8:proc
 extern do_init:proc
 extern vault_unlock:proc
 extern vault_lock:proc
+extern vault_reload:proc                ; C8: refresh from disk (reload-safe conflict)
 extern vault_reseal:proc
 extern vault_ext_changed:proc           ; vault.asm: on-disk file changed since load?
 extern vault_remove_at:proc
@@ -747,8 +748,10 @@ WSTR s_io,          <Cannot read or write that file.>
 WSTR s_rollback,    <This vault is older than the last one saved on this PC. It may be a restored backup or a rollback. Open it anyway?>
 WSTR s_rbabort,     <Unlock aborted (older vault).>
 WSTR t_rbtitle,     <Vault rollback warning>
-WSTR s_extchg,      <The vault file changed on disk since you opened it. Another program or copy may have written it. Overwrite with your changes?>
 WSTR t_exttitle,    <Vault changed on disk>
+WSTR s_reloaded,    <This vault was changed by someone else and has been reloaded from disk. Your change was not saved - re-apply it and save again.>
+WSTR t_reloaded,    <Vault reloaded>
+WSTR s_busy,        <Another user is saving this vault right now. Your change is kept in memory - try saving again in a moment.>
 WSTR g_singleton_name, <VordrSingletonMutex_v1>
 WSTR g_vault_title,    <Vordr - Vault>
 WSTR g_vault_title_ro, <Vordr - Vault (read-only)>   ; E9: title when opened read-only
@@ -4770,10 +4773,9 @@ gui_commit proc frame
     call    vault_ext_changed
     test    eax, eax
     jz      gco_noext
-    WINCALL gui_msgbox, qword ptr [rbp-24], addr s_extchg, addr t_exttitle, \
-            <MB_YESNO or MB_ICONWARNING>
-    cmp     eax, IDYES
-    jne     gco_done                          ; declined -> keep both, do not save
+    mov     rcx, qword ptr [rbp-24]           ; C8: reload-safe - the file changed under
+    call    gui_reload_safe                   ; us; reload + inform, never clobber
+    jmp     gco_done
 gco_noext:
     mov     rcx, qword ptr [rbp-24]
     call    gui_gather
@@ -4820,15 +4822,41 @@ gco_notitle:
     FRAME_EPILOG
     ret
 gco_resealerr:
+    cmp     eax, EXIT_CHANGED                   ; C8: change caught in the TOCTOU window
+    je      gco_reload
+    cmp     eax, EXIT_BUSY                       ; C8: another instance holds the write lock
+    je      gco_busy
     WINCALL gui_msgbox, qword ptr [rbp-24], addr s_resealfail, addr t_err, \
             <MB_YESNO or MB_ICONWARNING>
     cmp     eax, IDYES                          ; Yes -> retry the write (file may be unlocked now)
     je      gco_reseal
+    jmp     gco_done
+gco_reload:
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_reload_safe
+    jmp     gco_done
+gco_busy:
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr s_busy, addr t_exttitle, <MB_OK or MB_ICONWARNING>
 gco_done:
     mov     dword ptr [g_dirty], 0
     FRAME_EPILOG
     ret
 gui_commit endp
+
+; gui_reload_safe(rcx = hdlg) - C8: the vault changed on disk under us; reload it
+;   (vault_reload, existing key - no re-KDF), refresh the list, and tell the user
+;   to re-apply their unsaved change.  Never overwrites the other writer's save.
+gui_reload_safe proc frame
+    FRAME_PROLOG 32
+    mov     qword ptr [rbp-24], rcx
+    call    vault_reload
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_poplist
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr s_reloaded, addr t_reloaded, \
+            <MB_OK or MB_ICONINFORMATION>
+    FRAME_EPILOG
+    ret
+gui_reload_safe endp
 
 ; gui_set_editmode(rcx=hdlg, edx=on) - 1 = detail fields editable (edit mode),
 ;   0 = read-only (view).  Toggles EM_SETREADONLY on the six fields and swaps
