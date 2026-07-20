@@ -66,7 +66,18 @@ after the startup KAT gate); `argon2id_hash`/`run_selftest` preserve r12/r13/r15
 NUL-termination; an http/https URL allowlist; `base32_decode` fails instead of
 truncating; `write_file`/`log_open` guards; TPM RSA-2048 set explicitly; the
 `pkat` CS-teardown race; dead empty `crc32.asm` removed. Follow-ups the audit
-surfaced are new below: C6, C7, D6, E16, G8 (the deferred CI SHA-pin is G7.3).
+surfaced are new below: C7, D6, E16, G8 (the deferred CI SHA-pin is G7.3).
+
+**Done 2026-07-20 (C6, registry location-leak hygiene → PR #2):** the per-vault
+HKCU value names — the rollback mirror (`reg_ctr_set`/`reg_ctr_get`) and the TPM
+blob (`reg_tpm_set`/`get`/`del`), both previously keyed by the **raw vault path**
+— are now SHA-256-hashed to a fixed 32-hex name by `reg_hash_name`, so the vault
+location no longer leaks; `reg_prune_all` (called from `vault_unlock`) deletes any
+surviving legacy path-named value. Runtime-verified: after a run the Rollback key
+holds only hashed names, zero path-leaking. This also closes C4.2 (the TPM value-
+name leak), so C4 keeps only the Hello-PIN item. Remaining nicety (not a leak): a
+hashed orphan left by a *moved* vault is opaque but not pruned — a touch-timestamp
++ expiry could add that later if wanted.
 
 House rules:
 
@@ -134,10 +145,10 @@ vault key.
 1. Optional Hello PIN / UI policy on key creation (setting; default
    unchanged). *Test:* with the policy set, unseal prompts; without, silent as
    today.
-2. Blob hygiene: the registry value name is the full vault path (location
-   leak; orphans when the vault moves). Hash the name + prune orphans at
-   unlock. *Test:* move the vault → the old value is gone after the next
-   unlock.
+
+(The former blob-hygiene item — the TPM registry value name was the full vault
+path — is fixed by C6: the name is now hashed and legacy path-named values are
+pruned at unlock.)
 
 ### C5. Audit-log honesty
 The "audit log" only records CLI diagnostic verbs; GUI unlock/save/export log
@@ -147,18 +158,6 @@ nothing.
    failure) or stop billing it as an audit log. Fix the stale header examples
    (`add/get/list`) and the "Event Log" comment in `main.asm`. *Test:* a GUI
    session produces the expected lines; no planted secret appears in any line.
-
-### C6. Registry location-leak hygiene
-Two HKCU value names are the **full vault path** in cleartext: the anti-rollback
-mirror (`HKCU\SOFTWARE\Vordr\Rollback`, `reg_ctr_get`/`reg_ctr_set` in
-`regcfg.asm`) and — per C4.2 — the TPM blob. Both disclose where a user's vaults
-live and orphan when a vault moves.
-
-1. Hash the value name (e.g. BLAKE2b of the canonical path) for both the rollback
-   mirror and the TPM blob; one shared helper. *Test:* `rbtest` still detects a
-   rollback after the change; the raw path no longer appears under either key.
-2. Prune orphaned values at unlock (shared with the C4.2 orphan-prune pass).
-   *Test:* move a vault → the old value is gone after the next unlock.
 
 ### C7. Temp-file exclusive create (atomic-save hardening)
 `write_file` (fileio.asm) creates `<vault>.tmp` with `CREATE_ALWAYS` and no
