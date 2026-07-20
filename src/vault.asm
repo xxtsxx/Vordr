@@ -3899,6 +3899,369 @@ vfa_none:
     ret
 vault_field_at endp
 
+; ===========================================================================
+; E6 vault-health analysis.  Thresholds are fixed (independent of vault policy)
+; so headless health counts are deterministic and self-describing.
+; ===========================================================================
+HEALTH_MINLEN     equ 12                          ; code points
+HEALTH_MINCLASS   equ 3                            ; distinct character classes
+HEALTH_OLD_100NS  equ 365 * 86400 * 10000000       ; 365 days in FILETIME ticks
+HDIG              equ 16                            ; BLAKE2b digest bytes / entry
+HSTRIDE           equ 17                            ; {digest16, haspw1} per entry
+
+; vh_pw_weak(rcx = utf8 bytes, edx = len) -> eax = 1 if the password is weak.
+;   Weak = fewer than HEALTH_MINLEN bytes, or fewer than HEALTH_MINCLASS of
+;   {lower, upper, digit, other} present.  (Byte length over-counts multi-byte
+;   UTF-8, which only makes a password look stronger - never falsely weak.)
+vh_pw_weak proc frame
+    FRAME_PROLOG 32
+    xor     r10d, r10d                  ; class bitmask
+    xor     r9d, r9d                    ; index
+    mov     r11d, edx                   ; len
+vw_lp:
+    cmp     r9d, r11d
+    jae     vw_eval
+    movzx   eax, byte ptr [rcx+r9]
+    cmp     eax, 'a'
+    jb      vw_c1
+    cmp     eax, 'z'
+    ja      vw_c1
+    or      r10d, 1
+    jmp     vw_adv
+vw_c1:
+    cmp     eax, 'A'
+    jb      vw_c2
+    cmp     eax, 'Z'
+    ja      vw_c2
+    or      r10d, 2
+    jmp     vw_adv
+vw_c2:
+    cmp     eax, '0'
+    jb      vw_c3
+    cmp     eax, '9'
+    ja      vw_c3
+    or      r10d, 4
+    jmp     vw_adv
+vw_c3:
+    or      r10d, 8                     ; symbol / non-ASCII
+vw_adv:
+    inc     r9d
+    jmp     vw_lp
+vw_eval:
+    cmp     r11d, HEALTH_MINLEN
+    jb      vw_weak
+    ; class count = popcount of the low nibble of r10d (0..4), computed by hand
+    mov     eax, r10d
+    and     eax, 1
+    mov     r8d, r10d
+    shr     r8d, 1
+    and     r8d, 1
+    add     eax, r8d
+    mov     r8d, r10d
+    shr     r8d, 2
+    and     r8d, 1
+    add     eax, r8d
+    mov     r8d, r10d
+    shr     r8d, 3
+    and     r8d, 1
+    add     eax, r8d
+    cmp     eax, HEALTH_MINCLASS
+    jb      vw_weak
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+vw_weak:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+vh_pw_weak endp
+
+; vault_health(rcx = out) - fill four dwords at [out]: {weak, reused, old,
+;   total}.  reused = entries whose VF_SECRET is byte-identical (BLAKE2b-128)
+;   to some other entry's; old = modified more than HEALTH_OLD_100NS ago.
+;   Entries with no password count toward total only.  Requires an unlocked
+;   body; if the scratch allocation fails the dup pass is skipped (reused = 0).
+public vault_health
+vault_health proc frame
+    FRAME_PROLOG 128
+    ; [rbp-24]=out [rbp-32]=n [rbp-40]=scratch [rbp-48]=i [rbp-56]=len
+    ; [rbp-64]=weak [rbp-72]=old [rbp-80]=now [rbp-88]=reused [rbp-96]=j
+    ; [rbp-104]=pw ptr
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rcx+0], 0
+    mov     dword ptr [rcx+4], 0
+    mov     dword ptr [rcx+8], 0
+    mov     dword ptr [rcx+12], 0
+    mov     dword ptr [rbp-64], 0
+    mov     dword ptr [rbp-72], 0
+    mov     dword ptr [rbp-88], 0
+    call    vault_count
+    mov     dword ptr [rbp-32], eax
+    mov     r10, qword ptr [rbp-24]
+    mov     dword ptr [r10+12], eax             ; total
+    test    eax, eax
+    jz      vh_done
+    mov     ecx, dword ptr [rbp-32]
+    imul    rcx, rcx, HSTRIDE
+    call    mem_alloc
+    mov     qword ptr [rbp-40], rax             ; 0 => dup pass disabled
+    lea     rcx, [g_ts]
+    call    GetSystemTimeAsFileTime
+    mov     rax, qword ptr [g_ts]
+    mov     qword ptr [rbp-80], rax             ; now
+    mov     dword ptr [rbp-48], 0               ; i
+vh_loop:
+    mov     eax, dword ptr [rbp-48]
+    cmp     eax, dword ptr [rbp-32]
+    jae     vh_dups
+    ; default haspw = 0
+    mov     rax, qword ptr [rbp-40]
+    test    rax, rax
+    jz      vh_pw
+    mov     ecx, dword ptr [rbp-48]
+    imul    rcx, rcx, HSTRIDE
+    mov     byte ptr [rax+rcx+16], 0
+vh_pw:
+    mov     ecx, dword ptr [rbp-48]
+    mov     edx, VF_SECRET
+    lea     r8, [rbp-56]
+    call    vault_field_at                      ; rax=ptr, [rbp-56]=len
+    test    rax, rax
+    jz      vh_next                             ; no password
+    mov     qword ptr [rbp-104], rax
+    mov     rcx, rax
+    mov     edx, dword ptr [rbp-56]
+    call    vh_pw_weak
+    test    eax, eax
+    jz      vh_old
+    inc     dword ptr [rbp-64]
+vh_old:
+    mov     ecx, dword ptr [rbp-48]
+    call    vault_entry_ptr
+    test    rax, rax
+    jz      vh_hash
+    mov     rdx, qword ptr [rbp-80]             ; now
+    sub     rdx, qword ptr [rax+24]             ; now - modified
+    js      vh_hash                             ; future timestamp -> not old
+    mov     r8, HEALTH_OLD_100NS                ; 64-bit: can't be a cmp immediate
+    cmp     rdx, r8
+    jbe     vh_hash
+    inc     dword ptr [rbp-72]
+vh_hash:
+    mov     rax, qword ptr [rbp-40]
+    test    rax, rax
+    jz      vh_next
+    mov     ecx, dword ptr [rbp-48]
+    imul    rcx, rcx, HSTRIDE
+    lea     r8, [rax+rcx]                       ; digest dest
+    mov     byte ptr [r8+16], 1                 ; haspw
+    mov     rcx, qword ptr [rbp-104]
+    mov     edx, dword ptr [rbp-56]
+    mov     r9, HDIG
+    call    blake2b_hash
+vh_next:
+    inc     dword ptr [rbp-48]
+    jmp     vh_loop
+vh_dups:
+    mov     rax, qword ptr [rbp-40]
+    test    rax, rax
+    jz      vh_store                            ; no scratch -> reused = 0
+    mov     dword ptr [rbp-48], 0               ; i
+vh_di:
+    mov     eax, dword ptr [rbp-48]
+    cmp     eax, dword ptr [rbp-32]
+    jae     vh_store
+    mov     r10, qword ptr [rbp-40]
+    mov     ecx, dword ptr [rbp-48]
+    imul    rcx, rcx, HSTRIDE
+    cmp     byte ptr [r10+rcx+16], 0
+    je      vh_di_next
+    mov     dword ptr [rbp-96], 0               ; j
+vh_dj:
+    mov     eax, dword ptr [rbp-96]
+    cmp     eax, dword ptr [rbp-32]
+    jae     vh_di_next                          ; no partner found
+    cmp     eax, dword ptr [rbp-48]
+    je      vh_dj_next
+    mov     r10, qword ptr [rbp-40]
+    mov     ecx, dword ptr [rbp-96]
+    imul    rcx, rcx, HSTRIDE
+    cmp     byte ptr [r10+rcx+16], 0
+    je      vh_dj_next
+    mov     r8, qword ptr [rbp-40]
+    mov     eax, dword ptr [rbp-48]
+    imul    rax, rax, HSTRIDE
+    lea     r10, [r8+rax]                       ; digest[i]
+    mov     eax, dword ptr [rbp-96]
+    imul    rax, rax, HSTRIDE
+    lea     r11, [r8+rax]                       ; digest[j]
+    mov     rax, qword ptr [r10]
+    cmp     rax, qword ptr [r11]
+    jne     vh_dj_next
+    mov     rax, qword ptr [r10+8]
+    cmp     rax, qword ptr [r11+8]
+    jne     vh_dj_next
+    inc     dword ptr [rbp-88]                  ; entry i is reused
+    jmp     vh_di_next
+vh_dj_next:
+    inc     dword ptr [rbp-96]
+    jmp     vh_dj
+vh_di_next:
+    inc     dword ptr [rbp-48]
+    jmp     vh_di
+vh_store:
+    mov     r10, qword ptr [rbp-24]
+    mov     eax, dword ptr [rbp-64]
+    mov     dword ptr [r10+0], eax              ; weak
+    mov     eax, dword ptr [rbp-88]
+    mov     dword ptr [r10+4], eax              ; reused
+    mov     eax, dword ptr [rbp-72]
+    mov     dword ptr [r10+8], eax              ; old
+    mov     rcx, qword ptr [rbp-40]
+    test    rcx, rcx
+    jz      vh_done
+    call    mem_free
+vh_done:
+    FRAME_EPILOG
+    ret
+vault_health endp
+
+; ===========================================================================
+; cmd_healthkat - E6 known-answer test for vault_health.  Points g_body_ptr at
+;   a hand-built 10-entry fixture with a known health profile, runs the
+;   analysis, and asserts the four counts.  No vault file, no unlock: the
+;   fixture is a raw body image, exactly the layout the trusting accessors
+;   expect.  exit 0 = counts match, 1 = mismatch.
+;
+;   Fixture profile:
+;     e0 "abc"                old,  weak(len),   dup with e9
+;     e1 "Password1!"         new,  weak(len)
+;     e2 "Str0ng#Password9"   new,  strong,      dup with e3
+;     e3 "Str0ng#Password9"   new,  strong,      dup with e2
+;     e4 "reused-pass-000"    new,  strong,      dup with e5
+;     e5 "reused-pass-000"    new,  strong,      dup with e4
+;     e6 "aaaaaaaaaaaaaaaa"   new,  weak(1 class)
+;     e7 (title only, no pw)  new,  -            counted in total only
+;     e8 "Zx9$Qw7!Lp2@"       old,  strong
+;     e9 "abc"                new,  weak(len),   dup with e0
+;   => weak=4  reused=6  old=2  total=10
+; ===========================================================================
+.data
+align 8
+hk_body:
+    dd  10                                   ; entry_count
+    ; --- e0 "abc" (old) -----------------------------------------------------
+    db  16 dup(0)
+    dq  0                                     ; created
+    dq  0                                     ; modified (old)
+    dd  1
+    dw  VF_SECRET
+    dd  3
+    db  "abc"
+    ; --- e1 "Password1!" (new) ---------------------------------------------
+    db  16 dup(0)
+    dq  0
+    dq  7FFFFFFFFFFFFFFFh
+    dd  1
+    dw  VF_SECRET
+    dd  10
+    db  "Password1!"
+    ; --- e2 "Str0ng#Password9" (new) ---------------------------------------
+    db  16 dup(0)
+    dq  0
+    dq  7FFFFFFFFFFFFFFFh
+    dd  1
+    dw  VF_SECRET
+    dd  16
+    db  "Str0ng#Password9"
+    ; --- e3 "Str0ng#Password9" (new, dup of e2) ----------------------------
+    db  16 dup(0)
+    dq  0
+    dq  7FFFFFFFFFFFFFFFh
+    dd  1
+    dw  VF_SECRET
+    dd  16
+    db  "Str0ng#Password9"
+    ; --- e4 "reused-pass-000" (new) ----------------------------------------
+    db  16 dup(0)
+    dq  0
+    dq  7FFFFFFFFFFFFFFFh
+    dd  1
+    dw  VF_SECRET
+    dd  15
+    db  "reused-pass-000"
+    ; --- e5 "reused-pass-000" (new, dup of e4) -----------------------------
+    db  16 dup(0)
+    dq  0
+    dq  7FFFFFFFFFFFFFFFh
+    dd  1
+    dw  VF_SECRET
+    dd  15
+    db  "reused-pass-000"
+    ; --- e6 "aaaaaaaaaaaaaaaa" (new, single class) -------------------------
+    db  16 dup(0)
+    dq  0
+    dq  7FFFFFFFFFFFFFFFh
+    dd  1
+    dw  VF_SECRET
+    dd  16
+    db  "aaaaaaaaaaaaaaaa"
+    ; --- e7 title only, no password (new) ----------------------------------
+    db  16 dup(0)
+    dq  0
+    dq  7FFFFFFFFFFFFFFFh
+    dd  1
+    dw  VF_TITLE
+    dd  4
+    db  "note"
+    ; --- e8 "Zx9$Qw7!Lp2@" (old, strong) -----------------------------------
+    db  16 dup(0)
+    dq  0
+    dq  0
+    dd  1
+    dw  VF_SECRET
+    dd  12
+    db  "Zx9$Qw7!Lp2@"
+    ; --- e9 "abc" (new, dup of e0) -----------------------------------------
+    db  16 dup(0)
+    dq  0
+    dq  7FFFFFFFFFFFFFFFh
+    dd  1
+    dw  VF_SECRET
+    dd  3
+    db  "abc"
+.code
+
+LANDING_PAD
+public cmd_healthkat
+cmd_healthkat proc frame
+    FRAME_PROLOG 64
+    ; [rbp-24] saved g_body_ptr ; [rbp-48..-33] health out {weak,reused,old,total}
+    mov     rax, qword ptr [g_body_ptr]
+    mov     qword ptr [rbp-24], rax
+    lea     rax, [hk_body]
+    mov     qword ptr [g_body_ptr], rax
+    lea     rcx, [rbp-48]
+    call    vault_health
+    mov     rax, qword ptr [rbp-24]
+    mov     qword ptr [g_body_ptr], rax         ; restore before any assert exit
+    cmp     dword ptr [rbp-48], 4               ; weak
+    jne     hk_fail
+    cmp     dword ptr [rbp-44], 6               ; reused
+    jne     hk_fail
+    cmp     dword ptr [rbp-40], 2               ; old
+    jne     hk_fail
+    cmp     dword ptr [rbp-36], 10              ; total
+    jne     hk_fail
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+hk_fail:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_healthkat endp
+
 
 ; ===========================================================================
 ; va_field_labeled(rcx = base type, rdx = label wide ptr (0/empty = none),
