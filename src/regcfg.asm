@@ -25,6 +25,7 @@ extern GetEnvironmentVariableW:proc
 extern CreateDirectoryW:proc
 
 REG_SZ          equ 1
+REG_EXPAND_SZ   equ 2
 REG_BINARY      equ 3
 REG_DWORD       equ 4
 KEY_READ        equ 20019h
@@ -61,6 +62,7 @@ g_hkcu  dq 080000001h            ; HKEY_CURRENT_USER
 
 .data?
 g_cfg_cb    dd ?                 ; RegGetValue/Set byte count
+g_cfg_type  dd ?                 ; RegQueryValueExW value type (REG_SZ check)
 g_cfg_dw    dd ?                 ; REG_DWORD value scratch
 g_cfg_khan  dq ?                 ; open key handle
 align 2
@@ -87,12 +89,36 @@ reg_query_sz proc frame
     jnz     qsz_no
     mov     eax, dword ptr [rbp-40]
     mov     dword ptr [g_cfg_cb], eax
-    WINCALL RegQueryValueExW, qword ptr [g_cfg_khan], qword ptr [rbp-24], 0, 0, \
+    WINCALL RegQueryValueExW, qword ptr [g_cfg_khan], qword ptr [rbp-24], 0, addr g_cfg_type, \
             qword ptr [rbp-32], addr g_cfg_cb
     mov     dword ptr [rbp-48], eax
     WINCALL RegCloseKey, qword ptr [g_cfg_khan]
     cmp     dword ptr [rbp-48], 0
     jne     qsz_no
+    ; the value must be a string type; other types may carry non-NUL-terminated
+    ; bytes that the wide-Z consumers (vault_mkbak, path scans) would over-read.
+    cmp     dword ptr [g_cfg_type], REG_SZ
+    je      qsz_term
+    cmp     dword ptr [g_cfg_type], REG_EXPAND_SZ
+    jne     qsz_no
+qsz_term:
+    ; RegQueryValueExW does not guarantee a terminating NUL (and none fits when the
+    ; value exactly fills the buffer).  Force a wide NUL inside [0, cap).
+    mov     ecx, dword ptr [rbp-40]             ; cap bytes
+    cmp     ecx, 2
+    jb      qsz_no                              ; can't even hold L"" -> reject
+    mov     eax, dword ptr [g_cfg_cb]           ; bytes returned
+    cmp     eax, ecx
+    jbe     @F
+    mov     eax, ecx
+@@: mov     edx, ecx
+    sub     edx, 2                              ; last in-bounds wide-NUL offset
+    cmp     eax, edx
+    jbe     @F
+    mov     eax, edx
+@@: and     eax, 0FFFFFFFEh                     ; align to a wchar boundary
+    mov     r10, qword ptr [rbp-32]             ; dst
+    mov     word ptr [r10+rax], 0
     mov     eax, 1
     FRAME_EPILOG
     ret

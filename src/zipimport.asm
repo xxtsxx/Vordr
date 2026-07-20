@@ -43,6 +43,7 @@ ZI_MAXENT   equ 8192                      ; max stageable entries (matches MAX_S
 ZI_ARENA    equ 4*1024*1024              ; per-entry wide/blob scratch
 ZI_SBUF     equ 256*1024                  ; one string's decoded UTF-8
 ZI_TBUF     equ 1024*1024                 ; persistent staged-title wide storage
+MAX_FIELDS  equ 56                        ; g_field_list capacity (matches main.asm)
 MEMREC      equ 32                        ; {nameptr8, namelen4, _4, dataptr8, usize4, _4}
 
 .data?
@@ -328,12 +329,16 @@ zi_u2w proc frame
     mov     eax, dword ptr [g_zi_ap]
     add     r10, rax
     mov     qword ptr [rbp-40], r10             ; dst
-    ; cap (wchars) = (ZI_ARENA - ap - 2) / 2
+    ; cap (wchars) = (ZI_ARENA - ap - 2) / 2, guarded against unsigned underflow.
+    ; A SIGNED check on the remaining bytes catches both an exhausted arena and any
+    ; prior overrun (ap >= ZI_ARENA); the old unsigned subtract wrapped to ~2GB.
     mov     ecx, ZI_ARENA
-    sub     ecx, dword ptr [g_zi_ap]
+    sub     ecx, dword ptr [g_zi_ap]           ; remaining bytes
+    cmp     ecx, 2
+    jle     zw_full                            ; no room for even a NUL -> empty string
     sub     ecx, 2
     shr     ecx, 1
-    mov     dword ptr [rbp-44], ecx             ; wide cap
+    mov     dword ptr [rbp-44], ecx             ; wide cap (bounds MBtoWC's writes)
     cmp     dword ptr [rbp-28], 0
     je      zw_empty
     WINCALL MultiByteToWideChar, CP_UTF8_, 0, qword ptr [rbp-24], dword ptr [rbp-28], \
@@ -342,13 +347,17 @@ zi_u2w proc frame
 zw_empty:
     xor     eax, eax
 zw_term:
-    ; NUL-terminate + advance ap by (wchars+1)*2
+    ; NUL-terminate + advance ap by (wchars+1)*2 (<= remaining, so ap stays <= ZI_ARENA)
     mov     r10, qword ptr [rbp-40]
     mov     word ptr [r10+rax*2], 0
     inc     eax
     lea     eax, [eax*2]
     add     dword ptr [g_zi_ap], eax
     mov     rax, qword ptr [rbp-40]
+    FRAME_EPILOG
+    ret
+zw_full:
+    lea     rax, [zi_empty_w]                  ; arena exhausted -> static empty wide str
     FRAME_EPILOG
     ret
 zi_u2w endp
@@ -419,6 +428,8 @@ zj_str proc frame
 zjs_lp:
     cmp     r10, qword ptr [g_zi_jend]
     jae     zjs_end
+    cmp     r11d, ZI_SBUF - 4                   ; output full (<=3 bytes/iter + NUL
+    jae     zjs_full                            ; headroom)? stop emitting, drain input
     movzx   eax, byte ptr [r10]
     cmp     eax, '"'
     je      zjs_close
@@ -531,6 +542,25 @@ zjs_u3:
     mov     byte ptr [rcx+r11], al
     inc     r11d
     jmp     zjs_lp
+zjs_full:
+    ; output cap reached: a single string >= ZI_SBUF only occurs in a crafted
+    ; archive.  Drain the rest of the string (honoring escapes so an escaped quote
+    ; cannot end it early) WITHOUT writing, keeping g_zi_p in sync, then stop.
+    ; Memory-safe truncation; the oversized value is discarded.
+    cmp     r10, qword ptr [g_zi_jend]
+    jae     zjs_end
+    movzx   eax, byte ptr [r10]
+    inc     r10
+    cmp     eax, '\'
+    jne     zjs_full_q
+    cmp     r10, qword ptr [g_zi_jend]          ; skip the escaped char
+    jae     zjs_end
+    inc     r10
+    jmp     zjs_full
+zjs_full_q:
+    cmp     eax, '"'
+    jne     zjs_full
+    jmp     zjs_end                             ; consumed the closing quote
 zjs_close:
     inc     r10                                 ; past closing quote
 zjs_end:
@@ -607,6 +637,12 @@ zaf_done:
     mov     r10, qword ptr [rbp-24]
     add     r10, r9                             ; fnptr
     mov     qword ptr [rbp-56], r10
+    ; ensure the arena has room for the worst-case blob before any write:
+    ;   4 (rawlen) + ARF_SIZE + (255+1)*2 (max wide filename incl NUL, MBtoWC-capped)
+    mov     eax, dword ptr [g_zi_ap]
+    add     eax, 4 + ARF_SIZE + 512
+    cmp     eax, ZI_ARENA
+    ja      za_skip
     ; build blob in arena: {u32 rawlen, AttachRef[68], filename wide (NUL-term)}
     mov     r11, qword ptr [g_zi_arena]
     mov     eax, dword ptr [g_zi_ap]
@@ -679,12 +715,12 @@ zi_stage_title proc frame
     add     r10, rax
     mov     qword ptr [rbp-48], r10             ; dst
     mov     ecx, ZI_TBUF                        ; cap (wchars) = (TBUF - tap - 2)/2
-    sub     ecx, dword ptr [g_zi_tap]
+    sub     ecx, dword ptr [g_zi_tap]           ; remaining bytes
+    cmp     ecx, 2                              ; SIGNED guard: catches tap >= TBUF-1
+    jle     st_full                            ; (old unsigned path wrapped to ~2GB)
     sub     ecx, 2
     shr     ecx, 1
     mov     dword ptr [rbp-52], ecx             ; cap
-    cmp     ecx, 0
-    jle     st_full
     cmp     dword ptr [rbp-36], 0
     je      st_empty
     WINCALL MultiByteToWideChar, CP_UTF8_, 0, qword ptr [rbp-32], dword ptr [rbp-36], \
@@ -824,6 +860,8 @@ zij_lbldone:
     ; ---- build the field (selected entries only; else parsed + discarded) ----
     cmp     dword ptr [g_zi_build], 0
     je      zij_field
+    cmp     dword ptr [rbp-24], MAX_FIELDS      ; g_field_list full? discard extra
+    jae     zij_field                           ; fields (already parsed, stays in sync)
     mov     eax, dword ptr [rbp-28]             ; type
     cmp     eax, VF_IMAGE
     je      zij_att
@@ -880,6 +918,10 @@ zij_done:
     cmp     dword ptr [g_zi_mode], 1
     je      zij_dret
     mov     eax, dword ptr [g_zi_e]             ; stage: publish the entry count
+    cmp     eax, ZI_MAXENT                      ; clamp: g_zi_titles/g_zi_tlens hold only
+    jbe     @F                                  ; ZI_MAXENT slots (entries past that were
+    mov     eax, ZI_MAXENT                      ; dropped by zi_stage_title) - a larger
+@@:                                            ; count would drive an OOB read in the GUI
     mov     dword ptr [g_zi_stg_n], eax
 zij_dret:
     mov     eax, dword ptr [g_zi_count]

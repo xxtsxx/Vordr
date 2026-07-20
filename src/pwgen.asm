@@ -27,6 +27,12 @@ externdef g_cfg_pwminclasses:dword
 
 PWGEN_MIN_LEN       equ 1
 PWGEN_MAX_LEN       equ 256
+; PASSPHRASE amplifies: each of n words emits up to WL_STRIDE(8) chars + a '-'
+; separator (+ optional trailing digit), so bytes ~= 9*n + 2.  Cap the word count
+; so the worst case fits any output buffer >= ~220 bytes (the GUI's g_genout is
+; 260).  CONTRACT: a pwgen_ex output buffer must hold PWGEN_PP_MAXWORDS words for
+; the passphrase style; today only the GUI uses a large n (others use n<=5).
+PWGEN_PP_MAXWORDS   equ 24
 
 PWCLASS_UPPER       equ 1
 PWCLASS_LOWER       equ 2
@@ -422,6 +428,10 @@ pex_pron_done:
     jmp     pex_afterphrase                     ; -> optional trailing digit
 ; ---- PASSPHRASE: n words from the embedded list ----------------------------
 pex_phrase:
+    cmp     dword ptr [rbp-32], PWGEN_PP_MAXWORDS  ; bound passphrase output so the
+    jbe     @F                                     ; worst-case byte count fits the
+    mov     dword ptr [rbp-32], PWGEN_PP_MAXWORDS  ; caller buffer (see contract note)
+@@:
     mov     dword ptr [rbp-56], 0               ; word i
 pex_phrase_lp:
     mov     eax, dword ptr [rbp-56]

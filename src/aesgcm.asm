@@ -13,6 +13,7 @@
 include macros.inc
 
 extern ct_memcmp:proc
+extern secure_zero:proc
 
 ; Request block shared by seal/open
 GCMREQ struct
@@ -566,6 +567,16 @@ gcm_open proc frame
     mov     rdx, qword ptr [r10].GCMREQ.tag
     mov     r8, 16
     call    ct_memcmp
+    test    eax, eax
+    jz      go_ok                               ; tag verified -> plaintext is valid
+    ; tag mismatch: scrub the unauthenticated plaintext we already wrote to outp,
+    ; so a caller that neglects to check the return value cannot process forged data.
+    mov     r10, qword ptr [rbp-24]
+    mov     rcx, qword ptr [r10].GCMREQ.outp
+    mov     rdx, qword ptr [r10].GCMREQ.inlen
+    call    secure_zero
+    mov     eax, 1                              ; restore the mismatch return value
+go_ok:
     FRAME_EPILOG
     ret
 gcm_open endp

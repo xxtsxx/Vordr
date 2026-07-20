@@ -967,20 +967,23 @@ vu_havekey:
     test    eax, eax
     jnz     vu_locked
     ; --- full-file MAC + anti-rollback trailer ------------------
-    ; If the file ends in FMAC_MAGIC, verify the keyed MAC over everything before
-    ; it (defence in depth over GCM: catches truncation / splicing of the
-    ; attachment section) and read the save counter.  g_fmac_len then hides the
-    ; trailer from all end-relative offset math below.  Legacy files lack it.
+    ; The file MUST end in FMAC_MAGIC and carry a valid keyed MAC over everything
+    ; before it.  This authenticates the attachment section (which GCM does NOT
+    ; cover - GCM authenticates only the record body via the header AAD) and makes
+    ; the anti-rollback counter non-strippable.  The trailer is MANDATORY: every
+    ; save (vault_seal_write) writes it, so a file lacking it is rejected as tamper
+    ; rather than silently accepted (which would let an attacker strip the MAC and
+    ; splice arbitrary, unauthenticated attachment bytes - see attach_index_build).
     mov     qword ptr [g_fmac_len], 0
     mov     qword ptr [g_save_counter], 0
     mov     dword ptr [g_rollback], 0
     mov     rax, qword ptr [g_filesize]
     cmp     rax, VH_TOTAL + 4 + 16 + FMAC_TRAILER
-    jb      vu_nofmac
+    jb      vu_auth                             ; too small to carry the MAC -> reject
     mov     r11, qword ptr [g_filebuf]
     add     r11, rax
     cmp     dword ptr [r11-4], FMAC_MAGIC       ; magic at the very end?
-    jne     vu_nofmac
+    jne     vu_auth                             ; no trailer -> reject (MAC is mandatory)
     mov     rcx, qword ptr [g_filebuf]          ; MAC over image + counter
     mov     rdx, rax
     sub     rdx, FMAC_MACLEN + 4                ; data len = filesize - 36
@@ -1155,6 +1158,12 @@ vl_key:
 vl_wipe:
     lea     rcx, [g_vkey]
     mov     rdx, 32
+    call    secure_zero
+    lea     rcx, [g_conv]                       ; wipe plaintext field-value scratch
+    mov     edx, CONV_CAP
+    call    secure_zero
+    lea     rcx, [g_convlabel]                  ; wipe plaintext field-label scratch
+    mov     edx, MAX_LABEL_BYTES
     call    secure_zero
     FRAME_EPILOG
     ret
@@ -4088,6 +4097,23 @@ attach_index_build proc frame
 aib_loop:
     cmp     r10, r11
     jae     aib_done
+    ; ---- bounds: the 24-byte entry header (id16 + u64 ctlen) must fit ----
+    mov     rax, r10
+    add     rax, ATT_ENThDR
+    cmp     rax, r11
+    ja      aib_done                            ; truncated header -> stop
+    ; ---- bounds: ct (ctlen bytes) + 16-byte tag must fit too.  ctlen is an
+    ;      untrusted u64, so compare against the AVAILABLE space (never add ctlen
+    ;      to a pointer, which could wrap) ----
+    mov     rax, qword ptr [r10+16]             ; ctlen
+    mov     rdx, r11
+    sub     rdx, r10
+    sub     rdx, ATT_ENThDR                     ; bytes available after the header
+    cmp     rdx, 16
+    jb      aib_done                            ; no room for the tag
+    sub     rdx, 16
+    cmp     rax, rdx
+    ja      aib_done                            ; ct+tag overruns the section -> stop
     mov     eax, dword ptr [g_attidx_n]
     cmp     eax, MAX_ATT
     jae     aib_done
@@ -4197,6 +4223,12 @@ ao_disk:
     mov     qword ptr [rbp-56], r11             ; ct ptr
     mov     rcx, qword ptr [r10+24]
     mov     qword ptr [rbp-64], rcx             ; ctlen
+    ; defence in depth: the on-disk ctlen must equal the body's ptlen (GCM is
+    ; length-preserving).  Refuse a mismatch BEFORE allocating, so gcm_open can
+    ; never be asked to write ctlen plaintext bytes into a ptlen-sized buffer.
+    mov     rax, qword ptr [rbp-64]
+    cmp     rax, qword ptr [rbp-40]
+    jne     ao_fail
     mov     rcx, qword ptr [rbp-40]
     call    mem_alloc
     test    rax, rax
