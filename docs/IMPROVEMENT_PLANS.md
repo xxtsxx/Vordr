@@ -170,6 +170,49 @@ should hold regardless.
    collision) and reject a pre-existing reparse point. *Test:* a pre-planted
    `<vault>.tmp` (plain + symlink) is not followed; `bktest`/`tmptest` stay green.
 
+### C8. Concurrent access on a shared network drive
+Multiple users may have the same vault open on a network share; today's model is
+"single-writer, last-rename-wins" (`formats.md` "Not yet addressed"). Compose the
+existing pieces — read-only + full-share opens (`read_file`: `GENERIC_READ` +
+`FILE_SHARE_RWD`, handle closed after load), the atomic temp+`MoveFileExW` save,
+`vault_ext_snapshot`/`vault_ext_changed` (size + BLAKE2b(header)), the FMAC
+monotonic save counter (`g_save_counter`), the `AVSLOT` availability-retry machine,
+and E9 read-only mode — into a safe multi-writer model. **Decisions (2026-07-21):
+reload-safe conflict policy; continuous-lite detection.** No vault-format change
+(the lock is out-of-band; the save counter already exists).
+
+1. **Write coordination lock.** The save is rename-based, so a byte-range lock on
+   the vault can't coordinate it. Acquire an advisory lock file `<vault>.lock`
+   (`CreateFileW` `CREATE_NEW`, no sharing, `FILE_FLAG_DELETE_ON_CLOSE`) for the
+   whole save sequence — re-check-changed -> write temp -> rename -> re-snapshot ->
+   release. Reclaim a stale lock (crashed holder) via its mtime + an age
+   threshold. This is the "temporary write lock, reduced back to read-only." *Test:*
+   a dbg `cowrite` probe races two seal sequences -> they serialize, no lost update.
+2. **Refresh (reload) on change.** Add `vault_reload()` - re-read the file,
+   `gcm_open` with the *existing* `g_vkey` (same salt; no Argon2 re-run),
+   `vault_body_validate`, swap the in-memory body, `vault_ext_snapshot`. Cheap.
+   *Test:* dbg `reload` probe - seal v1, external-modify to v2, reload -> in-memory
+   count/titles match v2; RUNALL green.
+3. **Reload-safe conflict at save.** Under the lock, if the on-disk save counter is
+   past the loaded one: do NOT overwrite. Stash the user's gathered pending edit in
+   a scratch, `vault_reload()`, and tell them "updated by someone else - your change
+   is set aside; re-apply it?" *Test:* scripted counter-advance -> save refused,
+   pending edit preserved, neither side's data lost.
+4. **Continuous-lite detection.** Re-run `vault_ext_changed` on `WM_ACTIVATE`/focus
+   and the existing idle `WM_TIMER`; if changed AND `g_dirty==0`, `vault_reload()`
+   silently + repaint; if there is an unsaved edit, show a non-blocking "vault
+   changed on disk" banner and defer to step 3 at save. *Test:* two instances; A
+   edits+saves -> B's list refreshes on focus.
+5. **Graceful contention + read-only.** Route lock-acquire failure ("another user
+   is saving") and a file that opens read-only on the share through the `AVSLOT`
+   retry machine + a clear status; if it can't be written at all, auto-enter E9
+   read-only mode. *Test:* an externally-held `<vault>.lock` -> save retries then
+   reports "locked by another user"; a read-only share opens the vault read-only.
+
+Sequencing: builds on E9 and the FMAC save counter (both landed). Step 1 shares the
+`CREATE_NEW`/reparse-point discipline with C7. When it ships, update `formats.md`'s
+"Not yet addressed / No multi-process locking" note.
+
 ---
 
 ## D. Docs & tooling
