@@ -31,6 +31,7 @@ extern attach_stage:proc
 extern vault_build_entry:proc
 extern print_a:proc
 extern print_u64:proc
+extern fuzz_seed:proc                   ; G7: reproducible/logged fuzzer seed (main.asm)
 externdef g_ae_dk:byte
 externdef g_field_list:qword
 externdef g_field_n:dword
@@ -1079,7 +1080,8 @@ zfz_rand endp
 ;   decrypt region {salt,verify,cipher[usize],hmac} - the exact bytes
 ;   zi_decrypt would read/write.  With zi_scan's bounds guard every touch is
 ;   in-range; a guard regression (or a memory-bomb usize) would fault here.
-;   ZFZ_ITERS iterations, fixed seed, exit 0 = completed with no crash.
+;   ZFZ_ITERS iterations; seed is random per run and logged (G7, --seed N to
+;   reproduce); exit 0 = completed with no crash.
 ; =============================================================================
 LANDING_PAD
 public cmd_zfuzz
@@ -1087,7 +1089,7 @@ cmd_zfuzz proc frame
     FRAME_PROLOG 112
     ; [rbp-16]=buf [rbp-32]=iters [rbp-40]=scanned [rbp-48]=rejected
     ; [rbp-56]=curlen [rbp-64]=nmut [rbp-72]=member i [rbp-80]=n
-    mov     rax, 9E3779B97F4A7C15h                        ; fixed seed
+    call    fuzz_seed                                     ; G7: random (or --seed) + logged
     mov     qword ptr [g_zfz_rng], rax
     mov     rcx, ZFZ_FIX_LEN
     call    mem_alloc

@@ -50,6 +50,7 @@ extern mem_free:proc
 extern print_a:proc
 extern print_err:proc
 extern print_u64:proc
+extern fuzz_seed:proc                   ; G7: reproducible/logged fuzzer seed (main.asm)
 extern WideCharToMultiByte:proc
 extern GetSystemTimeAsFileTime:proc
 extern GetFileAttributesW:proc
@@ -1803,7 +1804,8 @@ vfz_rand endp
 ;   times.  Every malformed body must be cleanly rejected or cleanly parsed -
 ;   never an access violation.  Prints the parsed/rejected split; exit 0 = the
 ;   run completed (a crash would fail-fast the process, so reaching the end
-;   with exit 0 IS the pass).  No positional args; fixed seed for reproducibility.
+;   with exit 0 IS the pass).  Seed is random per run and logged (G7); pass
+;   --seed N to reproduce a logged failure.
 ; ===========================================================================
 LANDING_PAD
 public cmd_vfuzz
@@ -1811,7 +1813,7 @@ cmd_vfuzz proc frame
     FRAME_PROLOG 112
     ; [rbp-16]=buf [rbp-32]=iters [rbp-40]=parsed [rbp-48]=rejected
     ; [rbp-56]=curlen [rbp-64]=n [rbp-72]=i [rbp-80]=outlen scratch [rbp-88]=nmut
-    mov     rax, 243F6A8885A308D3h                       ; fixed seed
+    call    fuzz_seed                                    ; G7: random (or --seed) + logged
     mov     qword ptr [g_vfz_rng], rax
     mov     rcx, VFZ_FIX_LEN
     call    mem_alloc
@@ -3205,7 +3207,7 @@ LANDING_PAD
 public cmd_attfuzz
 cmd_attfuzz proc frame
     FRAME_PROLOG 48
-    mov     rax, 9E3779B97F4A7C15h               ; fixed seed (deterministic, reproducible)
+    call    fuzz_seed                            ; G7: random (or --seed) + logged
     mov     qword ptr [g_vfz_rng], rax
     mov     rcx, ATTFZ_LEN
     call    mem_alloc

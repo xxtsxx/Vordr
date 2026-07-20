@@ -70,6 +70,8 @@ endif
 
 extern con_init:proc
 extern print_a:proc
+extern print_u64:proc                   ; console.asm: rcx = u64 -> decimal stdout
+extern rng_fill:proc                    ; random.asm: rcx=buf, edx=len -> eax=1 ok
 extern pwgen_ex:proc                    ; styled password generator (pwgen.asm)
 externdef g_pwgen_outcap:dword          ; E16: one-shot pwgen output capacity
 extern do_seed:proc                     ; bulk test-vault seeder (vault.asm)
@@ -133,6 +135,9 @@ g_gen_buf       db 160 dup (?)           ; genpw: sample output buffer
 g_cfg_pass      db MAX_PASSWORD_BYTES+1 dup (?)
 g_positionals   dq MAX_ARGS dup (?)  ; -> UTF-16 positional argument strings
 g_poscount      dq ?                 ; number of positionals
+public g_fuzz_seed, g_fuzz_seed_set
+g_fuzz_seed     dd ?                 ; G7: 32-bit fuzzer seed (from --seed or RNG)
+g_fuzz_seed_set dd ?                 ; G7: 1 = --seed given (else random each run)
 
 ; -----------------------------------------------------------------------------
 .const
@@ -152,6 +157,8 @@ msg_usage label byte
     db "  Every launch runs the self-test gate first and fails closed on mismatch.",13,10
 msg_usage_len equ $ - msg_usage
 CSTR msg_nocpu,    "error: CPU lacks required features (AES-NI, PCLMULQDQ, SSE4.1)",13,10
+CSTR fs_seedlabel, "fuzz seed: "       ; G7: precedes the decimal seed on stdout
+fs_nl db 13,10
 CSTR msg_badnum,   "error: numeric argument out of range",13,10
 CSTR msg_st_ok,    "all self-tests passed",13,10
 CSTR msg_st_fail,  "SELFTEST FAILURE",13,10
@@ -208,6 +215,7 @@ WSTR w_crashme,  <crashme>
 endif
 WSTR w_opt_m,    <-m>
 WSTR w_opt_t,    <-t>
+WSTR w_opt_seed,       <--seed>       ; G7: reproducible fuzzer seed (decimal)
 WSTR w_opt_log,        <--log>
 WSTR w_opt_logfile,    <--log-file>
 WSTR w_lvl_none,       <none>
@@ -501,6 +509,43 @@ wu_ok:
 wstr_to_u32 endp
 
 ; =============================================================================
+; fuzz_seed() -> rax = nonzero 64-bit xorshift seed for the dbg fuzzers.  (G7)
+;   With --seed N it uses N; otherwise it draws 4 random bytes so each run
+;   explores fresh inputs.  Either way it logs "fuzz seed: N" to stdout, so a
+;   nightly crash reproduces deterministically with `--seed N`.  The 32-bit
+;   value is expanded to a nonzero 64-bit state via a splitmix multiply.
+; =============================================================================
+public fuzz_seed
+fuzz_seed proc frame
+    FRAME_PROLOG 48
+    cmp     dword ptr [g_fuzz_seed_set], 0
+    jne     fs_log
+    lea     rcx, [rbp-16]               ; 4-byte scratch (clear of shadow+canary)
+    mov     edx, 4
+    call    rng_fill
+    mov     eax, dword ptr [rbp-16]
+    test    eax, eax
+    jnz     @F
+    mov     eax, 1                      ; never seed the RNG with zero
+@@: mov     dword ptr [g_fuzz_seed], eax
+fs_log:
+    lea     rcx, [fs_seedlabel]
+    mov     edx, fs_seedlabel_len
+    call    print_a
+    mov     ecx, dword ptr [g_fuzz_seed]    ; zero-extended
+    call    print_u64
+    lea     rcx, [fs_nl]
+    mov     edx, 2
+    call    print_a
+    mov     eax, dword ptr [g_fuzz_seed]    ; zero-extended into rax
+    mov     rcx, 9E3779B97F4A7C15h
+    imul    rax, rcx
+    or      rax, 1                          ; guarantee nonzero xorshift state
+    FRAME_EPILOG
+    ret
+fuzz_seed endp
+
+; =============================================================================
 ; parse_cmdline - tokenize GetCommandLineW into g_argv/g_argc using the
 ; standard Windows quoting rules (incl. backslash-quote and "" handling).
 ; Every write into g_argbuf is bounds-checked.  Returns nothing; overlong
@@ -726,6 +771,7 @@ co_loop:
     jae     co_check
     OPTMATCH w_opt_m,       co_take_m
     OPTMATCH w_opt_t,       co_take_t
+    OPTMATCH w_opt_seed,    co_take_seed
     OPTMATCH w_opt_log,     co_take_log
     OPTMATCH w_opt_logfile, co_take_logfile
     ; any other token is a positional (only the dbg `redteam` case name uses one)
@@ -767,6 +813,17 @@ co_take_t:
     cmp     eax, ARGON2_MAX_T
     ja      co_badnum
     mov     dword ptr [g_cfg_t], eax
+    jmp     co_loop
+co_take_seed:
+    call    co_next_arg
+    test    rax, rax
+    jz      co_usage
+    mov     rcx, rax
+    call    wstr_to_u32
+    test    edx, edx
+    jz      co_badnum
+    mov     dword ptr [g_fuzz_seed], eax
+    mov     dword ptr [g_fuzz_seed_set], 1
     jmp     co_loop
 co_take_log:
     call    co_next_arg
