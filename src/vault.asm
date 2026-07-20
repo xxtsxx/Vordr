@@ -60,6 +60,7 @@ extern reg_tpm_set:proc
 extern reg_tpm_get:proc
 extern reg_tpm_del:proc
 extern reg_prune_all:proc               ; C6: drop legacy path-named reg values
+externdef g_readonly:dword              ; E9: read-only mode flag (owned by gui.asm)
 extern reg_ctr_set:proc
 extern reg_ctr_get:proc
 
@@ -3471,12 +3472,18 @@ vault_field_selftest endp
 public vault_reseal
 vault_reseal proc frame
     FRAME_PROLOG 32
+    cmp     dword ptr [g_readonly], 0           ; E9: a read-only vault never writes to
+    jne     vrs_ro                              ; disk - report success, change nothing
     lea     rcx, [g_hdr+VH_NONCE]
     mov     edx, 12
     call    rng_fill
     test    eax, eax
     jz      vrs_oom
     call    vault_seal_write
+    FRAME_EPILOG
+    ret
+vrs_ro:
+    xor     eax, eax
     FRAME_EPILOG
     ret
 vrs_oom:

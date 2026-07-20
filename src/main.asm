@@ -37,6 +37,7 @@ extern iat_lockdown:proc
 extern secure_zero:proc
 extern run_selftest:proc
 extern log_result:proc
+externdef g_readonly:dword              ; E9: read-only launch flag (owned by gui.asm)
 extern do_bench:proc                    ; benchmark (bench.asm)
 extern gui_phtest:proc                  ; pw-history capture probe (gui.asm)
 extern gui_tmptest:proc                 ; secure temp-file lifecycle probe (gui.asm)
@@ -180,6 +181,7 @@ WSTR w_bktest,   <bktest>
 WSTR w_mactest,  <mactest>
 WSTR w_rbtest,   <rbtest>
 WSTR w_xctest,   <xctest>
+WSTR w_ro,       <--ro>                  ; E9: GUI read-only launch flag (not a verb)
 WSTR w_pkat,     <pkat>
 WSTR w_trtest,   <trtest>
 WSTR w_mvtest,   <mvtest>
@@ -1275,6 +1277,17 @@ icc_optck:
     ; not a known verb - but a leading '-' means an option (e.g. --help, -h):
     ; route those to the CLI too so terminal usage prints to the console.  A
     ; file path handed by Explorer/drag-drop is drive-absolute, never '-'.
+    ; Exception (E9): "--ro" is a GUI read-only launch flag, not a CLI verb - set
+    ; the flag and stay in GUI mode.
+    lea     r11, [g_argv]
+    mov     rcx, qword ptr [r11+8]      ; argv[1] ptr
+    lea     rdx, [w_ro]
+    call    wstr_eq
+    test    eax, eax
+    jz      icc_dash
+    mov     dword ptr [g_readonly], 1
+    jmp     icc_no                      ; --ro is not a CLI command -> GUI mode
+icc_dash:
     lea     r11, [g_argv]
     mov     r10, qword ptr [r11+8]      ; argv[1] ptr
     movzx   eax, word ptr [r10]         ; first UTF-16 unit
