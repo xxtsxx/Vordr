@@ -245,6 +245,8 @@ CSTR mt_bad, "mactest: FAIL",13,10
 CSTR mt_leak,"mactest: FAIL (file-MAC did not catch the trailer tamper)",13,10
 CSTR rb_ok,  "rbtest: PASS (older counter flagged, current one not)",13,10
 CSTR rb_bad, "rbtest: FAIL",13,10
+CSTR rl_ok,  "reload: PASS (in-memory body refreshed from disk)",13,10
+CSTR rl_bad, "reload: FAIL",13,10
 CSTR xc_ok,  "xctest: PASS (external header change detected)",13,10
 CSTR xc_bad, "xctest: FAIL",13,10
 CSTR e_io,      "error: cannot read/write the vault file",13,10
@@ -284,6 +286,7 @@ g_ctr_io    dq ?                            ; reg_ctr_get/set scratch (u64 count
 g_fmac_len  dq ?                            ; 0 (legacy) or FMAC_TRAILER for this image
 g_ext_size  dq ?                            ; on-disk size snapshotted at load/save
 g_ext_hash  db 32 dup (?)                   ; BLAKE2b of the header snapshotted then
+g_reuse_key dd ?                            ; C8: vault_reload reuses g_vkey (skip Argon2)
 align 16
 g_fmac_ctx  db 256 dup (?)                  ; BLAKE2B_CTX scratch (216 used)
 g_fmac_out  db 32 dup (?)                   ; computed file MAC
@@ -954,6 +957,8 @@ vu_hcpy:
     cmp     r8, VH_TOTAL
     jb      vu_hcpy
     ; derive key (TPM sidecar or master password) + KCV check
+    cmp     dword ptr [g_reuse_key], 0  ; C8 reload: g_vkey already derived - skip Argon2
+    jne     vu_havekey                  ; (KCV below still re-verifies it fits the file)
     cmp     dword ptr [g_use_tpm], 0
     je      vu_pwderive
     call    vk_derive_tpm
@@ -1171,6 +1176,37 @@ vl_wipe:
     FRAME_EPILOG
     ret
 vault_lock endp
+
+; ===========================================================================
+; vault_reload() - C8: re-read the vault file and re-decrypt with the EXISTING key
+;   (no Argon2 re-run), replacing the in-memory body.  Used when another user
+;   saved the vault on a shared drive.  Frees the current resident image + body
+;   first (keeps g_vkey / g_hdr / g_cfg_in).  -> eax = 0 / EXIT_*.
+; ===========================================================================
+public vault_reload
+vault_reload proc frame
+    FRAME_PROLOG 32
+    mov     rcx, qword ptr [g_body_ptr]         ; free the current secmem body
+    test    rcx, rcx
+    jz      vr_nobody
+    mov     rdx, VAULT_BODY_MAX
+    call    secmem_free
+    mov     qword ptr [g_body_ptr], 0
+vr_nobody:
+    call    attach_reset                        ; free pending attachment plaintext
+    mov     rcx, qword ptr [g_filebuf]          ; free the current resident file image
+    test    rcx, rcx
+    jz      vr_nofile
+    mov     rdx, qword ptr [g_filesize]
+    call    mem_free
+    mov     qword ptr [g_filebuf], 0
+vr_nofile:
+    mov     dword ptr [g_reuse_key], 1          ; re-open reusing g_vkey (skip the KDF)
+    call    vault_unlock
+    mov     dword ptr [g_reuse_key], 0
+    FRAME_EPILOG
+    ret
+vault_reload endp
 
 ; ===========================================================================
 
@@ -3034,6 +3070,72 @@ rb_fail:
     FRAME_EPILOG
     ret
 cmd_rbtest endp
+
+; ===========================================================================
+; cmd_reload <path> - C8: prove vault_reload re-reads a vault changed on disk.
+;   Seed a 3-entry vault, open it, delete one entry in memory (no save), then
+;   vault_reload -> the in-memory count must return to 3 (the on-disk state).
+; ===========================================================================
+LANDING_PAD
+public cmd_reload
+cmd_reload proc frame
+    FRAME_PROLOG 48
+    lea     r10, [g_argv]
+    mov     rax, qword ptr [r10+16]             ; argv[2] = vault path
+    mov     qword ptr [g_cfg_in], rax
+    lea     r10, [bk_pw]                        ; fixed test password
+    lea     r11, [g_cfg_pass]
+    xor     ecx, ecx
+rl_pwcp:
+    mov     al, byte ptr [r10+rcx]
+    mov     byte ptr [r11+rcx], al
+    test    al, al
+    jz      rl_pwd
+    inc     ecx
+    cmp     ecx, 32
+    jb      rl_pwcp
+rl_pwd:
+    mov     dword ptr [g_cfg_passlen], 9
+    mov     dword ptr [g_cfg_t], 1
+    mov     dword ptr [g_cfg_m], 8192
+    mov     ecx, 3                              ; create + seed 3 entries (seals + closes)
+    call    do_seed
+    test    eax, eax
+    jnz     rl_fail
+    call    vault_unlock                        ; open (fresh Argon2 derive)
+    test    eax, eax
+    jnz     rl_fail
+    call    vault_count
+    cmp     eax, 3
+    jne     rl_faillk
+    xor     ecx, ecx                            ; delete entry 0 in memory only (no reseal)
+    call    vault_remove_at
+    call    vault_count                         ; memory now 2, disk still 3
+    cmp     eax, 2
+    jne     rl_faillk
+    call    vault_reload                        ; re-read disk with the existing key
+    test    eax, eax
+    jnz     rl_faillk
+    call    vault_count                         ; memory back to 3
+    cmp     eax, 3
+    jne     rl_faillk
+    call    vault_lock
+    lea     rcx, [rl_ok]
+    mov     edx, rl_ok_len
+    call    print_a
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+rl_faillk:
+    call    vault_lock
+rl_fail:
+    lea     rcx, [rl_bad]
+    mov     edx, rl_bad_len
+    call    print_a
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_reload endp
 
 ; ===========================================================================
 ; cmd_xctest <path> - prove external-change detection.  Create a vault
