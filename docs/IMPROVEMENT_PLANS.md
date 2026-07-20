@@ -240,10 +240,13 @@ unlocks inline.
 step; `ilammy/msvc-dev-cmd` SHA-pinned; stage-list comments in `run_all.cmd` +
 `build.yml` corrected.
 
-**Remaining:**
-1. Make `vfuzz`/`fuzzzip` take (and log) an explicit random seed so a nightly
-   failure reproduces from its logged seed. *Test:* a seeded failure reproduces
-   from the seed in the log. (Pairs with G8's `attfuzz`.)
+**Done (2026-07-21):** `vfuzz`, `fuzzzip` and `attfuzz` now draw a random 32-bit
+seed each run and log `fuzz seed: N` to stdout (captured in each stage's log by
+`run_all.cmd`). `--seed N` forces a specific seed, so a nightly failure
+reproduces deterministically from the value in its log. Shared helper
+`fuzz_seed` (main.asm) expands the 32-bit value to a nonzero 64-bit xorshift
+state via a splitmix multiply. *Verified:* `--seed 42` twice → identical splits;
+random runs log distinct seeds; all three stay exit-0 in the gate.
 
 ---
 
