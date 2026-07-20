@@ -43,6 +43,7 @@ extern CopyFileW:proc
 extern DeleteFileW:proc
 extern CreateFileW:proc                 ; C8: <vault>.lock write coordination
 extern CloseHandle:proc
+externdef g_wf_disp:dword               ; C7: one-shot write_file disposition (fileio)
 extern mem_alloc:proc
 extern mem_free:proc
 extern print_a:proc
@@ -865,7 +866,11 @@ vsw_pdone:
     mov     word ptr [r11+r8*2], 'p'
     inc     r8
     mov     word ptr [r11+r8*2], 0
-    ; write the image to the temp file
+    ; write the image to the temp file.  C7: delete any stale/pre-planted temp,
+    ; then create it exclusively (CREATE_NEW) so a re-planted symlink at that name
+    ; is refused rather than silently followed.
+    WINCALL DeleteFileW, addr g_tmppath
+    mov     dword ptr [g_wf_disp], 1             ; CREATE_NEW (one-shot)
     lea     rcx, [g_tmppath]
     mov     rdx, qword ptr [g_outbuf]
     mov     r8, qword ptr [g_outlen]

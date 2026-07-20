@@ -171,17 +171,6 @@ nothing.
    (`add/get/list`) and the "Event Log" comment in `main.asm`. *Test:* a GUI
    session produces the expected lines; no planted secret appears in any line.
 
-### C7. Temp-file exclusive create (atomic-save hardening)
-`write_file` (fileio.asm) creates `<vault>.tmp` with `CREATE_ALWAYS` and no
-exclusive-create / reparse-point check. In a writable shared directory a
-pre-planted `<vault>.tmp` symlink could redirect the save. The vault dir is
-normally user-owned (hence low), but the atomic-write guarantee in `formats.md`
-should hold regardless.
-
-1. Create the temp with `CREATE_NEW` (retry with a fresh unpredictable suffix on
-   collision) and reject a pre-existing reparse point. *Test:* a pre-planted
-   `<vault>.tmp` (plain + symlink) is not followed; `bktest`/`tmptest` stay green.
-
 ---
 
 ## D. Docs & tooling
