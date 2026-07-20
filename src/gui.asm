@@ -914,7 +914,7 @@ WSTR imp_xls_wrongpw,<Could not open the workbook - the password was incorrect.>
 WSTR imp_g_title,    <Import>
 WSTR imp_g_pre,      <Imported >
 WSTR imp_g_post,     < entries.>
-WSTR imp_g_none,     <No importable entries were found in that file.>
+WSTR imp_g_none,     <No importable entries were found. Vordr imports uncompressed (STORED) AES-zip members only - re-create hand-built archives with no compression.>
 WSTR imp_g_bad,      <That file is not a Vordr encrypted export (.zip), or the password was wrong.>
 WSTR zip_title,      <Export to encrypted archive>
 WSTR zip_defname,    <vordr-export.zip>

@@ -305,6 +305,14 @@ that must satisfy the vault's policy. Import stages a `.vaultz`, lets you pick
 entries, and appends them (never overwrites). Password history is deliberately
 not exported.
 
+Import accepts **STORED** (uncompressed) AES-zip members only — the format
+Vordr's own export writes. Archives whose members are DEFLATE-compressed (the
+default for 7-Zip and WinRAR when you re-zip `vordr.json` yourself) decrypt but
+then fail to parse, because there is no inflate implementation in the codebase
+(zero third-party code is a deliberate design constraint). To move a hand-built
+archive in, re-create it with **no compression** (STORE). Vordr-produced
+`.vaultz` files always import.
+
 ### OneDrive storage
 
 On first run Vordr proposes `%OneDrive%\Vordr\vault.vordr` as the default
