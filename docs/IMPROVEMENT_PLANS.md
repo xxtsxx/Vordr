@@ -179,28 +179,6 @@ tiles — can ship first and shares the same analysis pass.)
 3. Sidebar badge with the worst-bucket count. *Test:* fix one weak password →
    badge decrements after save.
 
-### E9. Read-only mode
-(The redesign's B1 landed read-only-by-default opens with full share masks, so
-this is now nearly free.)
-
-**Landed (PR #2, 2026-07-20):** `g_readonly` (gui.asm); the `--ro` launch flag
-(main.asm `is_cli_command` exemption — verified via cdb: `--ro` → `g_readonly=1`,
-else 0) and the unlock-dialog "Open read-only" checkbox (`IDC_U_RONLY`, read in
-`gui_unlock`, mirrored from `--ro` in `up_init`); an airtight write block
-(`vault_reseal` no-ops when RO — RUNALL stays green because the CLI/probes never
-set the flag); `gui_set_editmode` forced to view; New/Delete/Favorite/Import and
-the auto-purge (`gui_purge_trash`) gated; the create path forces RW; and a
-`g_vault_title_ro` "(read-only)" window title.
-
-**Remaining:**
-1. Grey out (disable) the still-visible mutation buttons — New / Edit / Delete /
-   Favorite / Import — in `vp_init` when RO (the *actions* are already gated, so
-   this is UX polish, not a hole). Theme the plain `AUTOCHECKBOX` to match the
-   custom-painted dialog. *Test:* RO open shows the buttons disabled.
-2. Gate the password-history purge (`gui_pwhist_click`) at the in-memory level
-   too (the `vault_reseal` backstop already blocks its persistence).
-3. Visual/interactive verification: confirm the "(read-only)" title suffix renders
-   and that a full RO UI walk leaves the file mtime unchanged. *Test:* both modes.
 
 ### E15. DEFLATE in zipimport (or a documented limitation)
 Imports accept only Vordr's own STORE-inside-AES exports today; 7-Zip/WinRAR
