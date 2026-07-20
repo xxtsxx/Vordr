@@ -65,6 +65,8 @@ sec_lock proc frame
     FRAME_PROLOG 48
     mov     qword ptr [rbp-24], rcx
     mov     qword ptr [rbp-32], rdx
+    cmp     dword ptr [g_force_lockfail], 0     ; C3 test hook: force a lock failure
+    jne     sl_failed
     WINCALL VirtualLock, qword ptr [rbp-24], qword ptr [rbp-32]
     test    eax, eax
     jnz     sl_done
@@ -72,7 +74,18 @@ sec_lock proc frame
     WINCALL GetCurrentProcess
     WINCALL SetProcessWorkingSetSize, rax, SEC_WS_MIN, SEC_WS_MAX
     WINCALL VirtualLock, qword ptr [rbp-24], qword ptr [rbp-32]
+    test    eax, eax
+    jz      sl_failed
 sl_done:
+    mov     eax, 1                              ; locked
+    FRAME_EPILOG
+    ret
+sl_failed:
+    ; C3: a secret buffer could not be pinned - it may reach the pagefile.  Record
+    ; it (the GUI shows a one-time warning; we do NOT fail closed, which would lock
+    ; the user out of their own vault on a constrained system).
+    mov     dword ptr [g_seclock_failed], 1
+    xor     eax, eax
     FRAME_EPILOG
     ret
 sec_lock endp
@@ -219,11 +232,18 @@ secmem_free endp
 secscan_ref db 16 dup (?)               ; runtime-random reference sentinel
 align 8
 ss_mbi      db 48 dup (?)               ; MEMORY_BASIC_INFORMATION (static: no stack use)
+align 4
+public g_seclock_failed
+g_seclock_failed dd ?                    ; C3: set if any VirtualLock failed (pageable secret)
+public g_force_lockfail
+g_force_lockfail dd ?                    ; C3: test hook - force sec_lock to fail
 
 .code
 CSTR ss_pass, "secscan: PASS (sentinel found before wipe, absent after)",13,10
 CSTR ss_res,  "secscan: FAIL (sentinel survived the wipe)",13,10
 CSTR ss_blind,"secscan: FAIL (scanner never found the plant)",13,10
+CSTR lk_ok,   "lktest: PASS (VirtualLock failure detected + recovered)",13,10
+CSTR lk_bad,  "lktest: FAIL",13,10
 
 ; ss_scan() -> eax = count of 16-byte sentinel copies in committed RW pages,
 ;   excluding the reference buffer secscan_ref itself.
@@ -333,5 +353,45 @@ ss_fail:
     FRAME_EPILOG
     ret
 cmd_secscan endp
+
+; ===========================================================================
+; cmd_lktest (probe) - C3: prove a VirtualLock failure is detected (g_seclock_
+;   failed set) via the force hook, and that a normal lock still works after.
+; ===========================================================================
+LANDING_PAD
+public cmd_lktest
+cmd_lktest proc frame
+    FRAME_PROLOG 48
+    mov     dword ptr [g_seclock_failed], 0
+    mov     dword ptr [g_force_lockfail], 1     ; force the next lock to fail
+    lea     rcx, [secscan_ref]
+    mov     edx, 16
+    call    sec_lock
+    mov     dword ptr [g_force_lockfail], 0
+    test    eax, eax
+    jnz     lk_fail                             ; forced call must report failure
+    cmp     dword ptr [g_seclock_failed], 0
+    je      lk_fail                             ; and must set the flag
+    mov     dword ptr [g_seclock_failed], 0     ; a real lock must still succeed
+    lea     rcx, [secscan_ref]
+    mov     edx, 16
+    call    sec_lock
+    test    eax, eax
+    jz      lk_fail
+    lea     rcx, [lk_ok]
+    mov     edx, lk_ok_len
+    call    print_a
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+lk_fail:
+    mov     dword ptr [g_force_lockfail], 0
+    lea     rcx, [lk_bad]
+    mov     edx, lk_bad_len
+    call    print_a
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_lktest endp
 
 end

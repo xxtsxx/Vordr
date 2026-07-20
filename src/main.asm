@@ -44,6 +44,7 @@ extern gui_tmptest:proc                 ; secure temp-file lifecycle probe (gui.
 extern fuzzy_score:proc                 ; fuzzy-search scoring (gui.asm)
 extern gui_trtest:proc                  ; trash timestamp/threshold probe (gui.asm)
 extern cmd_secscan:proc                 ; secret-wipe page-scan probe (secmem.asm)
+extern cmd_lktest:proc                  ; C3: VirtualLock failure-detection probe (secmem)
 ifdef DBG_TRACE
 extern cmd_securedesk:proc              ; secure-desktop spike (gui.asm)
 endif
@@ -175,6 +176,7 @@ WSTR w_atgen,    <atgen>
 WSTR w_zitest,   <zitest>
 WSTR w_phtest,   <phtest>
 WSTR w_secscan,  <secscan>
+WSTR w_lktest,   <lktest>
 WSTR w_tmptest,  <tmptest>
 WSTR w_fztest,   <fztest>
 WSTR w_vfuzz,    <vfuzz>
@@ -230,6 +232,7 @@ cmd_table label CMDENT
     CMDENT { w_zitest,    cmd_zitest,    2, 0 }   ; headless encrypted-zip import probe
     CMDENT { w_phtest,    cmd_phtest,    0, 0 }   ; headless pw-history capture probe
     CMDENT { w_secscan,   cmd_secscan,   0, 0 }   ; secret-wipe page-scan probe
+    CMDENT { w_lktest,    cmd_lktest,    0, 0 }   ; C3: VirtualLock failure-detection probe
     CMDENT { w_tmptest,   cmd_tmptest,   0, 0 }   ; secure temp-file lifecycle probe
     CMDENT { w_fztest,    cmd_fztest,    0, 0 }   ; fuzzy-search scoring KAT
     CMDENT { w_vfuzz,     cmd_vfuzz,     0, 0 }   ; vault record-parser structural fuzzer
