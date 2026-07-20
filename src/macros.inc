@@ -73,7 +73,10 @@ KCV_LEN             equ 16         ; key-check value bytes (SHA-256(key) prefix)
 ; CSPRNG nonce and is committed atomically via a temp file + MoveFileExW.
 ; ---------------------------------------------------------------------------
 VAULT_MAGIC         equ 52445256h  ; "VRDR" little-endian  - the single vault file
-VAULT_VERSION       equ 1
+; v2: the full-file MAC trailer (FMAC) is MANDATORY.  vault_unlock rejects any
+; file whose version != VAULT_VERSION, so a v1 image (which allowed a missing
+; FMAC trailer) no longer opens - the attachment section is always authenticated.
+VAULT_VERSION       equ 2
 
 VAULT_HDR struct
     magic       dd ?               ; "VRDR"

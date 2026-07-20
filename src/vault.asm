@@ -59,6 +59,7 @@ extern tpm_delete:proc
 extern reg_tpm_set:proc
 extern reg_tpm_get:proc
 extern reg_tpm_del:proc
+extern reg_prune_all:proc               ; C6: drop legacy path-named reg values
 extern reg_ctr_set:proc
 extern reg_ctr_get:proc
 
@@ -974,6 +975,7 @@ vu_havekey:
     ; save (vault_seal_write) writes it, so a file lacking it is rejected as tamper
     ; rather than silently accepted (which would let an attacker strip the MAC and
     ; splice arbitrary, unauthenticated attachment bytes - see attach_index_build).
+    call    reg_prune_all                       ; C6: drop legacy path-named reg values
     mov     qword ptr [g_fmac_len], 0
     mov     qword ptr [g_save_counter], 0
     mov     dword ptr [g_rollback], 0
