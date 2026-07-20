@@ -999,6 +999,7 @@ lay_band     dd 14, 0, 18                         ; label band: card(top) vs 0=f
 lay_itemh    dd 42, 30, 58                         ; list-item pixel height (index 0 used)
 pref_scheme dw 'u','i','_','s','c','h','e','m','e',0
 pref_loglevel dw 'L','o','g','L','e','v','e','l',0   ; C5: HKCU audit-log verbosity
+pref_reqhello dw 'T','p','m','R','e','q','u','i','r','e','H','e','l','l','o',0  ; C4
 pref_layout dw 'u','i','_','l','a','y','o','u','t',0
 align 8
 align 4
@@ -1280,8 +1281,11 @@ g_no_history  dd ?                    ; 1 = "Do not save history" setting on
 g_no_phonetic dd ?                    ; 1 = "Disable phonetic reader" setting on
 public g_readonly
 g_readonly    dd ?                    ; E9: 1 = vault opened read-only (no disk writes)
+public g_tpm_reqhello
+g_tpm_reqhello dd ?                   ; C4: 1 = require Hello/PIN on TPM unlock (not silent)
 g_seclock_warned dd ?                 ; C3: 1 = the "secrets not pinned" warning was shown
 g_loglvl_lock   dd ?                  ; C5: 1 = LogLevel forced by HKLM policy
+g_reqhello_lock dd ?                  ; C4: 1 = TpmRequireHello forced by HKLM policy
 g_nohist_lock dd ?                    ; 1 = NoHistory forced by HKLM policy (locked)
 g_nophon_lock dd ?                    ; 1 = NoPhonetic forced by HKLM policy (locked)
 g_pw_compliant dd ?                   ; 1 = create-dialog password meets the policy
@@ -8699,6 +8703,12 @@ gui_load_prefs proc frame
     jbe     @F
     xor     eax, eax
 @@: mov     dword ptr [g_cfg_loglevel], eax
+    ; C4: optional "require Hello/PIN on TPM unlock" (HKLM > HKCU > 0/off)
+    WINCALL cfg_get_dword, addr pref_reqhello, 0, addr g_reqhello_lock
+    test    eax, eax
+    jz      @F
+    mov     eax, 1
+@@: mov     dword ptr [g_tpm_reqhello], eax
     FRAME_EPILOG
     ret
 gui_load_prefs endp
