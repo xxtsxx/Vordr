@@ -63,6 +63,7 @@ extern vault_field_at:proc
 extern vault_entry_ptr:proc
 extern g_carry_created:qword
 extern pwgen_ex:proc
+externdef g_pwgen_outcap:dword          ; E16: one-shot pwgen output capacity
 extern g_col_bg:dword
 extern g_col_panel:dword
 extern g_col_frame:dword
@@ -13742,6 +13743,7 @@ gui_pg_regen proc frame
     mov     edx, dword ptr [g_pg_len]
     mov     r8d, dword ptr [g_pg_style]
     mov     r9d, dword ptr [g_pg_opt]
+    mov     dword ptr [g_pwgen_outcap], 260     ; E16: g_genout capacity
     call    pwgen_ex
     mov     dword ptr [g_pg_bits], eax
     test    eax, eax

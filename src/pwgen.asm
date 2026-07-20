@@ -27,12 +27,9 @@ externdef g_cfg_pwminclasses:dword
 
 PWGEN_MIN_LEN       equ 1
 PWGEN_MAX_LEN       equ 256
-; PASSPHRASE amplifies: each of n words emits up to WL_STRIDE(8) chars + a '-'
-; separator (+ optional trailing digit), so bytes ~= 9*n + 2.  Cap the word count
-; so the worst case fits any output buffer >= ~220 bytes (the GUI's g_genout is
-; 260).  CONTRACT: a pwgen_ex output buffer must hold PWGEN_PP_MAXWORDS words for
-; the passphrase style; today only the GUI uses a large n (others use n<=5).
-PWGEN_PP_MAXWORDS   equ 24
+; E16: every write in pwgen_ex is bounded by the caller's output capacity, set
+; one-shot in g_pwgen_outcap before the call (0 => a conservative default).  The
+; passphrase emit loop stops at the output end; fixed-length styles clamp n.
 
 PWCLASS_UPPER       equ 1
 PWCLASS_LOWER       equ 2
@@ -64,6 +61,8 @@ align 16
 pw_alpha    db 128 dup (?)         ; assembled alphabet (max 26+26+10+23 = 85)
 pw_alpha_n  dd ?                    ; assembled alphabet length
 pw_entropy  dd ?                    ; running entropy estimate in millibits
+public g_pwgen_outcap
+g_pwgen_outcap dd ?                 ; E16: one-shot output-buffer capacity (bytes; 0=default)
 
 .code
 
@@ -315,11 +314,32 @@ pwgen_ex proc frame
     mov     dword ptr [rbp-32], edx            ; n
     mov     dword ptr [rbp-40], r8d            ; style
     mov     dword ptr [rbp-48], r9d            ; opt
+    ; E16: one-shot output capacity -> byte limit (outcap-1, leaves room for NUL)
+    mov     ecx, dword ptr [g_pwgen_outcap]
+    mov     dword ptr [g_pwgen_outcap], 0     ; auto-reset (this call only)
+    test    ecx, ecx
+    jnz     @F
+    mov     ecx, PWGEN_MAX_LEN                ; no cap set -> conservative default
+@@: dec     ecx
+    mov     dword ptr [rbp-80], ecx           ; byte limit (outcap-1)
+    mov     rax, qword ptr [rbp-24]           ; end = outbuf + byte limit (all styles)
+    add     rax, rcx
+    mov     qword ptr [rbp-72], rax
     mov     dword ptr [pw_entropy], 0
     cmp     edx, 1
     jb      pex_fail
     cmp     edx, PWGEN_MAX_LEN
     ja      pex_fail
+    ; E16: fixed-length styles emit n bytes - clamp n to the limit (passphrase n
+    ; is a word count, bounded in its emit loop instead)
+    cmp     r8d, PWS_PASSPHRASE
+    je      @F
+    mov     eax, dword ptr [rbp-32]
+    cmp     eax, dword ptr [rbp-80]
+    jbe     @F
+    mov     eax, dword ptr [rbp-80]
+    mov     dword ptr [rbp-32], eax
+@@:
     mov     eax, r8d
     cmp     eax, PWS_PASSPHRASE
     je      pex_phrase
@@ -428,14 +448,13 @@ pex_pron_done:
     jmp     pex_afterphrase                     ; -> optional trailing digit
 ; ---- PASSPHRASE: n words from the embedded list ----------------------------
 pex_phrase:
-    cmp     dword ptr [rbp-32], PWGEN_PP_MAXWORDS  ; bound passphrase output so the
-    jbe     @F                                     ; worst-case byte count fits the
-    mov     dword ptr [rbp-32], PWGEN_PP_MAXWORDS  ; caller buffer (see contract note)
-@@:
     mov     dword ptr [rbp-56], 0               ; word i
 pex_phrase_lp:
     mov     eax, dword ptr [rbp-56]
     cmp     eax, dword ptr [rbp-32]
+    jae     pex_phrase_done
+    mov     r10, qword ptr [rbp-24]             ; E16: stop when the output is full
+    cmp     r10, qword ptr [rbp-72]
     jae     pex_phrase_done
     ; separator '-' between words
     cmp     eax, 0
@@ -473,6 +492,8 @@ pex_word_cp:
     sub     cl, 20h
 pex_word_put:
     mov     r11, qword ptr [rbp-24]
+    cmp     r11, qword ptr [rbp-72]             ; E16: output full mid-word -> stop
+    jae     pex_phrase_done
     mov     byte ptr [r11], cl
     inc     qword ptr [rbp-24]
     inc     dword ptr [rbp-64]
@@ -492,6 +513,8 @@ pex_afterphrase:
     je      pex_fail
     add     eax, '0'
     mov     r10, qword ptr [rbp-24]
+    cmp     r10, qword ptr [rbp-72]             ; E16: no room for the digit -> skip
+    jae     pex_afterdigit
     mov     byte ptr [r10], al
     inc     qword ptr [rbp-24]
     add     dword ptr [pw_entropy], 3321        ; log2(10)

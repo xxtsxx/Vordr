@@ -70,6 +70,7 @@ endif
 extern con_init:proc
 extern print_a:proc
 extern pwgen_ex:proc                    ; styled password generator (pwgen.asm)
+externdef g_pwgen_outcap:dword          ; E16: one-shot pwgen output capacity
 extern do_seed:proc                     ; bulk test-vault seeder (vault.asm)
 extern print_err:proc
 extern vault_unlock:proc
@@ -938,6 +939,7 @@ cmd_genpw proc frame
     mov     edx, 20
     mov     r8d, PWS_RANDOM
     mov     r9d, 15 or PWO_NOAMBIG
+    mov     dword ptr [g_pwgen_outcap], 160     ; E16: g_gen_buf capacity
     call    pwgen_ex
     call    gp_println
     WINCALL print_a, addr gl_phrase, gl_phrase_len
@@ -945,6 +947,7 @@ cmd_genpw proc frame
     mov     edx, 5
     mov     r8d, PWS_PASSPHRASE
     mov     r9d, PWO_CAP or PWO_DASH or PWO_DIGIT
+    mov     dword ptr [g_pwgen_outcap], 160     ; E16: g_gen_buf capacity
     call    pwgen_ex
     call    gp_println
     WINCALL print_a, addr gl_pron, gl_pron_len
@@ -952,6 +955,7 @@ cmd_genpw proc frame
     mov     edx, 14
     mov     r8d, PWS_PRONOUNCE
     mov     r9d, PWO_CAP or PWO_DIGIT
+    mov     dword ptr [g_pwgen_outcap], 160     ; E16: g_gen_buf capacity
     call    pwgen_ex
     call    gp_println
     WINCALL print_a, addr gl_pin, gl_pin_len
@@ -959,6 +963,7 @@ cmd_genpw proc frame
     mov     edx, 8
     mov     r8d, PWS_PIN
     xor     r9d, r9d
+    mov     dword ptr [g_pwgen_outcap], 160     ; E16: g_gen_buf capacity
     call    pwgen_ex
     call    gp_println
     WINCALL print_a, addr gl_hex, gl_hex_len
@@ -966,6 +971,7 @@ cmd_genpw proc frame
     mov     edx, 24
     mov     r8d, PWS_HEX
     xor     r9d, r9d
+    mov     dword ptr [g_pwgen_outcap], 160     ; E16: g_gen_buf capacity
     call    pwgen_ex
     call    gp_println
     xor     eax, eax

@@ -213,20 +213,6 @@ AES zips are rejected. There is no inflate in this repo — sibling project
    method 8 vs 0. *Test:* a 7-Zip-produced deflated AE-2 zip imports
    correctly; RUNALL (incl. the `fuzzzip` stage) green.
 
-### E16. pwgen output-capacity parameter
-The 2026-07-20 audit bounded the passphrase word count (`PWGEN_PP_MAXWORDS`) to
-stop `pwgen_ex` overflowing a caller buffer (the GUI's 260-byte `g_genout`). That
-is a stopgap: `pwgen_ex` still takes no explicit output-capacity argument, so a
-future caller with a small buffer and a large `n` could overflow for a
-non-passphrase style too.
-
-1. Add an `outcap` argument to `pwgen_ex` (and `pwgen`); bound every write; drop
-   the `PWGEN_PP_MAXWORDS` special case. Update all call sites (~12) and their
-   frame sizes. *Test:* a dbg probe requests each style into a deliberately-tiny
-   buffer and gets a clean truncation/refusal, never an overwrite; SELFTEST +
-   `atgen` green.
-
----
 
 ## R. Redesign remainder
 

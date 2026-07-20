@@ -33,6 +33,7 @@ extern argon2id_hash:proc
 extern check_password_policy:proc
 extern pwgen:proc
 extern pwgen_ex:proc
+externdef g_pwgen_outcap:dword          ; E16: one-shot pwgen output capacity
 extern vault_selftest:proc
 extern hmac_sha1:proc
 extern base32_decode:proc
@@ -711,6 +712,7 @@ st_after_gen:
     mov     edx, 20
     mov     r8d, PWS_RANDOM
     mov     r9d, 15 or PWO_NOAMBIG
+    mov     dword ptr [g_pwgen_outcap], 64      ; E16: pw_out capacity
     call    pwgen_ex
     cmp     eax, 90                             ; 20 chars * ~5.9 bits ~= 118, floor >= 90
     jb      st_gx_fail
@@ -718,6 +720,7 @@ st_after_gen:
     mov     edx, 4
     mov     r8d, PWS_PASSPHRASE
     mov     r9d, PWO_CAP or PWO_DASH
+    mov     dword ptr [g_pwgen_outcap], 64      ; E16: pw_out capacity
     call    pwgen_ex
     cmp     eax, 32                             ; 4 words * 8 bits
     jne     st_gx_fail
@@ -725,6 +728,7 @@ st_after_gen:
     mov     edx, 12
     mov     r8d, PWS_PRONOUNCE
     mov     r9d, PWO_CAP
+    mov     dword ptr [g_pwgen_outcap], 64      ; E16: pw_out capacity
     call    pwgen_ex
     test    eax, eax
     jz      st_gx_fail
@@ -732,6 +736,7 @@ st_after_gen:
     mov     edx, 6
     mov     r8d, PWS_PIN
     xor     r9d, r9d
+    mov     dword ptr [g_pwgen_outcap], 64      ; E16: pw_out capacity
     call    pwgen_ex
     cmp     eax, 19                             ; 6 * log2(10) = 19.9 -> 19
     jne     st_gx_fail
@@ -750,6 +755,7 @@ st_gx_pin:
     mov     edx, 16
     mov     r8d, PWS_HEX
     xor     r9d, r9d
+    mov     dword ptr [g_pwgen_outcap], 64      ; E16: pw_out capacity
     call    pwgen_ex
     cmp     eax, 64                             ; 16 * 4 bits
     jne     st_gx_fail

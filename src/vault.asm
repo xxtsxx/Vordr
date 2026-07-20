@@ -34,6 +34,7 @@ extern secure_zero:proc
 extern secmem_alloc:proc
 extern sec_lock:proc
 extern pwgen_ex:proc
+externdef g_pwgen_outcap:dword          ; E16: one-shot pwgen output capacity
 extern secmem_free:proc
 extern read_file:proc
 extern write_file:proc
@@ -1423,6 +1424,7 @@ seed_make_entry proc frame
     mov     edx, 16
     mov     r8d, PWS_RANDOM
     mov     r9d, 15 or PWO_NOAMBIG
+    mov     dword ptr [g_pwgen_outcap], 40      ; E16: seed_pass_a capacity
     call    pwgen_ex
     lea     rcx, [seed_pass_w]
     lea     rdx, [seed_pass_a]
