@@ -10501,7 +10501,9 @@ search_overlay_populate endp
 ;   hit count: height = clamp(rows * itemHeight, one row, SO_LISTH).  Called after
 ;   every populate so the dropdown shrinks as the query filters results down.
 search_overlay_resize proc frame
-    FRAME_PROLOG 64
+    FRAME_PROLOG 96                            ; must hold a 7-arg WINCALL (SetWindowPos):
+                                              ; its stack args reach [rbp-56], so the hwnd/
+                                              ; listH/hdlg locals (-24..-40) must sit above it
     mov     qword ptr [rbp-24], rcx
     mov     eax, dword ptr [g_layout]         ; rowH = the list-card height for this layout
     lea     r11, [lay_itemh]                  ;   (deterministic; what WM_MEASUREITEM sets)
