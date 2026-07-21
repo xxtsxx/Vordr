@@ -143,7 +143,7 @@ House rules:
   `zitest` → `phtest` → `secscan` → `lktest` → `tmptest` → `fztest` → `trtest`
   → `vfuzz` → `fuzzzip` → `bktest` → `mactest` → `rbtest` → `xctest` → `reload`
   → `cowrite` → `attfuzz` → `healthkat` → `pkat` → `mvtest` → `mvswitch` →
-  `avtest`. `--quick` skips stage 1.
+  `mvname` → `avtest`. `--quick` skips stage 1.
 - **FRAMES** = no >4-arg `WINCALL` directly inside a raw `sub rsp,64` dialog
   proc (`create_proc`, `unlock_proc`, `vault_proc`, `msg_proc`, `about_proc`,
   …); wide calls go in a `FRAME_PROLOG N` helper. This is the BEX64/offset-0
@@ -175,92 +175,106 @@ strip + cross-vault search) is a dead end: every open vault demands its own
 password on every unlock, TPM convenience-unlock is per-vault and awkward, and
 the tab strip fragments what should be one list of secrets. The redesign makes
 **one master vault the single authentication gate**; other vaults ("foreign"
-vaults) are *federated* — the master holds a keyring that caches their keys, so
-unlocking the master (password **or** TPM) transparently opens them all, and all
-their secrets merge into one list.
+vaults) are *federated* through a **machine-local keyring** that caches their
+keys, so unlocking the master (password **or** TPM) transparently opens them all
+and their secrets merge into one list. **The keyring belongs to the machine, not
+to any vault** — it is never written into a vault file and is not exportable, so a
+master vault stays an ordinary, portable, shareable file.
 
 **Shape.** The existing multi-vault machinery is *reused, not thrown away*: the
 VSLOT/`vault_ctx_*` contexts stay as the per-vault live-state holders, and the
 cross-vault XR enumeration (`search_overlay_xfill`) is promoted from a search-only
-cache to **the primary list builder**. What goes away is the user-facing tab strip
-and per-vault password prompting. This supersedes the tab-oriented parts of the R
+cache to **the primary list builder**. What goes away: the user-facing tab strip,
+per-vault password prompting, and *any in-vault links table* — the entire
+federation state (which vaults, their keys, names, locators) lives in a
+machine-local, encrypted **registry** blob. **The vault file format is untouched
+(no `VAULT_VERSION` bump).** This supersedes the tab-oriented parts of the R
 backlog: **R4**'s "per-vault entry counts on tabs" and **R5**'s "reopen the whole
-tab set" are rewritten below (M3/M4); delete those clauses from R when M lands.
+tab set" are rewritten below (M3/M4/M5); delete those clauses from R when M lands.
 
-**Security posture (state it plainly).** The keyring means *master compromise =
-compromise of every federated vault* — the master's encrypted body becomes the
-one place that concentrates key material. That is the deliberate trade: a single
-strong gate (Argon2id + KCV + optional TPM) instead of N weak habits (password
-reuse, sticky notes). Cached keys live **only** inside the master's AES-256-GCM
-body, never in the registry, never on disk in the clear, and are `secure_zero`'d
-on lock like every other secret. Foreign vaults each keep their own independent
-key on disk — the cache is a convenience copy, not a new root of trust beyond the
-master. Two levers bound the blast radius: (1) a per-vault **`LINK_PROMPT`
-opt-out** — a high-value vault can be flagged to always demand its own password
-even inside the federation (no cached key stored for it); and (2) **lock is
-all-or-nothing** — locking or auto-lock-timing-out the master wipes *every*
-federated body from secmem, so the federation is never "half open."
+**Security posture (state it plainly).** A machine-local, master-bound, and
+machine-bound keyring means opening the federation needs **four factors**: the
+master file + the master password/TPM + this machine's keyring blob + this
+machine (via TPM binding). **Stealing the master file alone yields nothing** —
+foreign keys are not in it. This is strictly better than an in-vault keyring
+(which concentrated every key in one stealable file) and gives *membership
+privacy*: a shared or exported master reveals nothing about what else you
+federate. The residual concentration — whoever holds the *unlocked* master on
+*this* machine holds the federation — is bounded by two levers: a per-vault
+**`LINK_PROMPT` opt-out** (a high-value vault is never cached; it always demands
+its own password), and **all-or-nothing lock** (locking / auto-lock-timeout wipes
+*every* federated body from secmem — never half-open). Cached keys sit AES-256-GCM
+at rest under a key derived from the master key **and** a TPM machine secret, and
+are `secure_zero`'d on lock like every other secret.
 
-**Decisions locked (2026-07-21, with the user).** (1) Keyring stores the
-**cached derived 32-byte key** (reference model): foreign vaults stay
-independent and portable, fan-out is instant, no plaintext password, staleness
-is KCV-detectable. Adoption/re-keying and password-caching were rejected — the
-first destroys portability (contradicting M6), the second stores reusable
-plaintext and pays Argon2 N times. (2) Vault ID is an **explicit random 16-byte
-ID pinned in the v3 body meta at creation**, immutable across password/salt
-rotation; salt-derivation is only the display fallback for not-yet-upgraded v2
-foreign vaults. (3) Foreign vaults **auto-open** from cached keys on master
-unlock, with the per-vault `LINK_PROMPT` opt-out above. (4) "Export to `.vordr`"
-produces a **child vault with its own new password** (portable/shareable), with
-an optional "and link it" step (M6).
+**Decisions locked (2026-07-21, with the user).** (1) **Fully machine-local
+federation:** the entire keyring — foreign links (`vault_id` + cached derived key
++ KCV + name + locator + flags) — lives in a machine-local **registry** blob,
+*never* in a vault file, non-exportable. Caching the derived key (not the
+password) keeps fan-out instant with no plaintext password and no Argon2 re-run.
+In-vault keyring rejected: it leaked keys + membership on share and broke path
+portability. (2) **At-rest crypto:** AES-256-GCM under `KEK = BLAKE2b(master_key ‖
+tpm_secret)` — the master key is the unlock gate, a TPM-sealed 32-byte machine
+secret is the machine binding (fallback: master-key-only where no TPM). (3)
+**Vault ID = salt-derived** `SHA-256(salt)[0..15]` — stable, unique, **zero format
+change**; the store references vaults by it. (4) **Names are machine-local
+labels** (in the federation record), basename fallback on a fresh machine. (5)
+Foreign vaults **auto-open** on master unlock, with the `LINK_PROMPT` opt-out. (6)
+"Export to `.vordr`" = a **child vault with its own new password** (an ordinary
+vault; no version question), optional "and link it".
 
-### M1. Vault identity — stable ID + user name
-1. **Vault ID (pinned, immutable):** generate a random 16-byte `vault_id` once at
-   creation (`rng_fill`) and store it in the v3 body meta (M1.2). It is identity,
-   not a crypto parameter, so it survives a password change *or* a future salt
-   rotation — which matters because it is the key the links table references, and
-   a link must never dangle because the crypto was rotated. **Fallback for v2**
-   (not-yet-upgraded) foreign vaults: derive a transitional display ID
-   `SHA-256(salt)[0..15]` until first save pins a real one. Add `vault_id_of()`
-   (returns the pinned meta ID, else the salt-derived fallback). *Test:* KAT — a
-   pinned ID round-trips through reseal unchanged; a v2 image reports the
-   salt-derived fallback, then a pinned ID after upgrade.
-2. **User-editable name + v3 body preamble:** store the name in the **body**
-   (authenticated + encrypted), not the header. Bump `VAULT_VERSION` → **3** and
-   define a body preamble: after the entry stream's `u32 entry_count`, a
-   version-gated `u16 meta_len | meta_TLV` block carrying `VMETA_ID` (the pinned
-   16-byte ID), `VMETA_NAME` (the display name), and reserved room for future
-   vault-level settings. v2 bodies have no preamble → name defaults to the file
-   basename and the ID is the salt-derived fallback; first save upgrades to v3.
-   Editing the name reseals the vault. *Test:* set a name, reseal, reload → name
-   and ID round-trip; a v2 image opens with basename+fallback then upgrades.
+### M1. Vault identity + naming (no format change)
+1. **Vault ID (salt-derived):** `vault_id_of()` = `SHA-256(g_hdr+VH_SALT)[0..15]`.
+   The 32-byte salt is unique per vault and fixed at creation, so the ID is stable
+   and **every existing v2 vault already has one — zero format change, no version
+   bump**. The machine-local store keys on it: open a foreign file → read its salt
+   → derive its ID → look up its cached key. (A pinned in-file ID was considered
+   but is unnecessary once the keyring is machine-local; revisit only if a salt-
+   rotation feature is ever added.) *Test:* KAT — a fixed salt yields a fixed ID;
+   distinct salts differ.
+2. **Name (machine-local label):** the user-editable name lives in the federation
+   record (M2), keyed by `vault_id`, falling back to the file basename when the
+   vault is unnamed on this machine. No vault write, no version bump — consistent
+   with the fully-local model. *Consequence:* a name does not travel with the file;
+   it is a per-machine label. *Test:* `federatetest` — a set name round-trips
+   through the registry blob; an unknown vault shows its basename.
 
-### M2. The keyring / links table (core)
-1. Define the **links table**, a v3 master-body meta section: `link* {
-   vault_id16 | foreign_KCV16 | cached_key32 | flags u32 | display_name |
-   locator }`, where `locator` is the foreign vault path (wide, capped). Caching
-   the **derived 32-byte key** — not the password — means no plaintext password at
-   rest and **no Argon2 re-run** per foreign vault (fast fan-out unlock). `flags`:
-   `LINK_STALE` (KCV mismatch), `LINK_MISSING` (file gone), and **`LINK_PROMPT`**
-   (opt-out: *no* `cached_key` is stored; the vault always demands its own password
-   even in the federation — the high-value-vault escape hatch).
-2. **Fan-out unlock:** after the master decrypts, walk the links table; for each
-   link (skipping `LINK_PROMPT`), load the foreign file and unlock it with
-   `cached_key` **directly** (`vault_unlock` variant that skips the KDF when a key
-   is supplied), verifying against the foreign file's own KCV. KCV mismatch
-   (foreign password was changed) → set `LINK_STALE`, skip, surface in M4; file
-   absent → `LINK_MISSING`. **Lock is all-or-nothing:** `vault_lock` (and the
-   auto-lock timeout) must wipe *every* federated body from secmem, not just the
-   master — the federation is never left half-open. **Memory is bounded:** all
-   bodies are VirtualLock'd at once, so a federation is capped by `MAX_VAULTS`
-   (8) × 16 MiB against the 256 MiB working-set ceiling (the dynamic `sec_ws_grow`
-   sizing already covers this; keep `MAX_VAULTS` as the federation cap).
-3. **Re-key on demand:** re-authenticating a stale link (M4) runs the foreign KDF
-   once, refreshes `cached_key` + `foreign_KCV`, reseals the master.
-4. Keep each foreign vault's own on-disk crypto untouched — the cache is additive.
-   *Test:* `keyringkat` (headless) — build a master with N links, seal, reload,
-   assert every cached key round-trips and KCV-validates; flip one foreign KCV and
-   assert `LINK_STALE` is detected; a `LINK_PROMPT` link stores no key bytes.
+### M2. The machine-local keyring (core)
+1. **Federation record** (one per master, machine-local): `{ master_vault_id,
+   record* }`, each `record = { vault_id16 | foreign_KCV16 | cached_key32 |
+   flags u32 | name | locator }` (`name`/`locator` u16-length-prefixed). `flags`:
+   `LINK_STALE` (KCV mismatch), `LINK_MISSING` (file gone), `LINK_PROMPT` (opt-out:
+   *no* `cached_key`; always demands its own password — the high-value escape
+   hatch). Caching the **derived key** — not the password — means no plaintext
+   password at rest and **no Argon2 re-run** per foreign vault (instant fan-out).
+2. **At-rest crypto + storage:** serialize → AES-256-GCM under `KEK =
+   BLAKE2b(master_key ‖ tpm_secret)` → store as `REG_BINARY` under
+   `HKCU\SOFTWARE\Vordr\Federation` (value name = hashed master `vault_id` via
+   `reg_hash_name`, reusing the `reg_tpm_*` infrastructure). `tpm_secret` = a
+   32-byte machine secret sealed by `tpm_seal`/`tpm_unseal` (tpm.asm) under a
+   persisted Vordr NCrypt key; when `tpm_available` = 0, fall back to
+   master-key-only and record that the keyring is password-bound but not
+   hardware-bound. The blob decrypts only with the master unlocked **and** on this
+   machine. `KEK` reuses the keyed-BLAKE2b already shipped for the file MAC — no
+   new primitive.
+3. **Fan-out unlock:** master unlocks → derive `master_key` → unseal `tpm_secret`
+   → derive `KEK` → decrypt the record → for each entry (skipping `LINK_PROMPT`),
+   load the foreign file and unlock with `cached_key` **directly** (a `vault_unlock`
+   variant that skips the KDF when a key is supplied), verifying the foreign KCV.
+   Mismatch → `LINK_STALE`; file gone → `LINK_MISSING`. **Lock is all-or-nothing:**
+   `vault_lock` / auto-lock wipes *every* federated body from secmem. **Memory
+   bounded:** all bodies VirtualLock'd at once → capped by `MAX_VAULTS` (8) × 16 MiB
+   under the 256 MiB WS ceiling (`sec_ws_grow` already sizes it; keep `MAX_VAULTS`
+   as the federation cap).
+4. **Re-key on demand:** re-auth a stale link (M4) runs the foreign KDF once,
+   refreshes `cached_key` + `foreign_KCV`, re-encrypts + rewrites the record.
+5. **Master-password change** → `master_key` changes → **re-wrap** the federation
+   record under the new `KEK`, and re-seal the master's TPM unlock sidecar (its key
+   name is KCV-derived, so a password change moves it).
+6. *Test:* `keyringkat` (headless, hermetic — synthetic keys, no real registry
+   writes, never emits key bytes): serialize→encrypt→decrypt→deserialize
+   round-trips N records; a wrong `tpm_secret` fails decryption (machine binding);
+   a flipped foreign KCV yields `LINK_STALE`; a `LINK_PROMPT` record stores no key.
 
 ### M3. Unified secret list (drop the tab strip)
 1. Remove `IDC_V_TABS`, `gui_draw_tabs`, `gui_tab_click`, `gui_switch_vault`, and
@@ -269,34 +283,37 @@ an optional "and link it" step (M6).
    `list_fill_all`) to build the default list, each row tagged `(vault_id, entry)`.
    Vault provenance shows as the existing dim right-aligned name (kept from the
    cross-vault card) or an optional group header — no tabs.
-2. Edit/save routes to the **owning** vault: `vault_ctx_front(owner)` then
-   `vault_reseal`. New-item **target** = the vault of the currently-selected entry,
-   else the master (predictable, no modal nag; a small target picker only when the
-   user wants to override). Health/search/sort already operate on the merged XR set
-   — reuse.
-   *Test:* extends `mvname`/`federatetest` — the merged list is the union with
-   correct owner attribution; editing an entry reseals only its owner.
+2. Edit/save **and attachment-open** route to the **owning** vault: the attachment
+   index (`g_att_*`) is per-live-vault, so a row's edit, save (`vault_ctx_front(owner)`
+   → `vault_reseal`) *and* an attachment click must front its owner first. Track the
+   master as `g_master_idx`. Opening a `.vordr` standalone that is already federated
+   fronts the existing context (no double-load). New-item **target** = the
+   currently-selected entry's vault, else the master (no modal nag; a small picker
+   only to override). Health/search/sort already run on the merged XR set — reuse.
+   *Test:* extends `mvname`/`federatetest` — merged list = union with correct owner
+   attribution; edits and attachment-opens hit the right owner.
 
 ### M4. Foreign-vault management screen
 1. A dedicated modeless dialog (replaces the tab strip's add/close/switch): rows
    of linked vaults with **name, path, status** (open / locked / stale / missing)
    and entry count. Actions: **add link** (pick `.vordr` → unlock once → cache
-   key), rename, remove link (drop cached key + reseal master), **set master**,
-   **re-authenticate** a stale link, open/close.
+   key), rename (machine-local label), remove link (drop cached key + rewrite the
+   record), **set master**, **re-authenticate** a stale link, **relocate** a missing
+   link (its file moved → re-point the locator), open/close.
 2. "Add link" is the federation entry point; "set master" re-points the registry +
-   TPM (M5) and folds the old master into the new master's links table.
+   TPM (M5) and **migrates the in-memory cached keys** into the new master's record.
    *Test (needs a display):* add → row appears, secrets merge into the list;
-   remove → they vanish and the cached key is gone from the resealed master.
+   remove → they vanish and the cached key is gone from the rewritten record.
 
-### M5. Scope TPM + registry to the master only
+### M5. Scope TPM + registry to the master (the federation record replaces per-vault entries)
 1. Registry persists **only** the master path (`reg_save_vault`); only the master
-   gets a TPM sidecar (`reg_tpm_set`/`gui_try_tpm_auto`). Foreign paths + keys move
-   **out** of the registry and **into** the master's links table — a net privacy
-   win (fewer plaintext vault paths in `HKCU`, extends the C6 hygiene work).
-2. The per-vault rollback mirror can key by `vault_id` instead of path (less
-   leakage). Foreign vaults no longer get their own registry/TPM entries.
-   *Test:* `migratetest` (headless) — after migration, `HKCU\SOFTWARE\Vordr`
-   TPM-Unlock/rollback hold master-only entries; foreign sidecars are deleted.
+   gets a TPM unlock sidecar (`reg_tpm_*`/`gui_try_tpm_auto`) **and** the TPM
+   machine secret that binds the keyring (M2). Foreign vault paths + keys live only
+   in the master's machine-local federation record — **no per-foreign registry/TPM
+   entries at all** (a privacy win; extends the C6 hygiene work).
+2. The per-vault rollback mirror keys by `vault_id` instead of path (less leakage).
+   *Test:* `migratetest` (headless) — after migration, `HKCU\SOFTWARE\Vordr` holds a
+   master-only TPM sidecar + one `Federation` blob; foreign sidecars are gone.
 
 ### M6. Vault as the default export/import format
 1. **Export default → `.vordr` (child vault, own password):** "export selected
@@ -315,49 +332,57 @@ an optional "and link it" step (M6).
    *Test:* `vaultexportkat` (headless) — export N entries + an attachment to a new
    vault, reopen, assert entries and attachment bytes match; re-merge is idempotent.
 
-### M7. Migration & back-compat
-1. `VAULT_VERSION` → 3 for the body preamble (ID + name + links meta). **v2 vaults
-   still open** (read path tolerates a missing preamble; name = basename; ID = the
-   salt-derived fallback); first save upgrades in place and pins a random ID. A
-   foreign vault may remain v2 — only the *master* needs v3 for its links table.
+### M7. Migration & back-compat (registry-only, no vault upgrades)
+1. **No vault file changes** — the format is untouched, so there is no version
+   bump, no downgrade risk, and foreign vaults stay v2. Exported children (M6) are
+   ordinary v2 vaults.
 2. On first launch after upgrade, if the old multi-vault registry/tab-set
-   remembered several vaults, **prompt to pick a master (never auto-elect one)** and
-   fold the rest into its links table (unlock each once to cache its key), then
-   delete their individual registry/TPM sidecars. Folding is non-destructive to the
-   foreign files themselves.
-3. Update `docs/formats.md` (v3 preamble + links-table layout) and the Sequencing
-   Format note; bump the format table. Any container/auth change bumps the version
-   — the links table is a container change, so v3 is mandatory, not tag-skip.
+   remembered several vaults, **prompt to pick a master (never auto-elect one)**,
+   unlock each foreign once to cache its key into the new machine-local federation
+   record, then delete the per-vault registry/TPM sidecars — **only after** the key
+   is confirmed in the record (never destroy the sole unlock path mid-migration).
+   Non-destructive to the foreign files themselves.
+3. **Single vault = zero ceremony:** no federation record, no master concept
+   surfaced; the common single-vault case is unchanged.
+4. Update `docs/formats.md` with a "federation state is machine-local (registry),
+   never in the file" note; no format-table bump.
 
 ### M8. Test/probe strategy (headless-first, per PROBE convention)
 Grounded in the existing probes (`mvtest`/`mvswitch`/`mvname`). Add, wired into
 `tests\run_all.cmd`:
-- **`keyringkat`** — links-table seal/reload + cached-key round-trip + stale-KCV
-  detection (M2).
+- **`keyringkat`** — federation-record encrypt/decrypt round-trip + machine-binding
+  (wrong `tpm_secret` fails) + stale-KCV + `LINK_PROMPT` (M2); hermetic, synthetic
+  keys, no real registry writes, never emits key bytes.
 - **`federatetest`** — master + N foreign contexts, fan-out unlock from cached
-  keys, unified enumeration = the union with correct owner attribution (M2/M3).
+  keys, unified enumeration = the union with correct owner attribution + machine-
+  local names (M2/M3).
 - **`vaultexportkat`** — entries + attachment export to a new `.vordr`, reopen,
-  byte-exact round-trip (M6).
-- **`migratetest`** — v2 + legacy multi-vault registry → v3 master + links; assert
-  foreign registry/TPM sidecars are gone (M5/M7).
-The keyring/format/migration logic must be provable headlessly; only the M4 screen
-and the list chrome (M3 painters) need a display.
+  byte-exact round-trip; re-merge is idempotent (M6).
+- **`migratetest`** — legacy multi-vault registry → machine-local federation record;
+  foreign registry/TPM sidecars gone (M5/M7).
+The keyring/migration logic must be provable headlessly; only the M4 screen and the
+list chrome (M3 painters) need a display.
 
-**Sequencing.** M1 (identity) → M2 (keyring + fan-out, headless, the core) →
-M7 (migration + version bump, alongside M2) → M6 (vault export/import, reuses the
-seal path) → M3 (unified list, removes tabs) → M4 (management screen) → M5 (registry/
-TPM scoping, folds in with M4). M1/M2/M6/M7/M8 are headlessly verifiable and should
-land build-green with KATs before the M3/M4 display work.
+**Sequencing.** M1 (salt-derived ID) → M2 (machine-local keyring + fan-out, the
+headless core) → M7 (registry-only migration, alongside M2) → M6 (vault export/
+import, reuses the seal path) → M3 (unified list, removes tabs) → M4 (management
+screen) → M5 (scoping, folds in with M4). M1/M2/M6/M7/M8 are headlessly verifiable
+and should land build-green with KATs before the M3/M4 display work. **Cross-group
+dependency:** M3 rewrites the list builder (`gui_poplist` → the merged XR fill) that
+**R1** (scroll), **R4** (sidebar niceties) and **R6** (health cache) all paint on —
+do M3 before investing in those R items, or they get built twice.
 
 **Resolved secondary calls (2026-07-21).** (a) **No master nesting** — a foreign
 vault cannot itself be a master (flat federation in v1); enforce and test. (b) Body
-16 MiB cap is per-vault and unaffected (the links table is tiny). (c) Per-vault save
-locking (`.lock`, `vault_ext_changed`) is unchanged — a save touches only the owning
-vault; the master reseals only when the links table changes. (d) **"Set master"
+16 MiB cap is per-vault and unaffected. (c) Per-vault save locking (`.lock`,
+`vault_ext_changed`) is unchanged — a save touches only the owning vault; the
+machine-local record is rewritten only when the keyring changes. (d) **"Set master"
 migrates the already-in-memory cached keys** (no re-prompt — they are already
 trusted). (e) **New-item target** = selected entry's vault, else master (M3). (f)
 **Merge-import dedups by entry id**, newer `modified` wins (M6). (g) Migration
-**never auto-elects a master** (M7).
+**never auto-elects a master** (M7). (h) **Names are machine-local labels** — they
+do not travel with the vault file; revisit only if a name should become a vault
+property (which would reintroduce a format change).
 
 ---
 
