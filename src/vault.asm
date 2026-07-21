@@ -313,6 +313,13 @@ g_outbuf    dq ?
 g_outlen    dq ?
 align 16
 g_att_greq  GCMREQ <>                          ; GCM req for attachment seal/open
+g_fedreq    GCMREQ <>                          ; M2: GCM req for the keyring blob seal/open
+g_fedkat_rec  db 128 dup (?)                   ; M2 keyringkat scratch: plaintext record
+g_fedkat_blob db 192 dup (?)                   ;   sealed blob (nonce+ct+tag)
+g_fedkat_out  db 128 dup (?)                   ;   opened plaintext
+g_fedkat_mk   db 32 dup (?)                     ;   synthetic master key
+g_fedkat_tpm  db 32 dup (?)                     ;   synthetic tpm secret
+g_fedkat_kek  db 32 dup (?)                     ;   derived KEK
 g_newatt    db MAX_ATT * 32 dup (?)            ; pending new: {id16, qword pt, qword ptlen}
 g_newatt_n  dd ?
 g_attidx    db MAX_ATT * 32 dup (?)            ; from file: {id16, qword ct, qword ctlen}
@@ -2869,6 +2876,165 @@ kek_fail:
     FRAME_EPILOG
     ret
 cmd_kekkat endp
+
+; keyring_seal(rcx=&record, edx=reclen, r8=&kek32, r9=&outblob) -> eax = blob len.
+;   outblob = [nonce12][ciphertext(reclen)][tag16]; caller supplies reclen+28 cap.
+public keyring_seal
+keyring_seal proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx           ; record
+    mov     qword ptr [rbp-32], r8            ; kek
+    mov     qword ptr [rbp-40], r9            ; outblob
+    mov     dword ptr [rbp-48], edx           ; reclen (below the qwords - no overlap)
+    mov     rcx, r9                           ; nonce = 12 fresh CSPRNG bytes at outblob[0]
+    mov     edx, 12
+    call    rng_fill
+    lea     r10, [g_fedreq]
+    mov     rax, qword ptr [rbp-32]           ; key = KEK
+    mov     qword ptr [r10].GCMREQ.key, rax
+    mov     rax, qword ptr [rbp-40]           ; iv = outblob (the nonce)
+    mov     qword ptr [r10].GCMREQ.iv, rax
+    lea     rax, [fed_kek_domain]             ; aad = domain (bind the blob to a version)
+    mov     qword ptr [r10].GCMREQ.aad, rax
+    mov     qword ptr [r10].GCMREQ.aadlen, FED_KEK_DOMLEN
+    mov     rax, qword ptr [rbp-24]           ; inp = record
+    mov     qword ptr [r10].GCMREQ.inp, rax
+    mov     eax, dword ptr [rbp-48]           ; inlen = reclen
+    mov     qword ptr [r10].GCMREQ.inlen, rax
+    mov     rax, qword ptr [rbp-40]           ; outp = outblob + 12
+    add     rax, 12
+    mov     qword ptr [r10].GCMREQ.outp, rax
+    mov     rax, qword ptr [rbp-40]           ; tag = outblob + 12 + reclen
+    add     rax, 12
+    mov     ecx, dword ptr [rbp-48]
+    add     rax, rcx
+    mov     qword ptr [r10].GCMREQ.tag, rax
+    lea     rcx, [g_fedreq]
+    call    gcm_seal
+    mov     eax, dword ptr [rbp-48]           ; 12 + reclen + 16
+    add     eax, 28
+    FRAME_EPILOG
+    ret
+keyring_seal endp
+
+; keyring_open(rcx=&blob, edx=bloblen, r8=&kek32, r9=&outrec) -> eax = reclen, or
+;   -1 on a too-short blob or authentication failure (wrong key = wrong machine).
+public keyring_open
+keyring_open proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx           ; blob
+    mov     qword ptr [rbp-32], r8            ; kek
+    mov     qword ptr [rbp-40], r9            ; outrec
+    mov     dword ptr [rbp-44], edx           ; bloblen (below the qwords - no overlap)
+    mov     eax, dword ptr [rbp-44]           ; ptlen = bloblen - 28
+    sub     eax, 28
+    js      ko_fail                           ; too short to hold nonce+tag
+    mov     dword ptr [rbp-48], eax           ; ptlen
+    lea     r10, [g_fedreq]
+    mov     rax, qword ptr [rbp-32]           ; key = KEK
+    mov     qword ptr [r10].GCMREQ.key, rax
+    mov     rax, qword ptr [rbp-24]           ; iv = blob (the nonce)
+    mov     qword ptr [r10].GCMREQ.iv, rax
+    lea     rax, [fed_kek_domain]             ; aad = domain (bind the blob to a version)
+    mov     qword ptr [r10].GCMREQ.aad, rax
+    mov     qword ptr [r10].GCMREQ.aadlen, FED_KEK_DOMLEN
+    mov     rax, qword ptr [rbp-24]           ; inp = ciphertext = blob + 12
+    add     rax, 12
+    mov     qword ptr [r10].GCMREQ.inp, rax
+    mov     eax, dword ptr [rbp-48]           ; inlen = ptlen
+    mov     qword ptr [r10].GCMREQ.inlen, rax
+    mov     rax, qword ptr [rbp-40]           ; outp = outrec
+    mov     qword ptr [r10].GCMREQ.outp, rax
+    mov     rax, qword ptr [rbp-24]           ; tag = blob + 12 + ptlen
+    add     rax, 12
+    mov     ecx, dword ptr [rbp-48]
+    add     rax, rcx
+    mov     qword ptr [r10].GCMREQ.tag, rax
+    lea     rcx, [g_fedreq]
+    call    gcm_open
+    test    eax, eax
+    jnz     ko_fail                           ; auth failed
+    mov     eax, dword ptr [rbp-48]           ; return ptlen
+    FRAME_EPILOG
+    ret
+ko_fail:
+    mov     eax, -1
+    FRAME_EPILOG
+    ret
+keyring_open endp
+
+; cmd_keyringkat - headless KAT for the keyring blob crypto: seal a synthetic
+;   record, open it with the same KEK and assert a byte-exact round-trip, then
+;   open with a KEK from a different tpm_secret and assert it fails (machine
+;   binding).  Exit 0 = pass.
+KEYRINGKAT_RECLEN equ 100
+LANDING_PAD
+public cmd_keyringkat
+cmd_keyringkat proc frame
+    FRAME_PROLOG 48
+    lea     rcx, [g_fedkat_rec]               ; record = 0xAB * 100, with distinct end bytes
+    mov     edx, KEYRINGKAT_RECLEN
+    mov     r8b, 0ABh
+    call    idk_fill
+    mov     byte ptr [g_fedkat_rec], 1
+    mov     byte ptr [g_fedkat_rec + KEYRINGKAT_RECLEN - 1], 099h
+    lea     rcx, [g_fedkat_mk]                ; master = 0x33 * 32
+    mov     edx, 32
+    mov     r8b, 033h
+    call    idk_fill
+    lea     rcx, [g_fedkat_tpm]               ; tpm = 0x44 * 32
+    mov     edx, 32
+    mov     r8b, 044h
+    call    idk_fill
+    lea     rcx, [g_fedkat_kek]               ; kek = KEK(master, tpm)
+    lea     rdx, [g_fedkat_mk]
+    lea     r8, [g_fedkat_tpm]
+    call    keyring_kek
+    lea     rcx, [g_fedkat_rec]               ; blob = seal(record, kek)
+    mov     edx, KEYRINGKAT_RECLEN
+    lea     r8, [g_fedkat_kek]
+    lea     r9, [g_fedkat_blob]
+    call    keyring_seal
+    mov     dword ptr [rbp-24], eax           ; bloblen (= reclen + 28)
+    cmp     eax, KEYRINGKAT_RECLEN + 28
+    mov     eax, 2
+    jne     krk_ret
+    lea     rcx, [g_fedkat_blob]              ; open with the right kek
+    mov     edx, dword ptr [rbp-24]
+    lea     r8, [g_fedkat_kek]
+    lea     r9, [g_fedkat_out]
+    call    keyring_open
+    cmp     eax, KEYRINGKAT_RECLEN            ; reclen must round-trip
+    mov     eax, 3
+    jne     krk_ret
+    lea     rcx, [g_fedkat_rec]               ; plaintext must round-trip byte-exact
+    lea     rdx, [g_fedkat_out]
+    mov     r8d, KEYRINGKAT_RECLEN
+    call    idk_eq
+    test    eax, eax
+    mov     eax, 4
+    jz      krk_ret
+    lea     rcx, [g_fedkat_tpm]               ; wrong machine: tpm = 0x55 -> different KEK
+    mov     edx, 32
+    mov     r8b, 055h
+    call    idk_fill
+    lea     rcx, [g_fedkat_kek]
+    lea     rdx, [g_fedkat_mk]
+    lea     r8, [g_fedkat_tpm]
+    call    keyring_kek
+    lea     rcx, [g_fedkat_blob]              ; open with the wrong KEK must fail (-1)
+    mov     edx, dword ptr [rbp-24]
+    lea     r8, [g_fedkat_kek]
+    lea     r9, [g_fedkat_out]
+    call    keyring_open
+    cmp     eax, -1
+    mov     eax, 5
+    jne     krk_ret
+    xor     eax, eax
+krk_ret:
+    FRAME_EPILOG
+    ret
+cmd_keyringkat endp
 
 ; mvt_zero(rcx=ptr, edx=len) - zero a buffer (probe helper).  Leaf, volatile regs.
 mvt_zero proc
