@@ -488,6 +488,42 @@ worst-bucket count badge. These need a per-entry classification cached at
 to recompute per paint). *Test:* fix one weak password → badge decrements after
 save; clicking a row highlights its tile.
 
+### R7. Title-bar & dialog UI polish (2026-07-21)
+Small visual/interaction fixes; all need a display to verify, so they ride with
+the R group. Each is independent and can ship together in one session.
+
+1. **Remove the misplaced per-dialog theme cogwheel.** The id-990 `GLY_SETTINGS`
+   "ghost-button foundation demo" that cycles the colour scheme (`unlock_proc`
+   `up_init` → `up_cyclescheme`; check `create_proc`/`about_proc` for siblings) is
+   out of place. Drop it — theme switching stays in the settings menu
+   (`IDC_V_MTHEME`) and the title-bar dock settings button (`IDC_T_SET`). *Test:* no
+   cogwheel on the unlock/create/about dialogs; theme still switchable from settings.
+2. **Ghost buttons must dim again on mouse-leave.** They currently keep the hover
+   halo after the cursor leaves. Fix in `ghost_subclass` — the hover byte in
+   `GWL_USERDATA` set by `gsc_move` should be cleared + repainted by the
+   `WM_MOUSELEAVE` (`gsc_leave`) path; verify the `TrackMouseEvent`/`TME_LEAVE`
+   arm actually fires and re-arms (check `TRACKMOUSEEVENT.cbSize`/struct and the
+   "already hovering → skip" guard so a missed leave can't stick). *Test:* hover
+   then leave every ghost button (dock + converted toolbar) → halo fades.
+3. **Read-only checkbox → Fluent toggle.** Convert the unlock dialog's `IDC_U_RONLY`
+   "Open read-only" checkbox to a Fluent pill toggle matching the existing
+   `IDC_V_MTPM` toggle (`vp_tdraw_toggle` painter), for style consistency. *Test:*
+   the toggle reads/writes `g_readonly`; looks like the TPM pill.
+4. **Standalone pwgen: "Use" → "Copy".** When the generator is opened standalone
+   from the title-bar dock (`vp_gen_standalone`, `g_pg_target == -1`) rather than
+   from a secret's field (`vpd_gen`), the action button should read **Copy** and put
+   the generated password on the clipboard (existing clip path + auto-clear timer)
+   instead of writing to `g_pg_target`. *Test:* dock-launched pwgen shows Copy →
+   clipboard gets the password; field-launched still shows Use → writes the field.
+5. **Remove minimize / maximize / lock buttons.** Drop the `IDC_T_MIN` and
+   `IDC_T_MAX` caption buttons and the `IDC_V_LOCK` button (+ their anchors,
+   `gt_min`/`gt_max` strings, and click handlers). They are redundant: `vp_close`
+   (the `IDC_T_CLOSE` "X"), `vp_esc` (Escape), and the idle-timeout all already fall
+   through to `vp_lock`, which wipes and hides to tray — so the X and Escape lock to
+   tray, and there is no need to minimise/maximise or expose a separate lock.
+   Reflow the caption to the single close glyph. *Test:* only the close glyph
+   remains; Esc and X both lock (wipe) and hide to tray.
+
 ---
 
 *Completed plans are removed from this file in the commit that ships them.
