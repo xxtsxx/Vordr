@@ -170,6 +170,14 @@ House rules:
 
 ## M. Master-vault federation (multi-vault redesign) — new headline effort (2026-07-21)
 
+**Pre-v1.0 clean slate (2026-07-21).** Until v1.0 ships, all pre-existing vaults
+and Vordr builds are treated as discarded — **no migration, no back-compat
+burden**. The format is defined fresh: every vault is created by the new code with
+its system items (ID + name) from the start, so there are no fallbacks, no
+in-place upgrades, and no old-reader concerns. This removed a whole tier of the
+plan (legacy-registry migration, salt-derived ID fallback, first-save-upgrade
+paths, the old-build caveat).
+
 **Why.** The tab-based multi-vault model (VSLOT/`g_vaults` contexts + `IDC_V_TABS`
 strip + cross-vault search) is a dead end: every open vault demands its own
 password on every unlock, TPM convenience-unlock is per-vault and awkward, and
@@ -187,8 +195,9 @@ cross-vault XR enumeration (`search_overlay_xfill`) is promoted from a search-on
 cache to **the primary list builder**. What goes away: the user-facing tab strip,
 per-vault password prompting, and *any in-vault links table* — the entire
 federation state (which vaults, their keys, names, locators) lives in a
-machine-local, encrypted **registry** blob. **The vault file format is untouched
-(no `VAULT_VERSION` bump).** This supersedes the tab-oriented parts of the R
+machine-local, encrypted **registry** blob. The only vault-file change is additive
+— system items (ID + name) carried inside the existing container (M1); pre-v1.0
+the format is simply defined fresh, no migration. This supersedes the tab-oriented parts of the R
 backlog: **R4**'s "per-vault entry counts on tabs" and **R5**'s "reopen the whole
 tab set" are rewritten below (M3/M4/M5); delete those clauses from R when M lands.
 
@@ -224,9 +233,8 @@ guaranteed on W11+; **TPM-unlock** (unsealing the master key to skip the passwor
 C4 PIN/Hello-gated) stays opt-in. On the rare no-TPM device the keyring falls back
 to **master-key-only** (still encrypted, still master-gated, but copyable — the
 UI warns it is not machine-bound). (3) **Vault ID = explicit random 16-byte ID
-pinned in a system item** at creation (immutable across password/salt rotation);
-`SHA-256(salt)[0..15]` is the fallback for vaults predating system items. (4)
-**Vault name = a permanent in-vault system item** (travels with the file); the
+pinned in a system item** at creation (immutable across password/salt rotation).
+(4) **Vault name = a permanent in-vault system item** (travels with the file); the
 federation record caches a display copy for locked/missing rows. (5) Foreign
 vaults **auto-open** on master unlock, with the `LINK_PROMPT` opt-out. (6) "Export
 to `.vordr`" = a **child vault with its own new password** (an ordinary vault),
@@ -237,24 +245,20 @@ extension mechanism — **still no `VAULT_VERSION` bump**. Boundary: system item
 hold what *should* travel with the vault; the federation keyring (other vaults'
 keys, locators, membership) stays machine-local and never becomes a system item.
 
-### M1. System items + vault identity/naming (no format change)
+### M1. System items + vault identity/naming
 1. **System items (the mechanism):** define a hidden entry class — an ordinary body
    entry carrying a reserved **`VF_SYSTEM`** marker field — that the list builder
    **excludes from the user list** and interprets as vault-level data. It is
-   authenticated + encrypted like any entry and rides the tolerant pattern, so
-   **no `VAULT_VERSION` bump**. Our save path must **faithfully round-trip** system
-   items (preserve entries/fields it does not itself own). *Caveat:* an *old* Vordr
-   build would show a system item as a stray blank entry and could drop it on
-   re-save — negligible for current single-build use; note it before any wide
-   distribution. This is the general extension slot for future per-vault settings
-   (auto-lock, icon/colour, read-only default…), each a `VF_SYS*` field.
+   authenticated + encrypted like any entry, so it fits the existing container with
+   no new parser. Our read/write path round-trips system items intact (forward-
+   compat for `VF_SYS*` fields a later build doesn't yet know). This is the general
+   extension slot for future per-vault settings (auto-lock, icon/colour, read-only
+   default…), each a `VF_SYS*` field.
 2. **Vault ID (pinned):** at creation, generate a random 16-byte `vault_id`
    (`rng_fill`) and store it in the system item — immutable across password *or*
    salt rotation, which matters because the machine-local store keys foreign vaults
-   by it. `vault_id_of()` returns the pinned ID, else the `SHA-256(g_hdr+VH_SALT)[0..15]`
-   fallback for a vault predating system items (a first save pins a real one).
-   *Test:* KAT — a pinned ID round-trips through reseal; a pre-system-item vault
-   reports the salt fallback, then a pinned ID after upgrade.
+   by it. `vault_id_of()` returns the pinned ID (every vault is created with one).
+   *Test:* KAT — a pinned ID round-trips through reseal unchanged; two vaults differ.
 3. **Vault name (permanent, in-vault):** the user-editable name is a system-item
    field — it **travels with the file**, so the vault knows its own name on any
    machine. Falls back to the basename only when unset. The federation record (M2)
@@ -340,8 +344,9 @@ keys, locators, membership) stays machine-local and never becomes a system item.
    in the master's machine-local federation record — **no per-foreign registry/TPM
    entries at all** (a privacy win; extends the C6 hygiene work).
 2. The per-vault rollback mirror keys by `vault_id` instead of path (less leakage).
-   *Test:* `migratetest` (headless) — after migration, `HKCU\SOFTWARE\Vordr` holds a
-   master-only TPM sidecar + one `Federation` blob; foreign sidecars are gone.
+   *Test:* `federatetest` asserts the runtime invariant — add/remove of a foreign
+   link touches only the master's `Federation` blob; no per-foreign registry/TPM
+   value is ever created.
 
 ### M6. Vault as the default export/import format
 1. **Export default → `.vordr` (child vault, own password):** "export selected
@@ -360,23 +365,23 @@ keys, locators, membership) stays machine-local and never becomes a system item.
    *Test:* `vaultexportkat` (headless) — export N entries + an attachment to a new
    vault, reopen, assert entries and attachment bytes match; re-merge is idempotent.
 
-### M7. Migration & back-compat (no format bump)
-1. **No format/version change** — system items ride the tolerant entry pattern, so
-   there is no `VAULT_VERSION` bump, no downgrade risk, and foreign vaults stay v2
-   readers. The only vault write is additive: a first save pins the ID + name
-   system item (M1). Exported children (M6) are ordinary v2 vaults.
-2. On first launch after upgrade, if the old multi-vault registry/tab-set
-   remembered several vaults, **prompt to pick a master (never auto-elect one)**,
-   unlock each foreign once to cache its key into the new machine-local federation
-   record, then delete the per-vault registry/TPM sidecars — **only after** the key
-   is confirmed in the record (never destroy the sole unlock path mid-migration).
-   Non-destructive to the foreign files themselves.
+### M7. Format definition (no migration — pre-v1.0 clean slate)
+1. **No migration, no back-compat.** Per the clean-slate note, pre-existing vaults
+   and any old multi-vault registry/tab-set are discarded, not migrated — there is
+   no legacy-import path and no in-place upgrade. Any stale `HKCU\SOFTWARE\Vordr`
+   values a current dev build left behind are simply abandoned (a one-shot wipe of
+   the old per-vault TPM-Unlock/Rollback subkeys on first run is optional tidiness,
+   not correctness).
+2. **Define the format fresh.** Every vault is created with its system items (ID +
+   name) from the start. The container is otherwise unchanged; a `VAULT_VERSION`
+   bump is *available* if we want a clean-break marker that rejects any stray old
+   vault, but not required — decide when M1 lands.
 3. **Single vault = zero ceremony:** no federation record, no master concept
    surfaced; the common single-vault case is unchanged.
 4. Update `docs/formats.md`: document **system items** (`VF_SYSTEM` marker, the
-   ID/name/settings they carry, the "excluded from the user list" + "save must
-   round-trip them" rules) and a "federation state is machine-local (registry),
-   never in the file" note. No format-table/version bump.
+   ID/name/settings they carry, the "excluded from the user list" + round-trip
+   rules) and a "federation state is machine-local (registry), never in the file"
+   note.
 
 ### M8. Test/probe strategy (headless-first, per PROBE convention)
 Grounded in the existing probes (`mvtest`/`mvswitch`/`mvname`). Add, wired into
@@ -389,16 +394,16 @@ Grounded in the existing probes (`mvtest`/`mvswitch`/`mvname`). Add, wired into
   names (and a system-item ID/name reseal round-trip) (M1/M2/M3).
 - **`vaultexportkat`** — entries + attachment export to a new `.vordr`, reopen,
   byte-exact round-trip; re-merge is idempotent (M6).
-- **`migratetest`** — legacy multi-vault registry → machine-local federation record;
-  foreign registry/TPM sidecars gone (M5/M7).
-The keyring/migration logic must be provable headlessly; only the M4 screen and the
-list chrome (M3 painters) need a display.
+(No `migratetest` — there is no migration path pre-v1.0.) The keyring logic must be
+provable headlessly; only the M4 screen and the list chrome (M3 painters) need a
+display.
 
 **Sequencing.** M1 (system items + pinned ID/name) → M2 (machine-local keyring +
-fan-out, the headless core) → M7 (registry-only migration, alongside M2) → M6 (vault export/
-import, reuses the seal path) → M3 (unified list, removes tabs) → M4 (management
-screen) → M5 (scoping, folds in with M4). M1/M2/M6/M7/M8 are headlessly verifiable
-and should land build-green with KATs before the M3/M4 display work. **Cross-group
+fan-out, the headless core) → M6 (vault export/import, reuses the seal path) → M3
+(unified list, removes tabs) → M4 (management screen) → M5 (scoping, folds in with
+M4). M7 is just the format-definition + docs that ride along with M1. M1/M2/M6/M8
+are headlessly verifiable and should land build-green with KATs before the M3/M4
+display work. **Cross-group
 dependency:** M3 rewrites the list builder (`gui_poplist` → the merged XR fill) that
 **R1** (scroll), **R4** (sidebar niceties) and **R6** (health cache) all paint on —
 do M3 before investing in those R items, or they get built twice.
@@ -410,10 +415,11 @@ vault cannot itself be a master (flat federation in v1); enforce and test. (b) B
 machine-local record is rewritten only when the keyring changes. (d) **"Set master"
 migrates the already-in-memory cached keys** (no re-prompt — they are already
 trusted). (e) **New-item target** = selected entry's vault, else master (M3). (f)
-**Merge-import dedups by entry id**, newer `modified` wins (M6). (g) Migration
-**never auto-elects a master** (M7). (h) **Names are a permanent vault property**
-via an in-vault system item (M1.3) — they travel with the file, achieved with *no*
-format bump; the federation record only caches a display copy. (i) **Two TPM
+**Merge-import dedups by entry id**, newer `modified` wins (M6). (g) The app
+**never auto-designates a master** — the user picks (M4); pre-v1.0 there is no
+migration that would need to (M7). (h) **Names are a permanent vault property**
+via an in-vault system item (M1.3) — they travel with the file; the federation
+record only caches a display copy. (i) **Two TPM
 roles** — no-PIN *binding* (default, since TPM is a W11 given) vs opt-in PIN/Hello
 *unlock* (C4); a no-TPM device degrades to a copyable master-key-only keyring with
 a UI warning.
