@@ -10024,8 +10024,9 @@ search_overlay_open proc frame
     sub     eax, dword ptr [rbp-76]
     mov     dword ptr [rbp-60], eax
     WINCALL GetDlgItem, qword ptr [rbp-24], IDC_SO_EDIT
-    WINCALL MoveWindow, rax, dword ptr [rbp-80], dword ptr [rbp-76], dword ptr [rbp-56], \
-            dword ptr [rbp-60], 0
+    mov     qword ptr [rbp-64], rax           ; hold hwnd (MoveWindow below has a memory
+    WINCALL MoveWindow, qword ptr [rbp-64], dword ptr [rbp-80], dword ptr [rbp-76], \
+            dword ptr [rbp-56], dword ptr [rbp-60], 0                                   ; stack-arg -> rax can't be arg1)
     mov     eax, dword ptr [rbp-40]           ; list inside the panel (4px inset)
     add     eax, 4
     mov     dword ptr [rbp-48], eax
@@ -10517,12 +10518,14 @@ search_overlay_resize proc frame
     mov     eax, dword ptr [rbp-28]
 @@: mov     dword ptr [rbp-32], eax           ; listH (final)
     WINCALL GetDlgItem, qword ptr [rbp-24], IDC_SO_LIST
-    WINCALL SetWindowPos, rax, 0, 0, 0, SO_W-8, dword ptr [rbp-32], SWP_FRAME_
+    mov     qword ptr [rbp-40], rax           ; hold hwnd (the SetWindowPos below has a
+    WINCALL SetWindowPos, qword ptr [rbp-40], 0, 0, 0, SO_W-8, dword ptr [rbp-32], SWP_FRAME_  ; memory stack-arg, so rax can't be arg1)
     mov     eax, dword ptr [rbp-32]           ; panel wraps the list (4px inset top+bottom)
     add     eax, 8
     mov     dword ptr [rbp-36], eax
     WINCALL GetDlgItem, qword ptr [rbp-24], IDC_SO_PANEL
-    WINCALL SetWindowPos, rax, 0, 0, 0, SO_W, dword ptr [rbp-36], SWP_FRAME_
+    mov     qword ptr [rbp-40], rax
+    WINCALL SetWindowPos, qword ptr [rbp-40], 0, 0, 0, SO_W, dword ptr [rbp-36], SWP_FRAME_
     FRAME_EPILOG
     ret
 search_overlay_resize endp
