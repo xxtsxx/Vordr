@@ -1125,7 +1125,6 @@ tmpl_table label qword
 g_anchor_def label dword
     dd IDC_V_MBACK,    ANCH_STRETCHW or ANCH_STRETCHH
     dd IDC_V_LIST,     ANCH_STRETCHH
-    dd IDC_V_SEARCH,   ANCH_BOTTOM
     dd IDC_V_REMOVE,   ANCH_BOTTOM
     dd IDC_V_HEADER,   ANCH_STRETCHW
     dd IDC_V_TITLE,    ANCH_STRETCHW
@@ -1137,7 +1136,7 @@ g_anchor_def label dword
     dd IDC_V_CANCEL,   ANCH_RIGHT or ANCH_BOTTOM
     dd IDC_V_SAVE,     ANCH_RIGHT or ANCH_BOTTOM
     dd IDC_V_LOCK,     ANCH_RIGHT or ANCH_BOTTOM
-ANCHOR_N equ 14
+ANCHOR_N equ 13
 tag_xw label word
     dw 0D7h, 0                             ; multiplication sign, used as the tag 'x'
 verb_open label word
@@ -1249,8 +1248,8 @@ g_empty_w label word
 align 4
 g_vault_ids label dword
     dd IDC_V_LIST, IDC_V_TITLE
-    dd IDC_V_ADDFIELD, IDC_V_SAVE, IDC_V_LOCK, IDC_V_SEARCH
-VAULT_ID_COUNT equ 6
+    dd IDC_V_ADDFIELD, IDC_V_SAVE, IDC_V_LOCK
+VAULT_ID_COUNT equ 5
 g_menu_ids label dword ; controls menu IDs which are hidden and displayed between settings and main screen.
     dd IDC_V_MBACK, IDC_V_MTITLE, IDC_V_MPOLL, IDC_V_MLENL, IDC_V_MLEN
     dd IDC_V_MCLSL, IDC_V_MCLS, IDC_V_MTPM, IDC_V_MTPML, IDC_V_MTPMINFO
@@ -5380,11 +5379,12 @@ gsc_char:
     jb      gsc_def
     WINCALL GetParent, qword ptr [rbp-24]
     mov     qword ptr [rbp-56], rax
-    WINCALL GetDlgItem, qword ptr [rbp-56], IDC_V_SEARCH
+    mov     rcx, rax                           ; open the search overlay, then type into it
+    call    search_overlay_open
+    WINCALL GetDlgItem, qword ptr [rbp-56], IDC_SO_EDIT
     mov     qword ptr [rbp-64], rax
     test    rax, rax
     jz      gsc_def
-    WINCALL SetFocus, qword ptr [rbp-64]
     WINCALL SendMessageW, qword ptr [rbp-64], WM_CHAR_, qword ptr [rbp-40], \
             qword ptr [rbp-48]
     xor     eax, eax
@@ -5474,12 +5474,10 @@ vault_ctrl_key proc frame
     WINCALL GetParent, qword ptr [rbp-24]
     mov     qword ptr [rbp-40], rax
     mov     eax, dword ptr [rbp-28]
-    cmp     eax, 4Bh                           ; 'K' -> focus the search box
+    cmp     eax, 4Bh                           ; 'K' -> open the title-bar search overlay
     jne     vck_chkn
-    WINCALL GetDlgItem, qword ptr [rbp-40], IDC_V_SEARCH
-    test    rax, rax
-    jz      vck_no
-    WINCALL SetFocus, rax
+    mov     rcx, qword ptr [rbp-40]
+    call    search_overlay_open
     jmp     vck_yes
 vck_chkn:
     cmp     eax, 4Eh                           ; 'N' -> new item
@@ -5533,11 +5531,12 @@ sts_notkey:
     jb      sts_def
     WINCALL GetParent, qword ptr [rbp-24]
     mov     qword ptr [rbp-56], rax
-    WINCALL GetDlgItem, qword ptr [rbp-56], IDC_V_SEARCH
+    mov     rcx, rax                           ; open the search overlay (focuses its edit),
+    call    search_overlay_open                ;   then forward the keystroke into it
+    WINCALL GetDlgItem, qword ptr [rbp-56], IDC_SO_EDIT
     mov     qword ptr [rbp-64], rax
     test    rax, rax
     jz      sts_def
-    WINCALL SetFocus, qword ptr [rbp-64]
     WINCALL SendMessageW, qword ptr [rbp-64], WM_CHAR_, qword ptr [rbp-40], \
             qword ptr [rbp-48]
     xor     eax, eax                           ; consumed
@@ -11264,7 +11263,6 @@ vp_init:
     call    gui_apply_scheme
     mov     rcx, qword ptr [rbp-8]
     call    gui_apply_layout
-    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_V_SEARCH, EM_SETCUEBANNER, 1, addr cue_search
     mov     dword ptr [g_cur_idx], -1         ; no entry selected yet
     mov     dword ptr [g_colorpw_row], -1
     mov     dword ptr [g_dirty], 0
@@ -11286,8 +11284,8 @@ vp_init:
     mov     rcx, qword ptr [rbp-8]            ;   here (launched from the tray, it is
     call    SetForegroundWindow              ;   otherwise visible but not active)
     add     rsp, 32
-    mov     rcx, qword ptr [rbp-8]            ; the search box takes focus on show
-    mov     edx, IDC_V_SEARCH
+    mov     rcx, qword ptr [rbp-8]            ; the entry list takes focus on show
+    mov     edx, IDC_V_LIST                   ;   (type-to-search opens the overlay)
     call    GetDlgItem
     sub     rsp, 32
     mov     rcx, rax
