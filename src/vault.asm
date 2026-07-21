@@ -243,6 +243,8 @@ CSTR vfz_m4, " rejected  0 crashes",13,10
 bk_pw       db "vordrtest", 0
 fmac_domain db "vordr-file-mac-v1"          ; MAC domain-separation prefix
 FMAC_DOMLEN equ 17
+fed_kek_domain db "vordr-federation-kek-v1" ; M2: keyring KEK domain-separation prefix
+FED_KEK_DOMLEN equ 23
 CSTR bk_ok,  "bktest: PASS (bak1..3 rotated and bak1 opens)",13,10
 CSTR bk_bad, "bktest: FAIL (backup missing or unopenable)",13,10
 CSTR mt_ok,  "mactest: PASS (counter tamper rejected, restore opens)",13,10
@@ -303,6 +305,7 @@ g_lock_h    dq ?                            ; C8: <vault>.lock handle (0 = not h
 g_lock_path dw (MAX_PATH_CHARS + 8) dup (?) ; C8: "<vault>.lock" wide path
 align 16
 g_fmac_ctx  db 256 dup (?)                  ; BLAKE2B_CTX scratch (216 used)
+g_fed_ctx   db 256 dup (?)                  ; M2: keyring KEK BLAKE2B_CTX scratch
 g_fmac_out  db 32 dup (?)                   ; computed file MAC
 g_filebuf   dq ?
 g_filesize  dq ?
@@ -2763,6 +2766,109 @@ idke_ne:
     xor     eax, eax
     ret
 idk_eq endp
+
+; ===========================================================================
+; M2 (machine-local keyring): at-rest crypto.  The federation record is
+; AES-256-GCM'd under KEK = BLAKE2b-256("vordr-federation-kek-v1" || master_key
+; || tpm_secret): the master key is the unlock gate, the TPM-sealed machine
+; secret is the machine binding.  Reuses the shipped keyed-BLAKE2b - no new
+; primitive.
+; ===========================================================================
+; keyring_kek(rcx = out32, rdx = master_key32, r8 = tpm_secret32) - derive the
+;   32-byte keyring key.  Domain-separated, order-fixed (master then tpm).
+public keyring_kek
+keyring_kek proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx           ; out32
+    mov     qword ptr [rbp-32], rdx           ; master_key
+    mov     qword ptr [rbp-40], r8            ; tpm_secret
+    lea     rcx, [g_fed_ctx]
+    mov     edx, 32
+    call    blake2b_init
+    lea     rcx, [g_fed_ctx]                  ; domain prefix
+    lea     rdx, [fed_kek_domain]
+    mov     r8, FED_KEK_DOMLEN
+    call    blake2b_update
+    lea     rcx, [g_fed_ctx]                  ; master key (unlock gate)
+    mov     rdx, qword ptr [rbp-32]
+    mov     r8, 32
+    call    blake2b_update
+    lea     rcx, [g_fed_ctx]                  ; tpm secret (machine binding)
+    mov     rdx, qword ptr [rbp-40]
+    mov     r8, 32
+    call    blake2b_update
+    lea     rcx, [g_fed_ctx]
+    mov     rdx, qword ptr [rbp-24]
+    call    blake2b_final
+    FRAME_EPILOG
+    ret
+keyring_kek endp
+
+; cmd_kekkat - headless KAT for keyring_kek: deterministic, and sensitive to
+;   BOTH the master key and the tpm secret (changing either changes the KEK).
+;   Exit 0 = pass.
+LANDING_PAD
+public cmd_kekkat
+cmd_kekkat proc frame
+    FRAME_PROLOG 224                           ; 5x 32-byte buffers down to [rbp-176]
+    lea     rcx, [rbp-40]                     ; master = 0x33 * 32  (rbp-40..-9)
+    mov     edx, 32
+    mov     r8b, 033h
+    call    idk_fill
+    lea     rcx, [rbp-80]                     ; tpm = 0x44 * 32      (rbp-80..-49)
+    mov     edx, 32
+    mov     r8b, 044h
+    call    idk_fill
+    lea     rcx, [rbp-112]                    ; kek1 = KEK(master,tpm)  (rbp-112..-81)
+    lea     rdx, [rbp-40]
+    lea     r8, [rbp-80]
+    call    keyring_kek
+    lea     rcx, [rbp-144]                    ; kek1b = KEK(master,tpm) again
+    lea     rdx, [rbp-40]
+    lea     r8, [rbp-80]
+    call    keyring_kek
+    lea     rcx, [rbp-112]                    ; determinism: kek1 == kek1b
+    lea     rdx, [rbp-144]
+    mov     r8d, 32
+    call    idk_eq
+    test    eax, eax
+    jz      kek_fail
+    lea     rcx, [rbp-144]                    ; master sensitivity: master = 0x55
+    mov     edx, 32
+    mov     r8b, 055h
+    call    idk_fill                          ; (reuse rbp-144 as a 2nd master buf)
+    lea     rcx, [rbp-176]                    ; kek2 = KEK(master2, tpm)
+    lea     rdx, [rbp-144]
+    lea     r8, [rbp-80]
+    call    keyring_kek
+    lea     rcx, [rbp-112]                    ; kek1 != kek2
+    lea     rdx, [rbp-176]
+    mov     r8d, 32
+    call    idk_eq
+    test    eax, eax
+    jnz     kek_fail
+    lea     rcx, [rbp-80]                     ; tpm sensitivity: tpm = 0x66
+    mov     edx, 32
+    mov     r8b, 066h
+    call    idk_fill
+    lea     rcx, [rbp-176]                    ; kek3 = KEK(master1, tpm2)
+    lea     rdx, [rbp-40]
+    lea     r8, [rbp-80]
+    call    keyring_kek
+    lea     rcx, [rbp-112]                    ; kek1 != kek3
+    lea     rdx, [rbp-176]
+    mov     r8d, 32
+    call    idk_eq
+    test    eax, eax
+    jnz     kek_fail
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+kek_fail:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_kekkat endp
 
 ; mvt_zero(rcx=ptr, edx=len) - zero a buffer (probe helper).  Leaf, volatile regs.
 mvt_zero proc
