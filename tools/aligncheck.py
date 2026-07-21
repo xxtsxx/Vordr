@@ -137,15 +137,17 @@ def scan_file(path, results):
             if a > 0:
                 offsets[section] = (offsets[section] + a - 1) & ~(a - 1)
             continue
-        # WSTR name, <text>  -> label + dw text + dw 0
+        # WSTR name, <text>  -> `even` + label + dw text + dw 0.  The WSTR macro
+        # now emits `even` first (macros.inc), so every wide string self-aligns
+        # regardless of a drifted/odd running offset.  Model that here: snap to
+        # even before counting.  (This also keeps the running offset honest
+        # through WSTR blocks even if an earlier directive was mis-parsed - the
+        # per-file-offset heuristic that let the original m_tpminfo odd address
+        # slip past this tool.)
         m = RE_WSTR.match(s)
         if m:
             name, text = m.group(1), m.group(2)
-            off = offsets[section]
-            if off % 2:
-                results.append(("string", fname, n, name, "dw", off,
-                    f"WSTR label at odd offset {off} - wide string can land unaligned "
-                    f"(tray_cls class: an aligned OS read faults)"))
+            off = (offsets[section] + 1) & ~1          # WSTR macro's `even`
             offsets[section] = off + 2 * (len(text) + 1)
             continue
         # CSTR name, "text"  -> db text + db 0
