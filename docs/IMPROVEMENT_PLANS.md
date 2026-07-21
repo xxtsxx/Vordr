@@ -143,7 +143,8 @@ House rules:
   `zitest` → `phtest` → `secscan` → `lktest` → `tmptest` → `fztest` → `trtest`
   → `vfuzz` → `fuzzzip` → `bktest` → `mactest` → `rbtest` → `xctest` → `reload`
   → `cowrite` → `attfuzz` → `healthkat` → `pkat` → `mvtest` → `mvswitch` →
-  `mvname` → `avtest`. `--quick` skips stage 1.
+  `mvname` → `idkat` → `kekkat` → `keyringkat` → `fedkat` → `avtest`.
+  `--quick` skips stage 1.
 - **FRAMES** = no >4-arg `WINCALL` directly inside a raw `sub rsp,64` dialog
   proc (`create_proc`, `unlock_proc`, `vault_proc`, `msg_proc`, `about_proc`,
   …); wide calls go in a `FRAME_PROLOG N` helper. This is the BEX64/offset-0
@@ -169,6 +170,22 @@ House rules:
 ---
 
 ## M. Master-vault federation (multi-vault redesign) — new headline effort (2026-07-21)
+
+**Landed so far (2026-07-22) — the headless keyring core, gate-verified:**
+- **M1 identity:** `vault_id_of()` = `SHA-256(salt)[0..15]` (vault.asm). Probe: `idkat`.
+- **M2 KEK:** `keyring_kek()` = `BLAKE2b("vordr-federation-kek-v1" ‖ master_key ‖
+  tpm_secret)`. Probe: `kekkat` (deterministic + sensitive to both inputs).
+- **M2 blob crypto:** `keyring_seal`/`keyring_open` — AES-256-GCM the record under
+  the KEK, blob = `[nonce12][ct][tag16]`, federation domain as AAD. Probe:
+  `keyringkat` (byte-exact round-trip + wrong-`tpm_secret` fails = machine binding).
+- **M2 record:** `FEDLINK`/`FEDREC` fixed-layout link table + `fed_reset`/`fed_slot`/
+  `fed_find`/`fed_add`; flag bits `LINK_STALE`/`MISSING`/`PROMPT`. Probe: `fedkat`
+  (add/lookup + seal→wipe→open round-trip incl. keys + flags).
+
+*Remaining M2:* the machine-local **registry** persistence (seal→`REG_BINARY` under
+`HKCU\SOFTWARE\Vordr\Federation` keyed by hashed master `vault_id`; reuse
+`reg_tpm_*`) and TPM machine-secret provisioning. Then M1.2 (system items),
+M3–M5 (display work), M6 (export). The four probes above run in `run_all`.
 
 **Pre-v1.0 clean slate (2026-07-21).** Until v1.0 ships, all pre-existing vaults
 and Vordr builds are treated as discarded — **no migration, no back-compat
