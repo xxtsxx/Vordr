@@ -51,8 +51,15 @@ MEM_COMMIT          equ 1000h
 MEM_RESERVE         equ 2000h
 MEM_RELEASE         equ 8000h
 PAGE_READWRITE      equ 04h
-SEC_WS_MIN          equ 00800000h   ; 8 MiB min working set (room for locked pages)
-SEC_WS_MAX          equ 04000000h   ; 64 MiB max
+; The working-set MIN is the hard lockable-page quota.  It MUST exceed the total
+; VirtualLock'd bytes, dominated by the decrypted body arena (VAULT_BODY_MAX =
+; 16 MiB, allocated per open vault) plus the ~23 KB static secret buffers.  An
+; 8 MiB min was smaller than a single 16 MiB body -> the body lock failed
+; ERROR_WORKING_SET_QUOTA even though the tiny startup buffers locked (found with
+; Thomas).  32 MiB covers one vault with headroom; MAX 256 MiB leaves room for
+; several multi-vault contexts.
+SEC_WS_MIN          equ 02000000h   ; 32 MiB min working set (> the 16 MiB body)
+SEC_WS_MAX          equ 10000000h   ; 256 MiB max
 ; QUOTA_LIMITS_HARDWS_MIN_ENABLE (1) | QUOTA_LIMITS_HARDWS_MAX_DISABLE (8): make
 ; the MIN a HARD reservation so VirtualLock actually gets quota.  Plain
 ; SetProcessWorkingSetSize sets only a soft hint -> VirtualLock still fails
@@ -225,8 +232,12 @@ secmem_alloc proc frame
     jz      sa_fail
     mov     qword ptr [rbp-32], rax         ; remember the base across the lock call
 
-    ; keep it resident / out of the pagefile (grows the working set if needed).
-    ; Best-effort: a lock failure does not invalidate the allocation.
+    ; keep it resident / out of the pagefile.  RE-ASSERT the hard working-set
+    ; minimum first: Argon2's 512 MiB KDF arena balloons the working set and, on
+    ; free, the OS trims it back and drops our startup reservation - so without
+    ; this the post-unlock body lock fails ERROR_WORKING_SET_QUOTA even though the
+    ; startup buffers locked fine.  (Diagnosed with Thomas: startup-fail flag = 0.)
+    call    sec_ws_grow
     mov     rcx, qword ptr [rbp-32]
     mov     rdx, qword ptr [rbp-24]
     call    sec_lock

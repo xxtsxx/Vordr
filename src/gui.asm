@@ -763,9 +763,9 @@ WSTR t_reloaded,    <Vault reloaded>
 WSTR s_busy,        <Another user is saving this vault right now. Your change is kept in memory - try saving again in a moment.>
 WSTR s_nolock,      <Vordr could not lock all secret buffers into RAM on this system, so decrypted secrets may be written to the pagefile. Consider closing memory-heavy apps.>
 WSTR t_nolock,      <Secrets not pinned to RAM>
-WSTR s_lkdiag1,     <Diagnostic - VirtualLock error >
+WSTR s_lkdiag1,     <Diagnostic: VirtualLock error >
 WSTR s_lkdiag2,     <, working-set-grow error >
-WSTR s_lkdiag3,     <. (VirtualLock is limited by the working-set quota / the "Increase a process working set" privilege - not by free RAM.)>
+WSTR s_lkdiag3,     <. (VirtualLock is limited by the working-set quota, not by free RAM.)>
 ; C5: GUI security-event names for the audit log (log_result classifies the code)
 WSTR ev_unlock,     <gui-unlock>
 WSTR ev_save,       <gui-save>
