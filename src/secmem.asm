@@ -30,6 +30,7 @@ extern vault_panic_wipe_slots:proc      ; vault.asm: crash-path wipe of slot sec
 extern GetCurrentProcess:proc
 extern SetProcessWorkingSetSizeEx:proc
 extern GetLastError:proc
+externdef g_vault_n:dword               ; vault.asm: number of open vaults (scales the WS min)
 extern rng_fill:proc
 extern VirtualQuery:proc
 extern print_a:proc
@@ -51,15 +52,14 @@ MEM_COMMIT          equ 1000h
 MEM_RESERVE         equ 2000h
 MEM_RELEASE         equ 8000h
 PAGE_READWRITE      equ 04h
-; The working-set MIN is the hard lockable-page quota.  It MUST exceed the total
-; VirtualLock'd bytes, dominated by the decrypted body arena (VAULT_BODY_MAX =
-; 16 MiB, allocated per open vault) plus the ~23 KB static secret buffers.  An
-; 8 MiB min was smaller than a single 16 MiB body -> the body lock failed
-; ERROR_WORKING_SET_QUOTA even though the tiny startup buffers locked (found with
-; Thomas).  32 MiB covers one vault with headroom; MAX 256 MiB leaves room for
-; several multi-vault contexts.
-SEC_WS_MIN          equ 02000000h   ; 32 MiB min working set (> the 16 MiB body)
-SEC_WS_MAX          equ 10000000h   ; 256 MiB max
+; The working-set MIN is the hard lockable-page quota; it MUST exceed the total
+; VirtualLock'd bytes.  That's dominated by the decrypted body arena
+; (VAULT_BODY_MAX = 16 MiB) which is locked PER OPEN VAULT - so the reservation
+; must SCALE with g_vault_n, not be a fixed value (a fixed 32 MiB failed the 2nd
+; vault; found with Thomas).  sec_ws_grow computes it dynamically.
+SEC_BODY_RESERVE    equ 01000000h   ; 16 MiB per open vault (matches VAULT_BODY_MAX)
+SEC_WS_STATICS      equ 00800000h   ; 8 MiB for the static secret buffers + headroom
+SEC_WS_MAX          equ 10000000h   ; 256 MiB cap (>= MAX_VAULTS bodies + statics)
 ; QUOTA_LIMITS_HARDWS_MIN_ENABLE (1) | QUOTA_LIMITS_HARDWS_MAX_DISABLE (8): make
 ; the MIN a HARD reservation so VirtualLock actually gets quota.  Plain
 ; SetProcessWorkingSetSize sets only a soft hint -> VirtualLock still fails
@@ -120,8 +120,19 @@ sec_lock endp
 public sec_ws_grow
 sec_ws_grow proc frame
     FRAME_PROLOG 48
+    ; min = statics + (open vaults + 1) * 16 MiB, so every locked body arena fits
+    ; (the +1 reserves headroom for the vault currently being opened).  Clamp to
+    ; the max.  g_vault_n is 0 at startup -> 24 MiB, ample for the static buffers.
+    mov     eax, dword ptr [g_vault_n]
+    inc     eax
+    imul    eax, eax, SEC_BODY_RESERVE
+    add     eax, SEC_WS_STATICS
+    cmp     eax, SEC_WS_MAX
+    jbe     @F
+    mov     eax, SEC_WS_MAX
+@@: mov     qword ptr [rbp-24], rax           ; computed min (survive the call setup)
     WINCALL GetCurrentProcess
-    WINCALL SetProcessWorkingSetSizeEx, rax, SEC_WS_MIN, SEC_WS_MAX, SEC_WS_FLAGS
+    WINCALL SetProcessWorkingSetSizeEx, rax, qword ptr [rbp-24], SEC_WS_MAX, SEC_WS_FLAGS
     test    eax, eax
     jnz     swg_ok
     WINCALL GetLastError
