@@ -596,7 +596,11 @@ endm
 
 ; UTF-16 string literal:  WSTR cmd_encrypt, <encrypt>
 ; (text inside <> may not contain commas; use multiple WSTRs or raw dw)
+; Every wide string MUST start 2-aligned: an odd-address WSTR passed to a Win32
+; -W API (SetDlgItemTextW, RegisterClassW) renders/registers empty on this
+; platform.  `even` here aligns every WSTR, so no block can drift odd.
 WSTR macro name, text
+    even
     name label word
     forc c, <text>
         dw '&c'
