@@ -10029,6 +10029,7 @@ search_overlay_open proc frame
     WINCALL MoveWindow, qword ptr [rbp-64], dword ptr [rbp-80], dword ptr [rbp-76], \
             dword ptr [rbp-56], dword ptr [rbp-60], 0                                   ; stack-arg -> rax can't be arg1)
     WINCALL SetWindowPos, qword ptr [rbp-64], 0, 0, 0, 0, 0, SWP_RAISE_   ; raise the edit above the pill
+    WINCALL ShowWindow, qword ptr [rbp-32], SW_HIDE   ; hide the pill; the edit visually replaces it
     mov     eax, dword ptr [rbp-40]           ; list inside the panel (4px inset)
     add     eax, 4
     mov     dword ptr [rbp-48], eax
@@ -10066,6 +10067,8 @@ search_overlay_close proc frame
     call    gui_show_ids
     mov     dword ptr [g_so_open], 0
     mov     dword ptr [g_xr_active], 0
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_T_SEARCH   ; restore the pill the edit replaced
+    WINCALL ShowWindow, rax, SW_SHOW
     WINCALL InvalidateRect, qword ptr [rbp-24], 0, 1   ; repaint the area it covered
     WINCALL SetFocus, qword ptr [rbp-24]
 soc_done:
