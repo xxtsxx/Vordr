@@ -4121,6 +4121,11 @@ vh_store:
     mov     rcx, qword ptr [rbp-40]
     test    rcx, rcx
     jz      vh_done
+    ; wipe the scratch before releasing it: it holds unsalted BLAKE2b-128
+    ; fingerprints of every password, which must not linger in freed pages.
+    mov     eax, dword ptr [rbp-32]             ; n
+    imul    rax, rax, HSTRIDE
+    mov     rdx, rax                            ; mem_free wipes rdx bytes
     call    mem_free
 vh_done:
     FRAME_EPILOG

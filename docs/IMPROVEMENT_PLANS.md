@@ -153,7 +153,8 @@ vault key.
    Hello/PIN prompt. Best-effort: a provider that rejects the policy just leaves
    the key silent. *Note:* the prompting path can't be runtime-verified in this
    environment (no TPM+Hello); gated off by default so existing TPM unlock is
-   byte-for-byte unchanged.
+   behaviorally unchanged (the default path loads the same silent flag values,
+   now via locals).
 
 (The former blob-hygiene item — the TPM registry value name was the full vault
 path — is fixed by C6: the name is now hashed and legacy path-named values are
