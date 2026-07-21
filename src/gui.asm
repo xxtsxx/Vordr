@@ -351,7 +351,6 @@ TAB_W               equ 130             ; per-vault tab width (px)
 DOCKBTN_W           equ 34              ; title-bar dock button width
 SEARCHPILL_W        equ 200             ; title-bar search pill width
 SO_W                equ 360             ; search overlay width (px)
-SO_EDITH            equ 26              ; search overlay edit height (px)
 SO_LISTH            equ 300             ; search overlay results height (px)
 LINK_BLUE           equ 00E08C3Ch        ; COLORREF (RGB 60,140,224) hyperlink blue
 WM_MEASUREITEM      equ 2Ch
@@ -412,7 +411,6 @@ LB_INITSTORAGE      equ 1A8h            ; pre-allocate item storage for large li
 LB_SETCURSEL        equ 186h
 LB_GETCURSEL        equ 188h
 LB_GETCOUNT         equ 18Bh
-LB_GETITEMHEIGHT    equ 1A1h
 LBN_DBLCLK          equ 2
 VK_RETURN_          equ 0Dh
 VK_ESCAPE_          equ 1Bh
@@ -10017,21 +10015,22 @@ search_overlay_open proc frame
 @@: mov     eax, dword ptr [rbp-68]           ; y = pill bottom + 2
     add     eax, 2
     mov     dword ptr [rbp-44], eax
-    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_SO_PANEL
-    WINCALL MoveWindow, rax, dword ptr [rbp-40], dword ptr [rbp-44], SO_W, SO_EDITH+SO_LISTH, 0
-    mov     eax, dword ptr [rbp-40]           ; edit inset
-    add     eax, 6
-    mov     dword ptr [rbp-48], eax
-    mov     eax, dword ptr [rbp-44]
-    add     eax, 4
-    mov     dword ptr [rbp-52], eax
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_SO_PANEL   ; panel wraps just the results
+    WINCALL MoveWindow, rax, dword ptr [rbp-40], dword ptr [rbp-44], SO_W, SO_LISTH+8, 0
+    mov     eax, dword ptr [rbp-72]           ; edit painted OVER the pill: pillW = R - L
+    sub     eax, dword ptr [rbp-80]
+    mov     dword ptr [rbp-56], eax
+    mov     eax, dword ptr [rbp-68]           ; pillH = B - T
+    sub     eax, dword ptr [rbp-76]
+    mov     dword ptr [rbp-60], eax
     WINCALL GetDlgItem, qword ptr [rbp-24], IDC_SO_EDIT
-    WINCALL MoveWindow, rax, dword ptr [rbp-48], dword ptr [rbp-52], SO_W-12, 18, 0
-    mov     eax, dword ptr [rbp-40]           ; list under the edit
+    WINCALL MoveWindow, rax, dword ptr [rbp-80], dword ptr [rbp-76], dword ptr [rbp-56], \
+            dword ptr [rbp-60], 0
+    mov     eax, dword ptr [rbp-40]           ; list inside the panel (4px inset)
     add     eax, 4
     mov     dword ptr [rbp-48], eax
     mov     eax, dword ptr [rbp-44]
-    add     eax, SO_EDITH
+    add     eax, 4
     mov     dword ptr [rbp-52], eax
     WINCALL GetDlgItem, qword ptr [rbp-24], IDC_SO_LIST
     WINCALL MoveWindow, rax, dword ptr [rbp-48], dword ptr [rbp-52], SO_W-8, SO_LISTH, 0
@@ -10501,9 +10500,9 @@ search_overlay_populate endp
 search_overlay_resize proc frame
     FRAME_PROLOG 64
     mov     qword ptr [rbp-24], rcx
-    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_SO_LIST, LB_GETITEMHEIGHT, 0, 0
-    test    eax, eax
-    jz      sor_done                          ; no row height yet -> leave as built
+    mov     eax, dword ptr [g_layout]         ; rowH = the list-card height for this layout
+    lea     r11, [lay_itemh]                  ;   (deterministic; what WM_MEASUREITEM sets)
+    mov     eax, dword ptr [r11+rax*4]
     mov     dword ptr [rbp-28], eax           ; rowH
     WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_SO_LIST, LB_GETCOUNT, 0, 0
     test    eax, eax
@@ -10519,12 +10518,11 @@ search_overlay_resize proc frame
 @@: mov     dword ptr [rbp-32], eax           ; listH (final)
     WINCALL GetDlgItem, qword ptr [rbp-24], IDC_SO_LIST
     WINCALL SetWindowPos, rax, 0, 0, 0, SO_W-8, dword ptr [rbp-32], SWP_FRAME_
-    mov     eax, dword ptr [rbp-32]           ; panel = edit strip + list
-    add     eax, SO_EDITH
+    mov     eax, dword ptr [rbp-32]           ; panel wraps the list (4px inset top+bottom)
+    add     eax, 8
     mov     dword ptr [rbp-36], eax
     WINCALL GetDlgItem, qword ptr [rbp-24], IDC_SO_PANEL
     WINCALL SetWindowPos, rax, 0, 0, 0, SO_W, dword ptr [rbp-36], SWP_FRAME_
-sor_done:
     FRAME_EPILOG
     ret
 search_overlay_resize endp
