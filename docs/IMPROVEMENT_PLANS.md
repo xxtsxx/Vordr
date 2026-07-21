@@ -515,14 +515,19 @@ the R group. Each is independent and can ship together in one session.
    the generated password on the clipboard (existing clip path + auto-clear timer)
    instead of writing to `g_pg_target`. *Test:* dock-launched pwgen shows Copy →
    clipboard gets the password; field-launched still shows Use → writes the field.
-5. **Remove minimize / maximize / lock buttons.** Drop the `IDC_T_MIN` and
-   `IDC_T_MAX` caption buttons and the `IDC_V_LOCK` button (+ their anchors,
-   `gt_min`/`gt_max` strings, and click handlers). They are redundant: `vp_close`
-   (the `IDC_T_CLOSE` "X"), `vp_esc` (Escape), and the idle-timeout all already fall
-   through to `vp_lock`, which wipes and hides to tray — so the X and Escape lock to
-   tray, and there is no need to minimise/maximise or expose a separate lock.
-   Reflow the caption to the single close glyph. *Test:* only the close glyph
-   remains; Esc and X both lock (wipe) and hide to tray.
+5. **Remove the minimize / maximize / lock / burger buttons.** Drop:
+   - the `IDC_T_MIN` and `IDC_T_MAX` caption buttons (+ `gt_min`/`gt_max` strings,
+     anchors, handlers) — no need to minimise/maximise;
+   - the `IDC_V_LOCK` button — redundant because `vp_close` (the `IDC_T_CLOSE`
+     "X"), `vp_esc` (Escape), and the idle-timeout all already fall through to
+     `vp_lock`, which wipes and hides to tray; so the X and Escape lock to tray;
+   - the **hamburger menu** `IDC_V_MENU` (`GLY_MORE`, `wb_menu`/`wb_close` toggle)
+     — redundant now that the title-bar dock settings glyph `IDC_T_SET` opens the
+     same overlay (both route to `vp_menu` → `gui_menu_toggle`). Keep `IDC_T_SET`
+     as the toggle; the overlay still closes via re-click / Esc.
+   Reflow the caption/toolbar to drop the removed slots. *Test:* only the close
+   glyph in the caption and the dock's New/Generate/Settings/search remain; Esc and
+   X lock (wipe) + hide to tray; the settings glyph opens/closes the overlay.
 
 ---
 
