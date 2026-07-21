@@ -109,6 +109,15 @@ BLAKE2b fingerprints or drive an OOB `secure_zero`; it now wipes `n*HSTRIDE`
 bytes. C4/E6/E15/G7 sections removed from this file; the visual-only remainder
 is group R.
 
+**Done 2026-07-21 (R safe-subset → PR #2):** the headlessly-verifiable slices of
+group R that carry negligible visual risk. **R6-lite** — the E6 sidebar dot is
+now colour-coded red=weak / amber=stale via `vault_entry_stale` (same >365-day
+rule as `vault_health`, KAT'd in `healthkat`). **R5-lite** — the last vault the
+user opens is persisted (`reg_save_vault`) so startup reopens it. The pure-layout
+/ cross-entry-cache remainder (R1 virtual scroll, R2 command palette, R3 DPI
+retrofit, R4 tab decorations, R5 multi-vault tab-set, R6 reused dot + modeless
+dialog) stays deferred — its acceptance tests are visual and need a display.
+
 House rules:
 
 - Plan IDs are stable: `C4` stays `C4` when other plans are completed or added.
@@ -166,9 +175,11 @@ With the C/E/G backlog cleared, group R is what's left. Every R item is
 screenshots", "scrolls with no paint over the header", "fast-scrolls to the
 right letter"), so each needs a real display to verify — they were deliberately
 left for an environment where the window can be seen, rather than shipped
-build-green-but-unverified. Sequence suggestion: R3 (DPI, touches every
-painter — do it before adding more) → R1 (scroll) → R6/R4 (tile decorations,
-shared analysis/enumeration) → R2 (palette) → R5 (session restore).
+build-green-but-unverified. The headlessly-safe slices are already done (R5-lite
+last-vault restore, R6-lite weak/stale tile dot — see the Done log). Sequence
+suggestion for the visual remainder: R3 (DPI, touches every painter — do it
+before adding more) → R1 (scroll) → R6/R4 (tile decorations, shared
+analysis/enumeration) → R2 (palette) → R5 (multi-vault tab-set restore).
 
 Folded in from `docs/REDESIGN_PLAN.md` (the standalone doc was merged into
 this file and deleted). The redesign landed with merge 2c9f744: custom frame +
@@ -201,19 +212,23 @@ The layout engine already scales; sweep painters for hardcoded px through a
 Per-vault entry counts on tabs; tag chips row under search results; alphabet
 fast-scroll on >200 entries. *Test:* 5k vault fast-scrolls to the right letter.
 
-### R5. Session restore
-Reopen the same tab set (paths from MRU) at next unlock, each tab showing a
-locked placeholder until its password is supplied (click → secure unlock for
-that vault). *Test:* two vaults open, lock, unlock → two placeholders; one
-unlocks inline.
+### R5. Session restore — partially done
+*Done (single-vault, 2026-07-21):* `gui_open_additional` persists the last
+successfully-opened vault via `reg_save_vault`, so startup's `gui_resolve_vault`
+(HKLM>HKCU) reopens it. *Remaining (needs a display):* reopen the whole tab set
+(the multi-vault context list), each tab a locked placeholder until its password
+is supplied (click → secure unlock). *Test:* two vaults open, lock, unlock → two
+placeholders; one unlocks inline.
 
-### R6. Vault-health dashboard, richer (from E6)
+### R6. Vault-health dashboard, richer (from E6) — partially done
 E6 shipped the analysis pass (`vault_health` + `healthkat`), a Ctrl+H summary
-box, and a weak-password tile dot. Remaining: a modeless health dialog whose
-rows jump to the offending entry, plus reused/stale tile indicators and a
-worst-bucket count badge. Needs a cached per-entry classification invalidated
-on edit/save (the summary recomputes on demand today). *Test:* fix one weak
-password → badge decrements after save; clicking a row highlights its tile.
+box, and a tile dot now colour-coded red=weak / amber=stale (`vault_entry_stale`,
+KAT'd). *Remaining (needs a display + a cache):* a modeless health dialog whose
+rows jump to the offending entry, a **reused**-password tile indicator, and a
+worst-bucket count badge. These need a per-entry classification cached at
+`gui_poplist` and invalidated on edit/save (the reused check is O(n²), too heavy
+to recompute per paint). *Test:* fix one weak password → badge decrements after
+save; clicking a row highlights its tile.
 
 ---
 
