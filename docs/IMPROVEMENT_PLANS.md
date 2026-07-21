@@ -143,8 +143,8 @@ House rules:
   `zitest` → `phtest` → `secscan` → `lktest` → `tmptest` → `fztest` → `trtest`
   → `vfuzz` → `fuzzzip` → `bktest` → `mactest` → `rbtest` → `xctest` → `reload`
   → `cowrite` → `attfuzz` → `healthkat` → `pkat` → `mvtest` → `mvswitch` →
-  `mvname` → `idkat` → `kekkat` → `keyringkat` → `fedkat` → `avtest`.
-  `--quick` skips stage 1.
+  `mvname` → `idkat` → `kekkat` → `keyringkat` → `fedkat` → `fedregkat` →
+  `avtest`. `--quick` skips stage 1.
 - **FRAMES** = no >4-arg `WINCALL` directly inside a raw `sub rsp,64` dialog
   proc (`create_proc`, `unlock_proc`, `vault_proc`, `msg_proc`, `about_proc`,
   …); wide calls go in a `FRAME_PROLOG N` helper. This is the BEX64/offset-0
@@ -181,11 +181,18 @@ House rules:
 - **M2 record:** `FEDLINK`/`FEDREC` fixed-layout link table + `fed_reset`/`fed_slot`/
   `fed_find`/`fed_add`; flag bits `LINK_STALE`/`MISSING`/`PROMPT`. Probe: `fedkat`
   (add/lookup + seal→wipe→open round-trip incl. keys + flags).
+- **M2 persistence:** `fed_store`/`fed_load` seal→`REG_BINARY` under
+  `HKCU\SOFTWARE\Vordr\Federation` (`reg_fed_set`/`get`/`del` in regcfg.asm),
+  machine-local + non-exportable; `fed_load` returns none on absent/auth-fail.
+  Probe: `fedregkat` (store→wipe→load→delete→confirm-none; self-cleaning).
 
-*Remaining M2:* the machine-local **registry** persistence (seal→`REG_BINARY` under
-`HKCU\SOFTWARE\Vordr\Federation` keyed by hashed master `vault_id`; reuse
-`reg_tpm_*`) and TPM machine-secret provisioning. Then M1.2 (system items),
-M3–M5 (display work), M6 (export). The four probes above run in `run_all`.
+**M2's headless keyring core is complete and gate-verified** (5 probes:
+`idkat`/`kekkat`/`keyringkat`/`fedkat`/`fedregkat`). *Remaining M — needs the live
+unlock flow / TPM hardware / display, so paused for those:* TPM machine-secret
+provisioning (`tpm_seal` a per-machine `tpm_secret`), **M1.2 system items** (vault
+body ID+name — a core on-disk-format change, do with review), **fan-out unlock**
+wiring, and **M3–M5** (unified list, mgmt screen, TPM/registry scoping — all
+display work). M6 (vault export) is the next headless-safe slice.
 
 **Pre-v1.0 clean slate (2026-07-21).** Until v1.0 ships, all pre-existing vaults
 and Vordr builds are treated as discarded — **no migration, no back-compat
