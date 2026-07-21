@@ -30,6 +30,9 @@ extern gcm_open:proc
 extern sha256_hash:proc
 extern ct_memcmp:proc
 extern rng_fill:proc
+extern reg_fed_set:proc                 ; M2: federation record registry I/O (regcfg.asm)
+extern reg_fed_get:proc
+extern reg_fed_del:proc
 extern secure_zero:proc
 extern secmem_alloc:proc
 extern sec_lock:proc
@@ -269,6 +272,8 @@ fmac_domain db "vordr-file-mac-v1"          ; MAC domain-separation prefix
 FMAC_DOMLEN equ 17
 fed_kek_domain db "vordr-federation-kek-v1" ; M2: keyring KEK domain-separation prefix
 FED_KEK_DOMLEN equ 23
+even
+fed_valname db 'r',0,'e',0,'c',0,'o',0,'r',0,'d',0,0,0  ; M2: record value name (wide)
 CSTR bk_ok,  "bktest: PASS (bak1..3 rotated and bak1 opens)",13,10
 CSTR bk_bad, "bktest: FAIL (backup missing or unopenable)",13,10
 CSTR mt_ok,  "mactest: PASS (counter tamper rejected, restore opens)",13,10
@@ -3242,6 +3247,123 @@ fk_ret:
     FRAME_EPILOG
     ret
 cmd_fedkat endp
+
+; --- M2: federation record registry persistence -----------------------------
+; fed_store(rcx = &kek32) -> eax = 1/0.  Seal the live record and write it to
+;   HKCU\SOFTWARE\Vordr\Federation (machine-local, non-exportable).
+public fed_store
+fed_store proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx           ; kek
+    lea     rcx, [g_fedrec]                   ; blob = seal(record, kek)
+    mov     edx, sizeof FEDREC
+    mov     r8, qword ptr [rbp-24]
+    lea     r9, [g_fedblob]
+    call    keyring_seal
+    mov     dword ptr [rbp-32], eax           ; bloblen
+    lea     rcx, [fed_valname]
+    lea     rdx, [g_fedblob]
+    mov     r8d, dword ptr [rbp-32]
+    call    reg_fed_set
+    FRAME_EPILOG
+    ret
+fed_store endp
+
+; fed_load(rcx = &kek32) -> eax = 1 if a record was decrypted into g_fedrec, else
+;   0 (no stored record, or auth failed = wrong master key / wrong machine).
+public fed_load
+fed_load proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx           ; kek
+    lea     rcx, [fed_valname]                ; blob = registry read
+    lea     rdx, [g_fedblob]
+    mov     r8d, (sizeof FEDREC) + 32
+    call    reg_fed_get
+    test    eax, eax
+    jz      fl_none                            ; no stored record
+    mov     dword ptr [rbp-32], eax           ; bloblen
+    lea     rcx, [g_fedblob]
+    mov     edx, dword ptr [rbp-32]
+    mov     r8, qword ptr [rbp-24]
+    lea     r9, [g_fedrec]
+    call    keyring_open
+    cmp     eax, 0
+    jl      fl_none                            ; auth fail
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+fl_none:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+fed_load endp
+
+; cmd_fedregkat - headless KAT for registry persistence: build a record, store it,
+;   wipe the live copy, load it back and assert it survives, then delete the value
+;   and assert a subsequent load reports "none".  Self-cleaning.  Exit 0 = pass.
+LANDING_PAD
+public cmd_fedregkat
+cmd_fedregkat proc frame
+    FRAME_PROLOG 48
+    call    fed_reset
+    mov     dword ptr [rbp-24], 0             ; v
+frk_build:
+    cmp     dword ptr [rbp-24], 2
+    jae     frk_built
+    lea     rcx, [g_fedlink_tmp + FEDLINK.fl_id]
+    mov     edx, 16
+    mov     r8d, dword ptr [rbp-24]
+    add     r8d, 030h
+    call    idk_fill
+    lea     rcx, [g_fedlink_tmp + FEDLINK.fl_key]
+    mov     edx, 32
+    mov     r8d, dword ptr [rbp-24]
+    add     r8d, 040h
+    call    idk_fill
+    mov     dword ptr [g_fedlink_tmp + FEDLINK.fl_flags], 0
+    lea     rcx, [g_fedlink_tmp]
+    call    fed_add
+    inc     dword ptr [rbp-24]
+    jmp     frk_build
+frk_built:
+    lea     rcx, [g_fedkat_mk]                ; kek = KEK(0x99, 0xAA)
+    mov     edx, 32
+    mov     r8b, 099h
+    call    idk_fill
+    lea     rcx, [g_fedkat_tpm]
+    mov     edx, 32
+    mov     r8b, 0AAh
+    call    idk_fill
+    lea     rcx, [g_fedkat_kek]
+    lea     rdx, [g_fedkat_mk]
+    lea     r8, [g_fedkat_tpm]
+    call    keyring_kek
+    lea     rcx, [g_fedkat_kek]              ; store -> registry
+    call    fed_store
+    test    eax, eax
+    mov     eax, 2
+    jz      frk_ret
+    call    fed_reset                          ; wipe the live record
+    lea     rcx, [g_fedkat_kek]              ; load back
+    call    fed_load
+    cmp     eax, 1
+    mov     eax, 3
+    jne     frk_ret
+    cmp     dword ptr [g_fedrec + FEDREC.fr_count], 2
+    mov     eax, 4
+    jne     frk_ret
+    lea     rcx, [fed_valname]               ; cleanup: delete the value
+    call    reg_fed_del
+    lea     rcx, [g_fedkat_kek]              ; load now reports none
+    call    fed_load
+    test    eax, eax
+    mov     eax, 5
+    jnz     frk_ret
+    xor     eax, eax
+frk_ret:
+    FRAME_EPILOG
+    ret
+cmd_fedregkat endp
 
 ; mvt_zero(rcx=ptr, edx=len) - zero a buffer (probe helper).  Leaf, volatile regs.
 mvt_zero proc
