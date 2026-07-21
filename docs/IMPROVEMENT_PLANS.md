@@ -547,10 +547,12 @@ is gone. Built on the existing `search_overlay_*` (panel/edit/list) infrastructu
    positioning (3) and dynamic sizing (6).
 5. **Linger until selection:** keep the results open until Enter/click/Esc (already
    the behaviour — confirm no close-on-blur once it is a popup).
-6. **Scale with hits:** size the popup to `clamp(hits × rowH, min, max)`, recomputed
-   on every keystroke as results filter.
-*Sequence:* stage 1 done → 2 (input) → 4+3+6 (the floating-popup rebuild) → 5
-(confirm). All visual — each increment verified by screenshot.
+6. **[done, stage 2]** Scale with hits: `search_overlay_resize` sizes the list +
+   backdrop to `clamp(rows × itemHeight, one row, SO_LISTH)` after every populate,
+   so the dropdown shrinks live as the query filters. Carries over to the popup.
+*Sequence:* stages 1–2 done → 2b (type-anywhere completeness) → 4+3 (the
+floating-popup rebuild, reuses the stage-2 sizing) → 5 (confirm). All visual —
+each increment verified by screenshot.
 
 ---
 
