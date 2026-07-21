@@ -28,7 +28,8 @@ extern secure_zero:proc
 extern vault_slots_lock:proc            ; vault.asm: VirtualLock the g_vaults table
 extern vault_panic_wipe_slots:proc      ; vault.asm: crash-path wipe of slot secrets
 extern GetCurrentProcess:proc
-extern SetProcessWorkingSetSize:proc
+extern SetProcessWorkingSetSizeEx:proc
+extern GetLastError:proc
 extern rng_fill:proc
 extern VirtualQuery:proc
 extern print_a:proc
@@ -52,6 +53,11 @@ MEM_RELEASE         equ 8000h
 PAGE_READWRITE      equ 04h
 SEC_WS_MIN          equ 00800000h   ; 8 MiB min working set (room for locked pages)
 SEC_WS_MAX          equ 04000000h   ; 64 MiB max
+; QUOTA_LIMITS_HARDWS_MIN_ENABLE (1) | QUOTA_LIMITS_HARDWS_MAX_DISABLE (8): make
+; the MIN a HARD reservation so VirtualLock actually gets quota.  Plain
+; SetProcessWorkingSetSize sets only a soft hint -> VirtualLock still fails
+; ERROR_WORKING_SET_QUOTA (1453) even though the call "succeeds".
+SEC_WS_FLAGS        equ 9
 
 .code
 
@@ -67,20 +73,17 @@ sec_lock proc frame
     mov     qword ptr [rbp-24], rcx
     mov     qword ptr [rbp-32], rdx
     cmp     dword ptr [g_force_lockfail], 0     ; C3 test hook: force a lock failure
-    jne     sl_failed
+    jne     sl_failed_hook
+    ; The working-set quota is grown ONCE up front (sec_ws_grow, from
+    ; sec_lock_statics) so the lock isn't capped; here we just attempt it.
     WINCALL VirtualLock, qword ptr [rbp-24], qword ptr [rbp-32]
     test    eax, eax
     jnz     sl_done
-    ; working set too small -> grow it, then retry the lock
-    WINCALL GetCurrentProcess
-    WINCALL SetProcessWorkingSetSize, rax, SEC_WS_MIN, SEC_WS_MAX
-    WINCALL VirtualLock, qword ptr [rbp-24], qword ptr [rbp-32]
-    test    eax, eax
-    jz      sl_failed
-sl_done:
-    mov     eax, 1                              ; locked
-    FRAME_EPILOG
-    ret
+    ; failed: record WHY (first failure's code) for the diagnostic warning
+    WINCALL GetLastError
+    cmp     dword ptr [g_lockerr_vl], 0
+    jne     sl_failed
+    mov     dword ptr [g_lockerr_vl], eax       ; keep the FIRST error only
 sl_failed:
     ; C3: a secret buffer could not be pinned - it may reach the pagefile.  Record
     ; it (the GUI shows a one-time warning; we do NOT fail closed, which would lock
@@ -89,7 +92,40 @@ sl_failed:
     xor     eax, eax
     FRAME_EPILOG
     ret
+sl_failed_hook:
+    mov     dword ptr [g_seclock_failed], 1     ; forced failure (test) - no real errno
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+sl_done:
+    mov     eax, 1                              ; locked
+    FRAME_EPILOG
+    ret
 sec_lock endp
+
+; =============================================================================
+; sec_ws_grow() - raise the process working-set min/max ONCE so VirtualLock has
+;   quota to pin the secret pages.  VirtualLock is capped by the working-set
+;   minimum, NOT by free RAM, so this (not memory) is what makes the locks hold.
+;   Records the Win32 error if the grow is refused (e.g. SeIncreaseWorkingSet
+;   privilege stripped by policy), which is then surfaced in the C3 warning.
+; =============================================================================
+public sec_ws_grow
+sec_ws_grow proc frame
+    FRAME_PROLOG 48
+    WINCALL GetCurrentProcess
+    WINCALL SetProcessWorkingSetSizeEx, rax, SEC_WS_MIN, SEC_WS_MAX, SEC_WS_FLAGS
+    test    eax, eax
+    jnz     swg_ok
+    WINCALL GetLastError
+    mov     dword ptr [g_lockerr_wss], eax
+    FRAME_EPILOG
+    ret
+swg_ok:
+    mov     dword ptr [g_lockerr_wss], 0
+    FRAME_EPILOG
+    ret
+sec_ws_grow endp
 
 ; =============================================================================
 ; sec_lock_statics() - VirtualLock every fixed static secret buffer.  Called
@@ -100,6 +136,7 @@ sec_lock endp
 public sec_lock_statics
 sec_lock_statics proc frame
     FRAME_PROLOG 32
+    call    sec_ws_grow                       ; raise the working-set quota FIRST
     lea     rcx, [g_cfg_pass]
     mov     edx, 1025
     call    sec_lock
@@ -241,6 +278,9 @@ public g_seclock_failed
 g_seclock_failed dd ?                    ; C3: set if any VirtualLock failed (pageable secret)
 public g_force_lockfail
 g_force_lockfail dd ?                    ; C3: test hook - force sec_lock to fail
+public g_lockerr_vl, g_lockerr_wss
+g_lockerr_vl  dd ?                       ; Win32 err from the FIRST failed VirtualLock (0=none)
+g_lockerr_wss dd ?                       ; Win32 err from SetProcessWorkingSetSize (0=ok)
 
 .code
 CSTR ss_pass, "secscan: PASS (sentinel found before wipe, absent after)",13,10
