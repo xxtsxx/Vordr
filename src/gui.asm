@@ -10013,8 +10013,8 @@ search_overlay_open proc frame
 @@: cmp     dword ptr [rbp-40], 4
     jge     @F
     mov     dword ptr [rbp-40], 4
-@@: mov     eax, dword ptr [rbp-68]           ; y = pill bottom + 2
-    add     eax, 2
+@@: mov     eax, dword ptr [rbp-68]           ; y = below the title bar, with a gap so the
+    add     eax, 8                            ;   dropdown detaches from the detail header
     mov     dword ptr [rbp-44], eax
     WINCALL GetDlgItem, qword ptr [rbp-24], IDC_SO_PANEL   ; panel wraps just the results
     WINCALL MoveWindow, rax, dword ptr [rbp-40], dword ptr [rbp-44], SO_W, SO_LISTH+8, 0
