@@ -10665,6 +10665,11 @@ gui_open_additional proc frame
     cmp     rax, 1
     jne     goa_rollback
 goa_loaded:
+    ; R5 (session restore, single-vault): remember the vault the user just opened
+    ; as the HKCU startup path, so the next launch reopens it (HKLM policy still
+    ; wins at load).  Best-effort; reg_load_vault already reads this back.
+    lea     rcx, [g_vpath]
+    call    reg_save_vault
     lea     rcx, [g_vpath]                     ; name the new tab from the basename
     call    gui_basename
     mov     ecx, dword ptr [g_vault_cur]
