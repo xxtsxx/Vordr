@@ -529,6 +529,29 @@ the R group. Each is independent and can ship together in one session.
    glyph in the caption and the dock's New/Generate/Settings/search remain; Esc and
    X lock (wipe) + hide to tray; the settings glyph opens/closes the overlay.
 
+### R8. Search overhaul — one title-bar search (2026-07-21, in progress)
+Consolidate to a single search driven from the title bar; the sidebar filter box
+is gone. Built on the existing `search_overlay_*` (panel/edit/list) infrastructure.
+1. **[done, stage 1]** Remove the redundant sidebar box (`IDC_V_SEARCH`); the list
+   reflows to fill it. Ctrl+K, list type-to-search (`search_type_subclass`) and
+   ghost-button type-to-search (`gsc_char`) now open the overlay and forward the
+   keystroke into `IDC_SO_EDIT`. *Verify on screen:* list fills the space; typing
+   anywhere with no field focused opens the overlay and starts the query.
+2. **Type-anywhere focus:** ensure *every* no-field-focused keypress reaches the
+   overlay (extend beyond the list/ghost subclasses if any control swallows it).
+3. **Edit painted over the pill:** position `IDC_SO_EDIT` over the `IDC_T_SEARCH`
+   rect (not below) so activating looks like the pill becomes the field.
+4. **Floating results window:** promote the results panel from a child control to a
+   top-level layered popup (`WS_POPUP` + drop-shadow / `WS_EX_NOACTIVATE`) that
+   floats over the window with a border + shadow. Subsumes the edit-over-pill
+   positioning (3) and dynamic sizing (6).
+5. **Linger until selection:** keep the results open until Enter/click/Esc (already
+   the behaviour — confirm no close-on-blur once it is a popup).
+6. **Scale with hits:** size the popup to `clamp(hits × rowH, min, max)`, recomputed
+   on every keystroke as results filter.
+*Sequence:* stage 1 done → 2 (input) → 4+3+6 (the floating-popup rebuild) → 5
+(confirm). All visual — each increment verified by screenshot.
+
 ---
 
 *Completed plans are removed from this file in the commit that ships them.
