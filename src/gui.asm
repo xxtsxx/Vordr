@@ -1149,6 +1149,8 @@ gl_doc      dw 0E8A5h, 0                 ; Document (Documents folder)
 gl_folder   dw 0E8B7h, 0                 ; Folder (other location)
 WSTR st_onedrive,   <OneDrive>
 WSTR st_documents,  <Documents>
+even
+s_stor_sep  dw ' ', 00B7h, ' ', 0            ; " . " separator: <location> . <vault name>
 f_iconname label word
     dw 'S','e','g','o','e',' ','F','l','u','e','n','t',' ','I','c','o','n','s', 0
 f_symbol label word
@@ -1463,6 +1465,8 @@ g_pwh_filter  dd MAX_PWHIST dup (?)              ; g_pwhist indices belonging to
 g_pwh_fn      dd ?                               ; number of rows in g_pwh_filter
 align 2
 g_imgfn_w     dw 200 dup (?)               ; current image's filename (wide) to store
+align 8
+g_storagelabel dw 300 dup (?)              ; unlock dialog: "<location> . <vault name>"
 g_imgbuf      dq ?                         ; imported file bytes (mem_alloc'd)
 g_imgbuflen   dq ?
 g_pickfilter  dq ?                         ; OPENFILENAME filter for the next pick (0=image)
@@ -1679,6 +1683,7 @@ gui_draw_storage proc frame
     WINCALL SetBkMode, qword ptr [rbp-32], 1
     lea     rcx, [g_vpath]                    ; classify: 0 OneDrive / 1 Documents / 2 other
     call    cfg_classify_path
+    mov     dword ptr [rbp-88], eax           ; keep the classification
     lea     r8, [gl_cloud]
     lea     r9, [st_onedrive]
     cmp     eax, 0
@@ -1693,7 +1698,40 @@ gds_other:
     lea     r9, [g_vpath]
 gds_have:
     mov     qword ptr [rbp-48], r8            ; glyph ptr
-    mov     qword ptr [rbp-56], r9            ; label ptr
+    mov     qword ptr [rbp-56], r9            ; label ptr (default)
+    ; friendly location (OneDrive/Documents) shows only the folder name - append
+    ; the vault file name so the user sees WHICH vault they are unlocking.
+    ; ('other' is the full path, which already ends in the file name.)
+    cmp     dword ptr [rbp-88], 2
+    jae     gds_labeldone
+    lea     rcx, [g_storagelabel]             ; "<location>"
+    mov     rdx, r9
+    call    gui_wstrcpy
+    mov     rcx, rax
+    lea     rdx, [s_stor_sep]                 ; " . "
+    call    gui_wstrcpy
+    lea     r10, [g_vpath]                    ; basename = text after the last \ or /
+    mov     r11, r10
+gds_bn:
+    movzx   edx, word ptr [r10]
+    test    edx, edx
+    jz      gds_bn_done
+    cmp     edx, '\'
+    je      gds_bn_sep
+    cmp     edx, '/'
+    jne     gds_bn_next
+gds_bn_sep:
+    lea     r11, [r10+2]
+gds_bn_next:
+    add     r10, 2
+    jmp     gds_bn
+gds_bn_done:
+    mov     rcx, rax                          ; append point
+    mov     rdx, r11                          ; -> vault file name
+    call    gui_wstrcpy
+    lea     rax, [g_storagelabel]
+    mov     qword ptr [rbp-56], rax           ; draw the combined label
+gds_labeldone:
     WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_accent]
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_font_icon]
     mov     qword ptr [rbp-64], rax           ; old font
