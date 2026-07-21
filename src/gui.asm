@@ -64,6 +64,7 @@ externdef g_vault_cur:dword
 extern vault_title_at:proc
 extern vault_field_at:proc
 extern vh_pw_weak:proc                  ; E6: weak-password predicate (rcx=bytes,edx=len)
+extern vault_entry_stale:proc           ; E6/R6: stale-entry predicate (rcx=index)
 extern vault_entry_ptr:proc
 extern g_carry_created:qword
 extern pwgen_ex:proc
@@ -2740,24 +2741,36 @@ gui_draw_listitem proc frame
     WINCALL DrawTextW, qword ptr [rbp-32], addr g_sub_w, -1, addr rbp-152, 8024h
 gli_subdone:
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-104]   ; restore font
-    ; E6: weak-password dot on the card's right edge (normal view only).  Reuses
-    ; the tested vault_field_at + vh_pw_weak; a red bullet just left of the star.
+    ; E6/R6: health dot on the card's right edge (normal view only).  Reuses the
+    ; tested vault_field_at + vh_pw_weak + vault_entry_stale; a single bullet just
+    ; left of the star, red when the password is weak, amber when it is stale
+    ; (unchanged over a year), absent when healthy.  Colour is stashed in the
+    ; now-dead len scratch [rbp-136] so it survives the WINCALLs below.
     cmp     dword ptr [g_trash_view], 0
     jne     gli_weakdone
     mov     ecx, dword ptr [rbp-80]                               ; entry index
     mov     edx, VF_SECRET
-    lea     r8, [rbp-136]                                         ; len scratch (free now)
+    lea     r8, [rbp-136]                                         ; len scratch (free after)
     call    vault_field_at
     test    rax, rax
-    jz      gli_weakdone
+    jz      gli_weakdone                                          ; no password -> no dot
     mov     rcx, rax
     mov     edx, dword ptr [rbp-136]
     call    vh_pw_weak
     test    eax, eax
-    jz      gli_weakdone
+    jz      gli_dot_stale
+    mov     dword ptr [rbp-136], 03B3BEFh                         ; red = weak
+    jmp     gli_dot_draw
+gli_dot_stale:
+    mov     ecx, dword ptr [rbp-80]
+    call    vault_entry_stale
+    test    eax, eax
+    jz      gli_weakdone                                          ; healthy -> no dot
+    mov     dword ptr [rbp-136], 02EB2F6h                         ; amber = stale
+gli_dot_draw:
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_symfont]
     mov     qword ptr [rbp-104], rax
-    WINCALL SetTextColor, qword ptr [rbp-32], 03B3BEFh            ; red (weak)
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [rbp-136]
     mov     word ptr [g_glyph_w], 2022h                           ; bullet
     mov     word ptr [g_glyph_w+2], 0
     mov     eax, dword ptr [rbp-56]

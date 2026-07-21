@@ -4132,6 +4132,34 @@ vh_done:
     ret
 vault_health endp
 
+; vault_entry_stale(rcx = index) -> eax = 1 if that entry was modified more than
+;   HEALTH_OLD_100NS ago (same "old" rule as vault_health), else 0.  Used by the
+;   sidebar to tint a tile's health dot amber.  Requires an unlocked body.
+public vault_entry_stale
+vault_entry_stale proc frame
+    FRAME_PROLOG 48
+    call    vault_entry_ptr                     ; rcx = index -> rax = entry ptr
+    test    rax, rax
+    jz      ves_no
+    mov     qword ptr [rbp-24], rax
+    lea     rcx, [g_ts]
+    call    GetSystemTimeAsFileTime
+    mov     rax, qword ptr [g_ts]               ; now
+    mov     r10, qword ptr [rbp-24]
+    sub     rax, qword ptr [r10+24]             ; now - modified
+    js      ves_no                              ; future timestamp -> not stale
+    mov     r8, HEALTH_OLD_100NS
+    cmp     rax, r8
+    jbe     ves_no
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+ves_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+vault_entry_stale endp
+
 ; ===========================================================================
 ; cmd_healthkat - E6 known-answer test for vault_health.  Points g_body_ptr at
 ;   a hand-built 10-entry fixture with a known health profile, runs the
@@ -4241,14 +4269,23 @@ hk_body:
 LANDING_PAD
 public cmd_healthkat
 cmd_healthkat proc frame
-    FRAME_PROLOG 64
-    ; [rbp-24] saved g_body_ptr ; [rbp-48..-33] health out {weak,reused,old,total}
+    FRAME_PROLOG 80
+    ; [rbp-24] saved g_body_ptr ; [rbp-48..-33] health {weak,reused,old,total}
+    ; [rbp-56]=vault_entry_stale(0) [rbp-64]=vault_entry_stale(1)
     mov     rax, qword ptr [g_body_ptr]
     mov     qword ptr [rbp-24], rax
     lea     rax, [hk_body]
     mov     qword ptr [g_body_ptr], rax
     lea     rcx, [rbp-48]
     call    vault_health
+    ; per-entry stale probe while the fixture body is still mounted: e0 is old
+    ; (modified=0), e1 is recent (modified=max).
+    xor     ecx, ecx
+    call    vault_entry_stale
+    mov     dword ptr [rbp-56], eax
+    mov     ecx, 1
+    call    vault_entry_stale
+    mov     dword ptr [rbp-64], eax
     mov     rax, qword ptr [rbp-24]
     mov     qword ptr [g_body_ptr], rax         ; restore before any assert exit
     cmp     dword ptr [rbp-48], 4               ; weak
@@ -4258,6 +4295,10 @@ cmd_healthkat proc frame
     cmp     dword ptr [rbp-40], 2               ; old
     jne     hk_fail
     cmp     dword ptr [rbp-36], 10              ; total
+    jne     hk_fail
+    cmp     dword ptr [rbp-56], 1               ; e0 stale
+    jne     hk_fail
+    cmp     dword ptr [rbp-64], 0               ; e1 not stale
     jne     hk_fail
     xor     eax, eax
     FRAME_EPILOG
