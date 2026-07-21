@@ -46,6 +46,8 @@ extern vault_unlock:proc
 extern vault_lock:proc
 extern vault_reload:proc                ; C8: refresh from disk (reload-safe conflict)
 externdef g_seclock_failed:dword        ; C3: a secret buffer stayed pageable
+externdef g_lockerr_vl:dword            ; C3 diag: first VirtualLock Win32 error
+externdef g_lockerr_wss:dword           ; C3 diag: SetProcessWorkingSetSize error
 extern log_result:proc                  ; C5: audit-log a GUI security event
 externdef g_cfg_loglevel:dword          ; C5: audit-log verbosity (from HKCU at GUI start)
 extern vault_reseal:proc
@@ -761,6 +763,9 @@ WSTR t_reloaded,    <Vault reloaded>
 WSTR s_busy,        <Another user is saving this vault right now. Your change is kept in memory - try saving again in a moment.>
 WSTR s_nolock,      <Vordr could not lock all secret buffers into RAM on this system, so decrypted secrets may be written to the pagefile. Consider closing memory-heavy apps.>
 WSTR t_nolock,      <Secrets not pinned to RAM>
+WSTR s_lkdiag1,     <Diagnostic - VirtualLock error >
+WSTR s_lkdiag2,     <, working-set-grow error >
+WSTR s_lkdiag3,     <. (VirtualLock is limited by the working-set quota / the "Increase a process working set" privilege - not by free RAM.)>
 ; C5: GUI security-event names for the audit log (log_result classifies the code)
 WSTR ev_unlock,     <gui-unlock>
 WSTR ev_save,       <gui-save>
@@ -1416,6 +1421,7 @@ g_cmpbuf      db 256 dup (?)               ; title-A copy for WM_COMPAREITEM
 align 2
 g_imp_msgw    dw 160 dup (?)               ; import result message scratch (wide)
 g_health_msgw dw 200 dup (?)               ; E6: vault-health summary scratch (wide)
+g_lockmsg     dw 400 dup (?)               ; C3: seclock warning + error-code diagnostic
 g_pg_len      dd ?                         ; password-generator: length
 g_pg_style    dd ?                         ;   PWS_* style
 g_pg_opt      dd ?                         ;   class mask + PWO_* flags
@@ -11123,7 +11129,8 @@ vp_init:
     cmp     dword ptr [g_seclock_warned], 0
     jne     @F
     mov     dword ptr [g_seclock_warned], 1
-    WINCALL gui_msgbox, qword ptr [rbp-8], addr s_nolock, addr t_nolock, <MB_OK or MB_ICONWARNING>
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_seclock_warn
 @@:
     WINCALL DragAcceptFiles, qword ptr [rbp-8], 1   ; accept Explorer file drops
     mov     rcx, qword ptr [rbp-8]           ; Vordr shield in the title bar
@@ -13748,6 +13755,45 @@ gsh_build:
     FRAME_EPILOG
     ret
 gui_show_health endp
+
+; ===========================================================================
+; gui_seclock_warn(rcx = hdlg) - C3: show the "Secrets not pinned to RAM"
+;   warning with the actual Win32 error codes appended (VirtualLock + the
+;   working-set-grow), so a constrained environment can be diagnosed.
+; ===========================================================================
+public gui_seclock_warn
+gui_seclock_warn proc frame
+    FRAME_PROLOG 32
+    mov     qword ptr [rbp-24], rcx
+    lea     rcx, [g_lockmsg]
+    lea     rdx, [s_nolock]
+    call    gui_wstrcpy
+    mov     rcx, rax
+    lea     rdx, [hb_crlf]
+    call    gui_wstrcpy
+    mov     rcx, rax
+    lea     rdx, [hb_crlf]
+    call    gui_wstrcpy                         ; blank line
+    mov     rcx, rax
+    lea     rdx, [s_lkdiag1]                    ; "Diagnostic - VirtualLock error "
+    call    gui_wstrcpy
+    mov     ecx, dword ptr [g_lockerr_vl]
+    mov     rdx, rax
+    call    gui_u32w
+    mov     rcx, rax
+    lea     rdx, [s_lkdiag2]                    ; ", working-set-grow error "
+    call    gui_wstrcpy
+    mov     ecx, dword ptr [g_lockerr_wss]
+    mov     rdx, rax
+    call    gui_u32w
+    mov     rcx, rax
+    lea     rdx, [s_lkdiag3]                    ; ". (VirtualLock is limited by ...)"
+    call    gui_wstrcpy
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr g_lockmsg, addr t_nolock, \
+            <MB_OK or MB_ICONWARNING>
+    FRAME_EPILOG
+    ret
+gui_seclock_warn endp
 
 ; =============================================================================
 ; gui_import(rcx = hdlg) -> eax = entries imported.  Pick a .vaultz file: the
