@@ -334,6 +334,7 @@ SW_MINIMIZE_        equ 6
 SW_MAXIMIZE_        equ 3
 SW_RESTORE_         equ 9
 SWP_FRAME_          equ 16h              ; SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE
+SWP_RAISE_          equ 13h              ; SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE (z-order to HWND_TOP)
 TBAR_H              equ 32               ; custom title-bar strip height (px)
 CAPBTN_W            equ 44               ; caption (min/max/close) button width
 IDC_T_MIN           equ 290             ; caption: minimize
@@ -10027,6 +10028,7 @@ search_overlay_open proc frame
     mov     qword ptr [rbp-64], rax           ; hold hwnd (MoveWindow below has a memory
     WINCALL MoveWindow, qword ptr [rbp-64], dword ptr [rbp-80], dword ptr [rbp-76], \
             dword ptr [rbp-56], dword ptr [rbp-60], 0                                   ; stack-arg -> rax can't be arg1)
+    WINCALL SetWindowPos, qword ptr [rbp-64], 0, 0, 0, 0, 0, SWP_RAISE_   ; raise the edit above the pill
     mov     eax, dword ptr [rbp-40]           ; list inside the panel (4px inset)
     add     eax, 4
     mov     dword ptr [rbp-48], eax
