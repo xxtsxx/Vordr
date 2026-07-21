@@ -186,6 +186,30 @@ VSLOT ends
 
 MAX_VAULTS      equ 8           ; simultaneously-open vaults (redesign items 6/7/9)
 
+; --- M2: the machine-local federation record (one per master) --------------
+; A fixed-layout table of foreign-vault links.  The whole struct is what
+; keyring_seal/open encrypt, so no variable-length serialization is needed.
+FED_MAXLINKS    equ MAX_VAULTS
+LINK_STALE      equ 1           ; cached key no longer matches the foreign KCV
+LINK_MISSING    equ 2           ; foreign file not found at the locator
+LINK_PROMPT     equ 4           ; opt-out: no cached key, always prompt
+
+FEDLINK struct
+    fl_id       db 16 dup(?)    ; foreign vault_id (SHA-256(salt)[0..15])
+    fl_kcv      db 16 dup(?)    ; foreign KCV (staleness check)
+    fl_key      db 32 dup(?)    ; cached derived key (zeroed when LINK_PROMPT)
+    fl_flags    dd ?
+    fl_pad      dd ?
+    fl_name     dw 64 dup(?)    ; display name (wide, NUL-term)
+    fl_loc      dw 260 dup(?)   ; locator = foreign file path (wide, NUL-term)
+FEDLINK ends
+
+FEDREC struct
+    fr_count    dd ?            ; number of live links (0..FED_MAXLINKS)
+    fr_rsv      dd ?
+    fr_links    FEDLINK FED_MAXLINKS dup(<>)
+FEDREC ends
+
 ; Availability retry state (redesign item 9): a vault whose file can't be opened
 ; (locked/missing) is not displayed; it is retried AVAIL_MAX_TRIES times at
 ; AVAIL_INTERVAL_MS spacing, then given up until the user unlocks again.  All
@@ -314,6 +338,10 @@ g_outlen    dq ?
 align 16
 g_att_greq  GCMREQ <>                          ; GCM req for attachment seal/open
 g_fedreq    GCMREQ <>                          ; M2: GCM req for the keyring blob seal/open
+align 8
+g_fedrec    FEDREC <>                          ; M2: the live federation record (link table)
+g_fedblob   db (sizeof FEDREC) + 32 dup (?)    ;   sealed form (nonce+ct+tag)
+g_fedlink_tmp FEDLINK <>                        ;   scratch link template (fedkat)
 g_fedkat_rec  db 128 dup (?)                   ; M2 keyringkat scratch: plaintext record
 g_fedkat_blob db 192 dup (?)                   ;   sealed blob (nonce+ct+tag)
 g_fedkat_out  db 128 dup (?)                   ;   opened plaintext
@@ -3035,6 +3063,185 @@ krk_ret:
     FRAME_EPILOG
     ret
 cmd_keyringkat endp
+
+; --- M2: federation link-table management -----------------------------------
+; fed_reset() - empty the record.  Leaf.
+public fed_reset
+fed_reset proc
+    mov     dword ptr [g_fedrec + FEDREC.fr_count], 0
+    ret
+fed_reset endp
+
+; fed_slot(ecx = index) -> rax = &g_fedrec link[index].  Leaf, no bounds check.
+public fed_slot
+fed_slot proc
+    mov     eax, ecx
+    imul    rax, rax, sizeof FEDLINK
+    lea     rcx, [g_fedrec + FEDREC.fr_links]
+    add     rax, rcx
+    ret
+fed_slot endp
+
+; fed_find(rcx = &id16) -> eax = index of the link with that vault_id, else -1.
+public fed_find
+fed_find proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx           ; &id
+    mov     dword ptr [rbp-32], 0             ; i
+ff_lp:
+    mov     eax, dword ptr [rbp-32]
+    cmp     eax, dword ptr [g_fedrec + FEDREC.fr_count]
+    jae     ff_none
+    mov     ecx, dword ptr [rbp-32]
+    call    fed_slot                          ; rax = &link[i] (fl_id at offset 0)
+    mov     rcx, rax
+    mov     rdx, qword ptr [rbp-24]
+    mov     r8d, 16
+    call    idk_eq
+    test    eax, eax
+    jnz     ff_hit
+    inc     dword ptr [rbp-32]
+    jmp     ff_lp
+ff_hit:
+    mov     eax, dword ptr [rbp-32]
+    FRAME_EPILOG
+    ret
+ff_none:
+    mov     eax, -1
+    FRAME_EPILOG
+    ret
+fed_find endp
+
+; fed_add(rcx = &FEDLINK src) -> eax = index (update the link with the same id, or
+;   append a new one), or -1 if the table is full.  Copies the whole fixed FEDLINK.
+public fed_add
+fed_add proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx           ; src (fl_id at offset 0)
+    call    fed_find                          ; already have this vault_id?
+    cmp     eax, -1
+    jne     fa_have
+    mov     eax, dword ptr [g_fedrec + FEDREC.fr_count]   ; append
+    cmp     eax, FED_MAXLINKS
+    jae     fa_full
+    mov     dword ptr [rbp-32], eax           ; idx = count
+    inc     eax
+    mov     dword ptr [g_fedrec + FEDREC.fr_count], eax
+    jmp     fa_copy
+fa_have:
+    mov     dword ptr [rbp-32], eax           ; idx = existing
+fa_copy:
+    mov     ecx, dword ptr [rbp-32]
+    call    fed_slot
+    mov     rcx, rax                          ; dst = &link[idx]
+    mov     rdx, qword ptr [rbp-24]           ; src
+    mov     r8d, sizeof FEDLINK
+    call    copy_bytes
+    mov     eax, dword ptr [rbp-32]
+    FRAME_EPILOG
+    ret
+fa_full:
+    mov     eax, -1
+    FRAME_EPILOG
+    ret
+fed_add endp
+
+; cmd_fedkat - headless KAT for the link table + record round-trip: add 3 links,
+;   assert count + lookups, seal the record, clear it, open it back, and assert
+;   the links survive (count, id lookup, and a cached-key byte-pattern).  Exit 0.
+LANDING_PAD
+public cmd_fedkat
+cmd_fedkat proc frame
+    FRAME_PROLOG 48
+    call    fed_reset
+    mov     dword ptr [rbp-24], 0             ; v
+fk_build:
+    cmp     dword ptr [rbp-24], 3
+    jae     fk_built
+    lea     rcx, [g_fedlink_tmp + FEDLINK.fl_id]   ; id = (0x10+v) * 16
+    mov     edx, 16
+    mov     r8d, dword ptr [rbp-24]
+    add     r8d, 010h
+    call    idk_fill
+    lea     rcx, [g_fedlink_tmp + FEDLINK.fl_key]  ; key = (0x20+v) * 32
+    mov     edx, 32
+    mov     r8d, dword ptr [rbp-24]
+    add     r8d, 020h
+    call    idk_fill
+    mov     dword ptr [g_fedlink_tmp + FEDLINK.fl_flags], LINK_STALE or LINK_MISSING or LINK_PROMPT
+    lea     rcx, [g_fedlink_tmp]
+    call    fed_add
+    inc     dword ptr [rbp-24]
+    jmp     fk_build
+fk_built:
+    cmp     dword ptr [g_fedrec + FEDREC.fr_count], 3
+    mov     eax, 2
+    jne     fk_ret
+    ; derive a kek and seal the record
+    lea     rcx, [g_fedkat_mk]
+    mov     edx, 32
+    mov     r8b, 077h
+    call    idk_fill
+    lea     rcx, [g_fedkat_tpm]
+    mov     edx, 32
+    mov     r8b, 088h
+    call    idk_fill
+    lea     rcx, [g_fedkat_kek]
+    lea     rdx, [g_fedkat_mk]
+    lea     r8, [g_fedkat_tpm]
+    call    keyring_kek
+    lea     rcx, [g_fedrec]
+    mov     edx, sizeof FEDREC
+    lea     r8, [g_fedkat_kek]
+    lea     r9, [g_fedblob]
+    call    keyring_seal
+    mov     dword ptr [rbp-28], eax           ; bloblen
+    call    fed_reset                          ; wipe the live record
+    lea     rcx, [g_fedblob]                  ; open back into g_fedrec
+    mov     edx, dword ptr [rbp-28]
+    lea     r8, [g_fedkat_kek]
+    lea     r9, [g_fedrec]
+    call    keyring_open
+    cmp     eax, sizeof FEDREC
+    mov     eax, 3
+    jne     fk_ret
+    cmp     dword ptr [g_fedrec + FEDREC.fr_count], 3   ; count survived
+    mov     eax, 4
+    jne     fk_ret
+    lea     rcx, [g_fedlink_tmp + FEDLINK.fl_id]   ; find id for v=1 -> index 1
+    mov     edx, 16
+    mov     r8b, 011h
+    call    idk_fill
+    lea     rcx, [g_fedlink_tmp + FEDLINK.fl_id]
+    call    fed_find
+    cmp     eax, 1
+    mov     eax, 5
+    jne     fk_ret
+    mov     ecx, 1                             ; link[1].fl_key must be 0x21 * 32
+    call    fed_slot
+    lea     rcx, [g_fedkat_out]
+    mov     edx, 32
+    mov     r8b, 021h
+    call    idk_fill
+    mov     ecx, 1
+    call    fed_slot
+    lea     rcx, [rax + FEDLINK.fl_key]
+    lea     rdx, [g_fedkat_out]
+    mov     r8d, 32
+    call    idk_eq
+    test    eax, eax
+    mov     eax, 6
+    jz      fk_ret
+    mov     ecx, 1                             ; flags round-trip intact
+    call    fed_slot
+    cmp     dword ptr [rax + FEDLINK.fl_flags], LINK_STALE or LINK_MISSING or LINK_PROMPT
+    mov     eax, 7
+    jne     fk_ret
+    xor     eax, eax
+fk_ret:
+    FRAME_EPILOG
+    ret
+cmd_fedkat endp
 
 ; mvt_zero(rcx=ptr, edx=len) - zero a buffer (probe helper).  Leaf, volatile regs.
 mvt_zero proc
