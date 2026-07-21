@@ -10364,6 +10364,29 @@ xf_vdone:
     ret
 search_overlay_xfill endp
 
+; gui_draw_sopanel(rcx=lpdis) - paint the search-overlay backdrop as a distinct
+;   floating card: filled panel + 1px frame border, so the results dropdown reads
+;   as separate from the detail pane it floats over.
+gui_draw_sopanel proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx
+    mov     r10, rcx
+    mov     rax, qword ptr [r10+32]           ; hDC
+    mov     qword ptr [rbp-32], rax
+    lea     rax, [r10+40]                     ; &rcItem
+    mov     qword ptr [rbp-40], rax
+    WINCALL CreateSolidBrush, dword ptr [g_col_panel]
+    mov     qword ptr [rbp-48], rax
+    WINCALL FillRect, qword ptr [rbp-32], qword ptr [rbp-40], qword ptr [rbp-48]
+    WINCALL DeleteObject, qword ptr [rbp-48]
+    WINCALL CreateSolidBrush, dword ptr [g_col_frame]
+    mov     qword ptr [rbp-48], rax
+    WINCALL FrameRect, qword ptr [rbp-32], qword ptr [rbp-40], qword ptr [rbp-48]
+    WINCALL DeleteObject, qword ptr [rbp-48]
+    FRAME_EPILOG
+    ret
+gui_draw_sopanel endp
+
 ; gui_draw_xresult(rcx=lpdis) - paint one cross-vault result card from g_xr
 ;   (icon + title + subtitle + right-aligned dim vault name).
 gui_draw_xresult proc frame
@@ -11036,6 +11059,8 @@ vp_tdraw:
     je      vp_tdraw_tnoprev
     cmp     eax, IDC_V_LIST                   ; the entry list = icon cards
     je      vp_tdraw_list
+    cmp     eax, IDC_SO_PANEL                 ; search-overlay backdrop = bordered card
+    je      vp_tdraw_sopanel
     cmp     eax, IDC_SO_LIST                  ; search-overlay results
     je      vp_tdraw_solist
     cmp     eax, IDC_V_TABS                   ; multi-vault tab strip
@@ -11075,6 +11100,11 @@ vp_tdraw_icon:
 vp_tdraw_tabs:
     mov     rcx, r9
     call    gui_draw_tabs
+    mov     eax, 1
+    jmp     vp_ret
+vp_tdraw_sopanel:
+    mov     rcx, r9
+    call    gui_draw_sopanel
     mov     eax, 1
     jmp     vp_ret
 vp_tdraw_solist:
