@@ -168,6 +168,160 @@ House rules:
 
 ---
 
+## M. Master-vault federation (multi-vault redesign) — new headline effort (2026-07-21)
+
+**Why.** The tab-based multi-vault model (VSLOT/`g_vaults` contexts + `IDC_V_TABS`
+strip + cross-vault search) is a dead end: every open vault demands its own
+password on every unlock, TPM convenience-unlock is per-vault and awkward, and
+the tab strip fragments what should be one list of secrets. The redesign makes
+**one master vault the single authentication gate**; other vaults ("foreign"
+vaults) are *federated* — the master holds a keyring that caches their keys, so
+unlocking the master (password **or** TPM) transparently opens them all, and all
+their secrets merge into one list.
+
+**Shape.** The existing multi-vault machinery is *reused, not thrown away*: the
+VSLOT/`vault_ctx_*` contexts stay as the per-vault live-state holders, and the
+cross-vault XR enumeration (`search_overlay_xfill`) is promoted from a search-only
+cache to **the primary list builder**. What goes away is the user-facing tab strip
+and per-vault password prompting. This supersedes the tab-oriented parts of the R
+backlog: **R4**'s "per-vault entry counts on tabs" and **R5**'s "reopen the whole
+tab set" are rewritten below (M3/M4); delete those clauses from R when M lands.
+
+**Security posture (state it plainly).** The keyring means *master compromise =
+compromise of every federated vault* — the master's encrypted body becomes the
+one place that concentrates key material. That is the deliberate trade: a single
+strong gate (Argon2id + KCV + optional TPM) instead of N weak habits (password
+reuse, sticky notes). Cached keys live **only** inside the master's AES-256-GCM
+body, never in the registry, never on disk in the clear, and are `secure_zero`'d
+on lock like every other secret. Foreign vaults each keep their own independent
+key on disk — the cache is a convenience copy, not a new root of trust beyond the
+master.
+
+### M1. Vault identity — stable ID + user name
+1. **Vault ID (no format change):** derive `vault_id = SHA-256(salt)[0..15]`. The
+   32-byte salt is already unique per vault and fixed at creation, and the header
+   is the GCM AAD, so the derived ID is stable, collision-free and unforgeable
+   without breaking authentication. Every existing v2 vault gets an ID for free;
+   no header byte is spent (the 80-byte header has no spare). Add `vault_id_of()`
+   (hash of `g_hdr+VH_SALT`). *Test:* KAT — a fixed salt yields a fixed ID; two
+   different salts differ.
+2. **User-editable name:** store in the **body** (authenticated + encrypted), not
+   the header. Bump `VAULT_VERSION` → **3** and define a body preamble: after the
+   entry stream's `u32 entry_count`, a version-gated `u16 meta_len | meta_TLV`
+   block carrying `VMETA_NAME` (and reserved room for future vault-level settings).
+   v2 bodies have no preamble → name defaults to the file basename; first save
+   upgrades to v3. Editing the name reseals the master. *Test:* set a name, reseal,
+   reload → name round-trips; a v2 image opens with basename fallback then upgrades.
+
+### M2. The keyring / links table (core)
+1. Define the **links table**, a v3 master-body meta section: `link* {
+   vault_id16 | foreign_KCV16 | cached_key32 | flags u32 | display_name |
+   locator }`, where `locator` is the foreign vault path (wide, capped). Caching
+   the **derived 32-byte key** — not the password — means no plaintext password at
+   rest and **no Argon2 re-run** per foreign vault (fast fan-out unlock). `flags`
+   tracks `LINK_STALE` / `LINK_MISSING`.
+2. **Fan-out unlock:** after the master decrypts, walk the links table; for each
+   link, load the foreign file, and unlock it with `cached_key` **directly**
+   (`vault_unlock` variant that skips the KDF when a key is supplied), verifying
+   against the foreign file's own KCV. KCV mismatch (foreign password was changed)
+   → set `LINK_STALE`, skip, surface in M4; file absent → `LINK_MISSING`.
+3. **Re-key on demand:** re-authenticating a stale link (M4) runs the foreign KDF
+   once, refreshes `cached_key` + `foreign_KCV`, reseals the master.
+4. Keep each foreign vault's own on-disk crypto untouched — the cache is additive.
+   *Test:* `keyringkat` (headless) — build a master with N links, seal, reload,
+   assert every cached key round-trips and KCV-validates; flip one foreign KCV and
+   assert `LINK_STALE` is detected.
+
+### M3. Unified secret list (drop the tab strip)
+1. Remove `IDC_V_TABS`, `gui_draw_tabs`, `gui_tab_click`, `gui_switch_vault`, and
+   the tab-strip geometry (`PH_TABH`); the list shows the **union** of all open
+   vaults' entries. Promote the XR enumeration (`search_overlay_xfill` → a general
+   `list_fill_all`) to build the default list, each row tagged `(vault_id, entry)`.
+   Vault provenance shows as the existing dim right-aligned name (kept from the
+   cross-vault card) or an optional group header — no tabs.
+2. Edit/save routes to the **owning** vault: `vault_ctx_front(owner)` then
+   `vault_reseal`. New-item creation asks for a target vault (default: master).
+   Health/search/sort already operate on the merged XR set — reuse.
+   *Test:* extends `mvname`/`federatetest` — the merged list is the union with
+   correct owner attribution; editing an entry reseals only its owner.
+
+### M4. Foreign-vault management screen
+1. A dedicated modeless dialog (replaces the tab strip's add/close/switch): rows
+   of linked vaults with **name, path, status** (open / locked / stale / missing)
+   and entry count. Actions: **add link** (pick `.vordr` → unlock once → cache
+   key), rename, remove link (drop cached key + reseal master), **set master**,
+   **re-authenticate** a stale link, open/close.
+2. "Add link" is the federation entry point; "set master" re-points the registry +
+   TPM (M5) and folds the old master into the new master's links table.
+   *Test (needs a display):* add → row appears, secrets merge into the list;
+   remove → they vanish and the cached key is gone from the resealed master.
+
+### M5. Scope TPM + registry to the master only
+1. Registry persists **only** the master path (`reg_save_vault`); only the master
+   gets a TPM sidecar (`reg_tpm_set`/`gui_try_tpm_auto`). Foreign paths + keys move
+   **out** of the registry and **into** the master's links table — a net privacy
+   win (fewer plaintext vault paths in `HKCU`, extends the C6 hygiene work).
+2. The per-vault rollback mirror can key by `vault_id` instead of path (less
+   leakage). Foreign vaults no longer get their own registry/TPM entries.
+   *Test:* `migratetest` (headless) — after migration, `HKCU\SOFTWARE\Vordr`
+   TPM-Unlock/rollback hold master-only entries; foreign sidecars are deleted.
+
+### M6. Vault as the default export/import format
+1. **Export default → `.vordr`:** "export selected entries" seals them into a
+   fresh standalone vault (new salt/key from a user-supplied password), reusing the
+   `gcm_seal` + attachment path. The encrypted-ZIP export (`ze_compose`) stays as
+   the alternate ("winzip flexibility") behind a format choice.
+2. **Import default → `.vordr`:** two modes — **link** (federate the file via M2,
+   the common case) or **merge** (copy its entries into the current vault). ZIP
+   import (`zi_stage`/`zi_commit`) stays for external data. The vault is already the
+   superior container (AEAD + Argon2 + full-file MAC + attachments), so export =
+   "spin off a child vault" that round-trips losslessly.
+   *Test:* `vaultexportkat` (headless) — export N entries + an attachment to a new
+   vault, reopen, assert entries and attachment bytes match.
+
+### M7. Migration & back-compat
+1. `VAULT_VERSION` → 3 for the body preamble (name + links meta). **v2 vaults still
+   open** (read path tolerates a missing preamble; name = basename; ID from salt);
+   first save upgrades in place. A foreign vault may remain v2 — only the *master*
+   needs v3 for its links table.
+2. On first launch after upgrade, if the old multi-vault registry/tab-set
+   remembered several vaults, prompt to pick a master and fold the rest into its
+   links table (unlock each once to cache its key), then delete their individual
+   registry/TPM sidecars.
+3. Update `docs/formats.md` (v3 preamble + links-table layout) and the Sequencing
+   Format note; bump the format table. Any container/auth change bumps the version
+   — the links table is a container change, so v3 is mandatory, not tag-skip.
+
+### M8. Test/probe strategy (headless-first, per PROBE convention)
+Grounded in the existing probes (`mvtest`/`mvswitch`/`mvname`). Add, wired into
+`tests\run_all.cmd`:
+- **`keyringkat`** — links-table seal/reload + cached-key round-trip + stale-KCV
+  detection (M2).
+- **`federatetest`** — master + N foreign contexts, fan-out unlock from cached
+  keys, unified enumeration = the union with correct owner attribution (M2/M3).
+- **`vaultexportkat`** — entries + attachment export to a new `.vordr`, reopen,
+  byte-exact round-trip (M6).
+- **`migratetest`** — v2 + legacy multi-vault registry → v3 master + links; assert
+  foreign registry/TPM sidecars are gone (M5/M7).
+The keyring/format/migration logic must be provable headlessly; only the M4 screen
+and the list chrome (M3 painters) need a display.
+
+**Sequencing.** M1 (identity) → M2 (keyring + fan-out, headless, the core) →
+M7 (migration + version bump, alongside M2) → M6 (vault export/import, reuses the
+seal path) → M3 (unified list, removes tabs) → M4 (management screen) → M5 (registry/
+TPM scoping, folds in with M4). M1/M2/M6/M7/M8 are headlessly verifiable and should
+land build-green with KATs before the M3/M4 display work.
+
+**Open questions (resolve before M2 code).** (a) No master nesting — a foreign
+vault cannot itself be a master (flat federation in v1); enforce and test. (b) Body
+16 MiB cap is per-vault and unaffected (the links table is tiny). (c) Per-vault save
+locking (`.lock`, `vault_ext_changed`) is unchanged — a save touches only the owning
+vault; the master reseals only when the links table changes. (d) Decide whether
+"set master" migrates cached keys or re-prompts (default: migrate, since the keys
+are already trusted in memory).
+
+---
+
 ## R. Redesign remainder — the current active backlog (2026-07-21)
 
 With the C/E/G backlog cleared, group R is what's left. Every R item is
