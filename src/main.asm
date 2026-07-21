@@ -63,6 +63,7 @@ extern cmd_mvswitch:proc                ; multi-vault context switch probe (vaul
 extern cmd_mvname:proc                  ; multi-vault name<->body coupling probe (vault.asm)
 extern cmd_idkat:proc                   ; M1: vault_id_of KAT (vault.asm)
 extern cmd_kekkat:proc                  ; M2: keyring KEK KAT (vault.asm)
+extern cmd_keyringkat:proc              ; M2: keyring seal/open KAT (vault.asm)
 extern cmd_avtest:proc                  ; availability retry state-machine probe (vault.asm)
 extern cmd_pkat:proc                    ; parallel fail-closed KAT gate (selftest.asm)
 extern read_file:proc
@@ -210,6 +211,7 @@ WSTR w_mvswitch, <mvswitch>
 WSTR w_mvname,   <mvname>
 WSTR w_idkat,    <idkat>
 WSTR w_kekkat,   <kekkat>
+WSTR w_keyringkat, <keyringkat>
 WSTR w_avtest,   <avtest>
 ifdef DBG_TRACE
 WSTR w_securedesk, <securedesk>
@@ -269,6 +271,7 @@ cmd_table label CMDENT
     CMDENT { w_mvname,    cmd_mvname,    0, 0 }   ; multi-vault name<->body coupling probe
     CMDENT { w_idkat,     cmd_idkat,     0, 0 }   ; M1: vault_id_of KAT
     CMDENT { w_kekkat,    cmd_kekkat,    0, 0 }   ; M2: keyring KEK KAT
+    CMDENT { w_keyringkat, cmd_keyringkat, 0, 0 } ; M2: keyring seal/open KAT
     CMDENT { w_avtest,    cmd_avtest,    0, 0 }   ; availability retry state-machine probe
     CMDENT { w_pkat,      cmd_pkat,      0, 0 }   ; parallel fail-closed KAT gate
     CMDENT { w_trtest,    cmd_trtest,    0, 0 }   ; trash timestamp/threshold KAT
