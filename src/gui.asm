@@ -412,6 +412,7 @@ LB_INITSTORAGE      equ 1A8h            ; pre-allocate item storage for large li
 LB_SETCURSEL        equ 186h
 LB_GETCURSEL        equ 188h
 LB_GETCOUNT         equ 18Bh
+LB_GETITEMHEIGHT    equ 1A1h
 LBN_DBLCLK          equ 2
 VK_RETURN_          equ 0Dh
 VK_ESCAPE_          equ 1Bh
@@ -10488,9 +10489,45 @@ sop_single:
     mov     r8d, IDC_SO_EDIT
     call    poplist_into
 sop_done:
+    mov     rcx, qword ptr [rbp-24]           ; grow/shrink the dropdown to the hit count
+    call    search_overlay_resize
     FRAME_EPILOG
     ret
 search_overlay_populate endp
+
+; search_overlay_resize(rcx=hdlg) - size the results list + panel to the current
+;   hit count: height = clamp(rows * itemHeight, one row, SO_LISTH).  Called after
+;   every populate so the dropdown shrinks as the query filters results down.
+search_overlay_resize proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_SO_LIST, LB_GETITEMHEIGHT, 0, 0
+    test    eax, eax
+    jz      sor_done                          ; no row height yet -> leave as built
+    mov     dword ptr [rbp-28], eax           ; rowH
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_SO_LIST, LB_GETCOUNT, 0, 0
+    test    eax, eax
+    jns     @F
+    xor     eax, eax                          ; LB_ERR -> 0 rows
+@@: imul    eax, dword ptr [rbp-28]           ; listH = rows * rowH
+    cmp     eax, SO_LISTH                      ; clamp high
+    jle     @F
+    mov     eax, SO_LISTH
+@@: cmp     eax, dword ptr [rbp-28]           ; clamp low (at least one row tall)
+    jge     @F
+    mov     eax, dword ptr [rbp-28]
+@@: mov     dword ptr [rbp-32], eax           ; listH (final)
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_SO_LIST
+    WINCALL SetWindowPos, rax, 0, 0, 0, SO_W-8, dword ptr [rbp-32], SWP_FRAME_
+    mov     eax, dword ptr [rbp-32]           ; panel = edit strip + list
+    add     eax, SO_EDITH
+    mov     dword ptr [rbp-36], eax
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_SO_PANEL
+    WINCALL SetWindowPos, rax, 0, 0, 0, SO_W, dword ptr [rbp-36], SWP_FRAME_
+sor_done:
+    FRAME_EPILOG
+    ret
+search_overlay_resize endp
 
 ; gui_draw_tabs(rcx=lpdis) - paint the multi-vault tab strip: one tab per open
 ;   vault (lock glyph + display name), the fronted vault highlighted.
