@@ -2655,6 +2655,115 @@ mvn_fail:
     ret
 cmd_mvname endp
 
+; ===========================================================================
+; M1 (master-vault federation): vault identity.  The machine-local keyring
+; keys foreign vaults by a 16-byte vault_id.  It is derived from the header
+; salt - SHA-256(salt)[0..15] - which is stable (the salt is fixed at vault
+; creation) and unique, and needs no format change.  A pinned system-item ID
+; supersedes this once system items land (M1.2).
+; ===========================================================================
+; vault_id_of(rcx = out16) - write SHA-256(g_hdr salt)[0..15] to out.
+public vault_id_of
+vault_id_of proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx           ; out16
+    lea     rcx, [g_hdr+VH_SALT]              ; hash the 32-byte CSPRNG salt
+    mov     edx, 32
+    lea     r8, [rbp-64]                      ; 32-byte digest scratch (above the shadow)
+    call    sha256_hash
+    mov     rcx, qword ptr [rbp-24]           ; out = digest[0..15]
+    lea     rdx, [rbp-64]
+    mov     r8d, 16
+    call    copy_bytes
+    FRAME_EPILOG
+    ret
+vault_id_of endp
+
+; cmd_idkat - headless KAT for vault_id_of: (1) it equals SHA-256(salt)[0..15],
+;   (2) it is deterministic (same salt -> same id), (3) it differs for a
+;   different salt.  Clobbers g_hdr salt (scratch when no vault is open).
+;   Exit 0 = pass.
+LANDING_PAD
+public cmd_idkat
+cmd_idkat proc frame
+    FRAME_PROLOG 112
+    lea     rcx, [g_hdr+VH_SALT]              ; salt = 0x11 * 32
+    mov     edx, 32
+    mov     r8b, 011h
+    call    idk_fill
+    lea     rcx, [rbp-32]                     ; id_a = vault_id_of()
+    call    vault_id_of
+    lea     rcx, [g_hdr+VH_SALT]              ; ref = SHA-256(salt), compare [0..15]
+    mov     edx, 32
+    lea     r8, [rbp-80]
+    call    sha256_hash
+    lea     rcx, [rbp-32]
+    lea     rdx, [rbp-80]
+    mov     r8d, 16
+    call    idk_eq
+    test    eax, eax
+    jz      idk_fail                          ; (1) must equal SHA-256(salt)[0..15]
+    lea     rcx, [rbp-48]                     ; (2) determinism: id again == id_a
+    call    vault_id_of
+    lea     rcx, [rbp-32]
+    lea     rdx, [rbp-48]
+    mov     r8d, 16
+    call    idk_eq
+    test    eax, eax
+    jz      idk_fail
+    lea     rcx, [g_hdr+VH_SALT]              ; (3) distinctness: salt = 0x22 -> id_b != id_a
+    mov     edx, 32
+    mov     r8b, 022h
+    call    idk_fill
+    lea     rcx, [rbp-48]
+    call    vault_id_of
+    lea     rcx, [rbp-32]
+    lea     rdx, [rbp-48]
+    mov     r8d, 16
+    call    idk_eq
+    test    eax, eax
+    jnz     idk_fail
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+idk_fail:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_idkat endp
+
+; idk_fill(rcx=ptr, edx=len, r8b=val) - byte-fill helper.  Leaf, volatile regs.
+idk_fill proc
+    xor     r9d, r9d
+idkf_lp:
+    cmp     r9d, edx
+    jae     idkf_done
+    mov     byte ptr [rcx+r9], r8b
+    inc     r9d
+    jmp     idkf_lp
+idkf_done:
+    ret
+idk_fill endp
+
+; idk_eq(rcx=a, rdx=b, r8d=len) -> eax = 1 if equal else 0.  Leaf, volatile regs.
+idk_eq proc
+    xor     r9d, r9d
+idke_lp:
+    cmp     r9d, r8d
+    jae     idke_eq
+    mov     al, byte ptr [rcx+r9]
+    cmp     al, byte ptr [rdx+r9]
+    jne     idke_ne
+    inc     r9d
+    jmp     idke_lp
+idke_eq:
+    mov     eax, 1
+    ret
+idke_ne:
+    xor     eax, eax
+    ret
+idk_eq endp
+
 ; mvt_zero(rcx=ptr, edx=len) - zero a buffer (probe helper).  Leaf, volatile regs.
 mvt_zero proc
     xor     r9d, r9d
