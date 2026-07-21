@@ -10253,7 +10253,14 @@ xr_wcopy endp
 ;   can be painted without its home vault being fronted.  Restores the original
 ;   fronted vault when done.
 search_overlay_xfill proc frame
-    FRAME_PROLOG 96
+    FRAME_PROLOG 128                          ; frame 144.  Keep the cached vname ptr
+                                              ; ([rbp-88], live across the whole entry loop)
+                                              ; out of the callee shadow/arg-home region
+                                              ; [rbp-framesize .. -framesize+32): at frame
+                                              ; 112 that window was [rbp-104..-72), so -88
+                                              ; sat inside it - a latent ABI hazard (any leaf
+                                              ; helper or inlined WINCALL there would corrupt
+                                              ; it).  Defensive; not the multi-vault fix.
     mov     qword ptr [rbp-24], rcx
     mov     eax, dword ptr [g_vault_cur]      ; remember the fronted vault
     mov     dword ptr [rbp-28], eax
@@ -10273,7 +10280,7 @@ xf_vloop:
     call    vault_ctx_front                   ; live = vault v
     mov     ecx, dword ptr [rbp-36]
     call    vault_ctx_nameptr
-    mov     qword ptr [rbp-88], rax           ; vname ptr (own 8-byte slot; -48 would overlap j at -44)
+    mov     qword ptr [rbp-88], rax           ; vname ptr (above the shadow region; see FRAME note)
     call    vault_count
     mov     dword ptr [rbp-40], eax           ; cnt
     mov     dword ptr [rbp-44], 0             ; j
@@ -10914,21 +10921,33 @@ vp_compare:
     call    gui_title_cmp
     jmp     vp_ret
 vp_compare_xr:
-    mov     ecx, dword ptr [r10+24]          ; cross-vault: sort by cached score (desc)
-    cmp     ecx, dword ptr [g_xr_n]          ; guard against foreign item data
-    jae     vpc_eq
-    mov     edx, dword ptr [r10+40]
-    cmp     edx, dword ptr [g_xr_n]
-    jae     vpc_eq
-    call    xr_ptr
-    mov     r11d, dword ptr [rax+XR.xr_score]
+    mov     ecx, dword ptr [r10+24]          ; cross-vault order: score DESC, then vault
+    cmp     ecx, dword ptr [g_xr_n]          ;   ASC, then entry ASC.  A *total* order:
+    jae     vpc_eq                           ;   with an empty query every score is 0, so
+    mov     edx, dword ptr [r10+40]          ;   score-only left the sort undefined and the
+    cmp     edx, dword ptr [g_xr_n]          ;   results looked shuffled / vaults mixed up.
+    jae     vpc_eq                           ;   (guard against foreign item data)
+    call    xr_ptr                           ; rax = xr[A] (ecx = idxA); r8 survives xr_ptr
+    mov     r8, rax
     mov     r10, r9
     mov     ecx, dword ptr [r10+40]
-    call    xr_ptr
-    mov     eax, dword ptr [rax+XR.xr_score]
-    cmp     r11d, eax
+    call    xr_ptr                           ; rax = xr[B]
+    mov     r11, rax
+    mov     ecx, dword ptr [r8+XR.xr_score]  ; 1) score descending
+    mov     edx, dword ptr [r11+XR.xr_score]
+    cmp     ecx, edx
     jg      vpc_a
     jl      vpc_b
+    mov     ecx, dword ptr [r8+XR.xr_vault]  ; 2) vault index ascending
+    mov     edx, dword ptr [r11+XR.xr_vault]
+    cmp     ecx, edx
+    jb      vpc_a
+    ja      vpc_b
+    mov     ecx, dword ptr [r8+XR.xr_entry]  ; 3) entry index ascending
+    mov     edx, dword ptr [r11+XR.xr_entry]
+    cmp     ecx, edx
+    jb      vpc_a
+    ja      vpc_b
     xor     eax, eax
     jmp     vp_ret
 vpc_a:

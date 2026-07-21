@@ -265,6 +265,8 @@ CSTR m_created, "vault created.",13,10
 .data?
 align 16
 g_mvslot    db (sizeof VSLOT) dup (?)  ; multi-vault: one held vault-state slot (probe/scratch)
+            even                       ; keep the wide scratch below 2-aligned
+g_mvnamebuf dw 8 dup (?)               ; cmd_mvname: scratch wide name source (probe)
 align 16
 public g_vaults
 public g_vault_n
@@ -2586,6 +2588,73 @@ mvt_fail:
     ret
 cmd_mvtest endp
 
+; cmd_mvname - headless probe for the cross-vault-search enumeration.  Reproduces
+;   what search_overlay_xfill does: open N vaults (each coupling a distinct body
+;   seed with a distinct display name), sit on tab 0 (the front() no-op path),
+;   then front every vault in turn and assert BOTH its live body state (mv_check)
+;   AND its cached name (vault_ctx_nameptr) still belong to that vault.  A slot
+;   whose name and body got crossed (the reported "vault N shows another vault's
+;   file") would fail here.  Exit 0 = pass.  Uses fake seed body pointers, so -
+;   like cmd_mvswitch - it never closes/resets at the end (those free the body).
+LANDING_PAD
+public cmd_mvname
+cmd_mvname proc frame
+    FRAME_PROLOG 48
+    call    vault_ctx_reset
+    mov     dword ptr [rbp-24], 0            ; v = 0
+mvn_open:
+    cmp     dword ptr [rbp-24], 6
+    jae     mvn_switch
+    call    vault_ctx_open                  ; snapshot prev live -> its slot; cur = v
+    mov     eax, dword ptr [rbp-24]          ; live = vault v (seed 40h+v)
+    add     eax, 40h
+    mov     ecx, eax
+    call    mv_plant
+    mov     eax, dword ptr [rbp-24]          ; name(v) = wide "<'0'+v>"
+    add     eax, '0'
+    mov     word ptr [g_mvnamebuf], ax
+    mov     word ptr [g_mvnamebuf+2], 0
+    mov     ecx, dword ptr [rbp-24]
+    lea     rdx, [g_mvnamebuf]
+    call    vault_ctx_setname
+    inc     dword ptr [rbp-24]
+    jmp     mvn_open
+mvn_switch:
+    xor     ecx, ecx                         ; sit on tab 0 (exercises the front() no-op)
+    call    vault_ctx_front
+    mov     dword ptr [rbp-24], 0            ; enumerate exactly like the search fill
+mvn_enum:
+    cmp     dword ptr [rbp-24], 6
+    jae     mvn_pass
+    mov     ecx, dword ptr [rbp-24]
+    call    vault_ctx_front
+    test    eax, eax
+    jnz     mvn_fail
+    mov     eax, dword ptr [rbp-24]          ; live body must be vault v's seed
+    add     eax, 40h
+    mov     ecx, eax
+    call    mv_check
+    test    eax, eax
+    jnz     mvn_fail
+    mov     ecx, dword ptr [rbp-24]          ; name(v) must still be vault v's name
+    call    vault_ctx_nameptr
+    movzx   edx, word ptr [rax]
+    mov     eax, dword ptr [rbp-24]
+    add     eax, '0'
+    cmp     dx, ax
+    jne     mvn_fail
+    inc     dword ptr [rbp-24]
+    jmp     mvn_enum
+mvn_pass:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+mvn_fail:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_mvname endp
+
 ; mvt_zero(rcx=ptr, edx=len) - zero a buffer (probe helper).  Leaf, volatile regs.
 mvt_zero proc
     xor     r9d, r9d
@@ -2739,6 +2808,7 @@ mvs_fail:
     FRAME_EPILOG
     ret
 cmd_mvswitch endp
+
 
 ; cmd_avtest - headless proof of the availability retry state machine (item 9).
 ;   Drives a single AVSLOT through the full unavailable->retry->give-up->manual-

@@ -100,7 +100,7 @@ set /a T_SELFTEST=!T1!-!T0!
 
 rem -------------------------------------------------------------- roundtrip --
 call :now T0
-echo === stage: roundtrip (seedtest / atgen / zitest / phtest / secscan / tmptest / fztest / trtest / vfuzz / fuzzzip / bktest / mactest / rbtest / xctest / reload / attfuzz / healthkat / pkat / mvtest / mvswitch / avtest) ===
+echo === stage: roundtrip (seedtest / atgen / zitest / phtest / secscan / tmptest / fztest / trtest / vfuzz / fuzzzip / bktest / mactest / rbtest / xctest / reload / attfuzz / healthkat / pkat / mvtest / mvswitch / mvname / avtest) ===
 set RT=PASS
 
 bin\vordr.exe seedtest "%WORK%\rt.vault" > "%WORK%\seedtest.log" 2>&1
@@ -176,6 +176,9 @@ if not "!errorlevel!"=="0" ( echo   mvtest: FAIL ^(exit !errorlevel!, multi-vaul
 
 bin\vordr.exe mvswitch > "%WORK%\mvswitch.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   mvswitch: FAIL ^(exit !errorlevel!, multi-vault context switch^) & set RT=FAIL )
+
+bin\vordr.exe mvname > "%WORK%\mvname.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   mvname: FAIL ^(exit !errorlevel!, cross-vault name/body coupling^) & set RT=FAIL )
 
 bin\vordr.exe avtest > "%WORK%\avtest.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   avtest: FAIL ^(exit !errorlevel!, availability retry state machine^) & set RT=FAIL )
