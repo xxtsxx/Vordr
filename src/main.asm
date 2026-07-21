@@ -65,6 +65,7 @@ extern cmd_idkat:proc                   ; M1: vault_id_of KAT (vault.asm)
 extern cmd_kekkat:proc                  ; M2: keyring KEK KAT (vault.asm)
 extern cmd_keyringkat:proc              ; M2: keyring seal/open KAT (vault.asm)
 extern cmd_fedkat:proc                  ; M2: federation link-table KAT (vault.asm)
+extern cmd_fedregkat:proc               ; M2: federation registry persistence KAT (vault.asm)
 extern cmd_avtest:proc                  ; availability retry state-machine probe (vault.asm)
 extern cmd_pkat:proc                    ; parallel fail-closed KAT gate (selftest.asm)
 extern read_file:proc
@@ -214,6 +215,7 @@ WSTR w_idkat,    <idkat>
 WSTR w_kekkat,   <kekkat>
 WSTR w_keyringkat, <keyringkat>
 WSTR w_fedkat,   <fedkat>
+WSTR w_fedregkat, <fedregkat>
 WSTR w_avtest,   <avtest>
 ifdef DBG_TRACE
 WSTR w_securedesk, <securedesk>
@@ -275,6 +277,7 @@ cmd_table label CMDENT
     CMDENT { w_kekkat,    cmd_kekkat,    0, 0 }   ; M2: keyring KEK KAT
     CMDENT { w_keyringkat, cmd_keyringkat, 0, 0 } ; M2: keyring seal/open KAT
     CMDENT { w_fedkat,    cmd_fedkat,    0, 0 }   ; M2: federation link-table KAT
+    CMDENT { w_fedregkat, cmd_fedregkat, 0, 0 }   ; M2: federation registry persistence KAT
     CMDENT { w_avtest,    cmd_avtest,    0, 0 }   ; availability retry state-machine probe
     CMDENT { w_pkat,      cmd_pkat,      0, 0 }   ; parallel fail-closed KAT gate
     CMDENT { w_trtest,    cmd_trtest,    0, 0 }   ; trash timestamp/threshold KAT
