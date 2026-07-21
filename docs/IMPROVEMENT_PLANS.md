@@ -91,6 +91,24 @@ Probes `reload` + `cowrite` gated in RUNALL; `formats.md` updated. The full
 backoff are possible refinements (the current reload-safe flow already prevents
 lost updates).
 
+**Done 2026-07-21 (plan-completion sweep → PR #2):** the remaining
+headlessly-verifiable backlog was cleared. **C4** (opt-in `TpmRequireHello`:
+`tpm_seal` stamps `NCRYPT_UI_POLICY`, `tpm_unseal` drops the SILENT flags when
+set; default off = silent unlock behaviorally unchanged; prompting path can't be
+verified without a TPM+Hello, so it is gated off). **E15** (DEFLATE-in-zipimport
+resolved as a documented STORED-only limitation in README + the GUI no-entries
+message; porting inflate deferred rather than add a fuzzed pre-auth path).
+**G7.1** (`vfuzz`/`fuzzzip`/`attfuzz` draw a random seed each run, log it, and
+accept `--seed N` to reproduce; shared `fuzz_seed` helper). **E6** (vault-health:
+`vault_health` computes {weak, reused, old, total}; `healthkat` KAT gates it in
+RUNALL; Ctrl+H shows a summary box; sidebar tiles show a weak-password dot — the
+richer modeless dialog + reused/stale badges are folded to **R6**). An
+adversarial re-audit of the sweep caught and fixed one real bug: `vault_health`
+freed its password-digest scratch without a wipe length, which could leak
+BLAKE2b fingerprints or drive an OOB `secure_zero`; it now wipes `n*HSTRIDE`
+bytes. C4/E6/E15/G7 sections removed from this file; the visual-only remainder
+is group R.
+
 House rules:
 
 - Plan IDs are stable: `C4` stays `C4` when other plans are completed or added.
@@ -113,9 +131,10 @@ House rules:
   pipeline: stage 1 redteam (dbg build; 8 fault-injection cases each exit with
   `0xFADE<code>` in the high word, `iat` dies with `0xC0000005`), stage 2
   strict build, stage 3 selftest, stage 4 probes: `seedtest` → `atgen` →
-  `zitest` → `phtest` → `secscan` → `tmptest` → `fztest` → `trtest` →
-  `vfuzz` → `fuzzzip` → `bktest` → `mactest` → `rbtest` → `xctest` → `pkat`.
-  `--quick` skips stage 1.
+  `zitest` → `phtest` → `secscan` → `lktest` → `tmptest` → `fztest` → `trtest`
+  → `vfuzz` → `fuzzzip` → `bktest` → `mactest` → `rbtest` → `xctest` → `reload`
+  → `cowrite` → `attfuzz` → `healthkat` → `pkat` → `mvtest` → `mvswitch` →
+  `avtest`. `--quick` skips stage 1.
 - **FRAMES** = no >4-arg `WINCALL` directly inside a raw `sub rsp,64` dialog
   proc (`create_proc`, `unlock_proc`, `vault_proc`, `msg_proc`, `about_proc`,
   …); wide calls go in a `FRAME_PROLOG N` helper. This is the BEX64/offset-0
@@ -140,69 +159,16 @@ House rules:
 
 ---
 
-## C. Hardening & platform
+## R. Redesign remainder — the current active backlog (2026-07-21)
 
-### C4. TPM unlock hardening — DONE
-All ncrypt calls were `NCRYPT_SILENT` — any same-user process could unwrap the
-vault key.
-
-1. *Done.* Opt-in `TpmRequireHello` setting (HKLM > HKCU DWORD, default 0 =
-   today's silent behavior). When set, `tpm_seal` stamps an `NCRYPT_UI_POLICY`
-   (`NCRYPT_UI_PROTECT_KEY_FLAG`) on the key at creation and `tpm_unseal` drops
-   `NCRYPT_SILENT_FLAG` / `NCRYPT_OAEP_SILENT` so Windows may surface a
-   Hello/PIN prompt. Best-effort: a provider that rejects the policy just leaves
-   the key silent. *Note:* the prompting path can't be runtime-verified in this
-   environment (no TPM+Hello); gated off by default so existing TPM unlock is
-   behaviorally unchanged (the default path loads the same silent flag values,
-   now via locals).
-
-(The former blob-hygiene item — the TPM registry value name was the full vault
-path — is fixed by C6: the name is now hashed and legacy path-named values are
-pruned at unlock.)
-
-
----
-
-## E. Features (all verified absent)
-
-### E6. Vault health dashboard — mostly DONE
-
-1. *Done.* `vault_health(out)` fills `{weak, reused, old, total}`: weak =
-   `< 12` code points or `< 3` character classes (`vh_pw_weak`); reused =
-   VF_SECRET byte-identical to another entry (BLAKE2b-128); old = modified over
-   365 days ago. Fixed, policy-independent thresholds keep headless counts
-   deterministic. `healthkat` verb asserts the counts against a hand-built
-   10-entry fixture (weak=4 reused=6 old=2 total=10) — wired into RUNALL.
-2. *Done (as a summary).* Ctrl+H runs `gui_show_health`, which calls
-   `vault_health` on the open vault and shows a message box with the four
-   counts (`gui_wstrcpy`/`gui_u32w`-composed). The richer version — a modeless
-   dialog whose rows jump to the offending entry — is a follow-up (**R-new**).
-3. *Done (weak only).* Sidebar tiles now show a red bullet on the right edge
-   when the entry's password is weak (`gui_draw_listitem`, normal view). Reused
-   and stale dots + a worst-bucket count badge are the follow-up in R-new.
-
-**Remaining (folded to a follow-up):** a modeless health dialog with
-click-to-navigate rows, and reused/stale tile indicators + a count badge. These
-need a cached per-entry classification with invalidation on edit/save; deferred
-because they can't be verified in a headless environment. Tracked as **R6**.
-
-
-### E15. DEFLATE in zipimport — DONE (documented limitation)
-Imports accept only Vordr's own STORE-inside-AES exports; DEFLATE-compressed
-AES zips (7-Zip/WinRAR default) decrypt but fail to parse. There is no inflate
-in this repo, and zero third-party code is a deliberate constraint (the sibling
-`myrkr` decoder is not present here to port).
-
-1. *Done — decision: document the limitation.* README "Import and export"
-   now states STORED-only and how to re-create an archive with no compression;
-   the GUI's "no importable entries" message spells out the STORED-only rule.
-2. Porting inflate is deferred (would add a fuzzed pre-auth code path for a
-   convenience the STORE workaround already covers). If revisited: `inflate.asm`
-   + KAT selftests, import dispatches method 8 vs 0, RUNALL incl. `fuzzzip`
-   must stay green.
-
-
-## R. Redesign remainder
+With the C/E/G backlog cleared, group R is what's left. Every R item is
+**painter/interaction work whose acceptance test is visual** ("100% vs 200%
+screenshots", "scrolls with no paint over the header", "fast-scrolls to the
+right letter"), so each needs a real display to verify — they were deliberately
+left for an environment where the window can be seen, rather than shipped
+build-green-but-unverified. Sequence suggestion: R3 (DPI, touches every
+painter — do it before adding more) → R1 (scroll) → R6/R4 (tile decorations,
+shared analysis/enumeration) → R2 (palette) → R5 (session restore).
 
 Folded in from `docs/REDESIGN_PLAN.md` (the standalone doc was merged into
 this file and deleted). The redesign landed with merge 2c9f744: custom frame +
@@ -248,23 +214,6 @@ rows jump to the offending entry, plus reused/stale tile indicators and a
 worst-bucket count badge. Needs a cached per-entry classification invalidated
 on edit/save (the summary recomputes on demand today). *Test:* fix one weak
 password → badge decrements after save; clicking a row highlights its tile.
-
----
-
-## G. Infrastructure & performance
-
-### G7. CI hardening
-**Done (2026-07-21):** nightly `schedule` trigger; the reproducible `build release`
-step; `ilammy/msvc-dev-cmd` SHA-pinned; stage-list comments in `run_all.cmd` +
-`build.yml` corrected.
-
-**Done (2026-07-21):** `vfuzz`, `fuzzzip` and `attfuzz` now draw a random 32-bit
-seed each run and log `fuzz seed: N` to stdout (captured in each stage's log by
-`run_all.cmd`). `--seed N` forces a specific seed, so a nightly failure
-reproduces deterministically from the value in its log. Shared helper
-`fuzz_seed` (main.asm) expands the 32-bit value to a nonzero 64-bit xorshift
-state via a splitmix multiply. *Verified:* `--seed 42` twice → identical splits;
-random runs log distinct seeds; all three stay exit-0 in the gate.
 
 ---
 
