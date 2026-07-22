@@ -1094,6 +1094,16 @@ CSTR krl_sha_empty,  "sha256/empty "
 CSTR krl_sha_abc,    "sha256/abc "
 CSTR krl_sha_fips2,  "sha256/fips2 "
 CSTR krl_sha_a1k,    "sha256/a1000 "
+CSTR krl_sha_a55,    "sha256/a55 "
+CSTR krl_sha_a56,    "sha256/a56 "
+CSTR krl_sha_a63,    "sha256/a63 "
+CSTR krl_sha_a64,    "sha256/a64 "
+CSTR krl_sha_a65,    "sha256/a65 "
+CSTR krl_sha_a127,   "sha256/a127 "
+CSTR krl_sha_a128,   "sha256/a128 "
+CSTR krl_b2_a127,    "blake2b512/a127 "
+CSTR krl_b2_a128,    "blake2b512/a128 "
+CSTR krl_b2_a129,    "blake2b512/a129 "
 CSTR krl_b2_empty,   "blake2b512/empty "
 CSTR krl_b2_abc,     "blake2b512/abc "
 CSTR krl_b2_fox,     "blake2b512/fox "
@@ -1154,6 +1164,25 @@ KEMIT macro lbl, buf, blen
     call    print_a
 endm
 
+; KSHA_N lbl, n - emit SHA-256 of the first n bytes of kr_a1k ('a'*n)
+KSHA_N macro lbl, n
+    lea     rcx, [kr_a1k]
+    mov     rdx, n
+    lea     r8, [kr_o64]
+    call    sha256_hash
+    KEMIT   lbl, kr_o64, 32
+endm
+
+; KB2_N lbl, n - emit BLAKE2b-512 of the first n bytes of kr_a1k ('a'*n)
+KB2_N macro lbl, n
+    lea     rcx, [kr_a1k]
+    mov     rdx, n
+    lea     r8, [kr_o64]
+    mov     r9, 64
+    call    blake2b_hash
+    KEMIT   lbl, kr_o64, 64
+endm
+
 LANDING_PAD
 public cmd_katreport
 cmd_katreport proc frame
@@ -1181,6 +1210,14 @@ cmd_katreport proc frame
     lea     r8, [kr_o64]
     call    sha256_hash
     KEMIT   krl_sha_a1k, kr_o64, 32
+    ; SHA-256 block-boundary lengths (block = 64; padding edge at 55/56) over 'a'*N
+    KSHA_N  krl_sha_a55, 55
+    KSHA_N  krl_sha_a56, 56
+    KSHA_N  krl_sha_a63, 63
+    KSHA_N  krl_sha_a64, 64
+    KSHA_N  krl_sha_a65, 65
+    KSHA_N  krl_sha_a127, 127
+    KSHA_N  krl_sha_a128, 128
 
     ; ---- BLAKE2b-512 ----
     lea     rcx, [st_abc]
@@ -1201,6 +1238,9 @@ cmd_katreport proc frame
     mov     r9, 64
     call    blake2b_hash
     KEMIT   krl_b2_fox, kr_o64, 64
+    KB2_N   krl_b2_a127, 127                     ; BLAKE2b block = 128 bytes
+    KB2_N   krl_b2_a128, 128
+    KB2_N   krl_b2_a129, 129
 
     ; ---- HMAC-SHA1 ----
     WINCALL hmac_sha1, addr hm_key, 20, addr hm_msg, 8, addr kr_o64
