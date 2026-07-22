@@ -188,7 +188,7 @@ endm
 ; Preserves rax/rdx/xmm0 (return values).  Clobbers r10, r11.
 ; =============================================================================
 FRAME_EPILOG macro
-    local ok1, ok2
+    local ok1, ok2, sse_scan, sse_fail
     ; ---- verify stack canary ------------------------------------------------
     mov     r10, qword ptr [g_stack_canary]
     cmp     r10, qword ptr [rbp-8]
@@ -196,17 +196,27 @@ FRAME_EPILOG macro
     mov     ecx, FF_STACK_COOKIE
     jmp     ff_trap
 ok1:
-    ; ---- pop + verify software shadow stack --------------------------------
+    ; ---- pop + verify the software shadow stack (SEH-unwind tolerant) -------
+    ; The OS SEH unwinder restores rsp/rbp but does NOT pop this software shadow
+    ; stack, so an exception unwinding through framed procs (e.g. the Windows
+    ; GUI / CoreMessaging exceptions raised while the create/unlock dialog runs
+    ; on the Secure-Unlock private desktop) leaves stale entries above the live
+    ; frame's.  So instead of fastfailing on the first mismatch, scan DOWN for
+    ; THIS frame's return address: found -> resync (drop the stale entries above
+    ; it); absent from the whole stack -> a genuine return-address (ROP)
+    ; violation.  rax holds the return value here, so scratch is r8/r10/r11 only.
+    mov     r11, qword ptr [rbp+8]              ; the return address to match
     mov     r10, qword ptr [g_sstk_index]
+    mov     r8, qword ptr [g_sstk_base]
+sse_scan:
     test    r10, r10
-    jz      @F
+    jz      sse_fail                            ; hit the bottom -> not ours -> ROP
     dec     r10
-    mov     qword ptr [g_sstk_index], r10
-    mov     r11, qword ptr [g_sstk_base]
-    mov     r11, qword ptr [r11+r10*8]
-    cmp     r11, qword ptr [rbp+8]
-    je      ok2
-@@:
+    cmp     r11, qword ptr [r8+r10*8]
+    jne     sse_scan
+    mov     qword ptr [g_sstk_index], r10       ; resync to just below the match
+    jmp     ok2
+sse_fail:
     mov     ecx, FF_SHADOW_STACK
     jmp     ff_trap
 ok2:
