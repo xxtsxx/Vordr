@@ -3045,6 +3045,69 @@ mvs_fail:
     ret
 cmd_mvstale endp
 
+; cmd_mvrecreate <path> - reproduce "create a master, use it, lock; then create
+;   ANOTHER master, crash".  Runs the full go_vault sequence (seed+derive, claim
+;   slot 0, real unlock, fed_unlock_master, fed_fanout) then the lock (reset+lock)
+;   TWICE in one process - the tray-persistent app's second create cycle.  Exit
+;   0 = both cycles survived.
+CSTR mrc_ok, "mvrecreate: PASS (two create+lock cycles survived)",13,10
+LANDING_PAD
+public cmd_mvrecreate
+cmd_mvrecreate proc frame
+    FRAME_PROLOG 64
+    mov     dword ptr [rbp-32], 0            ; cycle
+mrc_cycle:
+    cmp     dword ptr [rbp-32], 2
+    jae     mrc_pass
+    lea     r10, [g_argv]                     ; g_cfg_in = argv[2]
+    mov     rax, qword ptr [r10+16]
+    mov     qword ptr [g_cfg_in], rax
+    lea     r10, [ffk_seedpw]                 ; seed password
+    lea     r11, [g_cfg_pass]
+    xor     ecx, ecx
+mrc_pw:
+    mov     al, byte ptr [r10+rcx]
+    mov     byte ptr [r11+rcx], al
+    test    al, al
+    jz      mrc_pwd
+    inc     ecx
+    cmp     ecx, 32
+    jb      mrc_pw
+mrc_pwd:
+    mov     dword ptr [g_cfg_passlen], 9
+    mov     ecx, 1
+    call    do_seed                           ; create the vault file
+    test    eax, eax
+    mov     eax, 2
+    jnz     mrc_ret
+    call    vk_derive                         ; master key
+    call    vault_ctx_reset                   ; go_vault: claim slot 0 + unlock
+    call    vault_ctx_open
+    lea     r10, [g_argv]
+    mov     rax, qword ptr [r10+16]
+    mov     qword ptr [g_cfg_in], rax
+    mov     dword ptr [g_reuse_key], 1
+    call    vault_unlock
+    mov     dword ptr [g_reuse_key], 0
+    test    eax, eax
+    mov     eax, 3
+    jnz     mrc_ret
+    call    fed_unlock_master
+    call    fed_fanout
+    call    vault_ctx_reset                   ; lock
+    call    vault_lock
+    inc     dword ptr [rbp-32]
+    jmp     mrc_cycle
+mrc_pass:
+    lea     rcx, [mrc_ok]
+    mov     edx, mrc_ok_len
+    call    print_a
+    xor     eax, eax
+mrc_ret:
+    FRAME_EPILOG
+    ret
+cmd_mvrecreate endp
+
 ; ===========================================================================
 ; M1 (master-vault federation): vault identity.  The machine-local keyring
 ; keys foreign vaults by a 16-byte vault_id.  It is derived from the header

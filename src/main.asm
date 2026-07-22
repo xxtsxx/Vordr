@@ -65,6 +65,7 @@ extern cmd_mvclose:proc                 ; multi-vault close/teardown double-free
 extern cmd_mvlock:proc                  ; multi-vault lock-teardown double-free probe (vault.asm)
 extern cmd_mvlockreal:proc              ; multi-REAL-vault lock repro (vault.asm)
 extern cmd_mvstale:proc                 ; stale-slot claim/lock probe (vault.asm)
+extern cmd_mvrecreate:proc              ; two create+lock cycles repro (vault.asm)
 extern cmd_idkat:proc                   ; M1: vault_id_of KAT (vault.asm)
 extern cmd_kekkat:proc                  ; M2: keyring KEK KAT (vault.asm)
 extern cmd_keyringkat:proc              ; M2: keyring seal/open KAT (vault.asm)
@@ -222,6 +223,7 @@ WSTR w_mvclose,  <mvclose>
 WSTR w_mvlock,   <mvlock>
 WSTR w_mvlockreal, <mvlockreal>
 WSTR w_mvstale,  <mvstale>
+WSTR w_mvrecreate, <mvrecreate>
 WSTR w_idkat,    <idkat>
 WSTR w_kekkat,   <kekkat>
 WSTR w_keyringkat, <keyringkat>
@@ -291,6 +293,7 @@ cmd_table label CMDENT
     CMDENT { w_mvlock,    cmd_mvlock,    0, 0 }   ; multi-vault lock-teardown double-free probe
     CMDENT { w_mvlockreal, cmd_mvlockreal, 1, 0 }  ; multi-REAL-vault lock repro (<path>)
     CMDENT { w_mvstale,   cmd_mvstale,   0, 0 }   ; stale-slot claim/lock probe
+    CMDENT { w_mvrecreate, cmd_mvrecreate, 1, 0 }  ; two create+lock cycles repro (<path>)
     CMDENT { w_idkat,     cmd_idkat,     0, 0 }   ; M1: vault_id_of KAT
     CMDENT { w_kekkat,    cmd_kekkat,    0, 0 }   ; M2: keyring KEK KAT
     CMDENT { w_keyringkat, cmd_keyringkat, 0, 0 } ; M2: keyring seal/open KAT
