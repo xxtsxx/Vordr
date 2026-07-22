@@ -66,7 +66,61 @@ SEC_WS_MAX          equ 10000000h   ; 256 MiB cap (>= MAX_VAULTS bodies + static
 ; ERROR_WORKING_SET_QUOTA (1453) even though the call "succeeds".
 SEC_WS_FLAGS        equ 9
 
+; Live-allocation registry: secmem_free is otherwise NOT double-free-safe (it
+; secure_zeros BEFORE VirtualFree, so a second/stale free writes released pages ->
+; access violation).  Multi-vault teardown has repeatedly aliased a decrypted body
+; across contexts and freed it twice.  Rather than chase every producer, we make
+; the free site structurally safe: alloc records the base, free only proceeds for a
+; base that is CURRENTLY registered (and removes it).  A double/stale/foreign free
+; finds it absent and no-ops.  CAP >> the realistic live set (<= MAX_VAULTS bodies +
+; 1 KDF arena); overflow fails the alloc closed.  Single-threaded like the shadow
+; stack: body allocs run on the GUI thread; the secdesk worker's KDF alloc happens
+; while the main thread is blocked in WaitForSingleObject - never concurrent.
+SECREG_CAP          equ 64
+
 .code
+
+; secreg_add(rcx = base) -> eax = 1 stored / 0 registry full.  Leaf.
+secreg_add proc
+    lea     r10, [g_secreg]
+    xor     r8d, r8d
+sra_lp:
+    cmp     r8d, SECREG_CAP
+    jae     sra_full
+    cmp     qword ptr [r10+r8*8], 0
+    jne     sra_next
+    mov     qword ptr [r10+r8*8], rcx
+    mov     eax, 1
+    ret
+sra_next:
+    inc     r8d
+    jmp     sra_lp
+sra_full:
+    xor     eax, eax
+    ret
+secreg_add endp
+
+; secreg_take(rcx = base) -> eax = 1 found (and cleared) / 0 absent.  Leaf.
+secreg_take proc
+    test    rcx, rcx
+    jz      srt_absent
+    lea     r10, [g_secreg]
+    xor     r8d, r8d
+srt_lp:
+    cmp     r8d, SECREG_CAP
+    jae     srt_absent
+    cmp     qword ptr [r10+r8*8], rcx
+    jne     srt_next
+    mov     qword ptr [r10+r8*8], 0
+    mov     eax, 1
+    ret
+srt_next:
+    inc     r8d
+    jmp     srt_lp
+srt_absent:
+    xor     eax, eax
+    ret
+secreg_take endp
 
 ; =============================================================================
 ; sec_lock(rcx = ptr, rdx = len) -> eax = nonzero if the region is now locked.
@@ -253,9 +307,19 @@ secmem_alloc proc frame
     mov     rdx, qword ptr [rbp-24]
     call    sec_lock
 
+    mov     rcx, qword ptr [rbp-32]         ; register the live base (double-free guard)
+    call    secreg_add
+    test    eax, eax
+    jz      sa_regfull
+
     mov     rax, qword ptr [rbp-32]         ; return the (locked) base
     FRAME_EPILOG
     ret
+sa_regfull:
+    ; registry saturated (should never happen: CAP >> live set) - fail closed so no
+    ; untracked, un-double-free-guarded arena escapes.  Release what we allocated.
+    WINCALL VirtualUnlock, qword ptr [rbp-32], qword ptr [rbp-24]
+    WINCALL VirtualFree, qword ptr [rbp-32], 0, MEM_RELEASE
 sa_fail:
     xor     eax, eax
     FRAME_EPILOG
@@ -269,6 +333,16 @@ secmem_free proc frame
     mov     qword ptr [rbp-24], rcx
     mov     qword ptr [rbp-32], rdx
     test    rcx, rcx
+    jz      sf_done
+
+    ; double-free guard: only wipe+release a base that is CURRENTLY registered as
+    ; live.  A second or stale free (an aliased/dangling vault body) finds it absent
+    ; and no-ops here - which is exactly the secure_zero-on-released-pages crash we
+    ; keep hitting on multi-vault teardown.  secreg_take clears the entry atomically
+    ; w.r.t. this single-threaded free, so the wipe below runs exactly once per base.
+    mov     rcx, qword ptr [rbp-24]
+    call    secreg_take
+    test    eax, eax
     jz      sf_done
 
     ; wipe first - secrets must be gone before the pages can be reused
@@ -292,6 +366,8 @@ secmem_free endp
 ;   address.  exit 0 = pass.
 ; =============================================================================
 .data?
+align 8
+g_secreg    dq SECREG_CAP dup (?)       ; live secmem allocation bases (0 = free slot)
 secscan_ref db 16 dup (?)               ; runtime-random reference sentinel
 align 8
 ss_mbi      db 48 dup (?)               ; MEMORY_BASIC_INFORMATION (static: no stack use)
@@ -459,5 +535,58 @@ lk_fail:
     FRAME_EPILOG
     ret
 cmd_lktest endp
+
+; ===========================================================================
+; cmd_secfreedup (probe) - prove secmem_free is double-free-safe.  Alloc a body,
+;   plant a sentinel, free it once (must wipe: sentinel gone), then free the SAME
+;   pointer TWO more times (aliased/stale frees).  Without the live-allocation
+;   registry the 2nd free secure_zeros released pages -> access violation (the
+;   recurring multi-vault teardown crash); with it, the 2nd/3rd frees no-op.
+;   Also frees a never-allocated pointer to prove a foreign free is inert.
+;   Survival (no fault) + first-free wipe = pass.  exit 0 = pass.
+; ===========================================================================
+CSTR sfd_ok,  "secfreedup: PASS (double/stale/foreign free is inert; first free wiped)",13,10
+CSTR sfd_bad, "secfreedup: FAIL (first free did not wipe)",13,10
+LANDING_PAD
+public cmd_secfreedup
+cmd_secfreedup proc frame
+    FRAME_PROLOG 48
+    mov     ecx, 65536
+    call    secmem_alloc                        ; [rbp-24] = live body
+    test    rax, rax
+    jz      sfd_fail
+    mov     qword ptr [rbp-24], rax
+    mov     r10, 0DEADBEEFCAFEF00Dh              ; sentinel in the arena
+    mov     qword ptr [rax], r10
+    mov     rcx, qword ptr [rbp-24]              ; free #1 - must wipe + release
+    mov     rdx, 65536
+    call    secmem_free
+    mov     r10, qword ptr [rbp-24]             ; (pages released; do NOT read them)
+    mov     rcx, qword ptr [rbp-24]              ; free #2 - stale, must no-op
+    mov     rdx, 65536
+    call    secmem_free
+    mov     rcx, qword ptr [rbp-24]              ; free #3 - stale again, must no-op
+    mov     rdx, 65536
+    call    secmem_free
+    mov     rcx, 0BADC0DE00h                     ; foreign pointer never allocated - inert
+    mov     rdx, 4096
+    call    secmem_free
+    xor     rcx, rcx                             ; null free - inert
+    xor     rdx, rdx
+    call    secmem_free
+    lea     rcx, [sfd_ok]                        ; survived every stale/foreign free
+    mov     edx, sfd_ok_len
+    call    print_a
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+sfd_fail:
+    lea     rcx, [sfd_bad]
+    mov     edx, sfd_bad_len
+    call    print_a
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_secfreedup endp
 
 end
