@@ -5,9 +5,11 @@
 #   2. strict release build (framecheck FATALs fail the build)
 #   3. selftest ("all self-tests passed")
 #   4. headless roundtrip: seedtest -> atgen -> zitest -> phtest -> secscan ->
-#      lktest -> tmptest -> fztest -> trtest -> vfuzz -> fuzzzip -> bktest ->
-#      mactest -> rbtest -> xctest -> reload -> cowrite -> pkat ->
-#      mvtest -> mvswitch -> avtest
+#      secfreedup -> lktest -> tmptest -> fztest -> trtest -> vfuzz -> fuzzzip ->
+#      bktest -> ... -> the mv*/`*kat` families -> avtest
+#   5. cryptodiff: tests\verify_crypto.py independently recomputes every crypto
+#      primitive (python stdlib + a self-validating pure-Python AES-256-GCM) and
+#      cross-checks the published FIPS/RFC/NIST vectors against `vordr katreport`.
 #
 # windows-latest ships VS (ml64/link/rc) and Python; ilammy/msvc-dev-cmd puts
 # the x64 toolchain on PATH the same way a "x64 Native Tools" prompt does.
@@ -48,6 +50,26 @@ jobs:
       - name: reproducible release build
         shell: cmd
         run: call build.cmd release
+
+      # External-audit artifact: the raw crypto proof (vordr's katreport output +
+      # the independent verifier's per-vector PASS/FAIL table). Uploaded always so
+      # a reviewer can download and re-check it against the published vectors.
+      - name: crypto proof artifact
+        if: always()
+        shell: cmd
+        run: |
+          mkdir crypto-proof 2>nul
+          bin\vordr.exe katreport > crypto-proof\katreport.txt 2>&1
+          python tests\verify_crypto.py --exe bin\vordr.exe > crypto-proof\verify_crypto.txt 2>&1
+          type crypto-proof\verify_crypto.txt
+
+      - name: upload crypto proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crypto-proof
+          path: crypto-proof/
+          if-no-files-found: ignore
 
       - name: upload vordr.exe
         uses: actions/upload-artifact@v4
