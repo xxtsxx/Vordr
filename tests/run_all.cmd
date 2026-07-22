@@ -100,7 +100,7 @@ set /a T_SELFTEST=!T1!-!T0!
 
 rem -------------------------------------------------------------- roundtrip --
 call :now T0
-echo === stage: roundtrip (seedtest / atgen / zitest / phtest / secscan / tmptest / fztest / trtest / vfuzz / fuzzzip / bktest / mactest / rbtest / xctest / reload / attfuzz / healthkat / pkat / mvtest / mvswitch / mvname / idkat / kekkat / keyringkat / fedkat / fedregkat / fmskat / fedapikat / avtest) ===
+echo === stage: roundtrip (seedtest / atgen / zitest / phtest / secscan / tmptest / fztest / trtest / vfuzz / fuzzzip / bktest / mactest / rbtest / xctest / reload / attfuzz / healthkat / pkat / mvtest / mvswitch / mvname / idkat / kekkat / keyringkat / fedkat / fedregkat / fmskat / fedapikat / fedfanout / avtest) ===
 set RT=PASS
 
 bin\vordr.exe seedtest "%WORK%\rt.vault" > "%WORK%\seedtest.log" 2>&1
@@ -200,6 +200,9 @@ if not "!errorlevel!"=="0" ( echo   fmskat: FAIL ^(exit !errorlevel!, M2 TPM mac
 
 bin\vordr.exe fedapikat > "%WORK%\fedapikat.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   fedapikat: FAIL ^(exit !errorlevel!, M2 master-key federation API^) & set RT=FAIL )
+
+bin\vordr.exe fedfanout "%WORK%\ffo.vault" > "%WORK%\fedfanout.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   fedfanout: FAIL ^(exit !errorlevel!, M2 fan-out open/rollback^) & set RT=FAIL )
 
 bin\vordr.exe avtest > "%WORK%\avtest.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   avtest: FAIL ^(exit !errorlevel!, availability retry state machine^) & set RT=FAIL )
