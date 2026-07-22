@@ -359,6 +359,8 @@ g_fedblob   db (sizeof FEDREC) + 32 dup (?)    ;   sealed form (nonce+ct+tag)
 g_fedlink_tmp FEDLINK <>                        ;   scratch link template (fedkat)
 g_fedkat_bak  db (sizeof FEDREC) + 32 dup (?)   ;   backup of the REAL record (hermetic KATs)
 g_fedkat_baklen dd ?
+g_vcid_live   db 16 dup (?)                     ; vault_ctx_is_dup: live vault_id
+g_vcid_slot   db 16 dup (?)                     ;   and a slot's vault_id to compare
 g_fed_mkblob db 512 dup (?)                     ; M2: sealed machine-secret blob
 g_fms_out1  db 32 dup (?)                       ;   fmskat scratch
 g_fms_out2  db 32 dup (?)
@@ -2861,6 +2863,121 @@ cmd_mvremove endp
 
 ; mvr_rebuild - replicate fed_remember_open's link-recording loop (slots 1..n-1),
 ;   keying each by vault_id_hdr(salt) and fed_add (which dedups by id).
+; cmd_mvrealremove <path> - the "Remove disconnects everything" repro with REAL
+;   bodies.  Opens master + 3 foreign contexts (same file, own bodies), removes
+;   the middle one exactly as gui_close_vault does (front master -> vault_ctx_close),
+;   then asserts g_vault_n dropped by one (to 3) and EVERY remaining vault still
+;   fronts and enumerates its entries (the compaction didn't detach a body).
+CSTR mrr_ok,  "mvrealremove: PASS (removed 1 of 4; the other 3 survive + enumerate)",13,10
+CSTR mrr_bad, "mvrealremove: FAIL (a remaining vault lost its entries / wrong count)",13,10
+LANDING_PAD
+public cmd_mvrealremove
+cmd_mvrealremove proc frame
+    FRAME_PROLOG 48
+    lea     r10, [g_argv]
+    mov     rax, qword ptr [r10+16]
+    mov     qword ptr [g_cfg_in], rax
+    lea     rcx, [g_fedlink_tmp + FEDLINK.fl_loc]
+    mov     rdx, rax
+    mov     r8d, 512
+    call    copy_bytes
+    lea     r10, [ffk_seedpw]
+    lea     r11, [g_cfg_pass]
+    xor     ecx, ecx
+mrr_pw:
+    mov     al, byte ptr [r10+rcx]
+    mov     byte ptr [r11+rcx], al
+    test    al, al
+    jz      mrr_pwd
+    inc     ecx
+    cmp     ecx, 32
+    jb      mrr_pw
+mrr_pwd:
+    mov     dword ptr [g_cfg_passlen], 9
+    mov     ecx, 3                            ; seed a 3-entry vault
+    call    do_seed
+    test    eax, eax
+    mov     eax, 2
+    jnz     mrr_ret
+    call    vk_derive
+    lea     rcx, [g_fedlink_tmp + FEDLINK.fl_key]
+    lea     rdx, [g_vkey]
+    mov     r8d, 32
+    call    copy_bytes
+    mov     dword ptr [g_fedlink_tmp + FEDLINK.fl_flags], 0
+    call    vault_ctx_reset
+    call    vault_ctx_open                    ; master
+    lea     r10, [g_argv]
+    mov     rax, qword ptr [r10+16]
+    mov     qword ptr [g_cfg_in], rax
+    mov     dword ptr [g_reuse_key], 1
+    call    vault_unlock
+    mov     dword ptr [g_reuse_key], 0
+    test    eax, eax
+    mov     eax, 3
+    jnz     mrr_ret
+    call    fed_reset                         ; 3 foreign links (distinct ids, same file)
+    mov     dword ptr [rbp-24], 0
+mrr_build:
+    cmp     dword ptr [rbp-24], 3
+    jae     mrr_fanout
+    mov     eax, dword ptr [rbp-24]
+    add     eax, 10h
+    lea     r10, [g_fedlink_tmp + FEDLINK.fl_id]
+    xor     ecx, ecx
+mrr_id:
+    mov     byte ptr [r10+rcx], al
+    inc     ecx
+    cmp     ecx, 16
+    jb      mrr_id
+    lea     rcx, [g_fedlink_tmp]
+    call    fed_add
+    inc     dword ptr [rbp-24]
+    jmp     mrr_build
+mrr_fanout:
+    call    fed_fanout                        ; master + 3 foreign open
+    cmp     dword ptr [g_vault_n], 4
+    jne     mrr_fail
+    ; ---- remove the middle foreign, exactly like gui_close_vault ----
+    xor     ecx, ecx
+    call    vault_ctx_front                   ; front master
+    mov     ecx, 1
+    call    vault_ctx_close                   ; remove slot 1
+    cmp     dword ptr [g_vault_n], 3          ; dropped by ONE, not all
+    jne     mrr_fail
+    ; ---- every remaining vault must still front + enumerate ----
+    mov     dword ptr [rbp-24], 0
+mrr_enum:
+    mov     eax, dword ptr [rbp-24]
+    cmp     eax, dword ptr [g_vault_n]
+    jae     mrr_pass
+    mov     ecx, dword ptr [rbp-24]
+    call    vault_ctx_front
+    call    vault_count
+    cmp     eax, 3                            ; same 3-entry file -> must read 3
+    jne     mrr_fail
+    inc     dword ptr [rbp-24]
+    jmp     mrr_enum
+mrr_pass:
+    call    vault_ctx_reset
+    lea     rcx, [mrr_ok]
+    mov     edx, mrr_ok_len
+    call    print_a
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+mrr_fail:
+    lea     rcx, [mrr_bad]
+    mov     edx, mrr_bad_len
+    call    print_a
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+mrr_ret:
+    FRAME_EPILOG
+    ret
+cmd_mvrealremove endp
+
 mvr_rebuild proc frame
     FRAME_PROLOG 32
     call    fed_reset
@@ -3248,6 +3365,51 @@ vault_id_of proc frame
     FRAME_EPILOG
     ret
 vault_id_of endp
+
+; vault_ctx_is_dup() -> eax = the index of an ALREADY-OPEN slot whose vault_id
+;   equals the LIVE vault's (g_hdr), other than the currently-fronted slot; or -1
+;   if none.  Lets the M4 "Add" path refuse opening the same vault twice (same
+;   file/salt -> same vault_id -> the federation record dedups them, so a second
+;   open just creates a confusing phantom that collapses on Remove).
+public vault_ctx_is_dup
+vault_ctx_is_dup proc frame
+    FRAME_PROLOG 48
+    lea     rcx, [g_vcid_live]
+    call    vault_id_of                       ; the live (just-unlocked) vault's id
+    mov     dword ptr [rbp-24], 0             ; i
+vid_loop:
+    mov     eax, dword ptr [rbp-24]
+    cmp     eax, dword ptr [g_vault_n]
+    jae     vid_no
+    mov     eax, dword ptr [rbp-24]
+    cmp     eax, dword ptr [g_vault_cur]      ; skip the just-claimed slot
+    je      vid_next
+    mov     ecx, dword ptr [rbp-24]
+    call    vault_ctx_slotptr
+    lea     rcx, [rax + VSLOT.s_hdr + VH_SALT]
+    lea     rdx, [g_vcid_slot]
+    call    vault_id_hdr
+    xor     r8d, r8d                          ; compare the two 16-byte ids
+vid_cmp:
+    lea     r10, [g_vcid_live]
+    lea     r11, [g_vcid_slot]
+    mov     al, byte ptr [r10+r8]
+    cmp     al, byte ptr [r11+r8]
+    jne     vid_next
+    inc     r8d
+    cmp     r8d, 16
+    jb      vid_cmp
+    mov     eax, dword ptr [rbp-24]           ; all 16 equal -> this slot is a duplicate
+    FRAME_EPILOG
+    ret
+vid_next:
+    inc     dword ptr [rbp-24]
+    jmp     vid_loop
+vid_no:
+    mov     eax, -1
+    FRAME_EPILOG
+    ret
+vault_ctx_is_dup endp
 
 ; cmd_idkat - headless KAT for vault_id_of: (1) it equals SHA-256(salt)[0..15],
 ;   (2) it is deterministic (same salt -> same id), (3) it differs for a
