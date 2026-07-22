@@ -17,6 +17,8 @@ extern sha256_hash:proc
 extern ct_memcmp:proc
 extern secure_zero:proc
 extern print_a:proc
+extern print_hex:proc
+extern print_u64:proc
 extern CreateThread:proc
 extern WaitForMultipleObjects:proc
 extern CloseHandle:proc
@@ -1074,5 +1076,352 @@ pk_fail:
     FRAME_EPILOG
     ret
 cmd_pkat endp
+
+; =============================================================================
+; cmd_katreport - EXTERNAL-AUDIT crypto proof mode.  Runs a fixed, deterministic
+;   battery of the crypto primitives over public/known inputs and prints each
+;   result as "<label> [counter] <lowercase-hex>\n".  The inputs are baked in
+;   (no vault, password, or real secret ever touches the command line - these are
+;   published RFC/NIST test vectors and fixed patterns), so `vordr kat-report`
+;   yields byte-identical output on any machine.  tests/verify_crypto.py holds the
+;   SAME inputs, recomputes each expected value with an INDEPENDENT reference
+;   (Python hashlib/hmac + a self-validating pure-Python AES-256-GCM) and against
+;   the official published vectors, then diffs vordr's output.  That makes the
+;   crypto correctness externally reproducible - an auditor runs both and checks.
+; =============================================================================
+.data
+; ---- labels (each ends in a space; no CRLF) --------------------------------
+CSTR krl_sha_empty,  "sha256/empty "
+CSTR krl_sha_abc,    "sha256/abc "
+CSTR krl_sha_fips2,  "sha256/fips2 "
+CSTR krl_sha_a1k,    "sha256/a1000 "
+CSTR krl_b2_empty,   "blake2b512/empty "
+CSTR krl_b2_abc,     "blake2b512/abc "
+CSTR krl_b2_fox,     "blake2b512/fox "
+CSTR krl_hm1,        "hmac-sha1/rfc2202-1 "
+CSTR krl_hm2,        "hmac-sha1/rfc2202-2 "
+CSTR krl_hmc,        "hmac-sha1/custom "
+CSTR krl_gcm_zct,    "gcm256/zero/ct "
+CSTR krl_gcm_ztag,   "gcm256/zero/tag "
+CSTR krl_gcm_act,    "gcm256/aad/ct "
+CSTR krl_gcm_atag,   "gcm256/aad/tag "
+CSTR krl_gcm_vct,    "gcm256/vec/ct "
+CSTR krl_gcm_vtag,   "gcm256/vec/tag "
+CSTR krl_gcm_ept,    "gcm256/emptypt/tag "
+CSTR krl_hotp,       "hotp/rfc4226 "
+CSTR krl_totp,       "totp/rfc6238 "
+CSTR krl_b32h,       "base32/hello "
+CSTR krl_b32o,       "base32/otp16 "
+CSTR krl_a2,         "argon2id/rfc9106 "
+; ---- fixed inputs ----------------------------------------------------------
+kr_fips2    db "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+kr_fips2_len equ $ - kr_fips2
+kr_fox      db "The quick brown fox jumps over the lazy dog"
+kr_fox_len  equ $ - kr_fox
+kr_a1k      db 1000 dup('a')
+kr_hkey     db "vordr-key"
+kr_hkey_len equ $ - kr_hkey
+kr_hmsg     db "differential test vector"
+kr_hmsg_len equ $ - kr_hmsg
+kr_zero32   db 32 dup(0)
+kr_zero12   db 12 dup(0)
+kr_iota16   db 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+kr_key32    db 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+kr_iv12     db 0,1,2,3,4,5,6,7,8,9,10,11
+kr_aad8     db 0a0h,0a1h,0a2h,0a3h,0a4h,0a5h,0a6h,0a7h
+kr_pt20     db 10h,11h,12h,13h,14h,15h,16h,17h,18h,19h,1ah,1bh,1ch,1dh,1eh,1fh,20h,21h,22h,23h
+align 8
+kr_totp_ctrs dq 1, 37037036, 41152263, 66666666   ; T=59,1111111109,1234567890,2000000000 (/30)
+kr_sp       db ' '
+kr_nl       db 10
+
+.data?
+kr_o64      db 64 dup(?)
+kr_ct       db 32 dup(?)
+kr_tag      db 16 dup(?)
+kr_otp      db 8 dup(?)
+
+.code
+; KEMIT lbl, buf, blen - print "<lbl><hex(buf[0..blen))>\n"
+KEMIT macro lbl, buf, blen
+    lea     rcx, [lbl]
+    mov     edx, lbl&_len
+    call    print_a
+    lea     rcx, [buf]
+    mov     edx, blen
+    call    print_hex
+    lea     rcx, [kr_nl]
+    mov     edx, 1
+    call    print_a
+endm
+
+LANDING_PAD
+public cmd_katreport
+cmd_katreport proc frame
+    FRAME_PROLOG 96
+    ; locals: [rbp-32] counter/scratch (q), [rbp-40] loop index (q), [rbp-48] declen (d)
+
+    ; ---- SHA-256 ----
+    lea     rcx, [st_abc]
+    xor     edx, edx
+    lea     r8, [kr_o64]
+    call    sha256_hash
+    KEMIT   krl_sha_empty, kr_o64, 32
+    lea     rcx, [st_abc]
+    mov     rdx, 3
+    lea     r8, [kr_o64]
+    call    sha256_hash
+    KEMIT   krl_sha_abc, kr_o64, 32
+    lea     rcx, [kr_fips2]
+    mov     rdx, kr_fips2_len
+    lea     r8, [kr_o64]
+    call    sha256_hash
+    KEMIT   krl_sha_fips2, kr_o64, 32
+    lea     rcx, [kr_a1k]
+    mov     rdx, 1000
+    lea     r8, [kr_o64]
+    call    sha256_hash
+    KEMIT   krl_sha_a1k, kr_o64, 32
+
+    ; ---- BLAKE2b-512 ----
+    lea     rcx, [st_abc]
+    xor     edx, edx
+    lea     r8, [kr_o64]
+    mov     r9, 64
+    call    blake2b_hash
+    KEMIT   krl_b2_empty, kr_o64, 64
+    lea     rcx, [st_abc]
+    mov     rdx, 3
+    lea     r8, [kr_o64]
+    mov     r9, 64
+    call    blake2b_hash
+    KEMIT   krl_b2_abc, kr_o64, 64
+    lea     rcx, [kr_fox]
+    mov     rdx, kr_fox_len
+    lea     r8, [kr_o64]
+    mov     r9, 64
+    call    blake2b_hash
+    KEMIT   krl_b2_fox, kr_o64, 64
+
+    ; ---- HMAC-SHA1 ----
+    WINCALL hmac_sha1, addr hm_key, 20, addr hm_msg, 8, addr kr_o64
+    KEMIT   krl_hm1, kr_o64, 20
+    WINCALL hmac_sha1, addr hm2_key, 4, addr hm2_msg, 28, addr kr_o64
+    KEMIT   krl_hm2, kr_o64, 20
+    WINCALL hmac_sha1, addr kr_hkey, kr_hkey_len, addr kr_hmsg, kr_hmsg_len, addr kr_o64
+    KEMIT   krl_hmc, kr_o64, 20
+
+    ; ---- AES-256-GCM: zero vector (NIST SP800-38D all-zero) ----
+    lea     rax, [kr_zero32]
+    mov     qword ptr [greq].GCMREQ.key, rax
+    lea     rax, [kr_zero12]
+    mov     qword ptr [greq].GCMREQ.iv, rax
+    mov     qword ptr [greq].GCMREQ.aad, 0
+    mov     qword ptr [greq].GCMREQ.aadlen, 0
+    lea     rax, [kr_zero32]
+    mov     qword ptr [greq].GCMREQ.inp, rax
+    mov     qword ptr [greq].GCMREQ.inlen, 16
+    lea     rax, [kr_ct]
+    mov     qword ptr [greq].GCMREQ.outp, rax
+    lea     rax, [kr_tag]
+    mov     qword ptr [greq].GCMREQ.tag, rax
+    lea     rcx, [greq]
+    call    gcm_seal
+    KEMIT   krl_gcm_zct, kr_ct, 16
+    KEMIT   krl_gcm_ztag, kr_tag, 16
+
+    ; ---- AES-256-GCM: key0/iv0, aad=iota16, pt=iota16 ----
+    lea     rax, [kr_zero32]
+    mov     qword ptr [greq].GCMREQ.key, rax
+    lea     rax, [kr_zero12]
+    mov     qword ptr [greq].GCMREQ.iv, rax
+    lea     rax, [kr_iota16]
+    mov     qword ptr [greq].GCMREQ.aad, rax
+    mov     qword ptr [greq].GCMREQ.aadlen, 16
+    lea     rax, [kr_iota16]
+    mov     qword ptr [greq].GCMREQ.inp, rax
+    mov     qword ptr [greq].GCMREQ.inlen, 16
+    lea     rax, [kr_ct]
+    mov     qword ptr [greq].GCMREQ.outp, rax
+    lea     rax, [kr_tag]
+    mov     qword ptr [greq].GCMREQ.tag, rax
+    lea     rcx, [greq]
+    call    gcm_seal
+    KEMIT   krl_gcm_act, kr_ct, 16
+    KEMIT   krl_gcm_atag, kr_tag, 16
+
+    ; ---- AES-256-GCM: key=iota32, iv=iota12, aad=8, pt=20 (partial block) ----
+    lea     rax, [kr_key32]
+    mov     qword ptr [greq].GCMREQ.key, rax
+    lea     rax, [kr_iv12]
+    mov     qword ptr [greq].GCMREQ.iv, rax
+    lea     rax, [kr_aad8]
+    mov     qword ptr [greq].GCMREQ.aad, rax
+    mov     qword ptr [greq].GCMREQ.aadlen, 8
+    lea     rax, [kr_pt20]
+    mov     qword ptr [greq].GCMREQ.inp, rax
+    mov     qword ptr [greq].GCMREQ.inlen, 20
+    lea     rax, [kr_ct]
+    mov     qword ptr [greq].GCMREQ.outp, rax
+    lea     rax, [kr_tag]
+    mov     qword ptr [greq].GCMREQ.tag, rax
+    lea     rcx, [greq]
+    call    gcm_seal
+    KEMIT   krl_gcm_vct, kr_ct, 20
+    KEMIT   krl_gcm_vtag, kr_tag, 16
+
+    ; ---- AES-256-GCM: empty plaintext, aad=iota16 (tag over AAD only) ----
+    lea     rax, [kr_zero32]
+    mov     qword ptr [greq].GCMREQ.key, rax
+    lea     rax, [kr_zero12]
+    mov     qword ptr [greq].GCMREQ.iv, rax
+    lea     rax, [kr_iota16]
+    mov     qword ptr [greq].GCMREQ.aad, rax
+    mov     qword ptr [greq].GCMREQ.aadlen, 16
+    lea     rax, [kr_zero32]
+    mov     qword ptr [greq].GCMREQ.inp, rax
+    mov     qword ptr [greq].GCMREQ.inlen, 0
+    lea     rax, [kr_ct]
+    mov     qword ptr [greq].GCMREQ.outp, rax
+    lea     rax, [kr_tag]
+    mov     qword ptr [greq].GCMREQ.tag, rax
+    lea     rcx, [greq]
+    call    gcm_seal
+    KEMIT   krl_gcm_ept, kr_tag, 16
+
+    ; ---- HOTP (RFC 4226 secret, counters 0..9) ----
+    mov     qword ptr [rbp-32], 0
+kr_hotp_lp:
+    cmp     qword ptr [rbp-32], 10
+    jae     kr_hotp_done
+    lea     rcx, [krl_hotp]
+    mov     edx, krl_hotp_len
+    call    print_a
+    mov     rcx, qword ptr [rbp-32]
+    call    print_u64
+    lea     rcx, [kr_sp]
+    mov     edx, 1
+    call    print_a
+    WINCALL hotp, addr otp_key, 20, qword ptr [rbp-32], addr kr_otp
+    lea     rcx, [kr_otp]
+    mov     edx, 6
+    call    print_hex
+    lea     rcx, [kr_nl]
+    mov     edx, 1
+    call    print_a
+    inc     qword ptr [rbp-32]
+    jmp     kr_hotp_lp
+kr_hotp_done:
+
+    ; ---- TOTP (RFC 6238 time-step -> counter; 6-digit HOTP) ----
+    mov     qword ptr [rbp-40], 0
+kr_totp_lp:
+    cmp     qword ptr [rbp-40], 4
+    jae     kr_totp_done
+    lea     rcx, [krl_totp]
+    mov     edx, krl_totp_len
+    call    print_a
+    lea     r10, [kr_totp_ctrs]
+    mov     rax, qword ptr [rbp-40]
+    mov     rax, qword ptr [r10+rax*8]
+    mov     qword ptr [rbp-32], rax
+    mov     rcx, rax
+    call    print_u64
+    lea     rcx, [kr_sp]
+    mov     edx, 1
+    call    print_a
+    WINCALL hotp, addr otp_key, 20, qword ptr [rbp-32], addr kr_otp
+    lea     rcx, [kr_otp]
+    mov     edx, 6
+    call    print_hex
+    lea     rcx, [kr_nl]
+    mov     edx, 1
+    call    print_a
+    inc     qword ptr [rbp-40]
+    jmp     kr_totp_lp
+kr_totp_done:
+
+    ; ---- base32 decode ----
+    WINCALL base32_decode, addr b32_src, 8, addr kr_o64, 64
+    mov     dword ptr [rbp-48], eax
+    lea     rcx, [krl_b32h]
+    mov     edx, krl_b32h_len
+    call    print_a
+    lea     rcx, [kr_o64]
+    mov     edx, dword ptr [rbp-48]
+    call    print_hex
+    lea     rcx, [kr_nl]
+    mov     edx, 1
+    call    print_a
+    WINCALL base32_decode, addr otp16_b32, 16, addr kr_o64, 64
+    mov     dword ptr [rbp-48], eax
+    lea     rcx, [krl_b32o]
+    mov     edx, krl_b32o_len
+    call    print_a
+    lea     rcx, [kr_o64]
+    mov     edx, dword ptr [rbp-48]
+    call    print_hex
+    lea     rcx, [kr_nl]
+    mov     edx, 1
+    call    print_a
+
+    ; ---- Argon2id (RFC 9106 vector: t=3,m=32,p=4,out=32,secret,ad) ----
+    lea     r8, [a2_pwd]
+    mov     ecx, 32
+kr_a2pwd:
+    mov     byte ptr [r8], 1
+    inc     r8
+    dec     ecx
+    jnz     kr_a2pwd
+    lea     r8, [a2_salt]
+    mov     ecx, 16
+kr_a2salt:
+    mov     byte ptr [r8], 2
+    inc     r8
+    dec     ecx
+    jnz     kr_a2salt
+    lea     r8, [a2_secret]
+    mov     ecx, 8
+kr_a2sec:
+    mov     byte ptr [r8], 3
+    inc     r8
+    dec     ecx
+    jnz     kr_a2sec
+    lea     r8, [a2_ad]
+    mov     ecx, 12
+kr_a2ad:
+    mov     byte ptr [r8], 4
+    inc     r8
+    dec     ecx
+    jnz     kr_a2ad
+    lea     r8, [a2_req]
+    mov     dword ptr [r8].ARGON2REQ.t_cost, 3
+    mov     dword ptr [r8].ARGON2REQ.m_cost, 32
+    mov     dword ptr [r8].ARGON2REQ.lanes, 4
+    mov     dword ptr [r8].ARGON2REQ.outlen, 32
+    mov     dword ptr [r8].ARGON2REQ.version, 13h
+    mov     dword ptr [r8].ARGON2REQ.atype, 2
+    lea     rax, [a2_pwd]
+    mov     qword ptr [r8].ARGON2REQ.pwd, rax
+    mov     dword ptr [r8].ARGON2REQ.pwdlen, 32
+    lea     rax, [a2_salt]
+    mov     qword ptr [r8].ARGON2REQ.salt, rax
+    mov     dword ptr [r8].ARGON2REQ.saltlen, 16
+    lea     rax, [a2_secret]
+    mov     qword ptr [r8].ARGON2REQ.secret, rax
+    mov     dword ptr [r8].ARGON2REQ.secretlen, 8
+    lea     rax, [a2_ad]
+    mov     qword ptr [r8].ARGON2REQ.ad, rax
+    mov     dword ptr [r8].ARGON2REQ.adlen, 12
+    lea     rax, [a2_out]
+    mov     qword ptr [r8].ARGON2REQ.outp, rax
+    lea     rcx, [a2_req]
+    call    argon2id_hash
+    KEMIT   krl_a2, a2_out, 32
+
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+cmd_katreport endp
 
 end

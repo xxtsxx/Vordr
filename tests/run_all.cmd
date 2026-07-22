@@ -227,6 +227,30 @@ call :now T1
 set /a T_ROUNDTRIP=!T1!-!T0!
 :roundtrip_done
 
+rem ------------------------------------------------------- cryptodiff (python) --
+rem Independent, external verification of the crypto primitives: recompute every
+rem primitive with Python stdlib + a self-validating pure-Python AES-GCM and
+rem against the published FIPS/RFC/NIST vectors, then diff vordr's kat-report.
+rem Skipped (not failed) if python is unavailable, so the gate still runs without it.
+call :now T0
+echo === stage: cryptodiff (independent python reference) ===
+where python >nul 2>&1
+if errorlevel 1 (
+    echo   cryptodiff: SKIP ^(python not found on PATH^)
+    set R_CRYPTODIFF=skip
+) else (
+    python tests\verify_crypto.py --exe bin\vordr.exe > "%WORK%\cryptodiff.log" 2>&1
+    if errorlevel 1 (
+        echo   cryptodiff: FAIL - see %WORK%\cryptodiff.log
+        set R_CRYPTODIFF=FAIL
+    ) else (
+        for /f "tokens=*" %%l in ('findstr /c:"RESULT:" "%WORK%\cryptodiff.log"') do echo   %%l
+        set R_CRYPTODIFF=PASS
+    )
+)
+call :now T1
+set /a T_CRYPTODIFF=!T1!-!T0!
+
 rem ---------------------------------------------------------------- summary --
 :summary
 echo.
@@ -236,6 +260,7 @@ echo   redteam      %R_REDTEAM%     %T_REDTEAM%
 echo   build        %R_BUILD%     %T_BUILD%
 echo   selftest     %R_SELFTEST%     %T_SELFTEST%
 echo   roundtrip    %R_ROUNDTRIP%     %T_ROUNDTRIP%
+echo   cryptodiff   %R_CRYPTODIFF%     %T_CRYPTODIFF%
 echo =========================================
 
 set EXITC=0
@@ -243,6 +268,7 @@ if not "%R_BUILD%"=="PASS" set EXITC=1
 if not "%R_SELFTEST%"=="PASS" set EXITC=1
 if not "%R_ROUNDTRIP%"=="PASS" set EXITC=1
 if not "%R_REDTEAM%"=="PASS" if not "%R_REDTEAM%"=="skip" set EXITC=1
+if not "%R_CRYPTODIFF%"=="PASS" if not "%R_CRYPTODIFF%"=="skip" set EXITC=1
 if "%EXITC%"=="0" ( echo ALL STAGES PASSED ) else ( echo RUN FAILED )
 exit /b %EXITC%
 

@@ -79,6 +79,7 @@ extern cmd_fedapikat:proc               ; M2: master-key federation API KAT (vau
 extern cmd_fedfanout:proc               ; M2: fan-out KAT (vault.asm)
 extern cmd_avtest:proc                  ; availability retry state-machine probe (vault.asm)
 extern cmd_pkat:proc                    ; parallel fail-closed KAT gate (selftest.asm)
+extern cmd_katreport:proc               ; external-audit crypto proof battery (selftest.asm)
 extern read_file:proc
 ifdef DBG_TRACE
 extern cmd_redteam:proc                 ; fault-injection self-test (redteam.asm)
@@ -219,6 +220,7 @@ WSTR w_cowrite,  <cowrite>               ; C8: write-lock exclusivity probe
 WSTR w_attfuzz,  <attfuzz>               ; G8: attachment-index fuzzer
 WSTR w_healthkat,<healthkat>             ; E6: vault-health analysis KAT
 WSTR w_pkat,     <pkat>
+WSTR w_katreport, <katreport>
 WSTR w_trtest,   <trtest>
 WSTR w_mvtest,   <mvtest>
 WSTR w_mvswitch, <mvswitch>
@@ -313,6 +315,7 @@ cmd_table label CMDENT
     CMDENT { w_fedfanout, cmd_fedfanout, 1, 0 }   ; M2: fan-out KAT (takes a vault path)
     CMDENT { w_avtest,    cmd_avtest,    0, 0 }   ; availability retry state-machine probe
     CMDENT { w_pkat,      cmd_pkat,      0, 0 }   ; parallel fail-closed KAT gate
+    CMDENT { w_katreport, cmd_katreport, 0, 0 }   ; external-audit crypto proof battery
     CMDENT { w_trtest,    cmd_trtest,    0, 0 }   ; trash timestamp/threshold KAT
 ifdef DBG_TRACE
     CMDENT { w_securedesk, cmd_securedesk, 0, 0 } ; private-desktop spike dialog (dbg)
