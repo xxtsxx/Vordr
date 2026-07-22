@@ -61,6 +61,7 @@ extern vault_ctx_front:proc
 extern vault_ctx_setname:proc
 extern fed_unlock_master:proc           ; M2: load federation record on master unlock (vault.asm)
 extern fed_fanout:proc                  ; M2: open foreign vaults with cached keys (vault.asm)
+extern fed_remember_open:proc           ; M2: record the open vault set (vault.asm)
 extern vault_ctx_nameptr:proc
 extern vault_ctx_close:proc
 externdef g_vault_n:dword
@@ -10800,6 +10801,7 @@ goa_loaded:
     mov     rcx, qword ptr [rbp-24]            ; repopulate for the new vault + repaint tabs
     mov     edx, dword ptr [g_vault_cur]
     call    gui_switch_vault
+    call    fed_remember_open                 ; record the open set (fan-out reopens next launch)
     jmp     goa_done
 goa_rollback:
     mov     eax, dword ptr [g_vault_n]         ; drop the claimed slot
@@ -10840,6 +10842,7 @@ gcv_tgt:
 gcv_drop:
     mov     ecx, dword ptr [rbp-32]           ; wipe + compact + adjust cur (vault.asm)
     call    vault_ctx_close
+    call    fed_remember_open                 ; update the recorded open set
     WINCALL GetDlgItem, qword ptr [rbp-24], IDC_V_TABS
     WINCALL InvalidateRect, rax, 0, 1
 gcv_done:

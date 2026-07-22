@@ -2722,17 +2722,29 @@ cmd_mvname endp
 ; ===========================================================================
 ; vault_id_of(rcx = out16) - write SHA-256(g_hdr salt)[0..15] to out.
 public vault_id_of
-vault_id_of proc frame
+; vault_id_hdr(rcx = &salt32, rdx = out16) - out = SHA-256(salt)[0..15].
+public vault_id_hdr
+vault_id_hdr proc frame
     FRAME_PROLOG 96
-    mov     qword ptr [rbp-24], rcx           ; out16
-    lea     rcx, [g_hdr+VH_SALT]              ; hash the 32-byte CSPRNG salt
-    mov     edx, 32
+    mov     qword ptr [rbp-24], rdx           ; out16
+    mov     edx, 32                           ; rcx already = &salt
     lea     r8, [rbp-64]                      ; 32-byte digest scratch (above the shadow)
     call    sha256_hash
     mov     rcx, qword ptr [rbp-24]           ; out = digest[0..15]
     lea     rdx, [rbp-64]
     mov     r8d, 16
     call    copy_bytes
+    FRAME_EPILOG
+    ret
+vault_id_hdr endp
+
+; vault_id_of(rcx = out16) - out = SHA-256(g_hdr salt)[0..15] (the live vault).
+public vault_id_of
+vault_id_of proc frame
+    FRAME_PROLOG 32
+    mov     rdx, rcx                          ; out
+    lea     rcx, [g_hdr+VH_SALT]
+    call    vault_id_hdr
     FRAME_EPILOG
     ret
 vault_id_of endp
@@ -3712,6 +3724,78 @@ ffo_done:
     FRAME_EPILOG
     ret
 fed_fanout endp
+
+; fed_remember_open() - capture the currently-open set into the machine-local
+;   federation record so the next launch's fan-out reopens it.  Rebuilds the
+;   record from every open slot except the master (slot 0), keyed/sealed under
+;   the master's key (slot 0's s_vkey).  An empty set deletes the record (no
+;   federation, no provisioning).  Call when the open set changes (a foreign
+;   vault opened or a tab closed).  slot 0 is assumed to be the master.
+public fed_remember_open
+fed_remember_open proc frame
+    FRAME_PROLOG 64
+    mov     eax, dword ptr [g_vault_cur]      ; snapshot live -> its slot (make all current)
+    cmp     eax, 0
+    jl      fro_build
+    mov     ecx, eax
+    call    vault_ctx_slotptr
+    mov     rcx, rax
+    call    vault_snapshot
+fro_build:
+    call    fed_reset
+    mov     dword ptr [rbp-24], 1             ; i = 1 (slot 0 = master, skip)
+fro_loop:
+    mov     eax, dword ptr [rbp-24]
+    cmp     eax, dword ptr [g_vault_n]
+    jae     fro_save
+    mov     ecx, dword ptr [rbp-24]
+    call    vault_ctx_slotptr
+    mov     qword ptr [rbp-32], rax           ; &slot[i]
+    lea     rcx, [rax + VSLOT.s_hdr + VH_SALT]  ; fl_id = SHA-256(slot salt)[0..15]
+    lea     rdx, [g_fedlink_tmp + FEDLINK.fl_id]
+    call    vault_id_hdr
+    mov     r10, qword ptr [rbp-32]           ; fl_kcv = slot header KCV
+    lea     rcx, [g_fedlink_tmp + FEDLINK.fl_kcv]
+    lea     rdx, [r10 + VSLOT.s_hdr + VH_KCV]
+    mov     r8d, 16
+    call    copy_bytes
+    mov     r10, qword ptr [rbp-32]           ; fl_key = slot's cached key
+    lea     rcx, [g_fedlink_tmp + FEDLINK.fl_key]
+    lea     rdx, [r10 + VSLOT.s_vkey]
+    mov     r8d, 32
+    call    copy_bytes
+    mov     r10, qword ptr [rbp-32]           ; fl_loc = slot's file path
+    lea     rcx, [g_fedlink_tmp + FEDLINK.fl_loc]
+    lea     rdx, [r10 + VSLOT.s_vpath]
+    mov     r8d, 512
+    call    copy_bytes
+    mov     r10, qword ptr [rbp-32]           ; fl_name = slot's display name
+    lea     rcx, [g_fedlink_tmp + FEDLINK.fl_name]
+    lea     rdx, [r10 + VSLOT.s_name]
+    mov     r8d, 128
+    call    copy_bytes
+    mov     dword ptr [g_fedlink_tmp + FEDLINK.fl_flags], 0
+    lea     rcx, [g_fedlink_tmp]
+    call    fed_add
+    inc     dword ptr [rbp-24]
+    jmp     fro_loop
+fro_save:
+    cmp     dword ptr [g_fedrec + FEDREC.fr_count], 0
+    jne     fro_dosave
+    lea     rcx, [fed_valname]                ; empty set -> forget the record
+    call    reg_fed_del
+    FRAME_EPILOG
+    ret
+fro_dosave:
+    xor     ecx, ecx                          ; master key = slot 0's s_vkey
+    call    vault_ctx_slotptr
+    lea     rcx, [rax + VSLOT.s_vkey]
+    lea     rdx, [fms_key]
+    lea     r8, [fms_val]
+    call    fed_save_all
+    FRAME_EPILOG
+    ret
+fed_remember_open endp
 
 ; cmd_fedfanout <path> - headless KAT: seed a real vault at <path>, link it with
 ;   its own key, fan out and assert it opens as a 2nd context; then corrupt the
