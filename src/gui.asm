@@ -15388,7 +15388,10 @@ secdesk_body endp
 ;   throughout, so mutating g_sstk_* here is race-free.  RAW proc by design: it must
 ;   NOT frame itself (that would push to the stack it is about to swap out).
 secdesk_thread proc
-    sub     rsp, 40                              ; 32 shadow + 8 to 16-align the call
+    push    rbp                                  ; robust raw frame: force 16-byte alignment
+    mov     rbp, rsp                             ; regardless of the OS thread-entry rsp
+    and     rsp, -16                             ; (a bad assumption here misaligned the crypto
+    sub     rsp, 32                              ;  in secdesk_body -> corruption/faults)
     mov     rax, qword ptr [g_sstk_base]         ; park the main thread's shadow stack
     mov     qword ptr [g_sstk_savebase], rax
     mov     rax, qword ptr [g_sstk_index]
@@ -15401,7 +15404,8 @@ secdesk_thread proc
     mov     qword ptr [g_sstk_base], rax
     mov     rax, qword ptr [g_sstk_saveidx]
     mov     qword ptr [g_sstk_index], rax
-    add     rsp, 40
+    mov     rsp, rbp
+    pop     rbp
     xor     eax, eax
     ret
 secdesk_thread endp
