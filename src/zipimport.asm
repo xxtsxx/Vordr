@@ -769,13 +769,23 @@ zi_stage_title endp
 ;               number of entries actually imported.
 ; =============================================================================
 zi_walk proc frame
-    FRAME_PROLOG 96
+    FRAME_PROLOG 112                            ; grown from 96: [rbp-72]/[rbp-80] are the
+                                                ; forward-progress markers below, and must sit
+                                                ; ABOVE the 32-byte callee shadow (a callee
+                                                ; would clobber a marker inside it).
     mov     dword ptr [g_zi_count], 0
     mov     dword ptr [g_zi_e], 0
+    mov     qword ptr [rbp-72], 0              ; entry-loop progress marker (0 = none yet)
     mov     al, '['
     call    zj_skipch
 zij_entry:
     mov     r10, qword ptr [g_zi_p]
+    cmp     r10, qword ptr [rbp-72]             ; FORWARD-PROGRESS guard: if this entry
+    je      zij_done                            ;   iteration begins where the last one did,
+    mov     qword ptr [rbp-72], r10             ;   the cursor is stuck on malformed json ->
+                                                ;   stop.  Without it a crafted vordr.json
+                                                ;   spins zij_entry forever (a DoS; found by
+                                                ;   the jfuzz structural fuzzer).
     cmp     r10, qword ptr [g_zi_jend]
     jae     zij_done
     movzx   eax, byte ptr [r10]
@@ -817,8 +827,12 @@ zij_titdone:
     call    zj_lit
     mov     dword ptr [g_zi_ap], 0              ; fresh arena for this entry
     mov     dword ptr [rbp-24], 0               ; n (field slot)
+    mov     qword ptr [rbp-80], 0              ; field-loop progress marker (reset per entry)
 zij_field:
     mov     r10, qword ptr [g_zi_p]
+    cmp     r10, qword ptr [rbp-80]             ; FORWARD-PROGRESS guard (see zij_entry): a
+    je      zij_fend                            ;   stuck cursor in the fields array would
+    mov     qword ptr [rbp-80], r10             ;   otherwise spin zij_field forever
     cmp     r10, qword ptr [g_zi_jend]
     jae     zij_fend
     movzx   eax, byte ptr [r10]
@@ -1239,5 +1253,130 @@ zfz_oom:
     FRAME_EPILOG
     ret
 cmd_zfuzz endp
+
+; =============================================================================
+; cmd_jfuzz - structural fuzzer for the DECRYPTED-JSON parser (zi_walk / zj_str /
+;   zj_num / zj_lit / zi_u2w / zi_stage_title).  cmd_zfuzz covers only the
+;   pre-crypto zi_scan surface; this closes the coverage gap on everything
+;   downstream of decryption.  It mutates a valid vordr.json seed and drives the
+;   STAGE pass (g_zi_mode=0), which decodes every title and label (JSON strings +
+;   the UTF-8->wide conversion) without needing an open vault.  The parser is
+;   bounds-safe by construction (reads are gated by g_zi_p < g_zi_jend, writes to
+;   g_zi_sbuf/arena are capped); this proves it stays crash-free under mutation.
+;   Survives every iteration => exit 0 = pass.
+; =============================================================================
+.data
+CSTR jfz_ok,  "jfuzz: PASS ("
+CSTR jfz_ok2, " iters, 0 crashes in the decrypted-json parser)",13,10
+jfz_seed label byte
+    db '[{"title":"account","fields":[{"type":1,"label":"user","value":"bob"},'
+    db '{"type":2,"label":"note","value":"hello world"}]},'
+    db '{"title":"second","fields":[{"type":1,"label":"x","value":"y"}]}]'
+jfz_seed_end label byte
+JFZ_SEED_LEN equ jfz_seed_end - jfz_seed
+JFZ_ITERS    equ 20000
+
+.data?
+align 8
+jfz_buf     db 1024 dup (?)
+
+.code
+LANDING_PAD
+public cmd_jfuzz
+cmd_jfuzz proc frame
+    FRAME_PROLOG 64
+    ; [rbp-24]=iters  [rbp-32]=curlen  [rbp-40]=nmut
+    call    fuzz_seed                                ; G7: random (or --seed) + logged
+    mov     qword ptr [g_zfz_rng], rax
+    mov     rcx, ZI_ARENA                            ; arena: zi_walk decodes wide here
+    call    mem_alloc
+    test    rax, rax
+    jz      jfz_oom
+    mov     qword ptr [g_zi_arena], rax
+    lea     rax, [g_zi_u8pw]
+    mov     qword ptr [g_zi_pwptr], rax
+    mov     dword ptr [g_zi_pwlen], 0
+    mov     qword ptr [rbp-24], JFZ_ITERS
+jfz_iter:
+    cmp     qword ptr [rbp-24], 0
+    je      jfz_report
+    lea     r10, [jfz_seed]                          ; restore pristine seed
+    lea     r11, [jfz_buf]
+    xor     r8, r8
+jfz_restore:
+    mov     al, byte ptr [r10+r8]
+    mov     byte ptr [r11+r8], al
+    inc     r8
+    cmp     r8, JFZ_SEED_LEN
+    jb      jfz_restore
+    mov     qword ptr [rbp-32], JFZ_SEED_LEN         ; curlen
+    call    zfz_rand                                 ; 1..4 mutations this round
+    and     rax, 3
+    inc     rax
+    mov     qword ptr [rbp-40], rax
+jfz_mut:
+    cmp     qword ptr [rbp-40], 0
+    je      jfz_run
+    mov     rax, qword ptr [rbp-32]
+    test    rax, rax
+    jz      jfz_mutnext
+    call    zfz_rand
+    mov     rcx, rax                                 ; r
+    xor     edx, edx
+    div     qword ptr [rbp-32]                       ; rdx = off = r mod curlen
+    mov     r8, rdx
+    mov     rax, rcx
+    shr     rax, 2
+    and     rax, 3
+    cmp     rax, 2
+    je      jfz_trunc                                ; op 2: truncate
+    lea     r9, [jfz_buf]                            ; op 0/1/3: set byte at off
+    add     r9, r8
+    mov     rax, rcx
+    shr     rax, 8
+    mov     byte ptr [r9], al
+    jmp     jfz_mutnext
+jfz_trunc:
+    mov     rax, rcx
+    shr     rax, 8
+    xor     edx, edx
+    mov     r10, JFZ_SEED_LEN + 1
+    div     r10
+    mov     qword ptr [rbp-32], rdx                  ; curlen = r mod (seedlen+1)
+jfz_mutnext:
+    dec     qword ptr [rbp-40]
+    jmp     jfz_mut
+jfz_run:
+    lea     rax, [jfz_buf]
+    mov     qword ptr [g_zi_jptr], rax
+    mov     qword ptr [g_zi_p], rax
+    mov     r10, qword ptr [rbp-32]
+    mov     dword ptr [g_zi_jlen], r10d
+    add     rax, r10
+    mov     qword ptr [g_zi_jend], rax
+    mov     dword ptr [g_zi_tap], 0
+    mov     dword ptr [g_zi_stg_n], 0
+    mov     dword ptr [g_zi_mode], 0                 ; STAGE: decode titles/labels
+    call    zi_walk
+    dec     qword ptr [rbp-24]
+    jmp     jfz_iter
+jfz_report:
+    call    zi_free_wipe                             ; release the arena + wipe pw
+    lea     rcx, [jfz_ok]
+    mov     edx, jfz_ok_len
+    call    print_a
+    mov     rcx, JFZ_ITERS
+    call    print_u64
+    lea     rcx, [jfz_ok2]
+    mov     edx, jfz_ok2_len
+    call    print_a
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+jfz_oom:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_jfuzz endp
 
 end

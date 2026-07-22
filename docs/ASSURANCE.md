@@ -136,7 +136,9 @@ Vordr parses fully attacker-controllable input: `.vordr` vault files, imported
 never crash on malformed input:
 
 - `vfuzz` — vault record-parser structural fuzzer.
-- `fuzzzip` — ZIP-import parser structural fuzzer.
+- `fuzzzip` — ZIP-import (pre-crypto) parser structural fuzzer.
+- `jfuzz` — decrypted-`vordr.json` parser structural fuzzer (added this pass; it
+  immediately found and we fixed an infinite-loop DoS — see §6a).
 - `attfuzz` — attachment-index builder fuzz with random blobs.
 
 Authenticity/anti-tamper of the vault file is separately proven: `mactest`
@@ -177,6 +179,25 @@ locations in this repository's test map; each is a self-contained assertion with
 an exit-code pass/fail signal.
 
 ---
+
+## 6a. Findings from the current audit pass
+
+An independent review of the untrusted-input parsers (the `.vordr` vault file and
+the imported `.zip`) was performed this pass. Both earned a **clean bill on
+attacker-reachable memory corruption** — no OOB read/write and no
+password-independent overflow. The prior "attachment section processed before full
+authentication" concern was confirmed **fixed** (the mandatory full-file MAC is
+verified before any attachment length is used). Three defense-in-depth items were
+found and hardened, each with a regression test:
+
+| Item | Severity | Fix | Test |
+|---|---|---|---|
+| KDF cost params (`t_cost`/`m_cost`) read from the unauthenticated header and run through Argon2id *before* the file MAC can be checked → a crafted file drives a giant allocation on open, no password needed | DoS (pre-auth, no key) | `vk_params_ok` rejects out-of-range params as corrupt before the KDF | `kdfparam` (gated) |
+| Attachment `entries_len + 112` could integer-wrap past a plausibility check (post-auth; a downstream cap caught it, but fragile) | latent | reject `entries_len ≥ effective_end` before the add | vault-open probes |
+| Post-decryption `vordr.json` parser could **infinite-loop** on malformed input (a stuck parse cursor never advanced) → hang/DoS on a crafted or corrupted file | DoS | forward-progress guards on both `zi_walk` parse loops (bail if the cursor doesn't advance) | `jfuzz` (gated) — the fuzzer that found it |
+
+The recurring multi-vault teardown crash class was also structurally closed this
+pass by making `secmem_free` double-free-safe (§3, `secfreedup`).
 
 ## 7. Honest limitations (what is NOT claimed)
 

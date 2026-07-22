@@ -100,7 +100,7 @@ set /a T_SELFTEST=!T1!-!T0!
 
 rem -------------------------------------------------------------- roundtrip --
 call :now T0
-echo === stage: roundtrip (seedtest / atgen / zitest / phtest / secscan / secfreedup / tmptest / fztest / trtest / vfuzz / fuzzzip / bktest / mactest / rbtest / xctest / reload / attfuzz / healthkat / pkat / mvtest / mvswitch / mvname / mvremove / mvclose / mvlock / mvstale / kdfparam / idkat / kekkat / keyringkat / fedkat / fedregkat / fmskat / fedapikat / fedfanout / avtest) ===
+echo === stage: roundtrip (seedtest / atgen / zitest / phtest / secscan / secfreedup / tmptest / fztest / trtest / vfuzz / fuzzzip / jfuzz / bktest / mactest / rbtest / xctest / reload / attfuzz / healthkat / pkat / mvtest / mvswitch / mvname / mvremove / mvclose / mvlock / mvstale / kdfparam / idkat / kekkat / keyringkat / fedkat / fedregkat / fmskat / fedapikat / fedfanout / avtest) ===
 set RT=PASS
 
 bin\vordr.exe seedtest "%WORK%\rt.vault" > "%WORK%\seedtest.log" 2>&1
@@ -146,6 +146,9 @@ if not "!errorlevel!"=="0" ( echo   vfuzz: FAIL ^(exit !errorlevel!, vault parse
 
 bin\vordr.exe fuzzzip > "%WORK%\fuzzzip.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   fuzzzip: FAIL ^(exit !errorlevel!, zip-import parser fuzzer crashed^) & set RT=FAIL )
+
+bin\vordr.exe jfuzz > "%WORK%\jfuzz.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   jfuzz: FAIL ^(exit !errorlevel!, decrypted-json parser fuzzer crashed/hung^) & set RT=FAIL )
 
 bin\vordr.exe bktest "%WORK%\bk.vault" > "%WORK%\bktest.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   bktest: FAIL ^(exit !errorlevel!, atomic-save/backup rotation^) & set RT=FAIL )
