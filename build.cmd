@@ -155,7 +155,7 @@ if errorlevel 1 goto :failed
 echo === linking vordr.exe (%GUARDFLAGS%) ===
 link /nologo /subsystem:windows /entry:wstart /nodefaultlib /incremental:no ^
      /dynamicbase /highentropyva /nxcompat /largeaddressaware ^
-     %GUARDFLAGS% %REPROFLAGS% /debug /pdb:bin\vordr.pdb ^
+     %GUARDFLAGS% %REPROFLAGS% /debug /pdb:bin\vordr.pdb /map:bin\vordr.map ^
      /manifest:embed /manifestinput:vordr.manifest /manifestuac:no ^
      /libpath:"%SDKLIB%" ^
      /out:bin\vordr.exe obj\main.obj obj\console.obj obj\hardening.obj obj\random.obj obj\loadcfg.obj obj\sha256.obj obj\sha1.obj obj\aesgcm.obj obj\blake2b.obj obj\argon2.obj obj\fileio.obj obj\secmem.obj obj\vault.obj obj\totp.obj obj\tpm.obj obj\regcfg.obj obj\pwgen.obj obj\bench.obj obj\log.obj obj\selftest.obj obj\redteam.obj obj\theme.obj obj\zipexport.obj obj\zipimport.obj obj\gui.obj obj\vordr.res ^
