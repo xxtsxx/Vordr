@@ -357,6 +357,8 @@ align 8
 g_fedrec    FEDREC <>                          ; M2: the live federation record (link table)
 g_fedblob   db (sizeof FEDREC) + 32 dup (?)    ;   sealed form (nonce+ct+tag)
 g_fedlink_tmp FEDLINK <>                        ;   scratch link template (fedkat)
+g_fedkat_bak  db (sizeof FEDREC) + 32 dup (?)   ;   backup of the REAL record (hermetic KATs)
+g_fedkat_baklen dd ?
 g_fed_mkblob db 512 dup (?)                     ; M2: sealed machine-secret blob
 g_fms_out1  db 32 dup (?)                       ;   fmskat scratch
 g_fms_out2  db 32 dup (?)
@@ -3331,7 +3333,8 @@ fed_load endp
 LANDING_PAD
 public cmd_fedregkat
 cmd_fedregkat proc frame
-    FRAME_PROLOG 48
+    FRAME_PROLOG 64
+    call    fed_rec_backup                    ; preserve the user's real record
     call    fed_reset
     mov     dword ptr [rbp-24], 0             ; v
 frk_build:
@@ -3388,6 +3391,9 @@ frk_built:
     jnz     frk_ret
     xor     eax, eax
 frk_ret:
+    mov     dword ptr [rbp-32], eax           ; save exit code across the restore
+    call    fed_rec_restore                    ; restore the user's real record
+    mov     eax, dword ptr [rbp-32]
     FRAME_EPILOG
     ret
 cmd_fedregkat endp
@@ -3600,6 +3606,7 @@ LANDING_PAD
 public cmd_fedapikat
 cmd_fedapikat proc frame
     FRAME_PROLOG 64
+    call    fed_rec_backup                    ; preserve the user's real record
     lea     rcx, [fms_kat_key]                ; clean start
     call    tpm_delete
     lea     rcx, [fms_kat_val]
@@ -3647,12 +3654,41 @@ fak_done:
     call    tpm_delete
     lea     rcx, [fms_kat_val]
     call    reg_fed_del
-    lea     rcx, [fed_valname]
-    call    reg_fed_del
+    call    fed_rec_restore                    ; restore the user's real record
     mov     eax, dword ptr [rbp-28]
     FRAME_EPILOG
     ret
 cmd_fedapikat endp
+
+; fed_rec_backup() - stash the real federation record blob so a KAT can clobber
+;   fed_valname and put it back.  fed_rec_restore() undoes it (deletes if none).
+fed_rec_backup proc frame
+    FRAME_PROLOG 32
+    lea     rcx, [fed_valname]
+    lea     rdx, [g_fedkat_bak]
+    mov     r8d, (sizeof FEDREC) + 32
+    call    reg_fed_get
+    mov     dword ptr [g_fedkat_baklen], eax
+    FRAME_EPILOG
+    ret
+fed_rec_backup endp
+
+fed_rec_restore proc frame
+    FRAME_PROLOG 32
+    cmp     dword ptr [g_fedkat_baklen], 0
+    jne     frr_set
+    lea     rcx, [fed_valname]
+    call    reg_fed_del
+    FRAME_EPILOG
+    ret
+frr_set:
+    lea     rcx, [fed_valname]
+    lea     rdx, [g_fedkat_bak]
+    mov     r8d, dword ptr [g_fedkat_baklen]
+    call    reg_fed_set
+    FRAME_EPILOG
+    ret
+fed_rec_restore endp
 
 ; --- M2: fan-out — open every foreign vault with its cached key ---------------
 ; fed_fanout() - for each link in g_fedrec (skipping LINK_PROMPT), open the
