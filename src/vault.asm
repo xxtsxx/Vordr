@@ -437,6 +437,31 @@ conv_w2u endp
 ; vk_derive() - Argon2id(master pw, g_hdr salt/t/m, p=1) -> g_vkey (32 bytes).
 ;   -> eax = 0 on success, EXIT_OOM on KDF failure.
 ; ===========================================================================
+; vk_params_ok() -> eax = 1 if the header's Argon2 cost params are within the
+;   range a legitimate Vordr vault can carry, else 0.  Bounds match the config/CLI:
+;   t_cost in [ARGON2_MIN_T .. ARGON2_MAX_T], m_cost in (0 .. ARGON2_MAX_M_KIB].
+;   A too-SMALL m is allowed (fast test vaults use m=8 KiB); only the exhaustion
+;   direction is dangerous.  Called before the KDF (pre-auth) so a crafted header
+;   can never drive a giant allocation.  Leaf.
+public vk_params_ok
+vk_params_ok proc
+    mov     eax, dword ptr [g_hdr+VH_T]
+    cmp     eax, ARGON2_MIN_T
+    jb      vp_bad
+    cmp     eax, ARGON2_MAX_T
+    ja      vp_bad
+    mov     eax, dword ptr [g_hdr+VH_M]
+    test    eax, eax
+    jz      vp_bad
+    cmp     eax, ARGON2_MAX_M_KIB
+    ja      vp_bad
+    mov     eax, 1
+    ret
+vp_bad:
+    xor     eax, eax
+    ret
+vk_params_ok endp
+
 vk_derive proc frame
     FRAME_PROLOG 32
     lea     r10, [g_areq]
@@ -1036,6 +1061,14 @@ vu_hcpy:
     inc     r8
     cmp     r8, VH_TOTAL
     jb      vu_hcpy
+    ; PRE-AUTH DoS guard: the KDF cost parameters come straight from the (as-yet
+    ; unauthenticated) header and must be run BEFORE the file MAC can be checked.
+    ; A crafted file could set m_cost to a huge value -> a giant KDF allocation on
+    ; a victim who merely OPENS the file (no password needed).  Reject params no
+    ; legitimate Vordr vault could carry (bounds below) as corrupt/tamper.
+    call    vk_params_ok
+    test    eax, eax
+    jz      vu_corrupt
     ; derive key (TPM sidecar or master password) + KCV check
     cmp     dword ptr [g_reuse_key], 0  ; C8 reload: g_vkey already derived - skip Argon2
     jne     vu_havekey                  ; (KCV below still re-verifies it fits the file)
@@ -1116,9 +1149,11 @@ vu_nofmac:
     sub     r11, ATT_TRAILER
     cmp     dword ptr [r11], ATT_MAGIC
     jne     vu_ctlen
-    mov     r9, qword ptr [r11+4]               ; attachment entries length
-    mov     rcx, r9
-    add     rcx, VH_TOTAL + 16 + ATT_TRAILER + 4
+    mov     r9, qword ptr [r11+4]               ; attachment entries length (untrusted u64)
+    cmp     r9, rax                             ; entries_len alone must be < effective end;
+    jae     vu_ctlen                            ;   reject first so the +112 below cannot WRAP
+    mov     rcx, r9                             ;   (a near-2^64 value would wrap small and slip
+    add     rcx, VH_TOTAL + 16 + ATT_TRAILER + 4 ;   past the plausibility check)
     cmp     rcx, rax
     ja      vu_ctlen                            ; implausible -> ignore
     mov     qword ptr [g_att_total], r9
@@ -3349,6 +3384,75 @@ mrc_ret:
     FRAME_EPILOG
     ret
 cmd_mvrecreate endp
+
+; ===========================================================================
+; cmd_kdfparam - regression for the PRE-AUTH KDF-parameter DoS guard.  A crafted
+;   .vordr header carries the Argon2 t_cost/m_cost, which vault_unlock must run
+;   BEFORE it can authenticate the file (the key is needed to check the MAC).  An
+;   out-of-range m_cost would otherwise drive a giant allocation on a victim who
+;   merely opens the file.  vk_params_ok gates it.  This probe asserts the exact
+;   accept/reject boundary; with the guard removed the "reject" cases would pass
+;   vk_params_ok and this probe FAILS (exit 1).
+; ===========================================================================
+CSTR kdp_ok,  "kdfparam: PASS (out-of-range KDF params rejected pre-auth; valid accepted)",13,10
+CSTR kdp_bad, "kdfparam: FAIL (a dangerous KDF parameter was not rejected)",13,10
+LANDING_PAD
+public cmd_kdfparam
+cmd_kdfparam proc frame
+    FRAME_PROLOG 32
+    ; --- must ACCEPT: legitimate params ---
+    mov     dword ptr [g_hdr+VH_T], ARGON2_DEF_T        ; t=3, m=512 MiB (default)
+    mov     dword ptr [g_hdr+VH_M], ARGON2_DEF_M_KIB
+    call    vk_params_ok
+    test    eax, eax
+    jz      kdp_fail
+    mov     dword ptr [g_hdr+VH_T], 1                   ; fast test vault: t=1, m=8 KiB
+    mov     dword ptr [g_hdr+VH_M], 8
+    call    vk_params_ok
+    test    eax, eax
+    jz      kdp_fail
+    mov     dword ptr [g_hdr+VH_T], ARGON2_MAX_T        ; upper boundary: t=16, m=4 GiB
+    mov     dword ptr [g_hdr+VH_M], ARGON2_MAX_M_KIB
+    call    vk_params_ok
+    test    eax, eax
+    jz      kdp_fail
+    ; --- must REJECT: the DoS / tamper vectors ---
+    mov     dword ptr [g_hdr+VH_T], ARGON2_DEF_T        ; m_cost = 0
+    mov     dword ptr [g_hdr+VH_M], 0
+    call    vk_params_ok
+    test    eax, eax
+    jnz     kdp_fail
+    mov     dword ptr [g_hdr+VH_M], ARGON2_MAX_M_KIB + 1 ; just over 4 GiB
+    call    vk_params_ok
+    test    eax, eax
+    jnz     kdp_fail
+    mov     dword ptr [g_hdr+VH_M], 0FFFFFFFFh          ; attacker's ~4 TiB request
+    call    vk_params_ok
+    test    eax, eax
+    jnz     kdp_fail
+    mov     dword ptr [g_hdr+VH_T], 0                   ; t_cost = 0
+    mov     dword ptr [g_hdr+VH_M], ARGON2_DEF_M_KIB
+    call    vk_params_ok
+    test    eax, eax
+    jnz     kdp_fail
+    mov     dword ptr [g_hdr+VH_T], ARGON2_MAX_T + 1    ; t_cost > 16
+    call    vk_params_ok
+    test    eax, eax
+    jnz     kdp_fail
+    lea     rcx, [kdp_ok]
+    mov     edx, kdp_ok_len
+    call    print_a
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+kdp_fail:
+    lea     rcx, [kdp_bad]
+    mov     edx, kdp_bad_len
+    call    print_a
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_kdfparam endp
 
 ; ===========================================================================
 ; M1 (master-vault federation): vault identity.  The machine-local keyring
