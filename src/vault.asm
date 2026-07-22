@@ -2779,6 +2779,111 @@ mvn_fail:
     ret
 cmd_mvname endp
 
+; cmd_mvremove - verify the M4 "Remove" recording.  fed_remember_open keys each
+;   foreign link by vault_id = SHA-256(slot salt), and fed_add dedups by that id.
+;   Phase 1 (DISTINCT salts): remove 1 of 4 -> g_vault_n=3 and the rebuilt record
+;   has 2 links.  Phase 2 (SHARED salt = same vault copied): the record dedups to
+;   1.  Confirms the remove logic is correct for distinct vaults, and documents
+;   that same-salt copies collapse (they are one vault to the federation).
+CSTR mvr_ok,  "mvremove: PASS (distinct remove keeps the rest; shared-salt dedups)",13,10
+CSTR mvr_bad, "mvremove: FAIL",13,10
+LANDING_PAD
+public cmd_mvremove
+cmd_mvremove proc frame
+    FRAME_PROLOG 48
+    ; ---- phase 1: four vaults with DISTINCT salts ----
+    call    vault_ctx_reset
+    mov     qword ptr [g_body_ptr], 0
+    call    vault_ctx_open
+    call    vault_ctx_open
+    call    vault_ctx_open
+    call    vault_ctx_open                   ; master + 3 foreign, n=4, cur=3
+    xor     ecx, ecx
+    call    vault_ctx_front                  ; cur=0
+    mov     dword ptr [rbp-24], 0
+mvr_ds:
+    cmp     dword ptr [rbp-24], 4
+    jae     mvr_d1
+    mov     ecx, dword ptr [rbp-24]
+    call    vault_ctx_slotptr
+    mov     r10, rax
+    mov     eax, dword ptr [rbp-24]
+    add     eax, 30h
+    mov     byte ptr [r10 + VSLOT.s_hdr + VH_SALT], al   ; distinct salt -> distinct id
+    inc     dword ptr [rbp-24]
+    jmp     mvr_ds
+mvr_d1:
+    mov     ecx, 1                           ; remove slot 1 (a foreign vault)
+    call    vault_ctx_close
+    cmp     dword ptr [g_vault_n], 3
+    jne     mvr_fail
+    call    mvr_rebuild
+    cmp     dword ptr [g_fedrec + FEDREC.fr_count], 2     ; the other two survive
+    jne     mvr_fail
+    ; ---- phase 2: four vaults with the SAME salt (copies) ----
+    call    vault_ctx_reset
+    mov     qword ptr [g_body_ptr], 0
+    call    vault_ctx_open
+    call    vault_ctx_open
+    call    vault_ctx_open
+    call    vault_ctx_open
+    xor     ecx, ecx
+    call    vault_ctx_front
+    mov     dword ptr [rbp-24], 0
+mvr_ss:
+    cmp     dword ptr [rbp-24], 4
+    jae     mvr_s1
+    mov     ecx, dword ptr [rbp-24]
+    call    vault_ctx_slotptr
+    mov     byte ptr [rax + VSLOT.s_hdr + VH_SALT], 77h   ; identical salt for all
+    inc     dword ptr [rbp-24]
+    jmp     mvr_ss
+mvr_s1:
+    mov     ecx, 1
+    call    vault_ctx_close
+    call    mvr_rebuild
+    cmp     dword ptr [g_fedrec + FEDREC.fr_count], 1     ; same id -> collapse to 1
+    jne     mvr_fail
+    lea     rcx, [mvr_ok]
+    mov     edx, mvr_ok_len
+    call    print_a
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+mvr_fail:
+    lea     rcx, [mvr_bad]
+    mov     edx, mvr_bad_len
+    call    print_a
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_mvremove endp
+
+; mvr_rebuild - replicate fed_remember_open's link-recording loop (slots 1..n-1),
+;   keying each by vault_id_hdr(salt) and fed_add (which dedups by id).
+mvr_rebuild proc frame
+    FRAME_PROLOG 32
+    call    fed_reset
+    mov     dword ptr [rbp-24], 1
+mrb_loop:
+    mov     eax, dword ptr [rbp-24]
+    cmp     eax, dword ptr [g_vault_n]
+    jae     mrb_done
+    mov     ecx, dword ptr [rbp-24]
+    call    vault_ctx_slotptr
+    lea     rcx, [rax + VSLOT.s_hdr + VH_SALT]
+    lea     rdx, [g_fedlink_tmp + FEDLINK.fl_id]
+    call    vault_id_hdr
+    mov     dword ptr [g_fedlink_tmp + FEDLINK.fl_flags], 0
+    lea     rcx, [g_fedlink_tmp]
+    call    fed_add
+    inc     dword ptr [rbp-24]
+    jmp     mrb_loop
+mrb_done:
+    FRAME_EPILOG
+    ret
+mvr_rebuild endp
+
 ; ===========================================================================
 ; cmd_mvclose - headless regression for the vault-close teardown (the M4 "Remove"
 ;   path).  Historically two lock-crashes came from secmem_free being asked to

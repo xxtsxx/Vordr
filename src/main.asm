@@ -61,6 +61,7 @@ extern cmd_xctest:proc                  ; external-change detection probe (vault
 extern cmd_mvtest:proc                  ; multi-vault state snapshot/restore probe (vault.asm)
 extern cmd_mvswitch:proc                ; multi-vault context switch probe (vault.asm)
 extern cmd_mvname:proc                  ; multi-vault name<->body coupling probe (vault.asm)
+extern cmd_mvremove:proc                ; M4 remove/record probe (vault.asm)
 extern cmd_mvclose:proc                 ; multi-vault close/teardown double-free probe (vault.asm)
 extern cmd_mvlock:proc                  ; multi-vault lock-teardown double-free probe (vault.asm)
 extern cmd_mvlockreal:proc              ; multi-REAL-vault lock repro (vault.asm)
@@ -219,6 +220,7 @@ WSTR w_trtest,   <trtest>
 WSTR w_mvtest,   <mvtest>
 WSTR w_mvswitch, <mvswitch>
 WSTR w_mvname,   <mvname>
+WSTR w_mvremove, <mvremove>
 WSTR w_mvclose,  <mvclose>
 WSTR w_mvlock,   <mvlock>
 WSTR w_mvlockreal, <mvlockreal>
@@ -289,6 +291,7 @@ cmd_table label CMDENT
     CMDENT { w_mvtest,    cmd_mvtest,    0, 0 }   ; multi-vault snapshot/restore probe
     CMDENT { w_mvswitch,  cmd_mvswitch,  0, 0 }   ; multi-vault context switch probe
     CMDENT { w_mvname,    cmd_mvname,    0, 0 }   ; multi-vault name<->body coupling probe
+    CMDENT { w_mvremove,  cmd_mvremove,  0, 0 }   ; M4 remove/record probe
     CMDENT { w_mvclose,   cmd_mvclose,   0, 0 }   ; multi-vault close/teardown double-free probe
     CMDENT { w_mvlock,    cmd_mvlock,    0, 0 }   ; multi-vault lock-teardown double-free probe
     CMDENT { w_mvlockreal, cmd_mvlockreal, 1, 0 }  ; multi-REAL-vault lock repro (<path>)
