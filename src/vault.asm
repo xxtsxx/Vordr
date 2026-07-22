@@ -2199,7 +2199,7 @@ vault_restore endp
 ;   never leave another vault's secrets resident.
 public vault_ctx_reset
 vault_ctx_reset proc frame
-    FRAME_PROLOG 48
+    FRAME_PROLOG 80
     mov     dword ptr [rbp-24], 0               ; i
 vcr_loop:
     mov     eax, dword ptr [rbp-24]
@@ -2216,6 +2216,7 @@ vcr_loop:
     mov     rcx, qword ptr [r10 + VSLOT.s_body_ptr]
     test    rcx, rcx
     jz      vcr_next
+    mov     qword ptr [rbp-40], rcx             ; P = this slot's body pointer
     ; The live arena (g_body_ptr) ALIASES the current slot's body_ptr - after a
     ; fan-out, slot[0].s_body_ptr == g_body_ptr (the master body).  On the lock
     ; path this proc runs right before vault_lock, which also frees g_body_ptr;
@@ -2228,9 +2229,32 @@ vcr_loop:
     mov     qword ptr [g_body_len], 0
 vcr_free:
     mov     rdx, qword ptr [r10 + VSLOT.s_body_len]
+    mov     rcx, qword ptr [rbp-40]
     call    secmem_free
     mov     r10, qword ptr [rbp-32]
     mov     qword ptr [r10 + VSLOT.s_body_ptr], 0
+    ; DEFENSIVE: null any OTHER slot that ALIASES the same body pointer, so a
+    ; duplicate arising from ANY source (ctx compaction, a snapshot, a stale slot)
+    ; is freed exactly once here - never twice.  secmem_free is not double-free
+    ; safe (it secure_zeros before VirtualFree), and this teardown has crashed on
+    ; that class more than once; make it structurally impossible.
+    mov     eax, dword ptr [rbp-24]
+    inc     eax
+    mov     dword ptr [rbp-48], eax             ; j = i + 1
+vcr_dedup:
+    cmp     dword ptr [rbp-48], MAX_VAULTS
+    jae     vcr_next
+    mov     ecx, dword ptr [rbp-48]
+    call    vault_ctx_slotptr
+    mov     r10, rax
+    mov     rax, qword ptr [rbp-40]             ; P
+    cmp     qword ptr [r10 + VSLOT.s_body_ptr], rax
+    jne     vcr_dedupnext
+    mov     qword ptr [r10 + VSLOT.s_body_ptr], 0
+    mov     qword ptr [r10 + VSLOT.s_body_len], 0
+vcr_dedupnext:
+    inc     dword ptr [rbp-48]
+    jmp     vcr_dedup
 vcr_next:
     inc     dword ptr [rbp-24]
     jmp     vcr_loop
@@ -2814,6 +2838,152 @@ mvc_fail:
     FRAME_EPILOG
     ret
 cmd_mvclose endp
+
+; cmd_mvlock - headless regression for the LOCK teardown with many vaults open
+;   (the fan-out / M4 "Add all" then lock path).  Mirrors fed_fanout: open N
+;   vaults, each with its OWN locked body, WITHOUT fronting between (the next open
+;   snapshots the prior into its slot), front the master at the end, then run the
+;   real lock sequence vault_ctx_reset -> vault_lock.  If any body is freed twice
+;   the process crashes; fixed, exit 0 = pass.
+CSTR mvl_ok,  "mvlock: PASS (reset+lock freed every body exactly once)",13,10
+CSTR mvl_bad, "mvlock: FAIL (a slot body survived teardown)",13,10
+LANDING_PAD
+public cmd_mvlock
+cmd_mvlock proc frame
+    FRAME_PROLOG 48
+    call    vault_ctx_reset
+    mov     qword ptr [g_filebuf], 0         ; no resident file image in this probe
+    mov     qword ptr [g_body_ptr], 0
+    mov     dword ptr [rbp-24], 0            ; v
+mvl_open:
+    cmp     dword ptr [rbp-24], 6
+    jae     mvl_ready
+    call    vault_ctx_open                   ; snapshot prev live -> its slot; cur = v
+    mov     ecx, 65536
+    call    secmem_alloc
+    test    rax, rax
+    jz      mvl_fail
+    mov     qword ptr [g_body_ptr], rax      ; new live body (prior stays in its slot)
+    mov     qword ptr [g_body_len], 65536
+    inc     dword ptr [rbp-24]
+    jmp     mvl_open
+mvl_ready:
+    xor     ecx, ecx                         ; ffo_done + gui_lb_seldata: front the master
+    call    vault_ctx_front
+    call    vault_ctx_reset                  ; the lock path: forget contexts, then wipe live
+    call    vault_lock
+    mov     dword ptr [rbp-24], 0            ; every slot body must be cleared
+mvl_scan:
+    cmp     dword ptr [rbp-24], MAX_VAULTS
+    jae     mvl_pass
+    mov     ecx, dword ptr [rbp-24]
+    call    vault_ctx_slotptr
+    cmp     qword ptr [rax + VSLOT.s_body_ptr], 0
+    jne     mvl_fail
+    inc     dword ptr [rbp-24]
+    jmp     mvl_scan
+mvl_pass:
+    lea     rcx, [mvl_ok]
+    mov     edx, mvl_ok_len
+    call    print_a
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+mvl_fail:
+    lea     rcx, [mvl_bad]
+    mov     edx, mvl_bad_len
+    call    print_a
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_mvlock endp
+
+; cmd_mvlockreal <path> - faithful multi-REAL-vault lock repro.  Seeds a vault,
+;   opens a real master, then fans out N real foreign contexts (distinct link ids,
+;   same file so each gets its own decrypted body + resident image), and runs the
+;   real lock path (vault_ctx_reset -> vault_lock).  Reproduces the user's
+;   "crash on lock after adding all vaults" with actual bodies/filebufs.  Exit 0 =
+;   survived (no double-free); a fault crashes the process.
+CSTR mlr_ok, "mvlockreal: PASS (N real vaults locked, freed once each)",13,10
+LANDING_PAD
+public cmd_mvlockreal
+cmd_mvlockreal proc frame
+    FRAME_PROLOG 48
+    lea     r10, [g_argv]                     ; path = argv[2]
+    mov     rax, qword ptr [r10+16]
+    mov     qword ptr [g_cfg_in], rax
+    lea     rcx, [g_fedlink_tmp + FEDLINK.fl_loc]   ; link locator = the same file
+    mov     rdx, rax
+    mov     r8d, 512
+    call    copy_bytes
+    lea     r10, [ffk_seedpw]                 ; seed password
+    lea     r11, [g_cfg_pass]
+    xor     ecx, ecx
+mlr_pw:
+    mov     al, byte ptr [r10+rcx]
+    mov     byte ptr [r11+rcx], al
+    test    al, al
+    jz      mlr_pwd
+    inc     ecx
+    cmp     ecx, 32
+    jb      mlr_pw
+mlr_pwd:
+    mov     dword ptr [g_cfg_passlen], 9
+    mov     ecx, 3
+    call    do_seed
+    test    eax, eax
+    mov     eax, 2
+    jnz     mlr_ret
+    call    vk_derive                         ; g_vkey = master key
+    lea     rcx, [g_fedlink_tmp + FEDLINK.fl_key]   ; link key = master key
+    lea     rdx, [g_vkey]
+    mov     r8d, 32
+    call    copy_bytes
+    mov     dword ptr [g_fedlink_tmp + FEDLINK.fl_flags], 0
+    ; open the master for real (its own body)
+    call    vault_ctx_reset
+    call    vault_ctx_open
+    lea     r10, [g_argv]
+    mov     rax, qword ptr [r10+16]
+    mov     qword ptr [g_cfg_in], rax
+    mov     dword ptr [g_reuse_key], 1
+    call    vault_unlock
+    mov     dword ptr [g_reuse_key], 0
+    test    eax, eax
+    mov     eax, 3
+    jnz     mlr_ret
+    ; build a record of 5 foreign links (distinct ids, same file + key)
+    call    fed_reset
+    mov     dword ptr [rbp-24], 0            ; i
+mlr_build:
+    cmp     dword ptr [rbp-24], 5
+    jae     mlr_fanout
+    mov     eax, dword ptr [rbp-24]           ; fl_id = 16 bytes of (0x10 + i)
+    add     eax, 10h
+    lea     r10, [g_fedlink_tmp + FEDLINK.fl_id]
+    xor     ecx, ecx
+mlr_id:
+    mov     byte ptr [r10+rcx], al
+    inc     ecx
+    cmp     ecx, 16
+    jb      mlr_id
+    lea     rcx, [g_fedlink_tmp]
+    call    fed_add
+    inc     dword ptr [rbp-24]
+    jmp     mlr_build
+mlr_fanout:
+    call    fed_fanout                        ; opens 5 real foreign contexts
+    ; the lock path
+    call    vault_ctx_reset
+    call    vault_lock
+    lea     rcx, [mlr_ok]
+    mov     edx, mlr_ok_len
+    call    print_a
+    xor     eax, eax
+mlr_ret:
+    FRAME_EPILOG
+    ret
+cmd_mvlockreal endp
 
 ; ===========================================================================
 ; M1 (master-vault federation): vault identity.  The machine-local keyring
