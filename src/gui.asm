@@ -12300,9 +12300,12 @@ cd_doinit:
     mov     qword ptr [rbp-56], rax
     jmp     cd_status
 cd_created:
-    ; persist the default vault path, and any editable policy values, to HKCU
-    cmp     dword ptr [g_is_default], 0
-    je      cd_savepol
+    ; Persist the freshly created vault as the startup vault, so it is reopened
+    ; next launch.  Always - not only on the auto-default path (g_is_default).
+    ; DLG_CREATE only ever makes the MASTER vault; foreign vaults are added via
+    ; the M4 screen, which deliberately does NOT touch the startup path.  Without
+    ; this, a second create in the same (tray-persistent) process left g_is_default
+    ; at 0 and never recorded the new vault.
     lea     rcx, [g_vpath]
     call    reg_save_vault
     mov     dword ptr [g_is_default], 0
