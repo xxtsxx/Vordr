@@ -182,22 +182,28 @@ an exit-code pass/fail signal.
 
 ## 6a. Findings from the current audit pass
 
-An independent review of the untrusted-input parsers (the `.vordr` vault file and
-the imported `.zip`) was performed this pass. Both earned a **clean bill on
-attacker-reachable memory corruption** — no OOB read/write and no
-password-independent overflow. The prior "attachment section processed before full
-authentication" concern was confirmed **fixed** (the mandatory full-file MAC is
-verified before any attachment length is used). Three defense-in-depth items were
-found and hardened, each with a regression test:
+Independent reviews of the untrusted-input paths — the `.vordr` vault parser, the
+imported `.zip` parser, the AES-ZIP exporter, the registry config reader, and the
+base32/TOTP code — were performed this pass. The `.vordr` parser, `regcfg`, and
+`totp` earned a **clean bill on attacker-reachable memory corruption**; the prior
+"attachment section processed before full authentication" concern was confirmed
+**fixed** (the mandatory full-file MAC is verified before any attachment length is
+used). The exporter had one **critical out-of-bounds write**. Every item below was
+fixed, each with a regression test:
 
 | Item | Severity | Fix | Test |
 |---|---|---|---|
+| **ZIP-export central directory unbounded:** a vault with ≥ 512 attachment fields drove `ze_add_file`'s record write past its array into adjacent **AES key-material globals** — an OOB write of attacker-influenced bytes | **Critical (OOB write)** | capacity guard refuses the write and fails the export closed | `zexcap` (gated) |
 | KDF cost params (`t_cost`/`m_cost`) read from the unauthenticated header and run through Argon2id *before* the file MAC can be checked → a crafted file drives a giant allocation on open, no password needed | DoS (pre-auth, no key) | `vk_params_ok` rejects out-of-range params as corrupt before the KDF | `kdfparam` (gated) |
+| Post-decryption `vordr.json` parser could **infinite-loop** on malformed input (a stuck parse cursor never advanced) → hang/DoS on a crafted or corrupted file | DoS | forward-progress guards on both `zi_walk` parse loops | `jfuzz` (gated) — the fuzzer that found it |
+| Export filename converted with `WideCharToMultiByte(-1)` on an attachment filename not verified NUL-terminated → OOB read past the value buffer | OOB read | bounded wide-length scan capped at the available region | export roundtrip |
 | Attachment `entries_len + 112` could integer-wrap past a plausibility check (post-auth; a downstream cap caught it, but fragile) | latent | reject `entries_len ≥ effective_end` before the add | vault-open probes |
-| Post-decryption `vordr.json` parser could **infinite-loop** on malformed input (a stuck parse cursor never advanced) → hang/DoS on a crafted or corrupted file | DoS | forward-progress guards on both `zi_walk` parse loops (bail if the cursor doesn't advance) | `jfuzz` (gated) — the fuzzer that found it |
 
 The recurring multi-vault teardown crash class was also structurally closed this
-pass by making `secmem_free` double-free-safe (§3, `secfreedup`).
+pass by making `secmem_free` double-free-safe (§3, `secfreedup`). Two of these were
+found by tools built this pass — the JSON infinite-loop by the new `jfuzz` fuzzer,
+and the export ABI-clobber in the *first* filename-fix attempt by the build's own
+`framecheck` stage — evidence the proof machinery itself catches real defects.
 
 ## 7. Honest limitations (what is NOT claimed)
 

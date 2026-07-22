@@ -100,7 +100,7 @@ set /a T_SELFTEST=!T1!-!T0!
 
 rem -------------------------------------------------------------- roundtrip --
 call :now T0
-echo === stage: roundtrip (seedtest / atgen / zitest / phtest / secscan / secfreedup / tmptest / fztest / trtest / vfuzz / fuzzzip / jfuzz / bktest / mactest / rbtest / xctest / reload / attfuzz / healthkat / pkat / mvtest / mvswitch / mvname / mvremove / mvclose / mvlock / mvstale / kdfparam / idkat / kekkat / keyringkat / fedkat / fedregkat / fmskat / fedapikat / fedfanout / avtest) ===
+echo === stage: roundtrip (seedtest / atgen / zitest / phtest / secscan / secfreedup / tmptest / fztest / trtest / vfuzz / fuzzzip / jfuzz / bktest / mactest / rbtest / xctest / reload / attfuzz / zexcap / healthkat / pkat / mvtest / mvswitch / mvname / mvremove / mvclose / mvlock / mvstale / kdfparam / idkat / kekkat / keyringkat / fedkat / fedregkat / fmskat / fedapikat / fedfanout / avtest) ===
 set RT=PASS
 
 bin\vordr.exe seedtest "%WORK%\rt.vault" > "%WORK%\seedtest.log" 2>&1
@@ -170,6 +170,9 @@ if not "!errorlevel!"=="0" ( echo   cowrite: FAIL ^(exit !errorlevel!, write-loc
 
 bin\vordr.exe attfuzz > "%WORK%\attfuzz.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   attfuzz: FAIL ^(exit !errorlevel!, attach_index_build fuzz^) & set RT=FAIL )
+
+bin\vordr.exe zexcap > "%WORK%\zexcap.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   zexcap: FAIL ^(exit !errorlevel!, zip-export central-dir cap OOB^) & set RT=FAIL )
 
 bin\vordr.exe healthkat > "%WORK%\healthkat.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   healthkat: FAIL ^(exit !errorlevel!, vault-health analysis counts^) & set RT=FAIL )
