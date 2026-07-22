@@ -357,6 +357,8 @@ g_fedlink_tmp FEDLINK <>                        ;   scratch link template (fedka
 g_fed_mkblob db 512 dup (?)                     ; M2: sealed machine-secret blob
 g_fms_out1  db 32 dup (?)                       ;   fmskat scratch
 g_fms_out2  db 32 dup (?)
+g_fed_tpmsec db 32 dup (?)                      ; M2: working tpm_secret (wiped after use)
+g_fed_workkek db 32 dup (?)                     ; M2: working KEK (wiped after use)
 g_fedkat_rec  db 128 dup (?)                   ; M2 keyringkat scratch: plaintext record
 g_fedkat_blob db 192 dup (?)                   ;   sealed blob (nonce+ct+tag)
 g_fedkat_out  db 128 dup (?)                   ;   opened plaintext
@@ -3477,6 +3479,145 @@ fms_kat_notpm:
     FRAME_EPILOG
     ret
 cmd_fmskat endp
+
+; --- M2: master-key-level federation API (the glue the GUI unlock path calls) --
+; fed_save_all(rcx=&master_key32, rdx=keyname, r8=valname) -> eax = 1/0.  Derive
+;   tpm_secret (or zero it when no TPM), derive the KEK, seal+store g_fedrec.
+public fed_save_all
+fed_save_all proc frame
+    FRAME_PROLOG 80
+    mov     qword ptr [rbp-24], rcx           ; master_key
+    mov     qword ptr [rbp-32], rdx           ; keyname
+    mov     qword ptr [rbp-40], r8            ; valname
+    lea     rcx, [g_fed_tpmsec]
+    mov     rdx, qword ptr [rbp-32]
+    mov     r8, qword ptr [rbp-40]
+    call    fed_machine_secret
+    test    eax, eax
+    jnz     @F
+    lea     rcx, [g_fed_tpmsec]               ; no TPM -> master-key-only (zero secret)
+    mov     edx, 32
+    call    secure_zero
+@@: lea     rcx, [g_fed_workkek]              ; kek = KEK(master_key, tpm_secret)
+    mov     rdx, qword ptr [rbp-24]
+    lea     r8, [g_fed_tpmsec]
+    call    keyring_kek
+    lea     rcx, [g_fed_workkek]
+    call    fed_store
+    mov     dword ptr [rbp-48], eax
+    lea     rcx, [g_fed_tpmsec]               ; wipe working key material
+    mov     edx, 32
+    call    secure_zero
+    lea     rcx, [g_fed_workkek]
+    mov     edx, 32
+    call    secure_zero
+    mov     eax, dword ptr [rbp-48]
+    FRAME_EPILOG
+    ret
+fed_save_all endp
+
+; fed_unlock_all(rcx=&master_key32, rdx=keyname, r8=valname) -> eax = link count
+;   (0 = no stored record or auth failed).  Loads the record into g_fedrec.
+public fed_unlock_all
+fed_unlock_all proc frame
+    FRAME_PROLOG 80
+    mov     qword ptr [rbp-24], rcx           ; master_key
+    mov     qword ptr [rbp-32], rdx           ; keyname
+    mov     qword ptr [rbp-40], r8            ; valname
+    lea     rcx, [g_fed_tpmsec]
+    mov     rdx, qword ptr [rbp-32]
+    mov     r8, qword ptr [rbp-40]
+    call    fed_machine_secret
+    test    eax, eax
+    jnz     @F
+    lea     rcx, [g_fed_tpmsec]
+    mov     edx, 32
+    call    secure_zero
+@@: lea     rcx, [g_fed_workkek]
+    mov     rdx, qword ptr [rbp-24]
+    lea     r8, [g_fed_tpmsec]
+    call    keyring_kek
+    lea     rcx, [g_fed_workkek]
+    call    fed_load
+    mov     dword ptr [rbp-48], eax           ; 1 = loaded, 0 = none
+    lea     rcx, [g_fed_tpmsec]
+    mov     edx, 32
+    call    secure_zero
+    lea     rcx, [g_fed_workkek]
+    mov     edx, 32
+    call    secure_zero
+    cmp     dword ptr [rbp-48], 0
+    jne     fua_ok
+    call    fed_reset                          ; no record -> empty table
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+fua_ok:
+    mov     eax, dword ptr [g_fedrec + FEDREC.fr_count]
+    FRAME_EPILOG
+    ret
+fed_unlock_all endp
+
+; cmd_fedapikat - headless KAT for the master-key API: build a record, save it
+;   under a master key, wipe the live copy, unlock with the same key and assert
+;   the links return.  Uses TEST TPM/registry names and self-cleans.  Exit 0.
+LANDING_PAD
+public cmd_fedapikat
+cmd_fedapikat proc frame
+    FRAME_PROLOG 64
+    lea     rcx, [fms_kat_key]                ; clean start
+    call    tpm_delete
+    lea     rcx, [fms_kat_val]
+    call    reg_fed_del
+    lea     rcx, [fed_valname]
+    call    reg_fed_del
+    call    fed_reset                          ; build 2 links
+    mov     dword ptr [rbp-24], 0
+fak_build:
+    cmp     dword ptr [rbp-24], 2
+    jae     fak_built
+    lea     rcx, [g_fedlink_tmp + FEDLINK.fl_id]
+    mov     edx, 16
+    mov     r8d, dword ptr [rbp-24]
+    add     r8d, 050h
+    call    idk_fill
+    mov     dword ptr [g_fedlink_tmp + FEDLINK.fl_flags], 0
+    lea     rcx, [g_fedlink_tmp]
+    call    fed_add
+    inc     dword ptr [rbp-24]
+    jmp     fak_build
+fak_built:
+    lea     rcx, [g_fedkat_mk]                ; a synthetic master key
+    mov     edx, 32
+    mov     r8b, 0C3h
+    call    idk_fill
+    lea     rcx, [g_fedkat_mk]                ; save under it
+    lea     rdx, [fms_kat_key]
+    lea     r8, [fms_kat_val]
+    call    fed_save_all
+    test    eax, eax
+    mov     dword ptr [rbp-28], 2
+    jz      fak_done
+    call    fed_reset                          ; wipe the live record
+    lea     rcx, [g_fedkat_mk]                ; unlock with the same master key
+    lea     rdx, [fms_kat_key]
+    lea     r8, [fms_kat_val]
+    call    fed_unlock_all
+    cmp     eax, 2                             ; both links must return
+    mov     dword ptr [rbp-28], 3
+    jne     fak_done
+    mov     dword ptr [rbp-28], 0             ; pass
+fak_done:
+    lea     rcx, [fms_kat_key]                ; self-clean
+    call    tpm_delete
+    lea     rcx, [fms_kat_val]
+    call    reg_fed_del
+    lea     rcx, [fed_valname]
+    call    reg_fed_del
+    mov     eax, dword ptr [rbp-28]
+    FRAME_EPILOG
+    ret
+cmd_fedapikat endp
 
 ; mvt_zero(rcx=ptr, edx=len) - zero a buffer (probe helper).  Leaf, volatile regs.
 mvt_zero proc
