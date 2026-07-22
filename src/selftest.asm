@@ -99,7 +99,6 @@ st_abc          db "abc"
 ; SHA-256("abc")
 sha_abc_exp     db 0bah,078h,016h,0bfh,08fh,001h,0cfh,0eah,041h,041h,040h,0deh,05dh,0aeh,022h,023h
                 db 0b0h,003h,061h,0a3h,096h,017h,07ah,09ch,0b4h,010h,0ffh,061h,0f2h,000h,015h,0adh
-; SHA-512("abc") - FIPS 180-4
 
 CSTR st_hdr,       "running self-tests:",13,10
 CSTR pk_ok,        "pkat: PASS (threaded fail-closed KAT gate)",13,10
