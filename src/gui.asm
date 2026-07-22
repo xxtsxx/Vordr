@@ -1439,7 +1439,6 @@ g_xr_active   dd ?                          ; 1 = overlay list is showing cross-
 g_lxr         db (sizeof XR)*MAX_XR dup(?) ; unified main-list rows (cached display data)
 g_lxr_n       dd ?                          ; number of unified main-list rows
 g_fm_count    dd 8 dup(?)                   ; M4 mgmt list: cached entry count per open slot
-g_fm_pathw    dw 300 dup(?)                 ; M4 mgmt list: wide path scratch for a row
 g_fm_statw    dw 32 dup(?)                  ; M4 mgmt list: "Open (N)"/"Master (N)" scratch
 g_cmpbuf      db 256 dup (?)               ; title-A copy for WM_COMPAREITEM
 align 2
@@ -13837,25 +13836,13 @@ gui_draw_fmrow proc frame
     call    vault_ctx_nameptr
     mov     qword ptr [rbp-112], rax           ; name ptr (spill: WINCALL may clobber rax)
     WINCALL DrawTextW, qword ptr [rbp-32], qword ptr [rbp-112], -1, addr rbp-104, 8024h
-    ; path (subfont, dim) - bottom line, end-ellipsis
+    ; path (subfont, dim) - bottom line, end-ellipsis.  s_vpath is a WIDE string
+    ; (GetOpenFileNameW wrote g_vpath), so draw it directly - no UTF-8 conversion.
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_subfont]
     WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_textdim]
     mov     ecx, dword ptr [rbp-60]
     call    vault_ctx_pathptr
-    mov     qword ptr [rbp-88], rax             ; utf8 path ptr
-    xor     edx, edx                            ; strlen (capped)
-fmr_slen:
-    mov     r10, qword ptr [rbp-88]
-    cmp     byte ptr [r10+rdx], 0
-    je      fmr_slend
-    inc     edx
-    cmp     edx, 259
-    jb      fmr_slen
-fmr_slend:
-    mov     rcx, qword ptr [rbp-88]
-    lea     r8, [g_fm_pathw]
-    mov     r9d, 299
-    call    gui_towide
+    mov     qword ptr [rbp-88], rax             ; wide path ptr (spill: WINCALL clobbers rax)
     mov     eax, dword ptr [rbp-40]
     add     eax, 46
     mov     dword ptr [rbp-104], eax
@@ -13868,7 +13855,7 @@ fmr_slend:
     mov     eax, dword ptr [rbp-52]
     sub     eax, 2
     mov     dword ptr [rbp-92], eax
-    WINCALL DrawTextW, qword ptr [rbp-32], addr g_fm_pathw, -1, addr rbp-104, 8024h
+    WINCALL DrawTextW, qword ptr [rbp-32], qword ptr [rbp-88], -1, addr rbp-104, 8024h
     ; status "Master (N)"/"Open (N)" (subfont, dim, right-aligned)
     lea     rdx, [w_fm_open]
     cmp     dword ptr [rbp-60], 0
