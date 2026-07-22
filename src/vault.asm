@@ -2455,7 +2455,7 @@ vault_ctx_pathptr endp
 ;   must first front a different vault if idx is the currently-fronted one.
 public vault_ctx_close
 vault_ctx_close proc frame
-    FRAME_PROLOG 48
+    FRAME_PROLOG 80
     mov     dword ptr [rbp-24], ecx
     mov     ecx, dword ptr [rbp-24]
     call    vault_ctx_slotptr
@@ -2467,8 +2467,28 @@ vault_ctx_close proc frame
     mov     rcx, qword ptr [r10 + VSLOT.s_body_ptr]   ; secmem_free wipes THEN releases; the
     test    rcx, rcx                          ; caller fronts the master first, so this is
     jz      vcc_compact                       ; never the live g_body_ptr.  (A bare wipe here
+    mov     qword ptr [rbp-56], rcx           ; save the ptr being freed
     mov     rdx, qword ptr [r10 + VSLOT.s_body_len]   ; leaked the alloc, and - worse - left the
     call    secmem_free                       ; pointer to be duplicated by the shift below.)
+    ; DEFENSIVE: null EVERY slot that aliases the just-freed body, so no context is
+    ; left pointing at freed memory.  A dangling body_ptr survived to here in the
+    ; field (crash in vault_count reading a freed arena on Remove); whatever created
+    ; the duplicate, make it harmless - a nulled slot just reads as 0 entries.
+    mov     dword ptr [rbp-64], 0             ; j
+vcc_dedup:
+    cmp     dword ptr [rbp-64], MAX_VAULTS
+    jae     vcc_compact
+    mov     ecx, dword ptr [rbp-64]
+    call    vault_ctx_slotptr
+    mov     r10, rax
+    mov     rax, qword ptr [rbp-56]
+    cmp     qword ptr [r10 + VSLOT.s_body_ptr], rax
+    jne     vcc_dedupnext
+    mov     qword ptr [r10 + VSLOT.s_body_ptr], 0
+    mov     qword ptr [r10 + VSLOT.s_body_len], 0
+vcc_dedupnext:
+    inc     dword ptr [rbp-64]
+    jmp     vcc_dedup
 vcc_compact:
     mov     eax, dword ptr [rbp-24]           ; shift slots [idx+1 .. n-1] down one
     mov     dword ptr [rbp-40], eax
