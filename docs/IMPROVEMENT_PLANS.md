@@ -144,7 +144,7 @@ House rules:
   → `vfuzz` → `fuzzzip` → `bktest` → `mactest` → `rbtest` → `xctest` → `reload`
   → `cowrite` → `attfuzz` → `healthkat` → `pkat` → `mvtest` → `mvswitch` →
   `mvname` → `idkat` → `kekkat` → `keyringkat` → `fedkat` → `fedregkat` →
-  `avtest`. `--quick` skips stage 1.
+  `fmskat` → `fedapikat` → `avtest`. `--quick` skips stage 1.
 - **FRAMES** = no >4-arg `WINCALL` directly inside a raw `sub rsp,64` dialog
   proc (`create_proc`, `unlock_proc`, `vault_proc`, `msg_proc`, `about_proc`,
   …); wide calls go in a `FRAME_PROLOG N` helper. This is the BEX64/offset-0
@@ -185,14 +185,26 @@ House rules:
   `HKCU\SOFTWARE\Vordr\Federation` (`reg_fed_set`/`get`/`del` in regcfg.asm),
   machine-local + non-exportable; `fed_load` returns none on absent/auth-fail.
   Probe: `fedregkat` (store→wipe→load→delete→confirm-none; self-cleaning).
+- **M2 machine binding:** `fed_machine_secret` get-or-creates the per-machine
+  `tpm_secret` (`tpm_seal`/`unseal`; no-TPM → 0 = master-key-only). Probe: `fmskat`
+  (provision→retrieve→match, self-cleaning test names).
+- **M2 master-key API:** `fed_save_all`/`fed_unlock_all` — master key in → derive
+  secret+KEK → store/load the record; working keys `secure_zero`'d. Probe:
+  `fedapikat` (save→wipe→unlock round-trip under a master key).
 
-**M2's headless keyring core is complete and gate-verified** (5 probes:
-`idkat`/`kekkat`/`keyringkat`/`fedkat`/`fedregkat`). *Remaining M — needs the live
-unlock flow / TPM hardware / display, so paused for those:* TPM machine-secret
-provisioning (`tpm_seal` a per-machine `tpm_secret`), **M1.2 system items** (vault
-body ID+name — a core on-disk-format change, do with review), **fan-out unlock**
-wiring, and **M3–M5** (unified list, mgmt screen, TPM/registry scoping — all
-display work). M6 (vault export) is the next headless-safe slice.
+**M2's machine-local keyring is now a complete, gate-verified headless library**
+(7 probes: `idkat`/`kekkat`/`keyringkat`/`fedkat`/`fedregkat`/`fmskat`/`fedapikat`):
+from a master key it provisions the machine secret, derives the KEK, and
+persists/loads the link table machine-locally, TPM-bound, non-exportable.
+
+*Remaining M — all integration or pixels, needs the live unlock flow / real
+foreign vault files / display:* **fan-out** (open each foreign file with its
+cached key — needs a `vault_unlock` key-supplied path + the VSLOT ctx + real
+files); **M1.2 system items** (vault-body ID+name — a core on-disk-format change,
+touches enumeration + the GUI list, do with review); **M3–M5** (unified list, mgmt
+screen, TPM/registry scoping — display); **M6** export (needs entry selection +
+password prompt). The GUI unlock path calls `fed_unlock_all(g_vkey, …)` /
+`fed_save_all(…)`; the library is ready for that wiring.
 
 **Pre-v1.0 clean slate (2026-07-21).** Until v1.0 ships, all pre-existing vaults
 and Vordr builds are treated as discarded — **no migration, no back-compat
