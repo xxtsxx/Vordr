@@ -64,6 +64,7 @@ extern fed_fanout:proc                  ; M2: open foreign vaults with cached ke
 extern fed_remember_open:proc           ; M2: record the open vault set (vault.asm)
 extern vault_ctx_nameptr:proc
 extern vault_ctx_pathptr:proc           ; M4: &g_vaults[idx].s_vpath (mgmt list)
+extern vault_ctx_is_dup:proc            ; M4: is the live vault already open? (vault.asm)
 extern vault_ctx_close:proc
 externdef g_vault_n:dword
 externdef g_vault_cur:dword
@@ -791,6 +792,8 @@ WSTR s_createfail,  <Could not create the vault (I/O or out of memory).>
 WSTR s_notitle,     <An entry needs a title.>
 WSTR s_nofieldroom, <No room for more fields on this record - remove one first.>
 WSTR s_resealfail,  <Unable to write to the vault file - it may be read-only or locked by another program. Your changes are kept in memory. Retry saving now?>
+WSTR t_dupvault,    <Vordr - vault already open>
+WSTR m_dupvault,    <That vault is already open. The same vault cannot be added twice.>
 WSTR t_overwrite,   <Vordr - vault already exists>
 WSTR m_overwrite,   <A vault file already exists at this location. Creating a new vault will PERMANENTLY destroy it and every entry it holds. Overwrite it?>
 WSTR s_kept,        <Existing vault kept. Cancel, or use "Create new..." to choose a different file.>
@@ -10739,6 +10742,14 @@ goa_loaded:
     ; vault next launch and (b) broke TPM auto-unlock, since the foreign vault has
     ; no TPM-Unlock entry (its path keys a different, absent registry value).
     ; Foreign vaults are reached via the machine-local federation record instead.
+    call    vault_ctx_is_dup                  ; already open (same vault_id)? refuse it -
+    test    eax, eax                          ;   a second open just phantoms the federation
+    js      goa_notdup                        ;   record and collapses on Remove
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr m_dupvault, addr t_dupvault, \
+            <MB_OK or MB_ICONINFORMATION>
+    call    vault_lock                        ; free the redundantly-unlocked body/key
+    jmp     goa_rollback                      ; drop the claimed slot, restore the previous
+goa_notdup:
     lea     rcx, [g_vpath]                     ; name the vault from its file basename
     call    gui_basename
     mov     ecx, dword ptr [g_vault_cur]
