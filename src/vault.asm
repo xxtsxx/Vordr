@@ -33,6 +33,10 @@ extern rng_fill:proc
 extern reg_fed_set:proc                 ; M2: federation record registry I/O (regcfg.asm)
 extern reg_fed_get:proc
 extern reg_fed_del:proc
+extern tpm_available:proc               ; M2: TPM machine-secret binding (tpm.asm)
+extern tpm_seal:proc
+extern tpm_unseal:proc
+extern tpm_delete:proc
 extern secure_zero:proc
 extern secmem_alloc:proc
 extern sec_lock:proc
@@ -274,6 +278,9 @@ fed_kek_domain db "vordr-federation-kek-v1" ; M2: keyring KEK domain-separation 
 FED_KEK_DOMLEN equ 23
 even
 fed_valname db 'r',0,'e',0,'c',0,'o',0,'r',0,'d',0,0,0  ; M2: record value name (wide)
+even
+fms_kat_key db 'V',0,'o',0,'r',0,'d',0,'r',0,'-',0,'F',0,'B',0,'K',0,'A',0,'T',0,0,0  ; fmskat TPM key
+fms_kat_val db 'm',0,'k',0,'k',0,'a',0,'t',0,0,0        ; fmskat registry value
 CSTR bk_ok,  "bktest: PASS (bak1..3 rotated and bak1 opens)",13,10
 CSTR bk_bad, "bktest: FAIL (backup missing or unopenable)",13,10
 CSTR mt_ok,  "mactest: PASS (counter tamper rejected, restore opens)",13,10
@@ -347,6 +354,9 @@ align 8
 g_fedrec    FEDREC <>                          ; M2: the live federation record (link table)
 g_fedblob   db (sizeof FEDREC) + 32 dup (?)    ;   sealed form (nonce+ct+tag)
 g_fedlink_tmp FEDLINK <>                        ;   scratch link template (fedkat)
+g_fed_mkblob db 512 dup (?)                     ; M2: sealed machine-secret blob
+g_fms_out1  db 32 dup (?)                       ;   fmskat scratch
+g_fms_out2  db 32 dup (?)
 g_fedkat_rec  db 128 dup (?)                   ; M2 keyringkat scratch: plaintext record
 g_fedkat_blob db 192 dup (?)                   ;   sealed blob (nonce+ct+tag)
 g_fedkat_out  db 128 dup (?)                   ;   opened plaintext
@@ -3364,6 +3374,109 @@ frk_ret:
     FRAME_EPILOG
     ret
 cmd_fedregkat endp
+
+; --- M2: TPM machine-secret provisioning (the KEK's machine-binding input) ---
+; fed_machine_secret(rcx = out32, rdx = keyname_wide, r8 = valname_wide) -> eax:
+;   1 = out holds the per-machine secret (unsealed the stored one, or freshly
+;   generated+sealed+stored); 0 = no usable TPM (caller falls back to
+;   master-key-only, with the copyable-keyring UI warning).
+public fed_machine_secret
+fed_machine_secret proc frame
+    FRAME_PROLOG 80
+    mov     qword ptr [rbp-24], rcx           ; out32
+    mov     qword ptr [rbp-32], rdx           ; keyname
+    mov     qword ptr [rbp-40], r8            ; valname
+    call    tpm_available
+    test    eax, eax
+    jz      fms_notpm
+    mov     rcx, qword ptr [rbp-40]           ; stored sealed blob?
+    lea     rdx, [g_fed_mkblob]
+    mov     r8d, 512
+    call    reg_fed_get
+    test    eax, eax
+    jz      fms_new
+    mov     dword ptr [rbp-44], eax           ; bloblen
+    mov     rcx, qword ptr [rbp-32]           ; unseal into out32
+    lea     rdx, [g_fed_mkblob]
+    mov     r8d, dword ptr [rbp-44]
+    mov     r9, qword ptr [rbp-24]
+    call    tpm_unseal
+    test    eax, eax
+    jz      fms_new                           ; stored blob unusable -> regenerate
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+fms_new:
+    mov     rcx, qword ptr [rbp-24]           ; fresh 32-byte secret into out
+    mov     edx, 32
+    call    rng_fill
+    mov     rcx, qword ptr [rbp-32]           ; seal it
+    mov     rdx, qword ptr [rbp-24]
+    lea     r8, [g_fed_mkblob]
+    mov     r9d, 512
+    call    tpm_seal
+    test    eax, eax
+    jz      fms_notpm                         ; seal failed -> treat as no TPM
+    mov     dword ptr [rbp-44], eax           ; bloblen
+    mov     rcx, qword ptr [rbp-40]           ; store the sealed blob
+    lea     rdx, [g_fed_mkblob]
+    mov     r8d, dword ptr [rbp-44]
+    call    reg_fed_set
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+fms_notpm:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+fed_machine_secret endp
+
+; cmd_fmskat - headless KAT for machine-secret provisioning: provision a secret
+;   under TEST key/value names, retrieve it again, and assert the two match (the
+;   secret is stable = machine-bound).  No TPM -> 0, trivially passes.  Deletes
+;   the test TPM key + registry value on entry and exit (self-cleaning).  Exit 0.
+LANDING_PAD
+public cmd_fmskat
+cmd_fmskat proc frame
+    FRAME_PROLOG 48
+    lea     rcx, [fms_kat_key]                ; clean any leftover from a prior run
+    call    tpm_delete
+    lea     rcx, [fms_kat_val]
+    call    reg_fed_del
+    lea     rcx, [g_fms_out1]                 ; provision
+    lea     rdx, [fms_kat_key]
+    lea     r8, [fms_kat_val]
+    call    fed_machine_secret
+    test    eax, eax
+    jz      fms_kat_notpm                     ; no TPM -> can't test, pass
+    lea     rcx, [g_fms_out2]                 ; retrieve again -> must be identical
+    lea     rdx, [fms_kat_key]
+    lea     r8, [fms_kat_val]
+    call    fed_machine_secret
+    test    eax, eax
+    mov     dword ptr [rbp-24], 2
+    jz      fms_kat_done
+    lea     rcx, [g_fms_out1]
+    lea     rdx, [g_fms_out2]
+    mov     r8d, 32
+    call    idk_eq
+    test    eax, eax
+    mov     dword ptr [rbp-24], 3
+    jz      fms_kat_done
+    mov     dword ptr [rbp-24], 0             ; pass
+fms_kat_done:
+    lea     rcx, [fms_kat_key]                ; cleanup (self-cleaning)
+    call    tpm_delete
+    lea     rcx, [fms_kat_val]
+    call    reg_fed_del
+    mov     eax, dword ptr [rbp-24]
+    FRAME_EPILOG
+    ret
+fms_kat_notpm:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+cmd_fmskat endp
 
 ; mvt_zero(rcx=ptr, edx=len) - zero a buffer (probe helper).  Leaf, volatile regs.
 mvt_zero proc
