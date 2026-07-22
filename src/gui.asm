@@ -1297,6 +1297,16 @@ g_secdesk_hd    dq ?                  ; HDESK of the private desktop
 g_secdesk_orig  dq ?                  ; HDESK of the original input desktop (restore on exit)
 g_secdesk_res   dq ?                  ; DialogBox result marshalled back to the caller
 align 8
+; The software shadow stack (g_sstk_base/g_sstk_index) is a process-global, but
+; the Secure-Unlock dialog runs on a SEPARATE worker thread (secdesk_thread) that
+; executes framed code.  If the worker pushed/popped onto the main thread's shared
+; stack it could corrupt the main thread's parked frames -> intermittent
+; FF_SHADOW_STACK on the next real return.  The worker gets its OWN shadow stack,
+; swapped in for the duration of its run (the main thread is blocked in
+; WaitForSingleObject, so touching these globals is race-free).
+g_sstk_worker   dq SSTK_CAPACITY dup (?)  ; the worker thread's isolated shadow stack
+g_sstk_savebase dq ?                  ; main thread's g_sstk_base, parked during the worker
+g_sstk_saveidx  dq ?                  ; main thread's g_sstk_index, parked during the worker
 g_nid       db 976 dup (?)           ; NOTIFYICONDATAW (x64 full size)
 g_wc        db 80 dup (?)            ; WNDCLASSW (72 used)
 g_msg       db 56 dup (?)            ; MSG
@@ -15352,7 +15362,7 @@ WAIT_FOREVER       equ 0FFFFFFFFh                 ; INFINITE
 
 ; secdesk_thread(rcx = unused) - worker: bind to the private desktop, make it
 ;   the visible input desktop, run the dialog, then switch back.  eax = 0.
-secdesk_thread proc frame
+secdesk_body proc frame
     FRAME_PROLOG 48
     WINCALL SetThreadDesktop, qword ptr [g_secdesk_hd]
     test    eax, eax
@@ -15368,6 +15378,31 @@ sdt_run:
 sdt_done:
     xor     eax, eax
     FRAME_EPILOG
+    ret
+secdesk_body endp
+
+; secdesk_thread(rcx = unused) - the CreateThread entry.  It swaps in this worker
+;   thread's OWN shadow stack for the duration of the dialog, so the framed code it
+;   runs (secdesk_body -> the create/unlock dialog) can never push or pop the main
+;   thread's shared shadow stack.  The main thread is parked in WaitForSingleObject
+;   throughout, so mutating g_sstk_* here is race-free.  RAW proc by design: it must
+;   NOT frame itself (that would push to the stack it is about to swap out).
+secdesk_thread proc
+    sub     rsp, 40                              ; 32 shadow + 8 to 16-align the call
+    mov     rax, qword ptr [g_sstk_base]         ; park the main thread's shadow stack
+    mov     qword ptr [g_sstk_savebase], rax
+    mov     rax, qword ptr [g_sstk_index]
+    mov     qword ptr [g_sstk_saveidx], rax
+    lea     rax, [g_sstk_worker]                 ; install this thread's own, empty stack
+    mov     qword ptr [g_sstk_base], rax
+    mov     qword ptr [g_sstk_index], 0
+    call    secdesk_body
+    mov     rax, qword ptr [g_sstk_savebase]     ; restore the main thread's shadow stack
+    mov     qword ptr [g_sstk_base], rax
+    mov     rax, qword ptr [g_sstk_saveidx]
+    mov     qword ptr [g_sstk_index], rax
+    add     rsp, 40
+    xor     eax, eax
     ret
 secdesk_thread endp
 
