@@ -60,6 +60,7 @@ extern vault_ctx_open:proc
 extern vault_ctx_front:proc
 extern vault_ctx_setname:proc
 extern fed_unlock_master:proc           ; M2: load federation record on master unlock (vault.asm)
+extern fed_fanout:proc                  ; M2: open foreign vaults with cached keys (vault.asm)
 extern vault_ctx_nameptr:proc
 extern vault_ctx_close:proc
 externdef g_vault_n:dword
@@ -15214,6 +15215,7 @@ go_vault:
     call    vault_ctx_setname
     call    fed_unlock_master               ; M2: load the machine-local federation
                                             ;   record under the master key (g_vkey)
+    call    fed_fanout                      ;   open each foreign vault with its cached key
 go_vault_show:
     WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_VAULT, qword ptr [rbp-24], addr vault_proc, 0
     call    vault_ctx_reset                 ; leaving the vault -> forget open contexts

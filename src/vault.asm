@@ -283,6 +283,7 @@ fms_key     db 'V',0,'o',0,'r',0,'d',0,'r',0,'-',0,'F',0,'e',0,'d',0,'B',0,'i',0
 fms_val     db 'm',0,'a',0,'c',0,'h',0,'i',0,'n',0,'e',0,'k',0,'e',0,'y',0,0,0  ; M2: sealed-secret registry value
 fms_kat_key db 'V',0,'o',0,'r',0,'d',0,'r',0,'-',0,'F',0,'B',0,'K',0,'A',0,'T',0,0,0  ; fmskat TPM key
 fms_kat_val db 'm',0,'k',0,'k',0,'a',0,'t',0,0,0        ; fmskat registry value
+ffk_seedpw  db "vordrtest",0                            ; fedfanout: seed vault password (9)
 CSTR bk_ok,  "bktest: PASS (bak1..3 rotated and bak1 opens)",13,10
 CSTR bk_bad, "bktest: FAIL (backup missing or unopenable)",13,10
 CSTR mt_ok,  "mactest: PASS (counter tamper rejected, restore opens)",13,10
@@ -3640,6 +3641,152 @@ fak_done:
     FRAME_EPILOG
     ret
 cmd_fedapikat endp
+
+; --- M2: fan-out — open every foreign vault with its cached key ---------------
+; fed_fanout() - for each link in g_fedrec (skipping LINK_PROMPT), open the
+;   foreign vault into a new multi-vault context using its cached key (the
+;   g_reuse_key / KDF-skip path).  On failure, mark the link (MISSING if the
+;   file is gone, else STALE = the cached key no longer matches) and roll the
+;   claimed slot back.  Leaves the master (slot 0) fronted.  Call after
+;   fed_unlock_master, with the master already registered as slot 0.
+public fed_fanout
+fed_fanout proc frame
+    FRAME_PROLOG 80
+    mov     dword ptr [rbp-24], 0            ; i
+ffo_loop:
+    mov     eax, dword ptr [rbp-24]
+    cmp     eax, dword ptr [g_fedrec + FEDREC.fr_count]
+    jae     ffo_done
+    mov     ecx, dword ptr [rbp-24]
+    call    fed_slot
+    mov     qword ptr [rbp-32], rax          ; link
+    test    dword ptr [rax + FEDLINK.fl_flags], LINK_PROMPT
+    jnz     ffo_next                          ; opt-out: no cached key, skip
+    mov     eax, dword ptr [g_vault_cur]      ; remember the vault to restore on failure
+    mov     dword ptr [rbp-36], eax
+    call    vault_ctx_open                    ; claim a slot (cur = new)
+    cmp     eax, -1
+    je      ffo_done                          ; table full (MAX_VAULTS)
+    mov     dword ptr [rbp-40], eax           ; new idx
+    mov     r10, qword ptr [rbp-32]           ; g_vkey = cached key
+    lea     rcx, [g_vkey]
+    lea     rdx, [r10 + FEDLINK.fl_key]
+    mov     r8d, 32
+    call    copy_bytes
+    mov     dword ptr [g_reuse_key], 1        ; reuse g_vkey (skip Argon2)
+    mov     r10, qword ptr [rbp-32]
+    lea     rax, [r10 + FEDLINK.fl_loc]       ; g_cfg_in = foreign path
+    mov     qword ptr [g_cfg_in], rax
+    call    vault_unlock
+    mov     dword ptr [rbp-44], eax           ; rc
+    mov     dword ptr [g_reuse_key], 0
+    cmp     dword ptr [rbp-44], 0
+    jne     ffo_fail
+    mov     ecx, dword ptr [rbp-40]           ; success: name the tab
+    mov     r10, qword ptr [rbp-32]
+    lea     rdx, [r10 + FEDLINK.fl_name]
+    call    vault_ctx_setname
+    mov     r10, qword ptr [rbp-32]           ; clear stale/missing
+    and     dword ptr [r10 + FEDLINK.fl_flags], NOT (LINK_STALE or LINK_MISSING)
+    jmp     ffo_next
+ffo_fail:
+    mov     r10, qword ptr [rbp-32]
+    mov     eax, dword ptr [rbp-44]
+    cmp     eax, EXIT_IO                       ; file gone -> MISSING, else STALE
+    jne     @F
+    or      dword ptr [r10 + FEDLINK.fl_flags], LINK_MISSING
+    jmp     ffo_rollback
+@@: or      dword ptr [r10 + FEDLINK.fl_flags], LINK_STALE
+ffo_rollback:
+    mov     eax, dword ptr [g_vault_n]         ; drop the claimed slot
+    dec     eax
+    mov     dword ptr [g_vault_n], eax
+    mov     ecx, dword ptr [rbp-36]           ; restore the previous vault
+    call    vault_ctx_front
+ffo_next:
+    inc     dword ptr [rbp-24]
+    jmp     ffo_loop
+ffo_done:
+    xor     ecx, ecx                          ; front the master (slot 0)
+    call    vault_ctx_front
+    FRAME_EPILOG
+    ret
+fed_fanout endp
+
+; cmd_fedfanout <path> - headless KAT: seed a real vault at <path>, link it with
+;   its own key, fan out and assert it opens as a 2nd context; then corrupt the
+;   cached key, fan out again, and assert the link is marked STALE and the slot
+;   rolled back.  Exit 0 = pass.
+LANDING_PAD
+public cmd_fedfanout
+cmd_fedfanout proc frame
+    FRAME_PROLOG 48
+    lea     r10, [g_argv]                     ; path = argv[2]
+    mov     rax, qword ptr [r10+16]
+    mov     qword ptr [g_cfg_in], rax
+    lea     rcx, [g_fedlink_tmp + FEDLINK.fl_loc]  ; copy path (dst) <- argv[2] (src)
+    mov     rdx, rax
+    mov     r8d, 512
+    call    copy_bytes
+    lea     r10, [ffk_seedpw]                  ; password = the fixed seed password
+    lea     r11, [g_cfg_pass]
+    xor     ecx, ecx
+ffk_pw:
+    mov     al, byte ptr [r10+rcx]
+    mov     byte ptr [r11+rcx], al
+    test    al, al
+    jz      ffk_pwd
+    inc     ecx
+    cmp     ecx, 32
+    jb      ffk_pw
+ffk_pwd:
+    mov     dword ptr [g_cfg_passlen], 9
+    mov     ecx, 3                             ; seed a small foreign vault
+    call    do_seed
+    test    eax, eax
+    mov     eax, 2
+    jnz     ffk_ret
+    call    vk_derive                          ; re-derive the key (do_seed wipes g_vkey);
+                                               ;   same password + the salt it left in g_hdr
+    lea     rcx, [g_fedlink_tmp + FEDLINK.fl_key]   ; capture its key
+    lea     rdx, [g_vkey]
+    mov     r8d, 32
+    call    copy_bytes
+    mov     dword ptr [g_fedlink_tmp + FEDLINK.fl_flags], 0
+    call    fed_reset                          ; record = this one link
+    lea     rcx, [g_fedlink_tmp]
+    call    fed_add
+    call    vault_ctx_reset                    ; master = slot 0
+    call    vault_ctx_open
+    call    fed_fanout                          ; SUCCESS path
+    cmp     dword ptr [g_vault_n], 2           ; master + foreign opened
+    mov     eax, 3
+    jne     ffk_ret
+    xor     ecx, ecx
+    call    fed_slot
+    test    dword ptr [rax + FEDLINK.fl_flags], LINK_STALE or LINK_MISSING
+    mov     eax, 4
+    jnz     ffk_ret
+    xor     ecx, ecx                           ; FAILURE path: corrupt the cached key
+    call    fed_slot
+    xor     byte ptr [rax + FEDLINK.fl_key], 0FFh
+    mov     dword ptr [rax + FEDLINK.fl_flags], 0
+    call    vault_ctx_reset
+    call    vault_ctx_open
+    call    fed_fanout
+    cmp     dword ptr [g_vault_n], 1           ; rolled back to master only
+    mov     eax, 5
+    jne     ffk_ret
+    xor     ecx, ecx
+    call    fed_slot
+    test    dword ptr [rax + FEDLINK.fl_flags], LINK_STALE
+    mov     eax, 6
+    jz      ffk_ret
+    xor     eax, eax
+ffk_ret:
+    FRAME_EPILOG
+    ret
+cmd_fedfanout endp
 
 ; mvt_zero(rcx=ptr, edx=len) - zero a buffer (probe helper).  Leaf, volatile regs.
 mvt_zero proc
