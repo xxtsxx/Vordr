@@ -63,6 +63,7 @@ extern fed_unlock_master:proc           ; M2: load federation record on master u
 extern fed_fanout:proc                  ; M2: open foreign vaults with cached keys (vault.asm)
 extern fed_remember_open:proc           ; M2: record the open vault set (vault.asm)
 extern vault_ctx_nameptr:proc
+extern vault_ctx_pathptr:proc           ; M4: &g_vaults[idx].s_vpath (mgmt list)
 extern vault_ctx_close:proc
 externdef g_vault_n:dword
 externdef g_vault_cur:dword
@@ -505,6 +506,7 @@ IDC_V_COLORPW equ 244                 ; overlay: colored revealed secret (owner-
 IDC_V_MEXPORT equ 245                 ; "Export secrets..." button (.vaultz archive)
 IDC_V_MIMPORT equ 246                 ; "Import..." button (Vordr .vaultz archives)
 IDC_V_MEXPZIP equ 247                 ; "Export to encrypted ZIP" button (settings)
+IDC_V_MMANAGE equ 248                 ; "Manage vaults..." button (M4 federation screen)
 DLG_ICON      equ 740                 ; icon picker (glyph grid + colour swatches)
 IDC_I_PREV    equ 850                 ; icon picker: live preview tile
 IDC_IG_BASE   equ 800                 ; icon picker: glyph buttons (18)
@@ -668,6 +670,10 @@ IDC_V_ICON   equ 249          ; edit-mode icon tile before the title (opens pick
 IDC_V_OVFL   equ 235          ; header overflow (...) menu button
 DLG_PWHIST   equ 780          ; password-history browser dialog
 IDC_PH_LIST  equ 781          ; owner-draw list of archived passwords
+DLG_FEDMGR   equ 790          ; M4 foreign-vault management dialog
+IDC_FM_LIST  equ 791          ; owner-draw listbox of open vaults
+IDC_FM_ADD   equ 792          ; "Add vault..." button
+IDC_FM_REMOVE equ 793         ; "Remove" button
 PH_ROW_H     equ 26           ; history row height (px)
 PH_PURGE_W   equ 22           ; per-row purge hotspot width (px)
 PH_TABH      equ 28           ; height (px) of the per-tile tab strip atop the list
@@ -1064,6 +1070,8 @@ WSTR gt_min, <Minimize>
 WSTR gt_max, <Maximize>
 WSTR gt_close, <Close>
 WSTR gt_settings, <Settings>
+WSTR w_fm_master, <Master >          ; M4 mgmt-list status prefixes (count appended)
+WSTR w_fm_open, <Open >
 WSTR wb_search_txt, <Search vault  (Ctrl+K)>
 kl_user label word
     dw 'U','s','e','r','n','a','m','e', 0
@@ -1259,14 +1267,14 @@ g_menu_ids label dword ; controls menu IDs which are hidden and displayed betwee
     dd IDC_V_MBACK, IDC_V_MTITLE, IDC_V_MPOLL, IDC_V_MLENL, IDC_V_MLEN
     dd IDC_V_MCLSL, IDC_V_MCLS, IDC_V_MTPM, IDC_V_MTPML, IDC_V_MTPMINFO
     dd IDC_V_MTHEMEL, IDC_V_MTHEME, IDC_V_MEXPORT
-    dd IDC_V_MIMPORT
+    dd IDC_V_MIMPORT, IDC_V_MMANAGE
     dd IDC_V_MNOHISTL, IDC_V_MNOHIST, IDC_V_MNOPHONL, IDC_V_MNOPHON
     dd IDC_V_MSECDL, IDC_V_MSECD, IDC_V_MSECINFO
     dd IDC_V_MCLIPL, IDC_V_MCLIP
     dd IDC_V_MIDLEL, IDC_V_MIDLE, IDC_V_MWLKL, IDC_V_MWLK
     dd IDC_V_MNOPREVL, IDC_V_MNOPREV, IDC_V_MNOPREVINFO
     dd IDC_V_MTOUTS
-MENU_ID_COUNT equ 31
+MENU_ID_COUNT equ 32
 
 .data?
 align 8
@@ -1430,6 +1438,9 @@ g_xr_active   dd ?                          ; 1 = overlay list is showing cross-
 ; item data (which are indices into this array).
 g_lxr         db (sizeof XR)*MAX_XR dup(?) ; unified main-list rows (cached display data)
 g_lxr_n       dd ?                          ; number of unified main-list rows
+g_fm_count    dd 8 dup(?)                   ; M4 mgmt list: cached entry count per open slot
+g_fm_pathw    dw 300 dup(?)                 ; M4 mgmt list: wide path scratch for a row
+g_fm_statw    dw 32 dup(?)                  ; M4 mgmt list: "Open (N)"/"Master (N)" scratch
 g_cmpbuf      db 256 dup (?)               ; title-A copy for WM_COMPAREITEM
 align 2
 g_imp_msgw    dw 160 dup (?)               ; import result message scratch (wide)
@@ -10673,34 +10684,6 @@ search_overlay_resize proc frame
 search_overlay_resize endp
 
 
-; gui_switch_vault(rcx=hdlg, edx=idx) - front vault idx and repopulate the UI
-;   (clear search, rebuild the sidebar, select its first entry, repaint tabs).
-gui_switch_vault proc frame
-    FRAME_PROLOG 64
-    mov     qword ptr [rbp-24], rcx
-    mov     ecx, edx
-    call    vault_ctx_front                  ; swap live state (incl g_vpath) to vault idx
-    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_SEARCH, addr w_empty
-    mov     rcx, qword ptr [rbp-24]
-    call    gui_poplist
-    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_GETCOUNT, 0, 0
-    test    eax, eax
-    jz      gsv_repaint
-    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_SETCURSEL, 0, 0
-    mov     rcx, qword ptr [rbp-24]
-    call    gui_lb_seldata                   ; fronts row 0's owner, returns its entry idx
-    mov     dword ptr [rbp-32], eax
-    mov     rcx, qword ptr [rbp-24]
-    mov     edx, dword ptr [rbp-32]
-    call    gui_showdetail
-    mov     rcx, qword ptr [rbp-24]
-    xor     edx, edx
-    call    gui_set_editmode
-gsv_repaint:
-    FRAME_EPILOG
-    ret
-gui_switch_vault endp
-
 
 ; gui_open_additional(rcx=hdlg) - pick + unlock another vault into a new tab.
 ;   Order matters: snapshot the current vault FIRST (its g_vpath is still intact),
@@ -10747,14 +10730,11 @@ goa_loaded:
     ; vault next launch and (b) broke TPM auto-unlock, since the foreign vault has
     ; no TPM-Unlock entry (its path keys a different, absent registry value).
     ; Foreign vaults are reached via the machine-local federation record instead.
-    lea     rcx, [g_vpath]                     ; name the new tab from the basename
+    lea     rcx, [g_vpath]                     ; name the vault from its file basename
     call    gui_basename
     mov     ecx, dword ptr [g_vault_cur]
     lea     rdx, [g_imgfn_w]
     call    vault_ctx_setname
-    mov     rcx, qword ptr [rbp-24]            ; repopulate for the new vault + repaint tabs
-    mov     edx, dword ptr [g_vault_cur]
-    call    gui_switch_vault
     call    fed_remember_open                 ; record the open set (fan-out reopens next launch)
     jmp     goa_done
 goa_rollback:
@@ -10768,38 +10748,19 @@ goa_done:
     ret
 gui_open_additional endp
 
-; gui_close_vault(rcx=hdlg, edx=idx) - close a vault tab: securely wipe its key +
-;   decrypted body, compact the ctx array, adjust the fronted index, repaint.
-;   Closing the last remaining vault locks everything (the normal WM_CLOSE path).
+; gui_close_vault(rcx=hdlg, edx=idx) - unlink a foreign vault (M4 "Remove"):
+;   securely wipe its key + decrypted body, compact the ctx array, and rewrite the
+;   federation record without it.  The master (slot 0) is never passed here (the
+;   caller guards it).  Front the master first so we are never fronted on the
+;   context being freed; the caller repopulates its own list afterwards.
 gui_close_vault proc frame
     FRAME_PROLOG 48
-    mov     qword ptr [rbp-24], rcx
-    mov     dword ptr [rbp-32], edx
-    cmp     dword ptr [g_vault_n], 2
-    jae     gcv_multi
-    WINCALL PostMessageW, qword ptr [rbp-24], WM_CLOSE, 0, 0   ; last vault -> lock all
-    jmp     gcv_done
-gcv_multi:
-    mov     eax, dword ptr [rbp-32]           ; closing the fronted vault? switch away first
-    cmp     eax, dword ptr [g_vault_cur]
-    jne     gcv_drop
-    mov     eax, dword ptr [rbp-32]           ; neighbor = (idx ? idx-1 : 1)
-    test    eax, eax
-    jnz     @F
-    mov     eax, 1
-    jmp     gcv_tgt
-@@: dec     eax
-gcv_tgt:
-    mov     rcx, qword ptr [rbp-24]
-    mov     edx, eax
-    call    gui_switch_vault                  ; snapshots the closing vault into its slot
-gcv_drop:
+    mov     dword ptr [rbp-32], edx           ; idx to close
+    xor     ecx, ecx                          ; front the master (slot 0) - a safe context
+    call    vault_ctx_front
     mov     ecx, dword ptr [rbp-32]           ; wipe + compact + adjust cur (vault.asm)
     call    vault_ctx_close
     call    fed_remember_open                 ; update the recorded open set
-    mov     rcx, qword ptr [rbp-24]           ; rebuild the unified list without the closed vault
-    call    gui_poplist
-gcv_done:
     FRAME_EPILOG
     ret
 gui_close_vault endp
@@ -11459,6 +11420,8 @@ vp_cmd_fixed:
     je      vp_export
     cmp     eax, IDC_V_MIMPORT
     je      vp_import
+    cmp     eax, IDC_V_MMANAGE
+    je      vp_mmanage
     cmp     eax, IDC_V_OVFL
     je      vp_ovfl
     cmp     eax, IDC_V_FAV
@@ -11682,6 +11645,10 @@ vp_import:
     jne     vp_handled
     mov     rcx, qword ptr [rbp-8]
     call    gui_import
+    jmp     vp_handled
+vp_mmanage:
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_open_fedmgr
     jmp     vp_handled
 vp_mnoprevinfo:
     WINCALL gui_msgbox, qword ptr [rbp-8], addr m_noprevinfo, addr t_noprevinfo, \
@@ -13793,6 +13760,320 @@ gop_done:
     FRAME_EPILOG
     ret
 gui_open_pwhist endp
+
+; =============================================================================
+; M4 - Foreign-vault management screen (DLG_FEDMGR).  A modal dialog listing the
+; open vaults (master + federated) as name / path / status(+count) rows, with Add
+; and Remove actions.  Add re-uses gui_open_additional (pick + unlock + cache the
+; key + record it); Remove re-uses gui_close_vault (wipe + drop from the record).
+; The unified main list is rebuilt when the dialog closes.
+; =============================================================================
+
+; gui_draw_fmrow(rcx=lpdis) - paint one management row: a vault glyph tile, the
+;   name, the dim file path, and a right-aligned "Master (N)"/"Open (N)" status.
+;   Item data is the open-vault slot index.
+gui_draw_fmrow proc frame
+    FRAME_PROLOG 160
+    mov     qword ptr [rbp-24], rcx
+    mov     r10, rcx
+    mov     eax, dword ptr [r10+8]              ; itemID
+    cmp     eax, -1
+    je      fmr_done
+    mov     rax, qword ptr [r10+32]
+    mov     qword ptr [rbp-32], rax             ; hdc
+    mov     eax, dword ptr [r10+40]
+    mov     dword ptr [rbp-40], eax             ; L
+    mov     eax, dword ptr [r10+44]
+    mov     dword ptr [rbp-44], eax             ; T
+    mov     eax, dword ptr [r10+48]
+    mov     dword ptr [rbp-48], eax             ; R
+    mov     eax, dword ptr [r10+52]
+    mov     dword ptr [rbp-52], eax             ; B
+    mov     eax, dword ptr [r10+16]
+    mov     dword ptr [rbp-56], eax             ; state
+    mov     eax, dword ptr [r10+56]
+    mov     dword ptr [rbp-60], eax             ; slot index (item data)
+    ; background: sidebar fill, frame colour when selected
+    mov     eax, dword ptr [g_col_side]
+    test    dword ptr [rbp-56], 1               ; ODS_SELECTED
+    jz      @F
+    mov     eax, dword ptr [g_col_frame]
+@@: WINCALL CreateSolidBrush, eax
+    mov     qword ptr [rbp-72], rax
+    mov     r10, qword ptr [rbp-24]
+    lea     rdx, [r10+40]
+    WINCALL FillRect, qword ptr [rbp-32], rdx, qword ptr [rbp-72]
+    WINCALL DeleteObject, qword ptr [rbp-72]
+    ; glyph tile (accent-filled lock)
+    mov     eax, dword ptr [g_col_accent]
+    mov     dword ptr [g_tilecolor], eax
+    mov     word ptr [g_glyph_w], GLY_VAULT
+    mov     word ptr [g_glyph_w+2], 0
+    mov     rcx, qword ptr [rbp-32]
+    mov     edx, dword ptr [rbp-40]
+    add     edx, 8
+    mov     r8d, dword ptr [rbp-44]
+    add     r8d, 6
+    mov     r9d, 28
+    call    gui_draw_tile
+    ; name (cardfont, bright) - top line
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_cardfont]
+    mov     qword ptr [rbp-80], rax             ; old font
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_text]
+    WINCALL SetBkMode, qword ptr [rbp-32], 1
+    mov     eax, dword ptr [rbp-40]
+    add     eax, 46
+    mov     dword ptr [rbp-104], eax            ; rect L
+    mov     eax, dword ptr [rbp-44]
+    add     eax, 4
+    mov     dword ptr [rbp-100], eax            ; rect T
+    mov     eax, dword ptr [rbp-48]
+    sub     eax, 76
+    mov     dword ptr [rbp-96], eax             ; rect R
+    mov     eax, dword ptr [rbp-44]
+    add     eax, 20
+    mov     dword ptr [rbp-92], eax             ; rect B
+    mov     ecx, dword ptr [rbp-60]
+    call    vault_ctx_nameptr
+    mov     qword ptr [rbp-112], rax           ; name ptr (spill: WINCALL may clobber rax)
+    WINCALL DrawTextW, qword ptr [rbp-32], qword ptr [rbp-112], -1, addr rbp-104, 8024h
+    ; path (subfont, dim) - bottom line, end-ellipsis
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_subfont]
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_textdim]
+    mov     ecx, dword ptr [rbp-60]
+    call    vault_ctx_pathptr
+    mov     qword ptr [rbp-88], rax             ; utf8 path ptr
+    xor     edx, edx                            ; strlen (capped)
+fmr_slen:
+    mov     r10, qword ptr [rbp-88]
+    cmp     byte ptr [r10+rdx], 0
+    je      fmr_slend
+    inc     edx
+    cmp     edx, 259
+    jb      fmr_slen
+fmr_slend:
+    mov     rcx, qword ptr [rbp-88]
+    lea     r8, [g_fm_pathw]
+    mov     r9d, 299
+    call    gui_towide
+    mov     eax, dword ptr [rbp-40]
+    add     eax, 46
+    mov     dword ptr [rbp-104], eax
+    mov     eax, dword ptr [rbp-44]
+    add     eax, 20
+    mov     dword ptr [rbp-100], eax
+    mov     eax, dword ptr [rbp-48]
+    sub     eax, 76
+    mov     dword ptr [rbp-96], eax
+    mov     eax, dword ptr [rbp-52]
+    sub     eax, 2
+    mov     dword ptr [rbp-92], eax
+    WINCALL DrawTextW, qword ptr [rbp-32], addr g_fm_pathw, -1, addr rbp-104, 8024h
+    ; status "Master (N)"/"Open (N)" (subfont, dim, right-aligned)
+    lea     rdx, [w_fm_open]
+    cmp     dword ptr [rbp-60], 0
+    jne     @F
+    lea     rdx, [w_fm_master]
+@@: lea     rcx, [g_fm_statw]
+    call    gui_wstrcpy                         ; rax = &NUL after the prefix
+    mov     r10d, dword ptr [rbp-60]
+    lea     r11, [g_fm_count]
+    mov     ecx, dword ptr [r11+r10*4]
+    mov     rdx, rax
+    call    gui_u32w
+    mov     eax, dword ptr [rbp-48]
+    sub     eax, 72
+    mov     dword ptr [rbp-104], eax
+    mov     eax, dword ptr [rbp-44]
+    add     eax, 4
+    mov     dword ptr [rbp-100], eax
+    mov     eax, dword ptr [rbp-48]
+    sub     eax, 8
+    mov     dword ptr [rbp-96], eax
+    mov     eax, dword ptr [rbp-52]
+    sub     eax, 4
+    mov     dword ptr [rbp-92], eax
+    WINCALL DrawTextW, qword ptr [rbp-32], addr g_fm_statw, -1, addr rbp-104, 8026h
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-80]   ; restore font
+fmr_done:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gui_draw_fmrow endp
+
+; gui_fedmgr_populate(rcx=hdlg) - (re)fill the management list with one row per
+;   open vault slot (item data = slot index), caching each vault's entry count.
+gui_fedmgr_populate proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    mov     eax, dword ptr [g_vault_cur]
+    mov     dword ptr [rbp-28], eax             ; restore the fronted vault afterwards
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_FM_LIST, LB_RESETCONTENT, 0, 0
+    mov     dword ptr [rbp-32], 0               ; v
+fmp_loop:
+    mov     eax, dword ptr [rbp-32]
+    cmp     eax, dword ptr [g_vault_n]
+    jae     fmp_done
+    mov     ecx, dword ptr [rbp-32]             ; count this slot's entries
+    call    vault_ctx_front
+    call    vault_count
+    mov     r10d, dword ptr [rbp-32]
+    lea     r11, [g_fm_count]
+    mov     dword ptr [r11+r10*4], eax
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_FM_LIST, LB_ADDSTRING, 0, \
+            dword ptr [rbp-32]                   ; item data = slot index
+    inc     dword ptr [rbp-32]
+    jmp     fmp_loop
+fmp_done:
+    mov     ecx, dword ptr [rbp-28]
+    call    vault_ctx_front
+    FRAME_EPILOG
+    ret
+gui_fedmgr_populate endp
+
+; fedmgr_proc - the DLG_FEDMGR dialog procedure (modal).  Raw OS callback frame.
+fedmgr_proc proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 64
+    mov     qword ptr [rbp-8], rcx
+    cmp     rdx, WM_INITDIALOG
+    je      fm_init
+    cmp     rdx, WM_COMMAND
+    je      fm_cmd
+    cmp     rdx, WM_MEASUREITEM
+    je      fm_measure
+    cmp     rdx, WM_CTLCOLORSTATIC
+    je      fm_col
+    cmp     rdx, WM_CTLCOLORBTN
+    je      fm_col
+    cmp     rdx, WM_CTLCOLORLISTBOX
+    je      fm_col
+    cmp     rdx, WM_CTLCOLORDLG
+    je      fm_col
+    cmp     rdx, WM_PAINT
+    je      fm_paint
+    cmp     rdx, WM_ERASEBKGND
+    je      fm_erase
+    cmp     rdx, WM_DRAWITEM
+    je      fm_draw
+    xor     eax, eax
+    jmp     fm_ret
+fm_col:
+    call    theme_ctlcolor
+    jmp     fm_ret
+fm_paint:
+    mov     rcx, qword ptr [rbp-8]
+    call    theme_paint
+    jmp     fm_ret
+fm_erase:
+    mov     rcx, r8
+    mov     rdx, qword ptr [rbp-8]
+    call    theme_erase
+    jmp     fm_ret
+fm_measure:
+    mov     r10, r9
+    mov     dword ptr [r10+16], 40             ; MEASUREITEMSTRUCT.itemHeight
+    mov     eax, 1
+    jmp     fm_ret
+fm_draw:
+    mov     r10, r9
+    mov     eax, dword ptr [r10+4]
+    cmp     eax, IDC_FM_LIST
+    jne     fm_draw_def
+    mov     rcx, r9
+    call    gui_draw_fmrow
+    mov     eax, 1
+    jmp     fm_ret
+fm_draw_def:
+    mov     rcx, r9
+    call    theme_drawitem
+    mov     eax, 1
+    jmp     fm_ret
+fm_init:
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDOK
+    call    theme_attach
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_set_winicon
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_fedmgr_populate
+    mov     eax, 1
+    jmp     fm_ret
+fm_cmd:
+    movzx   eax, r8w
+    cmp     eax, IDC_FM_ADD
+    je      fm_add
+    cmp     eax, IDC_FM_REMOVE
+    je      fm_remove
+    cmp     eax, IDOK
+    je      fm_close
+    cmp     eax, IDCANCEL
+    je      fm_close
+    xor     eax, eax
+    jmp     fm_ret
+fm_add:
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_open_additional               ; pick + unlock + cache + record
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_fedmgr_populate
+    mov     eax, 1
+    jmp     fm_ret
+fm_remove:
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_FM_LIST, LB_GETCURSEL, 0, 0
+    cmp     eax, LB_ERR
+    je      fm_rdone
+    mov     dword ptr [rbp-16], eax           ; selected row
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_FM_LIST, LB_GETITEMDATA, \
+            dword ptr [rbp-16], 0
+    cmp     eax, 0                            ; slot 0 = master -> not removable
+    jle     fm_rdone
+    mov     dword ptr [rbp-16], eax           ; slot index
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, dword ptr [rbp-16]
+    call    gui_close_vault                   ; wipe + drop from the record
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_fedmgr_populate
+fm_rdone:
+    mov     eax, 1
+    jmp     fm_ret
+fm_close:
+    WINCALL EndDialog, qword ptr [rbp-8], 0
+    mov     eax, 1
+fm_ret:
+    mov     rsp, rbp
+    pop     rbp
+    ret
+fedmgr_proc endp
+
+; gui_open_fedmgr(rcx=hdlg) - open the management screen (modal); on close, rebuild
+;   the unified list since the open-vault set may have changed.
+gui_open_fedmgr proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_FEDMGR, qword ptr [rbp-24], \
+            addr fedmgr_proc, 0
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_poplist
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_GETCOUNT, 0, 0
+    test    eax, eax
+    jz      gof_done
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_SETCURSEL, 0, 0
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_lb_seldata                    ; fronts row 0's owner, returns entry idx
+    cmp     eax, -1
+    je      gof_done
+    mov     dword ptr [rbp-32], eax
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-32]
+    call    gui_showdetail
+    mov     rcx, qword ptr [rbp-24]
+    xor     edx, edx
+    call    gui_set_editmode
+gof_done:
+    FRAME_EPILOG
+    ret
+gui_open_fedmgr endp
 
 ; gui_wstrcpy(rcx=dst, rdx=src wide) -> rax = ptr to the terminating NUL in dst.  Leaf.
 gui_wstrcpy proc
