@@ -144,7 +144,7 @@ House rules:
   → `vfuzz` → `fuzzzip` → `bktest` → `mactest` → `rbtest` → `xctest` → `reload`
   → `cowrite` → `attfuzz` → `healthkat` → `pkat` → `mvtest` → `mvswitch` →
   `mvname` → `idkat` → `kekkat` → `keyringkat` → `fedkat` → `fedregkat` →
-  `fmskat` → `fedapikat` → `avtest`. `--quick` skips stage 1.
+  `fmskat` → `fedapikat` → `fedfanout` → `avtest`. `--quick` skips stage 1.
 - **FRAMES** = no >4-arg `WINCALL` directly inside a raw `sub rsp,64` dialog
   proc (`create_proc`, `unlock_proc`, `vault_proc`, `msg_proc`, `about_proc`,
   …); wide calls go in a `FRAME_PROLOG N` helper. This is the BEX64/offset-0
@@ -191,20 +191,26 @@ House rules:
 - **M2 master-key API:** `fed_save_all`/`fed_unlock_all` — master key in → derive
   secret+KEK → store/load the record; working keys `secure_zero`'d. Probe:
   `fedapikat` (save→wipe→unlock round-trip under a master key).
+- **M2 wired into unlock:** `gui_open` calls `fed_unlock_master` (loads the record
+  under `g_vkey`) then `fed_fanout` on the first (master) vault unlock. A
+  provisioning guard peeks for a record first, so non-federating users get no
+  TPM key.
+- **M2 fan-out:** `fed_fanout` opens each foreign vault into a VSLOT context with
+  its cached key (the `g_reuse_key`/`vu_havekey` KDF-skip path); marks
+  `LINK_MISSING`/`STALE` and rolls back on failure. Probe: `fedfanout` (seed a
+  real vault → link → open as 2nd ctx; corrupt key → STALE + rollback).
 
-**M2's machine-local keyring is now a complete, gate-verified headless library**
-(7 probes: `idkat`/`kekkat`/`keyringkat`/`fedkat`/`fedregkat`/`fmskat`/`fedapikat`):
-from a master key it provisions the machine secret, derives the KEK, and
-persists/loads the link table machine-locally, TPM-bound, non-exportable.
+**M2 is now functional end to end and gate-verified** (8 probes:
+`idkat`/`kekkat`/`keyringkat`/`fedkat`/`fedregkat`/`fmskat`/`fedapikat`/`fedfanout`):
+master unlock → load the machine-local, TPM-bound, non-exportable record → open
+every foreign vault with its cached key.
 
-*Remaining M — all integration or pixels, needs the live unlock flow / real
-foreign vault files / display:* **fan-out** (open each foreign file with its
-cached key — needs a `vault_unlock` key-supplied path + the VSLOT ctx + real
-files); **M1.2 system items** (vault-body ID+name — a core on-disk-format change,
-touches enumeration + the GUI list, do with review); **M3–M5** (unified list, mgmt
-screen, TPM/registry scoping — display); **M6** export (needs entry selection +
-password prompt). The GUI unlock path calls `fed_unlock_all(g_vkey, …)` /
-`fed_save_all(…)`; the library is ready for that wiring.
+*Remaining M — all pixels/format, needs the display or format review:* **M3**
+(unified list — the foreign vaults now open as tabs; merging their entries into
+one list is display work), **M4** (mgmt screen to add/remove links, calls
+`fed_save_all`), **M5** (registry/TPM scoping — mostly done via the keyring),
+**M1.2 system items** (vault-body ID+name — a core on-disk-format change, do with
+review), **M6** export (entry selection + password prompt).
 
 **Pre-v1.0 clean slate (2026-07-21).** Until v1.0 ships, all pre-existing vaults
 and Vordr builds are treated as discarded — **no migration, no back-compat
