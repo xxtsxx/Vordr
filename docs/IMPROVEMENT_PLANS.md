@@ -366,6 +366,36 @@ keys, locators, membership) stays machine-local and never becomes a system item.
    *Test:* extends `mvname`/`federatetest` — merged list = union with correct owner
    attribution; edits and attachment-opens hit the right owner.
 
+**LANDED (2026-07-22).** The unified list is live and gate-green:
+- New store `g_lxr`/`g_lxr_n` (separate from the overlay's `g_xr` so the browse
+  list and search overlay never alias). `search_overlay_xfill` refactored into
+  parameterized **`xfill_into(hdlg, queryEditId, xrbase, &count)`** (honours
+  `g_trash_view`); thin wrappers `search_overlay_xfill` (→`g_xr`) and
+  **`list_fill_all`** (→`g_lxr`, no query = full union). `MAX_XR` 200→4096 (the
+  union of 8 vaults, not one search). `gui_poplist` now fills `IDC_V_LIST` with
+  `g_lxr` indices; `gui_draw_xresult` + the `WM_COMPAREITEM` path self-select
+  `g_lxr` vs `g_xr` by CtlID (main-list order = vault ASC, then title). Provenance
+  = the dim right-aligned vault name (no group headers).
+- **Selection chokepoint:** `gui_lb_seldata` decodes the row's xr index →
+  `vault_ctx_front(owner)` → returns the entry index, so detail/save/edit/
+  attachment-open all hit the right owner unchanged. `gui_lb_selbydata` reselects
+  by `(fronted vault, entry)`; `search_overlay_activate` fronts owner + reselects
+  (no `gui_switch_vault`); new-item target = selected row's vault else master (0).
+- **Tab strip removed:** `gui_draw_tabs`, `gui_tab_click`, `IDC_V_TABS`, `TAB_W`
+  and all dispatch/layout gone (the strip lived in the caption, so the list
+  geometry was untouched). `gui_switch_vault`/`gui_open_additional`/
+  `gui_close_vault` are **kept but unwired** (allowlisted in `tools/deadcode.py`)
+  for M4 to re-wire as "add/remove link". Per user (2026-07-22) there is **no
+  interim open/close affordance** — foreign vaults arrive via the fan-out only
+  until M4.
+- Corrections to the plan text above: `PH_TABH` is the *password-history* browser's
+  strip, unrelated — not touched. `g_master_idx` not introduced yet (master = slot
+  0, as elsewhere); fold it in with M4. **`federatetest` still pending** — the
+  mv-probe harness plants synthetic scalars and does not stand up multiple
+  decrypted vaults with real entry bodies, which the union enumeration needs;
+  deferred rather than faked. **GUI wiring not yet screen-verified** — headless
+  build + gate green; awaiting Thomas's visual check.
+
 ### M4. Foreign-vault management screen
 1. A dedicated modeless dialog (replaces the tab strip's add/close/switch): rows
    of linked vaults with **name, path, status** (open / locked / stale / missing)
