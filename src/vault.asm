@@ -2345,6 +2345,17 @@ vco_no_current:
     mov     dword ptr [g_vault_n], eax      ; n = n + 1
     mov     eax, dword ptr [rbp-24]
     mov     dword ptr [g_vault_cur], eax    ; cur = idx
+    ; A freshly-claimed slot must NOT inherit a stale body pointer from a prior
+    ; life in that slot: the caller loads the new vault into the LIVE globals and
+    ; only snapshots it here on the next front, so until then a leftover
+    ; s_body_ptr would be a dead pointer that vault_ctx_reset frees on lock ->
+    ; secmem_free secure_zeros already-released pages -> crash.  Seen as
+    ; "create a fresh master, lock, crash" (the master claims slot 0 with the
+    ; fan-out opening nothing, so no snapshot ever populates it).
+    mov     ecx, dword ptr [rbp-24]
+    call    vault_ctx_slotptr
+    mov     qword ptr [rax + VSLOT.s_body_ptr], 0
+    mov     qword ptr [rax + VSLOT.s_body_len], 0
     mov     eax, dword ptr [rbp-24]
     FRAME_EPILOG
     ret
@@ -2984,6 +2995,55 @@ mlr_ret:
     FRAME_EPILOG
     ret
 cmd_mvlockreal endp
+
+; cmd_mvstale - headless regression for "create a fresh master, lock, crash".
+;   A slot reused across the app's lifetime could carry a stale (already-freed)
+;   body pointer; when vault_ctx_open re-claims it for a new vault WITHOUT the
+;   next front ever snapshotting a real body over it (the single-master, empty
+;   fan-out case), vault_ctx_reset on lock frees that dangling pointer -> crash.
+;   Plants a freed pointer in slot 0, claims it, and asserts the claim dropped it.
+CSTR mvs_ok,  "mvstale: PASS (claimed slot dropped the stale body pointer)",13,10
+CSTR mvs_bad, "mvstale: FAIL (stale body pointer survived claim -> lock would crash)",13,10
+LANDING_PAD
+public cmd_mvstale
+cmd_mvstale proc frame
+    FRAME_PROLOG 48
+    call    vault_ctx_reset                  ; clean slate (n=0, cur=-1)
+    mov     ecx, 65536                        ; a real body, then freed -> dangling pointer
+    call    secmem_alloc
+    test    rax, rax
+    jz      mvs_fail
+    mov     qword ptr [rbp-24], rax
+    mov     rcx, rax
+    mov     rdx, 65536
+    call    secmem_free
+    xor     ecx, ecx                          ; plant the dangling pointer in slot 0
+    call    vault_ctx_slotptr
+    mov     r10, rax
+    mov     rax, qword ptr [rbp-24]
+    mov     qword ptr [r10 + VSLOT.s_body_ptr], rax
+    mov     qword ptr [r10 + VSLOT.s_body_len], 65536
+    call    vault_ctx_open                    ; "create master": claim slot 0 (cur=-1)
+    xor     ecx, ecx
+    call    vault_ctx_slotptr
+    cmp     qword ptr [rax + VSLOT.s_body_ptr], 0   ; the claim must have dropped it
+    jne     mvs_fail
+    mov     qword ptr [g_body_ptr], 0         ; the lock: reset must skip the (dropped) slot
+    call    vault_ctx_reset
+    lea     rcx, [mvs_ok]
+    mov     edx, mvs_ok_len
+    call    print_a
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+mvs_fail:
+    lea     rcx, [mvs_bad]
+    mov     edx, mvs_bad_len
+    call    print_a
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_mvstale endp
 
 ; ===========================================================================
 ; M1 (master-vault federation): vault identity.  The machine-local keyring
