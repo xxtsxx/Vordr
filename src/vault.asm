@@ -2426,12 +2426,12 @@ vault_ctx_close proc frame
     lea     rcx, [rax + VSLOT.s_vkey]         ; wipe master key
     mov     edx, 32
     call    secure_zero
-    mov     r10, qword ptr [rbp-32]           ; wipe decrypted body (its own alloc)
-    mov     rcx, qword ptr [r10 + VSLOT.s_body_ptr]
-    test    rcx, rcx
-    jz      vcc_compact
-    mov     edx, dword ptr [r10 + VSLOT.s_body_len]
-    call    secure_zero
+    mov     r10, qword ptr [rbp-32]           ; free the decrypted body (its own alloc).
+    mov     rcx, qword ptr [r10 + VSLOT.s_body_ptr]   ; secmem_free wipes THEN releases; the
+    test    rcx, rcx                          ; caller fronts the master first, so this is
+    jz      vcc_compact                       ; never the live g_body_ptr.  (A bare wipe here
+    mov     rdx, qword ptr [r10 + VSLOT.s_body_len]   ; leaked the alloc, and - worse - left the
+    call    secmem_free                       ; pointer to be duplicated by the shift below.)
 vcc_compact:
     mov     eax, dword ptr [rbp-24]           ; shift slots [idx+1 .. n-1] down one
     mov     dword ptr [rbp-40], eax
@@ -2454,11 +2454,17 @@ vcc_shift:
     jmp     vcc_shift
 vcc_shifted:
     dec     dword ptr [g_vault_n]
-    mov     ecx, dword ptr [g_vault_n]        ; wipe the excluded trailing slot's key copy
+    mov     ecx, dword ptr [g_vault_n]        ; the now-excluded trailing slot
     call    vault_ctx_slotptr
-    lea     rcx, [rax + VSLOT.s_vkey]
+    mov     qword ptr [rbp-32], rax
+    lea     rcx, [rax + VSLOT.s_vkey]         ; wipe its master-key copy
     mov     edx, 32
     call    secure_zero
+    mov     r10, qword ptr [rbp-32]           ; drop its DUPLICATE body reference: the shift
+    mov     qword ptr [r10 + VSLOT.s_body_ptr], 0   ; copied this slot's body_ptr down into a
+    mov     qword ptr [r10 + VSLOT.s_body_len], 0   ; live slot, so the stale copy up here must
+                                              ; NOT survive - else vault_ctx_reset (on lock)
+                                              ; frees the same body twice -> crash.
     mov     eax, dword ptr [g_vault_cur]      ; cur > idx -> shift down with the array
     cmp     eax, dword ptr [rbp-24]
     jle     vcc_done
@@ -2737,6 +2743,77 @@ mvn_fail:
     FRAME_EPILOG
     ret
 cmd_mvname endp
+
+; ===========================================================================
+; cmd_mvclose - headless regression for the vault-close teardown (the M4 "Remove"
+;   path).  Historically two lock-crashes came from secmem_free being asked to
+;   free the same decrypted body twice (it secure_zeros BEFORE VirtualFree, so a
+;   second free writes released pages -> access violation): (1) g_body_ptr
+;   aliasing slot[cur] on the fan-out, and (2) vault_ctx_close's compaction
+;   copying a slot's body_ptr DOWN into a live slot without clearing the stale
+;   copy up top.  This probe stands up 4 vaults each with its OWN locked body,
+;   removes the middle one repeatedly (exercising the shift), asserts no slot
+;   retains a duplicate body_ptr, then tears down.  With the bug, the teardown
+;   double-frees and this process crashes (non-zero exit); fixed, exit 0 = pass.
+CSTR mvc_ok,  "mvclose: PASS (no duplicate body_ptr; teardown freed each once)",13,10
+CSTR mvc_bad, "mvclose: FAIL (a duplicate body_ptr survived close)",13,10
+LANDING_PAD
+public cmd_mvclose
+cmd_mvclose proc frame
+    FRAME_PROLOG 48
+    call    vault_ctx_reset                  ; clean slate
+    mov     dword ptr [rbp-24], 0            ; v
+mvc_open:
+    cmp     dword ptr [rbp-24], 4
+    jae     mvc_ready
+    call    vault_ctx_open                   ; snapshot prev live -> its slot; cur = v
+    mov     ecx, 65536                       ; give the live vault its OWN locked body
+    call    secmem_alloc
+    test    rax, rax
+    jz      mvc_fail                         ; OOM -> cannot run
+    mov     qword ptr [g_body_ptr], rax
+    mov     qword ptr [g_body_len], 65536
+    inc     dword ptr [rbp-24]
+    jmp     mvc_open
+mvc_ready:
+    xor     ecx, ecx                         ; front the master: snapshots the last-opened
+    call    vault_ctx_front                  ;   body into its slot, live = slot 0
+mvc_close:
+    cmp     dword ptr [g_vault_n], 1         ; remove the middle vault until only master left
+    jbe     mvc_closed
+    mov     ecx, 1
+    call    vault_ctx_close
+    jmp     mvc_close
+mvc_closed:
+    mov     dword ptr [rbp-24], 1            ; assert slots 1..MAX_VAULTS-1 hold no stale body
+mvc_scan:
+    cmp     dword ptr [rbp-24], MAX_VAULTS
+    jae     mvc_teardown
+    mov     ecx, dword ptr [rbp-24]
+    call    vault_ctx_slotptr
+    cmp     qword ptr [rax + VSLOT.s_body_ptr], 0
+    jne     mvc_fail                         ; a duplicate survived -> would double-free
+    inc     dword ptr [rbp-24]
+    jmp     mvc_scan
+mvc_teardown:
+    call    vault_ctx_reset                  ; frees the master body once; a duplicate here
+                                             ; would fault (released-page wipe) -> crash
+    lea     rcx, [mvc_ok]
+    mov     edx, mvc_ok_len
+    call    print_a
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+mvc_fail:
+    ; do NOT reset here: if a duplicate is present, freeing it is the very crash
+    ; we are detecting.  Report cleanly and let process exit reclaim the leak.
+    lea     rcx, [mvc_bad]
+    mov     edx, mvc_bad_len
+    call    print_a
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_mvclose endp
 
 ; ===========================================================================
 ; M1 (master-vault federation): vault identity.  The machine-local keyring
