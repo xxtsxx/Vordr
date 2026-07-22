@@ -279,6 +279,8 @@ FED_KEK_DOMLEN equ 23
 even
 fed_valname db 'r',0,'e',0,'c',0,'o',0,'r',0,'d',0,0,0  ; M2: record value name (wide)
 even
+fms_key     db 'V',0,'o',0,'r',0,'d',0,'r',0,'-',0,'F',0,'e',0,'d',0,'B',0,'i',0,'n',0,'d',0,0,0  ; M2: machine-binding TPM key
+fms_val     db 'm',0,'a',0,'c',0,'h',0,'i',0,'n',0,'e',0,'k',0,'e',0,'y',0,0,0  ; M2: sealed-secret registry value
 fms_kat_key db 'V',0,'o',0,'r',0,'d',0,'r',0,'-',0,'F',0,'B',0,'K',0,'A',0,'T',0,0,0  ; fmskat TPM key
 fms_kat_val db 'm',0,'k',0,'k',0,'a',0,'t',0,0,0        ; fmskat registry value
 CSTR bk_ok,  "bktest: PASS (bak1..3 rotated and bak1 opens)",13,10
@@ -3524,39 +3526,59 @@ fed_unlock_all proc frame
     mov     qword ptr [rbp-24], rcx           ; master_key
     mov     qword ptr [rbp-32], rdx           ; keyname
     mov     qword ptr [rbp-40], r8            ; valname
-    lea     rcx, [g_fed_tpmsec]
+    lea     rcx, [fed_valname]                ; peek: is there a stored record at all?
+    lea     rdx, [g_fedblob]                  ;   (skip TPM provisioning for users who
+    mov     r8d, (sizeof FEDREC) + 32         ;    never federate - no record, no key)
+    call    reg_fed_get
+    test    eax, eax
+    jz      fua_none
+    lea     rcx, [g_fed_tpmsec]               ; provision/get the machine secret
     mov     rdx, qword ptr [rbp-32]
     mov     r8, qword ptr [rbp-40]
     call    fed_machine_secret
     test    eax, eax
     jnz     @F
-    lea     rcx, [g_fed_tpmsec]
+    lea     rcx, [g_fed_tpmsec]               ; no TPM -> master-key-only
     mov     edx, 32
     call    secure_zero
-@@: lea     rcx, [g_fed_workkek]
+@@: lea     rcx, [g_fed_workkek]              ; kek = KEK(master_key, tpm_secret)
     mov     rdx, qword ptr [rbp-24]
     lea     r8, [g_fed_tpmsec]
     call    keyring_kek
     lea     rcx, [g_fed_workkek]
     call    fed_load
-    mov     dword ptr [rbp-48], eax           ; 1 = loaded, 0 = none
-    lea     rcx, [g_fed_tpmsec]
+    mov     dword ptr [rbp-48], eax           ; 1 = loaded, 0 = auth fail
+    lea     rcx, [g_fed_tpmsec]               ; wipe working key material
     mov     edx, 32
     call    secure_zero
     lea     rcx, [g_fed_workkek]
     mov     edx, 32
     call    secure_zero
     cmp     dword ptr [rbp-48], 0
-    jne     fua_ok
-    call    fed_reset                          ; no record -> empty table
-    xor     eax, eax
-    FRAME_EPILOG
-    ret
-fua_ok:
+    je      fua_none
     mov     eax, dword ptr [g_fedrec + FEDREC.fr_count]
     FRAME_EPILOG
     ret
+fua_none:
+    call    fed_reset                          ; no record / auth fail -> empty table
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
 fed_unlock_all endp
+
+; fed_unlock_master() -> eax = link count.  Load the machine-local federation
+;   record under the currently-unlocked master key (g_vkey).  Called by the GUI
+;   immediately after the master vault decrypts.
+public fed_unlock_master
+fed_unlock_master proc frame
+    FRAME_PROLOG 32
+    lea     rcx, [g_vkey]
+    lea     rdx, [fms_key]
+    lea     r8, [fms_val]
+    call    fed_unlock_all
+    FRAME_EPILOG
+    ret
+fed_unlock_master endp
 
 ; cmd_fedapikat - headless KAT for the master-key API: build a record, save it
 ;   under a master key, wipe the live copy, unlock with the same key and assert
