@@ -100,7 +100,7 @@ set /a T_SELFTEST=!T1!-!T0!
 
 rem -------------------------------------------------------------- roundtrip --
 call :now T0
-echo === stage: roundtrip (seedtest / atgen / zitest / phtest / secscan / secfreedup / tmptest / fztest / trtest / vfuzz / fuzzzip / bktest / mactest / rbtest / xctest / reload / attfuzz / healthkat / pkat / mvtest / mvswitch / mvname / mvremove / mvclose / mvlock / mvstale / idkat / kekkat / keyringkat / fedkat / fedregkat / fmskat / fedapikat / fedfanout / avtest) ===
+echo === stage: roundtrip (seedtest / atgen / zitest / phtest / secscan / secfreedup / tmptest / fztest / trtest / vfuzz / fuzzzip / bktest / mactest / rbtest / xctest / reload / attfuzz / healthkat / pkat / mvtest / mvswitch / mvname / mvremove / mvclose / mvlock / mvstale / kdfparam / idkat / kekkat / keyringkat / fedkat / fedregkat / fmskat / fedapikat / fedfanout / avtest) ===
 set RT=PASS
 
 bin\vordr.exe seedtest "%WORK%\rt.vault" > "%WORK%\seedtest.log" 2>&1
@@ -194,6 +194,9 @@ if not "!errorlevel!"=="0" ( echo   mvlock: FAIL ^(exit !errorlevel!, multi-vaul
 
 bin\vordr.exe mvstale > "%WORK%\mvstale.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   mvstale: FAIL ^(exit !errorlevel!, claimed slot kept a stale body pointer^) & set RT=FAIL )
+
+bin\vordr.exe kdfparam > "%WORK%\kdfparam.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   kdfparam: FAIL ^(exit !errorlevel!, pre-auth KDF-param DoS guard^) & set RT=FAIL )
 
 bin\vordr.exe idkat > "%WORK%\idkat.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   idkat: FAIL ^(exit !errorlevel!, M1 vault_id_of^) & set RT=FAIL )

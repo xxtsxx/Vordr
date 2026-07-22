@@ -63,6 +63,9 @@ ARGON2_MIN_T        equ 1
 ARGON2_MAX_T        equ 16
 ARGON2_DEF_T        equ 3
 ARGON2_DEF_M_KIB    equ 524288     ; 512 MiB (tuned for ~600-700ms with AVX2)
+ARGON2_MAX_M_KIB    equ 4194304    ; 4 GiB - the max the config/CLI accepts (4096 MiB);
+                                   ; a header m_cost above this is corrupt/tamper and is
+                                   ; rejected BEFORE the KDF runs (pre-auth DoS guard)
 
 KCV_LEN             equ 16         ; key-check value bytes (SHA-256(key) prefix)
 
