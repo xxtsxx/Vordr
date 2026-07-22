@@ -45,12 +45,6 @@ ALLOWLIST = {
     # deleting the unused members just means re-adding them on next use.
     "CHECK_SUB_OVF", "CHECK_MUL_OVF",
     "xELSE", "xELIF", "xWHILET", "xWHILEZ", "xCONTINUE",
-    # M3 dropped the tab strip (their only caller was gui_tab_click).  These two
-    # keep their tested logic - file picker + TPM-auto + rollback + the
-    # fed_remember_open wiring - intact for M4's management screen, which will
-    # re-wire "add link"/"remove link" to them.  Intentionally unreferenced in
-    # the M3..M4 interim, NOT dead.  Remove from the allowlist when M4 wires them.
-    "gui_open_additional", "gui_close_vault",
 }
 
 # MASM identifiers: letter/_/$/?/@ then letter/digit/_/$/?/@.  Matches both the

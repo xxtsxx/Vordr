@@ -409,6 +409,28 @@ keys, locators, membership) stays machine-local and never becomes a system item.
    *Test (needs a display):* add → row appears, secrets merge into the list;
    remove → they vanish and the cached key is gone from the rewritten record.
 
+**LANDED — v1 (2026-07-22).** The management screen exists and closes the M3 open/
+close gap. Build + gate green.
+- New modal dialog `DLG_FEDMGR` (`fedmgr_proc`) reached via a **"Manage vaults…"**
+  button (`IDC_V_MMANAGE`) added to the settings overlay (in `g_menu_ids`,
+  `MENU_ID_COUNT` 31→32, dispatched at `vp_mmanage`→`gui_open_fedmgr`). Modal, like
+  every other secondary dialog (no modeless pump exists).
+- An owner-draw listbox (`IDC_FM_LIST`) shows one row per **open** vault slot:
+  glyph tile + name (`s_name`) + dim path (`s_vpath`, via new
+  `vault_ctx_pathptr`) + right-aligned **"Master (N)"/"Open (N)"** with the entry
+  count (`gui_draw_fmrow`; counts cached in `g_fm_count` at populate).
+- **Add vault…** and **Remove** re-wire the parked procs: `gui_open_additional`
+  (now decoupled from the main window — no `gui_switch_vault`) and `gui_close_vault`
+  (rewritten: front master → `vault_ctx_close` → `fed_remember_open`; the old
+  last-vault/WM_CLOSE + neighbour-switch logic is gone). `gui_switch_vault` is
+  **deleted** (fully obsolete); both procs are off the deadcode allowlist. On
+  dialog close, `gui_open_fedmgr` rebuilds the unified list + reselects row 0.
+- **Deferred to M4 v2:** set-master (needs M5's registry/TPM re-point + key
+  migration), rename (needs M1.3 system-item name), re-authenticate a stale link,
+  relocate a missing link, and showing record links that **failed** to fan out
+  (stale/missing) — v1 lists only currently-open slots. **Not screen-verified** —
+  headless build + gate green; awaiting Thomas's visual check.
+
 ### M5. Scope TPM + registry to the master (the federation record replaces per-vault entries)
 1. Registry persists **only** the master path (`reg_save_vault`); only the master
    gets a TPM unlock sidecar (`reg_tpm_*`/`gui_try_tpm_auto`) **and** the TPM

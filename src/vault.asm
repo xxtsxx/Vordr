@@ -2400,6 +2400,18 @@ vault_ctx_nameptr proc
     ret
 vault_ctx_nameptr endp
 
+; vault_ctx_pathptr(ecx=idx) -> rax = &g_vaults[idx].s_vpath (UTF-8 file path).
+;   Leaf.  Used by the M4 vault-management list to show each slot's locator.
+public vault_ctx_pathptr
+vault_ctx_pathptr proc
+    mov     eax, ecx
+    imul    rax, rax, sizeof VSLOT
+    lea     rcx, [g_vaults]
+    add     rax, rcx
+    add     rax, VSLOT.s_vpath
+    ret
+vault_ctx_pathptr endp
+
 ; vault_ctx_close(ecx=idx) - remove open-vault context idx: securely wipe its
 ;   master key + decrypted body, compact the g_vaults array, wipe the trailing
 ;   slot's key copy, and shift g_vault_cur down if it was above idx.  The caller
