@@ -2216,6 +2216,17 @@ vcr_loop:
     mov     rcx, qword ptr [r10 + VSLOT.s_body_ptr]
     test    rcx, rcx
     jz      vcr_next
+    ; The live arena (g_body_ptr) ALIASES the current slot's body_ptr - after a
+    ; fan-out, slot[0].s_body_ptr == g_body_ptr (the master body).  On the lock
+    ; path this proc runs right before vault_lock, which also frees g_body_ptr;
+    ; drop the alias here so vault_lock's free is a no-op.  Without this the
+    ; second secmem_free secure_zero's already-released pages -> access violation
+    ; (crash on lock with multiple vaults open).
+    cmp     rcx, qword ptr [g_body_ptr]
+    jne     vcr_free
+    mov     qword ptr [g_body_ptr], 0
+    mov     qword ptr [g_body_len], 0
+vcr_free:
     mov     rdx, qword ptr [r10 + VSLOT.s_body_len]
     call    secmem_free
     mov     r10, qword ptr [rbp-32]
