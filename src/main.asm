@@ -61,6 +61,7 @@ extern cmd_xctest:proc                  ; external-change detection probe (vault
 extern cmd_mvtest:proc                  ; multi-vault state snapshot/restore probe (vault.asm)
 extern cmd_mvswitch:proc                ; multi-vault context switch probe (vault.asm)
 extern cmd_mvname:proc                  ; multi-vault name<->body coupling probe (vault.asm)
+extern cmd_mvclose:proc                 ; multi-vault close/teardown double-free probe (vault.asm)
 extern cmd_idkat:proc                   ; M1: vault_id_of KAT (vault.asm)
 extern cmd_kekkat:proc                  ; M2: keyring KEK KAT (vault.asm)
 extern cmd_keyringkat:proc              ; M2: keyring seal/open KAT (vault.asm)
@@ -214,6 +215,7 @@ WSTR w_trtest,   <trtest>
 WSTR w_mvtest,   <mvtest>
 WSTR w_mvswitch, <mvswitch>
 WSTR w_mvname,   <mvname>
+WSTR w_mvclose,  <mvclose>
 WSTR w_idkat,    <idkat>
 WSTR w_kekkat,   <kekkat>
 WSTR w_keyringkat, <keyringkat>
@@ -279,6 +281,7 @@ cmd_table label CMDENT
     CMDENT { w_mvtest,    cmd_mvtest,    0, 0 }   ; multi-vault snapshot/restore probe
     CMDENT { w_mvswitch,  cmd_mvswitch,  0, 0 }   ; multi-vault context switch probe
     CMDENT { w_mvname,    cmd_mvname,    0, 0 }   ; multi-vault name<->body coupling probe
+    CMDENT { w_mvclose,   cmd_mvclose,   0, 0 }   ; multi-vault close/teardown double-free probe
     CMDENT { w_idkat,     cmd_idkat,     0, 0 }   ; M1: vault_id_of KAT
     CMDENT { w_kekkat,    cmd_kekkat,    0, 0 }   ; M2: keyring KEK KAT
     CMDENT { w_keyringkat, cmd_keyringkat, 0, 0 } ; M2: keyring seal/open KAT
