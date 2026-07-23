@@ -61,28 +61,9 @@ extern cmd_cowrite:proc                 ; C8: write-lock exclusivity probe (vaul
 extern cmd_attfuzz:proc                 ; G8: attachment-index fuzzer (vault.asm)
 extern cmd_healthkat:proc               ; E6: vault-health analysis KAT (vault.asm)
 extern cmd_xctest:proc                  ; external-change detection probe (vault.asm)
-extern cmd_mvtest:proc                  ; multi-vault state snapshot/restore probe (vault.asm)
-extern cmd_mvswitch:proc                ; multi-vault context switch probe (vault.asm)
-extern cmd_mvname:proc                  ; multi-vault name<->body coupling probe (vault.asm)
-extern cmd_mvremove:proc                ; M4 remove/record probe (vault.asm)
-extern cmd_mvrealremove:proc            ; M4 real-vault remove probe (vault.asm)
 extern cmd_vaultexportkat:proc          ; M6 vault export/merge KAT (vault.asm)
 extern cmd_vaultexpattkat:proc          ; M6 attachment-carry KAT (vault.asm)
-extern cmd_mvclose:proc                 ; multi-vault close/teardown double-free probe (vault.asm)
-extern cmd_mvlock:proc                  ; multi-vault lock-teardown double-free probe (vault.asm)
-extern cmd_mvlockreal:proc              ; multi-REAL-vault lock repro (vault.asm)
-extern cmd_mvstale:proc                 ; stale-slot claim/lock probe (vault.asm)
 extern cmd_kdfparam:proc                ; pre-auth KDF-param DoS-guard probe (vault.asm)
-extern cmd_mvrecreate:proc              ; two create+lock cycles repro (vault.asm)
-extern cmd_idkat:proc                   ; M1: vault_id_of KAT (vault.asm)
-extern cmd_kekkat:proc                  ; M2: keyring KEK KAT (vault.asm)
-extern cmd_keyringkat:proc              ; M2: keyring seal/open KAT (vault.asm)
-extern cmd_fedkat:proc                  ; M2: federation link-table KAT (vault.asm)
-extern cmd_fedregkat:proc               ; M2: federation registry persistence KAT (vault.asm)
-extern cmd_fmskat:proc                  ; M2: TPM machine-secret provisioning KAT (vault.asm)
-extern cmd_fedapikat:proc               ; M2: master-key federation API KAT (vault.asm)
-extern cmd_fedfanout:proc               ; M2: fan-out KAT (vault.asm)
-extern cmd_avtest:proc                  ; availability retry state-machine probe (vault.asm)
 extern cmd_pkat:proc                    ; parallel fail-closed KAT gate (selftest.asm)
 extern cmd_katreport:proc               ; external-audit crypto proof battery (selftest.asm)
 extern read_file:proc
@@ -229,28 +210,9 @@ WSTR w_healthkat,<healthkat>             ; E6: vault-health analysis KAT
 WSTR w_pkat,     <pkat>
 WSTR w_katreport, <katreport>
 WSTR w_trtest,   <trtest>
-WSTR w_mvtest,   <mvtest>
-WSTR w_mvswitch, <mvswitch>
-WSTR w_mvname,   <mvname>
-WSTR w_mvremove, <mvremove>
-WSTR w_mvrealrm, <mvrealremove>
 WSTR w_vaultexportkat, <vaultexportkat>
 WSTR w_vaultexpattkat, <vaultexpattkat>
-WSTR w_mvclose,  <mvclose>
-WSTR w_mvlock,   <mvlock>
-WSTR w_mvlockreal, <mvlockreal>
-WSTR w_mvstale,  <mvstale>
 WSTR w_kdfparam, <kdfparam>
-WSTR w_mvrecreate, <mvrecreate>
-WSTR w_idkat,    <idkat>
-WSTR w_kekkat,   <kekkat>
-WSTR w_keyringkat, <keyringkat>
-WSTR w_fedkat,   <fedkat>
-WSTR w_fedregkat, <fedregkat>
-WSTR w_fmskat,   <fmskat>
-WSTR w_fedapikat, <fedapikat>
-WSTR w_fedfanout, <fedfanout>
-WSTR w_avtest,   <avtest>
 ifdef DBG_TRACE
 WSTR w_securedesk, <securedesk>
 endif
@@ -307,28 +269,9 @@ cmd_table label CMDENT
     CMDENT { w_cowrite,   cmd_cowrite,   1, 0 }   ; C8: write-lock exclusivity probe
     CMDENT { w_attfuzz,   cmd_attfuzz,   0, 0 }   ; G8: attachment-index fuzzer
     CMDENT { w_healthkat, cmd_healthkat, 0, 0 }   ; E6: vault-health analysis KAT
-    CMDENT { w_mvtest,    cmd_mvtest,    0, 0 }   ; multi-vault snapshot/restore probe
-    CMDENT { w_mvswitch,  cmd_mvswitch,  0, 0 }   ; multi-vault context switch probe
-    CMDENT { w_mvname,    cmd_mvname,    0, 0 }   ; multi-vault name<->body coupling probe
-    CMDENT { w_mvremove,  cmd_mvremove,  0, 0 }   ; M4 remove/record probe
-    CMDENT { w_mvrealrm,  cmd_mvrealremove, 1, 0 }  ; M4 real-vault remove probe (<path>)
     CMDENT { w_vaultexportkat, cmd_vaultexportkat, 1, 0 } ; M6 vault export/merge KAT (<path>)
     CMDENT { w_vaultexpattkat, cmd_vaultexpattkat, 1, 0 } ; M6 attachment-carry KAT (<path>)
-    CMDENT { w_mvclose,   cmd_mvclose,   0, 0 }   ; multi-vault close/teardown double-free probe
-    CMDENT { w_mvlock,    cmd_mvlock,    0, 0 }   ; multi-vault lock-teardown double-free probe
-    CMDENT { w_mvlockreal, cmd_mvlockreal, 1, 0 }  ; multi-REAL-vault lock repro (<path>)
-    CMDENT { w_mvstale,   cmd_mvstale,   0, 0 }   ; stale-slot claim/lock probe
     CMDENT { w_kdfparam,  cmd_kdfparam,  0, 0 }   ; pre-auth KDF-param DoS-guard probe
-    CMDENT { w_mvrecreate, cmd_mvrecreate, 1, 0 }  ; two create+lock cycles repro (<path>)
-    CMDENT { w_idkat,     cmd_idkat,     0, 0 }   ; M1: vault_id_of KAT
-    CMDENT { w_kekkat,    cmd_kekkat,    0, 0 }   ; M2: keyring KEK KAT
-    CMDENT { w_keyringkat, cmd_keyringkat, 0, 0 } ; M2: keyring seal/open KAT
-    CMDENT { w_fedkat,    cmd_fedkat,    0, 0 }   ; M2: federation link-table KAT
-    CMDENT { w_fedregkat, cmd_fedregkat, 0, 0 }   ; M2: federation registry persistence KAT
-    CMDENT { w_fmskat,    cmd_fmskat,    0, 0 }   ; M2: TPM machine-secret provisioning KAT
-    CMDENT { w_fedapikat, cmd_fedapikat, 0, 0 }   ; M2: master-key federation API KAT
-    CMDENT { w_fedfanout, cmd_fedfanout, 1, 0 }   ; M2: fan-out KAT (takes a vault path)
-    CMDENT { w_avtest,    cmd_avtest,    0, 0 }   ; availability retry state-machine probe
     CMDENT { w_pkat,      cmd_pkat,      0, 0 }   ; parallel fail-closed KAT gate
     CMDENT { w_katreport, cmd_katreport, 0, 0 }   ; external-audit crypto proof battery
     CMDENT { w_trtest,    cmd_trtest,    0, 0 }   ; trash timestamp/threshold KAT

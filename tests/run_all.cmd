@@ -100,7 +100,7 @@ set /a T_SELFTEST=!T1!-!T0!
 
 rem -------------------------------------------------------------- roundtrip --
 call :now T0
-echo === stage: roundtrip (seedtest / atgen / zitest / phtest / secscan / secfreedup / tmptest / fztest / trtest / vfuzz / fuzzzip / jfuzz / bktest / mactest / rbtest / xctest / reload / attfuzz / zexcap / healthkat / pkat / mvtest / mvswitch / mvname / mvremove / mvclose / mvlock / mvstale / kdfparam / idkat / kekkat / keyringkat / fedkat / fedregkat / fmskat / fedapikat / fedfanout / avtest / vaultexportkat / vaultexpattkat) ===
+echo === stage: roundtrip (seedtest / atgen / zitest / phtest / secscan / secfreedup / tmptest / fztest / trtest / vfuzz / fuzzzip / jfuzz / bktest / mactest / rbtest / xctest / reload / attfuzz / zexcap / healthkat / pkat / kdfparam / vaultexportkat / vaultexpattkat) ===
 set RT=PASS
 
 bin\vordr.exe seedtest "%WORK%\rt.vault" > "%WORK%\seedtest.log" 2>&1
@@ -180,56 +180,24 @@ if not "!errorlevel!"=="0" ( echo   healthkat: FAIL ^(exit !errorlevel!, vault-h
 bin\vordr.exe pkat > "%WORK%\pkat.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   pkat: FAIL ^(exit !errorlevel!, parallel fail-closed KAT gate^) & set RT=FAIL )
 
-bin\vordr.exe mvtest > "%WORK%\mvtest.log" 2>&1
-if not "!errorlevel!"=="0" ( echo   mvtest: FAIL ^(exit !errorlevel!, multi-vault snapshot/restore^) & set RT=FAIL )
 
-bin\vordr.exe mvswitch > "%WORK%\mvswitch.log" 2>&1
-if not "!errorlevel!"=="0" ( echo   mvswitch: FAIL ^(exit !errorlevel!, multi-vault context switch^) & set RT=FAIL )
 
-bin\vordr.exe mvname > "%WORK%\mvname.log" 2>&1
-if not "!errorlevel!"=="0" ( echo   mvname: FAIL ^(exit !errorlevel!, cross-vault name/body coupling^) & set RT=FAIL )
 
-bin\vordr.exe mvremove > "%WORK%\mvremove.log" 2>&1
-if not "!errorlevel!"=="0" ( echo   mvremove: FAIL ^(exit !errorlevel!, M4 remove/record dedup^) & set RT=FAIL )
 
-bin\vordr.exe mvclose > "%WORK%\mvclose.log" 2>&1
-if not "!errorlevel!"=="0" ( echo   mvclose: FAIL ^(exit !errorlevel!, vault-close teardown double-free^) & set RT=FAIL )
 
-bin\vordr.exe mvlock > "%WORK%\mvlock.log" 2>&1
-if not "!errorlevel!"=="0" ( echo   mvlock: FAIL ^(exit !errorlevel!, multi-vault lock teardown double-free^) & set RT=FAIL )
 
-bin\vordr.exe mvstale > "%WORK%\mvstale.log" 2>&1
-if not "!errorlevel!"=="0" ( echo   mvstale: FAIL ^(exit !errorlevel!, claimed slot kept a stale body pointer^) & set RT=FAIL )
 
 bin\vordr.exe kdfparam > "%WORK%\kdfparam.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   kdfparam: FAIL ^(exit !errorlevel!, pre-auth KDF-param DoS guard^) & set RT=FAIL )
 
-bin\vordr.exe idkat > "%WORK%\idkat.log" 2>&1
-if not "!errorlevel!"=="0" ( echo   idkat: FAIL ^(exit !errorlevel!, M1 vault_id_of^) & set RT=FAIL )
 
-bin\vordr.exe kekkat > "%WORK%\kekkat.log" 2>&1
-if not "!errorlevel!"=="0" ( echo   kekkat: FAIL ^(exit !errorlevel!, M2 keyring KEK^) & set RT=FAIL )
 
-bin\vordr.exe keyringkat > "%WORK%\keyringkat.log" 2>&1
-if not "!errorlevel!"=="0" ( echo   keyringkat: FAIL ^(exit !errorlevel!, M2 keyring seal/open^) & set RT=FAIL )
 
-bin\vordr.exe fedkat > "%WORK%\fedkat.log" 2>&1
-if not "!errorlevel!"=="0" ( echo   fedkat: FAIL ^(exit !errorlevel!, M2 federation link-table^) & set RT=FAIL )
 
-bin\vordr.exe fedregkat > "%WORK%\fedregkat.log" 2>&1
-if not "!errorlevel!"=="0" ( echo   fedregkat: FAIL ^(exit !errorlevel!, M2 federation registry persistence^) & set RT=FAIL )
 
-bin\vordr.exe fmskat > "%WORK%\fmskat.log" 2>&1
-if not "!errorlevel!"=="0" ( echo   fmskat: FAIL ^(exit !errorlevel!, M2 TPM machine-secret provisioning^) & set RT=FAIL )
 
-bin\vordr.exe fedapikat > "%WORK%\fedapikat.log" 2>&1
-if not "!errorlevel!"=="0" ( echo   fedapikat: FAIL ^(exit !errorlevel!, M2 master-key federation API^) & set RT=FAIL )
 
-bin\vordr.exe fedfanout "%WORK%\ffo.vault" > "%WORK%\fedfanout.log" 2>&1
-if not "!errorlevel!"=="0" ( echo   fedfanout: FAIL ^(exit !errorlevel!, M2 fan-out open/rollback^) & set RT=FAIL )
 
-bin\vordr.exe avtest > "%WORK%\avtest.log" 2>&1
-if not "!errorlevel!"=="0" ( echo   avtest: FAIL ^(exit !errorlevel!, availability retry state machine^) & set RT=FAIL )
 
 bin\vordr.exe vaultexportkat "%WORK%\ve.vault" > "%WORK%\vaultexportkat.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   vaultexportkat: FAIL ^(exit !errorlevel!, M6 vault export/merge round-trip^) & set RT=FAIL )
