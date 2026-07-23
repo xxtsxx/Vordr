@@ -1745,6 +1745,28 @@ vbv_field:
     add     eax, 2
     cmp     rax, r8                             ; 2 + labellen must fit inside the field
     ja      vbv_bad
+    ; attachment fields (VF_IMAGE/VF_FILE) must carry a full AttachRef - downstream
+    ; (attach_build/emit/open) dereferences [value + ARF_PTLEN]; reject a crafted body
+    ; whose attachment value is shorter than ARF_SIZE (68).
+    mov     r10, qword ptr [rbp-24]
+    mov     rcx, qword ptr [rbp-40]
+    movzx   r9d, word ptr [r10+rcx]             ; raw type
+    mov     eax, r9d
+    and     eax, VF_KINDMASK                    ; base kind
+    cmp     eax, VF_IMAGE
+    je      vbv_atref
+    cmp     eax, VF_FILE
+    jne     vbv_fadv
+vbv_atref:
+    mov     r11, r8                             ; value length = field len minus the
+    test    r9d, VF_LABELED                     ;   {u16 labellen, label} prefix if labelled
+    jz      vbv_atlen
+    movzx   eax, word ptr [r10+rcx+6]
+    add     eax, 2
+    sub     r11, rax
+vbv_atlen:
+    cmp     r11, ARF_SIZE
+    jb      vbv_bad
 vbv_fadv:
     mov     rcx, qword ptr [rbp-40]
     add     rcx, 6
@@ -4923,6 +4945,9 @@ attach_emit_one proc frame
     imul    eax, eax, 32
     lea     r10, [g_attidx]
     add     r10, rax
+    mov     rax, qword ptr [r10+24]             ; on-disk ctlen must equal the body ref's ptlen
+    cmp     rax, qword ptr [rbp-40]             ;   (attach_open enforces the same); otherwise
+    jne     aeo_badlen                          ;   att_cpy(ptlen+16) would over-read g_filebuf
     mov     rdx, qword ptr [r10+16]             ; src ct
     mov     rcx, qword ptr [rbp-32]
     add     rcx, ATT_ENThDR                     ; dst = cur+24
@@ -4930,6 +4955,8 @@ attach_emit_one proc frame
     add     r8, 16                              ; ct + tag
     call    att_cpy
     jmp     aeo_done
+aeo_badlen:
+    FASTFAIL FF_BOUNDS                          ; crafted body: ctlen/ptlen mismatch, refuse
 aeo_new:
     imul    eax, eax, 32
     lea     r10, [g_newatt]

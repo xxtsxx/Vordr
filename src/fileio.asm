@@ -129,10 +129,11 @@ rf_ok:
     mov     r10, qword ptr [rbp-56]
     mov     qword ptr [rax], r10                 ; *outbuf
     mov     rax, qword ptr [rbp-32]
-    mov     r10, qword ptr [rbp-48]
-    mov     qword ptr [rax], r10                 ; *outsize
-    xor     eax, eax
-    jmp     rf_done
+    mov     r10, qword ptr [rbp-64]              ; cursor - base = bytes ACTUALLY read
+    sub     r10, qword ptr [rbp-56]              ;   (a file shrunk mid-read reports the
+    mov     qword ptr [rax], r10                 ;   real count, not the pre-read filesize
+    xor     eax, eax                             ;   with a zero-padded tail; the full-file
+    jmp     rf_done                              ;   MAC still rejects such a truncated image)
 
 rf_io_freebuf:
     mov     rcx, qword ptr [rbp-56]
