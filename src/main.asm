@@ -35,6 +35,8 @@ extern hardening_init:proc
 extern sec_lock_statics:proc
 extern iat_lockdown:proc
 extern secure_zero:proc
+extern secmem_panic_wipe:proc           ; secmem.asm: zero every live secret buffer
+externdef g_sstk_index:qword            ; hardening.asm: software shadow-stack depth
 extern run_selftest:proc
 extern log_result:proc
 externdef g_readonly:dword              ; E9: read-only launch flag (owned by gui.asm)
@@ -352,6 +354,14 @@ ff_emit:
     or      eax, 0FADE0000h
     WINCALL ExitProcess, eax
 endif
+    ; Wipe key material before the non-catchable __fastfail.  int 29h bypasses the
+    ; vectored handler, so crash_veh -> crash_contain (which wipes on an ordinary AV)
+    ; never runs here - yet this path fires on a DETECTED memory-corruption attack,
+    ; exactly when secrets are most worth exfiltrating via a crash/hibernation dump.
+    ; Reset the shadow-stack depth first so secmem_panic_wipe's framed prolog can push
+    ; even when THIS trap is FF_SHADOW_STACK (a full shadow stack); we are terminating.
+    mov     qword ptr [g_sstk_index], 0
+    call    secmem_panic_wipe
     int     29h                         ; release: real fast-fail
 ff_trap endp
 
