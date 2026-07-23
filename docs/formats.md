@@ -142,9 +142,18 @@ key material is `secure_zero`'d. But against a **fully compromised kernel** (or 
 DMA-capable attacker), user-mode defenses cannot be absolute. We state this
 plainly rather than overclaiming.
 
+### Concurrent access (shared network drive)
+Multiple users may have the same vault open. Vordr opens the file read-only with
+full share (`GENERIC_READ` + `FILE_SHARE_READ|WRITE|DELETE`, handle closed after
+loading into memory) and only takes a **brief exclusive write lock** — an advisory
+`<vault>.lock` (`CREATE_NEW` + `FILE_FLAG_DELETE_ON_CLOSE`) held just around a
+save, then released. A save first re-checks `vault_ext_changed` under the lock and
+**refuses to overwrite** a vault another writer changed since we loaded it
+(reload-safe: the GUI reloads via `vault_reload` — re-decrypt with the existing
+key, no re-KDF — rather than clobber). A held lock reports "another user is
+saving"; the idle poll silently refreshes a clean vault when it changes on disk;
+a read-only vault file opens in read-only mode. A crashed lock holder's lock
+auto-vanishes (delete-on-close) and an orphan is reclaimed on next save.
+
 ### Not yet addressed
-- No multi-process / cross-host file locking (single-writer assumption; a
-  best-effort external-change tripwire — `vault_ext_changed`, a size + header
-  hash snapshot taken at load/save — warns before overwriting a file that
-  changed under us).
 - No external security review.

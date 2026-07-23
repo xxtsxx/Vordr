@@ -35,27 +35,39 @@ extern hardening_init:proc
 extern sec_lock_statics:proc
 extern iat_lockdown:proc
 extern secure_zero:proc
+extern secmem_panic_wipe:proc           ; secmem.asm: zero every live secret buffer
+externdef g_sstk_index:qword            ; hardening.asm: software shadow-stack depth
 extern run_selftest:proc
 extern log_result:proc
+externdef g_readonly:dword              ; E9: read-only launch flag (owned by gui.asm)
 extern do_bench:proc                    ; benchmark (bench.asm)
 extern gui_phtest:proc                  ; pw-history capture probe (gui.asm)
 extern gui_tmptest:proc                 ; secure temp-file lifecycle probe (gui.asm)
 extern fuzzy_score:proc                 ; fuzzy-search scoring (gui.asm)
 extern gui_trtest:proc                  ; trash timestamp/threshold probe (gui.asm)
 extern cmd_secscan:proc                 ; secret-wipe page-scan probe (secmem.asm)
+extern cmd_lktest:proc                  ; C3: VirtualLock failure-detection probe (secmem)
+extern cmd_secfreedup:proc              ; secmem_free double-free-safety probe (secmem.asm)
 ifdef DBG_TRACE
 extern cmd_securedesk:proc              ; secure-desktop spike (gui.asm)
 endif
 extern cmd_vfuzz:proc                   ; vault record-parser fuzzer (vault.asm)
 extern cmd_zfuzz:proc                   ; zip-import parser fuzzer (zipimport.asm)
+extern cmd_jfuzz:proc                   ; decrypted-json parser fuzzer (zipimport.asm)
+extern cmd_zexcap:proc                  ; zip-export central-dir cap guard probe (zipexport.asm)
 extern cmd_bktest:proc                  ; atomic-save + backup rotation probe (vault.asm)
 extern cmd_mactest:proc                 ; full-file MAC tamper-detection probe (vault.asm)
 extern cmd_rbtest:proc                  ; anti-rollback detection probe (vault.asm)
+extern cmd_reload:proc                  ; C8: vault_reload refresh probe (vault.asm)
+extern cmd_cowrite:proc                 ; C8: write-lock exclusivity probe (vault.asm)
+extern cmd_attfuzz:proc                 ; G8: attachment-index fuzzer (vault.asm)
+extern cmd_healthkat:proc               ; E6: vault-health analysis KAT (vault.asm)
 extern cmd_xctest:proc                  ; external-change detection probe (vault.asm)
-extern cmd_mvtest:proc                  ; multi-vault state snapshot/restore probe (vault.asm)
-extern cmd_mvswitch:proc                ; multi-vault context switch probe (vault.asm)
-extern cmd_avtest:proc                  ; availability retry state-machine probe (vault.asm)
+extern cmd_vaultexportkat:proc          ; M6 vault export/merge KAT (vault.asm)
+extern cmd_vaultexpattkat:proc          ; M6 attachment-carry KAT (vault.asm)
+extern cmd_kdfparam:proc                ; pre-auth KDF-param DoS-guard probe (vault.asm)
 extern cmd_pkat:proc                    ; parallel fail-closed KAT gate (selftest.asm)
+extern cmd_katreport:proc               ; external-audit crypto proof battery (selftest.asm)
 extern read_file:proc
 ifdef DBG_TRACE
 extern cmd_redteam:proc                 ; fault-injection self-test (redteam.asm)
@@ -65,7 +77,10 @@ endif
 
 extern con_init:proc
 extern print_a:proc
+extern print_u64:proc                   ; console.asm: rcx = u64 -> decimal stdout
+extern rng_fill:proc                    ; random.asm: rcx=buf, edx=len -> eax=1 ok
 extern pwgen_ex:proc                    ; styled password generator (pwgen.asm)
+externdef g_pwgen_outcap:dword          ; E16: one-shot pwgen output capacity
 extern do_seed:proc                     ; bulk test-vault seeder (vault.asm)
 extern print_err:proc
 extern vault_unlock:proc
@@ -127,6 +142,9 @@ g_gen_buf       db 160 dup (?)           ; genpw: sample output buffer
 g_cfg_pass      db MAX_PASSWORD_BYTES+1 dup (?)
 g_positionals   dq MAX_ARGS dup (?)  ; -> UTF-16 positional argument strings
 g_poscount      dq ?                 ; number of positionals
+public g_fuzz_seed, g_fuzz_seed_set
+g_fuzz_seed     dd ?                 ; G7: 32-bit fuzzer seed (from --seed or RNG)
+g_fuzz_seed_set dd ?                 ; G7: 1 = --seed given (else random each run)
 
 ; -----------------------------------------------------------------------------
 .const
@@ -146,7 +164,10 @@ msg_usage label byte
     db "  Every launch runs the self-test gate first and fails closed on mismatch.",13,10
 msg_usage_len equ $ - msg_usage
 CSTR msg_nocpu,    "error: CPU lacks required features (AES-NI, PCLMULQDQ, SSE4.1)",13,10
+CSTR fs_seedlabel, "fuzz seed: "       ; G7: precedes the decimal seed on stdout
+fs_nl db 13,10
 CSTR msg_badnum,   "error: numeric argument out of range",13,10
+CSTR msg_testverb, "error: that diagnostic takes a file path and is disabled in release builds (test/PROBE_IO builds only)",13,10
 CSTR msg_st_ok,    "all self-tests passed",13,10
 CSTR msg_st_fail,  "SELFTEST FAILURE",13,10
 gl_rand   db "  random     : "
@@ -172,19 +193,29 @@ WSTR w_atgen,    <atgen>
 WSTR w_zitest,   <zitest>
 WSTR w_phtest,   <phtest>
 WSTR w_secscan,  <secscan>
+WSTR w_lktest,   <lktest>
+WSTR w_secfreedup, <secfreedup>
 WSTR w_tmptest,  <tmptest>
 WSTR w_fztest,   <fztest>
 WSTR w_vfuzz,    <vfuzz>
 WSTR w_fuzzzip,  <fuzzzip>
+WSTR w_jfuzz,    <jfuzz>
+WSTR w_zexcap,   <zexcap>
 WSTR w_bktest,   <bktest>
 WSTR w_mactest,  <mactest>
 WSTR w_rbtest,   <rbtest>
 WSTR w_xctest,   <xctest>
+WSTR w_ro,       <--ro>                  ; E9: GUI read-only launch flag (not a verb)
+WSTR w_reload,   <reload>                ; C8: vault_reload refresh probe
+WSTR w_cowrite,  <cowrite>               ; C8: write-lock exclusivity probe
+WSTR w_attfuzz,  <attfuzz>               ; G8: attachment-index fuzzer
+WSTR w_healthkat,<healthkat>             ; E6: vault-health analysis KAT
 WSTR w_pkat,     <pkat>
+WSTR w_katreport, <katreport>
 WSTR w_trtest,   <trtest>
-WSTR w_mvtest,   <mvtest>
-WSTR w_mvswitch, <mvswitch>
-WSTR w_avtest,   <avtest>
+WSTR w_vaultexportkat, <vaultexportkat>
+WSTR w_vaultexpattkat, <vaultexpattkat>
+WSTR w_kdfparam, <kdfparam>
 ifdef DBG_TRACE
 WSTR w_securedesk, <securedesk>
 endif
@@ -197,6 +228,7 @@ WSTR w_crashme,  <crashme>
 endif
 WSTR w_opt_m,    <-m>
 WSTR w_opt_t,    <-t>
+WSTR w_opt_seed,       <--seed>       ; G7: reproducible fuzzer seed (decimal)
 WSTR w_opt_log,        <--log>
 WSTR w_opt_logfile,    <--log-file>
 WSTR w_lvl_none,       <none>
@@ -224,18 +256,27 @@ cmd_table label CMDENT
     CMDENT { w_zitest,    cmd_zitest,    2, 0 }   ; headless encrypted-zip import probe
     CMDENT { w_phtest,    cmd_phtest,    0, 0 }   ; headless pw-history capture probe
     CMDENT { w_secscan,   cmd_secscan,   0, 0 }   ; secret-wipe page-scan probe
+    CMDENT { w_lktest,    cmd_lktest,    0, 0 }   ; C3: VirtualLock failure-detection probe
+    CMDENT { w_secfreedup, cmd_secfreedup, 0, 0 } ; secmem_free double-free-safety probe
     CMDENT { w_tmptest,   cmd_tmptest,   0, 0 }   ; secure temp-file lifecycle probe
     CMDENT { w_fztest,    cmd_fztest,    0, 0 }   ; fuzzy-search scoring KAT
     CMDENT { w_vfuzz,     cmd_vfuzz,     0, 0 }   ; vault record-parser structural fuzzer
     CMDENT { w_fuzzzip,   cmd_zfuzz,     0, 0 }   ; zip-import parser structural fuzzer
+    CMDENT { w_jfuzz,     cmd_jfuzz,     0, 0 }   ; decrypted-json parser structural fuzzer
+    CMDENT { w_zexcap,    cmd_zexcap,    0, 0 }   ; zip-export central-dir cap guard
     CMDENT { w_bktest,    cmd_bktest,    1, 0 }   ; atomic-save + backup-rotation probe
     CMDENT { w_mactest,   cmd_mactest,   1, 0 }   ; full-file MAC tamper-detection probe
     CMDENT { w_rbtest,    cmd_rbtest,    1, 0 }   ; anti-rollback detection probe
     CMDENT { w_xctest,    cmd_xctest,    1, 0 }   ; external-change detection probe
-    CMDENT { w_mvtest,    cmd_mvtest,    0, 0 }   ; multi-vault snapshot/restore probe
-    CMDENT { w_mvswitch,  cmd_mvswitch,  0, 0 }   ; multi-vault context switch probe
-    CMDENT { w_avtest,    cmd_avtest,    0, 0 }   ; availability retry state-machine probe
+    CMDENT { w_reload,    cmd_reload,    1, 0 }   ; C8: vault_reload refresh probe
+    CMDENT { w_cowrite,   cmd_cowrite,   1, 0 }   ; C8: write-lock exclusivity probe
+    CMDENT { w_attfuzz,   cmd_attfuzz,   0, 0 }   ; G8: attachment-index fuzzer
+    CMDENT { w_healthkat, cmd_healthkat, 0, 0 }   ; E6: vault-health analysis KAT
+    CMDENT { w_vaultexportkat, cmd_vaultexportkat, 1, 0 } ; M6 vault export/merge KAT (<path>)
+    CMDENT { w_vaultexpattkat, cmd_vaultexpattkat, 1, 0 } ; M6 attachment-carry KAT (<path>)
+    CMDENT { w_kdfparam,  cmd_kdfparam,  0, 0 }   ; pre-auth KDF-param DoS-guard probe
     CMDENT { w_pkat,      cmd_pkat,      0, 0 }   ; parallel fail-closed KAT gate
+    CMDENT { w_katreport, cmd_katreport, 0, 0 }   ; external-audit crypto proof battery
     CMDENT { w_trtest,    cmd_trtest,    0, 0 }   ; trash timestamp/threshold KAT
 ifdef DBG_TRACE
     CMDENT { w_securedesk, cmd_securedesk, 0, 0 } ; private-desktop spike dialog (dbg)
@@ -314,6 +355,14 @@ ff_emit:
     or      eax, 0FADE0000h
     WINCALL ExitProcess, eax
 endif
+    ; Wipe key material before the non-catchable __fastfail.  int 29h bypasses the
+    ; vectored handler, so crash_veh -> crash_contain (which wipes on an ordinary AV)
+    ; never runs here - yet this path fires on a DETECTED memory-corruption attack,
+    ; exactly when secrets are most worth exfiltrating via a crash/hibernation dump.
+    ; Reset the shadow-stack depth first so secmem_panic_wipe's framed prolog can push
+    ; even when THIS trap is FF_SHADOW_STACK (a full shadow stack); we are terminating.
+    mov     qword ptr [g_sstk_index], 0
+    call    secmem_panic_wipe
     int     29h                         ; release: real fast-fail
 ff_trap endp
 
@@ -484,6 +533,43 @@ wu_ok:
     mov     edx, 1
     ret
 wstr_to_u32 endp
+
+; =============================================================================
+; fuzz_seed() -> rax = nonzero 64-bit xorshift seed for the dbg fuzzers.  (G7)
+;   With --seed N it uses N; otherwise it draws 4 random bytes so each run
+;   explores fresh inputs.  Either way it logs "fuzz seed: N" to stdout, so a
+;   nightly crash reproduces deterministically with `--seed N`.  The 32-bit
+;   value is expanded to a nonzero 64-bit state via a splitmix multiply.
+; =============================================================================
+public fuzz_seed
+fuzz_seed proc frame
+    FRAME_PROLOG 48
+    cmp     dword ptr [g_fuzz_seed_set], 0
+    jne     fs_log
+    lea     rcx, [rbp-16]               ; 4-byte scratch (clear of shadow+canary)
+    mov     edx, 4
+    call    rng_fill
+    mov     eax, dword ptr [rbp-16]
+    test    eax, eax
+    jnz     @F
+    mov     eax, 1                      ; never seed the RNG with zero
+@@: mov     dword ptr [g_fuzz_seed], eax
+fs_log:
+    lea     rcx, [fs_seedlabel]
+    mov     edx, fs_seedlabel_len
+    call    print_a
+    mov     ecx, dword ptr [g_fuzz_seed]    ; zero-extended
+    call    print_u64
+    lea     rcx, [fs_nl]
+    mov     edx, 2
+    call    print_a
+    mov     eax, dword ptr [g_fuzz_seed]    ; zero-extended into rax
+    mov     rcx, 9E3779B97F4A7C15h
+    imul    rax, rcx
+    or      rax, 1                          ; guarantee nonzero xorshift state
+    FRAME_EPILOG
+    ret
+fuzz_seed endp
 
 ; =============================================================================
 ; parse_cmdline - tokenize GetCommandLineW into g_argv/g_argc using the
@@ -711,6 +797,7 @@ co_loop:
     jae     co_check
     OPTMATCH w_opt_m,       co_take_m
     OPTMATCH w_opt_t,       co_take_t
+    OPTMATCH w_opt_seed,    co_take_seed
     OPTMATCH w_opt_log,     co_take_log
     OPTMATCH w_opt_logfile, co_take_logfile
     ; any other token is a positional (only the dbg `redteam` case name uses one)
@@ -752,6 +839,17 @@ co_take_t:
     cmp     eax, ARGON2_MAX_T
     ja      co_badnum
     mov     dword ptr [g_cfg_t], eax
+    jmp     co_loop
+co_take_seed:
+    call    co_next_arg
+    test    rax, rax
+    jz      co_usage
+    mov     rcx, rax
+    call    wstr_to_u32
+    test    edx, edx
+    jz      co_badnum
+    mov     dword ptr [g_fuzz_seed], eax
+    mov     dword ptr [g_fuzz_seed_set], 1
     jmp     co_loop
 co_take_log:
     call    co_next_arg
@@ -927,6 +1025,7 @@ cmd_genpw proc frame
     mov     edx, 20
     mov     r8d, PWS_RANDOM
     mov     r9d, 15 or PWO_NOAMBIG
+    mov     dword ptr [g_pwgen_outcap], 160     ; E16: g_gen_buf capacity
     call    pwgen_ex
     call    gp_println
     WINCALL print_a, addr gl_phrase, gl_phrase_len
@@ -934,6 +1033,7 @@ cmd_genpw proc frame
     mov     edx, 5
     mov     r8d, PWS_PASSPHRASE
     mov     r9d, PWO_CAP or PWO_DASH or PWO_DIGIT
+    mov     dword ptr [g_pwgen_outcap], 160     ; E16: g_gen_buf capacity
     call    pwgen_ex
     call    gp_println
     WINCALL print_a, addr gl_pron, gl_pron_len
@@ -941,6 +1041,7 @@ cmd_genpw proc frame
     mov     edx, 14
     mov     r8d, PWS_PRONOUNCE
     mov     r9d, PWO_CAP or PWO_DIGIT
+    mov     dword ptr [g_pwgen_outcap], 160     ; E16: g_gen_buf capacity
     call    pwgen_ex
     call    gp_println
     WINCALL print_a, addr gl_pin, gl_pin_len
@@ -948,6 +1049,7 @@ cmd_genpw proc frame
     mov     edx, 8
     mov     r8d, PWS_PIN
     xor     r9d, r9d
+    mov     dword ptr [g_pwgen_outcap], 160     ; E16: g_gen_buf capacity
     call    pwgen_ex
     call    gp_println
     WINCALL print_a, addr gl_hex, gl_hex_len
@@ -955,6 +1057,7 @@ cmd_genpw proc frame
     mov     edx, 24
     mov     r8d, PWS_HEX
     xor     r9d, r9d
+    mov     dword ptr [g_pwgen_outcap], 160     ; E16: g_gen_buf capacity
     call    pwgen_ex
     call    gp_println
     xor     eax, eax
@@ -1275,6 +1378,17 @@ icc_optck:
     ; not a known verb - but a leading '-' means an option (e.g. --help, -h):
     ; route those to the CLI too so terminal usage prints to the console.  A
     ; file path handed by Explorer/drag-drop is drive-absolute, never '-'.
+    ; Exception (E9): "--ro" is a GUI read-only launch flag, not a CLI verb - set
+    ; the flag and stay in GUI mode.
+    lea     r11, [g_argv]
+    mov     rcx, qword ptr [r11+8]      ; argv[1] ptr
+    lea     rdx, [w_ro]
+    call    wstr_eq
+    test    eax, eax
+    jz      icc_dash
+    mov     dword ptr [g_readonly], 1
+    jmp     icc_no                      ; --ro is not a CLI command -> GUI mode
+icc_dash:
     lea     r11, [g_argv]
     mov     r10, qword ptr [r11+8]      ; argv[1] ptr
     movzx   eax, word ptr [r10]         ; first UTF-16 unit
@@ -1327,6 +1441,18 @@ dp_found:
     call    collect_options
     cmp     eax, EXIT_OK
     jne     dp_done                     ; validation failed; eax = exit code
+ifndef PROBE_IO
+    ; The shipped CLI is diagnostics-only and takes NO file path.  Every verb that
+    ; accepts a positional (pos_args >= 1) is a test probe that creates/overwrites a
+    ; file at a caller-given path (seedtest/atgen/zitest/bktest/.../vaultexport*kat) -
+    ; a data-loss footgun if aimed at a real vault.  Refuse them here unless this is a
+    ; PROBE_IO (or dbg) test build; collect_options only stashed the path pointer, so
+    ; nothing on disk has been touched yet.  redteam (also positional) is DBG_TRACE-
+    ; only, and dbg implies PROBE_IO, so this guard is inert in every test build.
+    mov     r10, qword ptr [rbp-24]
+    cmp     dword ptr [r10].CMDENT.pos_args, 0
+    jne     dp_testonly
+endif
     mov     r10, qword ptr [rbp-24]
     mov     rax, qword ptr [r10].CMDENT.handler
     CALL_GUARDED rax                    ; DLPV-checked indirect call
@@ -1339,6 +1465,14 @@ dp_found:
     mov     eax, dword ptr [rbp-32]     ; restore exit code
     jmp     dp_done
 
+ifndef PROBE_IO
+dp_testonly:
+    lea     rcx, [msg_testverb]
+    mov     edx, msg_testverb_len
+    call    print_err
+    mov     eax, EXIT_USAGE
+    jmp     dp_done
+endif
 dp_usage:
     lea     rcx, [msg_usage]
     mov     edx, msg_usage_len

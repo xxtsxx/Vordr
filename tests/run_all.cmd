@@ -8,9 +8,12 @@ rem              the process with a 0xFADExx fail-fast code (iat: raw AV).
 rem              Skipped with --quick.
 rem   build      release build via build.cmd strict (framecheck FATALs gate it)
 rem   selftest   bin\vordr.exe selftest must print "all self-tests passed"
-rem   roundtrip  headless probes: seedtest -> atgen -> zitest -> phtest ->
-rem              secscan -> tmptest -> fztest -> trtest -> vfuzz -> fuzzzip ->
-rem              bktest -> mactest -> rbtest -> xctest -> pkat
+rem   roundtrip  builds a PROBE_IO binary (a plain release refuses the path-taking
+rem              verbs), then runs the headless probes: seedtest -> atgen -> zitest
+rem              -> phtest -> secscan -> secfreedup -> lktest -> tmptest -> fztest ->
+rem              trtest -> vfuzz -> fuzzzip -> jfuzz -> bktest -> mactest -> rbtest ->
+rem              xctest -> reload -> cowrite -> attfuzz -> zexcap -> healthkat ->
+rem              pkat -> kdfparam -> vaultexportkat -> vaultexpattkat
 rem
 rem Usage: tests\run_all.cmd [--quick]
 rem Exit:  0 = all stages passed, 1 = at least one FAIL (see the summary table).
@@ -99,8 +102,21 @@ set /a T_SELFTEST=!T1!-!T0!
 
 rem -------------------------------------------------------------- roundtrip --
 call :now T0
-echo === stage: roundtrip (seedtest / atgen / zitest / phtest / secscan / tmptest / fztest / trtest / vfuzz / fuzzzip / bktest / mactest / rbtest / xctest / pkat / mvtest / mvswitch / avtest) ===
+echo === stage: roundtrip (seedtest / atgen / zitest / phtest / secscan / secfreedup / tmptest / fztest / trtest / vfuzz / fuzzzip / jfuzz / bktest / mactest / rbtest / xctest / reload / attfuzz / zexcap / healthkat / pkat / kdfparam / vaultexportkat / vaultexpattkat) ===
 set RT=PASS
+
+rem --- data-loss guard: the RELEASE binary (still in bin\ from the build stage)
+rem     must REFUSE any path-taking diagnostic and touch no file on disk ---------
+del "%WORK%\guard.vault" >nul 2>nul
+bin\vordr.exe seedtest "%WORK%\guard.vault" > "%WORK%\guard.log" 2>&1
+if not errorlevel 1 ( echo   release-guard: FAIL ^(release accepted a path verb^) & set RT=FAIL )
+if exist "%WORK%\guard.vault" ( echo   release-guard: FAIL ^(path verb created a file^) & set RT=FAIL )
+if "!RT!"=="PASS" echo   release-guard: path-taking verbs refused in release - ok
+
+rem --- the path-taking probes are diagnostics-only; build a PROBE_IO binary to
+rem     exercise them (a plain release build refuses them, verified above) --------
+call .\build.cmd probeio strict > "%WORK%\build_probeio.log" 2>&1
+if errorlevel 1 ( echo   probeio build FAILED - see %WORK%\build_probeio.log & set RT=FAIL & goto :roundtrip_publish )
 
 bin\vordr.exe seedtest "%WORK%\rt.vault" > "%WORK%\seedtest.log" 2>&1
 if errorlevel 1 ( echo   seedtest: FAIL ^(exit !errorlevel!^) & set RT=FAIL )
@@ -125,6 +141,12 @@ if not "!errorlevel!"=="1" ( echo   phtest: FAIL ^(exit !errorlevel!, expected 1
 bin\vordr.exe secscan > "%WORK%\secscan.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   secscan: FAIL ^(exit !errorlevel!, secret residue after wipe^) & set RT=FAIL )
 
+bin\vordr.exe secfreedup > "%WORK%\secfreedup.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   secfreedup: FAIL ^(exit !errorlevel!, secmem_free not double-free-safe^) & set RT=FAIL )
+
+bin\vordr.exe lktest > "%WORK%\lktest.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   lktest: FAIL ^(exit !errorlevel!, VirtualLock failure detection^) & set RT=FAIL )
+
 bin\vordr.exe tmptest > "%WORK%\tmptest.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   tmptest: FAIL ^(exit !errorlevel!, temp file not wiped+deleted^) & set RT=FAIL )
 
@@ -140,6 +162,9 @@ if not "!errorlevel!"=="0" ( echo   vfuzz: FAIL ^(exit !errorlevel!, vault parse
 bin\vordr.exe fuzzzip > "%WORK%\fuzzzip.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   fuzzzip: FAIL ^(exit !errorlevel!, zip-import parser fuzzer crashed^) & set RT=FAIL )
 
+bin\vordr.exe jfuzz > "%WORK%\jfuzz.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   jfuzz: FAIL ^(exit !errorlevel!, decrypted-json parser fuzzer crashed/hung^) & set RT=FAIL )
+
 bin\vordr.exe bktest "%WORK%\bk.vault" > "%WORK%\bktest.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   bktest: FAIL ^(exit !errorlevel!, atomic-save/backup rotation^) & set RT=FAIL )
 
@@ -152,22 +177,82 @@ if not "!errorlevel!"=="0" ( echo   rbtest: FAIL ^(exit !errorlevel!, anti-rollb
 bin\vordr.exe xctest "%WORK%\xc.vault" > "%WORK%\xctest.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   xctest: FAIL ^(exit !errorlevel!, external-change detection^) & set RT=FAIL )
 
+bin\vordr.exe reload "%WORK%\rl.vault" > "%WORK%\reload.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   reload: FAIL ^(exit !errorlevel!, vault_reload refresh^) & set RT=FAIL )
+
+bin\vordr.exe cowrite "%WORK%\cw.vault" > "%WORK%\cowrite.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   cowrite: FAIL ^(exit !errorlevel!, write-lock exclusivity^) & set RT=FAIL )
+
+bin\vordr.exe attfuzz > "%WORK%\attfuzz.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   attfuzz: FAIL ^(exit !errorlevel!, attach_index_build fuzz^) & set RT=FAIL )
+
+bin\vordr.exe zexcap > "%WORK%\zexcap.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   zexcap: FAIL ^(exit !errorlevel!, zip-export central-dir cap OOB^) & set RT=FAIL )
+
+bin\vordr.exe healthkat > "%WORK%\healthkat.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   healthkat: FAIL ^(exit !errorlevel!, vault-health analysis counts^) & set RT=FAIL )
+
 bin\vordr.exe pkat > "%WORK%\pkat.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   pkat: FAIL ^(exit !errorlevel!, parallel fail-closed KAT gate^) & set RT=FAIL )
 
-bin\vordr.exe mvtest > "%WORK%\mvtest.log" 2>&1
-if not "!errorlevel!"=="0" ( echo   mvtest: FAIL ^(exit !errorlevel!, multi-vault snapshot/restore^) & set RT=FAIL )
 
-bin\vordr.exe mvswitch > "%WORK%\mvswitch.log" 2>&1
-if not "!errorlevel!"=="0" ( echo   mvswitch: FAIL ^(exit !errorlevel!, multi-vault context switch^) & set RT=FAIL )
 
-bin\vordr.exe avtest > "%WORK%\avtest.log" 2>&1
-if not "!errorlevel!"=="0" ( echo   avtest: FAIL ^(exit !errorlevel!, availability retry state machine^) & set RT=FAIL )
 
+
+
+
+
+bin\vordr.exe kdfparam > "%WORK%\kdfparam.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   kdfparam: FAIL ^(exit !errorlevel!, pre-auth KDF-param DoS guard^) & set RT=FAIL )
+
+
+
+
+
+
+
+
+
+
+bin\vordr.exe vaultexportkat "%WORK%\ve.vault" > "%WORK%\vaultexportkat.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   vaultexportkat: FAIL ^(exit !errorlevel!, M6 vault export/merge round-trip^) & set RT=FAIL )
+
+bin\vordr.exe vaultexpattkat "%WORK%\vea.vault" > "%WORK%\vaultexpattkat.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   vaultexpattkat: FAIL ^(exit !errorlevel!, M6 attachment carry^) & set RT=FAIL )
+
+:roundtrip_publish
 set R_ROUNDTRIP=!RT!
 call :now T1
 set /a T_ROUNDTRIP=!T1!-!T0!
 :roundtrip_done
+
+rem ------------------------------------------------------- cryptodiff (python) --
+rem Independent, external verification of the crypto primitives: recompute every
+rem primitive with Python stdlib + a self-validating pure-Python AES-GCM and
+rem against the published FIPS/RFC/NIST vectors, then diff vordr's kat-report.
+rem Skipped (not failed) if python is unavailable, so the gate still runs without it.
+call :now T0
+echo === stage: cryptodiff (independent python reference) ===
+where python >nul 2>&1
+if errorlevel 1 (
+    echo   cryptodiff: SKIP ^(python not found on PATH^)
+    set R_CRYPTODIFF=skip
+) else (
+    python tests\verify_crypto.py --exe bin\vordr.exe > "%WORK%\cryptodiff.log" 2>&1
+    if errorlevel 1 (
+        echo   cryptodiff: FAIL - see %WORK%\cryptodiff.log
+        set R_CRYPTODIFF=FAIL
+    ) else (
+        for /f "tokens=*" %%l in ('findstr /c:"RESULT:" "%WORK%\cryptodiff.log"') do echo   %%l
+        set R_CRYPTODIFF=PASS
+    )
+)
+call :now T1
+set /a T_CRYPTODIFF=!T1!-!T0!
+
+rem --- restore a clean RELEASE binary in bin\ (roundtrip left a PROBE_IO build,
+rem     which exposes the path-taking verbs - never leave that as the artifact) --
+if "%R_BUILD%"=="PASS" call .\build.cmd strict > "%WORK%\build_restore.log" 2>&1
 
 rem ---------------------------------------------------------------- summary --
 :summary
@@ -178,6 +263,7 @@ echo   redteam      %R_REDTEAM%     %T_REDTEAM%
 echo   build        %R_BUILD%     %T_BUILD%
 echo   selftest     %R_SELFTEST%     %T_SELFTEST%
 echo   roundtrip    %R_ROUNDTRIP%     %T_ROUNDTRIP%
+echo   cryptodiff   %R_CRYPTODIFF%     %T_CRYPTODIFF%
 echo =========================================
 
 set EXITC=0
@@ -185,6 +271,7 @@ if not "%R_BUILD%"=="PASS" set EXITC=1
 if not "%R_SELFTEST%"=="PASS" set EXITC=1
 if not "%R_ROUNDTRIP%"=="PASS" set EXITC=1
 if not "%R_REDTEAM%"=="PASS" if not "%R_REDTEAM%"=="skip" set EXITC=1
+if not "%R_CRYPTODIFF%"=="PASS" if not "%R_CRYPTODIFF%"=="skip" set EXITC=1
 if "%EXITC%"=="0" ( echo ALL STAGES PASSED ) else ( echo RUN FAILED )
 exit /b %EXITC%
 

@@ -110,6 +110,17 @@ log_putn endp
 ; log_puta(rcx = dst, rdx = src, r8 = len) -> rax = dst+len.  Byte copy.  Leaf.
 ; -----------------------------------------------------------------------------
 log_puta proc
+    ; Clamp to the end of g_logline (its only destination).  log_putw self-bounds,
+    ; but a long debug -in/-out path filling the line left these trailing separators
+    ; (sep_out/sep_close/sep_crlf) to run a few bytes past LINELEN into adjacent
+    ; statics.  Bounding here keeps the whole assembled line inside the buffer.
+    lea     rax, [g_logline + LINELEN]
+    sub     rax, rcx                    ; remaining bytes (signed)
+    jle     pa_done                     ; at/past the end -> write nothing
+    cmp     r8, rax
+    jbe     pa_have
+    mov     r8, rax                     ; clamp copy length to the space left
+pa_have:
     test    r8, r8
     jz      pa_done
 pa_l:

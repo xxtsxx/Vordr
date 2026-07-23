@@ -21,6 +21,7 @@ extern aes_ctr_xor:proc
 extern hmac_sha1:proc
 extern rng_fill:proc
 extern mem_alloc:proc
+extern print_a:proc
 extern mem_free:proc
 extern secure_zero:proc
 extern vault_count:proc
@@ -245,6 +246,19 @@ public ze_add_file
 ze_add_file proc frame
     FRAME_PROLOG 128                            ; keep locals (to rbp-80) above the
                                                 ; callee shadow region
+    ; CAPACITY GUARD (must be first - before any write): the central-directory
+    ; array g_ze_cd holds only ZE_MAXFILE records, but nothing else bounds g_ze_cn.
+    ; A vault with >= ZE_MAXFILE attachment fields would drive the record write at
+    ; [g_ze_cd + g_ze_cn*24] straight past the array into adjacent key-material
+    ; globals (g_ae_dk / g_ze_rk) - an OOB write of attacker-influenced bytes.
+    ; Fail the export closed instead; the caller aborts on g_xl_err.
+    cmp     dword ptr [g_ze_cn], ZE_MAXFILE
+    jb      zaf_room
+    mov     byte ptr [g_xl_err], 1
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+zaf_room:
     mov     qword ptr [rbp-24], rcx             ; name
     mov     dword ptr [rbp-32], edx             ; namelen
     mov     qword ptr [rbp-40], r8              ; data
@@ -367,6 +381,7 @@ zaf_ncpd:
     mov     rax, qword ptr [rbp-24]
     mov     qword ptr [r11+16], rax              ; nameptr
     inc     dword ptr [g_ze_cn]
+    xor     eax, eax                             ; ok
     FRAME_EPILOG
     ret
 ze_add_file endp
@@ -714,10 +729,34 @@ ze_att_zippath proc frame
     mov     r11, qword ptr [rbp-32]
     lea     rax, [r11+68]
     mov     qword ptr [rbp-72], rax
-    WINCALL WideCharToMultiByte, CP_UTF8_, 0, qword ptr [rbp-72], -1, addr g_zj_fn, 500, 0, 0
-    dec     eax                                  ; strip the terminating NUL
+    ; BOUNDED wide length.  Passing -1 (as before) made WideCharToMultiByte scan for
+    ; a terminating NUL that a crafted attachment value need not contain -> an OOB
+    ; read past the value buffer (bounded only by the 500-byte output cap).  Only
+    ; (value_len-68)/2 wide chars are actually present; find a wide NUL WITHIN that
+    ; region and cap the conversion count there.
+    ; -60/-64 sit ABOVE the 8-arg WINCALL arg-spill zone (deeper slots would be
+    ; clobbered by the WideCharToMultiByte call below - see framecheck).
+    mov     eax, dword ptr [rbp-40]
+    sub     eax, 68
+    shr     eax, 1                               ; navail = available wide chars
+    mov     dword ptr [rbp-60], eax
+    xor     r9d, r9d                             ; i
+azp_fnscan:
+    cmp     r9d, dword ptr [rbp-60]
+    jae     azp_fnlen
+    mov     r11, qword ptr [rbp-72]
+    movzx   eax, word ptr [r11+r9*2]
+    test    eax, eax
+    jz      azp_fnlen
+    inc     r9d
+    jmp     azp_fnscan
+azp_fnlen:
+    test    r9d, r9d
+    jz      azp_def                              ; empty filename -> default
+    mov     dword ptr [rbp-64], r9d              ; cch (stops at NUL, never past navail)
+    WINCALL WideCharToMultiByte, CP_UTF8_, 0, qword ptr [rbp-72], dword ptr [rbp-64], addr g_zj_fn, 500, 0, 0
     cmp     eax, 0
-    jg      azp_havefn
+    jg      azp_havefn                           ; eax = UTF-8 byte length (no NUL emitted)
 azp_def:
     lea     r10, [zj_defname]
     lea     r11, [g_zj_fn]
@@ -850,9 +889,9 @@ zea_enext:
     inc     dword ptr [rbp-44]
     jmp     zea_elp
 zea_fin:
-    xor     eax, eax
-    FRAME_EPILOG
-    ret
+    movzx   eax, byte ptr [g_xl_err]            ; abort the export if any ze_add_file hit the
+    FRAME_EPILOG                                 ; central-dir cap (or a buffer filled): do not
+    ret                                          ; emit a silently-truncated archive
 ze_add_attachments endp
 
 ; =============================================================================
@@ -890,6 +929,8 @@ ze_compose proc frame
     mov     r8, qword ptr [r10]
     mov     r9, qword ptr [r10+8]
     call    ze_add_file
+    test    eax, eax                            ; json is file #1; guard is defensive/uniform
+    jnz     comp_ziperr
     lea     r10, [g_json]                       ; wipe the plaintext json (every field value
     mov     rcx, qword ptr [r10]                ; of every exported entry) before freeing it
     mov     rdx, qword ptr [r10+16]
@@ -1056,5 +1097,54 @@ bpd_emit:
     FRAME_EPILOG
     ret
 buf_pu32dec endp
+
+; =============================================================================
+; cmd_zexcap - regression for the central-directory capacity guard.  g_ze_cd holds
+;   only ZE_MAXFILE 24-byte records; without a bound, a vault with >= ZE_MAXFILE
+;   attachment fields would drive ze_add_file's record write past the array into
+;   adjacent key-material globals (g_ae_dk / g_ze_rk) - an OOB write.  With the
+;   array marked full, ze_add_file must refuse (return error, flag g_xl_err, and
+;   NOT increment the count / write a record).  If the guard were absent, g_ze_cn
+;   would advance to ZE_MAXFILE+1 (a record written out of bounds) and this FAILS.
+; =============================================================================
+.data
+CSTR zxc_ok,  "zexcap: PASS (central-dir cap enforced; OOB write into key material refused)",13,10
+CSTR zxc_bad, "zexcap: FAIL (ze_add_file wrote a record past g_ze_cd[ZE_MAXFILE])",13,10
+zxc_name db "a"
+.code
+LANDING_PAD
+public cmd_zexcap
+cmd_zexcap proc frame
+    FRAME_PROLOG 32
+    call    ze_reset                            ; allocate the archive buffer, cn=0, err=0
+    test    eax, eax
+    jnz     zxc_fail
+    mov     dword ptr [g_ze_cn], ZE_MAXFILE     ; central-dir array full
+    mov     byte ptr [g_xl_err], 0
+    lea     rcx, [zxc_name]                     ; attempt one more file -> must be refused
+    mov     edx, 1
+    lea     r8, [zxc_name]
+    mov     r9, 1
+    call    ze_add_file
+    cmp     eax, 1                              ; must report error
+    jne     zxc_fail
+    cmp     byte ptr [g_xl_err], 1              ; must flag the export to abort
+    jne     zxc_fail
+    cmp     dword ptr [g_ze_cn], ZE_MAXFILE     ; count unchanged => no OOB record written
+    jne     zxc_fail
+    lea     rcx, [zxc_ok]
+    mov     edx, zxc_ok_len
+    call    print_a
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+zxc_fail:
+    lea     rcx, [zxc_bad]
+    mov     edx, zxc_bad_len
+    call    print_a
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_zexcap endp
 
 end

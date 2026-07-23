@@ -16,6 +16,7 @@ Heap secrets go through `secmem_alloc`, which VirtualLock's on allocation.
 | `g_pwbuf` | gui.asm (`.data?`) | 2048 B | unlock/create password field (wide) | `sec_lock_statics` | `password_to_utf8` (main.asm, wipes the wide source after conversion), `gui_wipepw_create`, `gui_xlpw_strength` (gui.asm) |
 | `g_pw2buf` | gui.asm (`.data?`) | 2048 B | confirm-password field (wide) | `sec_lock_statics` | `gui_wipepw_create`, `gui_xlpw_strength` (gui.asm) |
 | `g_secret_w` | gui.asm (`.data?`) | 16384 B | revealed secret for reveal/copy (wide) | `sec_lock_statics` | `vault_proc` close/lock path (gui.asm) |
+| `g_rowpw_w` | gui.asm (`.data?`) | 1024 B | reveal-overlay secret copy (wide) | `sec_lock_statics` | `gui_colorpw_hide` + `vault_proc` close/lock (gui.asm) |
 | `g_e_totp` | gui.asm (`.data?`) | 512 B | entry-form TOTP key (wide) | `sec_lock_statics` | `vault_proc` close/lock path (gui.asm) |
 | `g_totp_b32` | gui.asm (`.data?`) | 256 B | selected entry TOTP key (UTF-8) | `sec_lock_statics` | `vault_proc` close/lock path (gui.asm) |
 | vault body | `secmem_alloc` (called from `vault_unlock` / `do_init`, vault.asm) | ≤ `VAULT_BODY_MAX` | decrypted entries (all field plaintext, incl. archived pw-history) | `secmem_alloc` (VirtualLock) | `secmem_free` (`secure_zero` before release) |
@@ -30,7 +31,15 @@ by `secmem_panic_wipe` (secmem.asm), which the VEH runs before terminating.
   hundreds of MB non-pageable is impractical and would create real memory
   pressure, so it is not locked. It holds intermediate Argon2 mixing blocks
   (not the password or key directly), and is `secure_zero`'d then `VirtualFree`d
-  at the end of every `argon2id_hash` call.
+  at the end of every `argon2id_hash` call. **`g_hbuf`** (argon2.asm, 80 B) holds
+  the key-equivalent H0 pre-hash for the same call; it is `.data?`, not locked
+  (transient, one KDF call), and `secure_zero`'d on every exit of `argon2id_hash`.
+- **`g_conv` / `g_convlabel`** (vault.asm) — UTF-8 scratch for a field value /
+  label while an entry is serialized (`conv_w2u` in `va_field_*`). Not locked
+  (transient, overwritten per field); `secure_zero`'d in `vault_lock`.
+- **`g_urlbuf` / `g_urlbuf2`** (gui.asm) — a clicked URL field (not a
+  password-class secret, but may carry internal hosts/tokens); `secure_zero`'d
+  after the `ShellExecute` in `gui_url_open`.
 - **Export scratch** (zipexport.asm) — the plaintext `vordr.json` assembled
   during "Export all secrets" is transient: `ze_compose` releases it with
   `mem_free` (which `secure_zero`s before `VirtualFree`), the archive buffer

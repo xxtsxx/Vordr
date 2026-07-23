@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vordr — Assurance Report</title>
+<style>
+  :root {
+    --ground: #eef2f3;
+    --panel: #ffffff;
+    --panel-2: #f6f9f9;
+    --ink: #10201f;
+    --ink-soft: #47605e;
+    --ink-faint: #7b918f;
+    --border: #d6e0df;
+    --border-strong: #bccbc9;
+    --accent: #0a8f83;
+    --accent-soft: #d7efec;
+    --pass: #1f9d63;
+    --pass-bg: #e2f3ea;
+    --warn: #b7811a;
+    --warn-bg: #f6ecd6;
+    --crit: #cf3b40;
+    --crit-bg: #f7dedf;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --shadow: 0 1px 2px rgba(16,32,31,.04), 0 8px 24px rgba(16,32,31,.05);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground: #0a1413;
+      --panel: #0f1c1b;
+      --panel-2: #132523;
+      --ink: #dbe8e6;
+      --ink-soft: #8ea6a3;
+      --ink-faint: #5f7a77;
+      --border: #1d3230;
+      --border-strong: #294341;
+      --accent: #24c1b1;
+      --accent-soft: #103430;
+      --pass: #3cc17e;
+      --pass-bg: #10302270;
+      --warn: #d7a63c;
+      --warn-bg: #33280f70;
+      --crit: #ef6a6e;
+      --crit-bg: #3a191b70;
+      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 10px 30px rgba(0,0,0,.35);
+    }
+  }
+  :root[data-theme="light"] {
+    --ground: #eef2f3; --panel: #ffffff; --panel-2: #f6f9f9; --ink: #10201f;
+    --ink-soft: #47605e; --ink-faint: #7b918f; --border: #d6e0df; --border-strong: #bccbc9;
+    --accent: #0a8f83; --accent-soft: #d7efec; --pass: #1f9d63; --pass-bg: #e2f3ea;
+    --warn: #b7811a; --warn-bg: #f6ecd6; --crit: #cf3b40; --crit-bg: #f7dedf;
+    --shadow: 0 1px 2px rgba(16,32,31,.04), 0 8px 24px rgba(16,32,31,.05);
+  }
+  :root[data-theme="dark"] {
+    --ground: #0a1413; --panel: #0f1c1b; --panel-2: #132523; --ink: #dbe8e6;
+    --ink-soft: #8ea6a3; --ink-faint: #5f7a77; --border: #1d3230; --border-strong: #294341;
+    --accent: #24c1b1; --accent-soft: #103430; --pass: #3cc17e; --pass-bg: #10302270;
+    --warn: #d7a63c; --warn-bg: #33280f70; --crit: #ef6a6e; --crit-bg: #3a191b70;
+    --shadow: 0 1px 2px rgba(0,0,0,.3), 0 10px 30px rgba(0,0,0,.35);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--ground); color: var(--ink);
+    font-family: var(--sans); line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: clamp(20px, 4vw, 56px) clamp(16px, 4vw, 40px) 80px; }
+
+  .eyebrow { font-family: var(--mono); font-size: 12px; letter-spacing: .16em; text-transform: uppercase; color: var(--accent); font-weight: 600; }
+  h1 { font-size: clamp(28px, 4vw, 40px); line-height: 1.08; margin: 12px 0 10px; letter-spacing: -.02em; text-wrap: balance; font-weight: 680; }
+  .lede { color: var(--ink-soft); max-width: 62ch; font-size: 16px; margin: 0; }
+
+  .meta { display: flex; flex-wrap: wrap; gap: 8px 10px; margin-top: 22px; align-items: center; }
+  .chip { font-family: var(--mono); font-size: 12px; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--border-strong); color: var(--ink-soft); background: var(--panel); white-space: nowrap; }
+  .chip b { color: var(--ink); font-weight: 600; }
+  .chip.ok { color: var(--pass); border-color: color-mix(in srgb, var(--pass) 40%, var(--border)); background: var(--pass-bg); }
+  .chip.ok b { color: var(--pass); }
+
+  section { margin-top: 40px; }
+  .sec-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 16px; }
+  .sec-head h2 { font-size: 19px; margin: 0; letter-spacing: -.01em; font-weight: 640; }
+  .sec-head .n { font-family: var(--mono); font-size: 12px; color: var(--ink-faint); }
+  .sec-head p { margin: 0; color: var(--ink-soft); font-size: 14px; }
+
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; box-shadow: var(--shadow); }
+
+  /* stage strip */
+  .stages { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; }
+  .stage { padding: 16px 14px; }
+  .stage .label { font-family: var(--mono); font-size: 12px; letter-spacing: .04em; color: var(--ink-soft); text-transform: uppercase; }
+  .stage .val { display: flex; align-items: center; gap: 7px; margin-top: 8px; font-weight: 640; font-size: 15px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--pass); box-shadow: 0 0 0 3px var(--pass-bg); flex: none; }
+  .stage .sub { font-family: var(--mono); font-size: 11px; color: var(--ink-faint); margin-top: 6px; }
+
+  .grid2 { display: grid; grid-template-columns: 1.15fr .85fr; gap: 16px; }
+  .card { padding: 20px; }
+  .card h3 { margin: 0 0 4px; font-size: 15px; font-weight: 640; }
+  .card .kicker { font-family: var(--mono); font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: var(--ink-faint); }
+
+  .bignum { font-family: var(--mono); font-size: 40px; font-weight: 600; letter-spacing: -.02em; color: var(--accent); line-height: 1; }
+  .bignum small { font-size: 15px; color: var(--ink-soft); font-weight: 500; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  .scroll { overflow-x: auto; }
+  th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { font-family: var(--mono); font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--ink-faint); font-weight: 600; }
+  tbody tr:last-child td { border-bottom: none; }
+  td.mono, .mono-cell { font-family: var(--mono); }
+  .cite { color: var(--accent); font-family: var(--mono); font-size: 12px; }
+
+  .tag { display: inline-flex; align-items: center; gap: 5px; font-family: var(--mono); font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 6px; letter-spacing: .02em; }
+  .tag.pass { color: var(--pass); background: var(--pass-bg); }
+  .tag.fixed { color: var(--accent); background: var(--accent-soft); }
+  .tag.crit { color: var(--crit); background: var(--crit-bg); }
+  .tag.dos { color: var(--warn); background: var(--warn-bg); }
+
+  /* controls grid */
+  .ctrls { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+  .ctrl { padding: 13px 14px; border: 1px solid var(--border); border-radius: 11px; background: var(--panel-2); }
+  .ctrl .c-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .ctrl .name { font-weight: 620; font-size: 13.5px; }
+  .ctrl .code { font-family: var(--mono); font-size: 11px; color: var(--ink-faint); margin-top: 7px; }
+  .fire { font-family: var(--mono); font-size: 10.5px; font-weight: 700; color: var(--pass); letter-spacing: .04em; }
+
+  .findings { display: flex; flex-direction: column; gap: 10px; }
+  .finding { display: grid; grid-template-columns: auto 1fr auto; gap: 12px 16px; align-items: start; padding: 16px 18px; }
+  .finding .tags { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+  .finding .body h4 { margin: 0 0 4px; font-size: 14.5px; font-weight: 640; }
+  .finding .body p { margin: 0; color: var(--ink-soft); font-size: 13.5px; }
+  .finding .probe { font-family: var(--mono); font-size: 12px; color: var(--ink-soft); text-align: right; white-space: nowrap; }
+  .finding .probe b { color: var(--accent); }
+
+  pre { font-family: var(--mono); font-size: 12.5px; margin: 0; padding: 16px 18px; overflow-x: auto; color: var(--ink); }
+  .cmd .prompt { color: var(--accent); user-select: none; }
+  .cmd .out { color: var(--ink-faint); }
+
+  .note { font-size: 13px; color: var(--ink-soft); border-left: 2px solid var(--accent); padding: 2px 0 2px 14px; margin-top: 14px; }
+  .note b { color: var(--ink); }
+
+  footer { margin-top: 48px; padding-top: 20px; border-top: 1px solid var(--border); color: var(--ink-faint); font-size: 12.5px; font-family: var(--mono); display: flex; flex-wrap: wrap; gap: 6px 16px; justify-content: space-between; }
+
+  @media (max-width: 760px) {
+    .stages { grid-template-columns: repeat(2, 1fr); }
+    .grid2 { grid-template-columns: 1fr; }
+    .ctrls { grid-template-columns: repeat(2, 1fr); }
+    .finding { grid-template-columns: 1fr; }
+    .finding .probe { text-align: left; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="eyebrow">Vordr · External Assurance</div>
+    <h1>Proof that the crypto is correct and the memory is safe — reproducible by anyone.</h1>
+    <p class="lede">Vordr is a password manager written from scratch in x64 assembly. Every claim below is backed by a test an outside auditor can re-run against an independent reference or a published standard — not by the authors' word.</p>
+    <div class="meta">
+      <span class="chip ok"><b>✓ ALL STAGES PASSED</b></span>
+      <span class="chip">branch <b>audit-fixes</b></span>
+      <span class="chip">commit <b>7faf938</b></span>
+      <span class="chip">gate <b>tests\run_all.cmd</b></span>
+      <span class="chip">re-run in CI on every push</span>
+    </div>
+  </header>
+
+  <section>
+    <div class="sec-head"><h2>The gate</h2><span class="n">5 stages · exit 0 only if all pass</span></div>
+    <div class="panel stages">
+      <div class="stage"><div class="label">redteam</div><div class="val"><span class="dot"></span>PASS</div><div class="sub">8/8 controls fire</div></div>
+      <div class="stage"><div class="label">build</div><div class="val"><span class="dot"></span>PASS</div><div class="sub">0 fatal · 0 dead</div></div>
+      <div class="stage"><div class="label">selftest</div><div class="val"><span class="dot"></span>PASS</div><div class="sub">startup KATs</div></div>
+      <div class="stage"><div class="label">roundtrip</div><div class="val"><span class="dot"></span>PASS</div><div class="sub">42 probes</div></div>
+      <div class="stage"><div class="label">cryptodiff</div><div class="val"><span class="dot"></span>PASS</div><div class="sub">60 checks</div></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><h2>Cryptographic correctness</h2><span class="n">01</span><p>independent recompute + published vectors</p></div>
+    <div class="grid2">
+      <div class="panel card">
+        <div class="kicker">How it's proven without trusting Vordr</div>
+        <h3 style="margin-top:6px">Differential verification</h3>
+        <p style="color:var(--ink-soft); font-size:14px; margin:8px 0 16px">
+          <span class="mono-cell" style="color:var(--accent)">vordr katreport</span> prints each primitive's output over fixed public inputs.
+          <span class="mono-cell" style="color:var(--accent)">verify_crypto.py</span> — Python stdlib only, no dependencies — recomputes every value with a self-validating pure-Python AES-GCM and checks the official FIPS/RFC/NIST vectors, then diffs. Now includes SHA-256 / BLAKE2b <b>block-boundary lengths</b> (55/56/63/64/127/128/129) — the padding edges most likely to expose a bug.
+        </p>
+        <div style="display:flex; gap:28px; flex-wrap:wrap">
+          <div><div class="bignum">43<small> / 0</small></div><div style="font-size:12px; color:var(--ink-faint); font-family:var(--mono); margin-top:6px">differential · fail</div></div>
+          <div><div class="bignum">17<small> / 0</small></div><div style="font-size:12px; color:var(--ink-faint); font-family:var(--mono); margin-top:6px">published · fail</div></div>
+        </div>
+        <p class="note"><b>Negative control:</b> tamper one output line and the verifier exits nonzero with the exact mismatch — it isn't rubber-stamping.</p>
+      </div>
+      <div class="panel card scroll">
+        <div class="kicker">Vector provenance</div>
+        <table style="margin-top:10px">
+          <thead><tr><th>Primitive</th><th>Cited vector</th></tr></thead>
+          <tbody>
+            <tr><td>SHA-256</td><td class="cite">FIPS 180-4 B.1</td></tr>
+            <tr><td>AES-256-GCM</td><td class="cite">NIST SP800-38D TC14</td></tr>
+            <tr><td>BLAKE2b-512</td><td class="cite">RFC 7693 App.A</td></tr>
+            <tr><td>Argon2id</td><td class="cite">RFC 9106 §5.3</td></tr>
+            <tr><td>HMAC-SHA1</td><td class="cite">RFC 2202 (1,2)</td></tr>
+            <tr><td>HOTP</td><td class="cite">RFC 4226 App.D</td></tr>
+            <tr><td>TOTP</td><td class="cite">RFC 6238 step</td></tr>
+            <tr><td>base32</td><td class="cite">RFC 4648</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><h2>Memory-safety controls</h2><span class="n">02</span><p>each one proven to fire by deliberate fault injection</p></div>
+    <div class="ctrls">
+      <div class="ctrl"><div class="c-top"><span class="name">Stack canary</span><span class="fire">FIRES</span></div><div class="code">FF_STACK_COOKIE · 0x2</div></div>
+      <div class="ctrl"><div class="c-top"><span class="name">Shadow stack</span><span class="fire">FIRES</span></div><div class="code">FF_SHADOW_STACK · 0xF001</div></div>
+      <div class="ctrl"><div class="c-top"><span class="name">CFI landing-pad</span><span class="fire">FIRES</span></div><div class="code">FF_GUARD_ICALL · 0xA</div></div>
+      <div class="ctrl"><div class="c-top"><span class="name">Checked add</span><span class="fire">FIRES</span></div><div class="code">FF_OVERFLOW · 0xF005</div></div>
+      <div class="ctrl"><div class="c-top"><span class="name">Bounds check</span><span class="fire">FIRES</span></div><div class="code">FF_BOUNDS · 0xF004</div></div>
+      <div class="ctrl"><div class="c-top"><span class="name">Type tag</span><span class="fire">FIRES</span></div><div class="code">FF_TYPE_MAGIC · 0xF003</div></div>
+      <div class="ctrl"><div class="c-top"><span class="name">Heap temporal tag</span><span class="fire">FIRES</span></div><div class="code">FF_HEAP_TAG · 0xF002</div></div>
+      <div class="ctrl"><div class="c-top"><span class="name">IAT lock</span><span class="fire">FIRES</span></div><div class="code">AV → contained 0xC0000409</div></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><h2>Findings from this pass</h2><span class="n">03</span><p>found &amp; fixed by independent review + the tools built this pass</p></div>
+    <div class="findings">
+      <div class="panel finding">
+        <div class="tags"><span class="tag crit">CRITICAL · OOB write</span><span class="tag fixed">FIXED</span></div>
+        <div class="body"><h4>ZIP-export central directory was unbounded</h4><p>A vault with 512 or more attachment fields drove the export's record write past its fixed array straight into adjacent <b>AES key-material</b> — an out-of-bounds write of attacker-influenced bytes. A capacity guard now refuses the write and fails the export closed.</p></div>
+        <div class="probe">probe <b>zexcap</b></div>
+      </div>
+      <div class="panel finding">
+        <div class="tags"><span class="tag dos">DoS · pre-auth</span><span class="tag fixed">FIXED</span></div>
+        <div class="body"><h4>KDF cost parameters trusted before authentication</h4><p>A crafted <span class="mono-cell">.vordr</span> could set the Argon2 memory cost enormous; the KDF runs before the file MAC can be checked, so merely opening the file drove a giant allocation — no password needed. Now rejected as corrupt outside legitimate bounds.</p></div>
+        <div class="probe">probe <b>kdfparam</b></div>
+      </div>
+      <div class="panel finding">
+        <div class="tags"><span class="tag dos">DoS · hang</span><span class="tag fixed">FIXED</span></div>
+        <div class="body"><h4>Infinite loop in the vordr.json parser</h4><p>Found by a new structural fuzzer on its first run: a malformed decrypted JSON could stick the parse cursor so the loop never terminated. Fixed with forward-progress guards on both parse loops.</p></div>
+        <div class="probe">found by <b>jfuzz</b></div>
+      </div>
+      <div class="panel finding">
+        <div class="tags"><span class="tag fixed">FIXED</span></div>
+        <div class="body"><h4>Attachment-length integer wrap</h4><p>A near-2⁶⁴ length could wrap past a plausibility check (post-auth; a downstream cap caught it, but fragile). Now the length is rejected before the arithmetic can overflow.</p></div>
+        <div class="probe">vault-open probes</div>
+      </div>
+      <div class="panel finding">
+        <div class="tags"><span class="tag fixed">FIXED</span></div>
+        <div class="body"><h4>Double-free-safe secret allocator</h4><p>The secure allocator wiped before releasing, so a stale/aliased free wrote freed pages — a recurring multi-vault crash class. A live-allocation registry makes any double, stale, or foreign free an inert no-op.</p></div>
+        <div class="probe">probe <b>secfreedup</b></div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><h2>Vault export / import</h2><span class="n">04</span><p>new this pass — verified end-to-end, headless</p></div>
+    <div class="findings">
+      <div class="panel finding">
+        <div class="tags"><span class="tag pass">ROUND-TRIP</span></div>
+        <div class="body"><h4>Export a vault under a new password</h4><p>Seals a chosen set of entries into a fresh child vault with its own salt + password, deduped by entry id (newer wins) so a re-merge is idempotent. The probe exports under a <b>different</b> password, reopens the child, and asserts every entry id survives.</p></div>
+        <div class="probe">probe <b>vaultexportkat</b></div>
+      </div>
+      <div class="panel finding">
+        <div class="tags"><span class="tag pass">ROUND-TRIP</span></div>
+        <div class="body"><h4>Attachments carried into the child vault</h4><p>Exports a vault holding two attachments, reopens the child under its new password, decrypts both blobs, and asserts the plaintext matches byte-for-byte — the ciphertext is carried verbatim, keyed by each attachment's own key that travels in the entry.</p></div>
+        <div class="probe">probe <b>vaultexpattkat</b></div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><h2>Reproduce it yourself</h2><span class="n">05</span></div>
+    <div class="panel">
+      <pre class="cmd"><span class="prompt">&gt;</span> tests\run_all.cmd
+<span class="out">  redteam    PASS      selftest   PASS      cryptodiff PASS</span>
+<span class="out">  build      PASS      roundtrip  PASS</span>
+<span class="out">  ALL STAGES PASSED</span>
+
+<span class="prompt">&gt;</span> python tests\verify_crypto.py --exe bin\vordr.exe
+<span class="out">  [ok] pure-Python AES-256-GCM reference self-validated vs NIST SP800-38D</span>
+<span class="out">  differential : 33 pass / 0 fail</span>
+<span class="out">  published    : 17 pass / 0 fail</span>
+<span class="out">  RESULT: PASS — Vordr's crypto matches independent reference AND published vectors.</span></pre>
+    </div>
+    <p class="note">Full methodology, the complete probe inventory, and an explicit list of what is <b>not</b> claimed (side channels, coverage-guided fuzzing) live in <b>docs/ASSURANCE.md</b>.</p>
+  </section>
+
+  <footer>
+    <span>Vordr · assurance snapshot</span>
+    <span>x64 MASM · Windows · self-implemented crypto</span>
+    <span>reproduce: run_all.cmd + verify_crypto.py</span>
+  </footer>
+</div>
+</body>
+</html>

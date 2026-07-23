@@ -103,7 +103,8 @@ runtime and no static library. What Windows ships is what Vordr uses.
 Nothing novel guards your secrets. AES-256-GCM (NIST SP 800-38D), Argon2id
 (RFC 9106), SHA-256 (FIPS 180-4), BLAKE2b (RFC 7693), HMAC (RFC 2104/2202) —
 each implemented from its specification and checked against the published
-vectors at startup, every time. Hardware instructions (AES-NI, PCLMULQDQ,
+vectors at startup, every time. Known-Answer Self-Tests (KATs) are used
+extensively throughout Vordr. Hardware instructions (AES-NI, PCLMULQDQ,
 SHA-NI, AVX2) are used where the CPU has them; a CPU without the required
 features is refused rather than served a software fallback of untested
 constant-timeness.
@@ -152,7 +153,7 @@ ever sees ciphertext.
 | Argon2 core hash | BLAKE2b (scalar 64-bit; AVX2 is used only inside Argon2's compressor) | RFC 7693 |
 | Key-check value / hashing | SHA-256 (SHA-NI) | FIPS 180-4 |
 | TOTP codes | HOTP/TOTP over HMAC-SHA-1, base32 keys | RFC 4226 / 6238 / 4648 |
-| `.vaultz` export/import | WinZip AE-2: PBKDF2-HMAC-SHA1, AES-256-CTR, HMAC-SHA1 | interop standard |
+| Winzip compatible export/import | WinZip AE-2: PBKDF2-HMAC-SHA1, AES-256-CTR, HMAC-SHA1 | interop standard |
 | Constant-time compare | `ct_memcmp` (OR-accumulate, branch-free) | — |
 
 Two honest notes on that table. SHA-1 appears **only** where interop standards
@@ -257,9 +258,10 @@ trade-offs.
 
 With Secure Unlock (default **on**; `SecureUnlock`), the master password is
 typed on a **private, isolated Windows desktop** — the same mechanism UAC
-prompts use. Keyloggers and screen scrapers running in your normal session
-cannot observe that desktop. If a private desktop cannot be created, Vordr
-falls back to a normal prompt rather than failing to unlock.
+prompts use. Keyloggers, screen scrapers running in your normal session and
+your screen shared through meetings cannot observe that desktop. If a private
+desktop cannot be created, Vordr falls back to a normal prompt rather than
+failing to unlock.
 
 ### Attachment preview
 
@@ -297,13 +299,21 @@ clears the clipboard if it is still ours, and destroys tracked temp files.
 
 ### Import and export
 
-Export produces a **`.vaultz`** file: a standard WinZip AES-256 (AE-2) archive
+Export uses a standard WinZip AES-256 (AE-2) archive file format
 containing `vordr.json` plus the attachments, openable with 7-Zip or any
 AES-zip tool — your guaranteed exit path from Vordr, with no proprietary
 lock-in. Export is selective (pick which entries), always under a password
-that must satisfy the vault's policy. Import stages a `.vaultz`, lets you pick
-entries, and appends them (never overwrites). Password history is deliberately
-not exported.
+that must satisfy the vault's policy. Import lets you pick entries, and
+appends them (never overwrites). Password history is deliberately not
+exported.
+
+Import accepts **STORED** (uncompressed) AES-zip members only — the format
+Vordr's own export writes. Archives whose members are DEFLATE-compressed (the
+default for 7-Zip and WinRAR when you re-zip `vordr.json` yourself) decrypt but
+then fail to parse, because there is no inflate implementation in the codebase
+(zero third-party code is a deliberate design constraint). To move a hand-built
+archive in, re-create it with **no compression** (STORE). Vordr-produced
+`.vaultz` files always import.
 
 ### OneDrive storage
 

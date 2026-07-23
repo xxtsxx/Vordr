@@ -1,12 +1,15 @@
-# Vordr CI - build + full test gate on every push/PR.
+# Vordr CI - build + full test gate on every push/PR (and nightly).
 #
 # Runs tests\run_all.cmd, which is the same gate used locally:
 #   1. dbg build + all 8 redteam fault-injection cases (0xFADE fail-fast codes)
 #   2. strict release build (framecheck FATALs fail the build)
 #   3. selftest ("all self-tests passed")
-#   4. headless roundtrip: seedtest -> atgen -> zitest -> phtest -> secscan ->
-#      tmptest -> fztest -> trtest -> vfuzz -> fuzzzip -> bktest -> mactest ->
-#      rbtest -> xctest -> pkat
+#   4. headless roundtrip: a PROBE_IO binary (a plain release refuses the path-
+#      taking verbs) runs seedtest -> atgen -> zitest -> ... -> bktest/mactest/
+#      rbtest/xctest/reload/cowrite -> ... -> vaultexportkat -> vaultexpattkat
+#   5. cryptodiff: tests\verify_crypto.py independently recomputes every crypto
+#      primitive (python stdlib + a self-validating pure-Python AES-256-GCM) and
+#      cross-checks the published FIPS/RFC/NIST vectors against `vordr katreport`.
 #
 # windows-latest ships VS (ml64/link/rc) and Python; ilammy/msvc-dev-cmd puts
 # the x64 toolchain on PATH the same way a "x64 Native Tools" prompt does.
@@ -20,6 +23,10 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+  schedule:
+    # G7.1: nightly re-run of the full gate (incl. the vfuzz/fuzzzip stages) at
+    # 05:17 UTC, to catch flakiness the per-push run might miss.
+    - cron: '17 5 * * *'
 
 jobs:
   gate:
@@ -28,14 +35,41 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # G7.3: third-party action pinned to a commit SHA (tag v1 is mutable).
       - name: MSVC x64 environment
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
         with:
           arch: x64
 
       - name: run_all gate (redteam + strict build + selftest + roundtrip)
         shell: cmd
         run: call tests\run_all.cmd
+
+      # G7.2: also produce the reproducible release build (/Brepro + pinned PDB
+      # path) and print its SHA-256, so the published-hash flow is exercised.
+      - name: reproducible release build
+        shell: cmd
+        run: call build.cmd release
+
+      # External-audit artifact: the raw crypto proof (vordr's katreport output +
+      # the independent verifier's per-vector PASS/FAIL table). Uploaded always so
+      # a reviewer can download and re-check it against the published vectors.
+      - name: crypto proof artifact
+        if: always()
+        shell: cmd
+        run: |
+          mkdir crypto-proof 2>nul
+          bin\vordr.exe katreport > crypto-proof\katreport.txt 2>&1
+          python tests\verify_crypto.py --exe bin\vordr.exe > crypto-proof\verify_crypto.txt 2>&1
+          type crypto-proof\verify_crypto.txt
+
+      - name: upload crypto proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crypto-proof
+          path: crypto-proof/
+          if-no-files-found: ignore
 
       - name: upload vordr.exe
         uses: actions/upload-artifact@v4
