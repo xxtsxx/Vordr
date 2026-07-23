@@ -488,13 +488,20 @@ close gap. Build + gate green.
   break dedup).
 - Probe **`vaultexportkat`** (gated): seed 3 → export under a *different* password →
   reopen → the 3 entry ids round-trip → merge back → 0 changes.
-- **Follow-ups (still open):** (1) **attachment carry** — v1 filters out
-  `VF_IMAGE`/`VF_FILE` fields so no dangling AttachRef ships; the blob ct is keyed by
-  its own per-attachment key in the AttachRef, so a later version can copy it verbatim
-  while the *source* image is the live `g_attidx` (do NOT reset the attachment globals
-  before the export seal), and `vaultexportkat` extends to assert the attachment bytes
-  round-trip. (2) **"and link it"** on export and the **link/merge import UI** are
-  GUI wiring (display-gated). (3) selected-subset export (v1 exports all entries).
+- **Attachment carry (LANDED 2026-07-23).** `fed_export(rcx, edx = carry)`: `carry=1`
+  copies entries verbatim (`entry_copy_full`) and keeps the source's attachment
+  context (`g_attidx`/`g_filebuf`) live through the seal, so `vault_seal_write` copies
+  every referenced blob into the child file — ct verbatim, keyed by the AttachRef's
+  own per-attachment key (which travels in the entry), so it still decrypts under the
+  child's new master password. Probe **`vaultexpattkat`** (gated): build a vault with
+  two attachments (`do_attgen`), export with `carry=1` under a different password,
+  reopen the child, `attach_open` both blobs and assert the plaintext matches
+  byte-for-byte. (`carry=0` stays the text-only path.) Audited attachment probes
+  (`attfuzz`/`zexcap`/`atgen`/`zitest`) unregressed.
+- **Follow-ups (still open):** (1) **"and link it"** on export and the **link/merge
+  import UI** are GUI wiring (display-gated). (2) selected-subset export (the headless
+  API exports all entries; the GUI picks the subset). (3) merge-import attachment
+  carry (v1 `fed_merge` still filters; export is the primary attachment case).
 
 ### M7. Format definition (no migration — pre-v1.0 clean slate)
 1. **No migration, no back-compat.** Per the clean-slate note, pre-existing vaults

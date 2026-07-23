@@ -287,6 +287,8 @@ ffk_seedpw  db "vordrtest",0                            ; fedfanout: seed vault 
 vxk_exppw   db "exportpw2",0                             ; vaultexportkat: export vault password (9)
 CSTR vxk_ok,  "vaultexportkat: PASS (export round-trips ids; re-merge idempotent)",13,10
 CSTR vxk_bad, "vaultexportkat: FAIL",13,10
+CSTR vea_ok,  "vaultexpattkat: PASS (attachments carried; blobs decrypt in the child vault)",13,10
+CSTR vea_bad, "vaultexpattkat: FAIL",13,10
 CSTR bk_ok,  "bktest: PASS (bak1..3 rotated and bak1 opens)",13,10
 CSTR bk_bad, "bktest: FAIL (backup missing or unopenable)",13,10
 CSTR mt_ok,  "mactest: PASS (counter tamper rejected, restore opens)",13,10
@@ -3575,6 +3577,7 @@ vxk_pw2d:
     lea     rax, [g_vx_pathb]                 ; export target = B
     mov     qword ptr [g_cfg_in], rax
     mov     rcx, qword ptr [rbp-24]           ; source body scratch
+    xor     edx, edx                          ; carry=0 (entries only)
     call    fed_export
     test    eax, eax
     mov     eax, 4
@@ -3641,6 +3644,195 @@ vxk_fail:
     FRAME_EPILOG
     ret
 cmd_vaultexportkat endp
+
+; ===========================================================================
+; cmd_vaultexpattkat <path> - M6 attachment-carry KAT.  Builds a source vault at
+;   <path> with one entry carrying two attachments (do_attgen: hello.txt + world.dat),
+;   seals it, then EXPORTS it with carry=1 to <path>.ec under a DIFFERENT password,
+;   reopens the child, and attach_open's both attachments - asserting the decrypted
+;   plaintext matches the originals byte-for-byte.  Proves the export carries the
+;   attachment ciphertext verbatim and it still decrypts under the child vault (the
+;   blob is keyed by the AttachRef's own key, which travels in the entry).  Exit 0=pass.
+; ===========================================================================
+LANDING_PAD
+public cmd_vaultexpattkat
+cmd_vaultexpattkat proc frame
+    FRAME_PROLOG 80                            ; [rbp-24]=scratch [rbp-32]=outlen [rbp-40]=entry
+    mov     dword ptr [g_cfg_t], 1            ; fast KDF for the gate
+    mov     dword ptr [g_cfg_m], 8
+    lea     r10, [g_argv]                     ; source path A = argv[2]
+    mov     rax, qword ptr [r10+16]
+    mov     qword ptr [g_cfg_in], rax
+    mov     r10, rax                          ; child path = A + ".ec"
+    lea     r11, [g_vx_pathb]
+    xor     r8d, r8d
+vea_pcpy:
+    mov     ax, word ptr [r10+r8*2]
+    mov     word ptr [r11+r8*2], ax
+    test    ax, ax
+    jz      vea_pdone
+    inc     r8d
+    cmp     r8d, MAX_PATH_CHARS-8
+    jb      vea_pcpy
+vea_pdone:
+    mov     word ptr [r11+r8*2], '.'
+    inc     r8d
+    mov     word ptr [r11+r8*2], 'e'
+    inc     r8d
+    mov     word ptr [r11+r8*2], 'c'
+    inc     r8d
+    mov     word ptr [r11+r8*2], 0
+    lea     r10, [ffk_seedpw]                 ; seed password -> g_cfg_pass
+    lea     r11, [g_cfg_pass]
+    xor     ecx, ecx
+vea_pw1:
+    mov     al, byte ptr [r10+rcx]
+    mov     byte ptr [r11+rcx], al
+    test    al, al
+    jz      vea_pw1d
+    inc     ecx
+    cmp     ecx, 32
+    jb      vea_pw1
+vea_pw1d:
+    mov     dword ptr [g_cfg_passlen], 9
+    mov     dword ptr [g_hdr+0], VAULT_MAGIC  ; --- build source vault A on disk ---
+    mov     dword ptr [g_hdr+4], VAULT_VERSION
+    mov     eax, dword ptr [g_cfg_t]
+    mov     dword ptr [g_hdr+VH_T], eax
+    mov     eax, dword ptr [g_cfg_m]
+    mov     dword ptr [g_hdr+VH_M], eax
+    mov     dword ptr [g_hdr+VH_LANES], 1
+    lea     rcx, [g_hdr+VH_SALT]
+    mov     edx, 32
+    call    rng_fill
+    test    eax, eax
+    jz      vea_fail
+    lea     rcx, [g_hdr+VH_NONCE]
+    mov     edx, 12
+    call    rng_fill
+    test    eax, eax
+    jz      vea_fail
+    call    vk_derive
+    test    eax, eax
+    jnz     vea_fail
+    call    vk_kcv
+    lea     r10, [g_sha32]
+    lea     r9, [g_hdr+VH_KCV]
+    xor     r8d, r8d
+vea_kcv:
+    mov     al, byte ptr [r10+r8]
+    mov     byte ptr [r9+r8], al
+    inc     r8d
+    cmp     r8d, KCV_LEN
+    jb      vea_kcv
+    call    do_attgen                         ; 1 entry, title + 2 pending attachments
+    test    eax, eax
+    jnz     vea_fail
+    mov     qword ptr [g_save_counter], 0
+    call    vault_seal_write                  ; A on disk; attachments sealed; g_attidx live
+    test    eax, eax
+    jnz     vea_fail
+    mov     rcx, VAULT_BODY_MAX               ; snapshot A body (keep A's attachment context)
+    call    secmem_alloc
+    test    rax, rax
+    jz      vea_fail
+    mov     qword ptr [rbp-24], rax
+    mov     rcx, rax
+    mov     rdx, qword ptr [g_body_ptr]
+    mov     r8d, dword ptr [g_body_len]
+    call    copy_bytes
+    lea     r10, [vxk_exppw]                  ; export password -> g_cfg_pass
+    lea     r11, [g_cfg_pass]
+    xor     ecx, ecx
+vea_pw2:
+    mov     al, byte ptr [r10+rcx]
+    mov     byte ptr [r11+rcx], al
+    test    al, al
+    jz      vea_pw2d
+    inc     ecx
+    cmp     ecx, 32
+    jb      vea_pw2
+vea_pw2d:
+    mov     dword ptr [g_cfg_passlen], 9
+    lea     rax, [g_vx_pathb]                 ; export target = child
+    mov     qword ptr [g_cfg_in], rax
+    mov     rcx, qword ptr [rbp-24]           ; source body scratch
+    mov     edx, 1                            ; carry=1 (attachments)
+    call    fed_export
+    test    eax, eax
+    jnz     vea_fail
+    call    vault_lock
+    call    vk_derive                         ; reopen the child under the export password
+    mov     dword ptr [g_reuse_key], 1
+    call    vault_unlock
+    mov     dword ptr [g_reuse_key], 0
+    test    eax, eax
+    jnz     vea_fail
+    call    vault_count
+    cmp     eax, 1
+    jne     vea_fail
+    xor     ecx, ecx                          ; entry 0
+    call    vault_entry_ptr
+    mov     qword ptr [rbp-40], rax
+    mov     rcx, rax                          ; VF_IMAGE attachment
+    mov     edx, VF_IMAGE
+    call    find_field_in
+    test    rax, rax
+    jz      vea_fail
+    mov     rcx, rax                          ; rcx = AttachRef
+    lea     rdx, [rbp-32]                     ; &outlen
+    call    attach_open
+    test    rax, rax
+    jz      vea_fail
+    mov     r10d, dword ptr [rbp-32]
+    cmp     r10d, AG_PLAIN_LEN
+    jne     vea_fail
+    lea     r11, [ag_plain]                   ; compare decrypted bytes
+    xor     ecx, ecx
+vea_cmp1:
+    mov     dl, byte ptr [rax+rcx]
+    cmp     dl, byte ptr [r11+rcx]
+    jne     vea_fail
+    inc     ecx
+    cmp     ecx, AG_PLAIN_LEN
+    jb      vea_cmp1
+    mov     rcx, qword ptr [rbp-40]           ; VF_FILE attachment
+    mov     edx, VF_FILE
+    call    find_field_in
+    test    rax, rax
+    jz      vea_fail
+    mov     rcx, rax
+    lea     rdx, [rbp-32]
+    call    attach_open
+    test    rax, rax
+    jz      vea_fail
+    mov     r10d, dword ptr [rbp-32]
+    cmp     r10d, AG_PLAI2_LEN
+    jne     vea_fail
+    lea     r11, [ag_plai2]
+    xor     ecx, ecx
+vea_cmp2:
+    mov     dl, byte ptr [rax+rcx]
+    cmp     dl, byte ptr [r11+rcx]
+    jne     vea_fail
+    inc     ecx
+    cmp     ecx, AG_PLAI2_LEN
+    jb      vea_cmp2
+    lea     rcx, [vea_ok]
+    mov     edx, vea_ok_len
+    call    print_a
+    call    vault_lock
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+vea_fail:
+    lea     rcx, [vea_bad]
+    mov     edx, vea_bad_len
+    call    print_a
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_vaultexpattkat endp
 
 ; ===========================================================================
 ; M1 (master-vault federation): vault identity.  The machine-local keyring
@@ -6199,29 +6391,56 @@ ffbi_none:
     ret
 fed_find_by_id endp
 
-; fed_export(rcx = source body ptr {u32 count, entries}) -> eax = 0 / EXIT_*.
-;   Build a NEW vault from every entry in the source body, sealed under a fresh
-;   salt + the password in g_cfg_pass, written to g_cfg_in.  Clobbers the live vault
-;   globals (header/key/body); the caller must not need the source vault live after.
+; entry_copy_full(rcx = src entry ptr, rdx = dst ptr) -> eax = bytes written.
+;   Verbatim entry copy INCLUDING attachment fields - the 68-byte AttachRef (with the
+;   attachment's own key/nonce/id) travels, so the blob can be carried into the new
+;   file.  Same signature as entry_copy_filtered.
+entry_copy_full proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rdx           ; dst
+    mov     qword ptr [rbp-32], rcx           ; src
+    call    vault_entry_len                   ; rcx = src -> rax = len
+    mov     dword ptr [rbp-40], eax
+    mov     rcx, qword ptr [rbp-24]
+    mov     rdx, qword ptr [rbp-32]
+    mov     r8d, dword ptr [rbp-40]
+    call    copy_bytes
+    mov     eax, dword ptr [rbp-40]
+    FRAME_EPILOG
+    ret
+entry_copy_full endp
+
+; fed_export(rcx = source body ptr {u32 count, entries}, edx = carry) -> eax = 0/EXIT_*.
+;   Build a NEW vault from every entry in the source body, sealed under a fresh salt +
+;   the password in g_cfg_pass, written to g_cfg_in.
+;   carry=0: attachment fields are STRIPPED (portable text-only child vault); the
+;     attachment section is reset to empty.  The caller may lock the source first.
+;   carry=1: entries copied VERBATIM and the source's attachment context
+;     (g_attidx/g_filebuf/g_newatt) is KEPT live, so vault_seal_write copies every
+;     referenced blob into the new file (ct verbatim - keyed by the AttachRef's own
+;     key, so it still decrypts under the new vault).  The caller must NOT lock the
+;     source first (its attachment image must stay resident); fed_export frees the
+;     old body itself.  Either way this clobbers the live header/key/body.
 public fed_export
 fed_export proc frame
-    FRAME_PROLOG 64
+    FRAME_PROLOG 96                            ; locals -24..-72 all above the callee shadow
     mov     qword ptr [rbp-24], rcx           ; source body
-    mov     rcx, VAULT_BODY_MAX               ; allocate the new body first (before we
-    call    secmem_alloc                      ; overwrite g_body_ptr)
+    mov     dword ptr [rbp-72], edx           ; carry flag
+    mov     rcx, VAULT_BODY_MAX
+    call    secmem_alloc
     test    rax, rax
     jz      fx_oom
     mov     qword ptr [rbp-32], rax           ; new body
-    mov     dword ptr [rax], 0                ; entry_count = 0
+    mov     dword ptr [rax], 0
     mov     qword ptr [rbp-40], 4             ; new body_len
-    mov     r10, qword ptr [rbp-24]           ; source body
+    mov     r10, qword ptr [rbp-24]
     mov     eax, dword ptr [r10]
     mov     dword ptr [rbp-48], eax           ; source count
     add     r10, 4
     mov     qword ptr [rbp-56], r10           ; source entry cursor
-    mov     dword ptr [rbp-60], 0            ; i
+    mov     dword ptr [rbp-64], 0            ; i
 fx_loop:
-    mov     eax, dword ptr [rbp-60]
+    mov     eax, dword ptr [rbp-64]
     cmp     eax, dword ptr [rbp-48]
     jae     fx_built
     mov     rcx, qword ptr [rbp-56]           ; bounds: worst case = full src entry len
@@ -6231,9 +6450,15 @@ fx_loop:
     cmp     r8, VAULT_BODY_MAX
     ja      fx_adv                            ; no room -> stop copying (drop the rest)
     mov     rcx, qword ptr [rbp-56]           ; src entry
-    mov     rdx, qword ptr [rbp-32]           ; new body + len
+    mov     rdx, qword ptr [rbp-32]           ; dst = new body + len
     add     rdx, qword ptr [rbp-40]
-    call    entry_copy_filtered
+    cmp     dword ptr [rbp-72], 0
+    je      fx_filt
+    call    entry_copy_full                   ; carry: keep attachment fields
+    jmp     fx_added
+fx_filt:
+    call    entry_copy_filtered               ; v1: drop attachment fields
+fx_added:
     mov     r8d, eax
     add     qword ptr [rbp-40], r8
     mov     r10, qword ptr [rbp-32]
@@ -6242,9 +6467,15 @@ fx_adv:
     mov     rcx, qword ptr [rbp-56]
     call    vault_entry_len
     add     qword ptr [rbp-56], rax
-    inc     dword ptr [rbp-60]
+    inc     dword ptr [rbp-64]
     jmp     fx_loop
 fx_built:
+    mov     rcx, qword ptr [g_body_ptr]       ; free the old (source) body; its attachment
+    test    rcx, rcx                          ; image/index (g_filebuf/g_attidx) stay live for
+    jz      fx_hdr                            ; the carry seal below
+    mov     rdx, VAULT_BODY_MAX
+    call    secmem_free
+fx_hdr:
     mov     dword ptr [g_hdr+0], VAULT_MAGIC  ; fresh header
     mov     dword ptr [g_hdr+4], VAULT_VERSION
     mov     eax, dword ptr [g_cfg_t]
@@ -6279,9 +6510,12 @@ fx_kcv:
     mov     qword ptr [g_body_ptr], rax
     mov     rax, qword ptr [rbp-40]
     mov     qword ptr [g_body_len], rax
-    mov     qword ptr [g_att_total], 0        ; v1: no attachment section
+    cmp     dword ptr [rbp-72], 0             ; carry -> keep the source attachment context
+    jne     fx_seal
+    mov     qword ptr [g_att_total], 0        ; no-carry: emit an empty attachment section
     mov     dword ptr [g_newatt_n], 0
     mov     dword ptr [g_attidx_n], 0
+fx_seal:
     mov     qword ptr [g_save_counter], 0     ; fresh vault: first save = counter 1
     call    vault_seal_write
     FRAME_EPILOG
