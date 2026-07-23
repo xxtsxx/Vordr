@@ -205,12 +205,15 @@ House rules:
 master unlock → load the machine-local, TPM-bound, non-exportable record → open
 every foreign vault with its cached key.
 
-*Remaining M — all pixels/format, needs the display or format review:* **M3**
-(unified list — the foreign vaults now open as tabs; merging their entries into
-one list is display work), **M4** (mgmt screen to add/remove links, calls
-`fed_save_all`), **M5** (registry/TPM scoping — mostly done via the keyring),
-**M1.2 system items** (vault-body ID+name — a core on-disk-format change, do with
-review), **M6** export (entry selection + password prompt).
+*Remaining M — needs the display or format review:* **M3**/**M4** landed (see their
+notes); **M5** (registry/TPM scoping — mostly done via the keyring; the rollback-
+mirror-by-`vault_id` refinement rides with M1's pinned id), **M1** system items
+(vault-body ID+name — a core on-disk-format change, **do with review**; see the M1
+note), and the **M8 `federatetest`** union-enumeration probe (needs M1's system
+items to stand up). **M6 export/merge landed v1 headless** (see its note; the
+"and link it" + import UI and attachment carry are the follow-ups). Net: the M6
+headless core is the fully-automatable slice that landed; M1/M5/`federatetest`
+are the review-and-display-gated remainder.
 
 **Pre-v1.0 clean slate (2026-07-21).** Until v1.0 ships, all pre-existing vaults
 and Vordr builds are treated as discarded — **no migration, no back-compat
@@ -288,6 +291,20 @@ hold what *should* travel with the vault; the federation keyring (other vaults'
 keys, locators, membership) stays machine-local and never becomes a system item.
 
 ### M1. System items + vault identity/naming
+
+**NOT autonomously landable — needs review + a display (noted 2026-07-23).** A
+system item is an ordinary body entry, so adding one changes **`vault_count` for
+every vault** — which ripples through every count-based probe *and* would surface a
+phantom entry in the on-screen list unless the list builder excludes it. That
+"excluded from the user list" acceptance is **display-gated** (not headlessly
+verifiable), the pinned-ID change re-points `vault_id_of` (rippling into the landed
+M2 keyring / `idkat` / `vault_ctx_is_dup` / `fed_remember_open`), and the plan
+itself flags this "a core on-disk-format change, do with review." So it is deferred
+for a review pass rather than dropped into an automated run. The headlessly-provable
+slice when it is done: a `VF_SYSTEM`/`VF_SYS_NAME` entry whose 16-byte entry id is
+the pinned `vault_id`, round-tripping through reseal (extend `idkat`), plus a
+`vault_user_count()` that excludes it (KAT the predicate).
+
 1. **System items (the mechanism):** define a hidden entry class — an ordinary body
    entry carrying a reserved **`VF_SYSTEM`** marker field — that the list builder
    **excludes from the user list** and interprets as vault-level data. It is
@@ -458,6 +475,26 @@ close gap. Build + gate green.
    attachments), so export = "spin off a child vault" that round-trips losslessly.
    *Test:* `vaultexportkat` (headless) — export N entries + an attachment to a new
    vault, reopen, assert entries and attachment bytes match; re-merge is idempotent.
+
+**LANDED — v1 (2026-07-23), headless core, gate-green.** The engine is in vault.asm:
+- **`fed_export(rcx = source body)`** builds a fresh standalone `.vordr` from every
+  entry in the source body under a NEW salt + the password in `g_cfg_pass`, written
+  to `g_cfg_in` (mirrors `do_seed`'s header/`vk_derive`/`vk_kcv`/`vault_seal_write`).
+- **`fed_merge(rcx = source body)`** copies source entries into the live body,
+  deduped by the 16-byte **entry** id (`fed_find_by_id`), newer `modified` winning;
+  idempotent (a re-merge of the same body changes nothing). Caller reseals.
+- **`entry_copy_filtered`** does a raw-ish entry copy that **preserves
+  id16/created/modified** (not `vault_build_entry`, which mints new ones and would
+  break dedup).
+- Probe **`vaultexportkat`** (gated): seed 3 → export under a *different* password →
+  reopen → the 3 entry ids round-trip → merge back → 0 changes.
+- **Follow-ups (still open):** (1) **attachment carry** — v1 filters out
+  `VF_IMAGE`/`VF_FILE` fields so no dangling AttachRef ships; the blob ct is keyed by
+  its own per-attachment key in the AttachRef, so a later version can copy it verbatim
+  while the *source* image is the live `g_attidx` (do NOT reset the attachment globals
+  before the export seal), and `vaultexportkat` extends to assert the attachment bytes
+  round-trip. (2) **"and link it"** on export and the **link/merge import UI** are
+  GUI wiring (display-gated). (3) selected-subset export (v1 exports all entries).
 
 ### M7. Format definition (no migration — pre-v1.0 clean slate)
 1. **No migration, no back-compat.** Per the clean-slate note, pre-existing vaults
