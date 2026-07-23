@@ -775,6 +775,25 @@ save; clicking a row highlights its tile.
 Small visual/interaction fixes; all need a display to verify, so they ride with
 the R group. Each is independent and can ship together in one session.
 
+**LANDED (2026-07-23) — build-clean + gate-green, AWAITING an on-screen pass.** All
+five implemented (strict build 0 fatal / 0 dead; full gate green - the changes are
+GUI-only, so no headless probe covers them):
+- **R7.1** unlock-dialog theme cogwheel (id 990) removed (`unlock_proc`: the
+  `ghost_make`, the dispatch, `up_cyclescheme`, the orphaned `gl_t_theme`).
+- **R7.2** ghost-button hover fixed: `TRACKMOUSEEVENT.cbSize` was 16 (x86); on x64
+  it must be 24, so `TrackMouseEvent` had failed to arm `WM_MOUSELEAVE` and the halo
+  stuck. Root-cause fix.
+- **R7.3** unlock "Open read-only" `AUTOCHECKBOX` -> Fluent pill toggle matching the
+  TPM pill (`.rc` LTEXT + `BS_OWNERDRAW`; `theme_toggle(g_readonly)`; `up_ronly`
+  flips + repaints; `gui_unlock` no longer reads a checkbox).
+- **R7.4** standalone (dock-launched) pwgen action button reads **Copy** and copies to
+  the clipboard with auto-clear; field-launched keeps **Use**.
+- **R7.5** minimize/maximize/`IDC_V_LOCK`/hamburger `IDC_V_MENU` buttons removed; the
+  caption keeps only Close (dock reflows left of it); Ctrl+L still locks (id/dispatch
+  kept), X/Esc/idle lock to tray, and `IDC_T_SET` opens the settings overlay.
+
+The clauses below are the original spec (kept for the on-screen review checklist).
+
 1. **Remove the misplaced per-dialog theme cogwheel.** The id-990 `GLY_SETTINGS`
    "ghost-button foundation demo" that cycles the colour scheme (`unlock_proc`
    `up_init` → `up_cyclescheme`; check `create_proc`/`about_proc` for siblings) is
