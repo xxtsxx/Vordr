@@ -193,7 +193,6 @@ extern WTSRegisterSessionNotification:proc   ; wtsapi32: Win+L lock events
 extern WTSUnRegisterSessionNotification:proc
 extern MultiByteToWideChar:proc
 extern WideCharToMultiByte:proc
-extern IsDlgButtonChecked:proc
 extern EnableWindow:proc
 extern GetDlgItem:proc
 extern GetFocus:proc
@@ -224,7 +223,6 @@ extern MapDialogRect:proc
 extern SendMessageW:proc
 extern PostMessageW:proc
 extern SetWindowTextW:proc
-extern CheckDlgButton:proc
 extern GetDlgCtrlID:proc
 extern GetKeyState:proc
 extern SetWindowLongPtrW:proc
@@ -451,7 +449,8 @@ IDC_U_UNLOCK equ 105
 IDC_U_STATUS equ 106
 IDC_U_TPM    equ 107
 IDC_U_REMEMBER equ 108
-IDC_U_RONLY  equ 109                  ; E9: "Open read-only" checkbox
+IDC_U_RONLY  equ 109                  ; E9: "Open read-only" - a Fluent pill toggle (R7.3)
+IDC_U_RONLYL equ 110                  ; its label
 DLG_VAULT    equ 200
 IDC_V_LIST   equ 201
 IDC_V_TITLE  equ 202
@@ -760,6 +759,7 @@ WSTR t_trash,       <Move this entry to the trash? It can be restored for 30 day
 WSTR t_delforever,  <Permanently delete this entry? This cannot be undone.>
 WSTR t_notrash,     <There are no deleted items to recover.>
 WSTR t_recover_ttl, <Recover items>
+WSTR gt_copy,       <Copy>                   ; standalone-pwgen action button (R7.4)
 WSTR s_pickvault,   <Select or create a vault file first.>
 WSTR s_nopw,        <Enter the master password.>
 WSTR s_badpw,       <Password must be 1..1024 UTF-8 bytes.>
@@ -1062,7 +1062,6 @@ align 4
 g_so_ids    dd IDC_SO_PANEL, IDC_SO_EDIT, IDC_SO_LIST
 cls_tooltip label word
     dw 't','o','o','l','t','i','p','s','_','c','l','a','s','s','3','2', 0
-WSTR gl_t_theme, <Theme / colour scheme>
 WSTR gt_more, <More>
 WSTR gt_fav, <Favorite>
 WSTR gt_new, <New item>
@@ -1589,8 +1588,8 @@ gui_unlock proc frame
     FRAME_PROLOG 48
     mov     qword ptr [rbp-24], rcx
     mov     dword ptr [g_use_tpm], 0        ; password path (not the TPM shortcut)
-    WINCALL IsDlgButtonChecked, qword ptr [rbp-24], IDC_U_RONLY   ; E9: read-only mode
-    mov     dword ptr [g_readonly], eax     ; follows the "Open read-only" checkbox
+    ; R7.3: g_readonly is maintained live by the read-only pill toggle (up_ronly) and
+    ; the --ro launch flag, so there is no checkbox to read back here.
     cmp     dword ptr [g_vpath_set], 0
     jne     gu_havepath
     mov     rcx, qword ptr [rbp-24]
@@ -1880,9 +1879,19 @@ up_terase:
 up_tdraw:
     mov     r10, r9
     cmp     dword ptr [r10+4], IDC_U_PATH        ; storage-location button: icon + name
-    jne     up_tdraw_def
+    je      up_tdraw_path
+    cmp     dword ptr [r10+4], IDC_U_RONLY       ; R7.3: read-only = Fluent pill toggle
+    je      up_tdraw_ronly
+    jmp     up_tdraw_def
+up_tdraw_path:
     mov     rcx, r9
     call    gui_draw_storage
+    mov     eax, 1
+    jmp     up_ret
+up_tdraw_ronly:
+    mov     rcx, r9
+    mov     edx, dword ptr [g_readonly]
+    call    theme_toggle
     mov     eax, 1
     jmp     up_ret
 up_tdraw_def:
@@ -1898,11 +1907,8 @@ up_init:
     call    theme_attach
     mov     rcx, qword ptr [rbp-8]
     call    gui_set_winicon
-    mov     rcx, qword ptr [rbp-8]              ; ghost-button foundation demo (top-left glyph)
-    mov     edx, 990
-    mov     r8d, GLY_SETTINGS
-    lea     r9, [gl_t_theme]
-    call    ghost_make
+    ; R7.1: the misplaced per-dialog theme cogwheel (id 990) is gone - theme switching
+    ; lives in the settings menu (IDC_V_MTHEME) and the title-bar dock (IDC_T_SET).
     ; cue-banner label shown inside the (borderless) password box
     sub     rsp, 48
     mov     rcx, qword ptr [rbp-8]
@@ -1922,14 +1928,8 @@ up_init:
     call    SetDlgItemTextW
 up_init_x:
     add     rsp, 32
-    sub     rsp, 48                          ; E9: reflect the --ro launch flag into
-    mov     rcx, qword ptr [rbp-8]           ; the "Open read-only" checkbox
-    mov     edx, IDC_U_RONLY
-    mov     r8d, 0F1h                        ; BM_SETCHECK
-    mov     r9d, dword ptr [g_readonly]      ; BST_CHECKED(1) / BST_UNCHECKED(0)
-    mov     qword ptr [rsp+32], 0
-    call    SendDlgItemMessageW
-    add     rsp, 48
+    ; R7.3: the read-only pill paints straight from g_readonly (which the --ro launch
+    ; flag already set), so there is no checkbox to seed here.
     mov     eax, 1
     jmp     up_ret
 up_cmd:
@@ -1944,24 +1944,23 @@ up_cmd:
     je      up_unlock
     cmp     eax, IDC_U_PATH                 ; click the storage location -> browse
     je      up_pickvault
-    cmp     eax, 990                        ; ghost theme button -> cycle colour scheme
-    je      up_cyclescheme
+    cmp     eax, IDC_U_RONLY               ; R7.3: click the read-only pill -> flip + repaint
+    je      up_ronly
     cmp     eax, IDCANCEL
     je      up_cancel
     xor     eax, eax
     jmp     up_ret
-up_cyclescheme:
-    cmp     dword ptr [g_scheme_lock], 0    ; respect an HKLM-forced scheme
-    jne     up_cs_done
-    mov     eax, dword ptr [g_scheme]
-    inc     eax
-    cmp     eax, 9                          ; SCHEME_COUNT (theme.asm)
-    jb      @F
-    xor     eax, eax
-@@: mov     dword ptr [g_scheme], eax
+up_ronly:
+    xor     dword ptr [g_readonly], 1
+    sub     rsp, 48
     mov     rcx, qword ptr [rbp-8]
-    call    gui_apply_scheme
-up_cs_done:
+    mov     edx, IDC_U_RONLY
+    call    GetDlgItem
+    mov     rcx, rax
+    xor     edx, edx
+    mov     r8d, 1
+    call    InvalidateRect
+    add     rsp, 48
     mov     eax, 1
     jmp     up_ret
 up_pickvault:
@@ -5484,7 +5483,10 @@ gsc_move:
     or      eax, 100h                           ; set hover byte
     mov     edx, eax
     WINCALL SetWindowLongPtrW, qword ptr [rbp-24], GWL_USERDATA, rdx
-    mov     dword ptr [rbp-80], 16              ; TRACKMOUSEEVENT{cbSize,dwFlags,hwnd,hover}
+    mov     dword ptr [rbp-80], 24              ; TRACKMOUSEEVENT{cbSize,dwFlags,hwnd,hover}
+                                                ; cbSize = sizeof on x64 = 24 (NOT the x86 16:
+                                                ; a wrong cbSize makes TrackMouseEvent fail to
+                                                ; arm WM_MOUSELEAVE, so the hover halo stuck)
     mov     dword ptr [rbp-76], TME_LEAVE_
     mov     rax, qword ptr [rbp-24]
     mov     qword ptr [rbp-72], rax
@@ -14585,6 +14587,10 @@ pp_init:
     mov     rcx, qword ptr [rbp-8]
     mov     edx, IDOK
     call    theme_attach
+    cmp     dword ptr [g_pg_target], 0          ; R7.4: dock-launched (target = -1) copies to
+    jge     pp_init_lbl                          ;   the clipboard, so the button says "Copy";
+    WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDOK, addr gt_copy  ; field-launched keeps "Use"
+pp_init_lbl:
     mov     rcx, qword ptr [rbp-8]
     call    gui_set_winicon
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_PG_LEN, TBM_SETRANGE, 1, 400006h
@@ -14656,7 +14662,15 @@ pp_syncgen:
     mov     eax, 1
     jmp     pp_ret
 pp_use:
+    cmp     dword ptr [g_pg_target], 0           ; R7.4: dock-launched -> clipboard (auto-clear),
+    jl      pp_use_copy                          ;   field-launched -> write the secret row
     call    gui_pg_apply
+    jmp     pp_use_wipe
+pp_use_copy:
+    mov     rcx, qword ptr [rbp-8]               ; hdlg (arms the clip auto-clear timer)
+    lea     rdx, [g_genout_w]                    ; the generated password (wide)
+    call    gui_copy
+pp_use_wipe:
     lea     rcx, [g_genout]                      ; wipe plaintext scratch
     mov     edx, 260
     call    secure_zero

@@ -14,6 +14,7 @@
 #define IDC_U_TPM    107
 #define IDC_U_REMEMBER 108
 #define IDC_U_RONLY  109
+#define IDC_U_RONLYL 110
 #define DLG_VAULT    200
 #define IDC_V_LIST   201
 #define IDC_V_TITLE  202
@@ -144,7 +145,8 @@ BEGIN
     LTEXT           "Storage location:", -1, 12, 13, 66, 10
     CONTROL         "", IDC_U_PATH, "Button", BS_OWNERDRAW | WS_TABSTOP, 80, 9, 228, 16
     EDITTEXT        IDC_U_PW, 12, 40, 296, 11, ES_PASSWORD | ES_AUTOHSCROLL | NOT WS_BORDER, 0
-    AUTOCHECKBOX    "Open &read-only", IDC_U_RONLY, 12, 56, 140, 10
+    LTEXT           "Open read-only", IDC_U_RONLYL, 12, 55, 84, 10
+    PUSHBUTTON      "", IDC_U_RONLY, 98, 56, 20, 8, BS_OWNERDRAW | NOT WS_TABSTOP
     PUSHBUTTON      "Unlock", IDC_U_UNLOCK, 254, 70, 54, 18, BS_OWNERDRAW
     LTEXT           "", IDC_U_STATUS, 12, 74, 232, 24
 END
