@@ -522,6 +522,11 @@ a UI warning.
 
 ## P. Passkey (WebAuthn) support — new headline effort (2026-07-23)
 
+**Status: PARKED (2026-07-23).** Captured for a future release; no implementation
+work is in progress. Left here in full so it can be picked up later — resume at
+P1 (the ECDSA P-256 primitive) once the Decision-1 invocation-bridge choice is
+made with the user.
+
 Make Vordr a **passkey provider**: generate, store, and use FIDO2/WebAuthn
 discoverable credentials (passkeys) so it can stand in for a website's password
 with a phishing-resistant public-key login. A passkey is a per-relying-party key
