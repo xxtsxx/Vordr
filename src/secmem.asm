@@ -256,6 +256,9 @@ secmem_panic_wipe proc frame
     lea     rcx, [g_secret_w]
     mov     edx, 16384
     call    secure_zero
+    lea     rcx, [g_rowpw_w]                     ; reveal-overlay copy (locked in sec_lock_statics,
+    mov     edx, 512*2                           ;   wiped on normal teardown) - must wipe here too
+    call    secure_zero
     lea     rcx, [g_e_totp]
     mov     edx, 512
     call    secure_zero

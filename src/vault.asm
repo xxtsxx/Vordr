@@ -3511,6 +3511,7 @@ fed_export proc frame
     FRAME_PROLOG 96                            ; locals -24..-72 all above the callee shadow
     mov     qword ptr [rbp-24], rcx           ; source body
     mov     dword ptr [rbp-72], edx           ; carry flag
+    mov     qword ptr [rbp-32], 0             ; new body (0 until allocated; fx_oom frees it)
     mov     rcx, VAULT_BODY_MAX
     call    secmem_alloc
     test    rax, rax
@@ -3560,6 +3561,9 @@ fx_built:
     jz      fx_hdr                            ; the carry seal below
     mov     rdx, VAULT_BODY_MAX
     call    secmem_free
+    mov     qword ptr [g_body_ptr], 0         ; freed - null it now so a later fx_oom (RNG/KDF
+                                              ; failure) can't leave g_body_ptr dangling at
+                                              ; released pages (UAF / panic-wipe writes freed mem)
 fx_hdr:
     mov     dword ptr [g_hdr+0], VAULT_MAGIC  ; fresh header
     mov     dword ptr [g_hdr+4], VAULT_VERSION
@@ -3606,6 +3610,9 @@ fx_seal:
     FRAME_EPILOG
     ret
 fx_oom:
+    mov     rcx, qword ptr [rbp-32]           ; free the new body if allocated (null-safe +
+    mov     rdx, VAULT_BODY_MAX               ;   double-free-safe); on the alloc-fail path
+    call    secmem_free                       ;   [rbp-32]=0 so this no-ops
     mov     eax, EXIT_OOM
     FRAME_EPILOG
     ret
