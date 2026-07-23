@@ -33,7 +33,12 @@ rem Optional args (combinable):
 rem   build nohw   link WITHOUT /CETCOMPAT (software mitigations only)
 rem   build dbg    add startup breadcrumb trace + per-primitive debug dumps,
 rem                the `redteam` fault-injection self-test, and FF-code-in-exit
-rem                (0xFADE<code>) for the security test harness (tests\run_all.cmd)
+rem                (0xFADE<code>) for the security test harness (tests\run_all.cmd).
+rem                Implies probeio (dbg is the full test build).
+rem   build probeio  expose the path-taking diagnostic verbs (seedtest/atgen/
+rem                zitest/bktest/.../vaultexport*kat).  A plain release build
+rem                REFUSES them (they create/overwrite a file at a caller path);
+rem                the gate builds a probeio binary to run the roundtrip stage.
 rem   build guishow  debug-only: launch straight into the vault window (auto-open,
 rem                no secure desktop) instead of starting minimised to the tray, so
 rem                the GUI can be visually inspected.  NEVER ship this build.
@@ -45,7 +50,8 @@ set REPRO=0
 :argloop
 if "%1"=="" goto :doneargs
 if /i "%1"=="nohw" set GUARDFLAGS=
-if /i "%1"=="dbg" set ASMEXTRA=%ASMEXTRA% /DDBG_TRACE
+if /i "%1"=="dbg" set ASMEXTRA=%ASMEXTRA% /DDBG_TRACE /DPROBE_IO
+if /i "%1"=="probeio" set ASMEXTRA=%ASMEXTRA% /DPROBE_IO
 if /i "%1"=="guishow" set ASMEXTRA=%ASMEXTRA% /DDBG_SHOW
 if /i "%1"=="strict" set STRICT=1
 if /i "%1"=="release" set REPRO=1

@@ -167,6 +167,7 @@ CSTR msg_nocpu,    "error: CPU lacks required features (AES-NI, PCLMULQDQ, SSE4.
 CSTR fs_seedlabel, "fuzz seed: "       ; G7: precedes the decimal seed on stdout
 fs_nl db 13,10
 CSTR msg_badnum,   "error: numeric argument out of range",13,10
+CSTR msg_testverb, "error: that diagnostic takes a file path and is disabled in release builds (test/PROBE_IO builds only)",13,10
 CSTR msg_st_ok,    "all self-tests passed",13,10
 CSTR msg_st_fail,  "SELFTEST FAILURE",13,10
 gl_rand   db "  random     : "
@@ -1440,6 +1441,18 @@ dp_found:
     call    collect_options
     cmp     eax, EXIT_OK
     jne     dp_done                     ; validation failed; eax = exit code
+ifndef PROBE_IO
+    ; The shipped CLI is diagnostics-only and takes NO file path.  Every verb that
+    ; accepts a positional (pos_args >= 1) is a test probe that creates/overwrites a
+    ; file at a caller-given path (seedtest/atgen/zitest/bktest/.../vaultexport*kat) -
+    ; a data-loss footgun if aimed at a real vault.  Refuse them here unless this is a
+    ; PROBE_IO (or dbg) test build; collect_options only stashed the path pointer, so
+    ; nothing on disk has been touched yet.  redteam (also positional) is DBG_TRACE-
+    ; only, and dbg implies PROBE_IO, so this guard is inert in every test build.
+    mov     r10, qword ptr [rbp-24]
+    cmp     dword ptr [r10].CMDENT.pos_args, 0
+    jne     dp_testonly
+endif
     mov     r10, qword ptr [rbp-24]
     mov     rax, qword ptr [r10].CMDENT.handler
     CALL_GUARDED rax                    ; DLPV-checked indirect call
@@ -1452,6 +1465,14 @@ dp_found:
     mov     eax, dword ptr [rbp-32]     ; restore exit code
     jmp     dp_done
 
+ifndef PROBE_IO
+dp_testonly:
+    lea     rcx, [msg_testverb]
+    mov     edx, msg_testverb_len
+    call    print_err
+    mov     eax, EXIT_USAGE
+    jmp     dp_done
+endif
 dp_usage:
     lea     rcx, [msg_usage]
     mov     edx, msg_usage_len

@@ -8,10 +8,12 @@ rem              the process with a 0xFADExx fail-fast code (iat: raw AV).
 rem              Skipped with --quick.
 rem   build      release build via build.cmd strict (framecheck FATALs gate it)
 rem   selftest   bin\vordr.exe selftest must print "all self-tests passed"
-rem   roundtrip  headless probes: seedtest -> atgen -> zitest -> phtest ->
-rem              secscan -> lktest -> tmptest -> fztest -> trtest -> vfuzz ->
-rem              fuzzzip -> bktest -> mactest -> rbtest -> xctest -> reload ->
-rem              cowrite -> attfuzz -> healthkat -> pkat -> mvtest -> mvswitch -> avtest
+rem   roundtrip  builds a PROBE_IO binary (a plain release refuses the path-taking
+rem              verbs), then runs the headless probes: seedtest -> atgen -> zitest
+rem              -> phtest -> secscan -> secfreedup -> lktest -> tmptest -> fztest ->
+rem              trtest -> vfuzz -> fuzzzip -> jfuzz -> bktest -> mactest -> rbtest ->
+rem              xctest -> reload -> cowrite -> attfuzz -> zexcap -> healthkat ->
+rem              pkat -> kdfparam -> vaultexportkat -> vaultexpattkat
 rem
 rem Usage: tests\run_all.cmd [--quick]
 rem Exit:  0 = all stages passed, 1 = at least one FAIL (see the summary table).
@@ -102,6 +104,19 @@ rem -------------------------------------------------------------- roundtrip --
 call :now T0
 echo === stage: roundtrip (seedtest / atgen / zitest / phtest / secscan / secfreedup / tmptest / fztest / trtest / vfuzz / fuzzzip / jfuzz / bktest / mactest / rbtest / xctest / reload / attfuzz / zexcap / healthkat / pkat / kdfparam / vaultexportkat / vaultexpattkat) ===
 set RT=PASS
+
+rem --- data-loss guard: the RELEASE binary (still in bin\ from the build stage)
+rem     must REFUSE any path-taking diagnostic and touch no file on disk ---------
+del "%WORK%\guard.vault" >nul 2>nul
+bin\vordr.exe seedtest "%WORK%\guard.vault" > "%WORK%\guard.log" 2>&1
+if not errorlevel 1 ( echo   release-guard: FAIL ^(release accepted a path verb^) & set RT=FAIL )
+if exist "%WORK%\guard.vault" ( echo   release-guard: FAIL ^(path verb created a file^) & set RT=FAIL )
+if "!RT!"=="PASS" echo   release-guard: path-taking verbs refused in release - ok
+
+rem --- the path-taking probes are diagnostics-only; build a PROBE_IO binary to
+rem     exercise them (a plain release build refuses them, verified above) --------
+call .\build.cmd probeio strict > "%WORK%\build_probeio.log" 2>&1
+if errorlevel 1 ( echo   probeio build FAILED - see %WORK%\build_probeio.log & set RT=FAIL & goto :roundtrip_publish )
 
 bin\vordr.exe seedtest "%WORK%\rt.vault" > "%WORK%\seedtest.log" 2>&1
 if errorlevel 1 ( echo   seedtest: FAIL ^(exit !errorlevel!^) & set RT=FAIL )
@@ -205,6 +220,7 @@ if not "!errorlevel!"=="0" ( echo   vaultexportkat: FAIL ^(exit !errorlevel!, M6
 bin\vordr.exe vaultexpattkat "%WORK%\vea.vault" > "%WORK%\vaultexpattkat.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   vaultexpattkat: FAIL ^(exit !errorlevel!, M6 attachment carry^) & set RT=FAIL )
 
+:roundtrip_publish
 set R_ROUNDTRIP=!RT!
 call :now T1
 set /a T_ROUNDTRIP=!T1!-!T0!
@@ -233,6 +249,10 @@ if errorlevel 1 (
 )
 call :now T1
 set /a T_CRYPTODIFF=!T1!-!T0!
+
+rem --- restore a clean RELEASE binary in bin\ (roundtrip left a PROBE_IO build,
+rem     which exposes the path-taking verbs - never leave that as the artifact) --
+if "%R_BUILD%"=="PASS" call .\build.cmd strict > "%WORK%\build_restore.log" 2>&1
 
 rem ---------------------------------------------------------------- summary --
 :summary

@@ -4,9 +4,9 @@
 #   1. dbg build + all 8 redteam fault-injection cases (0xFADE fail-fast codes)
 #   2. strict release build (framecheck FATALs fail the build)
 #   3. selftest ("all self-tests passed")
-#   4. headless roundtrip: seedtest -> atgen -> zitest -> phtest -> secscan ->
-#      secfreedup -> lktest -> tmptest -> fztest -> trtest -> vfuzz -> fuzzzip ->
-#      bktest -> ... -> the mv*/`*kat` families -> avtest
+#   4. headless roundtrip: a PROBE_IO binary (a plain release refuses the path-
+#      taking verbs) runs seedtest -> atgen -> zitest -> ... -> bktest/mactest/
+#      rbtest/xctest/reload/cowrite -> ... -> vaultexportkat -> vaultexpattkat
 #   5. cryptodiff: tests\verify_crypto.py independently recomputes every crypto
 #      primitive (python stdlib + a self-validating pure-Python AES-256-GCM) and
 #      cross-checks the published FIPS/RFC/NIST vectors against `vordr katreport`.
