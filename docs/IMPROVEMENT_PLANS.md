@@ -169,7 +169,37 @@ House rules:
 
 ---
 
-## M. Master-vault federation (multi-vault redesign) — new headline effort (2026-07-21)
+## M. Master-vault federation (multi-vault redesign) — WITHDRAWN (2026-07-23)
+
+> **STATUS: WITHDRAWN / RIPPED OUT (2026-07-23).** Per the user, multi-vault support
+> "only causes problems for us" — Vordr is now **single-vault**: exactly one vault
+> open at a time. The entire federation/multi-vault machinery was removed in one pass:
+> the `VSLOT`/`g_vaults` context array, `vault_snapshot`/`restore`/`ctx_*`, the
+> availability retry state machine, the machine-local keyring (`keyring_*`,
+> `FEDLINK`/`FEDREC`, `fed_reset`/`slot`/`find`/`add`/`store`/`load`/`save_all`/
+> `unlock_all`/`unlock_master`/`fanout`/`remember_open`, `fed_machine_secret`), the
+> `reg_fed_*` registry I/O, `vault_id_of`/`vault_id_hdr`, the M4 management screen
+> (`DLG_FEDMGR`/`gui_open_fedmgr`/`fedmgr_proc`), the unified cross-vault list (M3,
+> `g_lxr`), and all their probes (`mvtest`/`mvname`/`mvremove`/`mvclose`/`mvlock`/
+> `mvstale`/`mvrecreate`/`mvswitch`/`avtest`/`idkat`/`kekkat`/`keyringkat`/`fedkat`/
+> `fedregkat`/`fmskat`/`fedapikat`/`fedfanout`). Gate stays green (redteam 8/8,
+> selftest, roundtrip, cryptodiff all PASS). Net ≈ −3.8k lines.
+>
+> **What SURVIVES the rip-out** (single-vault import/export, kept deliberately):
+> - **M6 — vault-as-export-format**, headless core: `fed_export`/`fed_merge`/
+>   `fed_find_by_id`/`entry_copy_filtered`/`entry_copy_full` (the names are historical;
+>   they operate on the one live vault, not a federation) + attachment carry. Probes
+>   `vaultexportkat`/`vaultexpattkat` still gate it. This is now "**import from a
+>   foreign `.vordr`**" and "**export to a child `.vordr`**", nothing federated.
+> - The search overlay keeps its ranked-result (`g_xr`) painter, now single-vault.
+>
+> **Everything below this banner is retained for historical record only** — M1–M5,
+> M7, M8 (`federatetest`) are all withdrawn. Do not implement them. The `M1`/`M5`
+> task entries are closed as obsolete; `M6` is the only M deliverable and it landed.
+
+---
+
+**[HISTORICAL — the plan as it stood 2026-07-22, before the rip-out.]**
 
 **Landed so far (2026-07-22) — the headless keyring core, gate-verified:**
 - **M1 identity:** `vault_id_of()` = `SHA-256(salt)[0..15]` (vault.asm). Probe: `idkat`.

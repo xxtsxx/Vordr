@@ -25,12 +25,9 @@ extern VirtualFree:proc
 extern VirtualLock:proc
 extern VirtualUnlock:proc
 extern secure_zero:proc
-extern vault_slots_lock:proc            ; vault.asm: VirtualLock the g_vaults table
-extern vault_panic_wipe_slots:proc      ; vault.asm: crash-path wipe of slot secrets
 extern GetCurrentProcess:proc
 extern SetProcessWorkingSetSizeEx:proc
 extern GetLastError:proc
-externdef g_vault_n:dword               ; vault.asm: number of open vaults (scales the WS min)
 extern rng_fill:proc
 extern VirtualQuery:proc
 extern print_a:proc
@@ -53,13 +50,12 @@ MEM_RESERVE         equ 2000h
 MEM_RELEASE         equ 8000h
 PAGE_READWRITE      equ 04h
 ; The working-set MIN is the hard lockable-page quota; it MUST exceed the total
-; VirtualLock'd bytes.  That's dominated by the decrypted body arena
-; (VAULT_BODY_MAX = 16 MiB) which is locked PER OPEN VAULT - so the reservation
-; must SCALE with g_vault_n, not be a fixed value (a fixed 32 MiB failed the 2nd
-; vault; found with Thomas).  sec_ws_grow computes it dynamically.
-SEC_BODY_RESERVE    equ 01000000h   ; 16 MiB per open vault (matches VAULT_BODY_MAX)
+; VirtualLock'd bytes.  That's dominated by the single decrypted body arena
+; (VAULT_BODY_MAX = 16 MiB).  Single-vault: exactly one body is ever resident, so
+; the reservation is a fixed statics + one body arena (sec_ws_grow).
+SEC_BODY_RESERVE    equ 01000000h   ; 16 MiB decrypted body (matches VAULT_BODY_MAX)
 SEC_WS_STATICS      equ 00800000h   ; 8 MiB for the static secret buffers + headroom
-SEC_WS_MAX          equ 10000000h   ; 256 MiB cap (>= MAX_VAULTS bodies + statics)
+SEC_WS_MAX          equ 10000000h   ; 256 MiB cap (ample for one body + statics)
 ; QUOTA_LIMITS_HARDWS_MIN_ENABLE (1) | QUOTA_LIMITS_HARDWS_MAX_DISABLE (8): make
 ; the MIN a HARD reservation so VirtualLock actually gets quota.  Plain
 ; SetProcessWorkingSetSize sets only a soft hint -> VirtualLock still fails
@@ -68,12 +64,12 @@ SEC_WS_FLAGS        equ 9
 
 ; Live-allocation registry: secmem_free is otherwise NOT double-free-safe (it
 ; secure_zeros BEFORE VirtualFree, so a second/stale free writes released pages ->
-; access violation).  Multi-vault teardown has repeatedly aliased a decrypted body
-; across contexts and freed it twice.  Rather than chase every producer, we make
-; the free site structurally safe: alloc records the base, free only proceeds for a
+; access violation).  A decrypted body can be aliased and freed twice (e.g. a
+; reseal that reuses a buffer).  Rather than chase every producer, we make the
+; free site structurally safe: alloc records the base, free only proceeds for a
 ; base that is CURRENTLY registered (and removes it).  A double/stale/foreign free
-; finds it absent and no-ops.  CAP >> the realistic live set (<= MAX_VAULTS bodies +
-; 1 KDF arena); overflow fails the alloc closed.  Single-threaded like the shadow
+; finds it absent and no-ops.  CAP >> the realistic live set (a body + a KDF
+; arena); overflow fails the alloc closed.  Single-threaded like the shadow
 ; stack: body allocs run on the GUI thread; the secdesk worker's KDF alloc happens
 ; while the main thread is blocked in WaitForSingleObject - never concurrent.
 SECREG_CAP          equ 64
@@ -174,12 +170,9 @@ sec_lock endp
 public sec_ws_grow
 sec_ws_grow proc frame
     FRAME_PROLOG 48
-    ; min = statics + (open vaults + 1) * 16 MiB, so every locked body arena fits
-    ; (the +1 reserves headroom for the vault currently being opened).  Clamp to
-    ; the max.  g_vault_n is 0 at startup -> 24 MiB, ample for the static buffers.
-    mov     eax, dword ptr [g_vault_n]
-    inc     eax
-    imul    eax, eax, SEC_BODY_RESERVE
+    ; min = statics + one 16 MiB body arena (single-vault: only one decrypted body is
+    ; ever resident).  Clamp to the max.
+    mov     eax, SEC_BODY_RESERVE
     add     eax, SEC_WS_STATICS
     cmp     eax, SEC_WS_MAX
     jbe     @F
@@ -233,7 +226,6 @@ sec_lock_statics proc frame
     lea     rcx, [g_totp_b32]
     mov     edx, 256
     call    sec_lock
-    call    vault_slots_lock                  ; the g_vaults table (slot master keys)
     FRAME_EPILOG
     ret
 sec_lock_statics endp
@@ -277,7 +269,6 @@ secmem_panic_wipe proc frame
     mov     rdx, qword ptr [g_body_len]
     call    secure_zero
 spw_slots:
-    call    vault_panic_wipe_slots            ; every open context's key + body
 spw_done:
     FRAME_EPILOG
     ret

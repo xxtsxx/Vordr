@@ -46,9 +46,6 @@ tpm_subkey label word
 ctr_subkey label word
     dw 'S','O','F','T','W','A','R','E', 5Ch, 'V','o','r','d','r', 5Ch
     dw 'R','o','l','l','b','a','c','k', 0
-fed_subkey label word                       ; M2: machine-local federation record
-    dw 'S','O','F','T','W','A','R','E', 5Ch, 'V','o','r','d','r', 5Ch
-    dw 'F','e','d','e','r','a','t','i','o','n', 0
 cfg_value label word
     dw 'v','a','u','l','t', 0
 cfg_fname label word
@@ -866,83 +863,5 @@ rcg_no:
     FRAME_EPILOG
     ret
 reg_ctr_get endp
-
-; ===========================================================================
-; M2: machine-local federation record, one REG_BINARY value under
-; HKCU\SOFTWARE\Vordr\Federation (value name = hashed master vault_id).
-;   reg_fed_set(rcx = value name, rdx = data ptr, r8d = len) -> eax = 1/0
-;   reg_fed_get(rcx = value name, rdx = outbuf, r8d = cap)   -> eax = bytes read
-;   reg_fed_del(rcx = value name) -> eax = 1
-; ===========================================================================
-public reg_fed_set
-reg_fed_set proc frame
-    FRAME_PROLOG 128
-    mov     qword ptr [rbp-32], rdx             ; data (saved before reg_hash_name)
-    mov     dword ptr [rbp-40], r8d             ; len
-    call    reg_hash_name
-    mov     qword ptr [rbp-24], rax
-    WINCALL RegCreateKeyExW, qword ptr [g_hkcu], addr fed_subkey, 0, 0, 0, \
-            KEY_WRITE, 0, addr g_cfg_khan, 0
-    test    eax, eax
-    jnz     rfs_fail
-    WINCALL RegSetValueExW, qword ptr [g_cfg_khan], qword ptr [rbp-24], 0, \
-            REG_BINARY, qword ptr [rbp-32], dword ptr [rbp-40]
-    mov     dword ptr [rbp-48], eax
-    WINCALL RegCloseKey, qword ptr [g_cfg_khan]
-    cmp     dword ptr [rbp-48], 0
-    jne     rfs_fail
-    mov     eax, 1
-    FRAME_EPILOG
-    ret
-rfs_fail:
-    xor     eax, eax
-    FRAME_EPILOG
-    ret
-reg_fed_set endp
-
-public reg_fed_get
-reg_fed_get proc frame
-    FRAME_PROLOG 96
-    mov     qword ptr [rbp-32], rdx             ; outbuf (saved before reg_hash_name)
-    mov     dword ptr [rbp-40], r8d             ; cap
-    call    reg_hash_name
-    mov     qword ptr [rbp-24], rax
-    WINCALL RegOpenKeyExW, qword ptr [g_hkcu], addr fed_subkey, 0, KEY_READ, \
-            addr g_cfg_khan
-    test    eax, eax
-    jnz     rfg_no
-    mov     eax, dword ptr [rbp-40]
-    mov     dword ptr [g_cfg_cb], eax
-    WINCALL RegQueryValueExW, qword ptr [g_cfg_khan], qword ptr [rbp-24], 0, 0, \
-            qword ptr [rbp-32], addr g_cfg_cb
-    mov     dword ptr [rbp-48], eax
-    WINCALL RegCloseKey, qword ptr [g_cfg_khan]
-    cmp     dword ptr [rbp-48], 0
-    jne     rfg_no
-    mov     eax, dword ptr [g_cfg_cb]
-    FRAME_EPILOG
-    ret
-rfg_no:
-    xor     eax, eax
-    FRAME_EPILOG
-    ret
-reg_fed_get endp
-
-public reg_fed_del
-reg_fed_del proc frame
-    FRAME_PROLOG 64
-    call    reg_hash_name
-    mov     qword ptr [rbp-24], rax
-    WINCALL RegOpenKeyExW, qword ptr [g_hkcu], addr fed_subkey, 0, KEY_WRITE, \
-            addr g_cfg_khan
-    test    eax, eax
-    jnz     rfd_done
-    WINCALL RegDeleteValueW, qword ptr [g_cfg_khan], qword ptr [rbp-24]
-    WINCALL RegCloseKey, qword ptr [g_cfg_khan]
-rfd_done:
-    mov     eax, 1
-    FRAME_EPILOG
-    ret
-reg_fed_del endp
 
 end
