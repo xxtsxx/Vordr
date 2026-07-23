@@ -202,8 +202,8 @@ crash_veh endp
 
 ; crash_dump() - best-effort crash breadcrumb: %TEMP%\vordr_crash.bin.  Runs
 ;   BEFORE the wipe/apology so the record survives even if a later containment
-;   step fails.  Release writes {code, addr, base, ExceptionInformation[0..1]}
-;   (24 bytes - no secret content); dbg builds append 10 GP registers for
+;   step fails.  Release writes {code, addr, base} (24 bytes - no secret content;
+;   the ExceptionInformation words are not recorded); dbg builds append 10 GP registers for
 ;   post-mortem analysis (registers may hold key/password bytes at a crash, so
 ;   they never ship in a release breadcrumb).
 crash_dump proc frame
