@@ -10550,6 +10550,13 @@ vp_size:
     call    gui_reflow
     mov     rcx, qword ptr [rbp-8]           ; keep the caption buttons right-aligned
     call    frame_layout
+    ; The title-strip dock/caption buttons are owner-draw children that MoveWindow
+    ; repositions by bit-blitting their pixels, then only re-invalidating the thin
+    ; newly-uncovered sliver.  On a slow multi-step drag that leaves each WM_DRAWITEM
+    ; painting only part of the glyph, so the Fluent icons tear into fragments and
+    ; the "+" loses its stem.  RDW_ALLCHILDREN forces a full repaint of every child
+    ; (whole glyph), not the blit-preserved copy, clearing the trails.
+    WINCALL RedrawWindow, qword ptr [rbp-8], 0, 0, 85h   ; INVALIDATE|ERASE|ALLCHILDREN
     xor     eax, eax
     jmp     vp_ret
 vp_searchfocus:
