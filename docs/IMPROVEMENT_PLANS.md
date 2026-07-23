@@ -114,9 +114,9 @@ group R that carry negligible visual risk. **R6-lite** — the E6 sidebar dot is
 now colour-coded red=weak / amber=stale via `vault_entry_stale` (same >365-day
 rule as `vault_health`, KAT'd in `healthkat`). **R5-lite** — the last vault the
 user opens is persisted (`reg_save_vault`) so startup reopens it. The pure-layout
-/ cross-entry-cache remainder (R1 virtual scroll, R2 command palette, R3 DPI
-retrofit, R4 tab decorations, R5 multi-vault tab-set, R6 reused dot + modeless
-dialog) stays deferred — its acceptance tests are visual and need a display.
+/ cross-entry-cache remainder (R2 command palette, R3 DPI retrofit, R4 tab
+decorations, R5 multi-vault tab-set, R6 reused dot + modeless dialog) stays
+deferred — its acceptance tests are visual and need a display.
 
 House rules:
 
@@ -499,8 +499,8 @@ M4). M7 is just the format-definition + docs that ride along with M1. M1/M2/M6/M
 are headlessly verifiable and should land build-green with KATs before the M3/M4
 display work. **Cross-group
 dependency:** M3 rewrites the list builder (`gui_poplist` → the merged XR fill) that
-**R1** (scroll), **R4** (sidebar niceties) and **R6** (health cache) all paint on —
-do M3 before investing in those R items, or they get built twice.
+**R4** (sidebar niceties) and **R6** (health cache) paint on — do M3 before
+investing in those R items, or they get built twice.
 
 **Resolved secondary calls (2026-07-21).** (a) **No master nesting** — a foreign
 vault cannot itself be a master (flat federation in v1); enforce and test. (b) Body
@@ -685,24 +685,14 @@ left for an environment where the window can be seen, rather than shipped
 build-green-but-unverified. The headlessly-safe slices are already done (R5-lite
 last-vault restore, R6-lite weak/stale tile dot — see the Done log). Sequence
 suggestion for the visual remainder: R3 (DPI, touches every painter — do it
-before adding more) → R1 (scroll) → R6/R4 (tile decorations, shared
-analysis/enumeration) → R2 (palette) → R5 (multi-vault tab-set restore).
+before adding more) → R6/R4 (tile decorations, shared analysis/enumeration) →
+R2 (palette) → R5 (multi-vault tab-set restore).
 
 Folded in from `docs/REDESIGN_PLAN.md` (the standalone doc was merged into
 this file and deleted). The redesign landed with merge 2c9f744: custom frame +
 title-bar search & dock, ghost buttons, resizable reflow, the B1–B3 IO
 contract, multi-vault contexts/tabs/cross-vault search, modular details pane
 (groups/spacers/templates), and Ctrl+K/N/G/L shortcuts. What remains:
-
-### R1. Detail-pane virtual scroll
-The scroll resurrection did not land with the merge. The reverted work is
-secured in-repo on branch `recovered-scroll` (18c747e virtual-scroll field
-list, b47fd3b drop the room cap); anchor reflow + elastic widths did land.
-
-1. Cherry-pick the two commits and adapt them to the anchor-reflow layout;
-   pixel viewport from the detail rect. *Test:* a 25-field entry on a 350-px
-   window scrolls cleanly with no paint over the header/dock; RUNALL.
-2. Precision wheel accumulation + PgUp/PgDn/Home/End when the pane has focus.
 
 ### R2. Command palette (Ctrl+Shift+P)
 The landed title-bar overlay in command mode (`>` prefix): Lock, Switch
