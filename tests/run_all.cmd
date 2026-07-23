@@ -100,7 +100,7 @@ set /a T_SELFTEST=!T1!-!T0!
 
 rem -------------------------------------------------------------- roundtrip --
 call :now T0
-echo === stage: roundtrip (seedtest / atgen / zitest / phtest / secscan / secfreedup / tmptest / fztest / trtest / vfuzz / fuzzzip / jfuzz / bktest / mactest / rbtest / xctest / reload / attfuzz / zexcap / healthkat / pkat / mvtest / mvswitch / mvname / mvremove / mvclose / mvlock / mvstale / kdfparam / idkat / kekkat / keyringkat / fedkat / fedregkat / fmskat / fedapikat / fedfanout / avtest) ===
+echo === stage: roundtrip (seedtest / atgen / zitest / phtest / secscan / secfreedup / tmptest / fztest / trtest / vfuzz / fuzzzip / jfuzz / bktest / mactest / rbtest / xctest / reload / attfuzz / zexcap / healthkat / pkat / mvtest / mvswitch / mvname / mvremove / mvclose / mvlock / mvstale / kdfparam / idkat / kekkat / keyringkat / fedkat / fedregkat / fmskat / fedapikat / fedfanout / avtest / vaultexportkat) ===
 set RT=PASS
 
 bin\vordr.exe seedtest "%WORK%\rt.vault" > "%WORK%\seedtest.log" 2>&1
@@ -230,6 +230,9 @@ if not "!errorlevel!"=="0" ( echo   fedfanout: FAIL ^(exit !errorlevel!, M2 fan-
 
 bin\vordr.exe avtest > "%WORK%\avtest.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   avtest: FAIL ^(exit !errorlevel!, availability retry state machine^) & set RT=FAIL )
+
+bin\vordr.exe vaultexportkat "%WORK%\ve.vault" > "%WORK%\vaultexportkat.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   vaultexportkat: FAIL ^(exit !errorlevel!, M6 vault export/merge round-trip^) & set RT=FAIL )
 
 set R_ROUNDTRIP=!RT!
 call :now T1

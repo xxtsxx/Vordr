@@ -284,6 +284,9 @@ fms_val     db 'm',0,'a',0,'c',0,'h',0,'i',0,'n',0,'e',0,'k',0,'e',0,'y',0,0,0  
 fms_kat_key db 'V',0,'o',0,'r',0,'d',0,'r',0,'-',0,'F',0,'B',0,'K',0,'A',0,'T',0,0,0  ; fmskat TPM key
 fms_kat_val db 'm',0,'k',0,'k',0,'a',0,'t',0,0,0        ; fmskat registry value
 ffk_seedpw  db "vordrtest",0                            ; fedfanout: seed vault password (9)
+vxk_exppw   db "exportpw2",0                             ; vaultexportkat: export vault password (9)
+CSTR vxk_ok,  "vaultexportkat: PASS (export round-trips ids; re-merge idempotent)",13,10
+CSTR vxk_bad, "vaultexportkat: FAIL",13,10
 CSTR bk_ok,  "bktest: PASS (bak1..3 rotated and bak1 opens)",13,10
 CSTR bk_bad, "bktest: FAIL (backup missing or unopenable)",13,10
 CSTR mt_ok,  "mactest: PASS (counter tamper rejected, restore opens)",13,10
@@ -308,6 +311,9 @@ align 16
 g_mvslot    db (sizeof VSLOT) dup (?)  ; multi-vault: one held vault-state slot (probe/scratch)
             even                       ; keep the wide scratch below 2-aligned
 g_mvnamebuf dw 8 dup (?)               ; cmd_mvname: scratch wide name source (probe)
+g_vx_pathb  dw MAX_PATH_CHARS dup (?)  ; vaultexportkat: export target path (source + ".exp")
+align 16
+g_vx_ids    db 16*16 dup (?)           ; vaultexportkat: snapshot of source entry ids
 align 16
 public g_vaults
 public g_vault_n
@@ -3455,6 +3461,188 @@ kdp_fail:
 cmd_kdfparam endp
 
 ; ===========================================================================
+; cmd_vaultexportkat <path> - M6 headless KAT for vault export + merge-import.
+;   Seeds a 3-entry source vault at <path>, exports every entry to a fresh vault
+;   <path>.exp under a DIFFERENT password, reopens it, and asserts the 3 entry ids
+;   round-trip (export preserved id16/created/modified, not a rebuild).  Then it
+;   snapshots the exported body and merges it back into itself, asserting ZERO
+;   changes (dedup by entry id is idempotent).  Uses m=8 KiB Argon2 for speed.
+;   Exit 0 = pass.  (No attachments in v1 - the entries are text-only.)
+; ===========================================================================
+LANDING_PAD
+public cmd_vaultexportkat
+cmd_vaultexportkat proc frame
+    FRAME_PROLOG 64
+    ; locals (all above the callee shadow): [rbp-24]=scratch1 [rbp-32]=scratch2 [rbp-40]=i
+    mov     dword ptr [g_cfg_t], 1            ; fast KDF for the gate (logic KAT, not a cost test)
+    mov     dword ptr [g_cfg_m], 8
+    lea     r10, [g_argv]                     ; source path A = argv[2]
+    mov     rax, qword ptr [r10+16]
+    mov     qword ptr [g_cfg_in], rax
+    mov     r10, rax                          ; build g_vx_pathb = A + ".exp"
+    lea     r11, [g_vx_pathb]
+    xor     r8d, r8d
+vxk_pcpy:
+    mov     ax, word ptr [r10+r8*2]
+    mov     word ptr [r11+r8*2], ax
+    test    ax, ax
+    jz      vxk_pdone
+    inc     r8d
+    cmp     r8d, MAX_PATH_CHARS-8
+    jb      vxk_pcpy
+vxk_pdone:
+    mov     word ptr [r11+r8*2], '.'
+    inc     r8d
+    mov     word ptr [r11+r8*2], 'e'
+    inc     r8d
+    mov     word ptr [r11+r8*2], 'x'
+    inc     r8d
+    mov     word ptr [r11+r8*2], 'p'
+    inc     r8d
+    mov     word ptr [r11+r8*2], 0
+    lea     r10, [ffk_seedpw]                 ; seed password -> g_cfg_pass
+    lea     r11, [g_cfg_pass]
+    xor     ecx, ecx
+vxk_pw1:
+    mov     al, byte ptr [r10+rcx]
+    mov     byte ptr [r11+rcx], al
+    test    al, al
+    jz      vxk_pw1d
+    inc     ecx
+    cmp     ecx, 32
+    jb      vxk_pw1
+vxk_pw1d:
+    mov     dword ptr [g_cfg_passlen], 9
+    mov     ecx, 3                            ; seed a 3-entry source vault
+    call    do_seed
+    test    eax, eax
+    mov     eax, 2
+    jnz     vxk_ret
+    call    vk_derive                         ; unlock A (re-derive + reuse key)
+    mov     dword ptr [g_reuse_key], 1
+    call    vault_unlock
+    mov     dword ptr [g_reuse_key], 0
+    test    eax, eax
+    mov     eax, 3
+    jnz     vxk_ret
+    call    vault_count
+    cmp     eax, 3
+    jne     vxk_fail
+    mov     dword ptr [rbp-40], 0            ; snapshot the 3 entry ids
+vxk_idsnap:
+    mov     eax, dword ptr [rbp-40]
+    cmp     eax, 3
+    jae     vxk_idsnapd
+    mov     ecx, eax
+    call    vault_entry_ptr
+    mov     r10d, dword ptr [rbp-40]
+    imul    r10d, r10d, 16
+    lea     r11, [g_vx_ids]
+    add     r11, r10
+    xor     ecx, ecx
+vxk_idcp:
+    mov     dl, byte ptr [rax+rcx]
+    mov     byte ptr [r11+rcx], dl
+    inc     ecx
+    cmp     ecx, 16
+    jb      vxk_idcp
+    inc     dword ptr [rbp-40]
+    jmp     vxk_idsnap
+vxk_idsnapd:
+    mov     rcx, VAULT_BODY_MAX               ; snapshot the source body to scratch1
+    call    secmem_alloc
+    test    rax, rax
+    jz      vxk_fail
+    mov     qword ptr [rbp-24], rax
+    mov     rcx, rax
+    mov     rdx, qword ptr [g_body_ptr]
+    mov     r8d, dword ptr [g_body_len]
+    call    copy_bytes
+    call    vault_lock                        ; free A body/image/key
+    lea     r10, [vxk_exppw]                  ; export password -> g_cfg_pass
+    lea     r11, [g_cfg_pass]
+    xor     ecx, ecx
+vxk_pw2:
+    mov     al, byte ptr [r10+rcx]
+    mov     byte ptr [r11+rcx], al
+    test    al, al
+    jz      vxk_pw2d
+    inc     ecx
+    cmp     ecx, 32
+    jb      vxk_pw2
+vxk_pw2d:
+    mov     dword ptr [g_cfg_passlen], 9
+    lea     rax, [g_vx_pathb]                 ; export target = B
+    mov     qword ptr [g_cfg_in], rax
+    mov     rcx, qword ptr [rbp-24]           ; source body scratch
+    call    fed_export
+    test    eax, eax
+    mov     eax, 4
+    jnz     vxk_ret
+    call    vault_lock                        ; free the new body + B image
+    call    vk_derive                         ; reopen B under the export password
+    mov     dword ptr [g_reuse_key], 1
+    call    vault_unlock
+    mov     dword ptr [g_reuse_key], 0
+    test    eax, eax
+    mov     eax, 5
+    jnz     vxk_ret
+    call    vault_count
+    cmp     eax, 3
+    jne     vxk_fail
+    mov     dword ptr [rbp-40], 0            ; assert the 3 ids survived the export
+vxk_idchk:
+    mov     eax, dword ptr [rbp-40]
+    cmp     eax, 3
+    jae     vxk_idchkd
+    mov     ecx, eax
+    call    vault_entry_ptr
+    mov     r10d, dword ptr [rbp-40]
+    imul    r10d, r10d, 16
+    lea     rdx, [g_vx_ids]
+    add     rdx, r10
+    mov     rcx, rax
+    mov     r8d, 16
+    call    ct_memcmp
+    test    eax, eax
+    jnz     vxk_fail
+    inc     dword ptr [rbp-40]
+    jmp     vxk_idchk
+vxk_idchkd:
+    mov     rcx, VAULT_BODY_MAX               ; idempotent re-merge: snapshot B, merge back
+    call    secmem_alloc
+    test    rax, rax
+    jz      vxk_fail
+    mov     qword ptr [rbp-32], rax
+    mov     rcx, rax
+    mov     rdx, qword ptr [g_body_ptr]
+    mov     r8d, dword ptr [g_body_len]
+    call    copy_bytes
+    mov     rcx, qword ptr [rbp-32]
+    call    fed_merge
+    test    eax, eax                          ; changed count must be 0 (idempotent)
+    jnz     vxk_fail
+    call    vault_count
+    cmp     eax, 3
+    jne     vxk_fail
+    lea     rcx, [vxk_ok]
+    mov     edx, vxk_ok_len
+    call    print_a
+    call    vault_lock
+    xor     eax, eax
+vxk_ret:
+    FRAME_EPILOG
+    ret
+vxk_fail:
+    lea     rcx, [vxk_bad]
+    mov     edx, vxk_bad_len
+    call    print_a
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_vaultexportkat endp
+
+; ===========================================================================
 ; M1 (master-vault federation): vault identity.  The machine-local keyring
 ; keys foreign vaults by a 16-byte vault_id.  It is derived from the header
 ; salt - SHA-256(salt)[0..15] - which is stable (the salt is fixed at vault
@@ -5907,6 +6095,262 @@ vrs_ro:
     FRAME_EPILOG
     ret
 vault_reseal endp
+
+; ===========================================================================
+; M6. Vault export / merge-import (headless core).
+;   Export = seal a chosen set of entries into a fresh standalone .vordr with its
+;   own new salt + password (a portable child vault).  Merge-import = copy entries
+;   from a decrypted source body into the live vault, deduped by the 16-byte entry
+;   id (newer `modified` wins), so a re-merge is idempotent.  Both PRESERVE each
+;   entry's id16/created/modified (raw-ish copy, not a rebuild).
+;   v1 does NOT carry attachments: an entry's VF_IMAGE/VF_FILE fields are filtered
+;   out so the copy never leaves a dangling AttachRef (the blob lives in the source
+;   file's section).  Attachment carry is a documented M6 follow-up - the blob ct is
+;   keyed by its own per-attachment key in the AttachRef, so a later version can copy
+;   it verbatim while the source image is the live g_attidx.
+; ===========================================================================
+
+; entry_copy_filtered(rcx = src entry ptr, rdx = dst ptr) -> eax = bytes written.
+;   Copies the 36-byte entry header (id16/created/modified) verbatim, then every
+;   field EXCEPT attachment kinds (VF_IMAGE/VF_FILE), patching the destination
+;   field_count.  Call-free (no shadow-region hazard); leaf.
+entry_copy_filtered proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-32], rdx           ; dst base
+    xor     r8d, r8d                          ; header: 36 bytes src->dst
+ecf_hc:
+    mov     al, byte ptr [rcx+r8]
+    mov     byte ptr [rdx+r8], al
+    inc     r8d
+    cmp     r8d, 36
+    jb      ecf_hc
+    mov     r10, rcx                          ; src field cursor
+    mov     r9d, dword ptr [r10+32]           ; src field_count
+    add     r10, 36
+    mov     r11, rdx                          ; dst field cursor
+    add     r11, 36
+    mov     dword ptr [rbp-24], 0             ; kept field count
+ecf_loop:
+    test    r9d, r9d
+    jz      ecf_done
+    movzx   eax, word ptr [r10]              ; field type
+    mov     ecx, eax
+    and     ecx, VF_KINDMASK                  ; base kind
+    mov     r8d, dword ptr [r10+2]           ; field value len
+    add     r8d, 6                            ; + {u16 type, u32 len} header = total bytes
+    cmp     ecx, VF_IMAGE
+    je      ecf_adv                           ; attachment field -> drop (don't copy)
+    cmp     ecx, VF_FILE
+    je      ecf_adv
+    xor     ecx, ecx                          ; copy r8d bytes r10 -> r11
+ecf_cp:
+    cmp     ecx, r8d
+    jae     ecf_cpd
+    mov     al, byte ptr [r10+rcx]
+    mov     byte ptr [r11+rcx], al
+    inc     ecx
+    jmp     ecf_cp
+ecf_cpd:
+    add     r11, r8                           ; advance dst
+    inc     dword ptr [rbp-24]                ; kept++
+ecf_adv:
+    add     r10, r8                           ; advance src (valid on the skip path too)
+    dec     r9d
+    jmp     ecf_loop
+ecf_done:
+    mov     r10, qword ptr [rbp-32]           ; patch dst field_count
+    mov     eax, dword ptr [rbp-24]
+    mov     dword ptr [r10+32], eax
+    mov     rax, r11
+    sub     rax, qword ptr [rbp-32]           ; bytes written
+    FRAME_EPILOG
+    ret
+entry_copy_filtered endp
+
+; fed_find_by_id(rcx = 16-byte id ptr) -> eax = index of that entry in the live body,
+;   or -1 if absent.
+fed_find_by_id proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx           ; wanted id
+    call    vault_count
+    mov     dword ptr [rbp-28], eax
+    mov     dword ptr [rbp-32], 0             ; i
+ffbi_loop:
+    mov     eax, dword ptr [rbp-32]
+    cmp     eax, dword ptr [rbp-28]
+    jae     ffbi_none
+    mov     ecx, eax
+    call    vault_entry_ptr
+    mov     rcx, rax
+    mov     rdx, qword ptr [rbp-24]
+    mov     r8d, 16
+    call    ct_memcmp
+    test    eax, eax
+    jz      ffbi_found
+    inc     dword ptr [rbp-32]
+    jmp     ffbi_loop
+ffbi_found:
+    mov     eax, dword ptr [rbp-32]
+    FRAME_EPILOG
+    ret
+ffbi_none:
+    mov     eax, -1
+    FRAME_EPILOG
+    ret
+fed_find_by_id endp
+
+; fed_export(rcx = source body ptr {u32 count, entries}) -> eax = 0 / EXIT_*.
+;   Build a NEW vault from every entry in the source body, sealed under a fresh
+;   salt + the password in g_cfg_pass, written to g_cfg_in.  Clobbers the live vault
+;   globals (header/key/body); the caller must not need the source vault live after.
+public fed_export
+fed_export proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx           ; source body
+    mov     rcx, VAULT_BODY_MAX               ; allocate the new body first (before we
+    call    secmem_alloc                      ; overwrite g_body_ptr)
+    test    rax, rax
+    jz      fx_oom
+    mov     qword ptr [rbp-32], rax           ; new body
+    mov     dword ptr [rax], 0                ; entry_count = 0
+    mov     qword ptr [rbp-40], 4             ; new body_len
+    mov     r10, qword ptr [rbp-24]           ; source body
+    mov     eax, dword ptr [r10]
+    mov     dword ptr [rbp-48], eax           ; source count
+    add     r10, 4
+    mov     qword ptr [rbp-56], r10           ; source entry cursor
+    mov     dword ptr [rbp-60], 0            ; i
+fx_loop:
+    mov     eax, dword ptr [rbp-60]
+    cmp     eax, dword ptr [rbp-48]
+    jae     fx_built
+    mov     rcx, qword ptr [rbp-56]           ; bounds: worst case = full src entry len
+    call    vault_entry_len
+    mov     r8, qword ptr [rbp-40]
+    add     r8, rax
+    cmp     r8, VAULT_BODY_MAX
+    ja      fx_adv                            ; no room -> stop copying (drop the rest)
+    mov     rcx, qword ptr [rbp-56]           ; src entry
+    mov     rdx, qword ptr [rbp-32]           ; new body + len
+    add     rdx, qword ptr [rbp-40]
+    call    entry_copy_filtered
+    mov     r8d, eax
+    add     qword ptr [rbp-40], r8
+    mov     r10, qword ptr [rbp-32]
+    inc     dword ptr [r10]                   ; entry_count++
+fx_adv:
+    mov     rcx, qword ptr [rbp-56]
+    call    vault_entry_len
+    add     qword ptr [rbp-56], rax
+    inc     dword ptr [rbp-60]
+    jmp     fx_loop
+fx_built:
+    mov     dword ptr [g_hdr+0], VAULT_MAGIC  ; fresh header
+    mov     dword ptr [g_hdr+4], VAULT_VERSION
+    mov     eax, dword ptr [g_cfg_t]
+    mov     dword ptr [g_hdr+VH_T], eax
+    mov     eax, dword ptr [g_cfg_m]
+    mov     dword ptr [g_hdr+VH_M], eax
+    mov     dword ptr [g_hdr+VH_LANES], 1
+    lea     rcx, [g_hdr+VH_SALT]
+    mov     edx, 32
+    call    rng_fill
+    test    eax, eax
+    jz      fx_oom
+    lea     rcx, [g_hdr+VH_NONCE]
+    mov     edx, 12
+    call    rng_fill
+    test    eax, eax
+    jz      fx_oom
+    call    vk_derive                         ; new key from g_cfg_pass
+    test    eax, eax
+    jnz     fx_oom
+    call    vk_kcv
+    lea     r10, [g_sha32]
+    lea     r9, [g_hdr+VH_KCV]
+    xor     r8d, r8d
+fx_kcv:
+    mov     al, byte ptr [r10+r8]
+    mov     byte ptr [r9+r8], al
+    inc     r8d
+    cmp     r8d, KCV_LEN
+    jb      fx_kcv
+    mov     rax, qword ptr [rbp-32]           ; adopt the new body
+    mov     qword ptr [g_body_ptr], rax
+    mov     rax, qword ptr [rbp-40]
+    mov     qword ptr [g_body_len], rax
+    mov     qword ptr [g_att_total], 0        ; v1: no attachment section
+    mov     dword ptr [g_newatt_n], 0
+    mov     dword ptr [g_attidx_n], 0
+    mov     qword ptr [g_save_counter], 0     ; fresh vault: first save = counter 1
+    call    vault_seal_write
+    FRAME_EPILOG
+    ret
+fx_oom:
+    mov     eax, EXIT_OOM
+    FRAME_EPILOG
+    ret
+fed_export endp
+
+; fed_merge(rcx = source body ptr) -> eax = number of entries added or updated.
+;   Merge every source entry into the live body, deduped by the 16-byte entry id:
+;   an id already present is updated only if the source's `modified` is newer, else
+;   skipped.  Attachments filtered (v1).  The caller reseals.  Idempotent.
+public fed_merge
+fed_merge proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx           ; source body
+    mov     dword ptr [rbp-28], 0             ; changed count
+    mov     r10, rcx
+    mov     eax, dword ptr [r10]
+    mov     dword ptr [rbp-32], eax           ; source count
+    add     r10, 4
+    mov     qword ptr [rbp-40], r10           ; source entry cursor
+    mov     dword ptr [rbp-44], 0             ; i
+fm_loop:
+    mov     eax, dword ptr [rbp-44]
+    cmp     eax, dword ptr [rbp-32]
+    jae     fm_done
+    mov     rcx, qword ptr [rbp-40]           ; src entry (id at +0)
+    call    fed_find_by_id
+    cmp     eax, -1
+    je      fm_append
+    mov     dword ptr [rbp-48], eax           ; dest idx
+    mov     ecx, eax
+    call    vault_entry_ptr                   ; rax = dest entry
+    mov     r10, qword ptr [rbp-40]           ; src entry
+    mov     r8, qword ptr [r10+24]           ; src modified
+    cmp     r8, qword ptr [rax+24]           ; vs dest modified
+    jbe     fm_next                           ; src not newer -> keep dest, skip
+    mov     ecx, dword ptr [rbp-48]           ; src newer -> remove dest then append
+    call    vault_remove_at
+fm_append:
+    mov     rcx, qword ptr [rbp-40]           ; bounds: room for the full src entry
+    call    vault_entry_len
+    mov     r8, qword ptr [g_body_len]
+    add     r8, rax
+    cmp     r8, VAULT_BODY_MAX
+    ja      fm_next
+    mov     rcx, qword ptr [rbp-40]
+    mov     rdx, qword ptr [g_body_ptr]
+    add     rdx, qword ptr [g_body_len]
+    call    entry_copy_filtered
+    mov     r8d, eax
+    add     qword ptr [g_body_len], r8
+    mov     r10, qword ptr [g_body_ptr]
+    inc     dword ptr [r10]
+    inc     dword ptr [rbp-28]                ; changed++
+fm_next:
+    mov     rcx, qword ptr [rbp-40]
+    call    vault_entry_len
+    add     qword ptr [rbp-40], rax
+    inc     dword ptr [rbp-44]
+    jmp     fm_loop
+fm_done:
+    mov     eax, dword ptr [rbp-28]
+    FRAME_EPILOG
+    ret
+fed_merge endp
 
 ; vault_count() -> eax = number of entries (0 if locked).  Leaf.
 public vault_count
