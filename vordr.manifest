@@ -3,6 +3,12 @@
   <application xmlns="urn:schemas-microsoft-com:asm.v3">
     <windowsSettings>
       <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+      <!-- GDI Scaling: the whole UI is GDI owner-draw (DrawTextW glyphs, FillRect
+           cards, RoundRect). The app stays DPI-unaware (fixed-pixel layout designed
+           for 96 DPI), but on a >100% display Windows renders the GDI primitives at
+           physical resolution instead of bitmap-stretching a 96-DPI frame - so text
+           and Fluent icons stay crisp with no layout rewrite. No-op at 100%. -->
+      <gdiScaling xmlns="http://schemas.microsoft.com/SMI/2017/WindowsSettings">true</gdiScaling>
     </windowsSettings>
   </application>
   <dependency>
