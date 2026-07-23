@@ -1,5 +1,9 @@
 # Vordr Assurance Report
 
+> A one-page visual summary of this report is in [`assurance.html`](assurance.html)
+> (open it in a browser) — the gate stages, crypto-check counts, memory-safety
+> controls, findings, and the vault export/import round-trips at a glance.
+
 **Scope:** how Vordr's quality and security claims are *proven*, and how an
 independent auditor reproduces every proof from a clean checkout. Nothing here
 asks you to trust the authors — each claim below names the mechanism, the test
