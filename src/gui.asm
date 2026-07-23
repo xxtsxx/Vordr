@@ -333,15 +333,10 @@ HTCLIENT            equ 1
 WM_NCHITTEST_       equ 84h
 HTCAPTION           equ 2
 DWLP_MSGRESULT_     equ 0
-SW_MINIMIZE_        equ 6
-SW_MAXIMIZE_        equ 3
-SW_RESTORE_         equ 9
 SWP_FRAME_          equ 16h              ; SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE
 SWP_RAISE_          equ 13h              ; SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE (z-order to HWND_TOP)
 TBAR_H              equ 32               ; custom title-bar strip height (px)
-CAPBTN_W            equ 44               ; caption (min/max/close) button width
-IDC_T_MIN           equ 290             ; caption: minimize
-IDC_T_MAX           equ 291             ; caption: maximize / restore
+CAPBTN_W            equ 44               ; caption (close) button width
 IDC_T_CLOSE         equ 292             ; caption: close
 IDC_T_NEW           equ 293             ; dock: new item
 IDC_T_GEN           equ 294             ; dock: password generator
@@ -470,7 +465,6 @@ IDC_V_TOTPBAR equ 215
 IDC_V_TOTP_WINDOW equ 30                   ; TOTP step (seconds) - progress denom
 IDC_V_TKEY   equ 227
 IDC_V_TKEYREVEAL equ 229
-IDC_V_MENU   equ 216
 EM_SETPASSWORDCHAR equ 0CCh
 SECRET_MASK  equ 2022h                ; bullet mask char for the secret field
 IDC_V_MBACK  equ 217
@@ -970,11 +964,6 @@ WSTR cue_xppw2,      <Confirm password>
 WSTR cue_ippw,       <Workbook password>
 WSTR imp_pw_title,   <Import from Excel>
 WSTR imp_pw_empty,   <Please enter the workbook password.>
-; burger / close glyphs for the settings button (wide)
-wb_menu label word
-    dw 2630h, 0                                  ; trigram for heaven (hamburger)
-wb_close label word
-    dw 2715h, 0                                  ; multiplication X
 wb_add label word
     dw 002Bh, 0                                  ; +  (add)
 wb_addf label word
@@ -1068,8 +1057,6 @@ WSTR gt_new, <New item>
 WSTR gt_edit, <Edit entry>
 WSTR gt_rem, <Delete entry>
 WSTR gt_gen, <Generate password>
-WSTR gt_min, <Minimize>
-WSTR gt_max, <Maximize>
 WSTR gt_close, <Close>
 WSTR gt_settings, <Settings>
 WSTR w_fm_master, <Master >          ; M4 mgmt-list status prefixes (count appended)
@@ -1150,8 +1137,7 @@ g_anchor_def label dword
     dd IDC_V_ADDFIELD, ANCH_BOTTOM
     dd IDC_V_CANCEL,   ANCH_RIGHT or ANCH_BOTTOM
     dd IDC_V_SAVE,     ANCH_RIGHT or ANCH_BOTTOM
-    dd IDC_V_LOCK,     ANCH_RIGHT or ANCH_BOTTOM
-ANCHOR_N equ 13
+ANCHOR_N equ 12
 tag_xw label word
     dw 0D7h, 0                             ; multiplication sign, used as the tag 'x'
 verb_open label word
@@ -1263,8 +1249,8 @@ g_empty_w label word
 align 4
 g_vault_ids label dword
     dd IDC_V_LIST, IDC_V_TITLE
-    dd IDC_V_ADDFIELD, IDC_V_SAVE, IDC_V_LOCK
-VAULT_ID_COUNT equ 5
+    dd IDC_V_ADDFIELD, IDC_V_SAVE
+VAULT_ID_COUNT equ 4
 g_menu_ids label dword ; controls menu IDs which are hidden and displayed between settings and main screen.
     dd IDC_V_MBACK, IDC_V_MTITLE, IDC_V_MPOLL, IDC_V_MLENL, IDC_V_MLEN
     dd IDC_V_MCLSL, IDC_V_MCLS, IDC_V_MTPM, IDC_V_MTPML, IDC_V_MTPMINFO
@@ -9650,7 +9636,6 @@ mo_cls_ok:
     xor     eax, 1
     mov     edx, eax
     call    EnableWindow
-    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_MENU, addr wb_close
     mov     dword ptr [g_menu_open], 1
     mov     ecx, 1                            ; opaque backdrop in theme_paint
     call    theme_overlay
@@ -9680,7 +9665,6 @@ gui_menu_close proc frame
     mov     rcx, qword ptr [rbp-24]
     mov     edx, dword ptr [g_editmode]
     call    gui_set_editmode
-    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_MENU, addr wb_menu
     mov     dword ptr [g_menu_open], 0
     xor     ecx, ecx
     call    theme_overlay
@@ -9919,19 +9903,10 @@ frame_layout proc frame
     mov     dword ptr [rbp-56], eax
     WINCALL GetDlgItem, qword ptr [rbp-24], IDC_T_CLOSE
     WINCALL MoveWindow, rax, dword ptr [rbp-56], 0, CAPBTN_W, TBAR_H, 1
-    mov     eax, dword ptr [rbp-52]            ; xMax = W - 2*CAPBTN_W
-    sub     eax, CAPBTN_W*2
-    mov     dword ptr [rbp-56], eax
-    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_T_MAX
-    WINCALL MoveWindow, rax, dword ptr [rbp-56], 0, CAPBTN_W, TBAR_H, 1
-    mov     eax, dword ptr [rbp-52]            ; xMin = W - 3*CAPBTN_W
-    sub     eax, CAPBTN_W*3
-    mov     dword ptr [rbp-56], eax
-    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_T_MIN
-    WINCALL MoveWindow, rax, dword ptr [rbp-56], 0, CAPBTN_W, TBAR_H, 1
-    ; dock: New / Generate / Settings, left of the caption buttons
-    mov     eax, dword ptr [rbp-52]            ; dock right edge = xMin
-    sub     eax, CAPBTN_W*3
+    ; R7.5: min/max buttons removed - the dock now sits directly left of Close.
+    ; dock: New / Generate / Settings, left of the (single) caption button
+    mov     eax, dword ptr [rbp-52]            ; dock right edge = xClose = W - CAPBTN_W
+    sub     eax, CAPBTN_W
     mov     dword ptr [rbp-60], eax
     mov     eax, dword ptr [rbp-60]            ; Settings = edge - DOCKBTN_W
     sub     eax, DOCKBTN_W
@@ -9995,16 +9970,7 @@ frame_maxinfo endp
 frame_build proc frame
     FRAME_PROLOG 128                            ; room for the 9-arg mk_ctl spill
     mov     qword ptr [rbp-24], rcx
-    mov     rcx, qword ptr [rbp-24]
-    mov     edx, IDC_T_MIN
-    mov     r8d, GLY_MIN
-    lea     r9, [gt_min]
-    call    ghost_make
-    mov     rcx, qword ptr [rbp-24]
-    mov     edx, IDC_T_MAX
-    mov     r8d, GLY_MAX
-    lea     r9, [gt_max]
-    call    ghost_make
+    ; R7.5: no minimize/maximize caption buttons - only the close glyph remains.
     mov     rcx, qword ptr [rbp-24]
     mov     edx, IDC_T_CLOSE
     mov     r8d, GLY_CLOSE
@@ -10855,21 +10821,6 @@ vp_size:
     call    frame_layout
     xor     eax, eax
     jmp     vp_ret
-vp_min:
-    WINCALL ShowWindow, qword ptr [rbp-8], SW_MINIMIZE_
-    xor     eax, eax
-    jmp     vp_ret
-vp_maxtoggle:
-    WINCALL IsZoomed, qword ptr [rbp-8]
-    test    eax, eax
-    jz      vp_domax
-    WINCALL ShowWindow, qword ptr [rbp-8], SW_RESTORE_
-    xor     eax, eax
-    jmp     vp_ret
-vp_domax:
-    WINCALL ShowWindow, qword ptr [rbp-8], SW_MAXIMIZE_
-    xor     eax, eax
-    jmp     vp_ret
 vp_searchfocus:
     mov     rcx, qword ptr [rbp-8]           ; open the blended search overlay
     call    search_overlay_open
@@ -11272,7 +11223,6 @@ vp_init:
     mov     r8d, MENU_ID_COUNT
     mov     r9d, SW_HIDE
     call    gui_show_ids
-    WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_MENU, addr wb_menu
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_ADD, addr wb_add
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_EDIT, addr wb_edit
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_REMOVE, addr wb_rem
@@ -11396,12 +11346,8 @@ vp_cmd_disp:
     jnz     vp_handled                        ;   an edit's stray notifs (EN_UPDATE, EN_MAXTEXT,
     jmp     vp_dyn                            ;   ...) must never fire a row button action
 vp_cmd_fixed:
-    cmp     eax, IDC_T_CLOSE                  ; custom caption buttons
+    cmp     eax, IDC_T_CLOSE                  ; custom caption button (only Close remains)
     je      vp_close
-    cmp     eax, IDC_T_MIN
-    je      vp_min
-    cmp     eax, IDC_T_MAX
-    je      vp_maxtoggle
     cmp     eax, IDC_T_SEARCH                 ; title-bar search pill -> focus the search box
     je      vp_searchfocus
     cmp     eax, IDC_T_NEW                    ; title-bar control dock
@@ -11432,10 +11378,8 @@ vp_cmd_fixed:
     je      vp_remove
     cmp     eax, IDC_V_DONE
     je      vp_done
-    cmp     eax, IDC_V_LOCK
+    cmp     eax, IDC_V_LOCK                   ; no Lock button, but Ctrl+L still posts this
     je      vp_lock
-    cmp     eax, IDC_V_MENU
-    je      vp_menu
     cmp     eax, IDC_V_MTHEME
     je      vp_theme
     cmp     eax, IDC_V_MEXPORT
