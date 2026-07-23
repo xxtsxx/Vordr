@@ -3872,7 +3872,12 @@ gef_field endp
 ; gui_lb_seldata(rcx = hdlg) -> eax = entry index of the selected row, or -1 if
 ;   nothing is selected.  The row's item data IS the vault entry index.
 gui_lb_seldata proc frame
-    FRAME_PROLOG 48
+    FRAME_PROLOG 64                             ; 64 -> alloc 80: the 5th-arg spill slot
+                                               ; [rsp+32]=[rbp-48] must clear the live
+                                               ; [rbp-32] cursel (arg4 source below).  A
+                                               ; smaller frame (48->alloc 64) put arg5 AT
+                                               ; [rbp-32], so LB_GETITEMDATA's lParam=0
+                                               ; store zeroed the index -> always row 0.
     mov     qword ptr [rbp-24], rcx
     WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_GETCURSEL, 0, 0
     mov     dword ptr [rbp-32], eax
@@ -3897,7 +3902,12 @@ gui_lb_seldata endp
 ;   Reselects the list row whose item data (the entry index) matches - used to
 ;   restore the selection after a repopulate.
 gui_lb_selbydata proc frame
-    FRAME_PROLOG 48
+    FRAME_PROLOG 80                              ; 80 -> alloc 96: the 5th-arg spill slot
+                                                ; [rsp+32]=[rbp-64] must clear the live
+                                                ; [rbp-32] target (held across the whole
+                                                ; loop).  A smaller frame put arg5 AT
+                                                ; [rbp-32], so every LB_* call's lParam=0
+                                                ; store zeroed the target -> matched row 0.
     mov     qword ptr [rbp-24], rcx
     mov     dword ptr [rbp-32], edx              ; target entry index
     WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_GETCOUNT, 0, 0
