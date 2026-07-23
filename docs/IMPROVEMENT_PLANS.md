@@ -49,6 +49,9 @@ with a tab strip and cross-vault search, modular details pane (heading dock,
 VF_GROUP/VF_SPACER blocks, entry templates), Ctrl+K/N/G/L shortcuts, and the
 mvtest/mvswitch/avtest gate probes. E8 (multi-vault) and F2 (resizable window)
 removed from this file as done; the remaining redesign items are group R.
+(**The multi-vault contexts / tab strip / cross-vault search / availability
+machinery and their probes were later ripped out — 2026-07-23, single-vault only;
+see group M.**)
 The reverted virtual-scroll commits were secured on branch `recovered-scroll`
 before the fork was deleted.
 
@@ -116,7 +119,8 @@ rule as `vault_health`, KAT'd in `healthkat`). **R5-lite** — the last vault th
 user opens is persisted (`reg_save_vault`) so startup reopens it. The pure-layout
 / cross-entry-cache remainder (R2 command palette, R3 DPI retrofit, R4 tab
 decorations, R5 multi-vault tab-set, R6 reused dot + modeless dialog) stays
-deferred — its acceptance tests are visual and need a display.
+deferred — its acceptance tests are visual and need a display. (The R5
+multi-vault tab-set item is **cancelled** — single-vault only since 2026-07-23.)
 
 House rules:
 
@@ -219,8 +223,8 @@ lock, never on the CLI per PROBE), the public key + a credential id go to the si
 
 **Why.** Passkeys are the industry's password replacement; a password manager that
 cannot hold them is increasingly incomplete. Vordr already has the hard parts of
-the *storage* side (AEAD vault, Argon2 gate, attachments, `secmem` hygiene,
-machine-bound federation); what it lacks is (a) an **asymmetric signing
+the *storage* side (AEAD vault, Argon2 gate, attachments, `secmem` hygiene);
+what it lacks is (a) an **asymmetric signing
 primitive** and (b) a **way for a browser/OS to invoke it**. This effort is
 deliberately split so the whole cryptographic core lands **headlessly, KAT-gated**
 (the strong part) before the OS/browser integration (the display-gated part).
@@ -253,9 +257,9 @@ KAT-friendly primitive — exactly the kind the new differential crypto harness
 3. **Discoverable (resident) vs server-side credentials:** resident (usernameless,
    the modern default) is primary; also support server-side (credential id carries
    the wrapped private key, zero storage) — decide whether v1 does both.
-4. **Signature counter policy:** return **0** (sync-friendly across machines/the M
-   federation — recommended) vs a monotonic per-credential counter (single-device
-   clone-detection, but clobbers on multi-device sync).
+4. **Signature counter policy:** return **0** (sync-friendly across machines and
+   exported/imported copies — recommended) vs a monotonic per-credential counter
+   (single-device clone-detection, but clobbers when a vault copy is synced).
 5. **Algorithms:** ES256 is mandatory and sufficient for v1; EdDSA (`-8`, Ed25519)
    and RS256 (`-257`) are optional later additions (each a new primitive).
 
@@ -301,20 +305,20 @@ signatures exact-match testable.
 ### P3. Credential store (vault-resident passkeys)
 1. A passkey record = `{ credentialId | rpId | rpIdHash | userHandle | userName |
    private_scalar | publicKey | signCount | created }`. Store as a **new hidden
-   entry class** built on M1's system-item mechanism (a reserved **`VF_PASSKEY`**
-   marker) so it rides the existing authenticated+encrypted container with no new
-   parser and round-trips forward-compatibly; the list builder shows passkeys in a
-   dedicated view, not mixed into password rows. Server-side (non-discoverable)
-   mode: `credentialId` = the AES-256-GCM-wrapped private key (self-contained, no
-   stored record). **Format discipline:** a new `VF_*` tag old readers skip is the
-   tolerant pattern, but passkey *semantics* need the new reader — decide with M
-   whether this rides a `VAULT_VERSION` bump or stays additive (per the Format note,
-   anything touching container/auth layout bumps the version; a new tag alone does
-   not).
-2. **Federation (M) interaction:** passkeys are vault entries, so they federate
-   like any secret — but the **counter policy (Decision 4)** must be sync-safe
-   (returning 0 sidesteps multi-machine clobber). A high-value passkey vault can use
-   the existing `LINK_PROMPT` opt-out. *Test:* `passkeykat` (headless) — create a
+   entry class** — a reserved **`VF_PASSKEY`** marker on an entry the list builder
+   excludes from password rows (self-contained within P; the M1 system-item scheme
+   it once leaned on is cancelled) — so it rides the existing authenticated+encrypted
+   container with no new parser and round-trips forward-compatibly; the list builder
+   shows passkeys in a dedicated view. Server-side (non-discoverable) mode:
+   `credentialId` = the AES-256-GCM-wrapped private key (self-contained, no stored
+   record). **Format discipline:** a new `VF_*` tag old readers skip is the tolerant
+   pattern, but passkey *semantics* need the new reader — decide whether this rides a
+   `VAULT_VERSION` bump or stays additive (per the Format note, anything touching
+   container/auth layout bumps the version; a new tag alone does not).
+2. **Export/import (M6) interaction:** passkeys are ordinary vault entries, so they
+   carry through `fed_export`/`fed_merge` like any secret — but the **counter policy
+   (Decision 4)** must be sync-safe (returning 0 sidesteps clobber across an
+   exported copy). *Test:* `passkeykat` (headless) — create a
    credential, seal → wipe → reload, produce an assertion, assert it verifies
    against the stored public key; **per-RP isolation** (an assertion for `rpId` A
    never validates against B's credential); server-side wrap/unwrap round-trips.
@@ -349,13 +353,12 @@ independent `verify_crypto.py` reference. Only P4 (OS/browser) and P5 (consent U
 need a live environment — mirror the R-group "verified interactively" stance.
 
 **Sequencing.** P1 (P-256/ECDSA — the gating primitive, KAT-gated) → P2 (COSE/CBOR
-+ WebAuthn objects) → P3 (`VF_PASSKEY` store, decide the M/`VAULT_VERSION`
++ WebAuthn objects) → P3 (`VF_PASSKEY` store, decide the `VAULT_VERSION`
 interaction) → **decision point** (P4 invocation bridge — pick (a) or (b) with the
 user) → P4 → P5 (consent UI). P6 KATs land alongside P1–P3. Do **not** start P4
 before P1–P3 are green — the integration is worthless without a proven, testable
-signing core, and P1 is a multi-week primitive on its own. Depends on M1's
-system-item mechanism for P3's storage; otherwise independent of the M federation
-work.
+signing core, and P1 is a multi-week primitive on its own. P3's storage is a
+self-contained `VF_PASSKEY` hidden-entry class — no dependency on other groups.
 
 ---
 
@@ -370,18 +373,19 @@ build-green-but-unverified. The headlessly-safe slices are already done (R5-lite
 last-vault restore, R6-lite weak/stale tile dot — see the Done log). Sequence
 suggestion for the visual remainder: R3 (DPI, touches every painter — do it
 before adding more) → R6/R4 (tile decorations, shared analysis/enumeration) →
-R2 (palette) → R5 (multi-vault tab-set restore).
+R2 (palette). (R5's multi-vault tab-set restore is cancelled — see below.)
 
 Folded in from `docs/REDESIGN_PLAN.md` (the standalone doc was merged into
 this file and deleted). The redesign landed with merge 2c9f744: custom frame +
 title-bar search & dock, ghost buttons, resizable reflow, the B1–B3 IO
-contract, multi-vault contexts/tabs/cross-vault search, modular details pane
-(groups/spacers/templates), and Ctrl+K/N/G/L shortcuts. What remains:
+contract, multi-vault contexts/tabs/cross-vault search (**since removed —
+single-vault only, 2026-07-23**), modular details pane (groups/spacers/templates),
+and Ctrl+K/N/G/L shortcuts. What remains:
 
 ### R2. Command palette (Ctrl+Shift+P)
-The landed title-bar overlay in command mode (`>` prefix): Lock, Switch
-vault, New item, Export, Import, Settings, theme switching, Trash view.
-*Test:* every command fires; fuzzy ranks correctly; Esc closes.
+The landed title-bar overlay in command mode (`>` prefix): Lock, New item,
+Export, Import, Settings, theme switching, Trash view. *Test:* every command
+fires; fuzzy ranks correctly; Esc closes.
 
 ### R3. DPI audit
 Revived by the redesign (supersedes the 2026-07-18 scope cut of the old F3).
@@ -390,16 +394,14 @@ The layout engine already scales; sweep painters for hardcoded px through a
 200% screenshots — chips, underlines, icons all scale.
 
 ### R4. Sidebar niceties
-Per-vault entry counts on tabs; tag chips row under search results; alphabet
-fast-scroll on >200 entries. *Test:* 5k vault fast-scrolls to the right letter.
+Tag chips row under search results; alphabet fast-scroll on >200 entries.
+*Test:* 5k vault fast-scrolls to the right letter.
 
-### R5. Session restore — partially done
-*Done (single-vault, 2026-07-21):* `gui_open_additional` persists the last
-successfully-opened vault via `reg_save_vault`, so startup's `gui_resolve_vault`
-(HKLM>HKCU) reopens it. *Remaining (needs a display):* reopen the whole tab set
-(the multi-vault context list), each tab a locked placeholder until its password
-is supplied (click → secure unlock). *Test:* two vaults open, lock, unlock → two
-placeholders; one unlocks inline.
+### R5. Session restore — DONE (single-vault)
+The last successfully-opened vault is persisted via `reg_save_vault`, so startup's
+`gui_resolve_vault` (HKLM>HKCU) reopens it. The multi-vault "reopen the whole tab
+set as locked placeholders" remainder is **cancelled** with the single-vault
+rip-out (2026-07-23) — there is no tab set. Nothing left here.
 
 ### R6. Vault-health dashboard, richer (from E6) — partially done
 E6 shipped the analysis pass (`vault_health` + `healthkat`), a Ctrl+H summary
