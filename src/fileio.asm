@@ -43,7 +43,10 @@ PAGE_READWRITE      equ 04h
 IO_CHUNK            equ 1000000h         ; 16 MiB per ReadFile/WriteFile
 
 .data?
-align 2
+align 4
+public g_wf_disp
+g_wf_disp   dd ?                       ; C7: one-shot write_file disposition override
+align 2                               ;     (0 = CREATE_ALWAYS default; caller sets CREATE_NEW)
 
 .code
 
@@ -126,10 +129,11 @@ rf_ok:
     mov     r10, qword ptr [rbp-56]
     mov     qword ptr [rax], r10                 ; *outbuf
     mov     rax, qword ptr [rbp-32]
-    mov     r10, qword ptr [rbp-48]
-    mov     qword ptr [rax], r10                 ; *outsize
-    xor     eax, eax
-    jmp     rf_done
+    mov     r10, qword ptr [rbp-64]              ; cursor - base = bytes ACTUALLY read
+    sub     r10, qword ptr [rbp-56]              ;   (a file shrunk mid-read reports the
+    mov     qword ptr [rax], r10                 ;   real count, not the pre-read filesize
+    xor     eax, eax                             ;   with a zero-padded tail; the full-file
+    jmp     rf_done                              ;   MAC still rejects such a truncated image)
 
 rf_io_freebuf:
     mov     rcx, qword ptr [rbp-56]
@@ -160,7 +164,13 @@ write_file proc frame
     mov     qword ptr [rbp-24], rdx
     mov     qword ptr [rbp-32], r8
 
-    WINCALL CreateFileW, rcx, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, FILE_ATTR_NORMAL, 0
+    mov     r10d, dword ptr [g_wf_disp]          ; C7: one-shot disposition (0 = default)
+    mov     dword ptr [g_wf_disp], 0             ;     auto-reset so it applies once
+    test    r10d, r10d
+    jnz     @F
+    mov     r10d, CREATE_ALWAYS
+@@:
+    WINCALL CreateFileW, rcx, GENERIC_WRITE, 0, 0, r10d, FILE_ATTR_NORMAL, 0
     cmp     rax, -1
     je      wf_io
     mov     qword ptr [rbp-40], rax

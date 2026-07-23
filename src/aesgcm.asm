@@ -434,6 +434,9 @@ gx_tb_next:
     GHASH_MEM r10
 gx_done:
     movdqu  xmmword ptr [r12+GC_Y], xmm1
+    pxor    xmm0, xmm0                          ; wipe the partial-block keystream [rsp+144]
+    movdqu  xmmword ptr [rsp+144], xmm0         ;   and zero-padded ct [rsp+160] scratch so a
+    movdqu  xmmword ptr [rsp+160], xmm0         ;   later stack read can't recover that block
 
     movdqu  xmm6,  xmmword ptr [rsp+32]
     movdqu  xmm7,  xmmword ptr [rsp+48]
@@ -528,6 +531,9 @@ gcm_seal proc frame
     mov     r10, qword ptr [rbp-24]
     mov     rdx, qword ptr [r10].GCMREQ.tag
     call    gcm_final
+    mov     rcx, qword ptr [rbp-32]              ; wipe the round-key schedule (invertible ->
+    mov     rdx, GCM_CTX_SIZE                    ;   key-equivalent to the master key) + GHASH
+    call    secure_zero                          ;   subkey; do not leave it on the stack
     xor     eax, eax
     FRAME_EPILOG
     ret
@@ -562,6 +568,9 @@ gcm_open proc frame
     mov     rcx, qword ptr [rbp-32]
     lea     rdx, [rsp+32+GCM_CTX_SIZE]
     call    gcm_final
+    mov     rcx, qword ptr [rbp-32]              ; wipe the round-key schedule + GHASH subkey
+    mov     rdx, GCM_CTX_SIZE                    ;   now (the computed tag sits just past the
+    call    secure_zero                          ;   ctx, so it survives for the compare below)
     lea     rcx, [rsp+32+GCM_CTX_SIZE]
     mov     r10, qword ptr [rbp-24]
     mov     rdx, qword ptr [r10].GCMREQ.tag

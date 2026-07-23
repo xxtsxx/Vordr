@@ -32,6 +32,10 @@ extern NCryptFreeObject:proc
 
 NCRYPT_SILENT_FLAG      equ 040h
 NCRYPT_OAEP_SILENT      equ 044h        ; NCRYPT_PAD_OAEP_FLAG | NCRYPT_SILENT_FLAG
+NCRYPT_PAD_OAEP         equ 004h        ; C4: OAEP without SILENT (lets the OS prompt)
+NCRYPT_UI_PROTECT_KEY   equ 1           ; NCRYPT_UI_POLICY dwFlags: prompt on each use
+
+externdef g_tpm_reqhello:dword          ; C4: require Hello/PIN on TPM unlock (gui.asm)
 
 .data
 ; CNG provider / algorithm names as UTF-16 (no commas -> WSTR)
@@ -40,6 +44,17 @@ WSTR tpm_alg,  <RSA>
 WSTR tpm_sha,  <SHA256>
 WSTR tpm_lenprop, <Length>              ; NCRYPT_LENGTH_PROPERTY
 tpm_keylen  dd 2048                     ; force RSA-2048 (never the provider default)
+; C4: UI policy stamped on the key when g_tpm_reqhello is set (opt-in).
+WSTR ui_policy_prop, <UI Policy>        ; NCRYPT_UI_POLICY_PROPERTY
+WSTR ui_friendly,    <Vordr>
+WSTR ui_desc,        <Unlock your Vordr vault>
+align 8
+g_ui_policy label byte                  ; NCRYPT_UI_POLICY (32 bytes, x64)
+    dd  1                               ; dwVersion
+    dd  NCRYPT_UI_PROTECT_KEY           ; dwFlags
+    dq  0                               ; pszCreationTitle
+    dq  ui_friendly                     ; pszFriendlyName
+    dq  ui_desc                         ; pszDescription
 
 .data?
 g_tpm_prov  dq ?                ; NCRYPT_PROV_HANDLE
@@ -111,6 +126,14 @@ tpm_seal proc frame
     ; Best-effort: a provider that rejects the property just uses its default.
     WINCALL NCryptSetProperty, qword ptr [g_tpm_key], addr tpm_lenprop, \
             addr tpm_keylen, 4, NCRYPT_SILENT_FLAG
+    ; C4 (opt-in): stamp a UI policy so every future use of this key prompts
+    ; for Windows Hello / PIN.  Best-effort - a provider that rejects it just
+    ; leaves the key silent.  Default (g_tpm_reqhello=0) keeps today's behavior.
+    cmp     dword ptr [g_tpm_reqhello], 0
+    je      ts_nohello
+    WINCALL NCryptSetProperty, qword ptr [g_tpm_key], addr ui_policy_prop, \
+            addr g_ui_policy, 32, 0
+ts_nohello:
     WINCALL NCryptFinalizeKey, qword ptr [g_tpm_key], NCRYPT_SILENT_FLAG
     test    eax, eax
     jnz     ts_freekey
@@ -153,14 +176,26 @@ tpm_unseal proc frame
     WINCALL NCryptOpenStorageProvider, addr g_tpm_prov, addr tpm_prov, 0
     test    eax, eax
     jnz     tu_fail
+    ; C4: pick the flags.  Default = silent (unchanged).  With g_tpm_reqhello,
+    ; drop SILENT so the OS is allowed to surface a Hello/PIN prompt.
+    ; [rbp-56]=OpenKey flag  [rbp-64]=Decrypt flag
+    mov     eax, NCRYPT_SILENT_FLAG
+    mov     edx, NCRYPT_OAEP_SILENT
+    cmp     dword ptr [g_tpm_reqhello], 0
+    je      tu_flags
+    xor     eax, eax
+    mov     edx, NCRYPT_PAD_OAEP
+tu_flags:
+    mov     dword ptr [rbp-56], eax
+    mov     dword ptr [rbp-64], edx
     WINCALL NCryptOpenKey, qword ptr [g_tpm_prov], addr g_tpm_key, \
-            qword ptr [rbp-24], 0, NCRYPT_SILENT_FLAG
+            qword ptr [rbp-24], 0, dword ptr [rbp-56]
     test    eax, eax
     jnz     tu_freeprov
     call    build_oaep
     WINCALL NCryptDecrypt, qword ptr [g_tpm_key], qword ptr [rbp-32], dword ptr [rbp-40], \
             addr g_tpm_oaep, qword ptr [rbp-48], 32, \
-            addr g_tpm_cbres, NCRYPT_OAEP_SILENT
+            addr g_tpm_cbres, dword ptr [rbp-64]
     test    eax, eax
     jnz     tu_freekey
     cmp     dword ptr [g_tpm_cbres], 32

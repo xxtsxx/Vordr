@@ -49,6 +49,9 @@ with a tab strip and cross-vault search, modular details pane (heading dock,
 VF_GROUP/VF_SPACER blocks, entry templates), Ctrl+K/N/G/L shortcuts, and the
 mvtest/mvswitch/avtest gate probes. E8 (multi-vault) and F2 (resizable window)
 removed from this file as done; the remaining redesign items are group R.
+(**The multi-vault contexts / tab strip / cross-vault search / availability
+machinery and their probes were later ripped out — 2026-07-23, single-vault only;
+see group M.**)
 The reverted virtual-scroll commits were secured on branch `recovered-scroll`
 before the fork was deleted.
 
@@ -79,6 +82,46 @@ name leak), so C4 keeps only the Hello-PIN item. Remaining nicety (not a leak): 
 hashed orphan left by a *moved* vault is opaque but not pruned — a touch-timestamp
 + expiry could add that later if wanted.
 
+**Done 2026-07-21 (C8, concurrent shared-drive access → PR #2):** vaults open
+read-only with full share (they already did); a save takes a brief advisory
+`<vault>.lock` (`CREATE_NEW` + `FILE_FLAG_DELETE_ON_CLOSE`) and, under it, refuses
+to overwrite a vault another writer changed since load (`EXIT_CHANGED`) - the GUI
+reloads via `vault_reload` (re-decrypt with the existing key, no re-KDF) instead
+of clobbering. A held lock -> `EXIT_BUSY` "try again"; the idle poll silently
+refreshes a clean vault; a read-only vault file auto-enters E9 read-only mode.
+Probes `reload` + `cowrite` gated in RUNALL; `formats.md` updated. The full
+"stash + precise re-apply of the pending edit" and an `AVSLOT`-backed retry with
+backoff are possible refinements (the current reload-safe flow already prevents
+lost updates).
+
+**Done 2026-07-21 (plan-completion sweep → PR #2):** the remaining
+headlessly-verifiable backlog was cleared. **C4** (opt-in `TpmRequireHello`:
+`tpm_seal` stamps `NCRYPT_UI_POLICY`, `tpm_unseal` drops the SILENT flags when
+set; default off = silent unlock behaviorally unchanged; prompting path can't be
+verified without a TPM+Hello, so it is gated off). **E15** (DEFLATE-in-zipimport
+resolved as a documented STORED-only limitation in README + the GUI no-entries
+message; porting inflate deferred rather than add a fuzzed pre-auth path).
+**G7.1** (`vfuzz`/`fuzzzip`/`attfuzz` draw a random seed each run, log it, and
+accept `--seed N` to reproduce; shared `fuzz_seed` helper). **E6** (vault-health:
+`vault_health` computes {weak, reused, old, total}; `healthkat` KAT gates it in
+RUNALL; Ctrl+H shows a summary box; sidebar tiles show a weak-password dot — the
+richer modeless dialog + reused/stale badges are folded to **R6**). An
+adversarial re-audit of the sweep caught and fixed one real bug: `vault_health`
+freed its password-digest scratch without a wipe length, which could leak
+BLAKE2b fingerprints or drive an OOB `secure_zero`; it now wipes `n*HSTRIDE`
+bytes. C4/E6/E15/G7 sections removed from this file; the visual-only remainder
+is group R.
+
+**Done 2026-07-21 (R safe-subset → PR #2):** the headlessly-verifiable slices of
+group R that carry negligible visual risk. **R6-lite** — the E6 sidebar dot is
+now colour-coded red=weak / amber=stale via `vault_entry_stale` (same >365-day
+rule as `vault_health`, KAT'd in `healthkat`). **R5-lite** — the last vault the
+user opens is persisted (`reg_save_vault`) so startup reopens it. The pure-layout
+/ cross-entry-cache remainder (R2 command palette, R3 DPI retrofit, R4 tab
+decorations, R5 multi-vault tab-set, R6 reused dot + modeless dialog) stays
+deferred — its acceptance tests are visual and need a display. (The R5
+multi-vault tab-set item is **cancelled** — single-vault only since 2026-07-23.)
+
 House rules:
 
 - Plan IDs are stable: `C4` stays `C4` when other plans are completed or added.
@@ -101,9 +144,11 @@ House rules:
   pipeline: stage 1 redteam (dbg build; 8 fault-injection cases each exit with
   `0xFADE<code>` in the high word, `iat` dies with `0xC0000005`), stage 2
   strict build, stage 3 selftest, stage 4 probes: `seedtest` → `atgen` →
-  `zitest` → `phtest` → `secscan` → `tmptest` → `fztest` → `trtest` →
-  `vfuzz` → `fuzzzip` → `bktest` → `mactest` → `rbtest` → `xctest` → `pkat`.
-  `--quick` skips stage 1.
+  `zitest` → `phtest` → `secscan` → `lktest` → `tmptest` → `fztest` → `trtest`
+  → `vfuzz` → `fuzzzip` → `bktest` → `mactest` → `rbtest` → `xctest` → `reload`
+  → `cowrite` → `attfuzz` → `healthkat` → `pkat` → `mvtest` → `mvswitch` →
+  `mvname` → `idkat` → `kekkat` → `keyringkat` → `fedkat` → `fedregkat` →
+  `fmskat` → `fedapikat` → `fedfanout` → `avtest`. `--quick` skips stage 1.
 - **FRAMES** = no >4-arg `WINCALL` directly inside a raw `sub rsp,64` dialog
   proc (`create_proc`, `unlock_proc`, `vault_proc`, `msg_proc`, `about_proc`,
   …); wide calls go in a `FRAME_PROLOG N` helper. This is the BEX64/offset-0
@@ -128,164 +173,219 @@ House rules:
 
 ---
 
-## C. Hardening & platform
+## M. Master-vault federation (multi-vault redesign) — WITHDRAWN (2026-07-23)
 
-### C3. VirtualLock failure policy
-`secmem_alloc` ignores a failed `sec_lock` — the secret stays pageable,
-silently.
+**Withdrawn / ripped out (2026-07-23).** Per the user, multi-vault support "only
+causes problems for us" — Vordr is now **single-vault**: exactly one vault open at a
+time. The federation/multi-vault machinery (VSLOT/ctx array, availability retry state
+machine, the machine-local keyring + `FEDLINK`/`FEDREC` + `fed_*`/`keyring_*` +
+`reg_fed_*`, `vault_id_of`, the M4 management screen, the M3 unified list, and all
+their probes) was removed in commit `4bb6210` (~-3.8k lines). M1-M5, M7, and M8
+(`federatetest`) are cancelled — do not implement them.
 
-1. Decide fail-closed (refuse unlock) vs loud one-time warning; implement.
-   *Test:* a forced-failure dbg hook exercises the chosen path; SELFTEST
-   unaffected.
-
-### C4. TPM unlock hardening
-All ncrypt calls are `NCRYPT_SILENT` — any same-user process can unwrap the
-vault key.
-
-1. Optional Hello PIN / UI policy on key creation (setting; default
-   unchanged). *Test:* with the policy set, unseal prompts; without, silent as
-   today.
-
-(The former blob-hygiene item — the TPM registry value name was the full vault
-path — is fixed by C6: the name is now hashed and legacy path-named values are
-pruned at unlock.)
-
-### C5. Audit-log honesty
-The "audit log" only records CLI diagnostic verbs; GUI unlock/save/export log
-nothing.
-
-1. Log GUI security events (unlock/lock/save/export/import, success and
-   failure) or stop billing it as an audit log. Fix the stale header examples
-   (`add/get/list`) and the "Event Log" comment in `main.asm`. *Test:* a GUI
-   session produces the expected lines; no planted secret appears in any line.
-
-### C7. Temp-file exclusive create (atomic-save hardening)
-`write_file` (fileio.asm) creates `<vault>.tmp` with `CREATE_ALWAYS` and no
-exclusive-create / reparse-point check. In a writable shared directory a
-pre-planted `<vault>.tmp` symlink could redirect the save. The vault dir is
-normally user-owned (hence low), but the atomic-write guarantee in `formats.md`
-should hold regardless.
-
-1. Create the temp with `CREATE_NEW` (retry with a fresh unpredictable suffix on
-   collision) and reject a pre-existing reparse point. *Test:* a pre-planted
-   `<vault>.tmp` (plain + symlink) is not followed; `bktest`/`tmptest` stay green.
+**M6 — vault as export/import format — LANDED (headless core, gate-green).** The one
+surviving deliverable, reframed for single-vault: import from / export to a foreign
+`.vordr`, nothing federated. Engine in vault.asm:
+- **`fed_export(rcx = source body, edx = carry)`** builds a fresh standalone `.vordr`
+  from the source body under a NEW salt + the password in `g_cfg_pass`, written to
+  `g_cfg_in` (mirrors `do_seed`'s header / `vk_derive` / `vk_kcv` / `vault_seal_write`).
+  `carry=1` copies entries verbatim (`entry_copy_full`) and keeps the source's
+  attachment context live through the seal so `vault_seal_write` copies every
+  referenced blob into the child (ct verbatim, keyed by the AttachRef's own key, so it
+  decrypts under the child's new password); `carry=0` is the text-only path.
+- **`fed_merge(rcx = source body)`** copies source entries into the live body, deduped
+  by the 16-byte **entry** id (`fed_find_by_id`), newer `modified` winning; idempotent.
+  Caller reseals.
+- **`entry_copy_filtered`/`entry_copy_full`** preserve id16/created/modified (not
+  `vault_build_entry`, which would mint new ids and break dedup).
+- Probes **`vaultexportkat`** (export under a different password -> ids round-trip ->
+  re-merge is a no-op) and **`vaultexpattkat`** (two attachments carried; blobs decrypt
+  byte-for-byte in the child) gate it. The search overlay keeps its ranked `g_xr`
+  painter, now single-vault.
+- **Follow-ups (open, GUI-gated):** selected-subset export (headless API exports all
+  entries; the GUI picks the subset); merge-import attachment carry (v1 `fed_merge`
+  still filters — export is the primary attachment case).
 
 ---
 
-## D. Docs & tooling
+## P. Passkey (WebAuthn) support — new headline effort (2026-07-23)
 
-### D6. SECRETS.md buffer-table sync
-The 2026-07-20 audit added wipes for `g_hbuf` (Argon2 H0 pre-hash), `g_rowpw_w`
-(reveal-overlay secret), `g_conv`/`g_convlabel` (field value/label scratch) and
-`g_urlbuf`. None appear in `SECRETS.md`'s buffer table or accepted-exceptions
-list, so its "no unknown rows" invariant no longer holds.
+**Status: PARKED (2026-07-23).** Captured for a future release; no implementation
+work is in progress. Left here in full so it can be picked up later — resume at
+P1 (the ECDSA P-256 primitive) once the Decision-1 invocation-bridge choice is
+made with the user.
 
-1. Add the four buffers with lock status + wipe site. Confirm each one's
-   VirtualLock status — in particular whether `g_rowpw_w` (a revealed plaintext
-   secret) is in `sec_lock_statics`; if it is not, either lock it or list it as a
-   justified transient exception (and, if unlocked, file a C-group lock task).
-   *Test:* every secret buffer in `src/*.asm` maps to a table row or a documented
-   exception (grep audit passes).
+Make Vordr a **passkey provider**: generate, store, and use FIDO2/WebAuthn
+discoverable credentials (passkeys) so it can stand in for a website's password
+with a phishing-resistant public-key login. A passkey is a per-relying-party key
+pair — the private key is a first-class secret (vault-resident, `secmem`-wiped on
+lock, never on the CLI per PROBE), the public key + a credential id go to the site.
+
+**Why.** Passkeys are the industry's password replacement; a password manager that
+cannot hold them is increasingly incomplete. Vordr already has the hard parts of
+the *storage* side (AEAD vault, Argon2 gate, attachments, `secmem` hygiene);
+what it lacks is (a) an **asymmetric signing
+primitive** and (b) a **way for a browser/OS to invoke it**. This effort is
+deliberately split so the whole cryptographic core lands **headlessly, KAT-gated**
+(the strong part) before the OS/browser integration (the display-gated part).
+
+**The gating fact.** Vordr today has **no software asymmetric crypto** — only the
+TPM/NCrypt RSA sealing in `tpm.asm` (platform, not a primitive we control). WebAuthn's
+mandatory algorithm is **ES256 = ECDSA over NIST P-256 with SHA-256** (COSE alg
+`-7`). So **P1 (a P-256 + ECDSA implementation) is the critical path**; nothing else
+in this group can be tested until it exists. It is a large but self-contained,
+KAT-friendly primitive — exactly the kind the new differential crypto harness
+(`docs/ASSURANCE.md`, `tests/verify_crypto.py`) was built to prove.
+
+**Decisions to make with the user before P4 (flagged, not assumed):**
+1. **Invocation bridge.** How a browser reaches Vordr — the real integration lift:
+   - **(a) Windows 11 passkey *plugin authenticator* / credential-manager API**
+     (23H2+, 2024): third-party providers register so the native OS passkey UI
+     offers them. Best UX, no extension, Windows-only, substantial COM surface and
+     app-identity/registration requirements. **Recommended strategic target.**
+   - **(b) Browser extension + native-messaging host:** an extension shims
+     `navigator.credentials.create/get` and talks to a Vordr helper over
+     stdin/stdout JSON. Cross-browser, how 1Password/Bitwarden shipped first, more
+     moving parts — and it needs a **new non-GUI process mode** (Vordr is a
+     GUI-subsystem exe with a diagnostics-only CLI; a native-messaging host breaks
+     the PROBE "no real I/O verbs" shape and must be a separate, explicitly-scoped
+     entry point).
+   - (c) Full CTAP2 authenticator over hybrid/virtual-HID — heaviest; out of scope
+     for v1.
+2. **Attestation:** `none` (privacy-preserving, no provider fingerprint —
+   **recommended for v1**) vs self/`packed`.
+3. **Discoverable (resident) vs server-side credentials:** resident (usernameless,
+   the modern default) is primary; also support server-side (credential id carries
+   the wrapped private key, zero storage) — decide whether v1 does both.
+4. **Signature counter policy:** return **0** (sync-friendly across machines and
+   exported/imported copies — recommended) vs a monotonic per-credential counter
+   (single-device clone-detection, but clobbers when a vault copy is synced).
+5. **Algorithms:** ES256 is mandatory and sufficient for v1; EdDSA (`-8`, Ed25519)
+   and RS256 (`-257`) are optional later additions (each a new primitive).
+
+**Security posture (state it plainly).** A passkey private key is the crown jewel:
+it is generated with `rng_fill`, stored **only** AES-256-GCM at rest inside the
+vault body like every other secret, `VirtualLock`'d + `secure_zero`'d on lock, and
+**never** printed, exported in the clear, or accepted/emitted on the command line
+(PROBE). Every assertion (login) requires the vault unlocked **and** an explicit
+per-use consent gesture bound to the shown relying party — Vordr must **never sign
+silently**; the anti-phishing guarantee is that the signature is bound to
+`rpIdHash = SHA-256(rpId)` and the origin from `clientDataJSON`, so a look-alike
+site gets a different (useless) credential. Deterministic ECDSA (RFC 6979) is used
+for signing so a bad RNG can never leak the key through nonce reuse — and it makes
+signatures exact-match testable.
+
+### P1. ECDSA over P-256 (ES256) — the new asymmetric primitive (critical path)
+1. NIST P-256 field + group arithmetic (256-bit modular over the curve prime and
+   order), constant-time scalar multiplication, key generation (`rng_fill` scalar →
+   public point), and **deterministic ECDSA** signing (RFC 6979 with SHA-256; Vordr
+   already has `sha256_hash`/`hmac`). A verify path too, for self-checking. New file
+   `p256.asm`; treat it with the same care as `argon2.asm`/`aesgcm.asm` (frames,
+   `secmem` for the private scalar, no secret-dependent branches/indexing).
+2. *Test:* `p256kat` (headless, gated in RUNALL) — **NIST CAVP P-256** key/sign
+   vectors + the **RFC 6979 Appendix A.2.5** deterministic (r,s) vectors (exact
+   bytes), plus a sign→verify round-trip and a tampered-message reject. **Extend the
+   differential harness:** add a `katreport` line emitting a deterministic signature
+   for a fixed key/message and have `verify_crypto.py` check it against the RFC 6979
+   vector and validate it with a small self-contained pure-Python P-256 verify (the
+   same "self-validating independent reference" pattern already used for AES-GCM).
+
+### P2. COSE / CBOR + the WebAuthn data objects
+1. A minimal canonical **CTAP2 CBOR** encoder (and just-enough decoder), a
+   **COSE_Key** EC2 encoder for the public key (`{1:2, 3:-7, -1:1, -2:x, -3:y}`),
+   and the WebAuthn structures: **authenticatorData** (`rpIdHash(32) ‖ flags(1) ‖
+   signCount(4) ‖ attestedCredentialData ‖ extensions`), the registration
+   **attestation object** (`CBOR{fmt:"none", authData, attStmt:{}}`), and the
+   assertion signature input (`authData ‖ SHA-256(clientDataJSON)`).
+2. *Test:* `webauthnkat` (headless) — byte-exact COSE_Key and
+   attestation-object encodings for fixed inputs; the assertion signature over a
+   known `authData ‖ clientDataHash` **verifies** against the stored public key
+   (chains P1). Canonical-CBOR ordering asserted (deterministic encoding).
+
+### P3. Credential store (vault-resident passkeys)
+1. A passkey record = `{ credentialId | rpId | rpIdHash | userHandle | userName |
+   private_scalar | publicKey | signCount | created }`. Store as a **new hidden
+   entry class** — a reserved **`VF_PASSKEY`** marker on an entry the list builder
+   excludes from password rows (self-contained within P; the M1 system-item scheme
+   it once leaned on is cancelled) — so it rides the existing authenticated+encrypted
+   container with no new parser and round-trips forward-compatibly; the list builder
+   shows passkeys in a dedicated view. Server-side (non-discoverable) mode:
+   `credentialId` = the AES-256-GCM-wrapped private key (self-contained, no stored
+   record). **Format discipline:** a new `VF_*` tag old readers skip is the tolerant
+   pattern, but passkey *semantics* need the new reader — decide whether this rides a
+   `VAULT_VERSION` bump or stays additive (per the Format note, anything touching
+   container/auth layout bumps the version; a new tag alone does not).
+2. **Export/import (M6) interaction:** passkeys are ordinary vault entries, so they
+   carry through `fed_export`/`fed_merge` like any secret — but the **counter policy
+   (Decision 4)** must be sync-safe (returning 0 sidesteps clobber across an
+   exported copy). *Test:* `passkeykat` (headless) — create a
+   credential, seal → wipe → reload, produce an assertion, assert it verifies
+   against the stored public key; **per-RP isolation** (an assertion for `rpId` A
+   never validates against B's credential); server-side wrap/unwrap round-trips.
+
+### P4. The invocation bridge (Decision 1 — OS/browser integration, not headless)
+1. Implement the chosen path from Decision 1 — recommended: the **Win11 passkey
+   plugin authenticator** COM server (register the provider; implement create/get so
+   the OS passkey UI lists Vordr; route to P1–P3 + the P5 consent). The
+   extension+native-messaging fallback needs the new non-GUI helper process mode
+   noted above.
+2. *Test (needs a display + a real relying party):* register a passkey on a live
+   WebAuthn test site (e.g. `webauthn.io`) via Vordr, then sign in with it; the RP
+   accepts the assertion. Not gate-automatable — verified interactively, like the R
+   group.
+
+### P5. Consent + user-verification UI (not headless)
+1. A per-ceremony consent surface: show the **relying party** and the **account**,
+   require an explicit approve gesture, and treat the unlocked vault (password /
+   TPM / Hello per C4) as user-verification (UV). Never sign without it; offer
+   "this site is asking to sign in as <user> — approve?" with the origin shown for
+   anti-phishing. Rate-limit / re-auth for high-value credentials.
+2. *Test (needs a display):* a create and a get ceremony each show the RP + account
+   and block until approved; declining aborts with no signature emitted.
+
+### P6. Test/probe strategy (headless-first, per PROBE)
+The entire crypto core is provable headlessly and must land KAT-gated before P4/P5:
+`p256kat` (P1, CAVP + RFC 6979), `webauthnkat` (P2, byte-exact COSE/attestation +
+assertion verify), `passkeykat` (P3, create→seal→reload→assert→verify + per-RP
+isolation + server-side wrap). All hermetic, synthetic keys, **never emit a private
+scalar**, wired into `tests\run_all.cmd`, and the P1 signature cross-checked by the
+independent `verify_crypto.py` reference. Only P4 (OS/browser) and P5 (consent UI)
+need a live environment — mirror the R-group "verified interactively" stance.
+
+**Sequencing.** P1 (P-256/ECDSA — the gating primitive, KAT-gated) → P2 (COSE/CBOR
++ WebAuthn objects) → P3 (`VF_PASSKEY` store, decide the `VAULT_VERSION`
+interaction) → **decision point** (P4 invocation bridge — pick (a) or (b) with the
+user) → P4 → P5 (consent UI). P6 KATs land alongside P1–P3. Do **not** start P4
+before P1–P3 are green — the integration is worthless without a proven, testable
+signing core, and P1 is a multi-week primitive on its own. P3's storage is a
+self-contained `VF_PASSKEY` hidden-entry class — no dependency on other groups.
 
 ---
 
-## E. Features (all verified absent)
+## R. Redesign remainder — the current active backlog (2026-07-21)
 
-### E6. Vault health dashboard
-(The redesign's cheap precursor — weak/reused dot indicators inline on sidebar
-tiles — can ship first and shares the same analysis pass.)
-
-1. Analysis pass: strength buckets (existing `gui_pw_strength` core),
-   exact-duplicates via BLAKE2b, age via pw-history timestamps; dbg `health`
-   verb prints counts for a scripted 10-entry vault — exact match.
-2. Dashboard dialog; clicking a row jumps to the entry. *Test:* navigation
-   highlights the right tile.
-3. Sidebar badge with the worst-bucket count. *Test:* fix one weak password →
-   badge decrements after save.
-
-### E9. Read-only mode
-(The redesign's B1 landed read-only-by-default opens with full share masks, so
-this is now nearly free.)
-
-1. `--ro` flag + an unlock-dialog checkbox set `g_readonly`. *Test:* dbg trace
-   shows the flag.
-2. Gate every mutation entry point (save, add, delete, import, history purge);
-   hide/disable the buttons. *Test:* a full UI walk in RO mode leaves the file
-   mtime unchanged.
-3. Title-bar suffix "(read-only)". *Test:* both modes.
-
-### E15. DEFLATE in zipimport (or a documented limitation)
-Imports accept only Vordr's own STORE-inside-AES exports today; 7-Zip/WinRAR
-AES zips are rejected. There is no inflate in this repo — sibling project
-`myrkr` has a proven puff-style decoder with KATs to port.
-
-1. Decide: port inflate (recommended) or document "imports Vordr exports
-   only" in README + the import dialog. *Test:* the choice is written down.
-2. If porting: `inflate.asm` + KAT selftests; the import path dispatches
-   method 8 vs 0. *Test:* a 7-Zip-produced deflated AE-2 zip imports
-   correctly; RUNALL (incl. the `fuzzzip` stage) green.
-
-### E16. pwgen output-capacity parameter
-The 2026-07-20 audit bounded the passphrase word count (`PWGEN_PP_MAXWORDS`) to
-stop `pwgen_ex` overflowing a caller buffer (the GUI's 260-byte `g_genout`). That
-is a stopgap: `pwgen_ex` still takes no explicit output-capacity argument, so a
-future caller with a small buffer and a large `n` could overflow for a
-non-passphrase style too.
-
-1. Add an `outcap` argument to `pwgen_ex` (and `pwgen`); bound every write; drop
-   the `PWGEN_PP_MAXWORDS` special case. Update all call sites (~12) and their
-   frame sizes. *Test:* a dbg probe requests each style into a deliberately-tiny
-   buffer and gets a clean truncation/refusal, never an overwrite; SELFTEST +
-   `atgen` green.
-
----
-
-## F. GUI / UX
-
-### F1. Toast notifications
-(The tray NIF flags are MESSAGE|ICON|TIP only — no balloon/toast exists.)
-
-1. Layered, rounded toast child window, auto-fade via timer, theme brushes;
-   dbg `toast <text>` verb. *Test:* no focus steal (caret stays in an edit).
-2. Wire copy/save/lock events; queue max 3. *Test:* 5 rapid copies → ≤3
-   stacked, all fade; GDI handle count stable over 100 toasts.
-3. Settings toggle. *Test:* off → old behavior only.
-
-### F4. Mnemonics & keyboard audit
-Tab order/Enter/Esc largely come free from the dialog manager; zero `&`
-mnemonics exist anywhere. The redesign landed Ctrl+K/N/G/L; complete the table
-(Ctrl+O open vault, Ctrl+W close tab, Ctrl+Tab cycle, F2 edit, Del → trash,
-Esc closes overlay → edit → clears search in that order).
-
-1. Per-dialog audit table (tab order, default button, Esc). *Test:* the table
-   has no unreachable-control rows after fixes.
-2. `&`-accelerators where owner-draw painters can render underscores. *Test:*
-   Alt+letter activates each marked control.
-
----
-
-## R. Redesign remainder
+With the C/E/G backlog cleared, group R is what's left. Every R item is
+**painter/interaction work whose acceptance test is visual** ("100% vs 200%
+screenshots", "scrolls with no paint over the header", "fast-scrolls to the
+right letter"), so each needs a real display to verify — they were deliberately
+left for an environment where the window can be seen, rather than shipped
+build-green-but-unverified. The headlessly-safe slices are already done (R5-lite
+last-vault restore, R6-lite weak/stale tile dot — see the Done log). Sequence
+suggestion for the visual remainder: R3 (DPI, touches every painter — do it
+before adding more) → R6/R4 (tile decorations, shared analysis/enumeration) →
+R2 (palette). (R5's multi-vault tab-set restore is cancelled — see below.)
 
 Folded in from `docs/REDESIGN_PLAN.md` (the standalone doc was merged into
 this file and deleted). The redesign landed with merge 2c9f744: custom frame +
 title-bar search & dock, ghost buttons, resizable reflow, the B1–B3 IO
-contract, multi-vault contexts/tabs/cross-vault search, modular details pane
-(groups/spacers/templates), and Ctrl+K/N/G/L shortcuts. What remains:
-
-### R1. Detail-pane virtual scroll
-The scroll resurrection did not land with the merge. The reverted work is
-secured in-repo on branch `recovered-scroll` (18c747e virtual-scroll field
-list, b47fd3b drop the room cap); anchor reflow + elastic widths did land.
-
-1. Cherry-pick the two commits and adapt them to the anchor-reflow layout;
-   pixel viewport from the detail rect. *Test:* a 25-field entry on a 350-px
-   window scrolls cleanly with no paint over the header/dock; RUNALL.
-2. Precision wheel accumulation + PgUp/PgDn/Home/End when the pane has focus.
+contract, multi-vault contexts/tabs/cross-vault search (**since removed —
+single-vault only, 2026-07-23**), modular details pane (groups/spacers/templates),
+and Ctrl+K/N/G/L shortcuts. What remains:
 
 ### R2. Command palette (Ctrl+Shift+P)
-The landed title-bar overlay in command mode (`>` prefix): Lock, Switch
-vault, New item, Export, Import, Settings, theme switching, Trash view.
-*Test:* every command fires; fuzzy ranks correctly; Esc closes.
+The landed title-bar overlay in command mode (`>` prefix): Lock, New item,
+Export, Import, Settings, theme switching, Trash view. *Test:* every command
+fires; fuzzy ranks correctly; Esc closes.
 
 ### R3. DPI audit
 Revived by the redesign (supersedes the 2026-07-18 scope cut of the old F3).
@@ -294,40 +394,109 @@ The layout engine already scales; sweep painters for hardcoded px through a
 200% screenshots — chips, underlines, icons all scale.
 
 ### R4. Sidebar niceties
-Per-vault entry counts on tabs; tag chips row under search results; alphabet
-fast-scroll on >200 entries. *Test:* 5k vault fast-scrolls to the right letter.
+Tag chips row under search results; alphabet fast-scroll on >200 entries.
+*Test:* 5k vault fast-scrolls to the right letter.
 
-### R5. Session restore
-Reopen the same tab set (paths from MRU) at next unlock, each tab showing a
-locked placeholder until its password is supplied (click → secure unlock for
-that vault). *Test:* two vaults open, lock, unlock → two placeholders; one
-unlocks inline.
+### R5. Session restore — DONE (single-vault)
+The last successfully-opened vault is persisted via `reg_save_vault`, so startup's
+`gui_resolve_vault` (HKLM>HKCU) reopens it. The multi-vault "reopen the whole tab
+set as locked placeholders" remainder is **cancelled** with the single-vault
+rip-out (2026-07-23) — there is no tab set. Nothing left here.
 
----
+### R6. Vault-health dashboard, richer (from E6) — partially done
+E6 shipped the analysis pass (`vault_health` + `healthkat`), a Ctrl+H summary
+box, and a tile dot now colour-coded red=weak / amber=stale (`vault_entry_stale`,
+KAT'd). *Remaining (needs a display + a cache):* a modeless health dialog whose
+rows jump to the offending entry, a **reused**-password tile indicator, and a
+worst-bucket count badge. These need a per-entry classification cached at
+`gui_poplist` and invalidated on edit/save (the reused check is O(n²), too heavy
+to recompute per paint). *Test:* fix one weak password → badge decrements after
+save; clicking a row highlights its tile.
 
-## G. Infrastructure & performance
+### R7. Title-bar & dialog UI polish (2026-07-21)
+Small visual/interaction fixes; all need a display to verify, so they ride with
+the R group. Each is independent and can ship together in one session.
 
-### G7. CI hardening
-1. Nightly scheduled workflow that runs the `vfuzz`/`fuzzzip` fuzz stages with
-   random logged seeds.
-2. dbg + release build matrix (incl. `build release`).
-3. SHA-pin `ilammy/msvc-dev-cmd` (currently tag-pinned).
-4. Fix the stage-list comments in `run_all.cmd` + `build.yml` (they omit
-   secscan/tmptest and the newer probes).
+**LANDED (2026-07-23) — build-clean + gate-green, AWAITING an on-screen pass.** All
+five implemented (strict build 0 fatal / 0 dead; full gate green - the changes are
+GUI-only, so no headless probe covers them):
+- **R7.1** unlock-dialog theme cogwheel (id 990) removed (`unlock_proc`: the
+  `ghost_make`, the dispatch, `up_cyclescheme`, the orphaned `gl_t_theme`).
+- **R7.2** ghost-button hover fixed: `TRACKMOUSEEVENT.cbSize` was 16 (x86); on x64
+  it must be 24, so `TrackMouseEvent` had failed to arm `WM_MOUSELEAVE` and the halo
+  stuck. Root-cause fix.
+- **R7.3** unlock "Open read-only" `AUTOCHECKBOX` -> Fluent pill toggle matching the
+  TPM pill (`.rc` LTEXT + `BS_OWNERDRAW`; `theme_toggle(g_readonly)`; `up_ronly`
+  flips + repaints; `gui_unlock` no longer reads a checkbox).
+- **R7.4** standalone (dock-launched) pwgen action button reads **Copy** and copies to
+  the clipboard with auto-clear; field-launched keeps **Use**.
+- **R7.5** minimize/maximize/`IDC_V_LOCK`/hamburger `IDC_V_MENU` buttons removed; the
+  caption keeps only Close (dock reflows left of it); Ctrl+L still locks (id/dispatch
+  kept), X/Esc/idle lock to tray, and `IDC_T_SET` opens the settings overlay.
 
-*Test:* the workflow runs green on schedule; a seeded fuzz failure reproduces
-from its logged seed.
+The clauses below are the original spec (kept for the on-screen review checklist).
 
-### G8. Attachment-section + FMAC fuzzer
-The 2026-07-20 audit added `attach_index_build` per-entry bounds and made the
-FMAC trailer mandatory; `vfuzz` mutates the record body, but nothing fuzzes the
-attachment section or the trailer specifically.
+1. **Remove the misplaced per-dialog theme cogwheel.** The id-990 `GLY_SETTINGS`
+   "ghost-button foundation demo" that cycles the colour scheme (`unlock_proc`
+   `up_init` → `up_cyclescheme`; check `create_proc`/`about_proc` for siblings) is
+   out of place. Drop it — theme switching stays in the settings menu
+   (`IDC_V_MTHEME`) and the title-bar dock settings button (`IDC_T_SET`). *Test:* no
+   cogwheel on the unlock/create/about dialogs; theme still switchable from settings.
+2. **Ghost buttons must dim again on mouse-leave.** They currently keep the hover
+   halo after the cursor leaves. Fix in `ghost_subclass` — the hover byte in
+   `GWL_USERDATA` set by `gsc_move` should be cleared + repainted by the
+   `WM_MOUSELEAVE` (`gsc_leave`) path; verify the `TrackMouseEvent`/`TME_LEAVE`
+   arm actually fires and re-arms (check `TRACKMOUSEEVENT.cbSize`/struct and the
+   "already hovering → skip" guard so a missed leave can't stick). *Test:* hover
+   then leave every ghost button (dock + converted toolbar) → halo fades.
+3. **Read-only checkbox → Fluent toggle.** Convert the unlock dialog's `IDC_U_RONLY`
+   "Open read-only" checkbox to a Fluent pill toggle matching the existing
+   `IDC_V_MTPM` toggle (`vp_tdraw_toggle` painter), for style consistency. *Test:*
+   the toggle reads/writes `g_readonly`; looks like the TPM pill.
+4. **Standalone pwgen: "Use" → "Copy".** When the generator is opened standalone
+   from the title-bar dock (`vp_gen_standalone`, `g_pg_target == -1`) rather than
+   from a secret's field (`vpd_gen`), the action button should read **Copy** and put
+   the generated password on the clipboard (existing clip path + auto-clear timer)
+   instead of writing to `g_pg_target`. *Test:* dock-launched pwgen shows Copy →
+   clipboard gets the password; field-launched still shows Use → writes the field.
+5. **Remove the minimize / maximize / lock / burger buttons.** Drop:
+   - the `IDC_T_MIN` and `IDC_T_MAX` caption buttons (+ `gt_min`/`gt_max` strings,
+     anchors, handlers) — no need to minimise/maximise;
+   - the `IDC_V_LOCK` button — redundant because `vp_close` (the `IDC_T_CLOSE`
+     "X"), `vp_esc` (Escape), and the idle-timeout all already fall through to
+     `vp_lock`, which wipes and hides to tray; so the X and Escape lock to tray;
+   - the **hamburger menu** `IDC_V_MENU` (`GLY_MORE`, `wb_menu`/`wb_close` toggle)
+     — redundant now that the title-bar dock settings glyph `IDC_T_SET` opens the
+     same overlay (both route to `vp_menu` → `gui_menu_toggle`). Keep `IDC_T_SET`
+     as the toggle; the overlay still closes via re-click / Esc.
+   Reflow the caption/toolbar to drop the removed slots. *Test:* only the close
+   glyph in the caption and the dock's New/Generate/Settings/search remain; Esc and
+   X lock (wipe) + hide to tray; the settings glyph opens/closes the overlay.
 
-1. A dbg probe (`attfuzz`) that seals a vault, then mutates the attachment
-   section (crafted `ctlen`/id, truncation, junk entries) and the FMAC trailer
-   (stripped, bit-flipped) under logged random seeds, asserting `vault_unlock`
-   rejects or safely skips — never crashes or reads OOB. *Test:* add to RUNALL
-   stage 4; a seeded failure reproduces from its seed. Pairs with G7.1.
+### R8. Search overhaul — one title-bar search (2026-07-21, in progress)
+Consolidate to a single search driven from the title bar; the sidebar filter box
+is gone. Built on the existing `search_overlay_*` (panel/edit/list) infrastructure.
+1. **[done, stage 1]** Remove the redundant sidebar box (`IDC_V_SEARCH`); the list
+   reflows to fill it. Ctrl+K, list type-to-search (`search_type_subclass`) and
+   ghost-button type-to-search (`gsc_char`) now open the overlay and forward the
+   keystroke into `IDC_SO_EDIT`. *Verify on screen:* list fills the space; typing
+   anywhere with no field focused opens the overlay and starts the query.
+2. **Type-anywhere focus:** ensure *every* no-field-focused keypress reaches the
+   overlay (extend beyond the list/ghost subclasses if any control swallows it).
+3. **Edit painted over the pill:** position `IDC_SO_EDIT` over the `IDC_T_SEARCH`
+   rect (not below) so activating looks like the pill becomes the field.
+4. **Floating results window:** promote the results panel from a child control to a
+   top-level layered popup (`WS_POPUP` + drop-shadow / `WS_EX_NOACTIVATE`) that
+   floats over the window with a border + shadow. Subsumes the edit-over-pill
+   positioning (3) and dynamic sizing (6).
+5. **Linger until selection:** keep the results open until Enter/click/Esc (already
+   the behaviour — confirm no close-on-blur once it is a popup).
+6. **[done, stage 2]** Scale with hits: `search_overlay_resize` sizes the list +
+   backdrop to `clamp(rows × itemHeight, one row, SO_LISTH)` after every populate,
+   so the dropdown shrinks live as the query filters. Carries over to the popup.
+*Sequence:* stages 1–2 done → 2b (type-anywhere completeness) → 4+3 (the
+floating-popup rebuild, reuses the stage-2 sizing) → 5 (confirm). All visual —
+each increment verified by screenshot.
 
 ---
 

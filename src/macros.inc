@@ -25,6 +25,8 @@ EXIT_NOCPU          equ 6
 EXIT_SELFTEST       equ 7
 EXIT_NOSPACE        equ 8          ; insufficient free disk space (pre-flight)
 EXIT_LOCKED         equ 9          ; vault is locked / wrong master password
+EXIT_CHANGED        equ 10         ; C8: vault changed on disk since load (reload-safe)
+EXIT_BUSY           equ 11         ; C8: another instance holds the write lock
 
 
 ; ---------------------------------------------------------------------------
@@ -61,6 +63,9 @@ ARGON2_MIN_T        equ 1
 ARGON2_MAX_T        equ 16
 ARGON2_DEF_T        equ 3
 ARGON2_DEF_M_KIB    equ 524288     ; 512 MiB (tuned for ~600-700ms with AVX2)
+ARGON2_MAX_M_KIB    equ 4194304    ; 4 GiB - the max the config/CLI accepts (4096 MiB);
+                                   ; a header m_cost above this is corrupt/tamper and is
+                                   ; rejected BEFORE the KDF runs (pre-auth DoS guard)
 
 KCV_LEN             equ 16         ; key-check value bytes (SHA-256(key) prefix)
 
@@ -186,7 +191,7 @@ endm
 ; Preserves rax/rdx/xmm0 (return values).  Clobbers r10, r11.
 ; =============================================================================
 FRAME_EPILOG macro
-    local ok1, ok2
+    local ok1, ok2, sse_scan, sse_fail
     ; ---- verify stack canary ------------------------------------------------
     mov     r10, qword ptr [g_stack_canary]
     cmp     r10, qword ptr [rbp-8]
@@ -194,17 +199,27 @@ FRAME_EPILOG macro
     mov     ecx, FF_STACK_COOKIE
     jmp     ff_trap
 ok1:
-    ; ---- pop + verify software shadow stack --------------------------------
+    ; ---- pop + verify the software shadow stack (SEH-unwind tolerant) -------
+    ; The OS SEH unwinder restores rsp/rbp but does NOT pop this software shadow
+    ; stack, so an exception unwinding through framed procs (e.g. the Windows
+    ; GUI / CoreMessaging exceptions raised while the create/unlock dialog runs
+    ; on the Secure-Unlock private desktop) leaves stale entries above the live
+    ; frame's.  So instead of fastfailing on the first mismatch, scan DOWN for
+    ; THIS frame's return address: found -> resync (drop the stale entries above
+    ; it); absent from the whole stack -> a genuine return-address (ROP)
+    ; violation.  rax holds the return value here, so scratch is r8/r10/r11 only.
+    mov     r11, qword ptr [rbp+8]              ; the return address to match
     mov     r10, qword ptr [g_sstk_index]
+    mov     r8, qword ptr [g_sstk_base]
+sse_scan:
     test    r10, r10
-    jz      @F
+    jz      sse_fail                            ; hit the bottom -> not ours -> ROP
     dec     r10
-    mov     qword ptr [g_sstk_index], r10
-    mov     r11, qword ptr [g_sstk_base]
-    mov     r11, qword ptr [r11+r10*8]
-    cmp     r11, qword ptr [rbp+8]
-    je      ok2
-@@:
+    cmp     r11, qword ptr [r8+r10*8]
+    jne     sse_scan
+    mov     qword ptr [g_sstk_index], r10       ; resync to just below the match
+    jmp     ok2
+sse_fail:
     mov     ecx, FF_SHADOW_STACK
     jmp     ff_trap
 ok2:
@@ -594,7 +609,11 @@ endm
 
 ; UTF-16 string literal:  WSTR cmd_encrypt, <encrypt>
 ; (text inside <> may not contain commas; use multiple WSTRs or raw dw)
+; Every wide string MUST start 2-aligned: an odd-address WSTR passed to a Win32
+; -W API (SetDlgItemTextW, RegisterClassW) renders/registers empty on this
+; platform.  `even` here aligns every WSTR, so no block can drift odd.
 WSTR macro name, text
+    even
     name label word
     forc c, <text>
         dw '&c'
