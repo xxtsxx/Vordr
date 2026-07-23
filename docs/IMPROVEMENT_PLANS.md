@@ -387,11 +387,19 @@ The landed title-bar overlay in command mode (`>` prefix): Lock, New item,
 Export, Import, Settings, theme switching, Trash view. *Test:* every command
 fires; fuzzy ranks correctly; Esc closes.
 
-### R3. DPI audit
-Revived by the redesign (supersedes the 2026-07-18 scope cut of the old F3).
-The layout engine already scales; sweep painters for hardcoded px through a
-`dpi_scale` (MulDiv) helper; recreate fonts on WM_DPICHANGED. *Test:* 100% vs
-200% screenshots — chips, underlines, icons all scale.
+### R3. DPI audit — step 1 done (GDI Scaling)
+**Landed (2026-07-23):** the manifest declares `gdiScaling=true` (SMI/2017). The
+app stays DPI-unaware (fixed 96-DPI pixel layout), but Windows now renders the GDI
+owner-draw content (DrawTextW glyphs, FillRect cards, RoundRect) at physical
+resolution on a >100% display instead of bitmap-stretching a 96-DPI frame — so text
+and Fluent icons stay crisp with zero layout rewrite. No-op at 100%; verified the
+element embeds in the exe manifest. **Needs an on-screen pass at 125/150/200% to
+confirm crispness** (headless gate can't test it).
+*Remaining (optional, only if GDI Scaling proves insufficient — e.g. blurry
+StretchBlt'd bitmaps or a per-monitor-DPI requirement):* the full retrofit — a
+`dpi_scale` (MulDiv) helper through the painters + recreate fonts on WM_DPICHANGED
+(per-monitor-v2), which is a much larger change and conflicts with gdiScaling.
+*Test:* 100% vs 200% screenshots — chips, underlines, icons all crisp.
 
 ### R4. Sidebar niceties
 Tag chips row under search results; alphabet fast-scroll on >200 entries.
