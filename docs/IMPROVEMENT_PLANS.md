@@ -208,157 +208,18 @@ surviving deliverable, reframed for single-vault: import from / export to a fore
 
 ---
 
-## P. Passkey (WebAuthn) support — new headline effort (2026-07-23)
+## P. Passkey (WebAuthn) support — WITHDRAWN (2026-07-24)
 
-**Status: PARKED (2026-07-23).** Captured for a future release; no implementation
-work is in progress. Left here in full so it can be picked up later — resume at
-P1 (the ECDSA P-256 primitive) once the Decision-1 invocation-bridge choice is
-made with the user.
-
-Make Vordr a **passkey provider**: generate, store, and use FIDO2/WebAuthn
-discoverable credentials (passkeys) so it can stand in for a website's password
-with a phishing-resistant public-key login. A passkey is a per-relying-party key
-pair — the private key is a first-class secret (vault-resident, `secmem`-wiped on
-lock, never on the CLI per PROBE), the public key + a credential id go to the site.
-
-**Why.** Passkeys are the industry's password replacement; a password manager that
-cannot hold them is increasingly incomplete. Vordr already has the hard parts of
-the *storage* side (AEAD vault, Argon2 gate, attachments, `secmem` hygiene);
-what it lacks is (a) an **asymmetric signing
-primitive** and (b) a **way for a browser/OS to invoke it**. This effort is
-deliberately split so the whole cryptographic core lands **headlessly, KAT-gated**
-(the strong part) before the OS/browser integration (the display-gated part).
-
-**The gating fact.** Vordr today has **no software asymmetric crypto** — only the
-TPM/NCrypt RSA sealing in `tpm.asm` (platform, not a primitive we control). WebAuthn's
-mandatory algorithm is **ES256 = ECDSA over NIST P-256 with SHA-256** (COSE alg
-`-7`). So **P1 (a P-256 + ECDSA implementation) is the critical path**; nothing else
-in this group can be tested until it exists. It is a large but self-contained,
-KAT-friendly primitive — exactly the kind the new differential crypto harness
-(`docs/ASSURANCE.md`, `tests/verify_crypto.py`) was built to prove.
-
-**Decisions to make with the user before P4 (flagged, not assumed):**
-1. **Invocation bridge.** How a browser reaches Vordr — the real integration lift:
-   - **(a) Windows 11 passkey *plugin authenticator* / credential-manager API**
-     (23H2+, 2024): third-party providers register so the native OS passkey UI
-     offers them. Best UX, no extension, Windows-only, substantial COM surface and
-     app-identity/registration requirements. **Recommended strategic target.**
-   - **(b) Browser extension + native-messaging host:** an extension shims
-     `navigator.credentials.create/get` and talks to a Vordr helper over
-     stdin/stdout JSON. Cross-browser, how 1Password/Bitwarden shipped first, more
-     moving parts — and it needs a **new non-GUI process mode** (Vordr is a
-     GUI-subsystem exe with a diagnostics-only CLI; a native-messaging host breaks
-     the PROBE "no real I/O verbs" shape and must be a separate, explicitly-scoped
-     entry point).
-   - (c) Full CTAP2 authenticator over hybrid/virtual-HID — heaviest; out of scope
-     for v1.
-2. **Attestation:** `none` (privacy-preserving, no provider fingerprint —
-   **recommended for v1**) vs self/`packed`.
-3. **Discoverable (resident) vs server-side credentials:** resident (usernameless,
-   the modern default) is primary; also support server-side (credential id carries
-   the wrapped private key, zero storage) — decide whether v1 does both.
-4. **Signature counter policy:** return **0** (sync-friendly across machines and
-   exported/imported copies — recommended) vs a monotonic per-credential counter
-   (single-device clone-detection, but clobbers when a vault copy is synced).
-5. **Algorithms:** ES256 is mandatory and sufficient for v1; EdDSA (`-8`, Ed25519)
-   and RS256 (`-257`) are optional later additions (each a new primitive).
-
-**Security posture (state it plainly).** A passkey private key is the crown jewel:
-it is generated with `rng_fill`, stored **only** AES-256-GCM at rest inside the
-vault body like every other secret, `VirtualLock`'d + `secure_zero`'d on lock, and
-**never** printed, exported in the clear, or accepted/emitted on the command line
-(PROBE). Every assertion (login) requires the vault unlocked **and** an explicit
-per-use consent gesture bound to the shown relying party — Vordr must **never sign
-silently**; the anti-phishing guarantee is that the signature is bound to
-`rpIdHash = SHA-256(rpId)` and the origin from `clientDataJSON`, so a look-alike
-site gets a different (useless) credential. Deterministic ECDSA (RFC 6979) is used
-for signing so a bad RNG can never leak the key through nonce reuse — and it makes
-signatures exact-match testable.
-
-### P1. ECDSA over P-256 (ES256) — the new asymmetric primitive (critical path)
-1. NIST P-256 field + group arithmetic (256-bit modular over the curve prime and
-   order), constant-time scalar multiplication, key generation (`rng_fill` scalar →
-   public point), and **deterministic ECDSA** signing (RFC 6979 with SHA-256; Vordr
-   already has `sha256_hash`/`hmac`). A verify path too, for self-checking. New file
-   `p256.asm`; treat it with the same care as `argon2.asm`/`aesgcm.asm` (frames,
-   `secmem` for the private scalar, no secret-dependent branches/indexing).
-2. *Test:* `p256kat` (headless, gated in RUNALL) — **NIST CAVP P-256** key/sign
-   vectors + the **RFC 6979 Appendix A.2.5** deterministic (r,s) vectors (exact
-   bytes), plus a sign→verify round-trip and a tampered-message reject. **Extend the
-   differential harness:** add a `katreport` line emitting a deterministic signature
-   for a fixed key/message and have `verify_crypto.py` check it against the RFC 6979
-   vector and validate it with a small self-contained pure-Python P-256 verify (the
-   same "self-validating independent reference" pattern already used for AES-GCM).
-
-### P2. COSE / CBOR + the WebAuthn data objects
-1. A minimal canonical **CTAP2 CBOR** encoder (and just-enough decoder), a
-   **COSE_Key** EC2 encoder for the public key (`{1:2, 3:-7, -1:1, -2:x, -3:y}`),
-   and the WebAuthn structures: **authenticatorData** (`rpIdHash(32) ‖ flags(1) ‖
-   signCount(4) ‖ attestedCredentialData ‖ extensions`), the registration
-   **attestation object** (`CBOR{fmt:"none", authData, attStmt:{}}`), and the
-   assertion signature input (`authData ‖ SHA-256(clientDataJSON)`).
-2. *Test:* `webauthnkat` (headless) — byte-exact COSE_Key and
-   attestation-object encodings for fixed inputs; the assertion signature over a
-   known `authData ‖ clientDataHash` **verifies** against the stored public key
-   (chains P1). Canonical-CBOR ordering asserted (deterministic encoding).
-
-### P3. Credential store (vault-resident passkeys)
-1. A passkey record = `{ credentialId | rpId | rpIdHash | userHandle | userName |
-   private_scalar | publicKey | signCount | created }`. Store as a **new hidden
-   entry class** — a reserved **`VF_PASSKEY`** marker on an entry the list builder
-   excludes from password rows (self-contained within P; the M1 system-item scheme
-   it once leaned on is cancelled) — so it rides the existing authenticated+encrypted
-   container with no new parser and round-trips forward-compatibly; the list builder
-   shows passkeys in a dedicated view. Server-side (non-discoverable) mode:
-   `credentialId` = the AES-256-GCM-wrapped private key (self-contained, no stored
-   record). **Format discipline:** a new `VF_*` tag old readers skip is the tolerant
-   pattern, but passkey *semantics* need the new reader — decide whether this rides a
-   `VAULT_VERSION` bump or stays additive (per the Format note, anything touching
-   container/auth layout bumps the version; a new tag alone does not).
-2. **Export/import (M6) interaction:** passkeys are ordinary vault entries, so they
-   carry through `fed_export`/`fed_merge` like any secret — but the **counter policy
-   (Decision 4)** must be sync-safe (returning 0 sidesteps clobber across an
-   exported copy). *Test:* `passkeykat` (headless) — create a
-   credential, seal → wipe → reload, produce an assertion, assert it verifies
-   against the stored public key; **per-RP isolation** (an assertion for `rpId` A
-   never validates against B's credential); server-side wrap/unwrap round-trips.
-
-### P4. The invocation bridge (Decision 1 — OS/browser integration, not headless)
-1. Implement the chosen path from Decision 1 — recommended: the **Win11 passkey
-   plugin authenticator** COM server (register the provider; implement create/get so
-   the OS passkey UI lists Vordr; route to P1–P3 + the P5 consent). The
-   extension+native-messaging fallback needs the new non-GUI helper process mode
-   noted above.
-2. *Test (needs a display + a real relying party):* register a passkey on a live
-   WebAuthn test site (e.g. `webauthn.io`) via Vordr, then sign in with it; the RP
-   accepts the assertion. Not gate-automatable — verified interactively, like the R
-   group.
-
-### P5. Consent + user-verification UI (not headless)
-1. A per-ceremony consent surface: show the **relying party** and the **account**,
-   require an explicit approve gesture, and treat the unlocked vault (password /
-   TPM / Hello per C4) as user-verification (UV). Never sign without it; offer
-   "this site is asking to sign in as <user> — approve?" with the origin shown for
-   anti-phishing. Rate-limit / re-auth for high-value credentials.
-2. *Test (needs a display):* a create and a get ceremony each show the RP + account
-   and block until approved; declining aborts with no signature emitted.
-
-### P6. Test/probe strategy (headless-first, per PROBE)
-The entire crypto core is provable headlessly and must land KAT-gated before P4/P5:
-`p256kat` (P1, CAVP + RFC 6979), `webauthnkat` (P2, byte-exact COSE/attestation +
-assertion verify), `passkeykat` (P3, create→seal→reload→assert→verify + per-RP
-isolation + server-side wrap). All hermetic, synthetic keys, **never emit a private
-scalar**, wired into `tests\run_all.cmd`, and the P1 signature cross-checked by the
-independent `verify_crypto.py` reference. Only P4 (OS/browser) and P5 (consent UI)
-need a live environment — mirror the R-group "verified interactively" stance.
-
-**Sequencing.** P1 (P-256/ECDSA — the gating primitive, KAT-gated) → P2 (COSE/CBOR
-+ WebAuthn objects) → P3 (`VF_PASSKEY` store, decide the `VAULT_VERSION`
-interaction) → **decision point** (P4 invocation bridge — pick (a) or (b) with the
-user) → P4 → P5 (consent UI). P6 KATs land alongside P1–P3. Do **not** start P4
-before P1–P3 are green — the integration is worthless without a proven, testable
-signing core, and P1 is a multi-week primitive on its own. P3's storage is a
-self-contained `VF_PASSKEY` hidden-entry class — no dependency on other groups.
+**Withdrawn — not building this.** A full WebAuthn/FIDO2 provider needs a
+constant-time P-256 / ECDSA primitive (a multi-week crown-jewel crypto module),
+CBOR/COSE + WebAuthn object encoders, a new `VF_PASSKEY` credential store, and —
+the unavoidable part — an OS/browser invocation bridge (a Win11 plugin
+authenticator or a browser extension + native-messaging host) plus a consent UI.
+The headless crypto/storage core was prototyped and proven, but the integration
+half is high-complexity, browser/display-bound, and hard to keep testable, while
+the user-facing value over the existing password + TOTP flows is low. **Complexity
+too high, value too low — off the roadmap.** The design notes and the prototype
+(branch `passkey`, P1–P3) survive in git history if it is ever revived.
 
 ---
 
