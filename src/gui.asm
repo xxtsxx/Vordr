@@ -1105,13 +1105,9 @@ g_anchor_def label dword
     dd IDC_V_HEADER,   ANCH_STRETCHW
     dd IDC_V_TITLE,    ANCH_STRETCHW
     dd IDC_V_TIMES,    ANCH_STRETCHW
-    dd IDC_V_HDREDIT,  ANCH_RIGHT
-    dd IDC_V_FAV,      ANCH_RIGHT
-    dd IDC_V_OVFL,     ANCH_RIGHT
-    dd IDC_V_ADDFIELD, ANCH_BOTTOM
-    dd IDC_V_CANCEL,   ANCH_RIGHT or ANCH_BOTTOM
-    dd IDC_V_SAVE,     ANCH_RIGHT or ANCH_BOTTOM
-ANCHOR_N equ 12
+; the command controls (edit/fav/more glyphs + add-field/cancel/save) are NOT
+; delta-anchored - gui_cmd_dock_layout edge-docks them from the live client rect.
+ANCHOR_N equ 6
 tag_xw label word
     dw 0D7h, 0                             ; multiplication sign, used as the tag 'x'
 verb_open label word
@@ -3504,6 +3500,8 @@ grf_next:
 grf_done:
     mov     rcx, qword ptr [rbp-24]           ; also stretch the detail value columns
     call    gui_stretch_rows
+    mov     rcx, qword ptr [rbp-24]           ; edge-dock the command controls (glyphs/buttons)
+    call    gui_cmd_dock_layout
     WINCALL InvalidateRect, qword ptr [rbp-24], 0, 1   ; repaint the field cards at the new width
     FRAME_EPILOG
     ret
@@ -3559,6 +3557,133 @@ gsr_done:
     FRAME_EPILOG
     ret
 gui_stretch_rows endp
+
+; dock_rect(rcx=hdlg, edx=id, r8=out{L,T,W,H}) -> rax=hwnd (0 if the control is
+;   absent).  Fills the control's rect in CLIENT pixels.
+dock_rect proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], r8
+    WINCALL GetDlgItem, qword ptr [rbp-24], edx
+    test    rax, rax
+    jz      dr_null
+    mov     qword ptr [rbp-40], rax
+    WINCALL GetWindowRect, qword ptr [rbp-40], addr rbp-64      ; L-64 T-60 R-56 B-52
+    WINCALL MapWindowPoints, 0, qword ptr [rbp-24], addr rbp-64, 2
+    mov     r8, qword ptr [rbp-32]
+    mov     eax, dword ptr [rbp-64]
+    mov     dword ptr [r8+0], eax             ; L
+    mov     eax, dword ptr [rbp-60]
+    mov     dword ptr [r8+4], eax             ; T
+    mov     eax, dword ptr [rbp-56]
+    sub     eax, dword ptr [rbp-64]
+    mov     dword ptr [r8+8], eax             ; W
+    mov     eax, dword ptr [rbp-52]
+    sub     eax, dword ptr [rbp-60]
+    mov     dword ptr [r8+12], eax            ; H
+    mov     rax, qword ptr [rbp-40]
+    FRAME_EPILOG
+    ret
+dr_null:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+dock_rect endp
+
+; --- gui_cmd_dock_layout local placement macros (rbp slots defined in the proc) ---
+;   -128..-116 = dock_rect out{L,T,W,H}; -136 hwnd; -140 nx; -144 ny;
+;   -72 running right edge; -52 cx; -56 cy; -60 marginx; -64 marginy; -68 gap
+DOCK_RIGHT macro cid, bottomflag
+    local skip
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, cid
+    lea     r8, [rbp-128]
+    call    dock_rect
+    test    rax, rax
+    jz      skip
+    mov     qword ptr [rbp-136], rax
+    mov     eax, dword ptr [rbp-72]           ; nx = right - W
+    sub     eax, dword ptr [rbp-120]
+    mov     dword ptr [rbp-140], eax
+IF bottomflag
+    mov     eax, dword ptr [rbp-56]           ; ny = cy - marginy - H (bottom-align)
+    sub     eax, dword ptr [rbp-64]
+    sub     eax, dword ptr [rbp-116]
+ELSE
+    mov     eax, dword ptr [rbp-124]          ; keep T
+ENDIF
+    mov     dword ptr [rbp-144], eax
+    WINCALL MoveWindow, qword ptr [rbp-136], dword ptr [rbp-140], dword ptr [rbp-144], \
+            dword ptr [rbp-120], dword ptr [rbp-116], 1
+    mov     eax, dword ptr [rbp-140]          ; advance the right edge leftward past this + gap
+    sub     eax, dword ptr [rbp-68]
+    mov     dword ptr [rbp-72], eax
+skip:
+endm
+
+; gui_cmd_dock_layout(rcx=hdlg) - dock the command controls to the window edges so
+;   they track a resize: the header glyphs (More / Favorite / Edit) right-align on
+;   their row; Save + Cancel right-align on the bottom border; + Add field rides the
+;   bottom border but keeps its x.  Called at init and from gui_reflow (WM_SIZE).
+gui_cmd_dock_layout proc frame
+    FRAME_PROLOG 192
+    mov     qword ptr [rbp-24], rcx
+    WINCALL GetClientRect, qword ptr [rbp-24], addr rbp-48       ; L-48 T-44 R-40 B-36
+    mov     eax, dword ptr [rbp-40]
+    mov     dword ptr [rbp-52], eax           ; cx
+    mov     eax, dword ptr [rbp-36]
+    mov     dword ptr [rbp-56], eax           ; cy
+    ; margins (12 DLU) -> px via MapDialogRect
+    mov     dword ptr [rbp-96], 0
+    mov     dword ptr [rbp-92], 0
+    mov     dword ptr [rbp-88], 12
+    mov     dword ptr [rbp-84], 12
+    WINCALL MapDialogRect, qword ptr [rbp-24], addr rbp-96
+    mov     eax, dword ptr [rbp-88]
+    mov     dword ptr [rbp-60], eax           ; marginx
+    mov     eax, dword ptr [rbp-84]
+    mov     dword ptr [rbp-64], eax           ; marginy
+    ; inter-control gap (4 DLU) -> px
+    mov     dword ptr [rbp-96], 0
+    mov     dword ptr [rbp-92], 0
+    mov     dword ptr [rbp-88], 4
+    mov     dword ptr [rbp-84], 0
+    WINCALL MapDialogRect, qword ptr [rbp-24], addr rbp-96
+    mov     eax, dword ptr [rbp-88]
+    mov     dword ptr [rbp-68], eax           ; gap
+    ; ---- header glyph row: More, Favorite, Edit (right -> left) ----
+    mov     eax, dword ptr [rbp-52]
+    sub     eax, dword ptr [rbp-60]
+    mov     dword ptr [rbp-72], eax           ; right edge = cx - marginx
+    DOCK_RIGHT IDC_V_OVFL, 0
+    DOCK_RIGHT IDC_V_FAV, 0
+    DOCK_RIGHT IDC_V_HDREDIT, 0
+    ; ---- bottom row: Save, Cancel (right-aligned) ----
+    mov     eax, dword ptr [rbp-52]
+    sub     eax, dword ptr [rbp-60]
+    mov     dword ptr [rbp-72], eax
+    DOCK_RIGHT IDC_V_SAVE, 1
+    DOCK_RIGHT IDC_V_CANCEL, 1
+    ; ---- + Add field: keep its x, ride the bottom border ----
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_V_ADDFIELD
+    lea     r8, [rbp-128]
+    call    dock_rect
+    test    rax, rax
+    jz      dk_done
+    mov     qword ptr [rbp-136], rax
+    mov     eax, dword ptr [rbp-128]          ; keep L
+    mov     dword ptr [rbp-140], eax
+    mov     eax, dword ptr [rbp-56]           ; ny = cy - marginy - H
+    sub     eax, dword ptr [rbp-64]
+    sub     eax, dword ptr [rbp-116]
+    mov     dword ptr [rbp-144], eax
+    WINCALL MoveWindow, qword ptr [rbp-136], dword ptr [rbp-140], dword ptr [rbp-144], \
+            dword ptr [rbp-120], dword ptr [rbp-116], 1
+dk_done:
+    FRAME_EPILOG
+    ret
+gui_cmd_dock_layout endp
 
 ; gui_draw_flatchevron(rcx=lpdis) - draw a reorder chevron as a bare dim glyph on
 ;   the dialog bg (no button chrome).  Up for DS_UP, down otherwise.
@@ -5081,6 +5206,14 @@ sem_rowsdone:
     je      sem_addcmd
     mov     dword ptr [rbp-52], SW_SHOW
 sem_addcmd:
+    ; header glyphs (edit / favorite / more) + the header tile show in VIEW mode,
+    ; but only when an entry is actually selected - with no secret shown they hide.
+    mov     eax, dword ptr [rbp-52]           ; SW_SHOW in edit, SW_HIDE in view
+    xor     eax, SW_SHOW                      ; -> SW_SHOW in view, SW_HIDE in edit
+    cmp     dword ptr [g_cur_idx], 0
+    jge     @F
+    xor     eax, eax                          ; no entry selected -> SW_HIDE
+@@: mov     dword ptr [rbp-88], eax           ; header-glyph visibility
     mov     rcx, qword ptr [rbp-24]
     mov     edx, IDC_V_ADDFIELD
     call    GetDlgItem
@@ -5116,8 +5249,7 @@ sem_addcmd:
     mov     edx, IDC_V_HEADER
     call    GetDlgItem
     mov     qword ptr [rbp-72], rax           ; header hwnd (own 8-byte slot)
-    mov     eax, dword ptr [rbp-52]           ; SW_SHOW in edit, SW_HIDE in view
-    xor     eax, SW_SHOW                      ; opposite: SW_SHOW in view
+    mov     eax, dword ptr [rbp-88]           ; view-mode + entry-selected visibility
     mov     rcx, qword ptr [rbp-72]
     mov     edx, eax
     call    ShowWindow
@@ -5127,8 +5259,7 @@ sem_addcmd:
     mov     edx, IDC_V_OVFL
     call    GetDlgItem
     mov     qword ptr [rbp-72], rax
-    mov     eax, dword ptr [rbp-52]
-    xor     eax, SW_SHOW
+    mov     eax, dword ptr [rbp-88]
     mov     rcx, qword ptr [rbp-72]
     mov     edx, eax
     call    ShowWindow
@@ -5136,8 +5267,7 @@ sem_addcmd:
     mov     edx, IDC_V_FAV
     call    GetDlgItem
     mov     qword ptr [rbp-72], rax
-    mov     eax, dword ptr [rbp-52]
-    xor     eax, SW_SHOW
+    mov     eax, dword ptr [rbp-88]
     mov     rcx, qword ptr [rbp-72]
     mov     edx, eax
     call    ShowWindow
@@ -5145,8 +5275,7 @@ sem_addcmd:
     mov     edx, IDC_V_HDREDIT
     call    GetDlgItem
     mov     qword ptr [rbp-72], rax
-    mov     eax, dword ptr [rbp-52]
-    xor     eax, SW_SHOW
+    mov     eax, dword ptr [rbp-88]
     mov     rcx, qword ptr [rbp-72]
     mov     edx, eax
     call    ShowWindow
@@ -9217,6 +9346,10 @@ gui_detail_clear proc frame
     mov     edx, IDC_V_HDREDIT
     call    GetDlgItem
     WINCALL ShowWindow, rax, SW_HIDE
+    mov     rcx, qword ptr [rbp-24]           ; the "..." (More) glyph hides with no entry too
+    mov     edx, IDC_V_OVFL
+    call    GetDlgItem
+    WINCALL ShowWindow, rax, SW_HIDE
     WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_SETCURSEL, \
             -1, 0
     FRAME_EPILOG
@@ -11011,6 +11144,8 @@ vp_init:
     call    search_overlay_build
     mov     rcx, qword ptr [rbp-8]            ; record control rects for responsive resize
     call    gui_anchor_init
+    mov     rcx, qword ptr [rbp-8]            ; edge-dock the glyphs/buttons for the initial size
+    call    gui_cmd_dock_layout
     xor     eax, eax                          ; we set focus ourselves -> return FALSE
     jmp     vp_ret
 vp_cmd:
