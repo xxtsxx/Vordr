@@ -60,6 +60,7 @@ extern GetDlgCtrlID:proc
 extern MapDialogRect:proc
 extern GetParent:proc
 extern g_vaulthwnd:qword              ; the DLG_VAULT window (sidebar card only there)
+extern sidebar_rect:proc              ; gui.asm: shared sidebar frame geometry
 IDC_V_SEARCH_TH equ 232               ; = IDC_V_SEARCH in gui.asm (sidebar search box)
 extern IsWindowVisible:proc
 extern DwmSetWindowAttribute:proc
@@ -702,22 +703,20 @@ col_darken endp
 ;   list + search box (they sit inside it and blend via the same fill colour).
 ; =============================================================================
 theme_sidecard proc frame
-    FRAME_PROLOG 192
+    FRAME_PROLOG 224                              ; RoundRect's 7-arg spill must clear the rect (-160)
     mov     qword ptr [rbp-24], rcx
     mov     qword ptr [rbp-32], rdx
-    ; card bounds in DLU (list+search bbox, outset ~3 DLU so the edge/round shows)
-    mov     dword ptr [rbp-64], 27
-    mov     dword ptr [rbp-60], 7
-    mov     dword ptr [rbp-56], 205
-    mov     dword ptr [rbp-52], 308
-    WINCALL MapDialogRect, qword ptr [rbp-24], addr rbp-64
-    mov     eax, dword ptr [rbp-64]
+    ; card bounds from the shared sidebar geometry (scales with the window height)
+    lea     rdx, [rbp-160]                    ; rect {L,T,R,B}
+    mov     rcx, qword ptr [rbp-24]
+    call    sidebar_rect
+    mov     eax, dword ptr [rbp-160]
     mov     dword ptr [rbp-72], eax           ; card L
-    mov     eax, dword ptr [rbp-60]
+    mov     eax, dword ptr [rbp-156]
     mov     dword ptr [rbp-68], eax           ; card T
-    mov     eax, dword ptr [rbp-56]
+    mov     eax, dword ptr [rbp-152]
     mov     dword ptr [rbp-76], eax           ; card R
-    mov     eax, dword ptr [rbp-52]
+    mov     eax, dword ptr [rbp-148]
     mov     dword ptr [rbp-80], eax           ; card B
     ; ---- drop shadow (offset +2,+3), NULL pen ----
     WINCALL GetStockObject, 8                 ; NULL_PEN

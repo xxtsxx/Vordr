@@ -321,21 +321,24 @@ WM_NCHITTEST_       equ 84h
 HTCAPTION           equ 2
 DWLP_MSGRESULT_     equ 0
 SWP_FRAME_          equ 16h              ; SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE
-SWP_RAISE_          equ 13h              ; SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE (z-order to HWND_TOP)
 TBAR_H              equ 32               ; custom title-bar strip height (px)
 CAPBTN_W            equ 44               ; caption (close) button width
 IDC_T_CLOSE         equ 292             ; caption: close
 IDC_T_NEW           equ 293             ; dock: new item
 IDC_T_GEN           equ 294             ; dock: password generator
 IDC_T_SET           equ 295             ; dock: settings
-IDC_T_SEARCH        equ 296             ; title-bar search pill
-IDC_SO_PANEL        equ 297             ; search overlay: framed backdrop
-IDC_SO_EDIT         equ 298             ; search overlay: query edit
-IDC_SO_LIST         equ 299             ; search overlay: owner-draw results list
 DOCKBTN_W           equ 34              ; title-bar dock button width
-SEARCHPILL_W        equ 200             ; title-bar search pill width
-SO_W                equ 360             ; search overlay width (px)
-SO_LISTH            equ 300             ; search overlay results height (px)
+; sidebar card geometry (sidebar_rect / sidebar_layout): the frame + entry list
+; scale with the window height at an equal top/bottom gap.  L/R and the gap are
+; DLU (DPI-aware); the list is inset inside the frame so it never paints over it.
+SIDE_L_DLU          equ 27              ; frame left (DLU)
+SIDE_R_DLU          equ 205             ; frame right (DLU)
+SIDE_GAP_DLU        equ 5               ; frame gap from strip-bottom / window-bottom (DLU)
+SIDE_BORD_X         equ 1               ; list inset L/R inside the frame (px) - selection meets
+                                        ;   the border's inner edge (frame stroke is 1px)
+SIDE_BORD_Y         equ 5               ; list inset T/B inside the frame (px) - list ends above it
+SIDE_SRCH_H         equ 20              ; search box height at the top of the frame (px)
+SIDE_SRCH_GAP       equ 6               ; gap between the search box and the list (px)
 LINK_BLUE           equ 00E08C3Ch        ; COLORREF (RGB 60,140,224) hyperlink blue
 WM_MEASUREITEM      equ 2Ch
 WM_COMPAREITEM      equ 39h
@@ -395,18 +398,6 @@ LB_INITSTORAGE      equ 1A8h            ; pre-allocate item storage for large li
 LB_SETCURSEL        equ 186h
 LB_GETCURSEL        equ 188h
 LB_GETCOUNT         equ 18Bh
-LBN_DBLCLK          equ 2
-VK_RETURN_          equ 0Dh
-VK_ESCAPE_          equ 1Bh
-VK_UP_              equ 26h
-VK_DOWN_            equ 28h
-WM_GETDLGCODE_      equ 0087h
-DLGC_WANTALLKEYS_   equ 0004h
-LBS_NOTIFY_         equ 0001h
-LBS_SORT_           equ 0002h
-LBS_OWNERDRAWFIXED_ equ 0010h
-LBS_NOINTEGRALHEIGHT_ equ 0100h
-WS_VSCROLL_         equ 00200000h
 LB_GETCURSEL        equ 188h
 LB_GETITEMRECT      equ 198h            ; item bounding rect (recycle-glyph hit-test)
 GWL_USERDATA        equ -21             ; button accent tag (theme_drawitem primary)
@@ -677,21 +668,6 @@ BS_OWNERDRAW_   equ 000Bh
 SS_OWNERDRAW_   equ 000Dh
 SS_LEFTNOWORDWRAP_ equ 000Ch
 WM_GETFONT      equ 31h
-
-; search result: a match with its display data cached for owner-draw painting.
-MAX_XR      equ 4096                         ; cap on cached search-result rows; g_xr is
-                                              ; BSS so the only real cost is touched pages.
-XR struct
-    xr_vault    dd ?
-    xr_entry    dd ?
-    xr_glyph    dd ?
-    xr_color    dd ?
-    xr_score    dd ?
-    xr_pad      dd ?
-    xr_title    dw 64 dup(?)
-    xr_sub      dw 64 dup(?)
-    xr_vname    dw 32 dup(?)
-XR ends
 
 ; OPENFILENAMEW (x64 layout; STRUCT 8 gives the correct natural alignment)
 OPENFILENAMEW struct 8
@@ -1021,12 +997,6 @@ cls_button label word
     dw 'B','u','t','t','o','n', 0
 cls_static label word
     dw 'S','t','a','t','i','c', 0
-cls_listbox label word
-    dw 'L','i','s','t','B','o','x', 0
-WSTR so_cue, <Search all entries...>
-w_empty     dw 0
-align 4
-g_so_ids    dd IDC_SO_PANEL, IDC_SO_EDIT, IDC_SO_LIST
 cls_tooltip label word
     dw 't','o','o','l','t','i','p','s','_','c','l','a','s','s','3','2', 0
 WSTR gt_more, <More>
@@ -1037,7 +1007,6 @@ WSTR gt_rem, <Delete entry>
 WSTR gt_gen, <Generate password>
 WSTR gt_close, <Close>
 WSTR gt_settings, <Settings>
-WSTR wb_search_txt, <Search vault  (Ctrl+K)>
 kl_user label word
     dw 'U','s','e','r','n','a','m','e', 0
 kl_secret label word
@@ -1102,14 +1071,13 @@ tmpl_table label qword
 ; resize anchors (redesign 1.3): {control id, anchor flags} for gui_reflow
 g_anchor_def label dword
     dd IDC_V_MBACK,    ANCH_STRETCHW or ANCH_STRETCHH
-    dd IDC_V_LIST,     ANCH_STRETCHH
     dd IDC_V_REMOVE,   ANCH_BOTTOM
     dd IDC_V_HEADER,   ANCH_STRETCHW
     dd IDC_V_TITLE,    ANCH_STRETCHW
     dd IDC_V_TIMES,    ANCH_STRETCHW
-; the command controls (edit/fav/more glyphs + add-field/cancel/save) are NOT
-; delta-anchored - gui_cmd_dock_layout edge-docks them from the live client rect.
-ANCHOR_N equ 6
+; the entry list (sidebar_layout) and the command controls (gui_cmd_dock_layout)
+; are NOT delta-anchored - they are laid out from the live client rect.
+ANCHOR_N equ 5
 tag_xw label word
     dw 0D7h, 0                             ; multiplication sign, used as the tag 'x'
 verb_open label word
@@ -1220,12 +1188,12 @@ g_empty_w label word
 ; control-id groups toggled when the settings overlay opens/closes
 align 4
 g_vault_ids label dword
-    dd IDC_V_LIST, IDC_V_TITLE
+    dd IDC_V_LIST, IDC_V_TITLE, IDC_V_SEARCH
     dd IDC_V_ADDFIELD, IDC_V_SAVE
     ; header cluster: hide with the vault so it does not shine through the settings
     ; overlay (gui_menu_close re-shows these, then gui_set_editmode re-gates them).
     dd IDC_V_HDREDIT, IDC_V_FAV, IDC_V_OVFL, IDC_V_HEADER
-VAULT_ID_COUNT equ 8
+VAULT_ID_COUNT equ 9
 g_menu_ids label dword ; controls menu IDs which are hidden and displayed between settings and main screen.
     dd IDC_V_MBACK, IDC_V_MTITLE, IDC_V_MPOLL, IDC_V_MLENL, IDC_V_MLEN
     dd IDC_V_MCLSL, IDC_V_MCLS, IDC_V_MTPM, IDC_V_MTPML, IDC_V_MTPMINFO
@@ -1304,7 +1272,6 @@ g_reqbuf    dw 768 dup (?)            ; formatted password-requirements callout 
 g_numtmp    db 16 dup (?)             ; scratch for uint-to-decimal
 g_vault_lock dd ?                     ; 1 = vault path set by HKLM (locked)
 g_menu_open  dd ?                     ; 1 = settings overlay is showing
-g_so_open    dd ?                     ; 1 = title-bar search overlay is showing
 g_revealed  dd ?
 g_clip_seq  dd ?                      ; clipboard sequence number at last copy
 g_clip_secs dd ?                      ; auto-clear timeout in seconds (0 = off); HKLM>HKCU>20
@@ -1401,9 +1368,6 @@ g_monofont    dq ?                         ; monospace font for the colored pass
 g_phonfont    dq ?                         ; small monospace font for the phonetic columns
 g_symfont     dq ?                         ; Segoe UI Symbol - the recycle glyph in recover mode
 g_sub_w       dw 512 dup (?)               ; subtitle scratch (wide)
-g_xr          db (sizeof XR)*MAX_XR dup(?) ; search-overlay results (cached display data)
-g_xr_n        dd ?                          ; number of search-overlay results
-g_xr_active   dd ?                          ; 1 = overlay list is showing scored xr results
 g_cmpbuf      db 256 dup (?)               ; title-A copy for WM_COMPAREITEM
 align 2
 g_imp_msgw    dw 160 dup (?)               ; import result message scratch (wide)
@@ -1952,8 +1916,8 @@ unlock_proc endp
 ; =============================================================================
 gui_poplist proc frame
     FRAME_PROLOG 32                              ; single-vault: fill IDC_V_LIST from the one
-    mov     edx, IDC_V_LIST                      ; open vault, item data = entry index, no query
-    xor     r8d, r8d                             ; (0 = no query control -> show every entry)
+    mov     edx, IDC_V_LIST                      ; open vault, filtered by the sidebar search box
+    mov     r8d, IDC_V_SEARCH                    ; (empty box -> shows every entry)
     call    poplist_into
     FRAME_EPILOG
     ret
@@ -3515,6 +3479,8 @@ grf_done:
     call    gui_stretch_rows
     mov     rcx, qword ptr [rbp-24]           ; edge-dock the command controls (glyphs/buttons)
     call    gui_cmd_dock_layout
+    mov     rcx, qword ptr [rbp-24]           ; fit the entry list inside the sidebar frame
+    call    sidebar_layout
     WINCALL InvalidateRect, qword ptr [rbp-24], 0, 1   ; repaint the field cards at the new width
     FRAME_EPILOG
     ret
@@ -3699,6 +3665,74 @@ dk_done:
     FRAME_EPILOG
     ret
 gui_cmd_dock_layout endp
+
+; sidebar_rect(rcx=hdlg, rdx=out{L,T,R,B}) - the sidebar frame rect in client px.
+;   L/R + the gap are DLU (DPI-aware); T is a gap below the title strip and B a
+;   matching gap above the window bottom, so the card scales with the window.
+public sidebar_rect
+sidebar_rect proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], rdx
+    WINCALL GetClientRect, qword ptr [rbp-24], addr rbp-64   ; L-64 T-60 R-56 B-52
+    mov     dword ptr [rbp-48], SIDE_L_DLU        ; map {L, gap, R, gap} DLU -> px
+    mov     dword ptr [rbp-44], SIDE_GAP_DLU      ; (scratch above the outgoing shadow zone)
+    mov     dword ptr [rbp-40], SIDE_R_DLU
+    mov     dword ptr [rbp-36], SIDE_GAP_DLU
+    WINCALL MapDialogRect, qword ptr [rbp-24], addr rbp-48
+    mov     r8, qword ptr [rbp-32]
+    mov     eax, dword ptr [rbp-48]               ; L
+    mov     dword ptr [r8+0], eax
+    mov     eax, dword ptr [rbp-44]               ; gap (vertical) -> T = strip + gap
+    add     eax, TBAR_H
+    mov     dword ptr [r8+4], eax
+    mov     eax, dword ptr [rbp-40]               ; R
+    mov     dword ptr [r8+8], eax
+    mov     eax, dword ptr [rbp-52]               ; B = client height - gap
+    sub     eax, dword ptr [rbp-44]
+    mov     dword ptr [r8+12], eax
+    FRAME_EPILOG
+    ret
+sidebar_rect endp
+
+; sidebar_layout(rcx=hdlg) - fit the entry list inside the sidebar frame: a thin
+;   L/R inset so the selection reaches the border, and a slightly larger T/B inset
+;   so the list ends above the frame.  Called at init and on WM_SIZE.
+sidebar_layout proc frame
+    FRAME_PROLOG 128                              ; MoveWindow's 6-arg spill must clear -76
+    mov     qword ptr [rbp-24], rcx
+    lea     rdx, [rbp-48]                         ; frame rect {L,T,R,B}
+    call    sidebar_rect
+    mov     eax, dword ptr [rbp-48]               ; inner x = frameL + BORD_X
+    add     eax, SIDE_BORD_X
+    mov     dword ptr [rbp-64], eax
+    mov     eax, dword ptr [rbp-40]               ; inner w = (frameR - frameL) - 2*BORD_X
+    sub     eax, dword ptr [rbp-48]
+    sub     eax, SIDE_BORD_X*2
+    mov     dword ptr [rbp-72], eax
+    ; --- search box: across the top of the frame ---
+    mov     eax, dword ptr [rbp-44]               ; sy = frameT + BORD_Y
+    add     eax, SIDE_BORD_Y
+    mov     dword ptr [rbp-68], eax
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_V_SEARCH
+    mov     qword ptr [rbp-88], rax               ; save hwnd: MoveWindow's mem args clobber rax
+    WINCALL MoveWindow, qword ptr [rbp-88], dword ptr [rbp-64], dword ptr [rbp-68], \
+            dword ptr [rbp-72], SIDE_SRCH_H, 1
+    ; --- list: below the search box, down to just above the frame bottom ---
+    mov     eax, dword ptr [rbp-68]               ; ly = sy + SRCH_H + SRCH_GAP
+    add     eax, SIDE_SRCH_H + SIDE_SRCH_GAP
+    mov     dword ptr [rbp-76], eax
+    mov     eax, dword ptr [rbp-36]               ; lh = (frameB - BORD_Y) - ly
+    sub     eax, SIDE_BORD_Y
+    sub     eax, dword ptr [rbp-76]
+    mov     dword ptr [rbp-80], eax
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_V_LIST
+    mov     qword ptr [rbp-88], rax               ; save hwnd before the MoveWindow (rax clobber)
+    WINCALL MoveWindow, qword ptr [rbp-88], dword ptr [rbp-64], dword ptr [rbp-76], \
+            dword ptr [rbp-72], dword ptr [rbp-80], 1
+    FRAME_EPILOG
+    ret
+sidebar_layout endp
 
 ; gui_draw_flatchevron(rcx=lpdis) - draw a reorder chevron as a bare dim glyph on
 ;   the dialog bg (no button chrome).  Up for DS_UP, down otherwise.
@@ -5520,17 +5554,16 @@ gsc_key:
     ret
 gsc_char:
     ; type-to-search: a printable key while a ghost button has focus jumps to the
-    ; search box (only the vault dialog has one; harmless elsewhere)
+    ; sidebar search box (only the vault dialog has one; harmless elsewhere)
     cmp     qword ptr [rbp-40], 20h
     jb      gsc_def
     WINCALL GetParent, qword ptr [rbp-24]
     mov     qword ptr [rbp-56], rax
-    mov     rcx, rax                           ; open the search overlay, then type into it
-    call    search_overlay_open
-    WINCALL GetDlgItem, qword ptr [rbp-56], IDC_SO_EDIT
+    WINCALL GetDlgItem, qword ptr [rbp-56], IDC_V_SEARCH   ; focus the sidebar box, type into it
     mov     qword ptr [rbp-64], rax
     test    rax, rax
     jz      gsc_def
+    WINCALL SetFocus, qword ptr [rbp-64]
     WINCALL SendMessageW, qword ptr [rbp-64], WM_CHAR_, qword ptr [rbp-40], \
             qword ptr [rbp-48]
     xor     eax, eax
@@ -5623,10 +5656,10 @@ vault_ctrl_key proc frame
     WINCALL GetParent, qword ptr [rbp-24]
     mov     qword ptr [rbp-40], rax
     mov     eax, dword ptr [rbp-28]
-    cmp     eax, 4Bh                           ; 'K' -> open the title-bar search overlay
+    cmp     eax, 4Bh                           ; 'K' -> focus the sidebar search box
     jne     vck_chkn
-    mov     rcx, qword ptr [rbp-40]
-    call    search_overlay_open
+    WINCALL GetDlgItem, qword ptr [rbp-40], IDC_V_SEARCH
+    WINCALL SetFocus, rax
     jmp     vck_yes
 vck_chkn:
     cmp     eax, 4Eh                           ; 'N' -> new item
@@ -5680,14 +5713,13 @@ sts_notkey:
     jb      sts_def
     WINCALL GetParent, qword ptr [rbp-24]
     mov     qword ptr [rbp-56], rax
-    mov     rcx, rax                           ; open the search overlay (focuses its edit),
-    call    search_overlay_open                ;   then forward the keystroke into it
-    WINCALL GetDlgItem, qword ptr [rbp-56], IDC_SO_EDIT
+    WINCALL GetDlgItem, qword ptr [rbp-56], IDC_V_SEARCH   ; focus the sidebar search box,
     mov     qword ptr [rbp-64], rax
     test    rax, rax
     jz      sts_def
+    WINCALL SetFocus, qword ptr [rbp-64]
     WINCALL SendMessageW, qword ptr [rbp-64], WM_CHAR_, qword ptr [rbp-40], \
-            qword ptr [rbp-48]
+            qword ptr [rbp-48]                  ;   then forward the keystroke into it
     xor     eax, eax                           ; consumed
     FRAME_EPILOG
     ret
@@ -10026,15 +10058,8 @@ frame_layout proc frame
     mov     dword ptr [rbp-56], eax
     WINCALL GetDlgItem, qword ptr [rbp-24], IDC_T_NEW
     WINCALL MoveWindow, rax, dword ptr [rbp-56], 0, DOCKBTN_W, TBAR_H, 1
-    ; search pill: left of the dock, vertically centred in the strip
-    mov     eax, dword ptr [rbp-56]            ; pill right = New left - 12 gap
-    sub     eax, 12
-    sub     eax, SEARCHPILL_W                  ; pill left
-    mov     dword ptr [rbp-64], eax
-    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_T_SEARCH
-    WINCALL MoveWindow, rax, dword ptr [rbp-64], 5, SEARCHPILL_W, 22, 1
     ; (the multi-vault tab strip was removed in M3 - the unified list shows every
-    ; open vault's entries, so the caption area to the left of the pill is now
+    ; open vault's entries, so the caption area to the left of the dock is now
     ; just empty draggable space.)
     FRAME_EPILOG
     ret
@@ -10094,577 +10119,11 @@ frame_build proc frame
     mov     r8d, GLY_SETTINGS
     lea     r9, [gt_settings]
     call    ghost_make
-    mov     rcx, qword ptr [rbp-24]             ; search pill: make as a ghost, then
-    mov     edx, IDC_T_SEARCH                    ;   switch its style byte 2 -> 3 so
-    mov     r8d, GLY_SEARCH                      ;   theme_drawitem paints the pill
-    lea     r9, [wb_search_txt]
-    call    ghost_make
-    mov     qword ptr [rbp-32], rax
-    WINCALL GetWindowLongPtrW, qword ptr [rbp-32], GWL_USERDATA
-    and     eax, 0FFFFFF00h
-    or      eax, 3
-    mov     edx, eax
-    WINCALL SetWindowLongPtrW, qword ptr [rbp-32], GWL_USERDATA, rdx
     mov     rcx, qword ptr [rbp-24]
     call    frame_layout
     FRAME_EPILOG
     ret
 frame_build endp
-
-; =============================================================================
-; Title-bar search overlay (redesign A2): a blended dropdown under the search
-; pill with a query edit + owner-draw results list.  Built as hidden dialog
-; children so it rides the existing WM_DRAWITEM / WM_COMMAND / WM_CTLCOLOR flow.
-; =============================================================================
-
-; search_overlay_build(rcx=hdlg) - create the panel/edit/list (hidden).  Called
-;   from vp_init after frame_build so the overlay sits topmost.
-search_overlay_build proc frame
-    FRAME_PROLOG 128
-    mov     qword ptr [rbp-24], rcx
-    WINCALL mk_ctl, qword ptr [rbp-24], IDC_SO_PANEL, addr cls_static, 0, \
-            SS_OWNERDRAW_, 0, 0, 10, 10
-    WINCALL mk_ctl, qword ptr [rbp-24], IDC_SO_EDIT, addr cls_edit, 0, \
-            ES_AUTOHSCROLL_, 0, 0, 10, 10
-    mov     qword ptr [rbp-32], rax
-    WINCALL SendMessageW, qword ptr [rbp-32], EM_SETCUEBANNER, 1, addr so_cue
-    WINCALL SetWindowSubclass, qword ptr [rbp-32], addr search_overlay_editsub, 0, \
-            qword ptr [rbp-24]
-    WINCALL mk_ctl, qword ptr [rbp-24], IDC_SO_LIST, addr cls_listbox, 0, \
-            LBS_OWNERDRAWFIXED_ or LBS_SORT_ or LBS_NOTIFY_ or LBS_NOINTEGRALHEIGHT_ or WS_VSCROLL_, \
-            0, 0, 10, 10
-    mov     rcx, qword ptr [rbp-24]
-    lea     rdx, [g_so_ids]
-    mov     r8d, 3
-    mov     r9d, SW_HIDE
-    call    gui_show_ids
-    FRAME_EPILOG
-    ret
-search_overlay_build endp
-
-; search_overlay_open(rcx=hdlg) - position the dropdown under the pill, show it,
-;   populate with all entries, and focus the query edit.
-search_overlay_open proc frame
-    FRAME_PROLOG 144                           ; spill must clear the pill/client rects (down to -112)
-    mov     qword ptr [rbp-24], rcx
-    cmp     dword ptr [g_so_open], 0
-    jne     soo_focus
-    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_T_SEARCH
-    mov     qword ptr [rbp-32], rax
-    WINCALL GetWindowRect, qword ptr [rbp-32], addr rbp-80   ; L-80 T-76 R-72 B-68
-    WINCALL MapWindowPoints, 0, qword ptr [rbp-24], addr rbp-80, 2
-    WINCALL GetClientRect, qword ptr [rbp-24], addr rbp-112  ; R at -104
-    mov     eax, dword ptr [rbp-80]           ; x = pill left
-    mov     dword ptr [rbp-40], eax
-    mov     eax, dword ptr [rbp-104]          ; clamp x to clientW - SO_W - 4
-    sub     eax, SO_W
-    sub     eax, 4
-    cmp     dword ptr [rbp-40], eax
-    jle     @F
-    mov     dword ptr [rbp-40], eax
-@@: cmp     dword ptr [rbp-40], 4
-    jge     @F
-    mov     dword ptr [rbp-40], 4
-@@: mov     eax, dword ptr [rbp-68]           ; y = below the title bar, with a gap so the
-    add     eax, 8                            ;   dropdown detaches from the detail header
-    mov     dword ptr [rbp-44], eax
-    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_SO_PANEL   ; panel wraps just the results
-    WINCALL MoveWindow, rax, dword ptr [rbp-40], dword ptr [rbp-44], SO_W, SO_LISTH+8, 0
-    mov     eax, dword ptr [rbp-72]           ; edit painted OVER the pill: pillW = R - L
-    sub     eax, dword ptr [rbp-80]
-    mov     dword ptr [rbp-56], eax
-    mov     eax, dword ptr [rbp-68]           ; pillH = B - T
-    sub     eax, dword ptr [rbp-76]
-    mov     dword ptr [rbp-60], eax
-    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_SO_EDIT
-    mov     qword ptr [rbp-64], rax           ; hold hwnd (MoveWindow below has a memory
-    WINCALL MoveWindow, qword ptr [rbp-64], dword ptr [rbp-80], dword ptr [rbp-76], \
-            dword ptr [rbp-56], dword ptr [rbp-60], 0                                   ; stack-arg -> rax can't be arg1)
-    WINCALL SetWindowPos, qword ptr [rbp-64], 0, 0, 0, 0, 0, SWP_RAISE_   ; raise the edit above the pill
-    WINCALL ShowWindow, qword ptr [rbp-32], SW_HIDE   ; hide the pill; the edit visually replaces it
-    mov     eax, dword ptr [rbp-40]           ; list inside the panel (4px inset)
-    add     eax, 4
-    mov     dword ptr [rbp-48], eax
-    mov     eax, dword ptr [rbp-44]
-    add     eax, 4
-    mov     dword ptr [rbp-52], eax
-    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_SO_LIST
-    WINCALL MoveWindow, rax, dword ptr [rbp-48], dword ptr [rbp-52], SO_W-8, SO_LISTH, 0
-    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_SO_EDIT, addr w_empty
-    mov     rcx, qword ptr [rbp-24]
-    lea     rdx, [g_so_ids]
-    mov     r8d, 3
-    mov     r9d, SW_SHOW
-    call    gui_show_ids
-    mov     rcx, qword ptr [rbp-24]
-    call    search_overlay_populate
-    mov     dword ptr [g_so_open], 1
-soo_focus:
-    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_SO_EDIT
-    WINCALL SetFocus, rax
-    FRAME_EPILOG
-    ret
-search_overlay_open endp
-
-; search_overlay_close(rcx=hdlg) - hide the dropdown, return focus to the dialog.
-search_overlay_close proc frame
-    FRAME_PROLOG 32
-    mov     qword ptr [rbp-24], rcx
-    cmp     dword ptr [g_so_open], 0
-    je      soc_done
-    mov     rcx, qword ptr [rbp-24]
-    lea     rdx, [g_so_ids]
-    mov     r8d, 3
-    mov     r9d, SW_HIDE
-    call    gui_show_ids
-    mov     dword ptr [g_so_open], 0
-    mov     dword ptr [g_xr_active], 0
-    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_T_SEARCH   ; restore the pill the edit replaced
-    WINCALL ShowWindow, rax, SW_SHOW
-    WINCALL InvalidateRect, qword ptr [rbp-24], 0, 1   ; repaint the area it covered
-    WINCALL SetFocus, qword ptr [rbp-24]
-soc_done:
-    FRAME_EPILOG
-    ret
-search_overlay_close endp
-
-; search_overlay_movesel(rcx=hdlg, edx=delta) - move the results selection.
-search_overlay_movesel proc frame
-    FRAME_PROLOG 64                            ; spill must clear delta at -32 / new at -40
-    mov     qword ptr [rbp-24], rcx
-    mov     dword ptr [rbp-32], edx
-    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_SO_LIST, LB_GETCOUNT, 0, 0
-    test    eax, eax
-    jz      som_done
-    mov     dword ptr [rbp-36], eax           ; count
-    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_SO_LIST, LB_GETCURSEL, 0, 0
-    add     eax, dword ptr [rbp-32]           ; cur(-1 if none) + delta
-    test    eax, eax
-    jns     @F
-    xor     eax, eax
-@@: cmp     eax, dword ptr [rbp-36]
-    jl      @F
-    mov     eax, dword ptr [rbp-36]
-    dec     eax
-@@: mov     dword ptr [rbp-40], eax
-    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_SO_LIST, LB_SETCURSEL, \
-            dword ptr [rbp-40], 0
-som_done:
-    FRAME_EPILOG
-    ret
-search_overlay_movesel endp
-
-; search_overlay_activate(rcx=hdlg) - open the selected result: sync the sidebar
-;   selection to it, load its detail, close the overlay.
-search_overlay_activate proc frame
-    FRAME_PROLOG 80
-    mov     qword ptr [rbp-24], rcx
-    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_SO_LIST, LB_GETCURSEL, 0, 0
-    cmp     eax, LB_ERR
-    je      soa_done
-    mov     dword ptr [rbp-48], eax           ; selected overlay row
-    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_SO_LIST, LB_GETITEMDATA, \
-            dword ptr [rbp-48], 0
-    mov     dword ptr [rbp-40], eax           ; item data = entry index (single vault)
-    mov     rcx, qword ptr [rbp-24]           ; hide the overlay
-    call    search_overlay_close
-    mov     rcx, qword ptr [rbp-24]           ; reselect its row in the list
-    mov     edx, dword ptr [rbp-40]
-    call    gui_lb_selbydata
-    mov     rcx, qword ptr [rbp-24]
-    mov     edx, dword ptr [rbp-40]
-    call    gui_showdetail
-    mov     rcx, qword ptr [rbp-24]
-    xor     edx, edx
-    call    gui_set_editmode
-soa_done:
-    FRAME_EPILOG
-    ret
-search_overlay_activate endp
-
-; search_overlay_editsub - SUBCLASSPROC on the query edit: Esc closes, Enter
-;   activates, Up/Down move the results selection.  dwRefData = hdlg ([rbp+56]).
-search_overlay_editsub proc frame
-    FRAME_PROLOG 48
-    mov     qword ptr [rbp-24], rcx
-    mov     qword ptr [rbp-32], rdx
-    mov     qword ptr [rbp-40], r8
-    mov     qword ptr [rbp-48], r9
-    cmp     rdx, WM_GETDLGCODE_               ; claim Enter/Esc/arrows from IsDialogMessage
-    je      ses_dlgcode
-    cmp     rdx, WM_KEYDOWN_
-    jne     ses_def
-    mov     r10d, r8d
-    cmp     r10d, VK_ESCAPE_
-    je      ses_esc
-    cmp     r10d, VK_RETURN_
-    je      ses_enter
-    cmp     r10d, VK_DOWN_
-    je      ses_down
-    cmp     r10d, VK_UP_
-    je      ses_up
-ses_def:
-    WINCALL DefSubclassProc, qword ptr [rbp-24], qword ptr [rbp-32], qword ptr [rbp-40], \
-            qword ptr [rbp-48]
-    FRAME_EPILOG
-    ret
-ses_dlgcode:
-    WINCALL DefSubclassProc, qword ptr [rbp-24], qword ptr [rbp-32], qword ptr [rbp-40], \
-            qword ptr [rbp-48]
-    or      eax, DLGC_WANTALLKEYS_
-    FRAME_EPILOG
-    ret
-ses_esc:
-    mov     rcx, qword ptr [rbp+56]
-    call    search_overlay_close
-    xor     eax, eax
-    FRAME_EPILOG
-    ret
-ses_enter:
-    mov     rcx, qword ptr [rbp+56]
-    call    search_overlay_activate
-    xor     eax, eax
-    FRAME_EPILOG
-    ret
-ses_down:
-    mov     rcx, qword ptr [rbp+56]
-    mov     edx, 1
-    call    search_overlay_movesel
-    xor     eax, eax
-    FRAME_EPILOG
-    ret
-ses_up:
-    mov     rcx, qword ptr [rbp+56]
-    mov     edx, -1
-    call    search_overlay_movesel
-    xor     eax, eax
-    FRAME_EPILOG
-    ret
-search_overlay_editsub endp
-
-; ---- cross-vault search (C4) ------------------------------------------------
-; xr_ptr(ecx=k) -> rax = &g_xr[k].  Leaf.
-xr_ptr proc
-    mov     eax, ecx
-    imul    rax, rax, sizeof XR
-    lea     rcx, [g_xr]
-    add     rax, rcx
-    ret
-xr_ptr endp
-
-; xr_ptr_at(ecx=k, rdx=base) -> rax = &base[k].  Leaf.  Base-relative form used by
-;   xfill_into and the search-overlay painter (base = g_xr).
-xr_ptr_at proc
-    mov     eax, ecx
-    imul    rax, rax, sizeof XR
-    add     rax, rdx
-    ret
-xr_ptr_at endp
-
-; xr_wcopy(rcx=dst wide, rdx=src wide, r8d=max chars) - copy a wide string,
-;   NUL-terminated, capped.  Leaf.
-xr_wcopy proc
-    xor     r9d, r9d
-xwc_lp:
-    cmp     r9d, r8d
-    jae     xwc_end
-    movzx   eax, word ptr [rdx + r9*2]
-    mov     word ptr [rcx + r9*2], ax
-    test    ax, ax
-    jz      xwc_done
-    inc     r9d
-    jmp     xwc_lp
-xwc_end:
-    mov     word ptr [rcx + r9*2], 0
-xwc_done:
-    ret
-xr_wcopy endp
-
-; xfill_into(rcx=hdlg, edx=queryEditId, r8=xrbase, r9=&count) - fuzzy-search the
-;   current vault, caching each match's display data (glyph/color/title/subtitle)
-;   into the XR array at r8 (count written back through r9).  edx=0 => no query
-;   control, match everything; otherwise the query is read from that edit control
-;   (the search overlay).  Honours g_trash_view: shows deleted iff in the trash
-;   view, exactly like poplist_into, so trash mode works.
-xfill_into proc frame
-    FRAME_PROLOG 128
-    mov     qword ptr [rbp-24], rcx
-    mov     dword ptr [rbp-108], edx          ; queryEditId (0 = match all)
-    mov     qword ptr [rbp-96], r8            ; xrbase
-    mov     qword ptr [rbp-104], r9           ; &count
-    mov     dword ptr [rbp-32], 0             ; qlen (0 unless a query control is given)
-    cmp     dword ptr [rbp-108], 0
-    je      xf_qdone
-    WINCALL GetDlgItemTextW, qword ptr [rbp-24], dword ptr [rbp-108], addr g_search_w, 255
-    mov     dword ptr [rbp-32], eax           ; qlen
-xf_qdone:
-    mov     eax, dword ptr [rbp-32]
-    mov     dword ptr [g_search_len], eax
-    test    eax, eax
-    jz      @F
-    WINCALL CharUpperBuffW, addr g_search_w, dword ptr [rbp-32]
-@@: mov     r10, qword ptr [rbp-104]          ; *count = 0
-    mov     dword ptr [r10], 0
-    call    vault_count                       ; single vault: one pass over its entries
-    mov     dword ptr [rbp-40], eax           ; cnt
-    mov     dword ptr [rbp-44], 0             ; j
-xf_eloop:
-    mov     eax, dword ptr [rbp-44]
-    cmp     eax, dword ptr [rbp-40]
-    jae     xf_vdone
-    mov     ecx, dword ptr [rbp-44]           ; trash filter: show deleted iff trash view
-    call    gui_entry_is_deleted
-    cmp     eax, dword ptr [g_trash_view]
-    jne     xf_jnext
-    cmp     dword ptr [rbp-32], 0
-    je      xf_match
-    mov     ecx, dword ptr [rbp-44]
-    call    gui_entry_fuzzy
-    test    eax, eax
-    js      xf_jnext
-    mov     dword ptr [rbp-52], eax
-    jmp     xf_store
-xf_match:
-    mov     dword ptr [rbp-52], 0
-xf_store:
-    mov     r10, qword ptr [rbp-104]
-    mov     eax, dword ptr [r10]              ; count
-    cmp     eax, MAX_XR
-    jae     xf_vdone
-    mov     ecx, eax
-    mov     rdx, qword ptr [rbp-96]           ; xrbase
-    call    xr_ptr_at
-    mov     qword ptr [rbp-64], rax
-    mov     r10, rax
-    mov     dword ptr [r10+XR.xr_vault], 0     ; single vault
-    mov     eax, dword ptr [rbp-44]
-    mov     dword ptr [r10+XR.xr_entry], eax
-    mov     eax, dword ptr [rbp-52]
-    mov     dword ptr [r10+XR.xr_score], eax
-    mov     ecx, dword ptr [rbp-44]           ; glyph -> cache
-    call    gui_entry_glyph
-    mov     r10, qword ptr [rbp-64]
-    mov     dword ptr [r10+XR.xr_glyph], eax
-    mov     ecx, dword ptr [rbp-44]           ; color -> cache
-    call    gui_entry_color
-    mov     r10, qword ptr [rbp-64]
-    mov     dword ptr [r10+XR.xr_color], eax
-    mov     ecx, dword ptr [rbp-44]           ; title (utf8) -> wide -> cache
-    lea     rdx, [rbp-72]
-    call    vault_title_at
-    mov     rcx, rax
-    mov     edx, dword ptr [rbp-72]
-    mov     r10, qword ptr [rbp-64]
-    lea     r8, [r10+XR.xr_title]
-    mov     r9d, 62
-    call    gui_towide
-    mov     ecx, dword ptr [rbp-44]           ; subtitle -> g_sub_w -> cache
-    call    gui_entry_subtitle
-    mov     r10, qword ptr [rbp-64]
-    lea     rcx, [r10+XR.xr_sub]
-    lea     rdx, [g_sub_w]
-    mov     r8d, 63
-    call    xr_wcopy
-    mov     r10, qword ptr [rbp-104]
-    inc     dword ptr [r10]                   ; count++
-xf_jnext:
-    inc     dword ptr [rbp-44]
-    jmp     xf_eloop
-xf_vdone:
-    FRAME_EPILOG
-    ret
-xfill_into endp
-
-; search_overlay_xfill(rcx=hdlg) - the search overlay's cross-vault fill: query
-;   from IDC_SO_EDIT, results into g_xr.
-search_overlay_xfill proc frame
-    FRAME_PROLOG 32
-    mov     edx, IDC_SO_EDIT
-    lea     r8, [g_xr]
-    lea     r9, [g_xr_n]
-    call    xfill_into
-    FRAME_EPILOG
-    ret
-search_overlay_xfill endp
-
-; gui_draw_sopanel(rcx=lpdis) - paint the search-overlay backdrop as a distinct
-;   floating card: filled panel + 1px frame border, so the results dropdown reads
-;   as separate from the detail pane it floats over.
-gui_draw_sopanel proc frame
-    FRAME_PROLOG 96
-    mov     qword ptr [rbp-24], rcx
-    mov     r10, rcx
-    mov     rax, qword ptr [r10+32]           ; hDC
-    mov     qword ptr [rbp-32], rax
-    lea     rax, [r10+40]                     ; &rcItem
-    mov     qword ptr [rbp-40], rax
-    WINCALL CreateSolidBrush, dword ptr [g_col_panel]
-    mov     qword ptr [rbp-48], rax
-    WINCALL FillRect, qword ptr [rbp-32], qword ptr [rbp-40], qword ptr [rbp-48]
-    WINCALL DeleteObject, qword ptr [rbp-48]
-    WINCALL CreateSolidBrush, dword ptr [g_col_frame]
-    mov     qword ptr [rbp-48], rax
-    WINCALL FrameRect, qword ptr [rbp-32], qword ptr [rbp-40], qword ptr [rbp-48]
-    WINCALL DeleteObject, qword ptr [rbp-48]
-    FRAME_EPILOG
-    ret
-gui_draw_sopanel endp
-
-; gui_draw_xresult(rcx=lpdis) - paint one cross-vault result card from g_xr
-;   (icon + title + subtitle + right-aligned dim vault name).
-gui_draw_xresult proc frame
-    FRAME_PROLOG 192
-    mov     qword ptr [rbp-24], rcx
-    mov     r10, rcx
-    mov     eax, dword ptr [r10+8]
-    cmp     eax, -1
-    je      gxr_done
-    mov     rax, qword ptr [r10+32]
-    mov     qword ptr [rbp-32], rax           ; hdc
-    mov     eax, dword ptr [r10+40]
-    mov     dword ptr [rbp-40], eax
-    mov     eax, dword ptr [r10+44]
-    mov     dword ptr [rbp-48], eax
-    mov     eax, dword ptr [r10+48]
-    mov     dword ptr [rbp-56], eax
-    mov     eax, dword ptr [r10+52]
-    mov     dword ptr [rbp-64], eax
-    mov     eax, dword ptr [r10+16]
-    mov     dword ptr [rbp-72], eax           ; state
-    lea     rax, [g_xr]                       ; search-overlay results are backed by g_xr
-    mov     qword ptr [rbp-112], rax
-    mov     eax, dword ptr [g_xr_n]
-    mov     dword ptr [rbp-116], eax
-    mov     r10, qword ptr [rbp-24]
-    mov     eax, dword ptr [r10+56]           ; itemData = xr index
-    cmp     eax, dword ptr [rbp-116]          ; guard: stale/foreign index -> skip
-    jae     gxr_done
-    mov     ecx, eax
-    mov     rdx, qword ptr [rbp-112]
-    call    xr_ptr_at
-    mov     qword ptr [rbp-80], rax
-    mov     eax, dword ptr [g_col_side]
-    test    dword ptr [rbp-72], 1
-    jz      @F
-    mov     eax, dword ptr [g_col_frame]
-@@: mov     dword ptr [rbp-88], eax
-    WINCALL CreateSolidBrush, dword ptr [rbp-88]
-    mov     qword ptr [rbp-96], rax
-    mov     r10, qword ptr [rbp-24]
-    lea     rdx, [r10+40]
-    WINCALL FillRect, qword ptr [rbp-32], rdx, qword ptr [rbp-96]
-    WINCALL DeleteObject, qword ptr [rbp-96]
-    mov     r10, qword ptr [rbp-80]           ; icon tile
-    mov     eax, dword ptr [r10+XR.xr_color]
-    mov     dword ptr [g_tilecolor], eax
-    mov     eax, dword ptr [r10+XR.xr_glyph]
-    mov     word ptr [g_glyph_w], ax
-    mov     word ptr [g_glyph_w+2], 0
-    mov     rcx, qword ptr [rbp-32]
-    mov     edx, dword ptr [rbp-40]
-    add     edx, 5
-    mov     r8d, dword ptr [rbp-48]
-    add     r8d, 5
-    mov     r9d, 34
-    call    gui_draw_tile
-    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_cardfont]   ; title
-    mov     qword ptr [rbp-104], rax
-    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_text]
-    WINCALL SetBkMode, qword ptr [rbp-32], 1
-    mov     eax, dword ptr [rbp-40]
-    add     eax, 46
-    mov     dword ptr [rbp-152], eax
-    mov     eax, dword ptr [rbp-48]
-    add     eax, 4
-    mov     dword ptr [rbp-148], eax
-    mov     eax, dword ptr [rbp-56]
-    sub     eax, 4
-    mov     dword ptr [rbp-144], eax
-    mov     eax, dword ptr [rbp-48]
-    add     eax, 22
-    mov     dword ptr [rbp-140], eax
-    mov     r10, qword ptr [rbp-80]
-    lea     rdx, [r10+XR.xr_title]
-    WINCALL DrawTextW, qword ptr [rbp-32], rdx, -1, addr rbp-152, 8024h
-    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_subfont]    ; subtitle (dim)
-    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_textdim]
-    mov     eax, dword ptr [rbp-48]
-    add     eax, 22
-    mov     dword ptr [rbp-148], eax
-    mov     eax, dword ptr [rbp-64]
-    sub     eax, 2
-    mov     dword ptr [rbp-140], eax
-    mov     r10, qword ptr [rbp-80]
-    lea     rdx, [r10+XR.xr_sub]
-    WINCALL DrawTextW, qword ptr [rbp-32], rdx, -1, addr rbp-152, 8024h
-    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-104]
-gxr_done:
-    mov     eax, 1
-    FRAME_EPILOG
-    ret
-gui_draw_xresult endp
-
-; search_overlay_populate(rcx=hdlg) - fill the overlay results list with the
-;   current vault's entries, ranked by match score (owner-drawn xr cards).
-search_overlay_populate proc frame
-    FRAME_PROLOG 64
-    mov     qword ptr [rbp-24], rcx
-    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_SO_LIST, LB_RESETCONTENT, 0, 0
-    mov     dword ptr [g_xr_active], 1        ; set AFTER clearing old (entry-index) items
-    mov     rcx, qword ptr [rbp-24]
-    call    search_overlay_xfill
-    mov     dword ptr [rbp-28], 0
-sop_addlp:
-    mov     eax, dword ptr [rbp-28]
-    cmp     eax, dword ptr [g_xr_n]
-    jae     sop_done
-    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_SO_LIST, LB_ADDSTRING, 0, \
-            dword ptr [rbp-28]
-    inc     dword ptr [rbp-28]
-    jmp     sop_addlp
-sop_done:
-    mov     rcx, qword ptr [rbp-24]           ; grow/shrink the dropdown to the hit count
-    call    search_overlay_resize
-    FRAME_EPILOG
-    ret
-search_overlay_populate endp
-
-; search_overlay_resize(rcx=hdlg) - size the results list + panel to the current
-;   hit count: height = clamp(rows * itemHeight, one row, SO_LISTH).  Called after
-;   every populate so the dropdown shrinks as the query filters results down.
-search_overlay_resize proc frame
-    FRAME_PROLOG 96                            ; must hold a 7-arg WINCALL (SetWindowPos):
-                                              ; its stack args reach [rbp-56], so the hwnd/
-                                              ; listH/hdlg locals (-24..-40) must sit above it
-    mov     qword ptr [rbp-24], rcx
-    mov     eax, dword ptr [g_layout]         ; rowH = the list-card height for this layout
-    lea     r11, [lay_itemh]                  ;   (deterministic; what WM_MEASUREITEM sets)
-    mov     eax, dword ptr [r11+rax*4]
-    mov     dword ptr [rbp-28], eax           ; rowH
-    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_SO_LIST, LB_GETCOUNT, 0, 0
-    test    eax, eax
-    jns     @F
-    xor     eax, eax                          ; LB_ERR -> 0 rows
-@@: imul    eax, dword ptr [rbp-28]           ; listH = rows * rowH
-    cmp     eax, SO_LISTH                      ; clamp high
-    jle     @F
-    mov     eax, SO_LISTH
-@@: cmp     eax, dword ptr [rbp-28]           ; clamp low (at least one row tall)
-    jge     @F
-    mov     eax, dword ptr [rbp-28]
-@@: mov     dword ptr [rbp-32], eax           ; listH (final)
-    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_SO_LIST
-    mov     qword ptr [rbp-40], rax           ; hold hwnd (the SetWindowPos below has a
-    WINCALL SetWindowPos, qword ptr [rbp-40], 0, 0, 0, SO_W-8, dword ptr [rbp-32], SWP_FRAME_  ; memory stack-arg, so rax can't be arg1)
-    mov     eax, dword ptr [rbp-32]           ; panel wraps the list (4px inset top+bottom)
-    add     eax, 8
-    mov     dword ptr [rbp-36], eax
-    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_SO_PANEL
-    mov     qword ptr [rbp-40], rax
-    WINCALL SetWindowPos, qword ptr [rbp-40], 0, 0, 0, SO_W, dword ptr [rbp-36], SWP_FRAME_
-    FRAME_EPILOG
-    ret
-search_overlay_resize endp
 
 
 ; =============================================================================
@@ -10742,11 +10201,6 @@ vp_size:
     WINCALL RedrawWindow, qword ptr [rbp-8], 0, 0, 85h   ; INVALIDATE|ERASE|ALLCHILDREN
     xor     eax, eax
     jmp     vp_ret
-vp_searchfocus:
-    mov     rcx, qword ptr [rbp-8]           ; open the blended search overlay
-    call    search_overlay_open
-    xor     eax, eax
-    jmp     vp_ret
 vp_minmax:
     mov     r10, r9                          ; MINMAXINFO: ptMinTrackSize at +24
     mov     eax, dword ptr [g_base_winw]
@@ -10797,50 +10251,9 @@ vp_measure_menu:
     jmp     vp_ret
 vp_compare:
     mov     r10, r9                          ; COMPAREITEMSTRUCT: CtlID +4, item data +24/+40
-    cmp     dword ptr [g_xr_active], 0        ; search overlay uses the score order below;
-    jne     vp_compare_xr                    ;   the main IDC_V_LIST uses gui_title_cmp
-    mov     ecx, dword ptr [r10+24]
+    mov     ecx, dword ptr [r10+24]          ; IDC_V_LIST entry cards ordered by gui_title_cmp
     mov     edx, dword ptr [r10+40]
     call    gui_title_cmp
-    jmp     vp_ret
-vp_compare_xr:
-    mov     ecx, dword ptr [r10+24]          ; cross-vault order: score DESC, then vault
-    cmp     ecx, dword ptr [g_xr_n]          ;   ASC, then entry ASC.  A *total* order:
-    jae     vpc_eq                           ;   with an empty query every score is 0, so
-    mov     edx, dword ptr [r10+40]          ;   score-only left the sort undefined and the
-    cmp     edx, dword ptr [g_xr_n]          ;   results looked shuffled / vaults mixed up.
-    jae     vpc_eq                           ;   (guard against foreign item data)
-    call    xr_ptr                           ; rax = xr[A] (ecx = idxA); r8 survives xr_ptr
-    mov     r8, rax
-    mov     r10, r9
-    mov     ecx, dword ptr [r10+40]
-    call    xr_ptr                           ; rax = xr[B]
-    mov     r11, rax
-    mov     ecx, dword ptr [r8+XR.xr_score]  ; 1) score descending
-    mov     edx, dword ptr [r11+XR.xr_score]
-    cmp     ecx, edx
-    jg      vpc_a
-    jl      vpc_b
-    mov     ecx, dword ptr [r8+XR.xr_vault]  ; 2) vault index ascending
-    mov     edx, dword ptr [r11+XR.xr_vault]
-    cmp     ecx, edx
-    jb      vpc_a
-    ja      vpc_b
-    mov     ecx, dword ptr [r8+XR.xr_entry]  ; 3) entry index ascending
-    mov     edx, dword ptr [r11+XR.xr_entry]
-    cmp     ecx, edx
-    jb      vpc_a
-    ja      vpc_b
-    xor     eax, eax
-    jmp     vp_ret
-vpc_a:
-    mov     eax, -1
-    jmp     vp_ret
-vpc_b:
-    mov     eax, 1
-    jmp     vp_ret
-vpc_eq:
-    xor     eax, eax
     jmp     vp_ret
 vp_tpaint:
     mov     rcx, qword ptr [rbp-8]
@@ -10875,10 +10288,6 @@ vp_tdraw:
     je      vp_tdraw_tnoprev
     cmp     eax, IDC_V_LIST                   ; single-vault entry-card painter
     je      vp_tdraw_list
-    cmp     eax, IDC_SO_PANEL                 ; search-overlay backdrop = bordered card
-    je      vp_tdraw_sopanel
-    cmp     eax, IDC_SO_LIST                  ; search-overlay results
-    je      vp_tdraw_solist
     cmp     eax, IDC_V_HEADER                 ; detail-pane header (tile + title)
     je      vp_tdraw_header
     cmp     eax, IDC_V_ICON                   ; edit-mode icon tile before the title
@@ -10909,18 +10318,6 @@ vp_tdraw_header:
 vp_tdraw_icon:
     mov     rcx, r9
     call    gui_draw_iconbtn
-    mov     eax, 1
-    jmp     vp_ret
-vp_tdraw_sopanel:
-    mov     rcx, r9
-    call    gui_draw_sopanel
-    mov     eax, 1
-    jmp     vp_ret
-vp_tdraw_solist:
-    cmp     dword ptr [g_xr_active], 0        ; cross-vault results use the cached painter
-    je      vp_tdraw_list
-    mov     rcx, r9
-    call    gui_draw_xresult
     mov     eax, 1
     jmp     vp_ret
 vp_tdraw_colorpw:
@@ -11138,6 +10535,7 @@ vp_init:
     call    ghost_attach
     WINCALL GetDlgItem, qword ptr [rbp-8], IDC_V_LIST    ; type-to-search: keystrokes on
     WINCALL SetWindowSubclass, rax, addr search_type_subclass, 0, 0   ;  the list -> search box
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_V_SEARCH, EM_SETCUEBANNER, 1, addr cue_search
     mov     dword ptr [g_trash_view], 0       ; start in the vault (not the trash) view
     mov     dword ptr [g_deleted_state], 0
     call    gui_purge_trash                   ; drop entries trashed > 30 days ago
@@ -11180,12 +10578,12 @@ vp_init:
     call    frame_grow
     mov     rcx, qword ptr [rbp-8]
     call    frame_build
-    mov     rcx, qword ptr [rbp-8]            ; build the (hidden) search overlay, topmost
-    call    search_overlay_build
     mov     rcx, qword ptr [rbp-8]            ; record control rects for responsive resize
     call    gui_anchor_init
     mov     rcx, qword ptr [rbp-8]            ; edge-dock the glyphs/buttons for the initial size
     call    gui_cmd_dock_layout
+    mov     rcx, qword ptr [rbp-8]            ; fit the entry list inside the sidebar frame
+    call    sidebar_layout
     xor     eax, eax                          ; we set focus ourselves -> return FALSE
     jmp     vp_ret
 vp_cmd:
@@ -11200,8 +10598,6 @@ vp_cmd:
     jne     vp_cmd_disp
     cmp     eax, IDC_V_SEARCH                 ; query changed -> re-filter the list
     je      vp_searchchg
-    cmp     eax, IDC_SO_EDIT                  ; overlay query changed -> refilter results
-    je      vp_so_change
     cmp     eax, IDC_V_TITLE
     je      vp_setdirty
     cmp     eax, IDC_DYN_BASE                 ; any runtime row value/label edit
@@ -11215,16 +10611,12 @@ vp_cmd_disp:
 vp_cmd_fixed:
     cmp     eax, IDC_T_CLOSE                  ; custom caption button (only Close remains)
     je      vp_close
-    cmp     eax, IDC_T_SEARCH                 ; title-bar search pill -> focus the search box
-    je      vp_searchfocus
     cmp     eax, IDC_T_NEW                    ; title-bar control dock
     je      vp_add
     cmp     eax, IDC_T_GEN
     je      vp_gen_standalone
     cmp     eax, IDC_T_SET
     je      vp_menu
-    cmp     eax, IDC_SO_LIST                  ; search-overlay results
-    je      vp_so_list
     cmp     eax, IDC_V_LIST
     je      vp_list
     cmp     eax, IDC_V_ADDFIELD
@@ -11404,16 +10796,6 @@ vp_searchchg:
 vp_search_now:
     mov     rcx, qword ptr [rbp-8]            ; refilter the entry list immediately
     call    gui_poplist
-    jmp     vp_handled
-vp_so_change:
-    mov     rcx, qword ptr [rbp-8]            ; overlay: refilter the results list live
-    call    search_overlay_populate
-    jmp     vp_handled
-vp_so_list:
-    cmp     r10d, LBN_DBLCLK                  ; double-click a result -> open it
-    jne     vp_handled
-    mov     rcx, qword ptr [rbp-8]
-    call    search_overlay_activate
     jmp     vp_handled
 vp_focusin:
     cmp     dword ptr [g_editmode], 0
