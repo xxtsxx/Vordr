@@ -9949,7 +9949,7 @@ gui_menu_save endp
 ; frame_hittest(rcx=hdlg, r9=lParam screen POINT) -> eax=1 when the cursor is in
 ;   the empty title strip (DWLP_MSGRESULT set to HTCAPTION), else 0 (default).
 frame_hittest proc frame
-    FRAME_PROLOG 64
+    FRAME_PROLOG 96
     mov     qword ptr [rbp-24], rcx
     movsx   eax, r9w                           ; screen x
     mov     dword ptr [rbp-40], eax
@@ -9958,10 +9958,20 @@ frame_hittest proc frame
     movsx   eax, r10w                          ; screen y
     mov     dword ptr [rbp-36], eax            ; POINT{x=[rbp-40], y=[rbp-36]}
     WINCALL ScreenToClient, qword ptr [rbp-24], addr rbp-40
-    mov     eax, dword ptr [rbp-36]            ; client y
+    WINCALL GetClientRect, qword ptr [rbp-24], addr rbp-64   ; 0 0 R-56 B-52
+    ; Anywhere inside the client area that isn't a child control counts as chrome
+    ; and drags the window (child controls hit-test themselves; static labels are
+    ; HTTRANSPARENT and fall through here).  Clicks outside the client are the NC
+    ; sizing border - leave those to DefDlgProc so the window stays resizable.
+    mov     eax, dword ptr [rbp-40]            ; x in [0, client width) ?
     cmp     eax, 0
     jl      fht_no
-    cmp     eax, TBAR_H
+    cmp     eax, dword ptr [rbp-56]
+    jge     fht_no
+    mov     eax, dword ptr [rbp-36]            ; y in [0, client height) ?
+    cmp     eax, 0
+    jl      fht_no
+    cmp     eax, dword ptr [rbp-52]
     jge     fht_no
     WINCALL SetWindowLongPtrW, qword ptr [rbp-24], DWLP_MSGRESULT_, HTCAPTION
     mov     eax, 1
