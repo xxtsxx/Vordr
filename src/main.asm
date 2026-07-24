@@ -167,7 +167,7 @@ CSTR msg_nocpu,    "error: CPU lacks required features (AES-NI, PCLMULQDQ, SSE4.
 CSTR fs_seedlabel, "fuzz seed: "       ; G7: precedes the decimal seed on stdout
 fs_nl db 13,10
 CSTR msg_badnum,   "error: numeric argument out of range",13,10
-CSTR msg_testverb, "error: that diagnostic takes a file path and is disabled in release builds (test/PROBE_IO builds only)",13,10
+CSTR msg_testverb, "error: that diagnostic runs only in test (PROBE_IO/dbg) builds; a release build exposes only 'selftest' and 'katreport'",13,10
 CSTR msg_st_ok,    "all self-tests passed",13,10
 CSTR msg_st_fail,  "SELFTEST FAILURE",13,10
 gl_rand   db "  random     : "
@@ -245,10 +245,18 @@ CMDENT struct
     needs_pass  dd ?                ; 1 if -p is mandatory
 CMDENT ends
 
-; The CLI exposes only non-sensitive diagnostics: no positionals, no secrets.
-; All vault / secret / generator operations live in the GUI.
+; The CLI exposes only non-sensitive diagnostics: no positionals, no secrets, and
+; all vault / secret / generator operations live in the GUI.  A RELEASE build ships
+; only the two assurance verbs a user or auditor is meant to run on it: `selftest`
+; (the fail-closed self-check) and `katreport` (the external-audit crypto proof).
+; Every other diagnostic - the fuzzers, memory/IO probes and internal KATs that
+; exist only to feed the test gate - is compiled in PROBE_IO test builds only (and
+; `dbg` implies PROBE_IO), so a plain release does not carry the CLI test surface.
 cmd_table label CMDENT
-    CMDENT { w_selftest,  cmd_selftest,  0, 0 }
+    CMDENT { w_selftest,  cmd_selftest,  0, 0 }   ; fail-closed self-check (release + test)
+    CMDENT { w_katreport, cmd_katreport, 0, 0 }   ; external-audit crypto proof (release + test)
+    ; --- everything below is refused by a RELEASE build (see the dp_testonly guard
+    ;     in dispatch); it runs only in PROBE_IO / dbg test builds ---
     CMDENT { w_bench,     cmd_bench,     0, 0 }
     CMDENT { w_genpw,     cmd_genpw,     0, 0 }   ; print one sample of each generator style
     CMDENT { w_seedtest,  cmd_seedtest,  1, 0 }   ; bulk-fill a test vault with 5000 entries
@@ -276,7 +284,6 @@ cmd_table label CMDENT
     CMDENT { w_vaultexpattkat, cmd_vaultexpattkat, 1, 0 } ; M6 attachment-carry KAT (<path>)
     CMDENT { w_kdfparam,  cmd_kdfparam,  0, 0 }   ; pre-auth KDF-param DoS-guard probe
     CMDENT { w_pkat,      cmd_pkat,      0, 0 }   ; parallel fail-closed KAT gate
-    CMDENT { w_katreport, cmd_katreport, 0, 0 }   ; external-audit crypto proof battery
     CMDENT { w_trtest,    cmd_trtest,    0, 0 }   ; trash timestamp/threshold KAT
 ifdef DBG_TRACE
     CMDENT { w_securedesk, cmd_securedesk, 0, 0 } ; private-desktop spike dialog (dbg)
@@ -1442,16 +1449,23 @@ dp_found:
     cmp     eax, EXIT_OK
     jne     dp_done                     ; validation failed; eax = exit code
 ifndef PROBE_IO
-    ; The shipped CLI is diagnostics-only and takes NO file path.  Every verb that
-    ; accepts a positional (pos_args >= 1) is a test probe that creates/overwrites a
-    ; file at a caller-given path (seedtest/atgen/zitest/bktest/.../vaultexport*kat) -
-    ; a data-loss footgun if aimed at a real vault.  Refuse them here unless this is a
-    ; PROBE_IO (or dbg) test build; collect_options only stashed the path pointer, so
-    ; nothing on disk has been touched yet.  redteam (also positional) is DBG_TRACE-
-    ; only, and dbg implies PROBE_IO, so this guard is inert in every test build.
+    ; A RELEASE build exposes only the two assurance verbs (selftest / katreport);
+    ; every other diagnostic - the fuzzers, IO/memory probes and internal KATs, plus
+    ; the path-taking ones that create/overwrite a file at a caller path (a data-loss
+    ; footgun) - is refused here.  It runs only in a PROBE_IO / dbg test build, where
+    ; this whole guard is compiled out.  collect_options only stashed arg pointers, so
+    ; nothing on disk has been touched yet.  Identify the two allowed verbs by their
+    ; handler address (their CMDENT is first in the table).
     mov     r10, qword ptr [rbp-24]
-    cmp     dword ptr [r10].CMDENT.pos_args, 0
-    jne     dp_testonly
+    mov     rax, qword ptr [r10].CMDENT.handler
+    lea     r11, [cmd_selftest]
+    cmp     rax, r11
+    je      dp_relok
+    lea     r11, [cmd_katreport]
+    cmp     rax, r11
+    je      dp_relok
+    jmp     dp_testonly
+dp_relok:
 endif
     mov     r10, qword ptr [rbp-24]
     mov     rax, qword ptr [r10].CMDENT.handler

@@ -53,6 +53,9 @@ correct output.
   result as `<label> [counter] <hex>`. The inputs are baked into the binary
   (published RFC/NIST vectors + fixed patterns); no secret ever crosses the
   command line, and output is byte-identical on any machine.
+  (A release build exposes only two CLI verbs — `selftest` and `katreport`; the
+  fuzzers, IO/memory probes and internal KATs are compiled into test/`dbg` builds
+  only, so the shipped binary carries no diagnostic CLI surface beyond these two.)
 - `tests/verify_crypto.py` is a **dependency-free** (Python 3 stdlib only)
   independent reference. It:
   1. recomputes every primitive with `hashlib`/`hmac` and a **self-contained
