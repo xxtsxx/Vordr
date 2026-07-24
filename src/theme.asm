@@ -1142,7 +1142,16 @@ tdi_dt:
     ; userdata = glyph(bits16-31) | hover(byte1) | style 2(byte0).  The window
     ; text stays a readable name (MSAA/tooltip); the glyph is drawn from userdata.
 tdi_ghost:
-    WINCALL FillRect, qword ptr [rbp-32], addr rbp-80, qword ptr [g_br_bg]
+    ; blend the frameless background: a fixed header glyph sits on the dialog bg,
+    ; but a dynamic row action button (reveal/copy/gen/trash) sits on a card, so it
+    ; must fill with the panel colour or its rect shows as an off-colour patch.
+    mov     rax, qword ptr [g_br_bg]
+    mov     r10, qword ptr [rbp-24]           ; lpdis
+    cmp     dword ptr [r10+4], IDC_DYN_BASE    ; CtlID: >= base -> a card row button
+    jb      @F
+    mov     rax, qword ptr [g_br_panel]
+@@: mov     qword ptr [rbp-116], rax
+    WINCALL FillRect, qword ptr [rbp-32], addr rbp-80, qword ptr [rbp-116]
     mov     eax, dword ptr [rbp-128]
     test    eax, 0FF00h                        ; hover bit set?
     jz      tdi_ghost_glyph
@@ -1154,15 +1163,23 @@ tdi_ghost:
 tdi_ghost_glyph:
     mov     eax, dword ptr [rbp-128]
     shr     eax, 16
-    movzx   eax, ax                            ; glyph codepoint
+    movzx   eax, ax                            ; glyph codepoint (userdata bits 16-31)
     test    eax, eax
-    jz      tdi_ghost_done                     ; no glyph -> bare hover area
+    jnz     tdi_ghost_udchar
+    ; userdata carries no glyph -> draw the button's own window-text glyph (already
+    ; in g_txtbuf).  Lets row action buttons (reveal/copy/gen/trash) become ghosts
+    ; while keeping their existing glyph text (incl. any runtime toggling).
+    movzx   eax, word ptr [g_txtbuf]
+    test    eax, eax
+    jz      tdi_ghost_done                     ; truly empty -> bare hover area
+    jmp     tdi_ghost_havechar
+tdi_ghost_udchar:
     mov     word ptr [g_txtbuf], ax
     mov     word ptr [g_txtbuf+2], 0
+tdi_ghost_havechar:
+    mov     dword ptr [rbp-116], eax           ; save codepoint (SetTextColor clobbers rax)
     WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_text]
-    mov     eax, dword ptr [rbp-128]
-    shr     eax, 16
-    movzx   eax, ax
+    mov     eax, dword ptr [rbp-116]
     cmp     eax, 0E000h                        ; PUA -> Fluent icons, else Segoe UI Symbol
     jb      tdi_ghost_sym
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_font_icon]

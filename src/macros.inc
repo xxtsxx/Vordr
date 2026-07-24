@@ -112,6 +112,11 @@ VF_DELETED          equ 14         ; reserved: entry is in the trash; value = 16
                                    ;   FILETIME of when it was deleted (soft-delete marker)
 VF_GROUP            equ 15         ; layout block: a section heading; value = the title
 VF_SPACER           equ 16         ; layout block: a blank gap (no label, no value)
+
+; Runtime detail-row control ids start here (IDC_DYN_BASE + row*DYN_SLOTS + slot).
+; Shared so theme.asm can tell a card row button from a fixed header glyph when it
+; fills a frameless ghost button's background.
+IDC_DYN_BASE        equ 3000
 ; A stored field type carries the base kind in its low byte; VF_LABELED in the
 ; high byte marks a field whose value bytes are prefixed with a custom label:
 ;   labeled: bytes = u16 labellen | label_utf8 | value_utf8

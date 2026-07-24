@@ -622,7 +622,7 @@ FDF_REVEALED equ 2              ; FD_FLAGS bit1 = value currently unmasked
 FDF_PWLVL_MASK equ 30h          ; FD_FLAGS bits4-5 = secret strength grade 0..3
 FDF_PWLVL_SHIFT equ 4
 ; Runtime control ids: IDC_DYN_BASE + row*DYN_SLOTS + slot (DYN_SLOTS = power of 2).
-IDC_DYN_BASE equ 3000
+; IDC_DYN_BASE now lives in macros.inc (shared with theme.asm's ghost-fill test).
 DYN_SLOTS   equ 16
 VDX_DLU     equ 58              ; detail-pane x-shift (DLU): widened sidebar by 50% (116->174)
 DYN_SLOTS_LOG2 equ 4
@@ -665,6 +665,8 @@ FIELD_AREA_BOTTOM equ 292        ; rows may not grow past here (DLU; Add-field i
 ; from windows.h, but this module needs the numeric values).
 WS_CHILD_       equ 40000000h
 WS_VISIBLE_     equ 10000000h
+WS_CLIPSIBLINGS_ equ 04000000h    ; a row value edit must not repaint over the
+                                  ; overlapping top-right cluster (badge/glyphs/trash)
 WS_TABSTOP_     equ 00010000h
 ES_AUTOHSCROLL_ equ 0080h
 ES_AUTOVSCROLL_ equ 0040h
@@ -1220,7 +1222,10 @@ align 4
 g_vault_ids label dword
     dd IDC_V_LIST, IDC_V_TITLE
     dd IDC_V_ADDFIELD, IDC_V_SAVE
-VAULT_ID_COUNT equ 4
+    ; header cluster: hide with the vault so it does not shine through the settings
+    ; overlay (gui_menu_close re-shows these, then gui_set_editmode re-gates them).
+    dd IDC_V_HDREDIT, IDC_V_FAV, IDC_V_OVFL, IDC_V_HEADER
+VAULT_ID_COUNT equ 8
 g_menu_ids label dword ; controls menu IDs which are hidden and displayed between settings and main screen.
     dd IDC_V_MBACK, IDC_V_MTITLE, IDC_V_MPOLL, IDC_V_MLENL, IDC_V_MLEN
     dd IDC_V_MCLSL, IDC_V_MCLS, IDC_V_MTPM, IDC_V_MTPML, IDC_V_MTPMINFO
@@ -3112,8 +3117,16 @@ gui_draw_sbadge proc frame
     mov     dword ptr [rbp-56], eax            ; R
     mov     eax, dword ptr [r10+52]
     mov     dword ptr [rbp-64], eax            ; B
-    ; clear to dialog base so nothing lingers behind the pill
-    WINCALL CreateSolidBrush, dword ptr [g_col_bg]
+    ; clear behind the pill to the row's own background so nothing lingers: the
+    ; panel colour in card layouts (the badge sits inside a tile), else the dialog bg
+    mov     eax, dword ptr [g_col_bg]
+    mov     r11d, dword ptr [g_layout]
+    lea     r10, [lay_band]
+    cmp     dword ptr [r10+r11*4], 0
+    je      @F
+    mov     eax, dword ptr [g_col_panel]
+@@: mov     dword ptr [rbp-80], eax
+    WINCALL CreateSolidBrush, dword ptr [rbp-80]
     mov     qword ptr [rbp-72], rax
     mov     r10, qword ptr [rbp-24]
     lea     rdx, [r10+40]
@@ -3514,8 +3527,10 @@ gui_reflow endp
 gui_stretch_rows proc frame
     FRAME_PROLOG 144
     mov     qword ptr [rbp-24], rcx
-    cmp     dword ptr [g_base_cx], 0
-    je      gsr_done
+    jmp     gsr_done                          ; DISABLED (2026-07): value boxes are a fixed
+                                              ; width sized to clear the top-right action
+                                              ; cluster, so they are no longer stretched to
+                                              ; the full window width (they ran under it).
     WINCALL GetClientRect, qword ptr [rbp-24], addr rbp-48
     mov     eax, dword ptr [rbp-40]
     sub     eax, dword ptr [g_base_cx]
@@ -5779,6 +5794,19 @@ gui_inval_detail proc frame
     ret
 gui_inval_detail endp
 
+; GHOSTIFY - turn the row action button just created by row_mk (hwnd in rax) into
+;   a frameless ghost: glyph 0 keeps its window-text glyph, so theme_drawitem's
+;   ghost path renders it borderless with a hover halo (matching the header glyphs).
+;   No tooltip (row controls are recreated each relayout - avoids tip accumulation).
+GHOSTIFY macro
+    mov     qword ptr [rbp-56], rax
+    mov     rcx, qword ptr [rbp-24]              ; parent
+    mov     rdx, qword ptr [rbp-56]              ; button hwnd
+    xor     r8d, r8d                             ; glyph 0 -> draw the window-text glyph
+    xor     r9, r9                               ; no tooltip
+    call    ghost_attach
+endm
+
 ; gui_row_add(rcx=hdlg, edx=kind) -> eax = row index (or -1 if at MAXROWS).
 ;   Append a descriptor and create the kind-appropriate row controls (geometry
 ;   is placeholder; call gui_rows_layout afterwards).
@@ -5826,7 +5854,7 @@ gra_zero:
     cmp     eax, VF_FILE
     je      gra_file
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_VALUE, addr cls_edit, 0, \
-            ES_AUTOHSCROLL_ or WS_TABSTOP_
+            ES_AUTOHSCROLL_ or WS_TABSTOP_ or WS_CLIPSIBLINGS_
     jmp     gra_reorder
 gra_file:
     ; attachments tile: owner-draw tag list (DS_VALUE, click = open/remove) + a
@@ -5836,6 +5864,7 @@ gra_file:
             BS_OWNERDRAW_ or WS_TABSTOP_
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_IMPORT, addr cls_button, addr wb_addf, \
             BS_OWNERDRAW_ or WS_TABSTOP_
+    GHOSTIFY
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_UP, addr cls_button, addr wb_up, \
             BS_OWNERDRAW_
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_DOWN, addr cls_button, addr wb_down, \
@@ -5843,35 +5872,40 @@ gra_file:
     jmp     gra_finish
 gra_secret:
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_VALUE, addr cls_edit, 0, \
-            ES_PASSWORD_ or ES_AUTOHSCROLL_ or WS_TABSTOP_
+            ES_PASSWORD_ or ES_AUTOHSCROLL_ or WS_TABSTOP_ or WS_CLIPSIBLINGS_
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_REVEAL, addr cls_button, addr wb_eye, \
             BS_OWNERDRAW_
+    GHOSTIFY
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_COPY, addr cls_button, addr wb_copy, \
             BS_OWNERDRAW_
+    GHOSTIFY
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_SBADGE, addr cls_static, 0, \
             SS_OWNERDRAW_
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_GEN, addr cls_button, addr wb_gen, \
             BS_OWNERDRAW_
+    GHOSTIFY
     jmp     gra_reorder
 gra_notes:
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_VALUE, addr cls_edit, 0, \
-            ES_MULTILINE_ or ES_AUTOVSCROLL_ or ES_WANTRETURN_ or WS_TABSTOP_
+            ES_MULTILINE_ or ES_AUTOVSCROLL_ or ES_WANTRETURN_ or WS_TABSTOP_ or WS_CLIPSIBLINGS_
     jmp     gra_reorder
 gra_totp:
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_VALUE, addr cls_edit, 0, \
-            ES_PASSWORD_ or ES_AUTOHSCROLL_ or WS_TABSTOP_
+            ES_PASSWORD_ or ES_AUTOHSCROLL_ or WS_TABSTOP_ or WS_CLIPSIBLINGS_
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_REVEAL, addr cls_button, addr wb_eye, \
             BS_OWNERDRAW_
+    GHOSTIFY
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_TCODE, addr cls_static, 0, \
             SS_LEFTNOWORDWRAP_
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_TBAR, addr cls_static, 0, \
             SS_OWNERDRAW_
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_COPY, addr cls_button, addr wb_copy, \
             BS_OWNERDRAW_
+    GHOSTIFY
     jmp     gra_reorder
 gra_group:
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_VALUE, addr cls_edit, 0, \
-            ES_AUTOHSCROLL_ or WS_TABSTOP_       ; the section title (rendered as a heading)
+            ES_AUTOHSCROLL_ or WS_TABSTOP_ or WS_CLIPSIBLINGS_   ; the section title (heading)
     jmp     gra_reorder
 gra_spacer:                                      ; a blank gap - no controls, just height
 gra_reorder:
@@ -5881,6 +5915,7 @@ gra_reorder:
             BS_OWNERDRAW_
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_DEL, addr cls_button, addr wb_rem, \
             BS_OWNERDRAW_
+    GHOSTIFY
 gra_finish:
     inc     dword ptr [g_field_count]
     mov     eax, dword ptr [rbp-40]
@@ -7091,11 +7126,16 @@ grl_lbl_done:
     jne     @F
     mov     dword ptr [rbp-76], 150             ; flat default
 @@: cmp     dword ptr [r10+FD_KIND], VF_SECRET
-    jne     grl_valpos
-    mov     dword ptr [rbp-76], 196             ; card secret (controls are on the top row)
+    jne     grl_chktotpw
+    mov     dword ptr [rbp-76], 118             ; card secret: stop before the badge (x=300)
     cmp     dword ptr [rbp-68], 0
     jne     grl_valpos
     mov     dword ptr [rbp-76], 130             ; flat secret
+    jmp     grl_valpos
+grl_chktotpw:
+    cmp     dword ptr [r10+FD_KIND], VF_TOTP     ; totp key edit: stop before the reveal (x=344)
+    jne     grl_valpos
+    mov     dword ptr [rbp-76], 160
 grl_valpos:
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
