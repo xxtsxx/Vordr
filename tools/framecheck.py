@@ -39,8 +39,14 @@ DEF_SRC = os.path.normpath(os.path.join(HERE, "..", "src"))
 # and [rbp-64] is a throwaway bytes-written slot that intentionally sits in
 # the CreateFileW(7)/WriteFile(5) spill zone.
 ALLOW_FP = {
-    "gui_draw_iconbtn", "gui_draw_sbadge", "read_file", "write_file",
-    "gui_temp_purge",
+    "gui_draw_sbadge", "read_file", "write_file", "gui_temp_purge",
+}
+
+# Home-space findings that are safe by inspection rather than by frame size.
+# read_file DELIBERATELY aliases ReadFile's lpNumberOfBytesRead with the
+# lpOverlapped=NULL slot; write_file/gui_temp_purge document the same pattern.
+ALLOW_HOME = {
+    "read_file", "write_file", "gui_temp_purge",
 }
 
 # Raw-proc warn findings verified safe: url_editproc's 5-arg CallWindowProcW
@@ -77,17 +83,35 @@ def join_continuations(lines):
         i += 1
     return out
 
+def wincall_parts(s):
+    """(callee, [args]) for a WINCALL line, or (None, []) if not a WINCALL."""
+    m = re.search(r'\bWINCALL\s+([\w$]+)\s*(,(.*))?$', s)
+    if not m: return (None, [])
+    if not m.group(3): return (m.group(1), [])
+    depth = 0; cur = ''; args = []
+    for c in m.group(3):
+        if c in '[(': depth += 1
+        elif c in '])': depth -= 1
+        if c == ',' and depth == 0:
+            args.append(cur.strip()); cur = ''
+        else:
+            cur += c
+    args.append(cur.strip())
+    return (m.group(1), args)
+
 def wincall_args(s):
     """Number of args of a WINCALL line (0 if not a WINCALL)."""
-    m = re.search(r'\bWINCALL\s+[\w$]+\s*(,(.*))?$', s)
-    if not m: return 0
-    if not m.group(2): return 0
-    depth = 0; n = 1
-    for c in m.group(2):
-        if c == '[' or c == '(': depth += 1
-        elif c == ']' or c == ')': depth -= 1
-        elif c == ',' and depth == 0: n += 1
-    return n
+    callee, args = wincall_parts(s)
+    return len(args) if callee else 0
+
+def clobbers_rax(arg):
+    """True if __WSTKARG routes this stack arg through rax."""
+    a = arg.strip()
+    if a.lower().startswith('addr '): return True       # lea rax, [X]
+    if a.lower() in REG64: return False                 # direct store
+    if RE_SAFEARG.match(a) and '[' not in a and ' ' not in a:
+        return False                                    # absolute constant / equ
+    return True                                         # 32-bit or memory -> via rax
 
 RE_PROC   = re.compile(r'^\s*([\w$]+)\s+proc\b', re.I)
 RE_ENDP   = re.compile(r'^\s*[\w$]+\s+endp\b', re.I)
@@ -96,7 +120,17 @@ RE_SUBRSP = re.compile(r'^\s*sub\s+rsp\s*,\s*([0-9*+ ]+?)\s*$', re.I)
 RE_ADDRSP = re.compile(r'^\s*add\s+rsp\s*,\s*([0-9*+ ]+?)\s*$', re.I)
 RE_PUSH   = re.compile(r'^\s*push\s+\w+', re.I)
 RE_POP    = re.compile(r'^\s*pop\s+\w+', re.I)
-RE_LOCAL  = re.compile(r'\[rbp\s*-\s*(\d+)\]')
+# A local is referenced either as [rbp-N] or, when its ADDRESS is handed to an
+# API, as "addr rbp-N".  Missing the second form is how the GetClientRect output
+# buffer in gui_draw_field_cards hid inside that call's own home space.
+RE_LOCAL  = re.compile(r'(?:\[rbp\s*-\s*(\d+)\]|\baddr\s+rbp\s*-\s*(\d+)\b)', re.I)
+RE_EXTERN = re.compile(r'^\s*extern\s+([\w$]+)\s*:\s*proc', re.I)
+# __WSTKARG stores an absolute constant or a 64-bit register straight to [rsp+K];
+# everything else (addr X, any 32-bit operand, 64-bit memory) round-trips via rax.
+RE_SAFEARG = re.compile(r'^(?:[0-9][0-9a-fx]*h?|r[a-z0-9]+|'
+                        r'[A-Z_][A-Z0-9_]*)$', re.I)
+REG64 = {'rax','rbx','rcx','rdx','rsi','rdi','rbp','rsp',
+         'r8','r9','r10','r11','r12','r13','r14','r15'}
 RE_EQU    = re.compile(r'^\s*([\w$]+)\s+equ\s+(.+?)\s*$', re.I)
 RE_STRUCT = re.compile(r'^\s*([\w$]+)\s+struct\b', re.I)
 RE_SENDS  = re.compile(r'^\s*[\w$]+\s+ends\b', re.I)
@@ -111,6 +145,7 @@ RE_MOVRSPBASE = re.compile(r'^\s*mov\s+rsp\s*,\s*rbp', re.I)
 
 EQUS = {}
 STRUCTS = {}
+EXTERNS = set()          # `extern X:proc` - a Win32 callee, free to use its home space
 STATS = {'fp': 0, 'sym': 0}
 
 def masm_int(tok):
@@ -155,6 +190,8 @@ def build_tables(files):
         raw = [strip_comment(l.rstrip('\n')) for l in open(path, encoding='latin-1')]
         cur = None; size = 0
         for s in raw:
+            xm = RE_EXTERN.match(s)
+            if xm: EXTERNS.add(xm.group(1))
             em = RE_EQU.match(s)
             if em and not cur: EQUS[em.group(1)] = em.group(2)
             sm = RE_STRUCT.match(s)
@@ -185,7 +222,7 @@ def scan_file(path, results):
         maxloc = 0
         for _, s in merged:
             for mm in RE_LOCAL.finditer(s):
-                maxloc = max(maxloc, int(mm.group(1)))
+                maxloc = max(maxloc, int(mm.group(1) or mm.group(2)))
 
         if fp:
             # ---- v1 heuristic on FRAME_PROLOG procs -------------------------
@@ -209,6 +246,36 @@ def scan_file(path, results):
                     f"FRAME_PROLOG {fp.group(1).strip()} (alloc {alloc}) < heuristic need {need} "
                     f"(deepest local -{maxloc}, {maxargs}-arg WINCALL) - "
                     f"verify the overlapped local is dead at that call"))
+            # ---- home-space overlap on Win32 callees ------------------------
+            # The 32-byte home area belongs to the CALLEE for any arg count, and
+            # a Win32 callee really does save nonvolatiles there (GetClientRect
+            # homes four on its first instruction).  Internal procs never touch a
+            # caller's home space - an unwritten invariant this whole codebase
+            # relies on - so only extern callees are judged here.
+            worst = 0; wat = start; wcallee = None
+            for ln, s in merged:
+                callee, args = wincall_parts(s)
+                if not callee or callee not in EXTERNS: continue
+                span = 32 + max(0, len(args) - 4) * 8
+                if span > worst: worst, wat, wcallee = span, start + ln, callee
+                # ---- WINCALL rax-clobber ----------------------------------
+                # __WSTKARG emits the stack args BEFORE the register args, and
+                # every form except an absolute constant or a 64-bit register
+                # goes out through rax.  Passing rax itself as arg 1-4 then
+                # loads the wrong value (this silently broke gui_reflow).
+                if len(args) > 4 and any(a.strip().lower() in ('rax', 'eax')
+                                         for a in args[:4]) \
+                   and any(clobbers_rax(a) for a in args[4:]):
+                    results.append(("FATAL", fname, start + ln + 1, name,
+                        f"WINCALL {callee} passes rax as a register arg while a "
+                        f"later stack arg routes through rax - the register arg "
+                        f"receives the WRONG value; stage the handle in a local"))
+            if worst and alloc - maxloc < worst and maxloc \
+               and name not in ALLOW_FP and name not in ALLOW_HOME:
+                results.append(("warn", fname, wat + 1, name,
+                    f"FRAME_PROLOG {fp.group(1).strip()} (alloc {alloc}): local "
+                    f"-{maxloc} lies in {wcallee}'s home/arg area (rsp..rsp+{worst}) "
+                    f"- a Win32 callee may save registers over it"))
         else:
             # ---- v2: raw proc ----------------------------------------------
             # find the raw prologue: sub rsp,N within the first few lines

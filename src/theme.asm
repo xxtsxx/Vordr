@@ -404,7 +404,7 @@ theme_dark_cb endp
 ;   the current scheme (call after a scheme switch so they follow dark<->light).
 public theme_scrollbars
 theme_scrollbars proc frame
-    FRAME_PROLOG 32
+    FRAME_PROLOG 48   ; >= 48: keep locals clear of the callee 32-byte home area
     mov     qword ptr [rbp-24], rcx
     WINCALL EnumChildWindows, qword ptr [rbp-24], addr theme_dark_cb, 0
     FRAME_EPILOG
@@ -423,7 +423,7 @@ theme_scrollbars endp
 ; =============================================================================
 public theme_dwm_apply
 theme_dwm_apply proc frame
-    FRAME_PROLOG 48
+    FRAME_PROLOG 64   ; >= 64: keep locals clear of the callee 32-byte home area
     ; [rbp-24] hwnd  [rbp-40] attribute value cell
     mov     qword ptr [rbp-24], rcx
     mov     eax, dword ptr [g_col_dark]         ; dark title bar only for dark schemes

@@ -234,7 +234,7 @@ write_file endp
 ;   feedback is a planned follow-up.)
 public file_rename
 file_rename proc frame
-    FRAME_PROLOG 48
+    FRAME_PROLOG 64   ; >= 64: keep locals clear of the callee 32-byte home area
     mov     qword ptr [rbp-24], rcx             ; from
     mov     qword ptr [rbp-32], rdx             ; to
     mov     dword ptr [rbp-40], 0               ; attempt count

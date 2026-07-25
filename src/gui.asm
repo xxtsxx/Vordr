@@ -5424,7 +5424,7 @@ gui_check_refresh endp
 ;   read-only vault reads as read-only.  The click handlers are already gated;
 ;   this is the matching visual state.
 gui_ro_disable_btns proc frame
-    FRAME_PROLOG 32
+    FRAME_PROLOG 48   ; >= 48: keep locals clear of the callee 32-byte home area
     mov     qword ptr [rbp-24], rcx
     WINCALL GetDlgItem, qword ptr [rbp-24], IDC_V_ADD
     WINCALL EnableWindow, rax, 0
@@ -6592,7 +6592,7 @@ gui_basename endp
 ;   directory part is stripped (basename after the last '\' or '/') to keep the
 ;   written+opened file confined to %TEMP% - no "..\" path traversal out of it.
 gui_tile_make_temp proc frame
-    FRAME_PROLOG 48
+    FRAME_PROLOG 64   ; >= 64: keep locals clear of the callee 32-byte home area
     mov     dword ptr [rbp-24], ecx
     WINCALL GetTempPathW, 512, addr g_tmpfile
     mov     dword ptr [rbp-32], eax                  ; base length incl trailing '\'
@@ -10440,7 +10440,7 @@ frame_layout endp
 ; frame_maxinfo(rcx=hdlg, rdx=MINMAXINFO*) - constrain the maximized size/position
 ;   to the monitor work area, so the borderless window does not cover the taskbar.
 frame_maxinfo proc frame
-    FRAME_PROLOG 96
+    FRAME_PROLOG 112   ; >= 112: keep locals clear of the callee 32-byte home area
     mov     qword ptr [rbp-24], rcx
     mov     qword ptr [rbp-32], rdx
     WINCALL MonitorFromWindow, qword ptr [rbp-24], 2   ; MONITOR_DEFAULTTONEAREST
@@ -10504,7 +10504,12 @@ frame_build endp
 vault_proc proc
     push    rbp
     mov     rbp, rsp
-    sub     rsp, 64
+    sub     rsp, 96                         ; 96 not 64: at 64 a 5-arg WINCALL's spill
+                                            ;   ([rsp+32]) landed on the deepest local
+                                            ;   [rbp-32].  Safe only because that slot
+                                            ;   is live solely inside vp_t_idle - too
+                                            ;   fragile a property for a 1100-line
+                                            ;   dispatcher that gains handlers often
     mov     qword ptr [rbp-8], rcx
     cmp     rdx, WM_INITDIALOG
     je      vp_init
@@ -13662,7 +13667,7 @@ gui_import endp
 ;   a Fluent pill by theme_toggle_labeled (which reads g_pg_opt), and the
 ;   SetDlgItemTextW here invalidates the owner-draw control so it repaints.
 gui_pg_toggle_text proc frame
-    FRAME_PROLOG 48
+    FRAME_PROLOG 64   ; >= 64: keep locals clear of the callee 32-byte home area
     mov     qword ptr [rbp-24], rcx
     mov     dword ptr [rbp-28], edx
     mov     qword ptr [rbp-40], r9
@@ -14398,7 +14403,7 @@ ic_glyph_btn endp
 
 ; ic_color_btn(rcx=DRAWITEMSTRUCT, r8d=index) - draw one colour swatch button.
 ic_color_btn proc frame
-    FRAME_PROLOG 64
+    FRAME_PROLOG 80   ; >= 80: keep locals clear of the callee 32-byte home area
     mov     qword ptr [rbp-24], rcx
     mov     dword ptr [rbp-32], r8d
     mov     r10, rcx
