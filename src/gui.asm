@@ -627,6 +627,11 @@ MAX_PWORIG   equ 64            ; up to MAXROWS value fields captured per entry (
 PWORIG_STRIDE equ 512          ; original field {label wide[128], value wide[128]}
 PWORIG_VAL   equ 256           ; value offset (bytes) within a g_pworig slot
 MAXROWS     equ 64
+; Commit scratch for custom labels.  Every row can contribute a full 128-wide-char
+; label (gg_label reads 128 and gg_lcp copies at most 127 + NUL), so the pool must
+; scale with MAXROWS - at 24 rows a fixed 4096 still fit, at 64 it did not.
+; gui_gather also range-checks against this, so the two can never drift again.
+LBLBLOB_W   equ MAXROWS*128
 FDF_LABELED equ 1               ; FD_FLAGS bit0 = carries a custom label
 FDF_REVEALED equ 2              ; FD_FLAGS bit1 = value currently unmasked
 FDF_PWLVL_MASK equ 30h          ; FD_FLAGS bits4-5 = secret strength grade 0..3
@@ -1458,7 +1463,7 @@ g_wipezeros   db WIPE_CHUNK dup (?)        ; source of zeros for overwriting tem
 align 2
 g_imgpath     dw 1024 dup (?)             ; import/export file path (wide)
 g_valblob   dw 32768 dup (?)          ; commit scratch: field values, NUL-joined
-g_lblblob   dw 4096 dup (?)           ; commit scratch: custom labels, NUL-joined
+g_lblblob   dw LBLBLOB_W dup (?)      ; commit scratch: custom labels, NUL-joined
 g_rlabel    dw 128 dup (?)            ; per-row label read scratch
 g_grouptxt  dw 128 dup (?)            ; group-heading title read scratch (paint)
 g_base_cx   dd ?                      ; vault client size recorded at init (resize anchors)
@@ -4772,7 +4777,15 @@ gg_label:
     call    gui_wstr_eq
     test    eax, eax
     jnz     gg_next
-    ; custom: copy g_rlabel -> lc, point the field's label at it
+    ; custom: copy g_rlabel -> lc, point the field's label at it.  The pool is
+    ; sized for MAXROWS worst-case labels, but bound the cursor anyway - running
+    ; past it would corrupt whatever .data? follows (g_ofn among it).  Out of
+    ; room -> leave the row unlabelled ([r11+8] is already 0) rather than spill.
+    mov     rax, qword ptr [rbp-56]              ; lc
+    lea     r10, [g_lblblob + LBLBLOB_W*2]       ; one past the pool
+    sub     r10, rax                             ; bytes left
+    cmp     r10, 128*2                           ; room for a worst-case label?
+    jb      gg_next
     mov     ecx, dword ptr [rbp-32]
     imul    ecx, ecx, 24
     lea     r11, [g_field_list]
