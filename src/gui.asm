@@ -3174,8 +3174,17 @@ gui_draw_taglist proc frame
     mov     dword ptr [rbp-56], eax            ; R
     mov     eax, dword ptr [r10+52]
     mov     dword ptr [rbp-64], eax            ; B
-    ; clear the whole item rect to the dialog base
-    WINCALL CreateSolidBrush, dword ptr [g_col_bg]
+    ; clear behind the tile to the row's own background: the panel colour in
+    ; card layouts (the tile sits inside a card, like the sbadge/chevron), else
+    ; the dialog bg - previously always dialog bg, which left a dark well in cards
+    mov     eax, dword ptr [g_col_bg]
+    mov     r11d, dword ptr [g_layout]
+    lea     r10, [lay_band]
+    cmp     dword ptr [r10+r11*4], 0
+    je      @F
+    mov     eax, dword ptr [g_col_panel]
+@@: mov     dword ptr [rbp-160], eax
+    WINCALL CreateSolidBrush, dword ptr [rbp-160]
     mov     qword ptr [rbp-112], rax
     mov     r10, qword ptr [rbp-24]
     lea     rdx, [r10+40]
