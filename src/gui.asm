@@ -592,7 +592,7 @@ FILE_ATTRIBUTE_TEMPORARY equ 100h
 WIPE_CHUNK    equ 65536        ; bytes of zeros written per pass
 TFILE_ENTRY equ 328
 TFILE_NAME  equ 68             ; filename offset within a tile-file entry
-MAX_FIELDS  equ 56             ; g_field_list capacity (matches main.asm)
+MAX_FIELDS  equ 96             ; g_field_list capacity (matches main.asm): >= MAXROWS + MAX_TFILES + title + markers
 ; Field history: each overwritten field value (ANY tile, not just secrets) is
 ; archived as a reserved VF_PWHIST field, value = raw {u64 FILETIME, label wide,
 ; old value wide} (VFL_RAW).  Loaded into g_pwhist for the open entry; g_pworig
@@ -604,10 +604,10 @@ PWHIST_ENTRY equ 528           ; {u64 filetime, label wide[128], value wide[128]
 PWHIST_LBL   equ 8             ; label offset within a g_pwhist entry
 PWHIST_PW    equ 264           ; value offset (8 + 128*2)
 PWHBLOB_ENTRY equ 512          ; emit scratch {u32 len, u64 ft, label wide, value wide}
-MAX_PWORIG   equ 24            ; up to MAXROWS value fields captured per entry
+MAX_PWORIG   equ 64            ; up to MAXROWS value fields captured per entry (= MAXROWS)
 PWORIG_STRIDE equ 512          ; original field {label wide[128], value wide[128]}
 PWORIG_VAL   equ 256           ; value offset (bytes) within a g_pworig slot
-MAXROWS     equ 24
+MAXROWS     equ 64
 FDF_LABELED equ 1               ; FD_FLAGS bit0 = carries a custom label
 FDF_REVEALED equ 2              ; FD_FLAGS bit1 = value currently unmasked
 FDF_PWLVL_MASK equ 30h          ; FD_FLAGS bits4-5 = secret strength grade 0..3
@@ -651,7 +651,10 @@ IDC_V_CANCEL equ 238          ; "Cancel" button (edit mode, discards edits)
 IDC_V_DONE   equ 271          ; trash view: "Done" (exit recover mode); accent button
 IDC_V_GENERATE equ 273        ; sidebar dock: standalone password generator (retired: hidden, dock replaces)
 IDC_V_HDREDIT  equ 274        ; detail-header edit ghost button (D1 command dock; replaces sidebar "e")
-FIELD_AREA_BOTTOM equ 292        ; rows may not grow past here (DLU; Add-field is at 296)
+IDC_V_PGPREV   equ 267        ; detail pagination: previous page (ghost)
+IDC_V_PGIND    equ 268        ; detail pagination: "n / m" indicator (static)
+IDC_V_PGNEXT   equ 269        ; detail pagination: next page (ghost)
+; (field-area bottom is computed live from the window height by gui_vis_bottom)
 ; Win32 window styles (gui.asm builds controls at runtime; the RC gets these
 ; from windows.h, but this module needs the numeric values).
 WS_CHILD_       equ 40000000h
@@ -740,7 +743,7 @@ WSTR g_unlock_title,   <Vordr - Unlock vault>
 WSTR g_create_title,   <Vordr - Set master password>
 WSTR s_createfail,  <Could not create the vault (I/O or out of memory).>
 WSTR s_notitle,     <An entry needs a title.>
-WSTR s_nofieldroom, <No room for more fields on this record - remove one first.>
+WSTR s_nofieldroom, <This record already has the maximum number of fields.>
 WSTR s_resealfail,  <Unable to write to the vault file - it may be read-only or locked by another program. Your changes are kept in memory. Retry saving now?>
 WSTR t_overwrite,   <Vordr - vault already exists>
 WSTR m_overwrite,   <A vault file already exists at this location. Creating a new vault will PERMANENTLY destroy it and every entry it holds. Overwrite it?>
@@ -1003,6 +1006,8 @@ WSTR gt_more, <More>
 WSTR gt_fav, <Favorite>
 WSTR gt_new, <New item>
 WSTR gt_edit, <Edit entry>
+WSTR gt_pgprev, <Previous page>
+WSTR gt_pgnext, <Next page>
 WSTR gt_rem, <Delete entry>
 WSTR gt_gen, <Generate password>
 WSTR gt_close, <Close>
@@ -1193,7 +1198,8 @@ g_vault_ids label dword
     ; header cluster: hide with the vault so it does not shine through the settings
     ; overlay (gui_menu_close re-shows these, then gui_set_editmode re-gates them).
     dd IDC_V_HDREDIT, IDC_V_FAV, IDC_V_OVFL, IDC_V_HEADER
-VAULT_ID_COUNT equ 9
+    dd IDC_V_PGPREV, IDC_V_PGIND, IDC_V_PGNEXT
+VAULT_ID_COUNT equ 12
 g_menu_ids label dword ; controls menu IDs which are hidden and displayed between settings and main screen.
     dd IDC_V_MBACK, IDC_V_MTITLE, IDC_V_MPOLL, IDC_V_MLENL, IDC_V_MLEN
     dd IDC_V_MCLSL, IDC_V_MCLS, IDC_V_MTPM, IDC_V_MTPML, IDC_V_MTPMINFO
@@ -1352,6 +1358,10 @@ public g_rowpw_w
 g_rowpw_w     dw 512 dup (?)               ; revealed secret text for the color overlay
 g_wordtmp     dw 32 dup (?)                ; one resolved phonetic word (scratch)
 g_content_h   dd ?                        ; field-form content bottom (DLU) after layout
+g_cur_page    dd ?                        ; detail-pane current page (0-based)
+g_page_count  dd ?                        ; detail-pane total pages (>=1)
+align 2
+g_pgbuf       dw 16 dup (?)               ; "n / m" pagination indicator text
 g_dlgfont     dq ?                        ; the vault dialog's font (for runtime ctls)
 g_tooltip     dq ?                        ; shared tooltip window for ghost buttons (0 = none)
 g_totp_row    dd ?                        ; row index of the TOTP field (-1 = none)
@@ -3616,7 +3626,7 @@ endm
 ;   their row; Save + Cancel right-align on the bottom border; + Add field rides the
 ;   bottom border but keeps its x.  Called at init and from gui_reflow (WM_SIZE).
 gui_cmd_dock_layout proc frame
-    FRAME_PROLOG 192
+    FRAME_PROLOG 224
     mov     qword ptr [rbp-24], rcx
     WINCALL GetClientRect, qword ptr [rbp-24], addr rbp-48       ; L-48 T-44 R-40 B-36
     mov     eax, dword ptr [rbp-40]
@@ -3670,6 +3680,50 @@ gui_cmd_dock_layout proc frame
     mov     dword ptr [rbp-144], eax
     WINCALL MoveWindow, qword ptr [rbp-136], dword ptr [rbp-140], dword ptr [rbp-144], \
             dword ptr [rbp-120], dword ptr [rbp-116], 1
+    ; ---- pagination bar: on the command-bar row (+Add field's y).  Positioned
+    ;      here so it tracks the true bottom exactly when +Add is docked
+    ;      (gui_page_bar only shows/hides + sets the text).  Edit mode: centre in
+    ;      the free gap between + Add field and Cancel (so it clears the buttons);
+    ;      view mode (no bottom buttons): centre on the detail pane. ----
+    cmp     dword ptr [g_editmode], 0
+    je      dk_pgview
+    mov     eax, dword ptr [rbp-140]           ; + Add field right = L + W
+    add     eax, dword ptr [rbp-120]
+    add     eax, dword ptr [rbp-72]            ; + running right edge (Cancel's left)
+    sar     eax, 1                             ; centre of the gap
+    mov     dword ptr [rbp-148], eax
+    jmp     dk_pghavex
+dk_pgview:
+    mov     dword ptr [rbp-96], 210            ; detail-pane left edge (DLU) -> px
+    mov     dword ptr [rbp-92], 0
+    mov     dword ptr [rbp-88], 210
+    mov     dword ptr [rbp-84], 0
+    WINCALL MapDialogRect, qword ptr [rbp-24], addr rbp-96
+    mov     eax, dword ptr [rbp-96]            ; centre x = (detail_left + cx) / 2
+    add     eax, dword ptr [rbp-52]
+    sar     eax, 1
+    mov     dword ptr [rbp-148], eax
+dk_pghavex:
+    mov     eax, dword ptr [rbp-144]            ; bar y = + Add field's docked top
+    mov     dword ptr [rbp-152], eax
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_V_PGPREV
+    mov     qword ptr [rbp-160], rax
+    mov     eax, dword ptr [rbp-148]
+    sub     eax, 48
+    mov     dword ptr [rbp-164], eax
+    WINCALL MoveWindow, qword ptr [rbp-160], dword ptr [rbp-164], dword ptr [rbp-152], 20, 20, 1
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_V_PGIND
+    mov     qword ptr [rbp-160], rax
+    mov     eax, dword ptr [rbp-148]
+    sub     eax, 25
+    mov     dword ptr [rbp-164], eax
+    WINCALL MoveWindow, qword ptr [rbp-160], dword ptr [rbp-164], dword ptr [rbp-152], 50, 20, 1
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_V_PGNEXT
+    mov     qword ptr [rbp-160], rax
+    mov     eax, dword ptr [rbp-148]
+    add     eax, 28
+    mov     dword ptr [rbp-164], eax
+    WINCALL MoveWindow, qword ptr [rbp-160], dword ptr [rbp-164], dword ptr [rbp-152], 20, 20, 1
 dk_done:
     FRAME_EPILOG
     ret
@@ -4167,6 +4221,7 @@ gui_showdetail proc frame
     mov     dword ptr [g_revealed], 0
     mov     dword ptr [g_cur_idx], edx
     mov     dword ptr [g_dirty], 0
+    mov     dword ptr [g_cur_page], 0         ; each entry opens on its first page
     mov     dword ptr [g_new_pending], 0      ; navigating to an entry clears the "just-added" flag
     mov     dword ptr [g_loading], 1          ; suppress EN_CHANGE dirty while loading
     mov     dword ptr [g_totp_on], 0
@@ -5337,6 +5392,8 @@ sem_addcmd:
     mov     rcx, qword ptr [rbp-72]
     mov     edx, eax
     call    ShowWindow
+    mov     rcx, qword ptr [rbp-24]           ; re-dock: pagination re-centres for the
+    call    gui_cmd_dock_layout               ;   new mode (gap between buttons vs pane)
     mov     rcx, qword ptr [rbp-24]
     call    gui_rows_layout
     ; the pencil button stays a pencil in both modes (Save handles committing)
@@ -7057,11 +7114,87 @@ mvc_ret:
     ret
 move_ctl endp
 
+; gui_vis_bottom(rcx=hdlg) -> eax = the visible field-area bottom in DLU (the
+;   live client height minus a reserve for the docked command bar).  Grows with
+;   the window, so the fields scroll within whatever height the user gives them.
+gui_vis_bottom proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx
+    WINCALL GetClientRect, qword ptr [rbp-24], addr rbp-48    ; {L-48 T-44 R-40 B-36}
+    mov     dword ptr [rbp-80], 0                             ; probe {0,0,4,8} -> base units
+    mov     dword ptr [rbp-76], 0
+    mov     dword ptr [rbp-72], 4
+    mov     dword ptr [rbp-68], 8
+    WINCALL MapDialogRect, qword ptr [rbp-24], addr rbp-80    ; [-68] = px per 8 vertical DLU
+    mov     eax, dword ptr [rbp-36]              ; client height (px, top = 0)
+    imul    eax, 8
+    cdq
+    idiv    dword ptr [rbp-68]                   ; -> client height in DLU
+    sub     eax, 30                              ; reserve the docked command bar
+    FRAME_EPILOG
+    ret
+gui_vis_bottom endp
+
+; pg_putnum(ecx = num 0..99, r8 = dst wide ptr) -> rax = advanced dst.  Leaf.
+pg_putnum proc
+    mov     eax, ecx
+    cmp     eax, 10
+    jb      ppn_one
+    xor     edx, edx
+    mov     r9d, 10
+    div     r9d                                  ; eax = tens, edx = ones
+    add     eax, '0'
+    mov     word ptr [r8], ax
+    add     r8, 2
+    mov     eax, edx
+ppn_one:
+    add     eax, '0'
+    mov     word ptr [r8], ax
+    add     r8, 2
+    mov     rax, r8
+    ret
+pg_putnum endp
+
+; gui_page_bar(rcx = hdlg) - position the "< n / m >" pagination bar at the
+;   bottom centre of the window and show it only when there is more than one page.
+gui_page_bar proc frame
+    FRAME_PROLOG 160
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-28], 0                ; SW_HIDE (single page)
+    cmp     dword ptr [g_page_count], 1
+    jle     gpb_apply
+    mov     dword ptr [rbp-28], SW_SHOW
+    ; --- indicator text "n / m" (1-based current, total) ---
+    lea     r8, [g_pgbuf]
+    mov     ecx, dword ptr [g_cur_page]
+    inc     ecx
+    call    pg_putnum
+    mov     r8, rax
+    mov     word ptr [r8], ' '
+    mov     word ptr [r8+2], '/'
+    mov     word ptr [r8+4], ' '
+    add     r8, 6
+    mov     ecx, dword ptr [g_page_count]
+    call    pg_putnum
+    mov     word ptr [rax], 0
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_PGIND, addr g_pgbuf
+    ; (positioning is done in gui_cmd_dock_layout, docked to the command-bar row)
+gpb_apply:
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_V_PGPREV
+    WINCALL ShowWindow, rax, dword ptr [rbp-28]
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_V_PGIND
+    WINCALL ShowWindow, rax, dword ptr [rbp-28]
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_V_PGNEXT
+    WINCALL ShowWindow, rax, dword ptr [rbp-28]
+    FRAME_EPILOG
+    ret
+gui_page_bar endp
+
 ; rowh(rcx=desc) -> rax = slot handle helper is inlined; small accessors below.
 ; gui_rows_layout(rcx=hdlg) - position every row's controls in the detail pane
 ;   and show/hide the per-row reorder buttons according to g_editmode.
 gui_rows_layout proc frame
-    FRAME_PROLOG 128
+    FRAME_PROLOG 160
     mov     qword ptr [rbp-24], rcx              ; hdlg
     mov     dword ptr [rbp-36], 0                ; i
     mov     dword ptr [rbp-40], 52               ; y (ROW_TOP - below the detail header)
@@ -7074,6 +7207,13 @@ grl_havecmd:
     lea     r10, [lay_band]
     mov     eax, dword ptr [r10+rax*4]
     mov     dword ptr [rbp-68], eax
+    mov     rcx, qword ptr [rbp-24]              ; pagination: rows are packed into pages
+    call    gui_vis_bottom                       ;   sized to the live window height
+    mov     dword ptr [rbp-92], eax              ; visible field-area bottom (DLU)
+grl_pgrestart:
+    mov     dword ptr [rbp-36], 0                ; i
+    mov     dword ptr [rbp-84], 52               ; py = per-page virtual cursor (ROW_TOP)
+    mov     dword ptr [rbp-88], 0                ; pg = current row's page index
 grl_row:
     mov     eax, dword ptr [rbp-36]
     cmp     eax, dword ptr [g_field_count]
@@ -7126,6 +7266,26 @@ grl_setyh:
     mov     eax, dword ptr [rbp-68]              ; adjust height for the layout band
     sub     eax, 14                              ; (base heights assume a 14-DLU band)
     add     dword ptr [rbp-44], eax
+    ; --- pagination: does this row fit on the current page?  If not, open a new
+    ;     one.  Rows on g_cur_page get their real y; all others go off-screen. ---
+    mov     eax, dword ptr [rbp-84]              ; py
+    cmp     eax, 52                              ; first row on a page always fits
+    je      grl_pg_disp
+    add     eax, dword ptr [rbp-44]              ; py + rowH
+    cmp     eax, dword ptr [rbp-92]              ; > visible bottom?
+    jle     grl_pg_disp
+    inc     dword ptr [rbp-88]                   ; pg++ : this row opens a new page
+    mov     dword ptr [rbp-84], 52               ; py = top of the new page
+grl_pg_disp:
+    mov     eax, dword ptr [rbp-88]              ; on the current page -> real y; else hide
+    cmp     eax, dword ptr [g_cur_page]
+    jne     grl_pg_hide
+    mov     eax, dword ptr [rbp-84]
+    jmp     grl_pg_sety
+grl_pg_hide:
+    mov     eax, 10000                           ; off-screen (far below the window)
+grl_pg_sety:
+    mov     dword ptr [rbp-40], eax              ; row_top = this row's display y
     mov     r10, qword ptr [rbp-32]
     mov     eax, dword ptr [rbp-40]
     mov     dword ptr [r10+FD_Y], eax
@@ -7367,18 +7527,38 @@ grl_attach:
     mov     edx, dword ptr [rbp-52]
     call    ShowWindow
 grl_advance:
-    ; advance y by the card height + the layout's inter-card gap
-    mov     eax, dword ptr [rbp-40]
+    ; advance the per-page virtual cursor by card height + inter-card gap
+    mov     eax, dword ptr [rbp-84]
     add     eax, dword ptr [rbp-44]
     mov     r10d, dword ptr [g_layout]
     lea     r11, [layout_gaps]
     add     eax, dword ptr [r11+r10*4]
-    mov     dword ptr [rbp-40], eax
+    mov     dword ptr [rbp-84], eax
     inc     dword ptr [rbp-36]
     jmp     grl_row
 grl_done:
-    ; place the created/modified line just below the last record, flowing with
-    ; the field rows (x=176 matches the row content column)
+    ; total pages = the last row's page index + 1
+    mov     eax, dword ptr [rbp-88]
+    inc     eax
+    mov     dword ptr [g_page_count], eax
+    ; if the current page fell past the end (window shrank / rows removed), clamp
+    ; it and re-run the layout once with the corrected page
+    mov     eax, dword ptr [g_cur_page]
+    cmp     eax, dword ptr [g_page_count]
+    jl      grl_pgok
+    mov     eax, dword ptr [g_page_count]
+    dec     eax
+    mov     dword ptr [g_cur_page], eax
+    jmp     grl_pgrestart
+grl_pgok:
+    ; created/modified line: below the last row on the last page, else off-screen
+    mov     ecx, 10000
+    mov     eax, dword ptr [g_cur_page]
+    cmp     eax, dword ptr [rbp-88]              ; on the last page?
+    jne     grl_times_at
+    mov     ecx, dword ptr [rbp-84]              ; -> just under the last row
+grl_times_at:
+    mov     dword ptr [rbp-40], ecx
     mov     rcx, qword ptr [rbp-24]
     mov     edx, IDC_V_TIMES
     call    GetDlgItem
@@ -7387,6 +7567,8 @@ grl_done:
     mov     eax, dword ptr [rbp-40]              ; content bottom incl. the timestamps line
     add     eax, 12
     mov     dword ptr [g_content_h], eax
+    mov     rcx, qword ptr [rbp-24]              ; position + show/hide the pagination bar
+    call    gui_page_bar
     mov     rcx, qword ptr [rbp-24]              ; keep value columns elastic after relayout
     call    gui_stretch_rows
     ; repaint just the detail pane (not the whole window) so the sidebar card's
@@ -7985,7 +8167,7 @@ gui_row_delete endp
 
 ; gui_addfield_one(rcx=hdlg, edx=kind, r8=label wide or 0) - append a field row.
 gui_addfield_one proc frame
-    FRAME_PROLOG 96
+    FRAME_PROLOG 128
     mov     qword ptr [rbp-24], rcx
     mov     dword ptr [rbp-32], edx
     mov     qword ptr [rbp-40], r8
@@ -7996,30 +8178,13 @@ gui_addfield_one proc frame
     test    eax, eax
     jnz     gao_done
 gao_chkroom:
-    ; refuse if the new row wouldn't fit the field area
-    mov     eax, dword ptr [rbp-32]              ; kind -> row height (incl gap)
-    mov     r9d, 18
-    cmp     eax, VF_NOTES
-    jne     gao_h1
-    mov     r9d, 46
-gao_h1:
-    cmp     eax, VF_TOTP
-    jne     gao_h2
-    mov     r9d, 34
-gao_h2:
-    mov     eax, dword ptr [g_content_h]
-    add     eax, r9d
-    cmp     eax, FIELD_AREA_BOTTOM
-    jle     gao_addit
-    WINCALL gui_msgbox, qword ptr [rbp-24], addr s_nofieldroom, addr t_err, \
-            <MB_OK or MB_ICONINFORMATION>
-    jmp     gao_done
-gao_addit:
+    ; adding always succeeds now - rows past the visible area flow onto further
+    ; pages (see gui_rows_layout).  The only hard cap is MAXROWS.
     mov     rcx, qword ptr [rbp-24]
     mov     edx, dword ptr [rbp-32]
     call    gui_row_add
     cmp     eax, 0
-    jl      gao_done
+    jl      gao_full
     mov     dword ptr [rbp-44], eax             ; row
     ; optional preset label
     cmp     qword ptr [rbp-40], 0
@@ -8046,8 +8211,14 @@ gao_dom:
 gao_show:
     mov     rcx, qword ptr [rbp-24]             ; (re)enter edit mode + relayout
     mov     edx, 1
-    call    gui_set_editmode
+    call    gui_set_editmode                   ; relayout -> g_page_count is current
     mov     dword ptr [g_dirty], 1
+    ; jump to the last page so the just-appended row is on-screen
+    mov     eax, dword ptr [g_page_count]
+    dec     eax
+    mov     dword ptr [g_cur_page], eax
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_rows_layout
     ; focus the new field for immediate typing (custom w/o label -> label, else value)
     mov     edx, DS_VALUE
     cmp     dword ptr [rbp-32], VF_TEXT
@@ -8063,6 +8234,11 @@ gao_focus:
     call    GetDlgItem
     mov     rcx, rax
     call    SetFocus
+    jmp     gao_done
+gao_full:
+    ; MAXROWS reached - the only remaining hard cap
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr s_nofieldroom, addr t_err, \
+            <MB_OK or MB_ICONINFORMATION>
 gao_done:
     FRAME_EPILOG
     ret
@@ -10209,6 +10385,11 @@ vp_nchit_def:
 vp_size:
     mov     rcx, qword ptr [rbp-8]           ; responsive reflow of anchored controls
     call    gui_reflow
+    cmp     dword ptr [g_cur_idx], 0         ; re-paginate the detail for the new height
+    jl      vp_size_nopag
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_rows_layout
+vp_size_nopag:
     mov     rcx, qword ptr [rbp-8]           ; keep the caption buttons right-aligned
     call    frame_layout
     ; The title-strip dock/caption buttons are owner-draw children that MoveWindow
@@ -10528,6 +10709,18 @@ vp_init:
     mov     r8d, GLY_EDIT
     lea     r9, [gt_edit]
     call    ghost_attach
+    WINCALL GetDlgItem, qword ptr [rbp-8], IDC_V_PGPREV  ; pagination arrows -> frameless ghosts
+    mov     rcx, qword ptr [rbp-8]
+    mov     rdx, rax
+    mov     r8d, 0E76Bh                                  ; ChevronLeft
+    lea     r9, [gt_pgprev]
+    call    ghost_attach
+    WINCALL GetDlgItem, qword ptr [rbp-8], IDC_V_PGNEXT
+    mov     rcx, qword ptr [rbp-8]
+    mov     rdx, rax
+    mov     r8d, 0E76Ch                                  ; ChevronRight
+    lea     r9, [gt_pgnext]
+    call    ghost_attach
     WINCALL GetDlgItem, qword ptr [rbp-8], IDC_V_ADD     ; sidebar toolbar -> frameless ghosts
     mov     rcx, qword ptr [rbp-8]
     mov     rdx, rax
@@ -10640,6 +10833,10 @@ vp_cmd_fixed:
     je      vp_list
     cmp     eax, IDC_V_ADDFIELD
     je      vp_addfield
+    cmp     eax, IDC_V_PGPREV
+    je      vp_pgprev
+    cmp     eax, IDC_V_PGNEXT
+    je      vp_pgnext
     cmp     eax, IDC_V_ADD
     je      vp_add
     cmp     eax, IDC_V_GENERATE
@@ -10962,6 +11159,22 @@ vl_load:
 vp_addfield:
     mov     rcx, qword ptr [rbp-8]
     call    gui_addfield_menu
+    jmp     vp_handled
+vp_pgprev:
+    cmp     dword ptr [g_cur_page], 0
+    jle     vp_handled
+    dec     dword ptr [g_cur_page]
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_rows_layout
+    jmp     vp_handled
+vp_pgnext:
+    mov     eax, dword ptr [g_cur_page]
+    inc     eax
+    cmp     eax, dword ptr [g_page_count]
+    jge     vp_handled
+    mov     dword ptr [g_cur_page], eax
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_rows_layout
     jmp     vp_handled
 vp_dyn:
     ; eax = control id of a runtime row button; decode row + slot

@@ -127,7 +127,7 @@ g_cfg_logfile       dq 0            ; --log-file PATH override (0 = default path
 ; Sized for the worst committed entry: title + up to MAXROWS-1 non-tile fields +
 ; up to MAX_TFILES attachment files (the tile expands to one field per file) +
 ; the reserved favorite/icon markers (see gui_tile_expand).
-MAX_FIELDS          equ 56
+MAX_FIELDS          equ 96
 public g_field_list, g_field_n
 g_field_n           dd 0                ; number of composed fields
 align 8
