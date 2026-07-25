@@ -60,9 +60,23 @@ Field type tags (`VF_*` in `macros.inc`): `VF_TITLE`=1, `VF_USERNAME`=2,
 RFC 6238), `VF_TEXT`=8 (generic single-line text), `VF_IMAGE`=9 /
 `VF_FILE`=10 (attachments — the value is an AttachRef, see below),
 `VF_FAV`=11 (favorite marker, value `"1"`), `VF_ICON`=12 (custom icon
-override, 12 hex chars `"GGGGCCCCCCCC"`), `VF_PWHIST`=13 (one overwritten
-password + when it was changed: 16 hex FILETIME chars + old password),
-`VF_DELETED`=14 (trash marker: 16 hex FILETIME chars of when it was deleted).
+override, 12 hex chars `"GGGGCCCCCCCC"`), `VF_PWHIST`=13 (one field-history
+event — see below), `VF_DELETED`=14 (trash marker: 16 hex FILETIME chars of
+when it was deleted).
+
+`VF_PWHIST` is written raw (`VFL_RAW`), one field per recorded event:
+
+```
+u64 FILETIME | label wide\0 | old value wide\0 | u32 action
+```
+
+`action` is 0 = CHANGED (the value was overwritten; `old value` is the
+superseded one) or 1 = ADDED (the label first came to hold data; `old value`
+is empty — history never stores a value that is still live in the record).
+Two older shapes still load: without the trailing `action` (read as CHANGED),
+and without the label either — just `u64 FILETIME | old password wide\0`,
+which is attributed to the default "Password" label. Records are never
+exported (see `zipexport.asm`).
 
 A stored field type carries the base kind in its low byte
 (`VF_KINDMASK = 00FFh`); `VF_LABELED = 8000h` in the high byte marks a field

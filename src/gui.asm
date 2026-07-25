@@ -593,17 +593,24 @@ WIPE_CHUNK    equ 65536        ; bytes of zeros written per pass
 TFILE_ENTRY equ 328
 TFILE_NAME  equ 68             ; filename offset within a tile-file entry
 MAX_FIELDS  equ 96             ; g_field_list capacity (matches main.asm): >= MAXROWS + MAX_TFILES + title + markers
-; Field history: each overwritten field value (ANY tile, not just secrets) is
+; Field history: every value-level event on ANY tile (not just secrets) is
 ; archived as a reserved VF_PWHIST field, value = raw {u64 FILETIME, label wide,
-; old value wide} (VFL_RAW).  Loaded into g_pwhist for the open entry; g_pworig
-; holds the entry's ORIGINAL field values keyed by (effective) label at load, so
-; gui_commit can detect per-tile which values were overwritten.  The browser
-; groups records into one tab per label.
+; old value wide, u32 action} (VFL_RAW).  Loaded into g_pwhist for the open entry;
+; g_pworig holds the entry's ORIGINAL field values keyed by (effective) label at
+; load, so gui_commit can detect per-tile what changed.  Two kinds of event are
+; recorded: CHANGED (a value was overwritten - the archived value is the OLD one)
+; and ADDED (a label first came to hold data, so there is no old value to keep).
+; ADDED deliberately stores no value: the current one is already in the record,
+; and history must not become a second copy of live secrets.  The browser groups
+; records into one tab per label.
 MAX_PWHIST   equ 64
-PWHIST_ENTRY equ 528           ; {u64 filetime, label wide[128], value wide[128]}
+PWHIST_ENTRY equ 528           ; {u64 filetime, label wide[128], value wide[128], u32 action}
 PWHIST_LBL   equ 8             ; label offset within a g_pwhist entry
 PWHIST_PW    equ 264           ; value offset (8 + 128*2)
-PWHBLOB_ENTRY equ 512          ; emit scratch {u32 len, u64 ft, label wide, value wide}
+PWHIST_ACT   equ 520           ; action offset (264 + 128*2), in the stride's slack
+PWHA_CHANGED equ 0             ; value overwritten -> PWHIST_PW holds the old value
+PWHA_ADDED   equ 1             ; label first filled with data -> PWHIST_PW is empty
+PWHBLOB_ENTRY equ 512          ; emit scratch {u32 len, u64 ft, label, value, u32 act}
 MAX_PWORIG   equ 64            ; up to MAXROWS value fields captured per entry (= MAXROWS)
 PWORIG_STRIDE equ 512          ; original field {label wide[128], value wide[128]}
 PWORIG_VAL   equ 256           ; value offset (bytes) within a g_pworig slot
@@ -643,9 +650,9 @@ DLG_PWHIST   equ 780          ; password-history browser dialog
 IDC_PH_LIST  equ 781          ; owner-draw list of archived passwords
 PH_ROW_H     equ 26           ; history row height (px)
 PH_PURGE_W   equ 22           ; per-row purge hotspot width (px)
-PH_TABH      equ 28           ; height (px) of the per-tile tab strip atop the list
+PH_HDRH      equ 22           ; height (px) of the created/modified header atop the list
+PH_TABH      equ 28           ; height (px) of the per-tile tab strip below the header
 MAX_TABS     equ 16           ; distinct labels (tabs) shown in the history browser
-IDC_V_TIMES  equ 236          ; created/modified timestamps line (below the last row)
 IDC_V_FAV    equ 237          ; header favorite (star) toggle
 IDC_V_CANCEL equ 238          ; "Cancel" button (edit mode, discards edits)
 IDC_V_DONE   equ 271          ; trash view: "Done" (exit recover mode); accent button
@@ -1079,10 +1086,9 @@ g_anchor_def label dword
     dd IDC_V_REMOVE,   ANCH_BOTTOM
     dd IDC_V_HEADER,   ANCH_STRETCHW
     dd IDC_V_TITLE,    ANCH_STRETCHW
-    dd IDC_V_TIMES,    ANCH_STRETCHW
 ; the entry list (sidebar_layout) and the command controls (gui_cmd_dock_layout)
 ; are NOT delta-anchored - they are laid out from the live client rect.
-ANCHOR_N equ 5
+ANCHOR_N equ 4
 tag_xw label word
     dw 0D7h, 0                             ; multiplication sign, used as the tag 'x'
 verb_open label word
@@ -1167,6 +1173,10 @@ t_created label word
     dw 'C','r','e','a','t','e','d',' ', 0
 t_modified label word
     dw ' ',' ',' ',' ','M','o','d','i','f','i','e','d',' ', 0
+pwh_empty label word            ; empty wide string: an ADDED row archives no value
+    dw 0
+ph_added label word             ; ADDED row marker, shown where an old value would be
+    dw '(','a','d','d','e','d',')', 0
 g_imgfilter label word          ; "Images\0*.png;*.jpg;*.jpeg;*.bmp;*.gif\0All\0*.*\0\0"
     dw 'I','m','a','g','e','s',0
     dw '*','.','p','n','g',';','*','.','j','p','g',';','*','.','j','p','e','g',';','*','.','b','m','p',';','*','.','g','i','f',0
@@ -1357,7 +1367,6 @@ g_colorpw_row dd ?                         ; row whose revealed secret is colore
 public g_rowpw_w
 g_rowpw_w     dw 512 dup (?)               ; revealed secret text for the color overlay
 g_wordtmp     dw 32 dup (?)                ; one resolved phonetic word (scratch)
-g_content_h   dd ?                        ; field-form content bottom (DLU) after layout
 g_cur_page    dd ?                        ; detail-pane current page (0-based)
 g_page_count  dd ?                        ; detail-pane total pages (>=1)
 align 2
@@ -4403,35 +4412,55 @@ gsd_attach_row:
     call    gui_row_add
     jmp     gsd_fnext
 gsd_pwhist:
-    ; reserved archive {u64 filetime, label wide\0, pw wide\0} -> g_pwhist (not a row).
-    ; Back-compat: an older record is just {u64 filetime, pw wide\0} (no label).
+    ; reserved archive {u64 filetime, label wide\0, value wide\0, u32 action} ->
+    ; g_pwhist (not a row).  Two older shapes still load: no action word (reads as
+    ; PWHA_CHANGED), and no label either - just {u64 filetime, pw wide\0}.
     mov     eax, dword ptr [rbp-64]             ; vallen
     cmp     eax, 10
     jb      gsd_fnext                           ; need the filetime + a NUL
     mov     r10, qword ptr [rbp-72]             ; valptr
+    mov     r11, r10                            ; value end = valptr + vallen
+    add     r11, rax
     mov     rcx, qword ptr [r10]                ; filetime qword
     lea     r8, [r10+8]                         ; scan string1 to its NUL
-    xor     r9d, r9d
+    xor     eax, eax
 gsd_ph_scan:
+    cmp     r8, r11                             ; never scan past the value
+    jae     gsd_ph_s1end
     cmp     word ptr [r8], 0
     je      gsd_ph_s1end
     add     r8, 2
-    inc     r9d
-    cmp     r9d, 255
+    inc     eax
+    cmp     eax, 255
     jb      gsd_ph_scan
 gsd_ph_s1end:
     add     r8, 2                               ; past string1's NUL
-    mov     r11, r10                            ; value end = valptr + vallen
-    mov     eax, dword ptr [rbp-64]
-    add     r11, rax
+    xor     r9d, r9d                            ; action defaults to PWHA_CHANGED
     cmp     r8, r11
-    jb      gsd_ph_new                          ; a second string follows -> new format
-    lea     rdx, [kl_secret]                    ; old format: label = "Password",
-    lea     r8, [r10+8]                         ;             pw = value+8
+    jb      gsd_ph_new                          ; a second string follows -> labelled format
+    lea     rdx, [kl_secret]                    ; oldest format: label = "Password",
+    lea     r8, [r10+8]                         ;                pw = value+8
     call    pwh_append
     jmp     gsd_fnext
 gsd_ph_new:
-    lea     rdx, [r10+8]                        ; new: label = value+8, pw = past its NUL
+    lea     rdx, [r10+8]                        ; label = value+8, value = past its NUL
+    mov     rax, r8                             ; scan the value; a u32 action may follow it
+gsd_ph_scan2:
+    cmp     rax, r11
+    jae     gsd_ph_go
+    cmp     word ptr [rax], 0
+    je      gsd_ph_s2end
+    add     rax, 2
+    jmp     gsd_ph_scan2
+gsd_ph_s2end:
+    add     rax, 6                              ; past the NUL + the u32 action
+    cmp     rax, r11
+    ja      gsd_ph_go                           ; no room -> pre-action record, keep CHANGED
+    mov     r9d, dword ptr [rax-4]
+    cmp     r9d, PWHA_ADDED                     ; unknown action -> treat as CHANGED
+    jbe     gsd_ph_go
+    xor     r9d, r9d
+gsd_ph_go:
     call    pwh_append
     jmp     gsd_fnext
 gsd_fnext:
@@ -4446,8 +4475,6 @@ gsd_fdone:
     mov     edx, IDC_V_HEADER
     call    GetDlgItem
     WINCALL InvalidateRect, rax, 0, 1
-    mov     rcx, qword ptr [rbp-24]           ; created/modified line
-    call    gui_show_times
     mov     rcx, qword ptr [rbp-24]           ; favorite star glyph
     call    gui_update_fav_glyph
     mov     rcx, qword ptr [rbp-24]
@@ -4895,13 +4922,15 @@ gte_finish:
     ret
 gui_tile_expand endp
 
-; gui_pwhist_capture() - archive any TILE value that was overwritten in this edit.
-;   Per-label set difference: for each original field (label L, value V) captured
-;   at load in g_pworig, if no NEW field with the same effective label L still holds
-;   value V, append {now, L, V} to g_pwhist.  This attributes each overwrite to its
-;   own tile (label); renaming/removing a tile also archives its old value.
+; gui_pwhist_capture() - record this edit's TILE value events, in two passes over
+;   the per-label set difference against g_pworig (the values captured at load):
+;     CHANGED - an original (label L, value V) whose L no longer holds V; archives
+;               {now, L, V}.  Renaming or removing a tile archives its old value.
+;     ADDED   - a new field with data whose label held none before; archives
+;               {now, L, ""}.  Covers a brand-new record, a field added in this
+;               edit, and an existing-but-empty field filled in for the first time.
 gui_pwhist_capture proc frame
-    FRAME_PROLOG 80
+    FRAME_PROLOG 96
     mov     dword ptr [rbp-24], 0             ; oi = original index
 gpc_orig:
     mov     eax, dword ptr [rbp-24]
@@ -4966,11 +4995,77 @@ gpc_notfound:
     mov     rdx, qword ptr [rbp-32]           ; label (slot+0)
     mov     r8, qword ptr [rbp-32]           ; old value (slot+PWORIG_VAL)
     add     r8, PWORIG_VAL
+    mov     r9d, PWHA_CHANGED
     call    pwh_append
 gpc_orignext:
     inc     dword ptr [rbp-24]
     jmp     gpc_orig
 gpc_done:
+    ; ---- pass 2: labels that now carry data but carried none at load -> ADDED ----
+    mov     dword ptr [rbp-24], 0             ; fi = field index
+gpc_add:
+    mov     eax, dword ptr [rbp-24]
+    cmp     eax, dword ptr [g_field_n]
+    jae     gpc_adddone
+    imul    eax, eax, 24
+    lea     r11, [g_field_list]
+    add     r11, rax
+    mov     ecx, dword ptr [r11]
+    and     ecx, VF_KINDMASK
+    cmp     ecx, VF_TITLE                     ; skip the same non-tile kinds as pass 1
+    je      gpc_addnext
+    cmp     ecx, VF_FAV
+    je      gpc_addnext
+    cmp     ecx, VF_ICON
+    je      gpc_addnext
+    cmp     ecx, VF_PWHIST
+    je      gpc_addnext
+    cmp     ecx, VF_FILE
+    je      gpc_addnext
+    cmp     ecx, VF_IMAGE
+    je      gpc_addnext
+    mov     rax, qword ptr [r11+16]           ; still empty -> nothing was filled in
+    test    rax, rax
+    jz      gpc_addnext
+    cmp     word ptr [rax], 0
+    je      gpc_addnext
+    mov     rax, qword ptr [r11+8]            ; effective label (custom, or kind default)
+    test    rax, rax
+    jnz     gpc_addEL
+    mov     edx, ecx
+    call    kind_label
+gpc_addEL:
+    mov     qword ptr [rbp-48], rax           ; EL (survives the wstr_eq calls)
+    mov     dword ptr [rbp-40], 0            ; oi = original index
+gpc_addorig:
+    mov     eax, dword ptr [rbp-40]
+    cmp     eax, dword ptr [g_pworig_n]
+    jae     gpc_addnew                        ; no original held data under EL -> new
+    imul    eax, eax, PWORIG_STRIDE
+    lea     r10, [g_pworig]
+    add     r10, rax
+    cmp     word ptr [r10+PWORIG_VAL], 0      ; an empty original doesn't count as data
+    je      gpc_addorignext
+    mov     rcx, r10
+    mov     rdx, qword ptr [rbp-48]
+    call    gui_wstr_eq
+    test    eax, eax
+    jnz     gpc_addnext                       ; EL already carried data -> not an add
+gpc_addorignext:
+    inc     dword ptr [rbp-40]
+    jmp     gpc_addorig
+gpc_addnew:
+    lea     rcx, [rbp-56]                      ; now -> FILETIME
+    call    GetSystemTimeAsFileTime
+    mov     rcx, qword ptr [rbp-56]           ; ft
+    mov     rdx, qword ptr [rbp-48]           ; label
+    lea     r8, [pwh_empty]                   ; ADDED archives no value
+    mov     r9d, PWHA_ADDED
+    call    pwh_append
+gpc_addnext:
+    inc     dword ptr [rbp-24]
+    jmp     gpc_add
+gpc_adddone:
     FRAME_EPILOG
     ret
 gui_pwhist_capture endp
@@ -5069,8 +5164,10 @@ gui_phtest endp
 
 
 ; gui_pwhist_emit() - append every g_pwhist entry to g_field_list as a reserved
-;   VF_PWHIST|VFL_RAW field: value = {u32 len, u64 ft, label wide\0, pw wide\0} built
-;   into g_pwhblob so it survives until vault_build_entry consumes it.
+;   VF_PWHIST|VFL_RAW field: value = {u32 len, u64 ft, label wide\0, pw wide\0,
+;   u32 action} built into g_pwhblob so it survives until vault_build_entry
+;   consumes it.  The action trails the strings so records written before it
+;   existed still parse (a short record reads back as PWHA_CHANGED).
 gui_pwhist_emit proc frame
     FRAME_PROLOG 48
     mov     dword ptr [rbp-24], 0            ; i
@@ -5106,7 +5203,11 @@ gpe_loop:
     call    gui_wcpy_capped                   ; eax = pw bytes incl NUL
     add     eax, 8                            ; len = ft(8) + label bytes + pw bytes
     add     eax, dword ptr [rbp-44]
-    mov     r11, qword ptr [rbp-32]
+    mov     r11, qword ptr [rbp-32]           ; u32 action trails both strings
+    mov     r10, qword ptr [rbp-40]
+    mov     r10d, dword ptr [r10+PWHIST_ACT]
+    mov     dword ptr [r11+rax+4], r10d       ; blob+4+len (past ft+strings)
+    add     eax, 4                            ; len += action
     mov     dword ptr [r11], eax             ; u32 len at blob+0
     mov     eax, dword ptr [g_field_n]        ; g_field_list[g_field_n]
     imul    eax, eax, 24
@@ -6177,13 +6278,15 @@ pwh_entry proc
     ret
 pwh_entry endp
 
-; pwh_append(rcx = FILETIME qword, rdx = wide label, r8 = wide old-password) - add a
-;   history entry; when full, drop the oldest so the most recent are kept.
+; pwh_append(rcx = FILETIME qword, rdx = wide label, r8 = wide old value,
+;            r9d = PWHA_* action) - add a history entry; when full, drop the
+;   oldest so the most recent are kept.
 pwh_append proc frame
-    FRAME_PROLOG 48
+    FRAME_PROLOG 64
     mov     qword ptr [rbp-24], rcx
     mov     qword ptr [rbp-32], rdx
     mov     qword ptr [rbp-56], r8
+    mov     dword ptr [rbp-64], r9d
     mov     eax, dword ptr [g_pwhist_n]
     cmp     eax, MAX_PWHIST
     jb      pwa_slot
@@ -6217,9 +6320,12 @@ pwa_slot:
     mov     rdx, qword ptr [rbp-32]
     call    gui_wcpy_capped
     mov     rax, qword ptr [rbp-48]
-    lea     rcx, [rax+PWHIST_PW]             ; old password (capped, NUL-term)
+    lea     rcx, [rax+PWHIST_PW]             ; old value (capped, NUL-term; empty for ADDED)
     mov     rdx, qword ptr [rbp-56]
     call    gui_wcpy_capped
+    mov     rax, qword ptr [rbp-48]
+    mov     r10d, dword ptr [rbp-64]
+    mov     dword ptr [rax+PWHIST_ACT], r10d ; action
     inc     dword ptr [g_pwhist_n]
     FRAME_EPILOG
     ret
@@ -7551,22 +7657,7 @@ grl_done:
     mov     dword ptr [g_cur_page], eax
     jmp     grl_pgrestart
 grl_pgok:
-    ; created/modified line: below the last row on the last page, else off-screen
-    mov     ecx, 10000
-    mov     eax, dword ptr [g_cur_page]
-    cmp     eax, dword ptr [rbp-88]              ; on the last page?
-    jne     grl_times_at
-    mov     ecx, dword ptr [rbp-84]              ; -> just under the last row
-grl_times_at:
-    mov     dword ptr [rbp-40], ecx
-    mov     rcx, qword ptr [rbp-24]
-    mov     edx, IDC_V_TIMES
-    call    GetDlgItem
-    mov     qword ptr [rbp-32], rax
-    WINCALL move_ctl, qword ptr [rbp-24], qword ptr [rbp-32], 176, dword ptr [rbp-40], 244, 10
-    mov     eax, dword ptr [rbp-40]              ; content bottom incl. the timestamps line
-    add     eax, 12
-    mov     dword ptr [g_content_h], eax
+    ; (created/modified now live in the history browser, not under the last row)
     mov     rcx, qword ptr [rbp-24]              ; position + show/hide the pagination bar
     call    gui_page_bar
     mov     rcx, qword ptr [rbp-24]              ; keep value columns elastic after relayout
@@ -9257,17 +9348,18 @@ gui_fmt_datetime proc frame
     ret
 gui_fmt_datetime endp
 
-; gui_show_times(rcx=hdlg) - fill IDC_V_TIMES with the current entry's
-;   "Created <dt>  Modified <dt>" (blank when no entry).
-gui_show_times proc frame
+; gui_build_times() - render the open entry's "Created <dt>  Modified <dt>" into
+;   g_times_w (NUL-terminated; empty when no entry).  Drawn as the history
+;   browser's header - the detail pane no longer carries a timestamps line.
+gui_build_times proc frame
     FRAME_PROLOG 64
-    mov     qword ptr [rbp-24], rcx
+    mov     word ptr [g_times_w], 0
     cmp     dword ptr [g_cur_idx], 0
-    jl      gts_clear
+    jl      gts_done
     mov     ecx, dword ptr [g_cur_idx]
     call    vault_entry_ptr
     test    rax, rax
-    jz      gts_clear
+    jz      gts_done
     mov     qword ptr [rbp-32], rax             ; entry ptr
     lea     rcx, [g_times_w]
     lea     rdx, [t_created]
@@ -9284,14 +9376,10 @@ gui_show_times proc frame
     add     rdx, 24                             ; modified FILETIME
     call    gui_fmt_datetime
     mov     word ptr [rax], 0                   ; NUL-terminate
-    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_TIMES, addr g_times_w
+gts_done:
     FRAME_EPILOG
     ret
-gts_clear:
-    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_TIMES, 0
-    FRAME_EPILOG
-    ret
-gui_show_times endp
+gui_build_times endp
 
 ; gui_entry_is_fav(ecx=idx) -> eax = 1 if the entry carries a VF_FAV field.
 gui_entry_is_fav proc frame
@@ -9589,7 +9677,6 @@ gui_leave_trash endp
 gui_detail_clear proc frame
     FRAME_PROLOG 48
     mov     qword ptr [rbp-24], rcx
-    call    gui_show_times                      ; clears the times (g_cur_idx = -1)
     WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_TITLE, 0
     mov     rcx, qword ptr [rbp-24]
     mov     edx, IDC_V_HEADER
@@ -11119,8 +11206,6 @@ vp_fav_toggle:
     call    gui_update_fav_glyph
     mov     rcx, qword ptr [rbp-8]               ; persist immediately
     call    gui_commit
-    mov     rcx, qword ptr [rbp-8]               ; refresh Modified (commit bumped it)
-    call    gui_show_times
     jmp     vp_handled
 vp_tpminfo:
     WINCALL gui_msgbox, qword ptr [rbp-8], addr m_tpminfo, addr t_tpminfo, \
@@ -12795,11 +12880,26 @@ gui_draw_pwhist proc frame
     lea     rdx, [r10+40]
     WINCALL FillRect, qword ptr [rbp-32], rdx, qword ptr [rbp-72]
     WINCALL DeleteObject, qword ptr [rbp-72]
-    cmp     dword ptr [g_pwhist_n], 0
-    je      gdh_done
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_subfont]
     mov     qword ptr [rbp-80], rax            ; old font
     WINCALL SetBkMode, qword ptr [rbp-32], 1
+    ; --- header: this entry's Created / Modified (dim, across the top) ---
+    call    gui_build_times
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_textdim]
+    mov     eax, dword ptr [rbp-40]
+    add     eax, 10
+    mov     dword ptr [rbp-176], eax
+    mov     eax, dword ptr [rbp-48]
+    mov     dword ptr [rbp-172], eax
+    mov     eax, dword ptr [rbp-56]
+    sub     eax, 2
+    mov     dword ptr [rbp-168], eax
+    mov     eax, dword ptr [rbp-48]
+    add     eax, PH_HDRH
+    mov     dword ptr [rbp-164], eax
+    WINCALL DrawTextW, qword ptr [rbp-32], addr g_times_w, -1, addr rbp-176, 8024h
+    cmp     dword ptr [g_pwhist_n], 0
+    je      gdh_restore                        ; no records: the header still shows
     call    pwh_build_tabs
     call    pwh_build_filter
     ; --- per-tile tab strip (splits the width evenly among the labels) ---
@@ -12823,17 +12923,18 @@ gdh_tab:
     jne     @F
     mov     eax, dword ptr [g_col_text]
 @@: WINCALL SetTextColor, qword ptr [rbp-32], eax
-    mov     eax, dword ptr [rbp-192]          ; text rect [tabX+4, T, tabX+tabW-4, T+PH_TABH]
-    add     eax, 4
+    mov     eax, dword ptr [rbp-192]          ; text rect [tabX+4, below the header,
+    add     eax, 4                            ;            tabX+tabW-4, +PH_TABH]
     mov     dword ptr [rbp-176], eax
     mov     eax, dword ptr [rbp-48]
+    add     eax, PH_HDRH
     mov     dword ptr [rbp-172], eax
     mov     eax, dword ptr [rbp-192]
     add     eax, dword ptr [rbp-188]
     sub     eax, 4
     mov     dword ptr [rbp-168], eax
     mov     eax, dword ptr [rbp-48]
-    add     eax, PH_TABH
+    add     eax, PH_HDRH+PH_TABH
     mov     dword ptr [rbp-164], eax
     mov     ecx, dword ptr [rbp-88]           ; tab label = its representative record's label
     lea     r10, [g_pwh_tabs]
@@ -12850,14 +12951,14 @@ gdh_tab:
     add     eax, 8
     mov     dword ptr [rbp-176], eax
     mov     eax, dword ptr [rbp-48]
-    add     eax, PH_TABH-3
+    add     eax, PH_HDRH+PH_TABH-3
     mov     dword ptr [rbp-172], eax
     mov     eax, dword ptr [rbp-192]
     add     eax, dword ptr [rbp-188]
     sub     eax, 8
     mov     dword ptr [rbp-168], eax
     mov     eax, dword ptr [rbp-48]
-    add     eax, PH_TABH-1
+    add     eax, PH_HDRH+PH_TABH-1
     mov     dword ptr [rbp-164], eax
     WINCALL FillRect, qword ptr [rbp-32], addr rbp-176, qword ptr [rbp-120]
     WINCALL DeleteObject, qword ptr [rbp-120]
@@ -12880,8 +12981,8 @@ gdh_loop:
     mov     eax, dword ptr [rbp-88]
     imul    eax, eax, PH_ROW_H
     add     eax, dword ptr [rbp-48]
-    add     eax, PH_TABH
-    mov     dword ptr [rbp-104], eax          ; rowTop (below the tab strip)
+    add     eax, PH_HDRH+PH_TABH
+    mov     dword ptr [rbp-104], eax          ; rowTop (below the header + tab strip)
     mov     ecx, eax
     add     ecx, PH_ROW_H
     cmp     ecx, dword ptr [rbp-64]
@@ -12931,8 +13032,18 @@ gdh_loop:
     mov     rax, qword ptr [rbp-152]
     add     rax, PWHIST_LBL
     WINCALL DrawTextW, qword ptr [rbp-32], rax, -1, addr rbp-176, 8024h
-    ; old password (normal, middle column, ellipsized)
-    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_text]
+    ; middle column (ellipsized): the old value for CHANGED, else a dim "(added)"
+    ; marker - an ADDED record keeps no value to show
+    mov     rax, qword ptr [rbp-152]
+    lea     r10, [rax+PWHIST_PW]
+    mov     r11d, dword ptr [g_col_text]
+    cmp     dword ptr [rax+PWHIST_ACT], PWHA_CHANGED
+    je      @F
+    lea     r10, [ph_added]
+    mov     r11d, dword ptr [g_col_textdim]
+@@: mov     qword ptr [rbp-200], r10          ; text ptr + color in their own slots:
+    mov     dword ptr [rbp-208], r11d         ;   WINCALL's arg stores clobber registers
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [rbp-208]
     mov     eax, dword ptr [rbp-184]
     add     eax, 8
     mov     dword ptr [rbp-176], eax
@@ -12943,9 +13054,7 @@ gdh_loop:
     mov     dword ptr [rbp-168], eax
     mov     eax, dword ptr [rbp-112]
     mov     dword ptr [rbp-164], eax
-    mov     rax, qword ptr [rbp-152]
-    add     rax, PWHIST_PW
-    WINCALL DrawTextW, qword ptr [rbp-32], rax, -1, addr rbp-176, 8024h
+    WINCALL DrawTextW, qword ptr [rbp-32], qword ptr [rbp-200], -1, addr rbp-176, 8024h
     ; change date (dim, right-aligned column)
     WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_textdim]
     mov     eax, dword ptr [rbp-144]
@@ -13002,8 +13111,11 @@ gui_pwhist_click proc frame
     mov     rcx, qword ptr [rbp-32]
     lea     rdx, [rbp-64]                      ; RECT l-64 t-60 r-56 b-52
     call    GetClientRect
-    ; --- click in the tab strip? (pt.y < PH_TABH) -> switch tab ---
-    cmp     dword ptr [rbp-44], PH_TABH
+    ; --- click in the header band? (above the tabs) -> nothing to do ---
+    cmp     dword ptr [rbp-44], PH_HDRH
+    jl      gpk_done
+    ; --- click in the tab strip? -> switch tab ---
+    cmp     dword ptr [rbp-44], PH_HDRH+PH_TABH
     jge     gpk_row
     mov     eax, dword ptr [rbp-56]           ; tabW = clientW / ntabs
     cdq
@@ -13023,8 +13135,8 @@ gui_pwhist_click proc frame
     jmp     gpk_repaint
 gpk_row:
     call    pwh_build_filter
-    mov     eax, dword ptr [rbp-44]           ; disp = scroll + (pt.y-PH_TABH)/PH_ROW_H
-    sub     eax, PH_TABH
+    mov     eax, dword ptr [rbp-44]           ; disp = scroll + (pt.y-tabsBot)/PH_ROW_H
+    sub     eax, PH_HDRH+PH_TABH
     cdq
     mov     ecx, PH_ROW_H
     idiv    ecx
