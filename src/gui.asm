@@ -2947,7 +2947,9 @@ gui_draw_header endp
 ;   showing the current entry's effective glyph + colour (the working override
 ;   if the user picked one, else the auto-derived icon).
 gui_draw_iconbtn proc frame
-    FRAME_PROLOG 96
+    FRAME_PROLOG 128                       ; >= 128: the 5-arg DrawTextW below spills
+                                           ;   its flags to [rsp+32]; at 96 that landed
+                                           ;   exactly on the saved font at [rbp-80]
     mov     qword ptr [rbp-24], rcx
     mov     r10, rcx
     mov     rax, qword ptr [r10+32]
@@ -3310,7 +3312,14 @@ gui_draw_taglist endp
 ; gui_draw_field_cards(rcx=hdc, rdx=hdlg) - fill a COL_PANEL rounded card behind
 ;   every field row (label+value edits already paint COL_PANEL, so they blend).
 gui_draw_field_cards proc frame
-    FRAME_PROLOG 160
+    FRAME_PROLOG 208                       ; >= 208: at 160 the GetClientRect output
+                                           ;   at [rbp-160] sat in that call's OWN
+                                           ;   home space (rsp+16), so user32 homed
+                                           ;   nonvolatiles over it and restored them
+                                           ;   from the rect.  This also lifts it clear
+                                           ;   of the 7-arg RoundRect spill below, so
+                                           ;   safety no longer rests on the local
+                                           ;   being dead by then.
     mov     qword ptr [rbp-24], rcx            ; hdc
     mov     qword ptr [rbp-32], rdx            ; hdlg
     mov     eax, dword ptr [g_layout]          ; flat (Compact) layout draws no cards
@@ -3514,7 +3523,12 @@ grf_lp:
     WINCALL GetDlgItem, qword ptr [rbp-24], dword ptr [rbp-64]
     test    rax, rax
     jz      grf_next
-    WINCALL MoveWindow, rax, dword ptr [rbp-72], dword ptr [rbp-76], \
+    mov     qword ptr [rbp-88], rax           ; stage the hwnd: WINCALL emits the
+                                              ;   32-bit memory stack args FIRST,
+                                              ;   via rax - passing rax here made
+                                              ;   MoveWindow take nHeight as its
+                                              ;   hWnd, so no anchor ever moved
+    WINCALL MoveWindow, qword ptr [rbp-88], dword ptr [rbp-72], dword ptr [rbp-76], \
             dword ptr [rbp-80], dword ptr [rbp-84], 1
 grf_next:
     inc     dword ptr [rbp-60]
