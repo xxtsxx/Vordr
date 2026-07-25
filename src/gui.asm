@@ -3733,6 +3733,23 @@ dk_pghavex:
     add     eax, 28
     mov     dword ptr [rbp-164], eax
     WINCALL MoveWindow, qword ptr [rbp-160], dword ptr [rbp-164], dword ptr [rbp-152], 20, 20, 1
+    ; The centre differs per mode, so an edit<->view switch shifts all three.  A
+    ; moved owner-draw/static control bit-blts its pixels and only invalidates the
+    ; sliver it uncovers - the area it VACATED keeps its old paint, so a stale
+    ; digit can sit where a chevron just landed.  Repaint the whole bar row,
+    ; children included, whenever the bar is up.
+    cmp     dword ptr [g_page_count], 1
+    jle     dk_done
+    mov     dword ptr [rbp-184], 0             ; strip {0, y-6, cx, y+30}
+    mov     eax, dword ptr [rbp-152]
+    sub     eax, 6
+    mov     dword ptr [rbp-180], eax
+    mov     eax, dword ptr [rbp-52]
+    mov     dword ptr [rbp-176], eax
+    mov     eax, dword ptr [rbp-152]
+    add     eax, 30
+    mov     dword ptr [rbp-172], eax
+    WINCALL RedrawWindow, qword ptr [rbp-24], addr rbp-184, 0, 85h
 dk_done:
     FRAME_EPILOG
     ret
