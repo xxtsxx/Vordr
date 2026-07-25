@@ -117,6 +117,14 @@ VF_SPACER           equ 16         ; layout block: a blank gap (no label, no val
 ; Shared so theme.asm can tell a card row button from a fixed header glyph when it
 ; fills a frameless ghost button's background.
 IDC_DYN_BASE        equ 3000
+; Field-history buffer geometry.  Shared rather than gui.asm-local because
+; secmem.asm has to lock and panic-wipe the same buffers, and a second copy of
+; these numbers would be free to drift out of step with the arrays they size.
+MAX_PWHIST          equ 64         ; archived events kept for the open entry
+PWHIST_ENTRY        equ 528        ; {u64 ft, label wide[128], value wide[128], u32 act}
+MAX_PWORIG          equ 64         ; originals captured at load (= MAXROWS)
+PWORIG_STRIDE       equ 512        ; {label wide[128], value wide[128]}
+PWHBLOB_ENTRY       equ 512        ; emit scratch per archived event
 ; A stored field type carries the base kind in its low byte; VF_LABELED in the
 ; high byte marks a field whose value bytes are prefixed with a custom label:
 ;   labeled: bytes = u16 labellen | label_utf8 | value_utf8

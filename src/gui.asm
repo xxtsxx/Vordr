@@ -615,16 +615,14 @@ MAX_FIELDS  equ 96             ; g_field_list capacity (matches main.asm): >= MA
 ; ADDED deliberately stores no value: the current one is already in the record,
 ; and history must not become a second copy of live secrets.  The browser groups
 ; records into one tab per label.
-MAX_PWHIST   equ 64
-PWHIST_ENTRY equ 528           ; {u64 filetime, label wide[128], value wide[128], u32 action}
+; MAX_PWHIST / PWHIST_ENTRY / MAX_PWORIG / PWORIG_STRIDE / PWHBLOB_ENTRY live in
+; macros.inc - secmem.asm locks and panic-wipes these buffers and must size them
+; identically.  The offsets below are gui-side only.
 PWHIST_LBL   equ 8             ; label offset within a g_pwhist entry
 PWHIST_PW    equ 264           ; value offset (8 + 128*2)
 PWHIST_ACT   equ 520           ; action offset (264 + 128*2), in the stride's slack
 PWHA_CHANGED equ 0             ; value overwritten -> PWHIST_PW holds the old value
 PWHA_ADDED   equ 1             ; label first filled with data -> PWHIST_PW is empty
-PWHBLOB_ENTRY equ 512          ; emit scratch {u32 len, u64 ft, label, value, u32 act}
-MAX_PWORIG   equ 64            ; up to MAXROWS value fields captured per entry (= MAXROWS)
-PWORIG_STRIDE equ 512          ; original field {label wide[128], value wide[128]}
 PWORIG_VAL   equ 256           ; value offset (bytes) within a g_pworig slot
 MAXROWS     equ 64
 ; Commit scratch for custom labels.  Every row can contribute a full 128-wide-char
@@ -1434,10 +1432,11 @@ g_sel         db MAX_SEL dup (?)                 ; export/import selection mask 
 g_sel_src     dd ?                               ; checklist source: 0 = vault (export), 1 = staged import
 align 8
 g_lvi         db 96 dup (?)                      ; LVITEMW/LVCOLUMNW marshalling scratch (modal, non-reentrant)
-g_pwhist      db MAX_PWHIST*PWHIST_ENTRY dup (?) ; open entry's overwritten passwords
+public g_pwhist, g_pwhblob, g_pworig      ; secmem.asm locks + panic-wipes these
+g_pwhist      db MAX_PWHIST*PWHIST_ENTRY dup (?) ; open entry's overwritten values
 g_pwhist_n    dd ?                               ; number of history entries
 g_pwhblob     db MAX_PWHIST*PWHBLOB_ENTRY dup (?); per-history emit scratch (VFL_RAW)
-g_pworig      db MAX_PWORIG*PWORIG_STRIDE dup (?); original {label,value} per secret
+g_pworig      db MAX_PWORIG*PWORIG_STRIDE dup (?); original {label,value} per field
 g_pworig_n    dd ?
 g_pwh_scroll  dd ?                               ; history browser: first visible row
 g_pwh_dirty   dd ?                               ; history browser: a purge happened
@@ -6318,10 +6317,26 @@ tf_find_row endp
 ; pwh_* / pworig_* - password history for the open entry (g_pwhist) and the
 ;   original secret values captured at load (g_pworig) used to detect overwrites.
 ; -----------------------------------------------------------------------------
-; pwh_reset() - clear history + originals for a freshly opened entry.  Leaf.
-pwh_reset proc
+; pwh_reset() - clear history + originals for a freshly opened entry.  Zeroes the
+;   buffers, not just the counts: g_pworig holds the plaintext of EVERY field of
+;   the entry (pworig_add runs before the kind check, so secrets included) and
+;   g_pwhist holds superseded values.  Dropping only the counts left the previous
+;   entry's secrets resident for the life of the process - and gui_towide does not
+;   pad, so a shorter value never covered a longer one's tail.
+pwh_reset proc frame
+    FRAME_PROLOG 32
+    lea     rcx, [g_pwhist]
+    mov     edx, MAX_PWHIST*PWHIST_ENTRY
+    call    secure_zero
+    lea     rcx, [g_pworig]
+    mov     edx, MAX_PWORIG*PWORIG_STRIDE
+    call    secure_zero
+    lea     rcx, [g_pwhblob]
+    mov     edx, MAX_PWHIST*PWHBLOB_ENTRY
+    call    secure_zero
     mov     dword ptr [g_pwhist_n], 0
     mov     dword ptr [g_pworig_n], 0
+    FRAME_EPILOG
     ret
 pwh_reset endp
 

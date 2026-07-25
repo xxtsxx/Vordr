@@ -42,6 +42,9 @@ externdef g_secret_w:byte           ; revealed secret for reveal/copy (gui.asm)
 externdef g_rowpw_w:byte            ; reveal-overlay secret copy (gui.asm)
 externdef g_e_totp:byte             ; entry-form TOTP key (gui.asm)
 externdef g_totp_b32:byte           ; selected entry TOTP key (gui.asm)
+externdef g_pwhist:byte             ; archived superseded field values (gui.asm)
+externdef g_pworig:byte             ; every field value of the open entry (gui.asm)
+externdef g_pwhblob:byte            ; history emit scratch (gui.asm)
 externdef g_body_ptr:qword          ; decrypted vault body arena (vault.asm)
 externdef g_body_len:qword
 
@@ -226,6 +229,15 @@ sec_lock_statics proc frame
     lea     rcx, [g_totp_b32]
     mov     edx, 256
     call    sec_lock
+    lea     rcx, [g_pwhist]                    ; field history: superseded plaintext
+    mov     edx, MAX_PWHIST*PWHIST_ENTRY
+    call    sec_lock
+    lea     rcx, [g_pworig]                    ; every field value of the open entry
+    mov     edx, MAX_PWORIG*PWORIG_STRIDE
+    call    sec_lock
+    lea     rcx, [g_pwhblob]                   ; the same values staged for the writer
+    mov     edx, MAX_PWHIST*PWHBLOB_ENTRY
+    call    sec_lock
     FRAME_EPILOG
     ret
 sec_lock_statics endp
@@ -264,6 +276,15 @@ secmem_panic_wipe proc frame
     call    secure_zero
     lea     rcx, [g_totp_b32]
     mov     edx, 256
+    call    secure_zero
+    lea     rcx, [g_pwhist]                     ; field history (locked above; the crash
+    mov     edx, MAX_PWHIST*PWHIST_ENTRY        ;   path must cover it too, or a minidump
+    call    secure_zero                         ;   keeps the open entry's plaintext)
+    lea     rcx, [g_pworig]
+    mov     edx, MAX_PWORIG*PWORIG_STRIDE
+    call    secure_zero
+    lea     rcx, [g_pwhblob]
+    mov     edx, MAX_PWHIST*PWHBLOB_ENTRY
     call    secure_zero
     mov     rax, qword ptr [g_body_ptr]         ; decrypted vault body, if resident
     test    rax, rax
