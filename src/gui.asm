@@ -267,6 +267,9 @@ extern DestroyMenu:proc
 extern SetMenuInfo:proc
 extern GetCursorPos:proc
 extern SetForegroundWindow:proc
+extern RegisterHotKey:proc
+extern UnregisterHotKey:proc
+extern VkKeyScanW:proc
 
 ; ---- constants ---------------------------------------------------------------
 MB_OK               equ 0
@@ -364,6 +367,14 @@ TPM_RIGHTBUTTON     equ 2
 TPM_LEFTALIGN       equ 0
 TPM_RETURNCMD       equ 0100h
 WS_EX_TOOLWINDOW    equ 80h
+; ---- global hotkey (Alt + |) - summons the vault from the tray ---------------
+WM_HOTKEY           equ 0312h
+MOD_ALT             equ 1
+MOD_CONTROL         equ 2
+MOD_SHIFT           equ 4
+MOD_NOREPEAT        equ 4000h            ; auto-repeat off (Win7+); dropped on failure
+HOTKEY_SHOW         equ 1                 ; our hotkey id on the tray-owner window
+VK_OEM_5            equ 0DCh              ; the \| key - fallback when '|' isn't mappable
 WS_POPUP            equ 80000000h
 IDM_ABOUT           equ 1001
 IDM_OPEN            equ 1002
@@ -537,6 +548,7 @@ LVIS_STATEIMAGEMASK          equ 0F000h
 LVCF_WIDTH                   equ 2
 SW_HIDE      equ 0
 SW_SHOW      equ 5
+SW_RESTORE   equ 9
 DLG_CREATE   equ 400
 IDC_C_PW     equ 402
 IDC_C_PW2    equ 403
@@ -14840,6 +14852,58 @@ gui_tray_del proc frame
     ret
 gui_tray_del endp
 
+; gui_hotkey_add(rcx = hwnd) - register the system-wide "summon" hotkey, Alt + |,
+;   on the tray-owner window (it outlives the vault window, which is destroyed on
+;   close).  RegisterHotKey is a plain user32 call - no hook and no separate DLL.
+;   The key carrying '|' differs per layout (unshifted left of 1 on Nordic, Shift
+;   + \ on US), so ask the ACTIVE layout for it via VkKeyScanW rather than hard-
+;   coding a scan code, and fold the shift state that '|' needs into the
+;   modifiers.  Silent on failure: another process may already own the combo, and
+;   a startup error box would be worse than a missing accelerator.
+gui_hotkey_add proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx              ; hwnd
+    mov     dword ptr [rbp-32], VK_OEM_5         ; vk  - fallback: the \| key
+    mov     dword ptr [rbp-40], MOD_ALT          ; mods
+    WINCALL VkKeyScanW, 7Ch                      ; '|' -> lo = vk, hi = shift state
+    movsx   eax, ax
+    cmp     eax, -1                              ; not on this layout -> keep the fallback
+    je      gha_reg
+    movzx   r10d, al                             ; vk
+    test    r10d, r10d
+    jz      gha_reg
+    mov     dword ptr [rbp-32], r10d
+    movzx   eax, ah                              ; shift state: 1 Shift, 2 Ctrl, 4 Alt
+    test    eax, 1                               ; (note the bits are NOT the MOD_ values)
+    jz      @F
+    or      dword ptr [rbp-40], MOD_SHIFT
+@@: test    eax, 2
+    jz      @F
+    or      dword ptr [rbp-40], MOD_CONTROL
+@@:
+gha_reg:
+    mov     eax, dword ptr [rbp-40]
+    or      eax, MOD_NOREPEAT
+    mov     dword ptr [rbp-48], eax
+    WINCALL RegisterHotKey, qword ptr [rbp-24], HOTKEY_SHOW, dword ptr [rbp-48], \
+            dword ptr [rbp-32]
+    test    eax, eax
+    jnz     gha_done
+    WINCALL RegisterHotKey, qword ptr [rbp-24], HOTKEY_SHOW, dword ptr [rbp-40], \
+            dword ptr [rbp-32]                   ; retry without MOD_NOREPEAT (pre-Win7)
+gha_done:
+    FRAME_EPILOG
+    ret
+gui_hotkey_add endp
+
+; gui_hotkey_del(rcx = hwnd) - release the summon hotkey.
+gui_hotkey_del proc frame
+    FRAME_PROLOG 32
+    WINCALL UnregisterHotKey, rcx, HOTKEY_SHOW
+    FRAME_EPILOG
+    ret
+gui_hotkey_del endp
+
 ; gui_tray_menu(rcx = hwnd) - the right-click context menu (About / Open / Exit).
 gui_tray_menu proc frame
     FRAME_PROLOG 96
@@ -14876,6 +14940,8 @@ tray_wndproc proc
     mov     qword ptr [rbp-32], r9           ; lParam
     cmp     rdx, WM_TRAYICON
     je      twp_tray
+    cmp     rdx, WM_HOTKEY
+    je      twp_hotkey
     cmp     rdx, WM_COMMAND
     je      twp_cmd
     cmp     rdx, WM_DESTROY
@@ -14914,6 +14980,17 @@ twp_toggle:
     WINCALL PostMessageW, qword ptr [g_vaulthwnd], WM_COMMAND, IDCANCEL, 0
     xor     eax, eax
     jmp     twp_ret
+twp_hotkey:
+    ; Alt + | from anywhere: summon the vault.  Unlike the tray left-click this
+    ; never toggles - the point is to bring the window up, so an already-open one
+    ; is un-minimised and raised rather than dismissed.  Serving a hotkey grants
+    ; this process the right to take the foreground, so SetForegroundWindow works.
+    cmp     qword ptr [g_vaulthwnd], 0
+    je      twp_open                         ; not up -> the usual unlock/open flow
+    WINCALL ShowWindow, qword ptr [g_vaulthwnd], SW_RESTORE
+    WINCALL SetForegroundWindow, qword ptr [g_vaulthwnd]
+    xor     eax, eax
+    jmp     twp_ret
 twp_cmd:
     movzx   eax, word ptr [rbp-24]           ; LOWORD(wParam) = menu id
     cmp     eax, IDM_ABOUT
@@ -14944,6 +15021,8 @@ twp_exit:
     xor     eax, eax
     jmp     twp_ret
 twp_destroy:
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_hotkey_del
     call    gui_tray_del
     WINCALL PostQuitMessage, 0
     xor     eax, eax
@@ -15275,6 +15354,8 @@ gm_trayhwnd:
     mov     qword ptr [g_trayhwnd], rax
     mov     rcx, rax
     call    gui_tray_add
+    mov     rcx, qword ptr [g_trayhwnd]       ; Alt + | summons the vault from anywhere
+    call    gui_hotkey_add
 ifdef DBG_SHOW
     WINCALL PostMessageW, qword ptr [g_trayhwnd], WM_TRAYICON, 0, WM_LBUTTONUP  ; auto-open the vault
 endif
