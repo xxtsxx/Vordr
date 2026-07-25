@@ -102,7 +102,7 @@ set /a T_SELFTEST=!T1!-!T0!
 
 rem -------------------------------------------------------------- roundtrip --
 call :now T0
-echo === stage: roundtrip (seedtest / atgen / zitest / phtest / secscan / secfreedup / tmptest / fztest / trtest / vfuzz / fuzzzip / jfuzz / bktest / mactest / rbtest / xctest / reload / attfuzz / zexcap / healthkat / pkat / kdfparam / vaultexportkat / vaultexpattkat) ===
+echo === stage: roundtrip (seedtest / atgen / zitest / phtest / secscan / secfreedup / tmptest / fztest / trtest / vfuzz / fuzzzip / jfuzz / bktest / mactest / rbtest / xctest / reload / attfuzz / zexcap / zexname / healthkat / pkat / kdfparam / vaultexportkat / vaultexpattkat) ===
 set RT=PASS
 
 rem --- data-loss guard: the RELEASE binary (still in bin\ from the build stage)
@@ -188,6 +188,9 @@ if not "!errorlevel!"=="0" ( echo   attfuzz: FAIL ^(exit !errorlevel!, attach_in
 
 bin\vordr.exe zexcap > "%WORK%\zexcap.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   zexcap: FAIL ^(exit !errorlevel!, zip-export central-dir cap OOB^) & set RT=FAIL )
+
+bin\vordr.exe zexname > "%WORK%\zexname.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   zexname: FAIL ^(exit !errorlevel!, attachment filename leaked into a cleartext ZIP member name^) & set RT=FAIL )
 
 bin\vordr.exe healthkat > "%WORK%\healthkat.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   healthkat: FAIL ^(exit !errorlevel!, vault-health analysis counts^) & set RT=FAIL )

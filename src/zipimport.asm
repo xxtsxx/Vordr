@@ -71,6 +71,9 @@ g_zi_count  dd ?
 g_zi_slot   dd ?                          ; zi_addattach: field slot
 g_zi_atype  dd ?                          ; zi_addattach: base type (9/10)
 g_zi_alabel dq ?                          ; zi_addattach: label wide (0/none)
+g_zi_anamen dd ?                          ; decoded "name" length; 0 = predates the key
+g_zi_nbuf   db 1024 dup (?)               ; decoded "name" (kept apart from g_zi_sbuf,
+                                          ;   which still holds the value/path)
 g_zi_mode   dd ?                          ; zi_walk: 0 = stage (titles), 1 = commit (build)
 g_zi_e      dd ?                          ; zi_walk: running entry index
 g_zi_build  dd ?                          ; zi_walk: current entry builds fields (1) or discards (0)
@@ -94,6 +97,7 @@ zl_fields   db ',"fields":['
 zl_type     db '"type":'
 zl_label    db ',"label":'
 zl_value    db ',"value":'
+zl_name     db ',"name":'                  ; optional, attachments only (see zi_addattach)
 
 ; --- fuzzzip fixture: a minimal WinZip-AES STORED local header for vordr.json
 ; (usize=4 so the whole member region {salt16, verify2, cipher4, hmac10} = 32B
@@ -620,7 +624,18 @@ zi_addattach proc frame
     call    attach_stage
     test    eax, eax
     jnz     za_skip
-    ; filename = basename(path) (after the last '/')
+    ; filename: prefer the json's "name".  Member names are opaque (16 hex of the
+    ; attachment id), so the path's last component is no longer the real name.
+    ; An archive written before that change carries no "name" - and there the
+    ; basename IS the real filename, so fall back to it.
+    cmp     dword ptr [g_zi_anamen], 0
+    je      zaf_frompath
+    mov     eax, dword ptr [g_zi_anamen]
+    mov     dword ptr [rbp-48], eax             ; fnlen
+    lea     r10, [g_zi_nbuf]
+    mov     qword ptr [rbp-56], r10             ; fnptr
+    jmp     zaf_have
+zaf_frompath:
     mov     r10, qword ptr [rbp-24]             ; path
     mov     r8d, dword ptr [rbp-28]             ; pathlen
     mov     ecx, r8d                            ; start = pathlen
@@ -639,6 +654,11 @@ zaf_done:
     mov     r10, qword ptr [rbp-24]
     add     r10, r9                             ; fnptr
     mov     qword ptr [rbp-56], r10
+zaf_have:
+    cmp     dword ptr [rbp-48], 255             ; clamp to the MultiByteToWideChar cap
+    jbe     zaf_fnok                            ;   below: over it the call returns 0 and
+    mov     dword ptr [rbp-48], 255             ;   the name would land EMPTY instead of
+zaf_fnok:                                       ;   merely truncated
     ; ensure the arena has room for the worst-case blob before any write:
     ;   4 (rawlen) + ARF_SIZE + (255+1)*2 (max wide filename incl NUL, MBtoWC-capped)
     mov     eax, dword ptr [g_zi_ap]
@@ -871,6 +891,23 @@ zij_lbldone:
     lea     rcx, [g_zi_sbuf]                    ; decode value -> sbuf
     call    zj_str
     mov     dword ptr [rbp-48], eax             ; vallen
+    ; optional ,"name":"<real filename>" - attachments only, and only in archives
+    ; written after member names were made opaque.  Its absence is normal: an
+    ; older archive carries the real name as the last path component instead.
+    mov     dword ptr [g_zi_anamen], 0
+    mov     r10, qword ptr [g_zi_p]
+    cmp     r10, qword ptr [g_zi_jend]
+    jae     zij_noname
+    movzx   eax, byte ptr [r10]
+    cmp     eax, ','
+    jne     zij_noname
+    lea     rcx, [zl_name]                      ; ,"name":
+    mov     edx, 8
+    call    zj_lit
+    lea     rcx, [g_zi_nbuf]                    ; decode name -> its own buffer
+    call    zj_str
+    mov     dword ptr [g_zi_anamen], eax
+zij_noname:
     mov     al, '}'
     call    zj_skipch
     ; ---- build the field (selected entries only; else parsed + discarded) ----

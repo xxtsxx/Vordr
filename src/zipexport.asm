@@ -456,6 +456,7 @@ zj_fields db ',"fields":[',0
 zj_ftype  db '{"type":',0
 zj_flabel db ',"label":',0
 zj_fvalue db ',"value":',0
+zj_fname  db ',"name":',0        ; attachment only: the real filename (member is opaque)
 zj_jsonname db "vordr.json"
 zj_defname  db "attachment.bin"
 hexdig    db "0123456789abcdef"
@@ -469,6 +470,8 @@ ZE_PWCAP    equ 1024
 g_ze_u8pw   db ZE_PWCAP dup (?)      ; wide->UTF-8 export password scratch
 g_zj_fld    db 40 dup (?)            ; vault_field_get out struct
 g_zj_fn     db 512 dup (?)           ; attachment filename (UTF-8)
+g_zj_fnlen  dd ?                     ; its length - ze_build_json writes it into the
+                                     ;   encrypted json, since the member name is opaque
 g_zj_path   db 768 dup (?)           ; "<title-folder>/<filename>" zip path
 
 .code
@@ -678,6 +681,13 @@ zbj_attval:
     lea     rdx, [g_zj_path]
     mov     r8d, eax
     call    json_str
+    lea     rcx, [g_json]                       ; ,"name":"<real filename>" - the member
+    lea     rdx, [zj_fname]                     ;   name is opaque, so the only copy of
+    call    buf_putcstr                         ;   the real name is here, inside the
+    lea     rcx, [g_json]                       ;   encrypted data file
+    lea     rdx, [g_zj_fn]
+    mov     r8d, dword ptr [g_zj_fnlen]
+    call    json_str
 zbj_valdone:
     lea     rcx, [g_json]
     mov     dl, '}'
@@ -715,11 +725,15 @@ ze_build_json endp
 
 ; =============================================================================
 ; ze_att_zippath(ecx = entry index, rdx = attachment value ptr, r8d = value len)
-;   -> eax = path byte length; the path "<sanitized title>/<filename>" is written
-;   into g_zj_path.  The serialized value is {AttachRef[68], filename wide}; the
-;   filename lives at value+68 (default "attachment.bin" when absent).  This is
-;   THE single source of the export path so the JSON/CSV references and the actual
-;   ZIP member name always agree.
+;   -> eax = path byte length; the path "<8 hex entry>/<16 hex attachment id>" is
+;   written into g_zj_path.  BOTH components are opaque: ZIP member names are not
+;   encrypted by WinZip-AES, so neither the record title nor the filename may
+;   appear there.  The real filename is decoded into g_zj_fn / g_zj_fnlen for
+;   ze_build_json to emit as "name" inside the encrypted data file.  The
+;   serialized value is {AttachRef[68], filename wide}; the filename lives at
+;   value+68 (default "attachment.bin" when absent).  This is THE single source of
+;   the export path so the JSON reference and the actual member name always agree
+;   - which is also why the id is derived rather than freshly randomised.
 ; =============================================================================
 public ze_att_zippath
 ze_att_zippath proc frame
@@ -774,6 +788,7 @@ azp_dcp:
     mov     eax, 14
 azp_havefn:
     mov     dword ptr [rbp-48], eax             ; fnlen
+    mov     dword ptr [g_zj_fnlen], eax         ; ze_build_json emits it as "name"
     ; ---- opaque per-entry folder (8 hex of the entry index) + '/' ----
     ; The entry TITLE must never appear in a cleartext ZIP member name (WinZip-AES
     ; leaves member names unencrypted, so a title folder leaked secrets like "Swiss
@@ -802,22 +817,54 @@ azp_hput:
     mov     byte ptr [r10], '/'
     mov     eax, 9                              ; prefix length = 8 hex + '/'
     mov     dword ptr [rbp-56], eax
-    ; ---- append the filename bytes ----
+    ; ---- opaque member name: 16 hex of ARF_ID (the attachment's random id) ----
+    ; The real filename must NOT appear here.  WinZip-AES leaves member names in
+    ; the CLEAR, so "passport-scan.pdf" was readable by anyone holding the archive
+    ; without the password - the same leak the title folder was fixed for.  ARF_ID
+    ; (AttachRef +0, 16 random bytes) names the member uniquely while disclosing
+    ; nothing; the real filename travels inside the encrypted json as "name".
+    ; It must be DERIVED rather than freshly random: ze_build_json and
+    ; ze_add_attachments each call this and the two names have to agree.
+    ; Only ARF_ID is touched - ARF_KEY at +16 is the attachment's AES-256 key and
+    ; must never reach a member name.
     lea     r10, [g_zj_path]
-    add     r10, rax
-    lea     r11, [g_zj_fn]
-    mov     ecx, dword ptr [rbp-48]             ; fnlen
-    xor     r8d, r8d
-azp_cp:
-    cmp     r8d, ecx
-    jae     azp_cpd
-    mov     al, byte ptr [r11+r8]
-    mov     byte ptr [r10+r8], al
+    add     r10, rax                            ; past "<8 hex>/"
+    mov     r11, qword ptr [rbp-32]             ; value; AttachRef is at +0
+    xor     r8d, r8d                            ; nibble index
+    cmp     dword ptr [rbp-40], 8               ; too short to hold an id (corrupt body)
+    jb      azp_idz                             ;   -> a fixed placeholder, never an
+azp_idn:                                        ;      out-of-bounds read
+    cmp     r8d, 16
+    jae     azp_iddone
+    mov     eax, r8d
+    shr     eax, 1                              ; byte = nibble / 2
+    movzx   ecx, byte ptr [r11+rax]
+    test    r8d, 1
+    jnz     azp_idlo
+    shr     ecx, 4                              ; even nibble -> high half
+    jmp     azp_idv
+azp_idlo:
+    and     ecx, 0Fh
+azp_idv:
+    cmp     ecx, 10
+    jb      azp_iddig
+    add     ecx, 'a'-10
+    jmp     azp_idput
+azp_iddig:
+    add     ecx, '0'
+azp_idput:
+    mov     byte ptr [r10+r8], cl
     inc     r8d
-    jmp     azp_cp
-azp_cpd:
+    jmp     azp_idn
+azp_idz:
+    cmp     r8d, 16
+    jae     azp_iddone
+    mov     byte ptr [r10+r8], '0'
+    inc     r8d
+    jmp     azp_idz
+azp_iddone:
     mov     eax, dword ptr [rbp-56]
-    add     eax, dword ptr [rbp-48]             ; pathlen = prefix + fnlen
+    add     eax, 16                             ; pathlen = prefix + 16 hex
     FRAME_EPILOG
     ret
 ze_att_zippath endp
@@ -825,9 +872,10 @@ ze_att_zippath endp
 ; =============================================================================
 ; ze_add_attachments() -> eax 0/err.  Append every image/file attachment in the
 ;   vault to the open archive (ze_reset + ze_set_pw must precede).  Each blob is
-;   decrypted to plaintext and added as "<secret title>/<filename>" (so all of a
-;   record's attachments land in one folder), then wiped + freed.  The same path
-;   is recorded in the data file by ze_build_json (ze_att_zippath).
+;   decrypted to plaintext and added under an opaque "<entry>/<attachment id>"
+;   name (so all of a record's attachments land in one folder), then wiped +
+;   freed.  The same path is recorded in the data file by ze_build_json
+;   (ze_att_zippath), alongside the real filename as "name".
 ; =============================================================================
 public ze_add_attachments
 ze_add_attachments proc frame
@@ -1155,5 +1203,87 @@ zxc_fail:
     FRAME_EPILOG
     ret
 cmd_zexcap endp
+
+; =============================================================================
+; cmd_zexname - ZIP member names must disclose nothing.  WinZip-AES leaves member
+;   names in the CLEAR, so a real attachment filename there is readable by anyone
+;   holding the archive, without the password.  Builds a synthetic attachment
+;   value {AttachRef, "passport-scan.pdf"} and asserts ze_att_zippath produces
+;   "<8 hex entry>/<16 hex id>" carrying NO byte of the filename, while the real
+;   name lands in g_zj_fn for ze_build_json to put inside the encrypted json.
+; =============================================================================
+.data
+CSTR zxn_ok,  "zexname: PASS (member name opaque; real filename only in the encrypted json)",13,10
+CSTR zxn_bad, "zexname: FAIL (attachment filename leaked into the cleartext ZIP member name)",13,10
+align 8
+zxn_val db 68 dup (0)                       ; AttachRef: id = 00 11 22 .. at +0
+        dw 'p','a','s','s','p','o','r','t','-','s','c','a','n','.','p','d','f',0
+zxn_exp db "0000002a/0011223344556677"      ; entry 42 + the id's first 8 bytes
+.code
+LANDING_PAD
+public cmd_zexname
+cmd_zexname proc frame
+    FRAME_PROLOG 48
+    lea     r10, [zxn_val]                      ; seed a recognisable ARF_ID
+    xor     ecx, ecx
+zxn_seed:
+    cmp     ecx, 8
+    jae     zxn_go
+    mov     eax, ecx
+    imul    eax, eax, 11h                       ; 00,11,22,33,44,55,66,77
+    mov     byte ptr [r10+rcx], al
+    inc     ecx
+    jmp     zxn_seed
+zxn_go:
+    mov     ecx, 42                             ; entry index
+    lea     rdx, [zxn_val]
+    mov     r8d, 68 + 18*2                      ; AttachRef + the wide filename
+    call    ze_att_zippath
+    cmp     eax, 9 + 16                         ; "<8 hex>/" + 16 hex, nothing else
+    jne     zxn_fail
+    lea     r10, [g_zj_path]                    ; must match byte for byte
+    lea     r11, [zxn_exp]
+    xor     ecx, ecx
+zxn_cmp:
+    cmp     ecx, 25
+    jae     zxn_leak
+    mov     al, byte ptr [r10+rcx]
+    cmp     al, byte ptr [r11+rcx]
+    jne     zxn_fail
+    inc     ecx
+    jmp     zxn_cmp
+zxn_leak:
+    ; belt and braces: no '.' can appear in an opaque name, so an extension
+    ; (or a whole filename) reappearing here fails even if zxn_exp is updated
+    xor     ecx, ecx
+zxn_dot:
+    cmp     ecx, 25
+    jae     zxn_fn
+    cmp     byte ptr [r10+rcx], '.'
+    je      zxn_fail
+    inc     ecx
+    jmp     zxn_dot
+zxn_fn:
+    cmp     dword ptr [g_zj_fnlen], 17          ; the real name is still recovered,
+    jne     zxn_fail                            ;   for the encrypted json
+    lea     r10, [g_zj_fn]
+    cmp     byte ptr [r10], 'p'
+    jne     zxn_fail
+    cmp     byte ptr [r10+16], 'f'
+    jne     zxn_fail
+    lea     rcx, [zxn_ok]
+    mov     edx, zxn_ok_len
+    call    print_a
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+zxn_fail:
+    lea     rcx, [zxn_bad]
+    mov     edx, zxn_bad_len
+    call    print_a
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_zexname endp
 
 end
