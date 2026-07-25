@@ -1437,6 +1437,11 @@ g_pwhist      db MAX_PWHIST*PWHIST_ENTRY dup (?) ; open entry's overwritten valu
 g_pwhist_n    dd ?                               ; number of history entries
 g_pwhblob     db MAX_PWHIST*PWHBLOB_ENTRY dup (?); per-history emit scratch (VFL_RAW)
 g_pworig      db MAX_PWORIG*PWORIG_STRIDE dup (?); original {label,value} per field
+g_pworig_hd   db MAX_PWORIG dup (?)              ; 1 = that field carried data at load.
+                                                 ;   Kept separately because the wide copy
+                                                 ;   above caps at 127 chars, so a longer
+                                                 ;   value lands empty and would otherwise
+                                                 ;   read back as "never had data"
 g_pworig_n    dd ?
 g_pwh_scroll  dd ?                               ; history browser: first visible row
 g_pwh_dirty   dd ?                               ; history browser: a purge happened
@@ -5079,6 +5084,9 @@ gpc_add:
     je      gpc_addnext
     cmp     ecx, VF_IMAGE
     je      gpc_addnext
+    cmp     ecx, VF_DELETED                   ; the trash marker is re-emitted by
+    je      gpc_addnext                       ;   gui_gather but never captured as an
+                                              ;   original, so it always looked new
     mov     rax, qword ptr [r11+16]           ; still empty -> nothing was filled in
     test    rax, rax
     jz      gpc_addnext
@@ -5096,11 +5104,12 @@ gpc_addorig:
     mov     eax, dword ptr [rbp-40]
     cmp     eax, dword ptr [g_pworig_n]
     jae     gpc_addnew                        ; no original held data under EL -> new
+    lea     r10, [g_pworig_hd]                ; carried data at load?  Read the recorded
+    cmp     byte ptr [r10+rax], 0             ;   flag, not the wide copy - that caps at
+    je      gpc_addorignext                   ;   127 chars and reads empty beyond it
     imul    eax, eax, PWORIG_STRIDE
     lea     r10, [g_pworig]
     add     r10, rax
-    cmp     word ptr [r10+PWORIG_VAL], 0      ; an empty original doesn't count as data
-    je      gpc_addorignext
     mov     rcx, r10
     mov     rdx, qword ptr [rbp-48]
     call    gui_wstr_eq
@@ -6334,6 +6343,9 @@ pwh_reset proc frame
     lea     rcx, [g_pwhblob]
     mov     edx, MAX_PWHIST*PWHBLOB_ENTRY
     call    secure_zero
+    lea     rcx, [g_pworig_hd]
+    mov     edx, MAX_PWORIG
+    call    secure_zero
     mov     dword ptr [g_pwhist_n], 0
     mov     dword ptr [g_pworig_n], 0
     FRAME_EPILOG
@@ -6470,6 +6482,13 @@ poa_val:
     add     r8, PWORIG_VAL
     mov     r9d, 127
     call    gui_towide
+    mov     eax, dword ptr [g_pworig_n]       ; note whether this field carried data,
+    lea     r10, [g_pworig_hd]                ;   taken from the SOURCE length: the wide
+    xor     ecx, ecx                          ;   copy above caps at 127 chars, so a
+    cmp     dword ptr [rbp-40], 0             ;   longer value lands empty and must not
+    je      @F                                ;   be mistaken for "never had a value"
+    mov     ecx, 1
+@@: mov     byte ptr [r10+rax], cl
     inc     dword ptr [g_pworig_n]
 poa_done:
     FRAME_EPILOG
