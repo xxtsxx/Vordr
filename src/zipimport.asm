@@ -53,7 +53,8 @@ g_zfz_rng   dq ?                          ; fuzzzip xorshift64 state (dbg/test o
 g_zi_end    dq ?                          ; raw end
 g_zi_pwptr  dq ?                          ; UTF-8 pw ptr (= g_zi_u8pw)
 g_zi_pwlen  dd ?
-g_zi_u8pw   db 512 dup (?)
+ZI_PWCAP    equ 1024                      ; 254 wide chars can be 762 UTF-8 bytes; the
+g_zi_u8pw   db ZI_PWCAP dup (?)           ;   old 512/500 truncated to an EMPTY password
 g_zi_n      dd ?                          ; member count
 g_zi_mem    db ZI_MAXMEM * MEMREC dup (?)
 g_zi_rk     db 15*16 dup (?)
@@ -955,7 +956,7 @@ zi_free_wipe proc frame
     mov     qword ptr [g_zi_arena], 0
 zfw_wipe:
     lea     rcx, [g_zi_u8pw]
-    mov     edx, 512
+    mov     edx, ZI_PWCAP
     call    secure_zero
     mov     dword ptr [g_zi_pwlen], 0
     FRAME_EPILOG
@@ -978,8 +979,15 @@ zi_stage proc frame
     ; wide pw -> UTF-8 g_zi_u8pw (stage count in r9d: WINCALL rax-clobber footgun)
     shr     r9d, 1                              ; wide chars
     mov     dword ptr [rbp-32], r9d
-    WINCALL WideCharToMultiByte, CP_UTF8_, 0, r8, dword ptr [rbp-32], addr g_zi_u8pw, 500, 0, 0
+    WINCALL WideCharToMultiByte, CP_UTF8_, 0, r8, dword ptr [rbp-32], addr g_zi_u8pw, ZI_PWCAP, 0, 0
     mov     dword ptr [g_zi_pwlen], eax
+    test    eax, eax                            ; 0 with a non-empty password = it did
+    jnz     zs_pwok                             ;   not fit.  Report "wrong password"
+    cmp     dword ptr [rbp-32], 0               ;   rather than silently trying the
+    je      zs_pwok                             ;   empty one - which is not what the
+    mov     dword ptr [rbp-40], -3               ;   archive was sealed with (ZE_PWCAP)
+    jmp     zs_fail
+zs_pwok:
     lea     rax, [g_zi_u8pw]
     mov     qword ptr [g_zi_pwptr], rax
     ; allocate the per-entry arena

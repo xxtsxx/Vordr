@@ -462,7 +462,11 @@ hexdig    db "0123456789abcdef"
 
 .data?
 g_json      dq 3 dup (?)             ; {ptr,len,cap} for the fields JSON
-g_ze_u8pw   db 512 dup (?)           ; wide->UTF-8 export password scratch
+; The dialog takes up to 254 wide chars, and a BMP char can be 3 UTF-8 bytes, so
+; the worst case is 762.  The old 512/500 silently truncated - and because
+; WideCharToMultiByte reports that by returning 0, the password became EMPTY.
+ZE_PWCAP    equ 1024
+g_ze_u8pw   db ZE_PWCAP dup (?)      ; wide->UTF-8 export password scratch
 g_zj_fld    db 40 dup (?)            ; vault_field_get out struct
 g_zj_fn     db 512 dup (?)           ; attachment filename (UTF-8)
 g_zj_path   db 768 dup (?)           ; "<title-folder>/<filename>" zip path
@@ -912,8 +916,13 @@ ze_compose proc frame
     mov     eax, dword ptr [rbp-32]
     shr     eax, 1                              ; wide chars
     mov     r9d, eax                            ; stage cchWideChar in r9d (WINCALL rax footgun)
-    WINCALL WideCharToMultiByte, CP_UTF8_, 0, qword ptr [rbp-24], r9d, addr g_ze_u8pw, 500, 0, 0
+    WINCALL WideCharToMultiByte, CP_UTF8_, 0, qword ptr [rbp-24], r9d, addr g_ze_u8pw, ZE_PWCAP, 0, 0
     mov     dword ptr [rbp-44], eax             ; UTF-8 length
+    test    eax, eax                            ; 0 = it did not fit (or a bad string).
+    jnz     comp_pwok                           ;   Refuse: deriving from a zero-length
+    cmp     dword ptr [rbp-32], 0               ;   password would encrypt every exported
+    jne     comp_err                            ;   secret under PBKDF2("", salt).
+comp_pwok:
     call    ze_reset
     test    eax, eax
     jnz     comp_err
@@ -944,14 +953,14 @@ ze_compose proc frame
     jnz     comp_ziperr
     call    ze_finish
     lea     rcx, [g_ze_u8pw]                    ; wipe the UTF-8 password copy
-    mov     edx, 500
+    mov     edx, ZE_PWCAP
     call    secure_zero
     xor     eax, eax
     FRAME_EPILOG
     ret
 comp_ziperr:
     lea     rcx, [g_ze_u8pw]
-    mov     edx, 500
+    mov     edx, ZE_PWCAP
     call    secure_zero
     mov     eax, 1
     FRAME_EPILOG
