@@ -1264,7 +1264,11 @@ g_vault_ids label dword
     ; overlay (gui_menu_close re-shows these, then gui_set_editmode re-gates them).
     dd IDC_V_HDREDIT, IDC_V_FAV, IDC_V_OVFL, IDC_V_HEADER
     dd IDC_V_PGPREV, IDC_V_PGIND, IDC_V_PGNEXT
-VAULT_ID_COUNT equ 12
+    ; left-margin glyphs: New and Generate act on the vault, so they have no
+    ; meaning over the settings screen and shone through it.  Settings itself
+    ; (IDC_T_SET) stays put - it is the way back out.
+    dd IDC_T_NEW, IDC_T_GEN
+VAULT_ID_COUNT equ 14
 g_menu_ids label dword ; controls menu IDs which are hidden and displayed between settings and main screen.
     dd IDC_V_MBACK, IDC_V_MTITLE, IDC_V_MPOLL, IDC_V_MLENL, IDC_V_MLEN
     dd IDC_V_MCLSL, IDC_V_MCLS, IDC_V_MTPM, IDC_V_MTPML, IDC_V_MTPMINFO
