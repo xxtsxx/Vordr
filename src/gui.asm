@@ -3374,6 +3374,12 @@ gui_draw_field_cards proc frame
                                            ;   being dead by then.
     mov     qword ptr [rbp-24], rcx            ; hdc
     mov     qword ptr [rbp-32], rdx            ; hdlg
+    cmp     dword ptr [g_menu_open], 0         ; settings up: the vault is not on screen,
+    jne     gfc_ret                            ;   so its cards must not be painted.  This
+                                               ;   runs from WM_ERASEBKGND, i.e. UNDER the
+                                               ;   overlay backdrop - relying on that
+                                               ;   backdrop to cover them left the cards
+                                               ;   showing wherever it did not reach.
     mov     eax, dword ptr [g_layout]          ; flat (Compact) layout draws no cards
     lea     r10, [lay_band]
     cmp     dword ptr [r10+rax*4], 0
