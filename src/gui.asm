@@ -270,6 +270,8 @@ extern SetForegroundWindow:proc
 extern RegisterHotKey:proc
 extern UnregisterHotKey:proc
 extern VkKeyScanW:proc
+extern GetKeyNameTextW:proc
+extern MapVirtualKeyW:proc
 
 ; ---- constants ---------------------------------------------------------------
 MB_OK               equ 0
@@ -374,9 +376,28 @@ WM_HOTKEY           equ 0312h
 MOD_ALT             equ 1
 MOD_CONTROL         equ 2
 MOD_SHIFT           equ 4
+MOD_WIN             equ 8
 MOD_NOREPEAT        equ 4000h            ; auto-repeat off (Win7+); dropped on failure
 HOTKEY_SHOW         equ 1                 ; our hotkey id on the tray-owner window
 VK_OEM_5            equ 0DCh              ; the \| key - fallback when '|' isn't mappable
+DLG_HOTKEY          equ 790               ; "capture a new summon hotkey" dialog
+IDC_HK_CAP          equ 791               ; the capture surface (focused, eats keystrokes)
+IDC_HK_HINT         equ 792
+IDC_HK_CLEAR        equ 793               ; restore the built-in Alt + | default
+IDC_V_MHOTKL        equ 275               ; settings: "Summon hotkey" label
+IDC_V_MHOTK         equ 276               ; settings: current combo (click = recapture)
+DLGC_WANTALLKEYS    equ 4                 ; WM_GETDLGCODE: give us Tab/Enter/Esc too
+MAPVK_VK_TO_VSC     equ 0
+WM_GETDLGCODE_      equ 87h
+WM_SYSKEYDOWN_      equ 104h              ; Alt+key arrives here, NOT as WM_KEYDOWN
+VK_TAB_             equ 9
+VK_RETURN_          equ 13
+VK_ESCAPE_          equ 27
+VK_SHIFT_           equ 10h
+VK_CONTROL_         equ 11h
+VK_MENU_            equ 12h
+VK_LWIN_            equ 5Bh
+VK_RWIN_            equ 5Ch
 WS_POPUP            equ 80000000h
 IDM_ABOUT           equ 1001
 IDM_OPEN            equ 1002
@@ -1001,6 +1022,16 @@ pref_scheme dw 'u','i','_','s','c','h','e','m','e',0
 pref_loglevel dw 'L','o','g','L','e','v','e','l',0   ; C5: HKCU audit-log verbosity
 pref_reqhello dw 'T','p','m','R','e','q','u','i','r','e','H','e','l','l','o',0  ; C4
 pref_layout dw 'u','i','_','l','a','y','o','u','t',0
+pref_hotkey dw 'u','i','_','h','o','t','k','e','y',0   ; (mods << 16) | vk; 0 = built-in default
+WSTR hk_plus, < + >
+WSTR hk_shift, <Shift>
+WSTR hk_ctrl, <Ctrl>
+WSTR hk_alt, <Alt>
+WSTR hk_win, <Win>
+WSTR hk_none, <(none)>
+WSTR hk_press, <Press keys...>
+WSTR hk_taken, <That combination is already in use by another program.  Vordr kept its previous hotkey.>
+WSTR hk_ttl, <Summon hotkey>
 align 8
 align 4
 ; class accent colors (index 0 upper / 2 digit / 3 symbol; lowercase uses g_col_text)
@@ -1246,7 +1277,8 @@ g_menu_ids label dword ; controls menu IDs which are hidden and displayed betwee
     dd IDC_V_MIDLEL, IDC_V_MIDLE, IDC_V_MWLKL, IDC_V_MWLK
     dd IDC_V_MNOPREVL, IDC_V_MNOPREV, IDC_V_MNOPREVINFO
     dd IDC_V_MTOUTS
-MENU_ID_COUNT equ 31
+    dd IDC_V_MHOTKL, IDC_V_MHOTK
+MENU_ID_COUNT equ 33
 
 .data?
 align 8
@@ -1398,6 +1430,12 @@ align 2
 g_pgbuf       dw 16 dup (?)               ; "n / m" pagination indicator text
 g_dlgfont     dq ?                        ; the vault dialog's font (for runtime ctls)
 g_tooltip     dq ?                        ; shared tooltip window for ghost buttons (0 = none)
+public g_hk_vk
+g_hk_vk       dd ?                        ; summon hotkey: virtual-key currently registered
+g_hk_mods     dd ?                        ;   and its MOD_* modifiers (0/0 = none registered)
+g_hk_cap_vk   dd ?                        ; capture dialog: the combo being offered
+g_hk_cap_mods dd ?
+g_hk_txt      dw 64 dup (?)               ; formatted combo ("Ctrl + Shift + F2")
 g_totp_row    dd ?                        ; row index of the TOTP field (-1 = none)
 g_totp_codehwnd dq ?                      ; live-code display control of the TOTP row
 g_totp_barhwnd  dq ?                      ; drain-bar control of the TOTP row
@@ -10224,6 +10262,8 @@ mo_cls_ok:
     xor     eax, 1
     mov     edx, eax
     call    EnableWindow
+    mov     rcx, qword ptr [rbp-24]           ; show the live summon combo on its button
+    call    gui_hotkey_label
     mov     dword ptr [g_menu_open], 1
     mov     ecx, 1                            ; opaque backdrop in theme_paint
     call    theme_overlay
@@ -11110,6 +11150,8 @@ vp_cmd_fixed:
     je      vp_lock
     cmp     eax, IDC_V_MTHEME
     je      vp_theme
+    cmp     eax, IDC_V_MHOTK
+    je      vp_hotkey
     cmp     eax, IDC_V_MEXPORT
     je      vp_export
     cmp     eax, IDC_V_MIMPORT
@@ -11317,6 +11359,10 @@ vp_theme:
     mov     rcx, qword ptr [rbp-8]
     call    gui_apply_scheme
     call    gui_save_prefs
+    jmp     vp_handled
+vp_hotkey:
+    mov     rcx, qword ptr [rbp-8]               ; capture + rebind the summon hotkey
+    call    gui_hotkey_capture
     jmp     vp_handled
 vp_export:
     mov     rcx, qword ptr [rbp-8]
@@ -14997,28 +15043,29 @@ gui_tray_del endp
 ;   coding a scan code, and fold the shift state that '|' needs into the
 ;   modifiers.  Silent on failure: another process may already own the combo, and
 ;   a startup error box would be worse than a missing accelerator.
+;   The user can rebind it from Settings; ui_hotkey holds (mods << 16) | vk and 0
+;   means "use the built-in default".
 gui_hotkey_add proc frame
     FRAME_PROLOG 64
     mov     qword ptr [rbp-24], rcx              ; hwnd
-    mov     dword ptr [rbp-32], VK_OEM_5         ; vk  - fallback: the \| key
-    mov     dword ptr [rbp-40], MOD_ALT          ; mods
-    WINCALL VkKeyScanW, 7Ch                      ; '|' -> lo = vk, hi = shift state
-    movsx   eax, ax
-    cmp     eax, -1                              ; not on this layout -> keep the fallback
-    je      gha_reg
-    movzx   r10d, al                             ; vk
-    test    r10d, r10d
+    lea     rcx, [rbp-32]                        ; start from the built-in default
+    lea     rdx, [rbp-40]
+    call    gui_hotkey_default
+    WINCALL cfg_get_dword, addr pref_hotkey, 0, 0    ; a saved rebind overrides it
+    test    eax, eax
     jz      gha_reg
+    mov     r10d, eax
+    and     r10d, 0FFh                           ; vk
+    jz      gha_reg                              ; malformed -> keep the default
     mov     dword ptr [rbp-32], r10d
-    movzx   eax, ah                              ; shift state: 1 Shift, 2 Ctrl, 4 Alt
-    test    eax, 1                               ; (note the bits are NOT the MOD_ values)
-    jz      @F
-    or      dword ptr [rbp-40], MOD_SHIFT
-@@: test    eax, 2
-    jz      @F
-    or      dword ptr [rbp-40], MOD_CONTROL
-@@:
+    shr     eax, 16
+    and     eax, 0Fh                             ; MOD_ALT|CONTROL|SHIFT|WIN only
+    mov     dword ptr [rbp-40], eax
 gha_reg:
+    mov     eax, dword ptr [rbp-32]              ; publish before registering: a refused
+    mov     dword ptr [g_hk_vk], eax             ;   rebind restores THIS pair
+    mov     eax, dword ptr [rbp-40]
+    mov     dword ptr [g_hk_mods], eax
     mov     eax, dword ptr [rbp-40]
     or      eax, MOD_NOREPEAT
     mov     dword ptr [rbp-48], eax
@@ -15040,6 +15087,400 @@ gui_hotkey_del proc frame
     FRAME_EPILOG
     ret
 gui_hotkey_del endp
+
+; hk_fmt(ecx = vk, edx = MOD_* mods) - render the combo into g_hk_txt as
+;   "Ctrl + Shift + F2".  The key's own name comes from GetKeyNameTextW off a scan
+;   code, so it is whatever the ACTIVE layout calls that key - localised, and
+;   correct for OEM keys like '|' that have no fixed name.
+hk_fmt proc frame
+    FRAME_PROLOG 96
+    mov     dword ptr [rbp-24], ecx             ; vk
+    mov     dword ptr [rbp-32], edx             ; mods
+    mov     word ptr [g_hk_txt], 0
+    cmp     dword ptr [rbp-24], 0
+    jne     hkf_mods
+    lea     rcx, [g_hk_txt]                     ; no key -> "(none)"
+    lea     rdx, [hk_none]
+    call    gui_w_appendz
+    mov     word ptr [rax], 0
+    jmp     hkf_done
+hkf_mods:
+    lea     rax, [g_hk_txt]
+    mov     qword ptr [rbp-40], rax             ; cursor
+    test    dword ptr [rbp-32], MOD_CONTROL     ; fixed order, not capture order, so the
+    jz      hkf_alt                             ;   same combo always reads the same way
+    mov     rcx, qword ptr [rbp-40]
+    lea     rdx, [hk_ctrl]
+    call    gui_w_appendz
+    mov     rcx, rax
+    lea     rdx, [hk_plus]
+    call    gui_w_appendz
+    mov     qword ptr [rbp-40], rax
+hkf_alt:
+    test    dword ptr [rbp-32], MOD_ALT
+    jz      hkf_shift
+    mov     rcx, qword ptr [rbp-40]
+    lea     rdx, [hk_alt]
+    call    gui_w_appendz
+    mov     rcx, rax
+    lea     rdx, [hk_plus]
+    call    gui_w_appendz
+    mov     qword ptr [rbp-40], rax
+hkf_shift:
+    test    dword ptr [rbp-32], MOD_SHIFT
+    jz      hkf_win
+    mov     rcx, qword ptr [rbp-40]
+    lea     rdx, [hk_shift]
+    call    gui_w_appendz
+    mov     rcx, rax
+    lea     rdx, [hk_plus]
+    call    gui_w_appendz
+    mov     qword ptr [rbp-40], rax
+hkf_win:
+    test    dword ptr [rbp-32], MOD_WIN
+    jz      hkf_key
+    mov     rcx, qword ptr [rbp-40]
+    lea     rdx, [hk_win]
+    call    gui_w_appendz
+    mov     rcx, rax
+    lea     rdx, [hk_plus]
+    call    gui_w_appendz
+    mov     qword ptr [rbp-40], rax
+hkf_key:
+    ; key name: vk -> scan code -> the lParam form GetKeyNameTextW wants (scan << 16)
+    WINCALL MapVirtualKeyW, dword ptr [rbp-24], MAPVK_VK_TO_VSC
+    shl     eax, 16
+    mov     dword ptr [rbp-48], eax
+    mov     rax, qword ptr [rbp-40]             ; wide chars still free in g_hk_txt
+    lea     r10, [g_hk_txt]
+    sub     rax, r10
+    sar     rax, 1
+    mov     ecx, 63
+    sub     ecx, eax
+    mov     dword ptr [rbp-56], ecx
+    WINCALL GetKeyNameTextW, dword ptr [rbp-48], qword ptr [rbp-40], dword ptr [rbp-56]
+    test    eax, eax                            ; unnamed key -> show the vk number, so a
+    jnz     hkf_done                            ;   row is never mysteriously blank
+    mov     rcx, qword ptr [rbp-40]
+    mov     edx, dword ptr [rbp-24]
+    call    gui_uint_w
+    mov     word ptr [rax], 0
+hkf_done:
+    FRAME_EPILOG
+    ret
+hk_fmt endp
+
+; gui_hotkey_default(rcx = *vk out, rdx = *mods out) - the built-in Alt + | combo,
+;   resolved against the ACTIVE layout (the key carrying '|' moves per layout).
+gui_hotkey_default proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], rdx
+    mov     dword ptr [rbp-40], VK_OEM_5        ; fallback: the \| key
+    mov     dword ptr [rbp-48], MOD_ALT
+    WINCALL VkKeyScanW, 7Ch                     ; '|' -> lo = vk, hi = shift state
+    movsx   eax, ax
+    cmp     eax, -1
+    je      hkd_out
+    movzx   r10d, al
+    test    r10d, r10d
+    jz      hkd_out
+    mov     dword ptr [rbp-40], r10d
+    movzx   eax, ah                             ; 1 Shift, 2 Ctrl, 4 Alt (NOT the MOD_ bits)
+    test    eax, 1
+    jz      @F
+    or      dword ptr [rbp-48], MOD_SHIFT
+@@: test    eax, 2
+    jz      @F
+    or      dword ptr [rbp-48], MOD_CONTROL
+@@:
+hkd_out:
+    mov     r10, qword ptr [rbp-24]
+    mov     eax, dword ptr [rbp-40]
+    mov     dword ptr [r10], eax
+    mov     r10, qword ptr [rbp-32]
+    mov     eax, dword ptr [rbp-48]
+    mov     dword ptr [r10], eax
+    FRAME_EPILOG
+    ret
+gui_hotkey_default endp
+
+; gui_hotkey_apply(ecx = vk, edx = mods) -> eax = 1 registered / 0 refused.
+;   Swap the live summon hotkey.  The old one is released first; if the new combo
+;   is owned by another process the old one is put back, so a refused rebind never
+;   leaves the app with no hotkey at all.
+public gui_hotkey_apply
+gui_hotkey_apply proc frame
+    FRAME_PROLOG 64
+    mov     dword ptr [rbp-24], ecx             ; vk
+    mov     dword ptr [rbp-32], edx             ; mods
+    cmp     qword ptr [g_trayhwnd], 0
+    je      hka_no
+    WINCALL UnregisterHotKey, qword ptr [g_trayhwnd], HOTKEY_SHOW
+    mov     eax, dword ptr [rbp-32]
+    or      eax, MOD_NOREPEAT
+    mov     dword ptr [rbp-40], eax
+    WINCALL RegisterHotKey, qword ptr [g_trayhwnd], HOTKEY_SHOW, dword ptr [rbp-40], \
+            dword ptr [rbp-24]
+    test    eax, eax
+    jnz     hka_ok
+    WINCALL RegisterHotKey, qword ptr [g_trayhwnd], HOTKEY_SHOW, dword ptr [rbp-32], \
+            dword ptr [rbp-24]                  ; retry without MOD_NOREPEAT (pre-Win7)
+    test    eax, eax
+    jnz     hka_ok
+    mov     eax, dword ptr [g_hk_mods]          ; refused -> put the previous one back
+    or      eax, MOD_NOREPEAT
+    mov     dword ptr [rbp-40], eax
+    WINCALL RegisterHotKey, qword ptr [g_trayhwnd], HOTKEY_SHOW, dword ptr [rbp-40], \
+            dword ptr [g_hk_vk]
+hka_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+hka_ok:
+    mov     eax, dword ptr [rbp-24]
+    mov     dword ptr [g_hk_vk], eax
+    mov     eax, dword ptr [rbp-32]
+    mov     dword ptr [g_hk_mods], eax
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gui_hotkey_apply endp
+
+; hk_cap_subclass - SUBCLASSPROC on the capture surface.  It answers WM_GETDLGCODE
+;   with WANTALLKEYS so the dialog manager stops eating keystrokes, and takes both
+;   WM_KEYDOWN and WM_SYSKEYDOWN - Alt combinations only ever arrive as the latter,
+;   which is the usual reason a hand-rolled capture misses exactly the combo the
+;   user is trying to set.
+hk_cap_subclass proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx             ; hwnd
+    mov     qword ptr [rbp-32], rdx             ; msg
+    mov     qword ptr [rbp-40], r8              ; wParam = vk
+    mov     qword ptr [rbp-48], r9              ; lParam
+    cmp     rdx, WM_GETDLGCODE_
+    je      hkc_wantall
+    cmp     rdx, WM_KEYDOWN_
+    je      hkc_key
+    cmp     rdx, WM_SYSKEYDOWN_
+    je      hkc_key
+    jmp     hkc_def
+hkc_wantall:
+    mov     eax, DLGC_WANTALLKEYS
+    FRAME_EPILOG
+    ret
+hkc_key:
+    mov     eax, dword ptr [rbp-40]             ; a bare modifier is not a hotkey by itself
+    cmp     eax, VK_SHIFT_
+    je      hkc_eat
+    cmp     eax, VK_CONTROL_
+    je      hkc_eat
+    cmp     eax, VK_MENU_
+    je      hkc_eat
+    cmp     eax, VK_LWIN_
+    je      hkc_eat
+    cmp     eax, VK_RWIN_
+    je      hkc_eat
+    ; gather the modifiers actually held down
+    xor     r11d, r11d
+    mov     dword ptr [rbp-56], r11d
+    WINCALL GetKeyState, VK_CONTROL_
+    test    ax, 8000h
+    jz      @F
+    or      dword ptr [rbp-56], MOD_CONTROL
+@@: WINCALL GetKeyState, VK_MENU_
+    test    ax, 8000h
+    jz      @F
+    or      dword ptr [rbp-56], MOD_ALT
+@@: WINCALL GetKeyState, VK_SHIFT_
+    test    ax, 8000h
+    jz      @F
+    or      dword ptr [rbp-56], MOD_SHIFT
+@@: WINCALL GetKeyState, VK_LWIN_
+    test    ax, 8000h
+    jnz     hkc_win
+    WINCALL GetKeyState, VK_RWIN_
+    test    ax, 8000h
+    jz      hkc_nowin
+hkc_win:
+    or      dword ptr [rbp-56], MOD_WIN
+hkc_nowin:
+    ; Tab / Enter / Esc UNMODIFIED still belong to the dialog, or there would be no
+    ; way to move focus or leave.  With a modifier they are fair game.
+    cmp     dword ptr [rbp-56], 0
+    jne     hkc_take
+    mov     eax, dword ptr [rbp-40]
+    cmp     eax, VK_TAB_
+    je      hkc_def
+    cmp     eax, VK_RETURN_
+    je      hkc_def
+    cmp     eax, VK_ESCAPE_
+    je      hkc_def
+hkc_take:
+    mov     eax, dword ptr [rbp-40]
+    mov     dword ptr [g_hk_cap_vk], eax
+    mov     eax, dword ptr [rbp-56]
+    mov     dword ptr [g_hk_cap_mods], eax
+    mov     ecx, dword ptr [g_hk_cap_vk]
+    mov     edx, dword ptr [g_hk_cap_mods]
+    call    hk_fmt
+    WINCALL SetWindowTextW, qword ptr [rbp-24], addr g_hk_txt
+    WINCALL InvalidateRect, qword ptr [rbp-24], 0, 1
+hkc_eat:
+    xor     eax, eax                            ; consumed
+    FRAME_EPILOG
+    ret
+hkc_def:
+    WINCALL DefSubclassProc, qword ptr [rbp-24], qword ptr [rbp-32], qword ptr [rbp-40], \
+            qword ptr [rbp-48]
+    FRAME_EPILOG
+    ret
+hk_cap_subclass endp
+
+; hotkey_proc - DLG_HOTKEY procedure (themed).
+hotkey_proc proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 96
+    mov     qword ptr [rbp-8], rcx
+    cmp     rdx, WM_INITDIALOG
+    je      hk_init
+    cmp     rdx, WM_COMMAND
+    je      hk_cmd
+    cmp     rdx, WM_CTLCOLORSTATIC
+    je      hk_col
+    cmp     rdx, WM_CTLCOLORBTN
+    je      hk_col
+    cmp     rdx, WM_CTLCOLORDLG
+    je      hk_col
+    cmp     rdx, WM_PAINT
+    je      hk_paint
+    cmp     rdx, WM_ERASEBKGND
+    je      hk_erase
+    cmp     rdx, WM_DRAWITEM
+    je      hk_draw
+    xor     eax, eax
+    jmp     hk_ret
+hk_col:
+    call    theme_ctlcolor
+    jmp     hk_ret
+hk_paint:
+    mov     rcx, qword ptr [rbp-8]
+    call    theme_paint
+    jmp     hk_ret
+hk_erase:
+    mov     rcx, r8
+    mov     rdx, qword ptr [rbp-8]
+    call    theme_erase
+    jmp     hk_ret
+hk_draw:
+    mov     rcx, r9                             ; lpdis - NOT the dialog hwnd still in rcx
+    call    theme_drawitem
+    mov     eax, 1
+    jmp     hk_ret
+hk_init:
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDOK
+    call    theme_attach
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDCANCEL
+    call    theme_attach
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_HK_CLEAR
+    call    theme_attach
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_set_winicon
+    mov     eax, dword ptr [g_hk_vk]            ; start from the live combo
+    mov     dword ptr [g_hk_cap_vk], eax
+    mov     eax, dword ptr [g_hk_mods]
+    mov     dword ptr [g_hk_cap_mods], eax
+    mov     ecx, dword ptr [g_hk_cap_vk]
+    mov     edx, dword ptr [g_hk_cap_mods]
+    call    hk_fmt
+    WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_HK_CAP, addr g_hk_txt
+    WINCALL GetDlgItem, qword ptr [rbp-8], IDC_HK_CAP
+    mov     qword ptr [rbp-16], rax
+    WINCALL SetWindowSubclass, qword ptr [rbp-16], addr hk_cap_subclass, 0, 0
+    WINCALL SetFocus, qword ptr [rbp-16]
+    xor     eax, eax                            ; we set focus ourselves -> FALSE
+    jmp     hk_ret
+hk_cmd:
+    movzx   eax, r8w
+    cmp     eax, IDOK
+    je      hk_ok
+    cmp     eax, IDCANCEL
+    je      hk_cancel
+    cmp     eax, IDC_HK_CLEAR
+    je      hk_clear
+    xor     eax, eax
+    jmp     hk_ret
+hk_clear:
+    lea     rcx, [g_hk_cap_vk]                  ; back to the built-in Alt + |
+    lea     rdx, [g_hk_cap_mods]
+    call    gui_hotkey_default
+    mov     ecx, dword ptr [g_hk_cap_vk]
+    mov     edx, dword ptr [g_hk_cap_mods]
+    call    hk_fmt
+    WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_HK_CAP, addr g_hk_txt
+    mov     eax, 1
+    jmp     hk_ret
+hk_ok:
+    WINCALL EndDialog, qword ptr [rbp-8], 1
+    mov     eax, 1
+    jmp     hk_ret
+hk_cancel:
+    WINCALL EndDialog, qword ptr [rbp-8], 0
+    mov     eax, 1
+hk_ret:
+    mov     rsp, rbp
+    pop     rbp
+    ret
+hotkey_proc endp
+
+; gui_hotkey_capture(rcx = hdlg) - run the capture dialog; on Set, rebind and
+;   persist.  A combo another process already owns is reported and nothing
+;   changes - gui_hotkey_apply has already put the previous one back.
+gui_hotkey_capture proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_HOTKEY, qword ptr [rbp-24], \
+            addr hotkey_proc, 0
+    cmp     rax, 1
+    jne     ghc_done
+    cmp     dword ptr [g_hk_cap_vk], 0
+    je      ghc_done
+    mov     ecx, dword ptr [g_hk_cap_vk]
+    mov     edx, dword ptr [g_hk_cap_mods]
+    call    gui_hotkey_apply
+    test    eax, eax
+    jz      ghc_taken
+    mov     eax, dword ptr [g_hk_mods]          ; persist as (mods << 16) | vk
+    shl     eax, 16
+    or      eax, dword ptr [g_hk_vk]
+    mov     dword ptr [rbp-32], eax
+    WINCALL cfg_set_dword_hkcu, addr pref_hotkey, dword ptr [rbp-32]
+    jmp     ghc_refresh
+ghc_taken:
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr hk_taken, addr hk_ttl, 030h
+ghc_refresh:
+    mov     rcx, qword ptr [rbp-24]             ; repaint the settings row either way
+    call    gui_hotkey_label
+ghc_done:
+    FRAME_EPILOG
+    ret
+gui_hotkey_capture endp
+
+; gui_hotkey_label(rcx = hdlg) - show the live combo on the settings button.
+gui_hotkey_label proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    mov     ecx, dword ptr [g_hk_vk]
+    mov     edx, dword ptr [g_hk_mods]
+    call    hk_fmt
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_MHOTK, addr g_hk_txt
+    FRAME_EPILOG
+    ret
+gui_hotkey_label endp
 
 ; gui_tray_menu(rcx = hwnd) - the right-click context menu (About / Open / Exit).
 gui_tray_menu proc frame
