@@ -571,7 +571,6 @@ LVIS_STATEIMAGEMASK          equ 0F000h
 LVCF_WIDTH                   equ 2
 SW_HIDE      equ 0
 SW_SHOW      equ 5
-SW_RESTORE   equ 9
 DLG_CREATE   equ 400
 IDC_C_PW     equ 402
 IDC_C_PW2    equ 403
@@ -15559,14 +15558,19 @@ twp_toggle:
     xor     eax, eax
     jmp     twp_ret
 twp_hotkey:
-    ; Alt + | from anywhere: summon the vault.  Unlike the tray left-click this
-    ; never toggles - the point is to bring the window up, so an already-open one
-    ; is un-minimised and raised rather than dismissed.  Serving a hotkey grants
-    ; this process the right to take the foreground, so SetForegroundWindow works.
+    ; The summon hotkey from anywhere: closed -> open (unlock flow), open -> LOCK.
+    ; Serving a hotkey grants this process the right to take the foreground, so
+    ; SetForegroundWindow is allowed to succeed on the way up.
+    ;
+    ; The lock half posts IDC_V_LOCK, the same command Ctrl+L uses, so it runs the
+    ; one real lock path: wipe secrets, purge decrypt-to-temp files, clear the
+    ; clipboard, drop to the tray.  Deliberately NOT IDCANCEL (what the tray
+    ; left-click posts) - that goes via vp_esc, which diverts to discarding a
+    ; just-added placeholder row instead of locking.  A key you press to secure the
+    ; screen has to lock every time, not sometimes discard a field.
     cmp     qword ptr [g_vaulthwnd], 0
     je      twp_open                         ; not up -> the usual unlock/open flow
-    WINCALL ShowWindow, qword ptr [g_vaulthwnd], SW_RESTORE
-    WINCALL SetForegroundWindow, qword ptr [g_vaulthwnd]
+    WINCALL PostMessageW, qword ptr [g_vaulthwnd], WM_COMMAND, IDC_V_LOCK, 0
     xor     eax, eax
     jmp     twp_ret
 twp_cmd:
