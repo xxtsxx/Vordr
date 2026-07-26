@@ -4615,9 +4615,12 @@ af_none:
     ret
 attach_find endp
 
-; attach_reset() - free pending new-attachment plaintext buffers, clear tables.
-public attach_reset
-attach_reset proc frame
+; attach_reset_pending() - free the pending new-attachment plaintext buffers and
+;   clear the pending table, leaving the ON-DISK index (g_attidx) intact.  Use
+;   this whenever a vault stays open: g_attidx is what attach_open resolves a
+;   saved attachment through, and only a save (attach_rescan) rebuilds it.
+public attach_reset_pending
+attach_reset_pending proc frame
     FRAME_PROLOG 48
     mov     dword ptr [rbp-24], 0
 ar_loop:
@@ -4637,6 +4640,19 @@ ar_next:
     jmp     ar_loop
 ar_done:
     mov     dword ptr [g_newatt_n], 0
+    FRAME_EPILOG
+    ret
+attach_reset_pending endp
+
+; attach_reset() - the above, PLUS drop the on-disk index.  Only correct where the
+;   index is about to be rebuilt (the attach_rescan right after a save) or where
+;   the vault is going away (lock / reload).  Anywhere else this silently strands
+;   every saved attachment: attach_open stops resolving them, and the next save
+;   cannot find their ciphertext to carry forward, which destroys it.
+public attach_reset
+attach_reset proc frame
+    FRAME_PROLOG 32
+    call    attach_reset_pending
     mov     dword ptr [g_attidx_n], 0
     FRAME_EPILOG
     ret

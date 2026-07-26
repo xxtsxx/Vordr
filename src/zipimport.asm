@@ -26,7 +26,7 @@ extern hmac_sha1:proc
 extern ct_memcmp:proc                    ; constant-time compare (hardening.asm)
 extern MultiByteToWideChar:proc
 extern WideCharToMultiByte:proc
-extern attach_reset:proc
+extern attach_reset_pending:proc
 extern attach_stage:proc
 extern vault_build_entry:proc
 extern print_a:proc
@@ -1037,7 +1037,11 @@ zs_pwok:
     mov     rcx, qword ptr [rbp-24]
     mov     edx, dword ptr [rbp-28]
     call    zi_scan
-    call    attach_reset                        ; start fresh pending-attachment set
+    call    attach_reset_pending                ; start a fresh PENDING set only - the
+                                                ;   vault stays open, and dropping its
+                                                ;   on-disk index here left every saved
+                                                ;   attachment unopenable, then let the
+                                                ;   post-import save write them away
     ; find + decrypt the data file
     lea     rcx, [zi_jsonname]
     mov     edx, 10
