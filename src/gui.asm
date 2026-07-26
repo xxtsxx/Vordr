@@ -600,6 +600,7 @@ OFN_FILEMUSTEXIST   equ 1000h
 OFN_EXPLORER        equ 80000h
 
 EBUF        equ 4096            ; wide chars per entry-field buffer
+EM_LIMITTEXT equ 0C5h           ; hard-stop typing/pasting at CONVW_MAX-1 (macros.inc)
 
 ; --- modular field rows (runtime-built detail form) ------------------------
 ; Per-row descriptor (flat record, stride DESCSZ) in g_fields[].
@@ -1380,7 +1381,7 @@ g_xlpwlen   dd ?                   ; export password length in bytes
 public g_pwbuf, g_pw2buf, g_secret_w, g_e_totp, g_totp_b32
 g_pwbuf     dw 1024 dup (?)        ; password field (wide; wiped after use)
 g_pw2buf    dw 1024 dup (?)        ; confirm-password field (wide; wiped)
-g_conv_w    dw EBUF*2 dup (?)      ; utf8 -> wide display scratch
+g_conv_w    dw CONVW_MAX dup (?)   ; utf8 -> wide display scratch (see CONVW_MAX)
 g_secret_w  dw EBUF*2 dup (?)      ; current selected secret (wide) for reveal/copy
 g_e_totp    dw 256 dup (?)            ; entry-form base32 TOTP key (wide)
 g_totp_on   dd ?                      ; 1 if the selected entry has a TOTP key
@@ -1567,7 +1568,7 @@ gui_setfield proc frame
     mov     rcx, r8
     mov     edx, r9d
     lea     r8, [g_conv_w]
-    mov     r9d, EBUF*2-1
+    mov     r9d, CONVW_MAX-1
     call    gui_towide
     WINCALL SetDlgItemTextW, qword ptr [rbp-24], dword ptr [rbp-32], addr g_conv_w
     FRAME_EPILOG
@@ -2801,7 +2802,7 @@ gui_draw_listitem proc frame
     mov     rcx, rax
     mov     edx, dword ptr [rbp-136]
     lea     r8, [g_conv_w]
-    mov     r9d, EBUF*2-1
+    mov     r9d, CONVW_MAX-1
     call    gui_towide
     WINCALL DrawTextW, qword ptr [rbp-32], addr g_conv_w, -1, addr rbp-152, 8024h
     cmp     dword ptr [g_layout], 1            ; compact: no subtitle
@@ -2985,7 +2986,7 @@ gui_draw_header proc frame
     mov     rcx, rax
     mov     edx, dword ptr [rbp-112]
     lea     r8, [g_conv_w]
-    mov     r9d, EBUF*2-1
+    mov     r9d, CONVW_MAX-1
     call    gui_towide
     WINCALL DrawTextW, qword ptr [rbp-32], addr g_conv_w, -1, addr rbp-104, 8024h
     ; (the username subtitle was redundant with the Username field below - removed)
@@ -4819,6 +4820,9 @@ gui_gather proc frame
     inc     eax
     mov     edx, eax
     sub     dword ptr [rbp-48], edx
+    jns     @F                                  ; never let the budget go negative: it is
+    mov     dword ptr [rbp-48], 0               ;   passed straight to GetDlgItemTextW as
+@@:                                             ;   nMaxCount, and -1 reads as 4 billion
     shl     edx, 1
     add     qword ptr [rbp-40], rdx
     mov     dword ptr [rbp-32], 1               ; k = 1
@@ -4858,6 +4862,9 @@ gg_row:
     inc     eax
     mov     edx, eax
     sub     dword ptr [rbp-48], edx
+    jns     @F                                  ; never let the budget go negative: it is
+    mov     dword ptr [rbp-48], 0               ;   passed straight to GetDlgItemTextW as
+@@:                                             ;   nMaxCount, and -1 reads as 4 billion
     shl     edx, 1
     add     qword ptr [rbp-40], rdx
 gg_label:
@@ -6313,6 +6320,21 @@ gra_reorder:
             BS_OWNERDRAW_
     GHOSTIFY gt_rowdel
 gra_finish:
+    ; Hard-stop the value edit at exactly what the display path can render back
+    ; (gui_setfield converts with CONVW_MAX-1).  Without this a user could type or
+    ; paste a value longer than the buffer, save it, and then find the field blank
+    ; on reload - at which point the next save wrote the blank over it.  The limit
+    ; is enforced by the edit control, so the text simply stops growing.
+    ; Harmless on the attachment tile, whose DS_VALUE is an owner-draw button.
+    mov     eax, dword ptr [rbp-40]
+    imul    eax, eax, DESCSZ
+    lea     r10, [g_fields]
+    add     r10, rax
+    mov     rcx, qword ptr [r10+FD_HANDLES+DS_VALUE*8]
+    test    rcx, rcx
+    jz      gra_nolimit
+    WINCALL SendMessageW, rcx, EM_LIMITTEXT, CONVW_MAX-1, 0
+gra_nolimit:
     inc     dword ptr [g_field_count]
     mov     eax, dword ptr [rbp-40]
     FRAME_EPILOG
@@ -11058,6 +11080,7 @@ vp_init:
     WINCALL GetDlgItem, qword ptr [rbp-8], IDC_V_LIST    ; type-to-search: keystrokes on
     WINCALL SetWindowSubclass, rax, addr search_type_subclass, 0, 0   ;  the list -> search box
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_V_SEARCH, EM_SETCUEBANNER, 1, addr cue_search
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_V_TITLE, EM_LIMITTEXT, CONVW_MAX-1, 0
     mov     dword ptr [g_trash_view], 0       ; start in the vault (not the trash) view
     mov     dword ptr [g_deleted_state], 0
     call    gui_purge_trash                   ; drop entries trashed > 30 days ago
@@ -12668,7 +12691,7 @@ gsp_show:
     mov     rcx, rax                             ; vault: UTF-8 -> wide in g_conv_w
     mov     edx, dword ptr [rbp-56]
     lea     r8, [g_conv_w]
-    mov     r9d, EBUF*2-1
+    mov     r9d, CONVW_MAX-1
     call    gui_towide
     lea     rax, [g_conv_w]
 gsp_wide:

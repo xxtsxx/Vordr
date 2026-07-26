@@ -56,6 +56,7 @@ extern cmd_zfuzz:proc                   ; zip-import parser fuzzer (zipimport.as
 extern cmd_jfuzz:proc                   ; decrypted-json parser fuzzer (zipimport.asm)
 extern cmd_zexcap:proc                  ; zip-export central-dir cap guard probe (zipexport.asm)
 extern cmd_zexname:proc                 ; zip member names disclose no filename (zipexport.asm)
+extern cmd_convcap:proc                 ; over-long value is refused, not stored empty (vault.asm)
 extern cmd_bktest:proc                  ; atomic-save + backup rotation probe (vault.asm)
 extern cmd_mactest:proc                 ; full-file MAC tamper-detection probe (vault.asm)
 extern cmd_rbtest:proc                  ; anti-rollback detection probe (vault.asm)
@@ -203,6 +204,7 @@ WSTR w_fuzzzip,  <fuzzzip>
 WSTR w_jfuzz,    <jfuzz>
 WSTR w_zexcap,   <zexcap>
 WSTR w_zexname,  <zexname>
+WSTR w_convcap,  <convcap>
 WSTR w_bktest,   <bktest>
 WSTR w_mactest,  <mactest>
 WSTR w_rbtest,   <rbtest>
@@ -275,6 +277,7 @@ cmd_table label CMDENT
     CMDENT { w_jfuzz,     cmd_jfuzz,     0, 0 }   ; decrypted-json parser structural fuzzer
     CMDENT { w_zexcap,    cmd_zexcap,    0, 0 }   ; zip-export central-dir cap guard
     CMDENT { w_zexname,   cmd_zexname,   0, 0 }   ; member names leak no attachment filename
+    CMDENT { w_convcap,   cmd_convcap,   0, 0 }   ; over-long value refused, never stored empty
     CMDENT { w_bktest,    cmd_bktest,    1, 0 }   ; atomic-save + backup-rotation probe
     CMDENT { w_mactest,   cmd_mactest,   1, 0 }   ; full-file MAC tamper-detection probe
     CMDENT { w_rbtest,    cmd_rbtest,    1, 0 }   ; anti-rollback detection probe

@@ -142,7 +142,22 @@ PWO_CAP             equ 100h       ; capitalize each word / first letter
 PWO_DIGIT           equ 200h       ; append a random digit
 PWO_DASH            equ 400h       ; separate passphrase words with '-'
 PWO_NOAMBIG         equ 800h       ; random: drop ambiguous glyphs (0O1lI)
-MAX_LABEL_BYTES     equ 128        ; bound on a single field's custom label
+; Bound on a single field's custom label, in UTF-8 BYTES.  The label edit accepts
+; 127 wide chars, and a BMP character is up to 3 UTF-8 bytes, so this has to be
+; 127*3 + NUL or a non-Latin label would not fit - and a label that does not fit
+; was silently dropped, turning a labelled field into an unlabelled one.
+; Writer-side only: vault_body_validate bounds a label by its field length, not by
+; this, so raising it cannot invalidate an existing vault.
+MAX_LABEL_BYTES     equ 384
+
+; Display scratch for one stored field value, in WIDE CHARS.  Sized to hold the
+; longest value any version could have written: conv_w2u's old 16384-byte cap
+; allowed at most 16383 UTF-8 bytes, i.e. 16383 wide chars of ASCII.  A value
+; longer than this converts to nothing, shows an EMPTY edit, and is then saved
+; back over the real text - so this bound is what stops an existing long field
+; destroying itself.  The value edits are EM_LIMITTEXT'd to CONVW_MAX-1 to match,
+; and CONV_CAP must cover (CONVW_MAX-1)*3 for a worst-case 3-byte-per-char script.
+CONVW_MAX           equ 16384
 ; GUI->vault_build_entry descriptor marker (in the g_field_list type qword, never
 ; stored): the value pointer is a raw binary blob {u32 len, bytes}, not wide text.
 VFL_RAW             equ 40000000h

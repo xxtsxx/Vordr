@@ -88,10 +88,20 @@ plain:    bytes = value_utf8
 ```
 
 Every length is bounds-checked against the remaining body and the 16 MiB
-plaintext cap (`VAULT_BODY_MAX`, record fields only); a custom label is
-capped at `MAX_LABEL_BYTES` (128). Unknown `VF_*` tags are skipped, so old
-readers tolerate newer files (that is how FAV/ICON/PWHIST/DELETED were
-added without a version bump).
+plaintext cap (`VAULT_BODY_MAX`, record fields only). A custom label is
+capped on the WRITER side at `MAX_LABEL_BYTES` (384 = the label edit's 127
+wide chars at up to 3 UTF-8 bytes each); the reader bounds a label only by
+its own field length, so this cap can be raised without invalidating an
+existing vault. Unknown `VF_*` tags are skipped, so old readers tolerate
+newer files (that is how FAV/ICON/PWHIST/DELETED were added without a
+version bump).
+
+A field value is capped at `CONVW_MAX - 1` (16383 wide chars), enforced by
+`EM_LIMITTEXT` on the edit itself, and `CONV_CAP` is sized to hold that many
+characters even when every one of them costs 3 UTF-8 bytes. The two must stay
+in step: a value that converts to more bytes than the buffer holds cannot be
+written, and writing it as an empty field instead would destroy it silently.
+The `convcap` probe asserts the relationship.
 
 ### Attachment section (`VATT`)
 

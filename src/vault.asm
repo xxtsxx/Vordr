@@ -129,7 +129,11 @@ VH_NONCE        equ 52
 VH_KCV          equ 64
 VH_TOTAL        equ 80          ; header + KCV (= GCM AAD)
 VAULT_BODY_MAX  equ 16777216    ; 16 MiB plaintext cap (record fields only)
-CONV_CAP        equ 16384
+; UTF-8 scratch for one field value.  Must cover the widest value the UI can hold
+; (CONVW_MAX-1 = 16383 wide chars) in the WORST script: a BMP character is up to 3
+; UTF-8 bytes, so 16383*3 + NUL.  Undersizing this is what made conv_w2u fail, and
+; a failed conversion used to be indistinguishable from an empty one.
+CONV_CAP        equ 49152
 MOVEFILE_REPLACE_EXISTING equ 1
 BAK_GENS        equ 3           ; rotated backup generations (.bak1 .. .bak3)
 
@@ -305,7 +309,15 @@ g_tpm_blob  db 512 dup (?)          ; sealed 32-byte master key (RSA-OAEP blob)
 
 ; ===========================================================================
 ; conv_w2u(rcx = wideZ ptr, rdx = outbuf, r8d = cap) -> eax = byte len (no NUL),
-;   0 if the pointer is NULL, the string is empty, or conversion fails.
+;   0 for a NULL pointer or a genuinely empty string, -1 if it DID NOT FIT.
+;
+;   The -1 matters.  WideCharToMultiByte returns 0 both for an empty result and
+;   for ERROR_INSUFFICIENT_BUFFER, and this used to collapse the two into 0 - so a
+;   value too long for the buffer was written to the vault as an EMPTY field,
+;   silently destroying it.  The same conflation produced an empty-password export
+;   (ef9fc8b) and phantom history rows (e08e6d2).  Callers must treat -1 as fatal,
+;   never as "no text": with a NUL-terminated source, 0 from the API can ONLY mean
+;   failure (an empty string still returns 1, for the terminator).
 ; ===========================================================================
 conv_w2u proc frame
     FRAME_PROLOG 32 + 32            ; +32 for WC2MB stack args
@@ -314,12 +326,16 @@ conv_w2u proc frame
     ; WideCharToMultiByte(CP_UTF8, 0, src, -1, out, cap, NULL, NULL)
     WINCALL WideCharToMultiByte, CP_UTF8, 0, rcx, -1, rdx, r8d, 0, 0
     test    eax, eax
-    jz      cw_zero
+    jz      cw_fail
     dec     eax                     ; drop terminating NUL
     FRAME_EPILOG
     ret
 cw_zero:
-    xor     eax, eax
+    xor     eax, eax                ; NULL source -> genuinely nothing to write
+    FRAME_EPILOG
+    ret
+cw_fail:
+    or      eax, -1                 ; did not fit - NOT the same as empty
     FRAME_EPILOG
     ret
 conv_w2u endp
@@ -2991,6 +3007,8 @@ va_field_bin_labeled proc frame
     lea     rdx, [g_convlabel]
     mov     r8d, MAX_LABEL_BYTES
     call    conv_w2u
+    cmp     eax, -1                             ; a dropped label is silent data loss too
+    je      vfb_of
     mov     ecx, eax
     mov     qword ptr [rbp-48], rcx
 vfb_write:
@@ -4229,6 +4247,8 @@ va_field_labeled proc frame
     lea     rdx, [g_conv]
     mov     r8d, CONV_CAP
     call    conv_w2u
+    cmp     eax, -1                             ; would have written the field EMPTY,
+    je      vfl_of                              ;   destroying it - refuse instead
     mov     ecx, eax
     mov     qword ptr [rbp-40], rcx
 vfl_lbl:
@@ -4243,6 +4263,8 @@ vfl_lbl:
     lea     rdx, [g_convlabel]
     mov     r8d, MAX_LABEL_BYTES
     call    conv_w2u
+    cmp     eax, -1                             ; a dropped label is silent data loss too
+    je      vfl_of
     mov     ecx, eax
     mov     qword ptr [rbp-32], rcx
 vfl_write:
@@ -5174,5 +5196,71 @@ ast_fail:
     FRAME_EPILOG
     ret
 attach_selftest endp
+
+; ===========================================================================
+; cmd_convcap - regression for the silent field-destruction bug.
+;   conv_w2u wraps WideCharToMultiByte, which returns 0 BOTH for an empty result
+;   and for ERROR_INSUFFICIENT_BUFFER.  Collapsing those into 0 meant a value too
+;   long for the buffer was written to the vault as an EMPTY field - the user's
+;   text was destroyed on save with no error.  conv_w2u now returns -1 for "did
+;   not fit", and the writers refuse rather than store the empty.
+;   Asserts, in order: a normal string converts; an empty string is 0 and NOT -1
+;   (the two must stay distinguishable); a string that overflows its buffer is -1
+;   and NOT 0; and CONV_CAP is large enough for the longest value the UI accepts
+;   even if every character is a 3-byte one.  Revert conv_w2u's cw_fail and the
+;   third assert FAILS (exit 1).
+; ===========================================================================
+.data
+CSTR cvc_ok,  "convcap: PASS (overflow is distinguishable from empty; cap covers the UI limit)",13,10
+CSTR cvc_bad, "convcap: FAIL (an over-long value would be stored as an EMPTY field)",13,10
+align 2
+cvc_hi  dw 'h','i',0
+cvc_mt  dw 0
+cvc_big dw 300 dup ('A'), 0                 ; 300 chars into a 64-byte buffer
+cvc_out db 4096 dup (?)
+.code
+LANDING_PAD
+public cmd_convcap
+cmd_convcap proc frame
+    FRAME_PROLOG 48
+    lea     rcx, [cvc_hi]                       ; 1. a normal string converts
+    lea     rdx, [cvc_out]
+    mov     r8d, 4096
+    call    conv_w2u
+    cmp     eax, 2
+    jne     cvc_fail
+    lea     rcx, [cvc_mt]                       ; 2. empty is 0, and must NOT be -1
+    lea     rdx, [cvc_out]
+    mov     r8d, 4096
+    call    conv_w2u
+    test    eax, eax
+    jnz     cvc_fail
+    lea     rcx, [cvc_big]                      ; 3. overflow is -1, and must NOT be 0 -
+    lea     rdx, [cvc_out]                      ;    0 here is what destroyed the field
+    mov     r8d, 64
+    call    conv_w2u
+    cmp     eax, -1
+    jne     cvc_fail
+    ; 4. the cap must cover the widest value the UI can hold, worst-case 3 bytes
+    ;    per wide char, or a legitimate value could still fail to fit.
+    mov     eax, CONVW_MAX - 1
+    imul    eax, eax, 3
+    inc     eax
+    cmp     eax, CONV_CAP
+    ja      cvc_fail
+    lea     rcx, [cvc_ok]
+    mov     edx, cvc_ok_len
+    call    print_a
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+cvc_fail:
+    lea     rcx, [cvc_bad]
+    mov     edx, cvc_bad_len
+    call    print_a
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_convcap endp
 
 end
