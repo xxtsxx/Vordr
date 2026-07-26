@@ -5198,6 +5198,104 @@ ast_fail:
 attach_selftest endp
 
 ; ===========================================================================
+; zi_att_verify() -> eax = attachment fields whose ciphertext opened AND whose
+;   plaintext matched one of the two do_attgen payloads.
+;   Walks every entry, opens every VF_IMAGE/VF_FILE AttachRef in the CURRENT
+;   vault and checks the bytes really came back.  cmd_zitest asserts the count,
+;   which is what turns the import probe from "an entry arrived" into "the
+;   attachment content survived" - the distinction that let an import silently
+;   destroy saved attachments (9ee91da) while the probe still reported success.
+; ===========================================================================
+; ===========================================================================
+; zi_att_verify(ecx = trailing entries to check) -> eax = attachment fields among
+;   them whose ciphertext opened AND whose plaintext matched a do_attgen payload.
+;
+;   Only the LAST n: zi_commit APPENDS, so imported records sit at the end.  Walking
+;   every entry instead is quadratic - vault_entry_ptr rescans from the body start -
+;   and the seeded probe vault carries 5000 records, which turns a correct walk into
+;   minutes of CPU that reads as a hang.
+;
+;   cmd_zitest asserts the count, which is what turns the import probe from "an
+;   entry arrived" into "the attachment content survived" - the distinction that
+;   let an import silently destroy saved attachments (9ee91da) while the probe
+;   still reported success.
+; ===========================================================================
+public zi_att_verify
+zi_att_verify proc frame
+    FRAME_PROLOG 96
+    mov     dword ptr [rbp-64], ecx             ; entries still to check
+    xor     eax, eax
+    mov     dword ptr [rbp-24], eax             ; ok count
+    call    vault_count
+    mov     dword ptr [rbp-40], eax             ; index, walked backwards from the end
+zav_entry:
+    cmp     dword ptr [rbp-64], 0
+    je      zav_done
+    cmp     dword ptr [rbp-40], 0
+    je      zav_done
+    dec     dword ptr [rbp-64]
+    dec     dword ptr [rbp-40]
+    mov     ecx, dword ptr [rbp-40]
+    call    vault_entry_ptr
+    test    rax, rax
+    jz      zav_entry
+    mov     qword ptr [rbp-32], rax
+    mov     dword ptr [rbp-36], VF_IMAGE        ; both attachment kinds
+zav_kind:
+    mov     rcx, qword ptr [rbp-32]
+    mov     edx, dword ptr [rbp-36]
+    call    find_field_in
+    test    rax, rax
+    jz      zav_kindnext
+    cmp     rdx, ARF_SIZE                       ; must carry a whole AttachRef
+    jb      zav_kindnext
+    mov     rcx, rax                            ; ref -> plaintext
+    lea     rdx, [rbp-48]
+    call    attach_open
+    test    rax, rax
+    jz      zav_kindnext                        ; ciphertext gone / unauthentic
+    mov     qword ptr [rbp-56], rax
+    mov     rax, qword ptr [rbp-48]             ; length must match one payload
+    cmp     rax, AG_PLAIN_LEN
+    je      zav_cmp1
+    cmp     rax, AG_PLAI2_LEN
+    jne     zav_free
+    lea     r11, [ag_plai2]
+    mov     r8d, AG_PLAI2_LEN
+    jmp     zav_cmp
+zav_cmp1:
+    lea     r11, [ag_plain]
+    mov     r8d, AG_PLAIN_LEN
+zav_cmp:
+    mov     r10, qword ptr [rbp-56]
+    xor     ecx, ecx
+zav_cmplp:
+    cmp     ecx, r8d
+    jae     zav_hit
+    mov     al, byte ptr [r10+rcx]
+    cmp     al, byte ptr [r11+rcx]
+    jne     zav_free
+    inc     ecx
+    jmp     zav_cmplp
+zav_hit:
+    inc     dword ptr [rbp-24]
+zav_free:
+    mov     rcx, qword ptr [rbp-56]
+    mov     rdx, qword ptr [rbp-48]
+    call    mem_free
+zav_kindnext:
+    mov     eax, dword ptr [rbp-36]
+    cmp     eax, VF_IMAGE
+    jne     zav_entry
+    mov     dword ptr [rbp-36], VF_FILE
+    jmp     zav_kind
+zav_done:
+    mov     eax, dword ptr [rbp-24]
+    FRAME_EPILOG
+    ret
+zi_att_verify endp
+
+; ===========================================================================
 ; cmd_convcap - regression for the silent field-destruction bug.
 ;   conv_w2u wraps WideCharToMultiByte, which returns 0 BOTH for an empty result
 ;   and for ERROR_INSUFFICIENT_BUFFER.  Collapsing those into 0 meant a value too

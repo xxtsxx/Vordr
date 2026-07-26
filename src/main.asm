@@ -92,6 +92,7 @@ extern mem_free:proc
 extern do_attgen:proc
 extern zi_stage:proc
 extern zi_commit:proc
+extern zi_att_verify:proc               ; imported attachments really decrypt (vault.asm)
 extern write_file:proc
 extern ze_compose:proc
 extern ze_free:proc
@@ -1202,6 +1203,50 @@ zit_sel:
 zit_seld:
     call    zi_commit                           ; imports selected, frees the arena
     mov     dword ptr [rbp-40], eax
+    call    vault_reseal                        ; round 1's attachments are now ON DISK
+    ; --- import the same archive a SECOND time ------------------------------
+    ; Round 1's attachments are saved and indexed by now, so round 2 must carry
+    ; them forward untouched.  That is the case which regressed: zi_stage used to
+    ; drop the on-disk attachment index, after which the next save could not find
+    ; the existing ciphertext and wrote empty headers over it (9ee91da).  A single
+    ; import cannot see this - with nothing saved yet there is nothing to lose.
+    ; Re-read the file: zi_decrypt works IN PLACE, so round 1 leaves the buffer
+    ; holding plaintext and a second pass over it cannot authenticate.
+    mov     rcx, qword ptr [rbp-24]
+    mov     rdx, qword ptr [rbp-32]
+    call    mem_free
+    lea     r10, [g_argv]
+    mov     rcx, qword ptr [r10+24]
+    lea     rdx, [rbp-24]
+    lea     r8, [rbp-32]
+    call    read_file
+    test    eax, eax
+    jnz     zit_fail
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-32]
+    lea     r8, [wpw_exp]
+    mov     r9d, 24
+    call    zi_stage
+    mov     dword ptr [rbp-48], eax
+    cmp     eax, 0
+    jl      zit_attfail                         ; never skip the assert silently
+    lea     r10, [g_sel]
+    xor     r8d, r8d
+zit_sel2:
+    cmp     r8d, dword ptr [rbp-48]
+    jae     zit_seld2
+    cmp     r8d, 8192
+    jae     zit_seld2
+    mov     byte ptr [r10+r8], 1
+    inc     r8d
+    jmp     zit_sel2
+zit_seld2:
+    call    zi_commit
+    call    vault_reseal
+    mov     ecx, 2                              ; both imported records
+    call    zi_att_verify
+    cmp     eax, 4                              ; 2 attachments x 2 imports
+    jne     zit_attfail
 zit_freeraw:
     mov     rcx, qword ptr [rbp-24]              ; free the raw zip
     mov     rdx, qword ptr [rbp-32]
@@ -1209,6 +1254,13 @@ zit_freeraw:
     call    vault_reseal
     mov     eax, dword ptr [rbp-40]
     FRAME_EPILOG
+    ret
+zit_attfail:
+    mov     rcx, qword ptr [rbp-24]
+    mov     rdx, qword ptr [rbp-32]
+    call    mem_free
+    mov     eax, 0E0C1h                          ; imported, but an attachment's
+    FRAME_EPILOG                                 ;   content did not survive
     ret
 zit_fail:
     mov     eax, 0E0CEh
