@@ -3520,12 +3520,23 @@ gui_reflow proc frame
     cmp     dword ptr [g_base_cx], 0          ; not recorded yet -> nothing to do
     je      grf_done
     WINCALL GetClientRect, qword ptr [rbp-24], addr rbp-48
+    ; Clamp both deltas at 0, exactly as gui_draw_field_cards does for the cards.
+    ; A window narrower than the recorded base gave a NEGATIVE dW, and a STRETCHW
+    ; control (IDC_V_HEADER, IDC_V_TITLE) then got width = base + dW - the header
+    ; is only 194 DLU wide, so it collapsed and the entry name vanished from the
+    ; detail pane.  Latent until the rax fix in 25e49aa made this MoveWindow run
+    ; at all.  Below the base size the layout keeps base metrics and clips, which
+    ; is also what the cards do - so the two stay in agreement.
     mov     eax, dword ptr [rbp-40]
     sub     eax, dword ptr [g_base_cx]
-    mov     dword ptr [rbp-52], eax           ; dW
+    jns     @F
+    xor     eax, eax
+@@: mov     dword ptr [rbp-52], eax           ; dW (>= 0)
     mov     eax, dword ptr [rbp-36]
     sub     eax, dword ptr [g_base_cy]
-    mov     dword ptr [rbp-56], eax           ; dH
+    jns     @F
+    xor     eax, eax
+@@: mov     dword ptr [rbp-56], eax           ; dH (>= 0)
     mov     dword ptr [rbp-60], 0             ; i
 grf_lp:
     mov     eax, dword ptr [rbp-60]
