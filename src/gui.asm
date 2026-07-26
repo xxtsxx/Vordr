@@ -331,7 +331,8 @@ IDC_T_CLOSE         equ 292             ; caption: close
 IDC_T_NEW           equ 293             ; dock: new item
 IDC_T_GEN           equ 294             ; dock: password generator
 IDC_T_SET           equ 295             ; dock: settings
-DOCKBTN_W           equ 34              ; title-bar dock button width
+MARGBTN_W           equ 34              ; left-margin glyph button (square: New / Generate /
+MARGBTN_GAP         equ 4               ;   Settings live beside the sidebar, not in the strip)
 ; sidebar card geometry (sidebar_rect / sidebar_layout): the frame + entry list
 ; scale with the window height at an equal top/bottom gap.  L/R and the gap are
 ; DLU (DPI-aware); the list is inset inside the frame so it never paints over it.
@@ -3821,7 +3822,9 @@ sidebar_rect endp
 ;   L/R inset so the selection reaches the border, and a slightly larger T/B inset
 ;   so the list ends above the frame.  Called at init and on WM_SIZE.
 sidebar_layout proc frame
-    FRAME_PROLOG 128                              ; MoveWindow's 6-arg spill must clear -76
+    FRAME_PROLOG 160                              ; MoveWindow's 6-arg spill reaches rbp-128,
+                                                  ;   so the margin-button locals (-104/-112)
+                                                  ;   have to sit above it
     mov     qword ptr [rbp-24], rcx
     lea     rdx, [rbp-48]                         ; frame rect {L,T,R,B}
     call    sidebar_rect
@@ -3852,6 +3855,35 @@ sidebar_layout proc frame
     mov     qword ptr [rbp-88], rax               ; save hwnd before the MoveWindow (rax clobber)
     WINCALL MoveWindow, qword ptr [rbp-88], dword ptr [rbp-64], dword ptr [rbp-76], \
             dword ptr [rbp-72], dword ptr [rbp-80], 1
+    ; --- left margin: New at the list's top, Generate + Settings at its bottom ---
+    ; Placed here rather than in frame_layout because they anchor to the LIST, and
+    ; this is the proc that knows where it ended up (and re-runs on every WM_SIZE).
+    mov     eax, dword ptr [rbp-48]               ; centre in the margin left of the frame
+    sub     eax, MARGBTN_W
+    sar     eax, 1
+    cmp     eax, 2                                ; never let it slide under the frame edge
+    jge     @F
+    mov     eax, 2
+@@: mov     dword ptr [rbp-96], eax               ; mx
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_T_NEW
+    mov     qword ptr [rbp-88], rax
+    WINCALL MoveWindow, qword ptr [rbp-88], dword ptr [rbp-96], dword ptr [rbp-76], \
+            MARGBTN_W, MARGBTN_W, 1               ; top edge == list top
+    mov     eax, dword ptr [rbp-76]               ; settings: bottom edge == list bottom
+    add     eax, dword ptr [rbp-80]
+    sub     eax, MARGBTN_W
+    mov     dword ptr [rbp-104], eax
+    mov     eax, dword ptr [rbp-104]              ; generate: stacked directly above it
+    sub     eax, MARGBTN_W + MARGBTN_GAP
+    mov     dword ptr [rbp-112], eax
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_T_GEN
+    mov     qword ptr [rbp-88], rax
+    WINCALL MoveWindow, qword ptr [rbp-88], dword ptr [rbp-96], dword ptr [rbp-112], \
+            MARGBTN_W, MARGBTN_W, 1
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_T_SET
+    mov     qword ptr [rbp-88], rax
+    WINCALL MoveWindow, qword ptr [rbp-88], dword ptr [rbp-96], dword ptr [rbp-104], \
+            MARGBTN_W, MARGBTN_W, 1
     FRAME_EPILOG
     ret
 sidebar_layout endp
@@ -10469,29 +10501,9 @@ frame_layout proc frame
     mov     dword ptr [rbp-56], eax
     WINCALL GetDlgItem, qword ptr [rbp-24], IDC_T_CLOSE
     WINCALL MoveWindow, rax, dword ptr [rbp-56], 0, CAPBTN_W, TBAR_H, 1
-    ; R7.5: min/max buttons removed - the dock now sits directly left of Close.
-    ; dock: New / Generate / Settings, left of the (single) caption button
-    mov     eax, dword ptr [rbp-52]            ; dock right edge = xClose = W - CAPBTN_W
-    sub     eax, CAPBTN_W
-    mov     dword ptr [rbp-60], eax
-    mov     eax, dword ptr [rbp-60]            ; Settings = edge - DOCKBTN_W
-    sub     eax, DOCKBTN_W
-    mov     dword ptr [rbp-56], eax
-    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_T_SET
-    WINCALL MoveWindow, rax, dword ptr [rbp-56], 0, DOCKBTN_W, TBAR_H, 1
-    mov     eax, dword ptr [rbp-60]            ; Generate = edge - 2*DOCKBTN_W
-    sub     eax, DOCKBTN_W*2
-    mov     dword ptr [rbp-56], eax
-    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_T_GEN
-    WINCALL MoveWindow, rax, dword ptr [rbp-56], 0, DOCKBTN_W, TBAR_H, 1
-    mov     eax, dword ptr [rbp-60]            ; New = edge - 3*DOCKBTN_W
-    sub     eax, DOCKBTN_W*3
-    mov     dword ptr [rbp-56], eax
-    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_T_NEW
-    WINCALL MoveWindow, rax, dword ptr [rbp-56], 0, DOCKBTN_W, TBAR_H, 1
-    ; (the multi-vault tab strip was removed in M3 - the unified list shows every
-    ; open vault's entries, so the caption area to the left of the dock is now
-    ; just empty draggable space.)
+    ; R7.5 removed min/max; New / Generate / Settings then moved out of the strip
+    ; into the left margin beside the sidebar (sidebar_layout places them, since
+    ; they anchor to the entry list).  The whole strip is now draggable space.
     FRAME_EPILOG
     ret
 frame_layout endp
