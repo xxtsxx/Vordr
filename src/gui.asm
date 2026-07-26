@@ -3341,8 +3341,6 @@ gui_draw_field_cards proc frame
     je      gfc_ret
     WINCALL CreateSolidBrush, dword ptr [g_col_panel]   ; card fill (active scheme)
     mov     qword ptr [rbp-40], rax
-    WINCALL CreateSolidBrush, dword ptr [g_col_frame]   ; group-heading rule colour
-    mov     qword ptr [rbp-96], rax
     WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-40]
     mov     qword ptr [rbp-48], rax            ; old brush
     WINCALL GetStockObject, 8                  ; NULL_PEN
@@ -3362,14 +3360,14 @@ gfc_lp:
     imul    eax, eax, DESCSZ
     lea     r10, [g_fields]
     add     r10, rax
-    mov     ecx, dword ptr [r10+FD_KIND]       ; layout blocks (heading / gap) get no card
-    cmp     ecx, VF_GROUP
-    je      gfc_group
-    cmp     ecx, VF_SPACER
-    je      gfc_next
+    mov     ecx, dword ptr [r10+FD_KIND]
+    mov     dword ptr [rbp-100], ecx           ; kind (survives the calls below)
+    cmp     ecx, VF_SPACER                     ; a blank gap is the only row with no card;
+    je      gfc_next                           ;   a heading gets one like any other tile
     mov     eax, dword ptr [r10+FD_Y]
-    mov     dword ptr [rbp-84], eax            ; T
-    add     eax, dword ptr [r10+FD_H]
+    mov     dword ptr [rbp-104], eax           ; row top in DLU: r10 is volatile and the
+    mov     dword ptr [rbp-84], eax            ;   heading text below is painted after two
+    add     eax, dword ptr [r10+FD_H]          ;   WINCALLs have clobbered it
     mov     dword ptr [rbp-76], eax            ; B
     mov     dword ptr [rbp-88], 214            ; L (156 + VDX_DLU)
     mov     dword ptr [rbp-80], 472            ; R (414 + VDX_DLU)
@@ -3378,43 +3376,35 @@ gfc_lp:
     add     dword ptr [rbp-80], eax
     WINCALL RoundRect, qword ptr [rbp-24], dword ptr [rbp-88], dword ptr [rbp-84], \
             dword ptr [rbp-80], dword ptr [rbp-76], 10, 10
-    jmp     gfc_next
-gfc_group:
-    ; section heading: in view mode paint the title as dim text + a hairline rule
-    ; along the baseline (edit mode shows the title edit instead, rule only)
-    mov     eax, dword ptr [r10+FD_Y]
-    mov     dword ptr [rbp-100], eax           ; row top
-    add     eax, dword ptr [r10+FD_H]
-    mov     dword ptr [rbp-104], eax           ; row bottom
+    cmp     dword ptr [rbp-100], VF_GROUP      ; a heading also paints its title on the card
+    jne     gfc_next
+    ; Edit mode shows the title EDIT instead, so painting here would double up with it.
+    ; No hairline rule any more either: the card is the separation, and the rule on top
+    ; of the edit read as two lines at different heights with the painted one jutting
+    ; out past the edit's right edge.
     cmp     dword ptr [g_editmode], 0
-    jne     gfc_grp_rule
+    jne     gfc_next
     mov     ecx, dword ptr [rbp-64]            ; the heading's title control
     mov     edx, DS_VALUE
     call    dynid
     WINCALL GetDlgItemTextW, qword ptr [rbp-32], eax, addr g_grouptxt, 128
     WINCALL SetBkMode, qword ptr [rbp-24], 1   ; TRANSPARENT
     WINCALL SetTextColor, qword ptr [rbp-24], dword ptr [g_col_textdim]
-    mov     eax, dword ptr [rbp-100]
-    mov     dword ptr [rbp-84], eax            ; T
-    add     eax, 12
+    mov     eax, dword ptr [rbp-104]
+    add     eax, 3                             ; the label band: identical to where every
+    mov     dword ptr [rbp-84], eax            ;   other tile puts its label, and to where
+    add     eax, 10                            ;   the title edit sits in edit mode
     mov     dword ptr [rbp-76], eax            ; B
-    mov     dword ptr [rbp-88], 176            ; L
+    ; L = the card content column, so the title lines up with the label of every tile
+    ; above and below it.  gui_rows_layout passes a bare 176 for those, but move_ctl
+    ; adds VDX_DLU itself; this path maps the rect directly, so the shift has to be
+    ; written out or the heading lands 58 DLU left - i.e. painted under the sidebar.
+    mov     dword ptr [rbp-88], 176 + VDX_DLU  ; L
     mov     dword ptr [rbp-80], 460            ; R
     WINCALL MapDialogRect, qword ptr [rbp-32], addr rbp-88
     mov     eax, dword ptr [rbp-112]           ; stretch heading text room to the widened pane
     add     dword ptr [rbp-80], eax
     WINCALL DrawTextW, qword ptr [rbp-24], addr g_grouptxt, -1, addr rbp-88, DT_NAMEFLAGS
-gfc_grp_rule:
-    mov     eax, dword ptr [rbp-104]
-    mov     dword ptr [rbp-76], eax            ; B = row bottom
-    sub     eax, 1
-    mov     dword ptr [rbp-84], eax            ; T = 1 DLU rule
-    mov     dword ptr [rbp-88], 176            ; L
-    mov     dword ptr [rbp-80], 460            ; R
-    WINCALL MapDialogRect, qword ptr [rbp-32], addr rbp-88
-    mov     eax, dword ptr [rbp-112]           ; stretch the hairline rule to the widened pane
-    add     dword ptr [rbp-80], eax
-    WINCALL FillRect, qword ptr [rbp-24], addr rbp-88, qword ptr [rbp-96]
 gfc_next:
     inc     dword ptr [rbp-64]
     jmp     gfc_lp
@@ -3422,7 +3412,6 @@ gfc_done:
     WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-48]   ; restore brush
     WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-56]   ; restore pen
     WINCALL DeleteObject, qword ptr [rbp-40]
-    WINCALL DeleteObject, qword ptr [rbp-96]                       ; group-rule brush
 gfc_ret:
     FRAME_EPILOG
     ret
@@ -7579,7 +7568,12 @@ grl_lbl_done:
     cmp     dword ptr [rbp-68], 0
     jne     @F
     mov     dword ptr [rbp-76], 150             ; flat default
-@@: cmp     dword ptr [r10+FD_KIND], VF_SECRET
+@@: cmp     dword ptr [r10+FD_KIND], VF_GROUP    ; section title: run the edit out to just
+    jne     grl_chksecw                          ;   short of the trash (x=394) so it reads
+    mov     dword ptr [rbp-76], 212              ;   as a heading field, not a stub box
+    jmp     grl_valpos
+grl_chksecw:
+    cmp     dword ptr [r10+FD_KIND], VF_SECRET
     jne     grl_chktotpw
     mov     dword ptr [rbp-76], 118             ; card secret: stop before the badge (x=300)
     cmp     dword ptr [rbp-68], 0
@@ -7596,6 +7590,14 @@ grl_valpos:
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_VALUE*8]
     cmp     dword ptr [rbp-68], 0
     je      grl_val_flat
+    cmp     dword ptr [r10+FD_KIND], VF_GROUP    ; a heading's title IS its label, so put it
+    jne     grl_val_card                         ;   in the LABEL band: the value band starts
+    mov     r8d, 176                             ;   at row_top+14 and a heading row is only
+    mov     r9d, dword ptr [rbp-40]              ;   22 tall, so the edit hung out past the
+    add     r9d, 3                               ;   bottom of its card and sat lower than
+    WINCALL move_ctl, rcx, rdx, r8d, r9d, dword ptr [rbp-76], 10   ; every other tile's label
+    jmp     grl_val_done
+grl_val_card:
     mov     r8d, 176                             ; content column (shifted for chevrons)
     mov     r9d, dword ptr [rbp-60]
     WINCALL move_ctl, rcx, rdx, r8d, r9d, dword ptr [rbp-76], dword ptr [rbp-48]
