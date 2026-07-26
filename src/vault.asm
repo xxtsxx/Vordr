@@ -212,6 +212,8 @@ CSTR bk_ok,  "bktest: PASS (bak1..3 rotated and bak1 opens)",13,10
 CSTR bk_bad, "bktest: FAIL (backup missing or unopenable)",13,10
 CSTR mt_ok,  "mactest: PASS (counter tamper rejected, restore opens)",13,10
 CSTR mt_bad, "mactest: FAIL",13,10
+CSTR si_ok,  "sysitemkat: PASS (hidden from user count, stamp round-trips, idempotent)",13,10
+CSTR si_bad, "sysitemkat: FAIL",13,10
 CSTR mt_leak,"mactest: FAIL (file-MAC did not catch the trailer tamper)",13,10
 CSTR rb_ok,  "rbtest: PASS (older counter flagged, current one not)",13,10
 CSTR rb_bad, "rbtest: FAIL",13,10
@@ -281,6 +283,9 @@ g_tmppath   dw MAX_PATH_CHARS dup (?)        ; "<vault>.tmp" for atomic replace
 g_bak_a     dw MAX_PATH_CHARS dup (?)        ; backup-rotation path scratch (from)
 g_bak_b     dw MAX_PATH_CHARS dup (?)        ; backup-rotation path scratch (to)
 g_ts        dq ?                ; GetSystemTimeAsFileTime scratch
+g_sys_ver   db ?                ; VF_SYSTEM value byte (schema version) - write scratch
+align 8
+g_sys_ft    dq ?                ; VF_SYS_PWVERIFY value staging - write scratch
 seed_title_w dw 80 dup (?)      ; seedtest scratch: entry field strings (wide)
 seed_user_w  dw 96 dup (?)
 seed_url_w   dw 96 dup (?)
@@ -2766,6 +2771,123 @@ rl_fail:
 cmd_reload endp
 
 ; ===========================================================================
+; cmd_sysitemkat <path> - system items: prove the item is hidden from the user-facing
+;   count, that the pwverify stamp survives a real seal/reload, and that adding twice
+;   cannot produce two.  Seeds 3 user entries (do_seed makes NO system item, by
+;   design) so the physical/user split is observable.
+; ===========================================================================
+LANDING_PAD
+public cmd_sysitemkat
+cmd_sysitemkat proc frame
+    FRAME_PROLOG 48
+    ; [rbp-24] = the stamp we plant and expect back
+    lea     r10, [g_argv]
+    mov     rax, qword ptr [r10+16]             ; argv[2] = vault path
+    mov     qword ptr [g_cfg_in], rax
+    lea     r10, [bk_pw]                        ; same fixed test password as cmd_reload
+    lea     r11, [g_cfg_pass]
+    xor     ecx, ecx
+si_pwcp:
+    mov     al, byte ptr [r10+rcx]
+    mov     byte ptr [r11+rcx], al
+    test    al, al
+    jz      si_pwd
+    inc     ecx
+    cmp     ecx, 32
+    jb      si_pwcp
+si_pwd:
+    mov     dword ptr [g_cfg_passlen], 9
+    mov     dword ptr [g_cfg_t], 1
+    mov     dword ptr [g_cfg_m], 8192
+    mov     ecx, 3                              ; create + seed 3 user entries
+    call    do_seed
+    test    eax, eax
+    jnz     si_fail
+    call    vault_unlock
+    test    eax, eax
+    jnz     si_fail
+    ; --- a seeded vault has no system item -------------------------------------
+    call    vault_sys_find
+    cmp     eax, -1
+    jne     si_faillk
+    call    vault_user_count
+    cmp     eax, 3
+    jne     si_faillk
+    call    vault_pwverify_get                  ; nothing stored yet
+    test    rax, rax
+    jnz     si_faillk
+    ; --- add one: physical 4, user still 3 -------------------------------------
+    call    vault_add_system_item
+    test    eax, eax
+    jz      si_faillk
+    call    vault_count
+    cmp     eax, 4
+    jne     si_faillk
+    call    vault_user_count
+    cmp     eax, 3
+    jne     si_faillk
+    call    vault_sys_find                      ; appended last
+    cmp     eax, 3
+    jne     si_faillk
+    mov     ecx, 3
+    call    vault_is_system
+    test    eax, eax
+    jz      si_faillk
+    xor     ecx, ecx                            ; a user entry must NOT read as system
+    call    vault_is_system
+    test    eax, eax
+    jnz     si_faillk
+    ; --- idempotent: a second add must not make a second item ------------------
+    call    vault_add_system_item
+    test    eax, eax
+    jz      si_faillk
+    call    vault_count
+    cmp     eax, 4
+    jne     si_faillk
+    ; --- plant the stamp, persist, and re-read from disk ------------------------
+    mov     rcx, 1122334455667788h
+    mov     qword ptr [rbp-24], rcx
+    call    vault_pwverify_set
+    test    eax, eax
+    jz      si_faillk
+    call    vault_pwverify_get
+    cmp     rax, qword ptr [rbp-24]
+    jne     si_faillk
+    call    vault_reseal
+    test    eax, eax
+    jnz     si_faillk
+    call    vault_lock
+    call    vault_unlock                        ; fresh Argon2 derive + body from disk
+    test    eax, eax
+    jnz     si_fail
+    call    vault_count                         ; the item survived the round trip...
+    cmp     eax, 4
+    jne     si_faillk
+    call    vault_user_count                    ; ...and is still hidden
+    cmp     eax, 3
+    jne     si_faillk
+    call    vault_pwverify_get                  ; ...and the stamp came back intact
+    cmp     rax, qword ptr [rbp-24]
+    jne     si_faillk
+    call    vault_lock
+    lea     rcx, [si_ok]
+    mov     edx, si_ok_len
+    call    print_a
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+si_faillk:
+    call    vault_lock
+si_fail:
+    lea     rcx, [si_bad]
+    mov     edx, si_bad_len
+    call    print_a
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_sysitemkat endp
+
+; ===========================================================================
 ; cmd_cowrite <path> - C8: prove the <vault>.lock write lock is exclusive and
 ;   reacquirable.  Acquire (must succeed), acquire again while held (must fail),
 ;   release, then re-acquire (must succeed).
@@ -4440,6 +4562,287 @@ vfg_none:
     FRAME_EPILOG
     ret
 vault_field_get endp
+
+; ===========================================================================
+; System items - permanent per-vault metadata (docs/SYSITEM_DESIGN.md).
+;
+; A system item is an ORDINARY entry whose field[0] is VF_SYSTEM, so the on-disk
+; container, the body walk and vault_body_validate are all unchanged.  What makes it
+; "system" is purely that user-facing code skips it.
+;
+; vault_count() stays the PHYSICAL count - seal/teardown/format code and every probe
+; that asserts a physical count depend on that.  User-facing code uses
+; vault_user_count().  List builders skip system items but still tag each row with the
+; PHYSICAL entry index, so no vault_entry_ptr caller needs remapping.
+;
+; NOTE on cost: vault_entry_ptr rescans from the body start, so calling
+; vault_is_system in a loop is quadratic.  vault_user_count and vault_sys_find
+; therefore walk the body ONCE themselves rather than calling it per index.
+; ===========================================================================
+
+; sys_first_kind(rcx = entry ptr) -> eax = kind of field[0] (0 if the entry has none).
+;   Leaf; clobbers eax/r10.
+sys_first_kind proc
+    test    rcx, rcx
+    jz      sfk_none
+    mov     eax, dword ptr [rcx+32]             ; field_count
+    test    eax, eax
+    jz      sfk_none
+    movzx   eax, word ptr [rcx+36]              ; field[0] raw type
+    and     eax, VF_KINDMASK
+    ret
+sfk_none:
+    xor     eax, eax
+    ret
+sys_first_kind endp
+
+; vault_is_system(ecx = index) -> eax = 1 if that entry is the system item.
+;   O(index) - do NOT call this in a loop; see vault_user_count.
+public vault_is_system
+vault_is_system proc frame
+    FRAME_PROLOG 32
+    call    vault_entry_ptr                     ; rcx = index -> rax = entry ptr
+    mov     rcx, rax
+    call    sys_first_kind
+    cmp     eax, VF_SYSTEM
+    jne     vis_no
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+vis_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+vault_is_system endp
+
+; sys_walk(rcx = 0 -> return the system item's INDEX or -1
+;              1 -> return the count of NON-system entries)
+;   One linear pass over the body (vault_entry_len per entry), so callers never pay
+;   vault_entry_ptr's rescan.  -> eax.
+sys_walk proc frame
+    FRAME_PROLOG 64
+    ; [rbp-24]=mode [rbp-32]=cursor [rbp-40]=i [rbp-48]=total [rbp-56]=result
+    mov     qword ptr [rbp-24], rcx
+    mov     r10, qword ptr [g_body_ptr]
+    test    r10, r10
+    jz      sw_none
+    mov     eax, dword ptr [r10]                ; entry_count
+    mov     dword ptr [rbp-48], eax
+    lea     r10, [r10+4]
+    mov     qword ptr [rbp-32], r10
+    mov     dword ptr [rbp-40], 0
+    mov     dword ptr [rbp-56], -1              ; mode 0: "not found"
+    cmp     qword ptr [rbp-24], 0
+    je      sw_loop
+    mov     eax, dword ptr [rbp-48]
+    mov     dword ptr [rbp-56], eax             ; mode 1: start from the physical count
+sw_loop:
+    mov     eax, dword ptr [rbp-40]
+    cmp     eax, dword ptr [rbp-48]
+    jae     sw_done
+    mov     rcx, qword ptr [rbp-32]
+    call    sys_first_kind
+    cmp     eax, VF_SYSTEM
+    jne     sw_next
+    cmp     qword ptr [rbp-24], 0
+    jne     sw_dec
+    mov     eax, dword ptr [rbp-40]             ; mode 0: first match wins
+    mov     dword ptr [rbp-56], eax
+    jmp     sw_done
+sw_dec:
+    dec     dword ptr [rbp-56]                  ; mode 1: one fewer user entry
+sw_next:
+    mov     rcx, qword ptr [rbp-32]
+    call    vault_entry_len
+    mov     r10, qword ptr [rbp-32]
+    add     r10, rax
+    mov     qword ptr [rbp-32], r10
+    inc     dword ptr [rbp-40]
+    jmp     sw_loop
+sw_done:
+    mov     eax, dword ptr [rbp-56]
+    FRAME_EPILOG
+    ret
+sw_none:
+    xor     eax, eax                            ; no body: 0 users / index -1
+    cmp     qword ptr [rbp-24], 0
+    jne     sw_nret
+    mov     eax, -1
+sw_nret:
+    FRAME_EPILOG
+    ret
+sys_walk endp
+
+; vault_sys_find() -> eax = index of the system item, or -1.
+public vault_sys_find
+vault_sys_find proc frame
+    FRAME_PROLOG 32
+    xor     ecx, ecx
+    call    sys_walk
+    FRAME_EPILOG
+    ret
+vault_sys_find endp
+
+; vault_user_count() -> eax = entries excluding system items (what the user sees).
+public vault_user_count
+vault_user_count proc frame
+    FRAME_PROLOG 32
+    mov     ecx, 1
+    call    sys_walk
+    FRAME_EPILOG
+    ret
+vault_user_count endp
+
+; sys_field_ptr(ecx = kind) -> rax = pointer to that field's VALUE bytes inside the
+;   system item, 0 if absent.  rdx = value length on success.
+sys_field_ptr proc frame
+    FRAME_PROLOG 64
+    ; [rbp-24]=wanted kind [rbp-32]=cursor [rbp-40]=remaining fields
+    mov     dword ptr [rbp-24], ecx
+    call    vault_sys_find
+    cmp     eax, -1
+    je      sfp_none
+    mov     ecx, eax
+    call    vault_entry_ptr
+    test    rax, rax
+    jz      sfp_none
+    mov     r10d, dword ptr [rax+32]            ; field_count
+    mov     dword ptr [rbp-40], r10d
+    lea     r10, [rax+36]
+    mov     qword ptr [rbp-32], r10
+sfp_loop:
+    cmp     dword ptr [rbp-40], 0
+    je      sfp_none
+    mov     r10, qword ptr [rbp-32]
+    movzx   eax, word ptr [r10]
+    and     eax, VF_KINDMASK
+    cmp     eax, dword ptr [rbp-24]
+    je      sfp_hit
+    mov     eax, dword ptr [r10+2]              ; field len
+    add     r10, 6
+    add     r10, rax
+    mov     qword ptr [rbp-32], r10
+    dec     dword ptr [rbp-40]
+    jmp     sfp_loop
+sfp_hit:
+    mov     r10, qword ptr [rbp-32]
+    mov     edx, dword ptr [r10+2]              ; value length
+    lea     rax, [r10+6]
+    FRAME_EPILOG
+    ret
+sfp_none:
+    xor     eax, eax
+    xor     edx, edx
+    FRAME_EPILOG
+    ret
+sys_field_ptr endp
+
+; vault_add_system_item() - append a fresh system item to the live body.  Called on
+;   the REAL vault-creation path only; do_seed/do_init deliberately leave test vaults
+;   system-item-free so every probe that asserts a physical count is untouched.
+;   Does NOT reseal.  -> eax = 1 ok / 0 failed.
+public vault_add_system_item
+vault_add_system_item proc frame
+    FRAME_PROLOG 64
+    ; [rbp-24] = entry start, [rbp-32] = fields written
+    cmp     qword ptr [g_body_ptr], 0
+    je      vasi_fail
+    call    vault_sys_find                      ; never create a second one
+    cmp     eax, -1
+    jne     vasi_ok
+    mov     rax, qword ptr [g_body_len]
+    add     rax, 36
+    cmp     rax, VAULT_BODY_MAX
+    ja      vasi_fail
+    mov     r11, qword ptr [g_body_ptr]
+    add     r11, qword ptr [g_body_len]
+    mov     qword ptr [rbp-24], r11
+    mov     rcx, r11
+    mov     edx, 16
+    call    rng_fill                            ; 16-byte random entry id
+    test    eax, eax
+    jz      vasi_fail
+    lea     rcx, [g_ts]
+    call    GetSystemTimeAsFileTime
+    mov     r11, qword ptr [rbp-24]
+    mov     rax, qword ptr [g_ts]
+    mov     qword ptr [r11+16], rax             ; created
+    mov     qword ptr [r11+24], rax             ; modified
+    mov     dword ptr [r11+32], 0               ; field_count placeholder
+    mov     rax, qword ptr [g_body_len]
+    add     rax, 36
+    mov     qword ptr [g_body_len], rax
+    mov     byte ptr [g_sys_ver], SYSITEM_VER   ; field[0]: the marker (MUST be first)
+    mov     rcx, VF_SYSTEM
+    xor     rdx, rdx
+    lea     r8, [g_sys_ver]
+    mov     r9, 1
+    call    va_field_bin_labeled
+    mov     dword ptr [rbp-32], eax
+    mov     qword ptr [g_sys_ft], 0             ; field[1]: pwverify, "never" until set
+    mov     rcx, VF_SYS_PWVERIFY
+    xor     rdx, rdx
+    lea     r8, [g_sys_ft]
+    mov     r9, 8
+    call    va_field_bin_labeled
+    add     dword ptr [rbp-32], eax
+    mov     r11, qword ptr [rbp-24]
+    mov     eax, dword ptr [rbp-32]
+    mov     dword ptr [r11+32], eax             ; patch field_count
+    mov     r11, qword ptr [g_body_ptr]
+    inc     dword ptr [r11]                     ; entry_count++
+vasi_ok:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+vasi_fail:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+vault_add_system_item endp
+
+; vault_pwverify_get() -> rax = the stored FILETIME (0 = never / no system item).
+public vault_pwverify_get
+vault_pwverify_get proc frame
+    FRAME_PROLOG 32
+    mov     ecx, VF_SYS_PWVERIFY
+    call    sys_field_ptr
+    test    rax, rax
+    jz      vpg_zero
+    cmp     rdx, 8                              ; a short field is not a timestamp
+    jb      vpg_zero
+    mov     rax, qword ptr [rax]
+    FRAME_EPILOG
+    ret
+vpg_zero:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+vault_pwverify_get endp
+
+; vault_pwverify_set(rcx = FILETIME) -> eax = 1 ok / 0 no slot.  Updates in place (the
+;   field is fixed-width), so it never moves the body.  Does NOT reseal - the caller
+;   decides when to persist, and on a read-only vault it simply never will.
+public vault_pwverify_set
+vault_pwverify_set proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    mov     ecx, VF_SYS_PWVERIFY
+    call    sys_field_ptr
+    test    rax, rax
+    jz      vps_no
+    cmp     rdx, 8
+    jb      vps_no
+    mov     rcx, qword ptr [rbp-24]
+    mov     qword ptr [rax], rcx
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+vps_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+vault_pwverify_set endp
 
 ; ===========================================================================
 ; vault_build_entry() - append one entry built from the GUI's ordered field

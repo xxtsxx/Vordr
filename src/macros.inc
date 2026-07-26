@@ -112,6 +112,15 @@ VF_DELETED          equ 14         ; reserved: entry is in the trash; value = 16
                                    ;   FILETIME of when it was deleted (soft-delete marker)
 VF_GROUP            equ 15         ; layout block: a section heading; value = the title
 VF_SPACER           equ 16         ; layout block: a blank gap (no label, no value)
+; --- system item: permanent per-vault metadata (docs/SYSITEM_DESIGN.md) --------
+; A "system item" is an ordinary entry whose FIRST field is VF_SYSTEM.  It rides the
+; existing container (same GCM, same body walk, no parser change) and is hidden from
+; every user-facing count/list.  Additive VF_* tags need no VAULT_VERSION bump: an
+; older reader skips unknown types, which is how FAV/ICON/PWHIST/DELETED landed.
+; Fields are written raw (VFL_RAW), never labelled.
+VF_SYSTEM           equ 17         ; marker, MUST be field[0]; value = u8 schema version
+VF_SYS_PWVERIFY     equ 18         ; C9: u64 FILETIME the master password was last typed
+SYSITEM_VER         equ 1          ; VF_SYSTEM value byte
 
 ; Runtime detail-row control ids start here (IDC_DYN_BASE + row*DYN_SLOTS + slot).
 ; Shared so theme.asm can tell a card row button from a fixed header glyph when it
