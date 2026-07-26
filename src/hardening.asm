@@ -23,7 +23,11 @@ extern AddVectoredExceptionHandler:proc
 extern SetErrorMode:proc
 extern TerminateProcess:proc
 extern GetCurrentProcess:proc
+extern GetCurrentThreadId:proc
+extern SwitchDesktop:proc               ; restore the user's desktop before we die
 extern MessageBoxW:proc
+externdef g_secdesk_orig:qword          ; gui.asm: HDESK of the user's own input desktop
+externdef g_secdesk_tid:dword           ; gui.asm: secure-desktop worker tid (0 = none)
 extern CreateFileW:proc
 extern WriteFile:proc
 extern CloseHandle:proc
@@ -125,6 +129,20 @@ ifdef DBG_TRACE
     mov     edx, crash_bc_len
     call    print_a
 endif
+    ; A fault raised while the Secure-Unlock desktop holds input would otherwise
+    ; strand the user there: we are about to TerminateProcess, and the only other
+    ; SwitchDesktop back lives in secdesk_body, which a faulting worker never
+    ; reaches.  Hand the session back BEFORE any UI or termination.
+    cmp     qword ptr [g_secdesk_orig], 0
+    je      cc_gui
+    WINCALL SwitchDesktop, qword ptr [g_secdesk_orig]
+    WINCALL GetCurrentThreadId                   ; is the faulting thread the worker?
+    cmp     eax, dword ptr [g_secdesk_tid]
+    je      cc_kill                             ; yes: its windows are on the desktop we
+                                                ;  just left, so a modal raised here would
+                                                ;  be invisible AND block termination for
+                                                ;  ever - die quietly instead
+cc_gui:
     cmp     dword ptr [g_gui_active], 0          ; apology box only when a GUI is up
     je      cc_kill                             ; (headless CLI never blocks on a modal)
     WINCALL MessageBoxW, 0, addr crash_apology, addr crash_title, \

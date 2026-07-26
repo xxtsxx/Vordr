@@ -154,6 +154,7 @@ extern SwitchDesktop:proc
 extern SetThreadDesktop:proc
 extern CloseDesktop:proc
 extern CreateThread:proc
+extern GetCurrentThreadId:proc
 extern WaitForSingleObject:proc
 extern CloseHandle:proc
 extern EndDialog:proc
@@ -1296,9 +1297,14 @@ g_secunlock_lock dd ?                 ; 1 = Secure Unlock forced by HKLM policy 
 g_tpm_lock       dd ?                 ; 1 = TPM Unlock forced by HKLM policy (locked)
 g_scheme_lock    dd ?                 ; 1 = colour scheme forced by HKLM policy (locked)
 g_secdesk_dlg   dd ?                  ; template id marshalled to the worker thread
+public g_secdesk_tid
+g_secdesk_tid   dd ?                  ; worker thread id while the dialog runs (0 = none).
+                                      ;   crash_contain reads it to tell whether the faulting
+                                      ;   thread's windows live on the private desktop.
 align 8
 g_secdesk_proc  dq ?                  ; dialog proc addr for the worker thread
 g_secdesk_hd    dq ?                  ; HDESK of the private desktop
+public g_secdesk_orig
 g_secdesk_orig  dq ?                  ; HDESK of the original input desktop (restore on exit)
 g_secdesk_res   dq ?                  ; DialogBox result marshalled back to the caller
 align 8
@@ -14891,6 +14897,8 @@ secdesk_thread proc
     mov     rbp, rsp                             ; regardless of the OS thread-entry rsp
     and     rsp, -16                             ; (a bad assumption here misaligned the crypto
     sub     rsp, 32                              ;  in secdesk_body -> corruption/faults)
+    call    GetCurrentThreadId                   ; publish before the desktop switch: a fault
+    mov     dword ptr [g_secdesk_tid], eax       ;   from here on is on the private desktop
     mov     rax, qword ptr [g_sstk_base]         ; park the main thread's shadow stack
     mov     qword ptr [g_sstk_savebase], rax
     mov     rax, qword ptr [g_sstk_index]
@@ -14899,6 +14907,7 @@ secdesk_thread proc
     mov     qword ptr [g_sstk_base], rax
     mov     qword ptr [g_sstk_index], 0
     call    secdesk_body
+    mov     dword ptr [g_secdesk_tid], 0         ; back on the caller's desktop from here
     mov     rax, qword ptr [g_sstk_savebase]     ; restore the main thread's shadow stack
     mov     qword ptr [g_sstk_base], rax
     mov     rax, qword ptr [g_sstk_saveidx]
@@ -14932,7 +14941,16 @@ gui_secdesk_show proc frame
     test    rax, rax
     jz      gss_fallback                         ; no thread -> plain dialog
     WINCALL WaitForSingleObject, qword ptr [rbp-24], WAIT_FOREVER
-    WINCALL CloseHandle, qword ptr [rbp-24]
+    ; secdesk_thread restores these itself on the normal path; repeat it here so a
+    ; worker that died mid-dialog cannot leave the main thread running on the
+    ; worker's shadow stack.  Same saved values, so the normal path is a no-op.
+    mov     rax, qword ptr [g_sstk_savebase]
+    test    rax, rax
+    jz      @F
+    mov     qword ptr [g_sstk_base], rax
+    mov     rax, qword ptr [g_sstk_saveidx]
+    mov     qword ptr [g_sstk_index], rax
+@@: WINCALL CloseHandle, qword ptr [rbp-24]
     jmp     gss_cleanup
 gss_fallback:
     ; degrade to a normal on-desktop modal dialog (never lock the user out)
@@ -14940,6 +14958,14 @@ gss_fallback:
             qword ptr [g_secdesk_proc], 0
     mov     qword ptr [g_secdesk_res], rax
 gss_cleanup:
+    ; belt-and-braces: secdesk_body switches back itself on the normal path, but a
+    ; worker that died mid-dialog never reached that line.  Switching to the desktop
+    ; that is already current is a harmless no-op, and it MUST precede CloseDesktop
+    ; (the desktop currently receiving input cannot be closed).
+    cmp     qword ptr [g_secdesk_orig], 0
+    je      gss_closehd
+    WINCALL SwitchDesktop, qword ptr [g_secdesk_orig]
+gss_closehd:
     cmp     qword ptr [g_secdesk_hd], 0
     je      gss_orig
     WINCALL CloseDesktop, qword ptr [g_secdesk_hd]
