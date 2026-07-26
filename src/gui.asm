@@ -311,6 +311,7 @@ TTS_NOPREFIX_       equ 2
 TTF_IDISHWND_       equ 1
 TTF_SUBCLASS_       equ 10h
 TTM_ADDTOOLW_       equ 432h            ; WM_USER+50
+TTM_DELTOOLW_       equ 433h            ; WM_USER+51
 TTM_SETMAXTIPW_     equ 418h            ; WM_USER+24
 WM_PAINT            equ 0Fh
 WM_SETCURSOR        equ 20h
@@ -1034,6 +1035,14 @@ WSTR gt_rem, <Delete entry>
 WSTR gt_gen, <Generate password>
 WSTR gt_close, <Close>
 WSTR gt_settings, <Settings>
+; per-field row glyphs (registered per control, dropped again by gui_rows_clear)
+WSTR gt_reveal, <Show / hide this value>
+WSTR gt_rowcopy, <Copy to clipboard>    ; (gt_copy is the pwgen button's caption)
+WSTR gt_rowgen, <Generate a password>
+WSTR gt_attach, <Attach a file>
+WSTR gt_rowdel, <Delete this field>
+WSTR gt_rowup, <Move this field up>
+WSTR gt_rowdn, <Move this field down>
 kl_user label word
     dw 'U','s','e','r','n','a','m','e', 0
 kl_secret label word
@@ -5871,6 +5880,29 @@ ghost_tip_add proc frame
     ret
 ghost_tip_add endp
 
+; ghost_tip_del(rcx=parent, rdx=tool hwnd) - drop a tool from the shared tooltip.
+;   Tools are keyed by hwnd, so a control that is destroyed without this leaves a
+;   dead entry behind.  The row controls are torn down and rebuilt on every
+;   selection, which is why they carried no tooltip at all before: without a
+;   matching delete the list would grow without bound.
+ghost_tip_del proc frame
+    FRAME_PROLOG 144
+    cmp     qword ptr [g_tooltip], 0
+    je      gtd_done                            ; nothing created yet -> nothing to drop
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], rdx
+    mov     dword ptr [rbp-104], 38h            ; TOOLINFOW cbSize (matches ghost_tip_add)
+    mov     dword ptr [rbp-100], TTF_IDISHWND_
+    mov     rax, qword ptr [rbp-24]
+    mov     qword ptr [rbp-96], rax             ; hwnd = parent
+    mov     rax, qword ptr [rbp-32]
+    mov     qword ptr [rbp-88], rax             ; uId = tool hwnd
+    WINCALL SendMessageW, qword ptr [g_tooltip], TTM_DELTOOLW_, 0, addr rbp-104
+gtd_done:
+    FRAME_EPILOG
+    ret
+ghost_tip_del endp
+
 ; search_type_subclass - SUBCLASSPROC on the sidebar list: type-to-search.  When
 ;   a printable character is typed while the list has focus (no edit focused),
 ;   move focus to the search box and forward the character there (redesign A2).
@@ -6019,6 +6051,11 @@ grc_slot:
     test    rcx, rcx
     jz      grc_slotnext
     mov     qword ptr [r10], 0
+    mov     qword ptr [rbp-48], rcx              ; drop its tooltip first: tools are keyed
+    mov     rdx, rcx                             ;   by hwnd, so destroying the control
+    mov     rcx, qword ptr [rbp-40]              ;   without this strands a dead entry and
+    call    ghost_tip_del                        ;   the list grows on every selection
+    mov     rcx, qword ptr [rbp-48]
     call    DestroyWindow
 grc_slotnext:
     inc     dword ptr [rbp-32]
@@ -6060,14 +6097,30 @@ gui_inval_detail endp
 ; GHOSTIFY - turn the row action button just created by row_mk (hwnd in rax) into
 ;   a frameless ghost: glyph 0 keeps its window-text glyph, so theme_drawitem's
 ;   ghost path renders it borderless with a hover halo (matching the header glyphs).
-;   No tooltip (row controls are recreated each relayout - avoids tip accumulation).
-GHOSTIFY macro
+;   Row controls are destroyed and rebuilt on every selection, so their tooltips
+;   would accumulate as dead entries - gui_rows_clear now calls ghost_tip_del for
+;   each handle before destroying it, which is what makes a per-row tip safe.
+GHOSTIFY macro tip
     mov     qword ptr [rbp-56], rax
     mov     rcx, qword ptr [rbp-24]              ; parent
     mov     rdx, qword ptr [rbp-56]              ; button hwnd
     xor     r8d, r8d                             ; glyph 0 -> draw the window-text glyph
+IFB <tip>
     xor     r9, r9                               ; no tooltip
+ELSE
+    lea     r9, [tip]
+ENDIF
     call    ghost_attach
+endm
+
+; ROWTIP - tooltip for a row button that is NOT ghostified (the reorder chevrons
+;   paint through gui_draw_flatchevron instead).  hwnd still in rax from row_mk.
+ROWTIP macro tip
+    mov     qword ptr [rbp-56], rax
+    mov     rcx, qword ptr [rbp-24]              ; parent
+    mov     rdx, qword ptr [rbp-56]              ; button hwnd
+    lea     r8, [tip]
+    call    ghost_tip_add
 endm
 
 ; gui_row_add(rcx=hdlg, edx=kind) -> eax = row index (or -1 if at MAXROWS).
@@ -6127,26 +6180,28 @@ gra_file:
             BS_OWNERDRAW_ or WS_TABSTOP_
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_IMPORT, addr cls_button, addr wb_addf, \
             BS_OWNERDRAW_ or WS_TABSTOP_
-    GHOSTIFY
+    GHOSTIFY gt_attach
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_UP, addr cls_button, addr wb_up, \
             BS_OWNERDRAW_
+    ROWTIP  gt_rowup
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_DOWN, addr cls_button, addr wb_down, \
             BS_OWNERDRAW_
+    ROWTIP  gt_rowdn
     jmp     gra_finish
 gra_secret:
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_VALUE, addr cls_edit, 0, \
             ES_PASSWORD_ or ES_AUTOHSCROLL_ or WS_TABSTOP_ or WS_CLIPSIBLINGS_
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_REVEAL, addr cls_button, addr wb_eye, \
             BS_OWNERDRAW_
-    GHOSTIFY
+    GHOSTIFY gt_reveal
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_COPY, addr cls_button, addr wb_copy, \
             BS_OWNERDRAW_
-    GHOSTIFY
+    GHOSTIFY gt_rowcopy
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_SBADGE, addr cls_static, 0, \
             SS_OWNERDRAW_
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_GEN, addr cls_button, addr wb_gen, \
             BS_OWNERDRAW_
-    GHOSTIFY
+    GHOSTIFY gt_rowgen
     jmp     gra_reorder
 gra_notes:
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_VALUE, addr cls_edit, 0, \
@@ -6157,14 +6212,14 @@ gra_totp:
             ES_PASSWORD_ or ES_AUTOHSCROLL_ or WS_TABSTOP_ or WS_CLIPSIBLINGS_
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_REVEAL, addr cls_button, addr wb_eye, \
             BS_OWNERDRAW_
-    GHOSTIFY
+    GHOSTIFY gt_reveal
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_TCODE, addr cls_static, 0, \
             SS_LEFTNOWORDWRAP_
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_TBAR, addr cls_static, 0, \
             SS_OWNERDRAW_
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_COPY, addr cls_button, addr wb_copy, \
             BS_OWNERDRAW_
-    GHOSTIFY
+    GHOSTIFY gt_rowcopy
     jmp     gra_reorder
 gra_group:
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_VALUE, addr cls_edit, 0, \
@@ -6174,11 +6229,13 @@ gra_spacer:                                      ; a blank gap - no controls, ju
 gra_reorder:
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_UP, addr cls_button, addr wb_up, \
             BS_OWNERDRAW_
+    ROWTIP  gt_rowup
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_DOWN, addr cls_button, addr wb_down, \
             BS_OWNERDRAW_
+    ROWTIP  gt_rowdn
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_DEL, addr cls_button, addr wb_rem, \
             BS_OWNERDRAW_
-    GHOSTIFY
+    GHOSTIFY gt_rowdel
 gra_finish:
     inc     dword ptr [g_field_count]
     mov     eax, dword ptr [rbp-40]
