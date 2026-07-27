@@ -76,8 +76,12 @@ g_prune_name dw 512 dup (?)      ; C6: RegEnumValueW value-name scratch (legacy 
 align 2
 cc_od       dw 1024 dup (?)      ; %OneDrive% root (cfg_classify_path scratch)
 cc_docs     dw 1024 dup (?)      ; Documents root (cfg_classify_path scratch)
+; One name for the UserFolder buffer's size, so the cbData handed to the registry and
+; the in-bounds NUL offset can never drift apart (they were two separate literals).
+OD_UFBUF_CH    equ 1024
+OD_UFBUF_BYTES equ OD_UFBUF_CH * 2
 od_namebuf  dw 256 dup (?)       ; account subkey name (cfg_od_linked)
-od_ufbuf    dw 1024 dup (?)      ; UserFolder value (cfg_od_linked)
+od_ufbuf    dw OD_UFBUF_CH dup (?) ; UserFolder value (cfg_od_linked)
 
 .code
 
@@ -526,13 +530,32 @@ col_enum:
     WINCALL RegOpenKeyExW, qword ptr [g_cfg_khan], addr od_namebuf, 0, KEY_READ, addr rbp-56
     test    eax, eax
     jnz     col_next
-    mov     dword ptr [rbp-72], 2048             ; cbData = 1024 chars * 2
+    mov     dword ptr [rbp-72], OD_UFBUF_BYTES   ; cbData = the whole buffer
     WINCALL RegQueryValueExW, qword ptr [rbp-56], addr od_userfolder, 0, addr rbp-64, \
             addr od_ufbuf, addr rbp-72
     mov     dword ptr [rbp-80], eax
     WINCALL RegCloseKey, qword ptr [rbp-56]
     cmp     dword ptr [rbp-80], 0
     jne     col_next                             ; stub account: no UserFolder
+    ; Same two guards cfg_get_str applies, and for the same reasons - this path had
+    ; neither, then handed the buffer straight to cfg_wstr_ieq, which scans to a NUL
+    ; with no bound.
+    ; 1) the value must be a string type: other types carry bytes that are not wide-Z.
+    mov     eax, dword ptr [rbp-64]              ; value type
+    cmp     eax, REG_SZ
+    je      col_term
+    cmp     eax, REG_EXPAND_SZ
+    jne     col_next
+col_term:
+    ; 2) RegQueryValueExW does not guarantee a terminating NUL, and none fits when the
+    ;    value exactly fills the buffer - which is precisely the 1024-wchar case here.
+    mov     eax, dword ptr [rbp-72]              ; bytes returned
+    cmp     eax, OD_UFBUF_BYTES-2
+    jbe     @F
+    mov     eax, OD_UFBUF_BYTES-2                ; last in-bounds wide-NUL offset
+@@: and     eax, 0FFFFFFFEh                      ; align to a wchar boundary
+    lea     r10, [od_ufbuf]
+    mov     word ptr [r10+rax], 0
     lea     rcx, [od_ufbuf]
     mov     rdx, qword ptr [rbp-24]
     call    cfg_wstr_ieq

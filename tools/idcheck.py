@@ -65,15 +65,57 @@ def parse_rc(path):
         ids.setdefault(m.group(1), v)
     return ids
 
-def parse_asm(path):
+def parse_asm(path, all_equs=None):
+    """-> {IDC_*/DLG_*: value}.  If `all_equs` is given, every literal equ is also
+    collected there - the range-span constants (GLYPHPAL_N, ...) are not ID names but
+    are needed to know how wide a *_BASE range is."""
     ids = {}
     for l in open(path, encoding='latin-1'):
         m = RE_EQU.match(strip_asm_comment(l.rstrip('\n')))
-        if not m or not RE_IDFAM.match(m.group(1)): continue
+        if not m: continue
         v = parse_int(m.group(2))
         if v is None: continue          # non-literal equ (expression) - skip
-        ids.setdefault(m.group(1), v)
+        if all_equs is not None:
+            all_equs.setdefault(m.group(1), v)
+        if RE_IDFAM.match(m.group(1)):
+            ids.setdefault(m.group(1), v)
     return ids
+
+# Control-id ranges carved out for runtime-created controls.  (base, span-constant);
+# a span of None means open-ended (everything from base upward).  A scalar id landing
+# inside one of these is the IDC_RM_TEXT=810-inside-IDC_IG_BASE(800..829) mistake:
+# harmless while the two live in different dialogs, and silently wrong the moment they
+# do not, because icon_proc dispatches these by RANGE rather than by name.
+RESERVED_RANGES = [
+    ("IDC_IG_BASE",  "GLYPHPAL_N"),
+    ("IDC_IC_BASE",  "GLYPHCOL_N"),
+    ("IDC_DYN_BASE", None),
+]
+
+def check_ranges(ids, equs):
+    """-> number of ids that fall inside a reserved range."""
+    bad = 0
+    for base_name, span_name in RESERVED_RANGES:
+        base = ids.get(base_name, equs.get(base_name))
+        if base is None:
+            continue
+        span = None
+        if span_name is not None:
+            span = equs.get(span_name)
+            if span is None:
+                print(f"[info] {base_name}: span {span_name} unresolved - range not checked")
+                continue
+        hi = None if span is None else base + span - 1
+        for name, v in sorted(ids.items()):
+            if name == base_name or name.endswith("_BASE"):
+                continue
+            if v < base or (hi is not None and v > hi):
+                continue
+            where = f"{base}..{hi}" if hi is not None else f"{base}+"
+            print(f"[IN-RANGE] {name} = {v} lies inside {base_name}'s reserved "
+                  f"range ({where}) - that range is dispatched by value, not by name")
+            bad += 1
+    return bad
 
 def main():
     ap = argparse.ArgumentParser()
@@ -81,7 +123,8 @@ def main():
     ap.add_argument("--asm", default=DEF_ASM, dest="asm")
     args = ap.parse_args()
     rc_ids  = parse_rc(args.rc)
-    asm_ids = parse_asm(args.asm)
+    asm_equs = {}
+    asm_ids = parse_asm(args.asm, asm_equs)
 
     mismatches = 0
     shared = 0
@@ -113,6 +156,10 @@ def main():
             mismatches += 1
             print(f"[DUPLICATE] id {v} used by {', '.join(sorted(names))} - "
                   f"GetDlgItem can only ever find the first of them")
+    # ...and an id sitting inside a range reserved for runtime-created controls
+    ranged = check_ranges({**rc_ids, **asm_ids}, asm_equs)
+    mismatches += ranged
+
     rc_only  = sorted(set(rc_ids) - set(asm_ids))
     asm_only = sorted(set(asm_ids) - set(rc_ids))
     for name in rc_only:
@@ -123,7 +170,7 @@ def main():
               f"(= {asm_ids[name]}; asm-side, not gated)")
     print(f"idcheck: {mismatches} mismatches across {shared} shared IDs "
           f"({'clean' if mismatches == 0 else 'ID DRIFT PRESENT'}); "
-          f"{dups} duplicate id(s); "
+          f"{dups} duplicate id(s); {ranged} in reserved range(s); "
           f"{len(rc_only)} rc-only, {len(asm_only)} asm-only (informational)")
     sys.exit(min(mismatches, 255))
 

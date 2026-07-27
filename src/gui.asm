@@ -522,8 +522,8 @@ IDC_V_MNOPREVL   equ 263              ; "Disable attachment preview" label
 IDC_V_MTOUTS equ 266                  ; "Timeouts" section heading
 IDC_V_MPWDL  equ 277                  ; C9: "Password reminder (days)" label
 IDC_V_MPWD   equ 278                  ; C9: reminder interval edit
-IDC_RM_TEXT  equ 810                  ; C9 reminder dialog: explanatory text
-IDC_RM_PW    equ 811                  ;   and the password field
+IDC_RM_TEXT  equ 279                  ; C9 reminder dialog: explanatory text
+IDC_RM_PW    equ 280                  ;   and the password field
 IDC_V_MNOPREV    equ 264              ; disable-attachment-preview toggle
 IDC_V_MNOPREVINFO equ 265            ; "Disable attachment preview" info (i)
 IDC_V_MTHEME equ 240                  ; color-scheme cycle button (settings)
@@ -534,8 +534,11 @@ IDC_V_MIMPORT equ 246                 ; "Import..." button (Vordr .vaultz archiv
 IDC_V_MEXPZIP equ 247                 ; "Export to encrypted ZIP" button (settings)
 DLG_ICON      equ 740                 ; icon picker (glyph grid + colour swatches)
 IDC_I_PREV    equ 850                 ; icon picker: live preview tile
-IDC_IG_BASE   equ 800                 ; icon picker: glyph buttons (18)
-IDC_IC_BASE   equ 830                 ; icon picker: colour swatches (12)
+; RESERVED RANGES - not scalars.  A control id placed inside one of these is invisible
+; to idcheck's duplicate check (which compares scalars and skips *_BASE), and icon_proc
+; dispatches on them by range.  idcheck now flags any id that lands inside one.
+IDC_IG_BASE   equ 800                 ; icon picker: glyph buttons  (GLYPHPAL_N = 30)
+IDC_IC_BASE   equ 830                 ; icon picker: colour swatches (GLYPHCOL_N = 12)
 DLG_PWGEN     equ 760                 ; password-generator window
 IDC_PG_OUT    equ 761
 IDC_PG_REGEN  equ 762

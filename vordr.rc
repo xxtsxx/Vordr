@@ -66,8 +66,8 @@
 #define IDC_V_MSECINFO 256
 #define IDC_V_MPWDL    277
 #define IDC_V_MPWD     278
-#define IDC_RM_TEXT    810
-#define IDC_RM_PW      811
+#define IDC_RM_TEXT    279
+#define IDC_RM_PW      280
 #define IDC_V_MCLIPL   257
 #define IDC_V_MCLIP    258
 #define IDC_V_MIDLEL   259
