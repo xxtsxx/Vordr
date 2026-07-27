@@ -52,6 +52,13 @@ externdef g_lockerr_wss:dword           ; C3 diag: SetProcessWorkingSetSize erro
 extern log_result:proc                  ; C5: audit-log a GUI security event
 externdef g_cfg_loglevel:dword          ; C5: audit-log verbosity (from HKCU at GUI start)
 extern vault_reseal:proc
+extern vault_open_foreign:proc          ; .vordr import: decrypt another vault while this
+                                        ;   one stays open (parks/restores every global)
+extern fed_merge:proc                   ;   and merge its entries in
+extern zi_stage_vault:proc              ;   titles -> the shared selection checklist
+extern vault_free_foreign:proc          ;   release the source body (size lives in vault.asm)
+externdef g_merge_sel:dword             ;   1 = fed_merge honours g_sel
+externdef g_zi_hide:byte                ;   staged rows the checklist must not show
 extern vault_export_sel:proc            ; .vordr export: selected entries -> a child file,
                                         ;   master vault left open and untouched
 extern vault_ext_changed:proc           ; vault.asm: on-disk file changed since load?
@@ -968,6 +975,11 @@ hb_crlf  dw 13,10,0
 WSTR imp_g_pre,      <Imported >
 WSTR imp_g_post,     < entries.>
 WSTR imp_g_none,     <No importable entries were found. Vordr imports uncompressed (STORED) AES-zip members only - re-create hand-built archives with no compression.>
+; The ZIP wording above is meaningless for a .vordr import, and worse, it was shown for
+; the ordinary case of re-importing a file this vault already contains - which is not a
+; failure at all.  These two say what actually happened.
+WSTR imp_v_none,     <That vault has no entries to import. Its records are either already in the trash or carry no title.>
+WSTR imp_v_same,     <Nothing to import - this vault already has every entry you selected, and none of them was newer. Re-importing the same file is always safe.>
 WSTR imp_g_bad,      <That file is not a Vordr encrypted export (.zip), or the password was wrong.>
 WSTR zip_title,      <Export to encrypted archive>
 WSTR zip_defname,    <vordr-export.zip>
@@ -1295,8 +1307,14 @@ g_vaultfilter label word        ; "Vordr vault\0*.vordr\0All files\0*.*\0\0"
     dw '*','.','v','o','r','d','r',0
     dw 'A','l','l',' ','f','i','l','e','s',0
     dw '*','.','*',0,0
-g_impfilter label word          ; "Vordr export\0*.zip\0All files\0*.*\0\0"
-    dw 'V','o','r','d','r',' ','e','x','p','o','r','t',0
+; Import accepts both formats Vordr writes.  The FORMAT is decided by the file's magic,
+; not by this filter or the extension - a .vordr renamed to .zip still imports correctly.
+g_impfilter label word          ; "Vordr files\0*.vordr;*.zip\0...\0\0"
+    dw 'V','o','r','d','r',' ','f','i','l','e','s',0
+    dw '*','.','v','o','r','d','r',';','*','.','z','i','p',0
+    dw 'V','o','r','d','r',' ','v','a','u','l','t',0
+    dw '*','.','v','o','r','d','r',0
+    dw 'Z','I','P',' ','a','r','c','h','i','v','e',0
     dw '*','.','z','i','p',0
     dw 'A','l','l',' ','f','i','l','e','s',0
     dw '*','.','*',0,0
@@ -12746,7 +12764,16 @@ gui_sel_title endp
 gui_sel_exportable proc frame
     FRAME_PROLOG 48
     cmp     dword ptr [g_sel_src], 0
-    jne     gse_yes
+    je      gse_vault
+    ; staged import: rows are staged at their SOURCE index so the tick mask lines up, so
+    ; the ones that must not be offered are flagged rather than removed.
+    cmp     ecx, MAX_SEL
+    jae     gse_no
+    lea     r10, [g_zi_hide]
+    cmp     byte ptr [r10+rcx], 0
+    jne     gse_no
+    jmp     gse_yes
+gse_vault:
     mov     qword ptr [rbp-24], rcx
     call    vault_is_system
     test    eax, eax
@@ -14028,6 +14055,7 @@ gui_import proc frame
     mov     qword ptr [rbp-24], rcx             ; hdlg
     mov     dword ptr [rbp-64], 0               ; imported count
     mov     qword ptr [rbp-32], 0               ; raw ptr (0 = not allocated)
+    mov     qword ptr [rbp-56], 0               ; foreign body ptr (.vordr path)
     lea     rax, [g_impfilter]
     mov     qword ptr [g_pickfilter], rax
     mov     rcx, qword ptr [rbp-24]
@@ -14044,7 +14072,13 @@ gui_import proc frame
     WINCALL gui_msgbox, qword ptr [rbp-24], addr imp_g_bad, addr imp_g_title, 030h
     jmp     gim_done
 gim_read_ok:
-    ; ---- require a Vordr encrypted zip (PK + WinZip-AES method 99) ----
+    ; ---- a .vordr vault?  decided by MAGIC, never by the extension --------------
+    mov     r10, qword ptr [rbp-32]
+    cmp     dword ptr [rbp-40], 8
+    jb      gim_notvordr
+    cmp     dword ptr [r10], VAULT_MAGIC
+    je      gim_vault
+    ; ---- else require a Vordr encrypted zip (PK + WinZip-AES method 99) ----
     mov     r10, qword ptr [rbp-32]             ; raw
     cmp     dword ptr [rbp-40], 10
     jb      gim_notvordr
@@ -14079,6 +14113,64 @@ gim_read_ok:
 gim_notvordr:
     WINCALL gui_msgbox, qword ptr [rbp-24], addr imp_g_bad, addr imp_g_title, 030h
     jmp     gim_done
+    ; ---- .vordr: decrypt the foreign vault, then reuse the same checklist ------
+gim_vault:
+    WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_IMPPW, qword ptr [rbp-24], addr imppw_proc, 0
+    cmp     eax, 1
+    jne     gim_done
+    lea     rcx, [g_xlpw]                       ; -> g_cfg_pass, wiping g_xlpw at the source
+    call    password_to_utf8
+    mov     dword ptr [g_xlpwlen], 0
+    test    eax, eax
+    jz      gim_bad
+    ; vault_open_foreign parks and restores every live global, so the open vault is
+    ; untouched by this - and it wipes the password we hand it.
+    lea     rcx, [g_imgpath]
+    lea     rdx, [g_cfg_pass]
+    mov     r8d, dword ptr [g_cfg_passlen]
+    lea     r9, [rbp-56]                        ; -> foreign body
+    call    vault_open_foreign
+    mov     dword ptr [rbp-72], eax
+    test    eax, eax
+    jnz     gim_vwrongpw
+    mov     rcx, qword ptr [rbp-56]
+    call    zi_stage_vault                      ; titles into the shared staging arrays
+    mov     dword ptr [rbp-64], eax
+    test    eax, eax
+    jz      gim_vempty
+    mov     dword ptr [g_sel_src], 1
+    mov     ecx, dword ptr [rbp-64]
+    call    gui_sel_all
+    WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_SELECT, qword ptr [rbp-24], addr select_proc, 0
+    cmp     eax, 1
+    jne     gim_vfree                           ; cancelled -> nothing merged
+    mov     dword ptr [g_merge_sel], 1          ; honour the ticks
+    mov     rcx, qword ptr [rbp-56]
+    call    fed_merge
+    mov     dword ptr [g_merge_sel], 0
+    mov     dword ptr [rbp-64], eax
+    test    eax, eax
+    jz      gim_vsame                           ; dedup by entry id: all already present
+    mov     rcx, qword ptr [rbp-56]             ; done with the source body
+    call    vault_free_foreign
+    mov     qword ptr [rbp-56], 0
+    mov     eax, dword ptr [rbp-64]
+    jmp     gim_ok                              ; reseal + audit + "Imported N entries."
+gim_vempty:
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr imp_v_none, addr imp_g_title, 030h
+    jmp     gim_vfree
+gim_vsame:
+    ; Not a failure: the merge dedups by entry id, so re-importing a file this vault
+    ; already holds correctly changes nothing.  Say that, with an information icon.
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr imp_v_same, addr imp_g_title, 040h
+    jmp     gim_vfree
+gim_vwrongpw:
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr imp_xls_wrongpw, addr imp_g_title, 030h
+gim_vfree:
+    mov     rcx, qword ptr [rbp-56]
+    call    vault_free_foreign
+    mov     qword ptr [rbp-56], 0
+    jmp     gim_done
 gim_sel:
     ; ---- selection screen (all entries pre-checked; import adds them as new) ----
     mov     dword ptr [g_sel_src], 1
@@ -14097,9 +14189,10 @@ gim_commit:
     WINCALL gui_msgbox, qword ptr [rbp-24], addr imp_g_none, addr imp_g_title, 030h
     jmp     gim_done
 gim_ok:
+    mov     dword ptr [rbp-64], eax             ; both paths arrive with the count in eax
     call    vault_reseal
     lea     rcx, [ev_import]                    ; C5: audit the import
-    mov     edx, eax
+    mov     edx, dword ptr [rbp-64]
     call    log_result
     mov     rcx, qword ptr [rbp-24]
     call    gui_poplist

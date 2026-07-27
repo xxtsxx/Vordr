@@ -29,6 +29,9 @@ extern WideCharToMultiByte:proc
 extern attach_reset_pending:proc
 extern attach_stage:proc
 extern vault_build_entry:proc
+extern vault_entry_len:proc             ; walking a decrypted .vordr import source
+extern entry_field_ptr:proc             ;   (pointer-based: it is NOT the live body)
+extern entry_has_field:proc
 extern print_a:proc
 extern print_u64:proc
 extern fuzz_seed:proc                   ; G7: reproducible/logged fuzzer seed (main.asm)
@@ -94,6 +97,12 @@ g_zi_titles dq ZI_MAXENT dup (?)          ; per-entry wide title ptr (into g_zi_
 public g_zi_tlens
 g_zi_tlens  dd ZI_MAXENT dup (?)          ; per-entry wide title length (wchars)
 g_zi_tbuf   db ZI_TBUF dup (?)            ; persistent staged-title text (wide)
+public g_zi_hide
+g_zi_hide   db ZI_MAXENT dup (?)          ; 1 = staged row the checklist must not show.
+                                          ;   Staging CANNOT compact these away: fed_merge
+                                          ;   indexes g_sel by the SOURCE entry index, so
+                                          ;   dropping rows would slide every tick onto the
+                                          ;   wrong record.  Stage all, hide some.
 
 .const
 zi_jsonname db "vordr.json"
@@ -731,6 +740,81 @@ zi_addattach endp
 ;   title to a NUL-terminated wide string in the persistent title arena and record
 ;   it in g_zi_titles[index] / g_zi_tlens[index].  On overflow, records "".
 ; =============================================================================
+; =============================================================================
+; zi_stage_vault(rcx = decrypted foreign vault body) -> eax = entries staged.
+;   Fills the same staging arrays zi_stage builds from a ZIP, so the existing
+;   selection checklist drives a .vordr import unchanged.
+;
+;   Every source entry is staged AT ITS PHYSICAL INDEX - fed_merge indexes g_sel by that
+;   index, so compacting the list would slide every tick onto a different record.  Rows
+;   that must not be offered (the source's system item, and anything in its trash) are
+;   flagged in g_zi_hide instead; fed_merge refuses them independently anyway.
+; =============================================================================
+public zi_stage_vault
+zi_stage_vault proc frame
+    FRAME_PROLOG 96
+    ; [rbp-24]=body [rbp-32]=cursor [rbp-40]=i [rbp-48]=count [rbp-56]=title len
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [g_zi_tap], 0
+    mov     dword ptr [g_zi_stg_n], 0
+    test    rcx, rcx
+    jz      zsv_done
+    mov     eax, dword ptr [rcx]
+    cmp     eax, ZI_MAXENT
+    jbe     @F
+    mov     eax, ZI_MAXENT                      ; stage what fits; the rest stay unticked
+@@: mov     dword ptr [rbp-48], eax
+    lea     r10, [rcx+4]
+    mov     qword ptr [rbp-32], r10
+    mov     dword ptr [rbp-40], 0
+zsv_loop:
+    mov     eax, dword ptr [rbp-40]
+    cmp     eax, dword ptr [rbp-48]
+    jae     zsv_done
+    lea     r11, [g_zi_hide]                    ; hidden unless proven otherwise
+    mov     byte ptr [r11+rax], 1
+    mov     rcx, qword ptr [rbp-32]
+    mov     edx, VF_SYSTEM
+    call    entry_has_field
+    test    eax, eax
+    jnz     zsv_blank                           ; the source's own system item
+    mov     rcx, qword ptr [rbp-32]
+    mov     edx, VF_DELETED
+    call    entry_has_field
+    test    eax, eax
+    jnz     zsv_blank                           ; a record the source had in its trash
+    mov     rcx, qword ptr [rbp-32]             ; title -> the checklist row
+    mov     edx, VF_TITLE
+    lea     r8, [rbp-56]
+    call    entry_field_ptr
+    test    rax, rax
+    jz      zsv_blank                           ; untitled: nothing to show, so do not offer
+    mov     rcx, qword ptr [rbp-40]
+    mov     rdx, rax
+    mov     r8d, dword ptr [rbp-56]
+    call    zi_stage_title
+    mov     eax, dword ptr [rbp-40]
+    lea     r11, [g_zi_hide]
+    mov     byte ptr [r11+rax], 0               ; a real, showable row
+    jmp     zsv_next
+zsv_blank:
+    mov     rcx, qword ptr [rbp-40]             ; keep the index slot occupied
+    lea     rdx, [zi_empty_w]
+    xor     r8d, r8d
+    call    zi_stage_title
+zsv_next:
+    mov     rcx, qword ptr [rbp-32]
+    call    vault_entry_len
+    add     qword ptr [rbp-32], rax
+    inc     dword ptr [rbp-40]
+    jmp     zsv_loop
+zsv_done:
+    mov     eax, dword ptr [rbp-48]
+    mov     dword ptr [g_zi_stg_n], eax
+    FRAME_EPILOG
+    ret
+zi_stage_vault endp
+
 zi_stage_title proc frame
     FRAME_PROLOG 128                            ; room for 6-arg MBtoWC arg spill
     mov     qword ptr [rbp-24], rcx             ; index

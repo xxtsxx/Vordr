@@ -40,6 +40,9 @@ extern sec_lock:proc
 extern pwgen_ex:proc
 externdef g_pwgen_outcap:dword          ; E16: one-shot pwgen output capacity
 externdef g_sel:byte                    ; per-entry export selection mask (gui.asm)
+extern zi_stage_vault:proc              ; .vordr import staging (zipimport.asm)
+externdef g_zi_hide:byte                ;   rows the checklist must not show
+externdef g_zi_stg_n:dword              ;   staged row count
 extern secmem_free:proc
 extern read_file:proc
 extern write_file:proc
@@ -3472,6 +3475,22 @@ vi_pw2d:
     call    vault_ext_changed
     test    eax, eax
     jnz     vi_faillk
+    ; ---- staging must offer the source's entries to the checklist ------------
+    ; The GUI reaches fed_merge only through this: if staging reports nothing, the user
+    ; is told "no importable entries" no matter how good the source is.
+    mov     rcx, qword ptr [rbp-32]
+    call    zi_stage_vault
+    cmp     eax, 3                              ; all three source entries staged...
+    jne     vi_faillk
+    cmp     dword ptr [g_zi_stg_n], 3
+    jne     vi_faillk
+    lea     r10, [g_zi_hide]                    ; ...and none of them hidden (do_seed makes
+    cmp     byte ptr [r10+0], 0                 ;   no system item and trashes nothing)
+    jne     vi_faillk
+    cmp     byte ptr [r10+1], 0
+    jne     vi_faillk
+    cmp     byte ptr [r10+2], 0
+    jne     vi_faillk
     ; ---- merge only the ticked source entries -------------------------------
     lea     r10, [g_sel]
     mov     byte ptr [r10+0], 1
@@ -4772,6 +4791,21 @@ vof_restore:
     ret
 vault_open_foreign endp
 
+; vault_free_foreign(rcx = body from vault_open_foreign) - release it.  Null-safe.
+;   Keeps VAULT_BODY_MAX in the module that allocates, so callers cannot mirror it and
+;   drift (constcheck would only catch a mismatch after it was already written).
+public vault_free_foreign
+vault_free_foreign proc frame
+    FRAME_PROLOG 32
+    test    rcx, rcx
+    jz      vff_done
+    mov     rdx, VAULT_BODY_MAX
+    call    secmem_free
+vff_done:
+    FRAME_EPILOG
+    ret
+vault_free_foreign endp
+
 ; fed_merge(rcx = source body ptr) -> eax = number of entries added or updated.
 ;   Merge every source entry into the live body, deduped by the 16-byte entry id:
 ;   an id already present is updated only if the source's `modified` is newer, else
@@ -5844,6 +5878,52 @@ ehf_no:
     xor     eax, eax
     ret
 entry_has_field endp
+
+; entry_field_ptr(rcx = entry ptr, edx = kind, r8 = *out len) -> rax = value ptr, 0 none.
+;   Pointer-based twin of vault_field_at, for walking a FOREIGN body.  Skips the
+;   {u16 labellen, label} prefix on a VF_LABELED field so the caller always gets the
+;   value itself.  Leaf.
+public entry_field_ptr
+entry_field_ptr proc
+    test    rcx, rcx
+    jz      efp_no
+    mov     r9d, dword ptr [rcx+32]             ; field_count
+    lea     r10, [rcx+36]
+efp_lp:
+    test    r9d, r9d
+    jz      efp_no
+    movzx   eax, word ptr [r10]                 ; raw type
+    mov     r11d, eax
+    and     eax, VF_KINDMASK
+    cmp     eax, edx
+    je      efp_hit
+    mov     eax, dword ptr [r10+2]
+    add     r10, 6
+    add     r10, rax
+    dec     r9d
+    jmp     efp_lp
+efp_hit:
+    mov     eax, dword ptr [r10+2]              ; field length
+    lea     r10, [r10+6]                        ; -> bytes
+    test    r11d, VF_LABELED
+    jz      efp_plain
+    cmp     eax, 2
+    jb      efp_no
+    movzx   r11d, word ptr [r10]                ; labellen
+    lea     r11d, [r11d+2]
+    cmp     eax, r11d
+    jb      efp_no
+    sub     eax, r11d
+    add     r10, r11
+efp_plain:
+    mov     dword ptr [r8], eax
+    mov     rax, r10
+    ret
+efp_no:
+    mov     dword ptr [r8], 0
+    xor     eax, eax
+    ret
+entry_field_ptr endp
 
 ; vault_is_deleted(ecx = index) -> eax = 1 if that entry is in the trash.
 ;   The vault-side twin of gui_entry_is_deleted, so the export paths can refuse trashed
