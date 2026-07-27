@@ -51,6 +51,8 @@ externdef g_lockerr_wss:dword           ; C3 diag: SetProcessWorkingSetSize erro
 extern log_result:proc                  ; C5: audit-log a GUI security event
 externdef g_cfg_loglevel:dword          ; C5: audit-log verbosity (from HKCU at GUI start)
 extern vault_reseal:proc
+extern vault_export_sel:proc            ; .vordr export: selected entries -> a child file,
+                                        ;   master vault left open and untouched
 extern vault_ext_changed:proc           ; vault.asm: on-disk file changed since load?
 extern vault_remove_at:proc
 extern vault_count:proc
@@ -134,6 +136,7 @@ externdef g_uline_br2:qword
 externdef g_cfg_in:qword
 externdef g_rollback:dword              ; vault.asm: 1 if the unlocked file is a rollback
 externdef g_cfg_pass:byte
+externdef g_cfg_passlen:dword
 externdef g_cfg_title:qword
 externdef g_cfg_user:qword
 externdef g_cfg_secret:qword
@@ -283,6 +286,7 @@ MB_ICONINFORMATION  equ 40h
 MB_ICONWARNING      equ 30h
 MB_YESNO            equ 4
 MB_ICONQUESTION     equ 20h
+MB_OKCANCEL         equ 1
 MB_DEFBUTTON2       equ 100h
 IDYES               equ 6
 IDNO                equ 7
@@ -944,6 +948,16 @@ WSTR imp_g_none,     <No importable entries were found. Vordr imports uncompress
 WSTR imp_g_bad,      <That file is not a Vordr encrypted export (.zip), or the password was wrong.>
 WSTR zip_title,      <Export to encrypted archive>
 WSTR zip_defname,    <vordr-export.zip>
+; No extension: the save box shows just the stem, so nothing on screen can disagree
+; with the file-type dropdown, and the modern dialog appends the selected type's
+; extension itself.  gui_fix_ext then settles it from the filter index regardless.
+WSTR exp_defname,    <vordr-export>
+WSTR exp_title,      <Export>
+WSTR w_dotvordr,     <.vordr>
+WSTR w_dotzip,       <.zip>
+WSTR exp_pw_vordr,   <This writes the selected entries (including passwords and TOTP secrets) into a new encrypted .vordr vault, protected only by the password you choose below. Store it safely and delete it when done.>
+WSTR exp_pw_zip,     <This writes the selected entries (including passwords and TOTP secrets) into one .zip archive encrypted with WinZip AE-2, protected only by the password you choose below. Store it safely.>
+WSTR exp_zipwarn,    <ZIP is the weaker format - use it only when the export must be read by other software. Attachment names become random ids but keep their extensions, so a holder can see what file types are inside. Continue?>
 WSTR exp_done_ok,    <Export complete. Keep the file safe and delete it when you no longer need it.>
 WSTR pg_lbl_up,  <Uppercase>
 WSTR pg_lbl_lo,  <Lowercase>
@@ -1241,7 +1255,12 @@ g_imgfilter label word          ; "Images\0*.png;*.jpg;*.jpeg;*.bmp;*.gif\0All\0
 g_allfilter label word          ; "All files\0*.*\0\0"
     dw 'A','l','l',' ','f','i','l','e','s',0
     dw '*','.','*',0,0
-g_zipfilter label word          ; "ZIP archive\0*.zip\0\0"
+; Export destination picker.  .vordr is FIRST so it is the default file type: it is
+; the stronger format (AES-256-GCM + Argon2id + a full-file MAC, attachments and all).
+; ZIP is offered second, for interoperability only, and warns before it is used.
+g_expfilter label word          ; "Vordr vault\0*.vordr\0ZIP archive\0*.zip\0\0"
+    dw 'V','o','r','d','r',' ','v','a','u','l','t',0
+    dw '*','.','v','o','r','d','r',0
     dw 'Z','I','P',' ','a','r','c','h','i','v','e',0
     dw '*','.','z','i','p',0,0
 g_vaultfilter label word        ; "Vordr vault\0*.vordr\0All files\0*.*\0\0"
@@ -1516,6 +1535,8 @@ g_storagelabel dw 300 dup (?)              ; unlock dialog: "<location> . <vault
 g_imgbuf      dq ?                         ; imported file bytes (mem_alloc'd)
 g_imgbuflen   dq ?
 g_pickfilter  dq ?                         ; OPENFILENAME filter for the next pick (0=image)
+g_exp_iszip   dd ?                         ; export format the user chose: 0 = .vordr, 1 = .zip
+                                           ;   (from the save dialog's filter index)
 g_tmpfile     dw 1024 dup (?)              ; temp path for opening an attachment (wide)
 align 8
 g_tempfiles   db MAX_TEMPFILES*TEMPREC dup (?)  ; tracked decrypt-to-temp paths + sizes
@@ -12973,6 +12994,108 @@ gui_sel_all endp
 ;   encrypted ZIP (vordr.json of all tiles + every attachment, history excluded),
 ;   then pick a save path and write it.
 ; =============================================================================
+; gfe_tailci(rcx = path, edx = pathlen, r8 = suffix, r9d = suffixlen)
+;   -> eax = 1 if path ends with suffix, case-insensitive (ASCII).  Leaf.
+gfe_tailci proc
+    cmp     edx, r9d
+    jb      gtc_no
+    sub     edx, r9d                            ; -> start of the tail
+    xor     r10d, r10d
+gtc_lp:
+    cmp     r10d, r9d
+    jae     gtc_yes
+    mov     eax, edx
+    add     eax, r10d
+    movzx   eax, word ptr [rcx+rax*2]
+    or      eax, 20h                            ; ASCII fold; both sides are literals here
+    movzx   r11d, word ptr [r8+r10*2]
+    or      r11d, 20h
+    cmp     eax, r11d
+    jne     gtc_no
+    inc     r10d
+    jmp     gtc_lp
+gtc_yes:
+    mov     eax, 1
+    ret
+gtc_no:
+    xor     eax, eax
+    ret
+gfe_tailci endp
+
+; gui_fix_ext(rcx = wide buffer, edx = capacity in chars, r8d = 1 for .zip / 0 for .vordr)
+;   Force the buffer's extension to agree with the chosen format.
+;   GetSaveFileName only applies lpstrDefExt when the name has NO extension, so changing
+;   the file type never rewrote an existing ".vordr" to ".zip" - pick ZIP and you still
+;   got vordr-export.vordr.  The FILTER INDEX is the authority: whatever the type box
+;   says, the name is made to match.  Only a trailing ".vordr"/".zip" is stripped, so
+;   "notes.2026" keeps its dots and simply gains the right suffix.
+gui_fix_ext proc frame
+    FRAME_PROLOG 64
+    ; [rbp-24]=buf [rbp-32]=cap [rbp-40]=iszip [rbp-48]=len
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-32], edx
+    mov     dword ptr [rbp-40], r8d
+    mov     r10, rcx
+    xor     ecx, ecx
+gfe_len:
+    cmp     word ptr [r10+rcx*2], 0
+    je      gfe_have
+    inc     ecx
+    mov     eax, dword ptr [rbp-32]
+    sub     eax, 8
+    cmp     ecx, eax
+    jb      gfe_len
+gfe_have:
+    mov     dword ptr [rbp-48], ecx
+    mov     rcx, qword ptr [rbp-24]             ; strip a trailing ".vordr"...
+    mov     edx, dword ptr [rbp-48]
+    lea     r8, [w_dotvordr]
+    mov     r9d, 6
+    call    gfe_tailci
+    test    eax, eax
+    jz      @F
+    sub     dword ptr [rbp-48], 6
+    jmp     gfe_app
+@@: mov     rcx, qword ptr [rbp-24]             ; ...or a trailing ".zip"
+    mov     edx, dword ptr [rbp-48]
+    lea     r8, [w_dotzip]
+    mov     r9d, 4
+    call    gfe_tailci
+    test    eax, eax
+    jz      gfe_app
+    sub     dword ptr [rbp-48], 4
+gfe_app:
+    mov     r10, qword ptr [rbp-24]
+    mov     ecx, dword ptr [rbp-48]
+    lea     r11, [w_dotvordr]
+    cmp     dword ptr [rbp-40], 0
+    je      @F
+    lea     r11, [w_dotzip]
+@@: xor     r8d, r8d
+gfe_cp:
+    mov     ax, word ptr [r11+r8*2]
+    mov     word ptr [r10+rcx*2], ax
+    test    ax, ax
+    jz      gfe_done
+    inc     ecx
+    inc     r8d
+    mov     eax, dword ptr [rbp-32]
+    dec     eax
+    cmp     ecx, eax
+    jb      gfe_cp
+    mov     word ptr [r10+rcx*2], 0
+gfe_done:
+    FRAME_EPILOG
+    ret
+gui_fix_ext endp
+
+; NOTE: an OFN_ENABLEHOOK hook handling CDN_TYPECHANGE would let us rewrite the
+; file-name edit live when the type changes - but installing ANY hook drops the save
+; box off the modern Vista+ dialog and back onto the legacy comdlg32 one.  That is a
+; far worse regression than a stale suffix, so the approach was removed.  Instead the
+; default name carries NO extension: nothing on screen can then contradict the type
+; box, and the extension is settled from the filter index on return (gui_fix_ext).
+
 gui_export proc frame
     FRAME_PROLOG 64
     mov     qword ptr [rbp-24], rcx
@@ -12983,9 +13106,75 @@ gui_export proc frame
     WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_SELECT, qword ptr [rbp-24], addr select_proc, 0
     cmp     eax, 1
     jne     gx_done
-    WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_XLPW, qword ptr [rbp-24], addr xlpw_proc, 0
-    cmp     eax, 1
+    ; ---- destination FIRST: the chosen file type is the chosen format ------
+    lea     rax, [g_expfilter]                   ; .vordr first (default), .zip second
+    mov     qword ptr [g_pickfilter], rax
+    lea     rcx, [g_imgpath]
+    lea     rdx, [exp_defname]
+    call    gui_wcpy_capped
+    mov     dword ptr [g_exp_iszip], 0           ; .vordr is filter 1 = the default
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, 1
+    call    img_pick
+    test    eax, eax
+    jz      gx_done
+    lea     r10, [g_ofn]                         ; the TYPE box is the authority, not the
+    xor     eax, eax                             ;   text the user was left with: filter 2
+    cmp     dword ptr [r10].OPENFILENAMEW.nFilterIndex, 2   ;   = ZIP, anything else = vordr
+    jne     @F
+    mov     eax, 1
+@@: mov     dword ptr [g_exp_iszip], eax
+    mov     dword ptr [rbp-40], eax              ; 0 = .vordr, 1 = .zip
+    lea     rcx, [g_imgpath]                     ; belt and braces: the hook keeps the shown
+    mov     edx, MAX_PATH_CHARS                  ;   name in step, this guarantees the path
+    mov     r8d, eax                             ;   actually written matches the format
+    call    gui_fix_ext
+    cmp     dword ptr [rbp-40], 0
+    je      gx_askpw
+    ; ZIP is the weaker path and must be a deliberate choice, so say plainly what is
+    ; given up - including the extensions kept in member names - and let them back out.
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr exp_zipwarn, addr exp_title, \
+            <MB_OKCANCEL or MB_ICONWARNING>
+    cmp     eax, IDOK
     jne     gx_done
+gx_askpw:
+    ; The export password is a secret being typed, so it honours the same
+    ; secure-desktop setting as the master password rather than being the one
+    ; password-entry box that ignores it.
+    cmp     dword ptr [g_secunlock], 0
+    je      gx_pw_normal
+    mov     ecx, DLG_XLPW
+    lea     rdx, [xlpw_proc]
+    call    gui_secdesk_show
+    jmp     gx_pw_res
+gx_pw_normal:
+    WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_XLPW, qword ptr [rbp-24], addr xlpw_proc, 0
+gx_pw_res:
+    cmp     rax, 1
+    jne     gx_done
+    cmp     dword ptr [rbp-40], 0
+    jne     gx_zip
+    ; ---- .vordr: seal a child vault; the master stays open throughout -------
+    lea     rcx, [g_xlpw]                        ; -> g_cfg_pass (and wipes g_xlpw)
+    call    password_to_utf8
+    test    eax, eax
+    jz      gx_composefail
+    lea     rcx, [g_imgpath]
+    call    vault_export_sel
+    mov     dword ptr [rbp-32], eax
+    lea     rcx, [ev_export]                     ; C5: audit the export
+    mov     edx, eax
+    call    log_result
+    lea     rcx, [g_cfg_pass]                    ; the EXPORT password must not be left
+    mov     edx, MAX_PASSWORD_BYTES+1            ;   sitting in the master's buffer
+    call    secure_zero
+    mov     dword ptr [g_cfg_passlen], 0
+    call    ges_wipepw
+    cmp     dword ptr [rbp-32], 0
+    jne     gx_writefail
+    WINCALL MessageBoxW, qword ptr [rbp-24], addr exp_done_ok, addr exp_title, 040h
+    jmp     gx_done
+gx_zip:
     lea     rcx, [g_xlpw]                        ; wide password + length (bytes)
     mov     edx, dword ptr [g_xlpwlen]
     call    ze_compose                           ; -> encrypted zip in g_zbuf (all tiles, no history)
@@ -12996,16 +13185,6 @@ gui_export proc frame
     mov     eax, dword ptr [rbp-32]
     test    eax, eax
     jnz     gx_composefail
-    lea     rax, [g_zipfilter]                   ; pick a .zip save path
-    mov     qword ptr [g_pickfilter], rax
-    lea     rcx, [g_imgpath]
-    lea     rdx, [zip_defname]
-    call    gui_wcpy_capped
-    mov     rcx, qword ptr [rbp-24]
-    mov     edx, 1
-    call    img_pick
-    test    eax, eax
-    jz      gx_zip_cancel
     lea     rcx, [g_imgpath]
     lea     r11, [g_zbuf]
     mov     rdx, qword ptr [r11]
@@ -13016,11 +13195,7 @@ gui_export proc frame
     call    ges_wipepw
     cmp     dword ptr [rbp-32], 0
     jne     gx_writefail
-    WINCALL MessageBoxW, qword ptr [rbp-24], addr exp_done_ok, addr zip_title, 040h
-    jmp     gx_done
-gx_zip_cancel:
-    call    ze_free
-    call    ges_wipepw
+    WINCALL MessageBoxW, qword ptr [rbp-24], addr exp_done_ok, addr exp_title, 040h
     jmp     gx_done
 gx_composefail:
     call    ze_free
@@ -14329,6 +14504,11 @@ xpp_init:
     call    theme_attach
     mov     rcx, qword ptr [rbp-8]
     call    gui_set_winicon
+    lea     rax, [exp_pw_vordr]                 ; the blurb must describe the format the
+    cmp     dword ptr [g_exp_iszip], 0          ;   user actually picked, not whatever the
+    je      @F                                  ;   .rc happened to say when ZIP was the
+    lea     rax, [exp_pw_zip]                   ;   only option
+@@: WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_XP_WARN, rax
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_XP_PW, EM_SETCUEBANNER, 1, addr cue_xppw
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_XP_PW2, EM_SETCUEBANNER, 1, addr cue_xppw2
     mov     dword ptr [g_uline_ctl], 0          ; start with default (accent) underlines
