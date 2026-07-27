@@ -80,10 +80,12 @@ rem framecheck: static scan for WINCALL stack-arg spills that overflow a proc's
 rem frame (the raw-dialog-proc return-address-smash class, see
 rem tools\framecheck.py).  Advisory by default; "build strict" makes a FATAL
 rem finding fail the build.  Skipped silently when python is not on PATH.
-rem idcheck (tools\idcheck.py), deadcode (tools\deadcode.py) and aligncheck
+rem idcheck (tools\idcheck.py - rc/asm control-ID mismatches, and two controls
+rem sharing one ID, which GetDlgItem cannot tell apart), constcheck
+rem (tools\constcheck.py - an `equ` that disagrees between modules, the
+rem MAX_FIELDS 56-vs-96 class), deadcode (tools\deadcode.py) and aligncheck
 rem (tools\aligncheck.py - odd-address wide strings of the tray_cls class) gate
-rem the same way: rc/asm control-ID mismatches / dead symbols / misaligned
-rem wide-string labels fail a strict build.
+rem the same way: any finding fails a strict build.
 rem ---------------------------------------------------------------------------
 where python >nul 2>nul
 if errorlevel 1 goto :nofc
@@ -104,6 +106,15 @@ if errorlevel 1 (
         goto :failed
     )
     echo idcheck: WARNING - ID mismatches above; build continues. Use "build strict" to gate.
+)
+echo === constcheck ===
+python tools\constcheck.py
+if errorlevel 1 (
+    if "%STRICT%"=="1" (
+        echo constcheck: a constant disagrees across modules - failing strict build
+        goto :failed
+    )
+    echo constcheck: WARNING - cross-module drift above; build continues. Use "build strict" to gate.
 )
 echo === deadcode ===
 python tools\deadcode.py
