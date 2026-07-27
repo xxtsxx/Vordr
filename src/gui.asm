@@ -11023,6 +11023,14 @@ vp_init:
     mov     qword ptr [g_dlgfont], rax
     mov     dword ptr [g_field_count], 0
     mov     dword ptr [g_menu_open], 0
+    xor     ecx, ecx                         ; ...and theme.asm's copy of that state, which
+    call    theme_overlay                    ;   OUTLIVES the dialog.  Locking with settings
+                                             ;   open (Esc, Ctrl+L, the hotkey, idle, Win+L)
+                                             ;   destroys the window with g_overlay still 1,
+                                             ;   and theme_erase then skips theme_sidecard -
+                                             ;   so the sidebar card stayed unpainted for the
+                                             ;   whole next session.  g_menu_open was already
+                                             ;   reset here; this is the half that was missed.
     mov     rcx, qword ptr [rbp-8]           ; keep the settings overlay hidden
     lea     rdx, [g_menu_ids]
     mov     r8d, MENU_ID_COUNT
