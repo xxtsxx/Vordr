@@ -102,7 +102,7 @@ set /a T_SELFTEST=!T1!-!T0!
 
 rem -------------------------------------------------------------- roundtrip --
 call :now T0
-echo === stage: roundtrip (seedtest / atgen / zitest / phtest / secscan / secfreedup / tmptest / fztest / trtest / vfuzz / fuzzzip / jfuzz / bktest / mactest / rbtest / sysitemkat / xctest / reload / attfuzz / zexcap / zexname / convcap / healthkat / pkat / kdfparam / vaultexportkat / vaultexpattkat) ===
+echo === stage: roundtrip (seedtest / atgen / zitest / phtest / secscan / secfreedup / tmptest / fztest / trtest / vfuzz / fuzzzip / jfuzz / bktest / mactest / rbtest / sysitemkat / vexselkat / xctest / reload / attfuzz / zexcap / zexname / convcap / healthkat / pkat / kdfparam / vaultexportkat / vaultexpattkat) ===
 set RT=PASS
 
 rem --- data-loss guard: the RELEASE binary (still in bin\ from the build stage)
@@ -176,6 +176,9 @@ if not "!errorlevel!"=="0" ( echo   rbtest: FAIL ^(exit !errorlevel!, anti-rollb
 
 bin\vordr.exe sysitemkat "%WORK%\si.vault" > "%WORK%\sysitemkat.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   sysitemkat: FAIL ^(exit !errorlevel!, system item hidden/round-trip^) & set RT=FAIL )
+
+bin\vordr.exe vexselkat "%WORK%\vs.vault" > "%WORK%\vexselkat.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   vexselkat: FAIL ^(exit !errorlevel!, .vordr export selection / master untouched^) & set RT=FAIL )
 
 bin\vordr.exe xctest "%WORK%\xc.vault" > "%WORK%\xctest.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   xctest: FAIL ^(exit !errorlevel!, external-change detection^) & set RT=FAIL )

@@ -468,6 +468,7 @@ g_json      dq 3 dup (?)             ; {ptr,len,cap} for the fields JSON
 ; the worst case is 762.  The old 512/500 silently truncated - and because
 ; WideCharToMultiByte reports that by returning 0, the password became EMPTY.
 ZE_PWCAP    equ 1024
+ZE_EXT_MAX  equ 12                   ; max ".ext" kept in a ZIP member name (dot + 11)
 g_ze_u8pw   db ZE_PWCAP dup (?)      ; wide->UTF-8 export password scratch
 g_zj_fld    db 40 dup (?)            ; vault_field_get out struct
 g_zj_fn     db 512 dup (?)           ; attachment filename (UTF-8)
@@ -871,6 +872,73 @@ azp_idz:
 azp_iddone:
     mov     eax, dword ptr [rbp-56]
     add     eax, 16                             ; pathlen = prefix + 16 hex
+    mov     dword ptr [rbp-52], eax             ; pathlen so far (every exit reads this)
+    ; ---- keep the real EXTENSION, and nothing else -------------------------
+    ; The stem stays opaque; the suffix is retained so the archive is usable in other
+    ; software.  That is a deliberate, documented leak - the KIND of file, never its
+    ; name - and the user is warned before any ZIP export.
+    ; This is attacker-influenced data going into a cleartext ZIP member name, so it
+    ; is validated hard: bounded, and [A-Za-z0-9] ONLY.  No dot-dot, no '/', no '\',
+    ; nothing that could steer an extractor outside the folder.  Anything that fails
+    ; the check is dropped and the member simply keeps its opaque name.
+    mov     r9d, dword ptr [rbp-48]             ; fnlen
+    cmp     r9d, 2
+    jb      azp_noext
+    mov     r10d, r9d                           ; scan back for the last '.'
+azp_dot:
+    dec     r10d
+    js      azp_noext                           ; no '.' at all
+    lea     r11, [g_zj_fn]
+    cmp     byte ptr [r11+r10], '.'
+    jne     azp_dot
+    mov     ecx, r9d
+    sub     ecx, r10d                           ; extlen, including the dot
+    cmp     ecx, 2
+    jb      azp_noext                           ; a trailing '.' carries nothing
+    cmp     ecx, ZE_EXT_MAX
+    ja      azp_noext                           ; implausible -> drop it
+    mov     r8d, r10d
+    inc     r8d                                 ; first char after the '.'
+azp_extval:
+    cmp     r8d, r9d
+    jae     azp_extok
+    lea     r11, [g_zj_fn]
+    movzx   eax, byte ptr [r11+r8]
+    cmp     eax, '0'
+    jb      azp_noext
+    cmp     eax, '9'
+    jbe     azp_extnext
+    cmp     eax, 'A'
+    jb      azp_noext
+    cmp     eax, 'Z'
+    jbe     azp_extnext
+    cmp     eax, 'a'
+    jb      azp_noext
+    cmp     eax, 'z'
+    ja      azp_noext
+azp_extnext:
+    inc     r8d
+    jmp     azp_extval
+azp_extok:
+    mov     eax, dword ptr [rbp-52]             ; append ".<ext>" to the member name
+    lea     r11, [g_zj_path]
+    add     r11, rax
+    lea     rcx, [g_zj_fn]
+    add     rcx, r10                            ; -> the '.'
+    mov     eax, r9d
+    sub     eax, r10d                           ; bytes to copy (<= ZE_EXT_MAX)
+    xor     r8d, r8d
+azp_extcp:
+    cmp     r8d, eax
+    jae     azp_extdone
+    mov     dl, byte ptr [rcx+r8]
+    mov     byte ptr [r11+r8], dl
+    inc     r8d
+    jmp     azp_extcp
+azp_extdone:
+    add     dword ptr [rbp-52], eax
+azp_noext:
+    mov     eax, dword ptr [rbp-52]
     FRAME_EPILOG
     ret
 ze_att_zippath endp
@@ -1223,12 +1291,18 @@ cmd_zexcap endp
 ;   name lands in g_zj_fn for ze_build_json to put inside the encrypted json.
 ; =============================================================================
 .data
-CSTR zxn_ok,  "zexname: PASS (member name opaque; real filename only in the encrypted json)",13,10
+CSTR zxn_ok,  "zexname: PASS (stem opaque, ext kept + validated; real name only in the json)",13,10
 CSTR zxn_bad, "zexname: FAIL (attachment filename leaked into the cleartext ZIP member name)",13,10
 align 8
 zxn_val db 68 dup (0)                       ; AttachRef: id = 00 11 22 .. at +0
         dw 'p','a','s','s','p','o','r','t','-','s','c','a','n','.','p','d','f',0
-zxn_exp db "0000002a/0011223344556677"      ; entry 42 + the id's first 8 bytes
+zxn_exp db "0000002a/0011223344556677.pdf"  ; entry 42 + the id's first 8 bytes + ext
+align 8
+zxn_b1  db 68 dup (0)                       ; hostile: a separator inside the "extension"
+        dw 'a','.','b','/','c',0
+align 8
+zxn_b2  db 68 dup (0)                       ; hostile: an implausibly long extension
+        dw 'x','.','a','b','c','d','e','f','g','h','i','j','k','l','m','n','o',0
 .code
 LANDING_PAD
 public cmd_zexname
@@ -1249,13 +1323,13 @@ zxn_go:
     lea     rdx, [zxn_val]
     mov     r8d, 68 + 18*2                      ; AttachRef + the wide filename
     call    ze_att_zippath
-    cmp     eax, 9 + 16                         ; "<8 hex>/" + 16 hex, nothing else
+    cmp     eax, 9 + 16 + 4                     ; "<8 hex>/<16 hex>" + ".pdf"
     jne     zxn_fail
     lea     r10, [g_zj_path]                    ; must match byte for byte
     lea     r11, [zxn_exp]
     xor     ecx, ecx
 zxn_cmp:
-    cmp     ecx, 25
+    cmp     ecx, 29
     jae     zxn_leak
     mov     al, byte ptr [r10+rcx]
     cmp     al, byte ptr [r11+rcx]
@@ -1263,16 +1337,44 @@ zxn_cmp:
     inc     ecx
     jmp     zxn_cmp
 zxn_leak:
-    ; belt and braces: no '.' can appear in an opaque name, so an extension
-    ; (or a whole filename) reappearing here fails even if zxn_exp is updated
+    ; The extension is kept deliberately; the STEM must still never appear.  Assert
+    ; exactly ONE '.', at the separator position - so no part of the filename body,
+    ; and no "..", can have reached the member name even if zxn_exp is edited.
     xor     ecx, ecx
+    xor     r9d, r9d                            ; dot count
 zxn_dot:
-    cmp     ecx, 25
-    jae     zxn_fn
+    cmp     ecx, 29
+    jae     zxn_dotd
     cmp     byte ptr [r10+rcx], '.'
-    je      zxn_fail
+    jne     zxn_dotn
+    inc     r9d
+    cmp     ecx, 25                             ; a dot anywhere else = a leak
+    jne     zxn_fail
+zxn_dotn:
     inc     ecx
     jmp     zxn_dot
+zxn_dotd:
+    cmp     r9d, 1
+    jne     zxn_fail
+    ; A '/' in the "extension" must be refused outright - it is the zip-slip shape,
+    ; and the member name is the one place it would be honoured by an extractor.
+    mov     ecx, 42
+    lea     rdx, [zxn_b1]
+    mov     r8d, 68 + 6*2
+    call    ze_att_zippath
+    cmp     eax, 9 + 16                         ; opaque only, nothing appended
+    jne     zxn_fail
+    ; An implausibly long extension is refused too (bounded by ZE_EXT_MAX).
+    mov     ecx, 42
+    lea     rdx, [zxn_b2]
+    mov     r8d, 68 + 18*2
+    call    ze_att_zippath
+    cmp     eax, 9 + 16
+    jne     zxn_fail
+    mov     ecx, 42                             ; re-run the good case: the hostile ones
+    lea     rdx, [zxn_val]                      ;   left their names in g_zj_fn
+    mov     r8d, 68 + 18*2
+    call    ze_att_zippath
 zxn_fn:
     cmp     dword ptr [g_zj_fnlen], 17          ; the real name is still recovered,
     jne     zxn_fail                            ;   for the encrypted json

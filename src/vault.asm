@@ -39,6 +39,7 @@ extern secmem_alloc:proc
 extern sec_lock:proc
 extern pwgen_ex:proc
 externdef g_pwgen_outcap:dword          ; E16: one-shot pwgen output capacity
+externdef g_sel:byte                    ; per-entry export selection mask (gui.asm)
 extern secmem_free:proc
 extern read_file:proc
 extern write_file:proc
@@ -212,8 +213,10 @@ CSTR bk_ok,  "bktest: PASS (bak1..3 rotated and bak1 opens)",13,10
 CSTR bk_bad, "bktest: FAIL (backup missing or unopenable)",13,10
 CSTR mt_ok,  "mactest: PASS (counter tamper rejected, restore opens)",13,10
 CSTR mt_bad, "mactest: FAIL",13,10
-CSTR si_ok,  "sysitemkat: PASS (hidden from user count, stamp round-trips, idempotent)",13,10
+CSTR si_ok,  "sysitemkat: PASS (hidden, stamp round-trips, idempotent, not exported)",13,10
 CSTR si_bad, "sysitemkat: FAIL",13,10
+CSTR xs_okm,  "vexselkat: PASS (selection honoured, master untouched, child re-keyed)",13,10
+CSTR xs_badm, "vexselkat: FAIL",13,10
 CSTR mt_leak,"mactest: FAIL (file-MAC did not catch the trailer tamper)",13,10
 CSTR rb_ok,  "rbtest: PASS (older counter flagged, current one not)",13,10
 CSTR rb_bad, "rbtest: FAIL",13,10
@@ -256,6 +259,14 @@ g_ctr_io    dq ?                            ; reg_ctr_get/set scratch (u64 count
 g_fmac_len  dq ?                            ; 0 (legacy) or FMAC_TRAILER for this image
 g_ext_size  dq ?                            ; on-disk size snapshotted at load/save
 g_ext_hash  db 32 dup (?)                   ; BLAKE2b of the header snapshotted then
+; vault_export_sel parks the live vault's state here while it seals a CHILD file, so
+; the master stays open and untouched throughout.  g_xs_vkey holds key material and is
+; wiped the moment it has been restored.
+align 8
+g_xs_hdr    db VH_TOTAL dup (?)             ; parked live header
+public g_xs_vkey
+g_xs_vkey   db 32 dup (?)                   ; parked live vault key (wiped after restore)
+g_xs_ehash  db 32 dup (?)                   ; parked external-change hash
 g_reuse_key dd ?                            ; C8: vault_reload reuses g_vkey (skip Argon2)
 align 8
 g_lock_h    dq ?                            ; C8: <vault>.lock handle (0 = not held)
@@ -2882,6 +2893,78 @@ si_pwd:
     call    vault_last_user
     cmp     eax, 2                              ; entries 0..2 are users, 3 is the system item
     jne     si_faillk
+    ; --- M6 merge: a FOREIGN system item must not land as a second one -----------
+    ; Merging a body into itself would prove nothing: dedup is by entry id, so the
+    ; system item would be skipped as "not newer" whether or not the filter exists.
+    ; Flip a byte of the snapshot's id so it looks like another vault's item.
+    mov     rcx, VAULT_BODY_MAX
+    call    secmem_alloc
+    test    rax, rax
+    jz      si_faillk
+    mov     qword ptr [rbp-32], rax             ; snapshot
+    mov     rcx, rax
+    mov     rdx, qword ptr [g_body_ptr]
+    mov     r8d, dword ptr [g_body_len]
+    call    copy_bytes
+    mov     ecx, 3                              ; live entry 3 = the system item
+    call    vault_entry_ptr
+    sub     rax, qword ptr [g_body_ptr]         ; -> its byte offset within the body
+    add     rax, qword ptr [rbp-32]             ; -> the same spot in the snapshot
+    xor     byte ptr [rax], 0FFh                ; now a foreign entry id
+    mov     rcx, qword ptr [rbp-32]
+    call    fed_merge
+    mov     dword ptr [rbp-40], eax             ; changed count (checked after the free)
+    mov     rcx, qword ptr [rbp-32]
+    mov     rdx, VAULT_BODY_MAX
+    call    secmem_free
+    cmp     dword ptr [rbp-40], 0               ; users dedup, system item filtered -> 0
+    jne     si_faillk
+    call    vault_count                         ; and no second system item was appended
+    cmp     eax, 4
+    jne     si_faillk
+    call    vault_user_count                    ; a second one would also hide a user entry
+    cmp     eax, 3
+    jne     si_faillk
+    ; --- M6: a child vault must not inherit the parent's system item -------------
+    ; fed_export builds the child body, ADOPTS it as the live body, then seals - so
+    ; after it returns the live state IS the child and can be inspected directly.
+    mov     r10, qword ptr [g_cfg_in]           ; g_vx_pathb = <path> + ".exp"
+    lea     r11, [g_vx_pathb]
+    xor     r8d, r8d
+si_pcpy:
+    mov     ax, word ptr [r10+r8*2]
+    mov     word ptr [r11+r8*2], ax
+    test    ax, ax
+    jz      si_pdone
+    inc     r8d
+    cmp     r8d, MAX_PATH_CHARS-8
+    jb      si_pcpy
+si_pdone:
+    mov     word ptr [r11+r8*2], '.'
+    inc     r8d
+    mov     word ptr [r11+r8*2], 'e'
+    inc     r8d
+    mov     word ptr [r11+r8*2], 'x'
+    inc     r8d
+    mov     word ptr [r11+r8*2], 'p'
+    inc     r8d
+    mov     word ptr [r11+r8*2], 0
+    lea     rax, [g_vx_pathb]
+    mov     qword ptr [g_cfg_in], rax           ; child target
+    mov     rcx, qword ptr [g_body_ptr]         ; export the live body, text-only
+    xor     edx, edx
+    call    fed_export
+    test    eax, eax
+    jnz     si_fail                             ; on failure the body is already freed/adopted
+    call    vault_count                         ; the child carries the 3 user entries only
+    cmp     eax, 3
+    jne     si_faillk
+    call    vault_sys_find                      ; ...no system item came across...
+    cmp     eax, -1
+    jne     si_faillk
+    call    vault_pwverify_get                  ; ...so its clock starts at "never" rather
+    test    rax, rax                            ;    than inheriting the parent's verification
+    jnz     si_faillk
     call    vault_lock
     lea     rcx, [si_ok]
     mov     edx, si_ok_len
@@ -2899,6 +2982,146 @@ si_fail:
     FRAME_EPILOG
     ret
 cmd_sysitemkat endp
+
+; ===========================================================================
+; cmd_vexselkat <path> - vault_export_sel: prove a .vordr export writes ONLY the
+;   ticked entries, never the system item, and leaves the master vault open and
+;   byte-identical - the whole point of not reusing fed_export.
+; ===========================================================================
+LANDING_PAD
+public cmd_vexselkat
+cmd_vexselkat proc frame
+    FRAME_PROLOG 96
+    ; [rbp-24] = saved master body ptr, [rbp-32] = child path
+    lea     r10, [g_argv]
+    mov     rax, qword ptr [r10+16]             ; argv[2] = master vault path
+    mov     qword ptr [g_cfg_in], rax
+    mov     r10, rax                            ; g_vx_pathb = <path> + ".exp"
+    lea     r11, [g_vx_pathb]
+    xor     r8d, r8d
+xk_pcpy:
+    mov     ax, word ptr [r10+r8*2]
+    mov     word ptr [r11+r8*2], ax
+    test    ax, ax
+    jz      xk_pdone
+    inc     r8d
+    cmp     r8d, MAX_PATH_CHARS-8
+    jb      xk_pcpy
+xk_pdone:
+    mov     word ptr [r11+r8*2], '.'
+    inc     r8d
+    mov     word ptr [r11+r8*2], 'e'
+    inc     r8d
+    mov     word ptr [r11+r8*2], 'x'
+    inc     r8d
+    mov     word ptr [r11+r8*2], 'p'
+    inc     r8d
+    mov     word ptr [r11+r8*2], 0
+    lea     rax, [g_vx_pathb]
+    mov     qword ptr [rbp-32], rax
+    lea     r10, [ffk_seedpw]                   ; master password
+    lea     r11, [g_cfg_pass]
+    xor     ecx, ecx
+xk_pw1:
+    mov     al, byte ptr [r10+rcx]
+    mov     byte ptr [r11+rcx], al
+    test    al, al
+    jz      xk_pw1d
+    inc     ecx
+    cmp     ecx, 32
+    jb      xk_pw1
+xk_pw1d:
+    mov     dword ptr [g_cfg_passlen], 9
+    mov     dword ptr [g_cfg_t], 1
+    mov     dword ptr [g_cfg_m], 8192
+    mov     ecx, 3
+    call    do_seed
+    test    eax, eax
+    jnz     xk_fail
+    call    vault_unlock
+    test    eax, eax
+    jnz     xk_fail
+    call    vault_add_system_item               ; 3 users + 1 system = 4 physical
+    test    eax, eax
+    jz      xk_faillk
+    call    vault_reseal
+    test    eax, eax
+    jnz     xk_faillk
+    mov     rax, qword ptr [g_body_ptr]
+    mov     qword ptr [rbp-24], rax
+    ; tick entries 0 and 2 only; leave 1 unticked and the system item at 3 ticked,
+    ; so the export has to reject it on its own merits rather than by luck.
+    lea     r10, [g_sel]
+    mov     byte ptr [r10+0], 1
+    mov     byte ptr [r10+1], 0
+    mov     byte ptr [r10+2], 1
+    mov     byte ptr [r10+3], 1
+    lea     r10, [vxk_exppw]                    ; a DIFFERENT password for the child
+    lea     r11, [g_cfg_pass]
+    xor     ecx, ecx
+xk_pw2:
+    mov     al, byte ptr [r10+rcx]
+    mov     byte ptr [r11+rcx], al
+    test    al, al
+    jz      xk_pw2d
+    inc     ecx
+    cmp     ecx, 32
+    jb      xk_pw2
+xk_pw2d:
+    mov     dword ptr [g_cfg_passlen], 9
+    mov     rcx, qword ptr [rbp-32]
+    call    vault_export_sel
+    test    eax, eax
+    jnz     xk_faillk
+    ; ---- the master must be exactly as it was --------------------------------
+    mov     rax, qword ptr [g_body_ptr]
+    cmp     rax, qword ptr [rbp-24]             ; same body, never freed or swapped
+    jne     xk_faillk
+    call    vault_count
+    cmp     eax, 4
+    jne     xk_faillk
+    call    vault_ext_changed                   ; the on-disk snapshot still describes the
+    test    eax, eax                            ;   MASTER, not the child we just sealed
+    jnz     xk_faillk
+    call    vault_reload                        ; re-decrypts with g_vkey: proves the key,
+    test    eax, eax                            ;   header and path all came back
+    jnz     xk_faillk
+    call    vault_count
+    cmp     eax, 4
+    jne     xk_faillk
+    call    vault_lock
+    ; ---- the child: only the ticked user entries, under its own password ------
+    mov     rax, qword ptr [rbp-32]
+    mov     qword ptr [g_cfg_in], rax
+    call    vault_unlock                        ; g_cfg_pass is still the export password
+    test    eax, eax
+    jnz     xk_fail
+    call    vault_count                         ; entries 0 and 2 - NOT 1, NOT the system
+    cmp     eax, 2
+    jne     xk_faillk
+    call    vault_sys_find
+    cmp     eax, -1
+    jne     xk_faillk
+    call    vault_pwverify_get                  ; child's clock starts at "never"
+    test    rax, rax
+    jnz     xk_faillk
+    call    vault_lock
+    lea     rcx, [xs_okm]
+    mov     edx, xs_okm_len
+    call    print_a
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+xk_faillk:
+    call    vault_lock
+xk_fail:
+    lea     rcx, [xs_badm]
+    mov     edx, xs_badm_len
+    call    print_a
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_vexselkat endp
 
 ; ===========================================================================
 ; cmd_cowrite <path> - C8: prove the <vault>.lock write lock is exclusive and
@@ -3704,6 +3927,14 @@ fx_loop:
     mov     eax, dword ptr [rbp-64]
     cmp     eax, dword ptr [rbp-48]
     jae     fx_built
+    mov     rcx, qword ptr [rbp-56]           ; A child vault is a DIFFERENT vault: it must
+    call    sys_first_kind                    ;   not inherit the parent's system item, which
+    cmp     eax, VF_SYSTEM                    ;   would hand it the parent's pwverify stamp
+    je      fx_adv                            ;   and start its clock pre-verified.  It gains
+                                              ;   its own on first save.  Pointer-based: the
+                                              ;   source body is NOT g_body_ptr here, so
+                                              ;   vault_is_system (which indexes the live
+                                              ;   body) would be the wrong test.
     mov     rcx, qword ptr [rbp-56]           ; bounds: worst case = full src entry len
     call    vault_entry_len
     mov     r8, qword ptr [rbp-40]
@@ -3793,6 +4024,205 @@ fx_oom:
     ret
 fed_export endp
 
+; ===========================================================================
+; vault_export_sel(rcx = target path wide) -> eax = 0 / EXIT_*.
+;   Export the entries ticked in g_sel to a NEW .vordr at `path`, sealed under a fresh
+;   salt/nonce and the password already in g_cfg_pass.
+;
+;   Unlike fed_export this is NON-CLOBBERING: fed_export frees the live body and adopts
+;   the child as the open vault, which is right for a headless "convert this vault" but
+;   wrong for a GUI export - the user would silently continue editing the CHILD.  Here
+;   every global the seal path mutates is parked and restored, and the master body is
+;   never freed, so the vault stays open exactly as it was.
+;
+;   Selection is honoured (matching the ZIP export), attachments travel
+;   (entry_copy_full + the live g_attidx), and system items are never copied - the
+;   child mints its own on first save, so its pwverify stamp starts at "never" rather
+;   than inheriting the parent's verification date.
+;
+;   Note it deliberately does NOT consult g_readonly: exporting never writes to the
+;   master, so it stays available on a read-only vault.
+; ===========================================================================
+public vault_export_sel
+vault_export_sel proc frame
+    FRAME_PROLOG 160
+    ; [rbp-24]=path [rbp-32]=saved body ptr [rbp-40]=saved body len [rbp-48]=saved cfg_in
+    ; [rbp-56]=saved counter [rbp-64]=saved ext_size [rbp-72]=child body [rbp-80]=child len
+    ; [rbp-88]=cursor [rbp-92]=i [rbp-96]=result [rbp-104]=saved att_total
+    ; [rbp-108]=saved newatt_n [rbp-112]=saved attidx_n
+    mov     qword ptr [rbp-24], rcx
+    cmp     qword ptr [g_body_ptr], 0
+    je      xs_novault
+    ; ---- park every global the seal path touches --------------------------
+    mov     rax, qword ptr [g_body_ptr]
+    mov     qword ptr [rbp-32], rax
+    mov     rax, qword ptr [g_body_len]
+    mov     qword ptr [rbp-40], rax
+    mov     rax, qword ptr [g_cfg_in]
+    mov     qword ptr [rbp-48], rax
+    mov     rax, qword ptr [g_save_counter]
+    mov     qword ptr [rbp-56], rax
+    mov     rax, qword ptr [g_ext_size]
+    mov     qword ptr [rbp-64], rax
+    mov     rax, qword ptr [g_att_total]
+    mov     qword ptr [rbp-104], rax
+    mov     eax, dword ptr [g_newatt_n]
+    mov     dword ptr [rbp-108], eax
+    mov     eax, dword ptr [g_attidx_n]
+    mov     dword ptr [rbp-112], eax
+    lea     rcx, [g_xs_hdr]                   ; header, key and change-hash are too big
+    lea     rdx, [g_hdr]                      ;   for the frame - park them in statics
+    mov     r8d, VH_TOTAL
+    call    copy_bytes
+    lea     rcx, [g_xs_vkey]
+    lea     rdx, [g_vkey]
+    mov     r8d, 32
+    call    copy_bytes
+    lea     rcx, [g_xs_ehash]
+    lea     rdx, [g_ext_hash]
+    mov     r8d, 32
+    call    copy_bytes
+    ; ---- build the child body: selected, non-system entries only ----------
+    mov     rcx, VAULT_BODY_MAX
+    call    secmem_alloc
+    test    rax, rax
+    jz      xs_nomem
+    mov     qword ptr [rbp-72], rax
+    mov     dword ptr [rax], 0                ; entry_count = 0
+    mov     qword ptr [rbp-80], 4
+    mov     r10, qword ptr [rbp-32]
+    add     r10, 4
+    mov     qword ptr [rbp-88], r10           ; source cursor
+    mov     dword ptr [rbp-92], 0
+xs_loop:
+    mov     eax, dword ptr [rbp-92]
+    mov     r10, qword ptr [rbp-32]
+    cmp     eax, dword ptr [r10]
+    jae     xs_built
+    lea     r11, [g_sel]                      ; honour the checklist, exactly as the ZIP
+    movzx   ecx, byte ptr [r11+rax]           ;   export does
+    test    ecx, ecx
+    jz      xs_next
+    mov     rcx, qword ptr [rbp-88]           ; and never carry the system item
+    call    sys_first_kind
+    cmp     eax, VF_SYSTEM
+    je      xs_next
+    mov     rcx, qword ptr [rbp-88]
+    call    vault_entry_len
+    mov     r8, qword ptr [rbp-80]
+    add     r8, rax
+    cmp     r8, VAULT_BODY_MAX
+    ja      xs_next                           ; no room -> drop it rather than overrun
+    mov     rcx, qword ptr [rbp-88]
+    mov     rdx, qword ptr [rbp-72]
+    add     rdx, qword ptr [rbp-80]
+    call    entry_copy_full                   ; verbatim: AttachRefs travel
+    mov     r8d, eax
+    add     qword ptr [rbp-80], r8
+    mov     r10, qword ptr [rbp-72]
+    inc     dword ptr [r10]
+xs_next:
+    mov     rcx, qword ptr [rbp-88]
+    call    vault_entry_len
+    add     qword ptr [rbp-88], rax
+    inc     dword ptr [rbp-92]
+    jmp     xs_loop
+xs_built:
+    ; ---- point the seal machinery at the child ----------------------------
+    mov     rax, qword ptr [rbp-24]
+    mov     qword ptr [g_cfg_in], rax
+    mov     rax, qword ptr [rbp-72]
+    mov     qword ptr [g_body_ptr], rax
+    mov     rax, qword ptr [rbp-80]
+    mov     qword ptr [g_body_len], rax
+    mov     dword ptr [g_hdr+0], VAULT_MAGIC  ; fresh header: new salt, new nonce, new key
+    mov     dword ptr [g_hdr+4], VAULT_VERSION
+    mov     eax, dword ptr [g_cfg_t]
+    mov     dword ptr [g_hdr+VH_T], eax
+    mov     eax, dword ptr [g_cfg_m]
+    mov     dword ptr [g_hdr+VH_M], eax
+    mov     dword ptr [g_hdr+VH_LANES], 1
+    lea     rcx, [g_hdr+VH_SALT]
+    mov     edx, 32
+    call    rng_fill
+    test    eax, eax
+    jz      xs_sealbad
+    lea     rcx, [g_hdr+VH_NONCE]
+    mov     edx, 12
+    call    rng_fill
+    test    eax, eax
+    jz      xs_sealbad
+    call    vk_derive                         ; child key from g_cfg_pass (the export pw)
+    test    eax, eax
+    jnz     xs_sealbad
+    call    vk_kcv
+    lea     r10, [g_sha32]
+    lea     r9, [g_hdr+VH_KCV]
+    xor     r8d, r8d
+xs_kcv:
+    mov     al, byte ptr [r10+r8]
+    mov     byte ptr [r9+r8], al
+    inc     r8d
+    cmp     r8d, KCV_LEN
+    jb      xs_kcv
+    mov     qword ptr [g_save_counter], 0     ; fresh vault: first save = counter 1
+    call    vault_seal_write
+    mov     dword ptr [rbp-96], eax
+    jmp     xs_restore
+xs_sealbad:
+    mov     dword ptr [rbp-96], EXIT_OOM
+xs_restore:
+    ; ---- put the live vault back exactly as it was ------------------------
+    mov     rax, qword ptr [rbp-32]
+    mov     qword ptr [g_body_ptr], rax
+    mov     rax, qword ptr [rbp-40]
+    mov     qword ptr [g_body_len], rax
+    mov     rax, qword ptr [rbp-48]
+    mov     qword ptr [g_cfg_in], rax
+    mov     rax, qword ptr [rbp-56]
+    mov     qword ptr [g_save_counter], rax
+    mov     rax, qword ptr [rbp-64]
+    mov     qword ptr [g_ext_size], rax       ; vault_seal_write re-snapshotted these for
+    mov     rax, qword ptr [rbp-104]          ;   the CHILD; the master's own snapshot must
+    mov     qword ptr [g_att_total], rax      ;   survive or vault_ext_changed misfires
+    mov     eax, dword ptr [rbp-108]
+    mov     dword ptr [g_newatt_n], eax
+    mov     eax, dword ptr [rbp-112]
+    mov     dword ptr [g_attidx_n], eax
+    lea     rcx, [g_hdr]
+    lea     rdx, [g_xs_hdr]
+    mov     r8d, VH_TOTAL
+    call    copy_bytes
+    lea     rcx, [g_vkey]
+    lea     rdx, [g_xs_vkey]
+    mov     r8d, 32
+    call    copy_bytes
+    lea     rcx, [g_ext_hash]
+    lea     rdx, [g_xs_ehash]
+    mov     r8d, 32
+    call    copy_bytes
+    lea     rcx, [g_xs_vkey]                  ; no second copy of the key outlives this
+    mov     edx, 32
+    call    secure_zero
+    mov     rcx, qword ptr [rbp-72]
+    mov     rdx, VAULT_BODY_MAX
+    call    secmem_free
+    mov     eax, dword ptr [rbp-96]
+    FRAME_EPILOG
+    ret
+xs_nomem:
+    lea     rcx, [g_xs_vkey]                  ; parked a key copy already - wipe it
+    mov     edx, 32
+    call    secure_zero
+    mov     eax, EXIT_OOM
+    FRAME_EPILOG
+    ret
+xs_novault:
+    mov     eax, EXIT_USAGE
+    FRAME_EPILOG
+    ret
+vault_export_sel endp
+
 ; fed_merge(rcx = source body ptr) -> eax = number of entries added or updated.
 ;   Merge every source entry into the live body, deduped by the 16-byte entry id:
 ;   an id already present is updated only if the source's `modified` is newer, else
@@ -3812,6 +4242,11 @@ fm_loop:
     mov     eax, dword ptr [rbp-44]
     cmp     eax, dword ptr [rbp-32]
     jae     fm_done
+    mov     rcx, qword ptr [rbp-40]           ; never merge in a foreign system item: dedup is
+    call    sys_first_kind                    ;   by ENTRY id, so it would not collide with
+    cmp     eax, VF_SYSTEM                    ;   ours - it would land as a SECOND system item,
+    je      fm_next                           ;   and vault_sys_find takes the first, silently
+                                              ;   shadowing this vault's own stamp.
     mov     rcx, qword ptr [rbp-40]           ; src entry (id at +0)
     call    fed_find_by_id
     cmp     eax, -1

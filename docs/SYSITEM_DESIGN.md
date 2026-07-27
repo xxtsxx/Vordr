@@ -112,9 +112,20 @@ and every probe (`cmd_vfuzz`, `cmd_vaultexportkat`, `cmd_vaultexpattkat`,
 builders only *skip*. This is the single most important invariant; breaking it turns
 every `vault_entry_ptr` caller into a bug.
 
-**M6.** `fed_export` must filter the system item out of a child vault (`fed_merge`
-likewise on the way in), otherwise an exported child inherits the parent's settings.
-The current `entry_copy_filtered`/`_full` copy everything.
+**M6 — done 2026-07-27.** Both directions filter, via the pointer-based
+`sys_first_kind` rather than `vault_is_system`: these loops walk a **foreign** body, and
+`vault_is_system` indexes the live `g_body_ptr`, so it would test the wrong vault.
+
+- `fed_export` skips the parent's system item. A child is a different vault; inheriting
+  the stamp would start its clock pre-verified.
+- `fed_merge` skips a foreign one. Dedup is by **entry id**, so a foreign system item
+  would not collide with ours — it would land as a *second* system item, and
+  `vault_sys_find` returns the first, silently shadowing this vault's own stamp.
+
+Both covered by `sysitemkat` and negative-tested (disable either filter and it exits 1).
+The merge case deliberately flips a byte of the snapshot's entry id: merging a body into
+itself proves nothing, because dedup would skip the item as "not newer" whether or not
+the filter exists.
 
 ## 4. Probe suite: keep test vaults system-item-free
 
