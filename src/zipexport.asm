@@ -317,10 +317,21 @@ zaf_ncpd:
     call    buf_putn
     call    ze_aextra
     ; ---- salt ----
+    ; MUST fail closed.  ze_add_file runs once per member, so if the CSPRNG fails and we
+    ; carry on, g_ze_salt still holds the PREVIOUS member's salt (or zeros on the first).
+    ; PBKDF2 then derives the same key and the same verifier, and AES-CTR starts from the
+    ; same counter - key-stream reuse across files, i.e. two plaintexts XORed together for
+    ; anyone holding the archive.  Silently, and only when the RNG is already failing.
     lea     rcx, [g_ze_salt]
     mov     edx, 16
     call    rng_fill
-    lea     rcx, [g_zbuf]
+    test    eax, eax
+    jnz     @F
+    mov     byte ptr [g_xl_err], 1              ; the caller aborts the whole export
+    mov     eax, 1
+    FRAME_EPILOG                                ; framed proc - a bare ret here would skip
+    ret                                         ;   the epilog and unbalance the stack
+@@: lea     rcx, [g_zbuf]
     lea     rdx, [g_ze_salt]
     mov     r8, 16
     call    buf_putn

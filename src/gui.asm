@@ -37,6 +37,7 @@ extern is_cli_command:proc
 extern dispatch:proc
 extern run_selftest:proc
 extern secure_zero:proc
+extern secmem_panic_wipe:proc           ; wipe every pinned secret (shutdown/logoff)
 extern print_err:proc
 
 ; ---- vault session API (vault.asm) + password helper (main.asm) -------------
@@ -369,6 +370,7 @@ WM_CTLCOLORSTATIC   equ 138h
 EM_SETCUEBANNER     equ 1501h
 ; ---- system tray / window-loop -----------------------------------------------
 WM_DESTROY          equ 2
+WM_ENDSESSION       equ 16h                ; the session is really ending (wParam != 0)
 WM_LBUTTONUP        equ 0202h
 WM_LBUTTONDBLCLK    equ 0203h
 WM_RBUTTONUP        equ 0205h
@@ -16051,6 +16053,8 @@ tray_wndproc proc
     je      twp_cmd
     cmp     rdx, WM_DESTROY
     je      twp_destroy
+    cmp     rdx, WM_ENDSESSION                  ; shutdown/logoff: wipe before we are killed
+    je      twp_endsession
     cmp     rdx, WM_MEASUREITEM                 ; themed owner-draw tray menu
     je      twp_measure
     cmp     rdx, WM_DRAWITEM
@@ -16128,6 +16132,17 @@ twp_about:
     jmp     twp_ret
 twp_exit:
     WINCALL DestroyWindow, qword ptr [rbp-8]
+    xor     eax, eax
+    jmp     twp_ret
+twp_endsession:
+    ; Windows is ending the session and will terminate us shortly - no auto-lock timer
+    ; will fire, and nothing else runs.  Drop the copied secret and wipe every pinned
+    ; buffer now.  wParam = 0 means the shutdown was cancelled, so do nothing then.
+    cmp     qword ptr [rbp-24], 0
+    je      twp_endsession_ret
+    call    gui_clipclear
+    call    secmem_panic_wipe
+twp_endsession_ret:
     xor     eax, eax
     jmp     twp_ret
 twp_destroy:

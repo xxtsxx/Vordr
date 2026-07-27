@@ -36,6 +36,7 @@ externdef g_cfg_passlen:dword
 ; the fixed static secret buffers, locked once at startup by sec_lock_statics
 externdef g_cfg_pass:byte           ; master password (main.asm)
 externdef g_vkey:byte               ; derived vault key (vault.asm)
+externdef g_xs_vkey:byte            ; parked copy of it during export / pw check (vault.asm)
 externdef g_pwbuf:byte              ; unlock/create password field (gui.asm)
 externdef g_pw2buf:byte             ; confirm-password field (gui.asm)
 externdef g_secret_w:byte           ; revealed secret for reveal/copy (gui.asm)
@@ -211,6 +212,9 @@ sec_lock_statics proc frame
     lea     rcx, [g_vkey]
     mov     edx, 32
     call    sec_lock
+    lea     rcx, [g_xs_vkey]                   ; a COPY of the vault key: vault_export_sel
+    mov     edx, 32                            ;   and vault_pw_check park it here across
+    call    sec_lock                           ;   an Argon2 derive, so it must be pinned
     lea     rcx, [g_pwbuf]
     mov     edx, 2048
     call    sec_lock
@@ -259,6 +263,9 @@ secmem_panic_wipe proc frame
     lea     rcx, [g_vkey]
     mov     edx, 32
     call    secure_zero
+    lea     rcx, [g_xs_vkey]                   ; the parked key copy: both holders wipe it
+    mov     edx, 32                            ;   on their own paths, but a crash WHILE
+    call    secure_zero                        ;   parked would otherwise leave it resident
     lea     rcx, [g_pwbuf]
     mov     edx, 2048
     call    secure_zero

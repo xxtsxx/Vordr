@@ -265,6 +265,10 @@ g_ext_hash  db 32 dup (?)                   ; BLAKE2b of the header snapshotted 
 ; the master stays open and untouched throughout.  g_xs_vkey holds key material and is
 ; wiped the moment it has been restored.
 align 8
+g_seal_noadopt dd ?                         ; 1 = this seal writes a DIFFERENT vault, so
+                                            ;   vault_seal_write must not adopt the image
+                                            ;   it just wrote as the live one
+align 8
 g_xs_hdr    db VH_TOTAL dup (?)             ; parked live header
 public g_xs_vkey
 g_xs_vkey   db 32 dup (?)                   ; parked live vault key (wiped after restore)
@@ -907,6 +911,27 @@ vsw_pdone:
     ; success: the image we just wrote becomes the resident file image, so newly
     ; sealed attachments are readable without a re-read.  Retire the old image,
     ; drop the pending list, and rebuild the attachment index.
+    ;
+    ; ...unless this seal wrote a DIFFERENT vault (vault_export_sel).  Adopting there is
+    ; actively destructive: it frees the master's resident image, repoints g_filebuf at
+    ; the child, and attach_reset drops g_attidx - so every attachment in the still-open
+    ; master then resolves against the child's image, and the next master save feeds
+    ; attach_build from it.  That is the shape of 9ee91da, where stranded attachments
+    ; were destroyed on the following save.  Nothing can be "restored" afterwards either,
+    ; because the master's image has already been freed by then.
+    cmp     dword ptr [g_seal_noadopt], 0
+    je      vsw_adopt
+    mov     rcx, qword ptr [g_outbuf]           ; nobody takes ownership -> release it
+    test    rcx, rcx
+    jz      vsw_naret
+    mov     rdx, qword ptr [g_outlen]
+    call    mem_free
+    mov     qword ptr [g_outbuf], 0
+vsw_naret:
+    mov     eax, dword ptr [rbp-24]             ; the live vault is left exactly as it was
+    FRAME_EPILOG
+    ret
+vsw_adopt:
     mov     rcx, qword ptr [g_filebuf]
     test    rcx, rcx
     jz      vsw_swap
@@ -3089,6 +3114,12 @@ xk_delv:
     jnz     xk_faillk
     mov     rax, qword ptr [g_body_ptr]
     mov     qword ptr [rbp-24], rax
+    mov     rax, qword ptr [g_filebuf]          ; the RESIDENT FILE IMAGE and the attachment
+    mov     qword ptr [rbp-48], rax             ;   index built from it: vault_seal_write
+    mov     rax, qword ptr [g_filesize]         ;   frees and replaces these on a normal
+    mov     qword ptr [rbp-56], rax             ;   save, which for an export would leave
+    mov     eax, dword ptr [g_attidx_n]         ;   the master pointing at the CHILD's image
+    mov     dword ptr [rbp-64], eax
     ; Tick 0, 2 and 3, leaving 1 unticked.  All three exclusions then have to fire on
     ; their own merits rather than by luck: 1 is dropped by the SELECTION, 2 by being
     ; TRASHED, 3 by being the SYSTEM item - so only entry 0 may reach the child.
@@ -3124,6 +3155,19 @@ xk_pw2d:
     call    vault_ext_changed                   ; the on-disk snapshot still describes the
     test    eax, eax                            ;   MASTER, not the child we just sealed
     jnz     xk_faillk
+    ; These three MUST be checked before the reload below.  vault_reload re-reads the
+    ; master from disk and rebuilds g_filebuf/g_attidx, so it REPAIRS this corruption -
+    ; the original version of this test asserted "master untouched" only after the
+    ; reload and therefore passed while the export was freeing the master's image.
+    mov     rax, qword ptr [g_filebuf]
+    cmp     rax, qword ptr [rbp-48]             ; image neither freed nor swapped...
+    jne     xk_faillk
+    mov     rax, qword ptr [g_filesize]
+    cmp     rax, qword ptr [rbp-56]
+    jne     xk_faillk
+    mov     eax, dword ptr [g_attidx_n]         ; ...and the attachment index survived
+    cmp     eax, dword ptr [rbp-64]
+    jne     xk_faillk
     call    vault_reload                        ; re-decrypts with g_vkey: proves the key,
     test    eax, eax                            ;   header and path all came back
     jnz     xk_faillk
@@ -4352,10 +4396,13 @@ xs_kcv:
     cmp     r8d, KCV_LEN
     jb      xs_kcv
     mov     qword ptr [g_save_counter], 0     ; fresh vault: first save = counter 1
+    mov     dword ptr [g_seal_noadopt], 1     ; do NOT let the child become the live image
     call    vault_seal_write
+    mov     dword ptr [g_seal_noadopt], 0
     mov     dword ptr [rbp-96], eax
     jmp     xs_restore
 xs_sealbad:
+    mov     dword ptr [g_seal_noadopt], 0
     mov     dword ptr [rbp-96], EXIT_OOM
 xs_restore:
     ; ---- put the live vault back exactly as it was ------------------------
@@ -5520,15 +5567,16 @@ vault_pw_due endp
 public vault_pw_check
 vault_pw_check proc frame
     FRAME_PROLOG 64
-    ; [rbp-24]=pw [rbp-32]=len [rbp-40]=saved passlen [rbp-48]=result
+    ; [rbp-24]=pw [rbp-32]=len [rbp-48]=result.  g_cfg_passlen is deliberately NOT saved
+    ; for restoring: the candidate password is wiped out of g_cfg_pass below, so the only
+    ; correct length afterwards is 0.  (An earlier version parked it, then loaded it into
+    ; eax and dropped it - dead code that read as an intended restore.)
     mov     qword ptr [rbp-24], rcx
     mov     dword ptr [rbp-32], edx
     lea     rcx, [g_xs_vkey]                    ; park the live key
     lea     rdx, [g_vkey]
     mov     r8d, 32
     call    copy_bytes
-    mov     eax, dword ptr [g_cfg_passlen]
-    mov     dword ptr [rbp-40], eax
     lea     rcx, [g_cfg_pass]                   ; vk_derive reads g_cfg_pass
     mov     rdx, qword ptr [rbp-24]
     mov     r8d, dword ptr [rbp-32]
@@ -5557,8 +5605,7 @@ vpc_restore:
     lea     rcx, [g_cfg_pass]                   ; never leave the typed password behind
     mov     edx, MAX_PASSWORD_BYTES+1
     call    secure_zero
-    mov     eax, dword ptr [rbp-40]
-    mov     dword ptr [g_cfg_passlen], 0
+    mov     dword ptr [g_cfg_passlen], 0        ; the buffer is wiped, so 0 is the truth
     mov     eax, dword ptr [rbp-48]
     FRAME_EPILOG
     ret

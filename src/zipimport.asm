@@ -44,7 +44,13 @@ ZI_MAXENT   equ 8192                      ; max stageable entries (matches MAX_S
 ZI_ARENA    equ 4*1024*1024              ; per-entry wide/blob scratch
 ZI_SBUF     equ 256*1024                  ; one string's decoded UTF-8
 ZI_TBUF     equ 1024*1024                 ; persistent staged-title wide storage
-MAX_FIELDS  equ 56                        ; g_field_list capacity (matches main.asm)
+; g_field_list capacity.  This MUST equal main.asm's MAX_FIELDS - that is the module
+; that actually allocates the array (dq 3*MAX_FIELDS).  It said 56 while main.asm and
+; gui.asm both said 96, and the comment claimed they matched, so an imported entry
+; silently lost every field past the 56th even though the array had room for 96.
+; Too small only loses data; too LARGE would overrun the array, so if these ever drift
+; again, drift downward.  There is no cross-module constant check to catch this.
+MAX_FIELDS  equ 96                        ; == main.asm MAX_FIELDS (verified 2026-07-27)
 MEMREC      equ 32                        ; {nameptr8, namelen4, _4, dataptr8, usize4, _4}
 
 .data?
