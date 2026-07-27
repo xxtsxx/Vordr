@@ -165,6 +165,7 @@ extern GetLastError:proc
 extern FindWindowW:proc
 extern MessageBoxW:proc
 extern DialogBoxParamW:proc
+extern CreateDialogParamW:proc          ; the settings child dialog
 ; secure-desktop (anti-keylogger) master-password entry
 extern CreateDesktopW:proc
 extern OpenInputDesktop:proc
@@ -349,6 +350,9 @@ WM_NCHITTEST_       equ 84h
 HTCAPTION           equ 2
 DWLP_MSGRESULT_     equ 0
 SWP_FRAME_          equ 16h              ; SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE
+SWP_NOSIZE_         equ 1h
+SWP_NOMOVE_         equ 2h
+SWP_NOACTIVATE_     equ 10h
 TBAR_H              equ 32               ; custom title-bar strip height (px)
 CAPBTN_W            equ 44               ; caption (close) button width
 IDC_T_CLOSE         equ 292             ; caption: close
@@ -458,6 +462,7 @@ LB_GETCOUNT         equ 18Bh
 LB_GETCURSEL        equ 188h
 LB_GETITEMRECT      equ 198h            ; item bounding rect (recycle-glyph hit-test)
 GWL_USERDATA        equ -21             ; button accent tag (theme_drawitem primary)
+GWL_STYLE_          equ -16
 LB_GETCOUNT         equ 18Bh
 LB_GETITEMDATA      equ 199h
 LB_ERR              equ -1
@@ -574,6 +579,8 @@ IDC_XP_PWL   equ 724
 IDC_XP_PW2L  equ 725
 DLG_IMPPW    equ 730                  ; import-password prompt (single field)
 DLG_PWREMIND equ 795                  ; C9 master-password reminder
+DLG_SETTINGS equ 796                  ; settings screen: a WS_CHILD dialog over the
+                                      ;   vault client area (docs/SETTINGS_DESIGN.md)
 DLG_SELECT   equ 750                  ; export/import entry-selection checklist
 IDC_SEL_SEARCH equ 751
 IDC_SEL_LIST equ 752                  ; SysListView32 checkbox list of entries
@@ -1588,6 +1595,10 @@ g_storagelabel dw 300 dup (?)              ; unlock dialog: "<location> . <vault
 g_imgbuf      dq ?                         ; imported file bytes (mem_alloc'd)
 g_imgbuflen   dq ?
 g_pickfilter  dq ?                         ; OPENFILENAME filter for the next pick (0=image)
+public g_settings_hwnd
+g_settings_hwnd dq ?                       ; the settings child dialog (0 = not created).
+                                           ;   One window to show/hide, instead of an id
+                                           ;   array (docs/SETTINGS_DESIGN.md)
 g_exp_iszip   dd ?                         ; export format the user chose: 0 = .vordr, 1 = .zip
                                            ;   (from the save dialog's filter index)
 g_tmpfile     dw 1024 dup (?)              ; temp path for opening an attachment (wide)
@@ -8229,39 +8240,6 @@ wse_done:
     ret
 gui_wstr_eq endp
 
-; gui_rows_show(rcx=hdlg, edx=cmd) - ShowWindow every runtime row control.
-gui_rows_show proc frame
-    FRAME_PROLOG 64
-    mov     dword ptr [rbp-32], edx
-    mov     dword ptr [rbp-24], 0
-grs_row:
-    mov     eax, dword ptr [rbp-24]
-    cmp     eax, dword ptr [g_field_count]
-    jae     grs_done
-    mov     dword ptr [rbp-40], 0
-grs_slot:
-    mov     eax, dword ptr [rbp-40]
-    cmp     eax, DYN_SLOTS
-    jae     grs_nextrow
-    mov     ecx, dword ptr [rbp-24]
-    mov     edx, dword ptr [rbp-40]
-    call    gui_row_handle
-    test    rax, rax
-    jz      grs_slotnext
-    mov     rcx, rax
-    mov     edx, dword ptr [rbp-32]
-    call    ShowWindow
-grs_slotnext:
-    inc     dword ptr [rbp-40]
-    jmp     grs_slot
-grs_nextrow:
-    inc     dword ptr [rbp-24]
-    jmp     grs_row
-grs_done:
-    FRAME_EPILOG
-    ret
-gui_rows_show endp
-
 ; gui_row_reveal(rcx=hdlg, edx=row) - toggle the row's value between masked/clear.
 gui_row_reveal proc frame
     FRAME_PROLOG 96
@@ -9576,7 +9554,10 @@ gui_apply_scheme proc frame
     lea     r10, [scheme_names]
     mov     rax, qword ptr [r10+rax*8]
     mov     qword ptr [rbp-32], rax
-    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_MTHEME, qword ptr [rbp-32]
+    ; the button lives in the settings CHILD, not in rcx's dialog: addressing the vault
+    ; here silently found nothing and left the rc template's placeholder caption showing,
+    ; so every scheme read "Dark" while the colours themselves cycled correctly.
+    WINCALL SetDlgItemTextW, qword ptr [g_settings_hwnd], IDC_V_MTHEME, qword ptr [rbp-32]
     mov     rcx, qword ptr [rbp-24]              ; title bar + backdrop material follow the scheme
     call    theme_dwm_apply
     mov     rcx, qword ptr [rbp-24]              ; re-theme scrollbars to match dark/light
@@ -10244,71 +10225,204 @@ gam_done:
 gui_addfield_menu endp
 
 ; gui_menu_open(rcx=hdlg) - hide the vault content, reveal the settings overlay.
-gui_menu_open proc frame
+; =============================================================================
+; The settings screen is a WS_CHILD dialog covering the vault's client area
+; (docs/SETTINGS_DESIGN.md).  It used to be ~34 controls living inside DLG_VAULT,
+; shown and hidden through a hand-maintained id array - which is what produced the
+; recurring bleed-through: a control missing from the array, or a painter that forgot
+; to check the flag, and the vault showed through the "overlay".
+;
+; A real window occludes what is behind it for free.  There is one hwnd to show and
+; hide, the settings rows live in their own coordinate space, and no painter needs to
+; know settings exists.
+;
+; settings_proc keeps NO logic of its own: WM_COMMAND / WM_DRAWITEM / WM_MEASUREITEM
+; are forwarded to the vault window, so every existing handler works unchanged.
+; =============================================================================
+settings_proc proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 64
+    mov     qword ptr [rbp-8], rcx
+    cmp     rdx, WM_INITDIALOG
+    je      stp_init
+    cmp     rdx, WM_COMMAND
+    je      stp_fwd
+    cmp     rdx, WM_DRAWITEM                    ; owner-draw settings controls: the parent
+    je      stp_fwd                             ;   already knows how to paint every one
+    cmp     rdx, WM_MEASUREITEM
+    je      stp_fwd
+    cmp     rdx, WM_CTLCOLORSTATIC
+    je      stp_col
+    cmp     rdx, WM_CTLCOLOREDIT
+    je      stp_col
+    cmp     rdx, WM_CTLCOLORBTN
+    je      stp_col
+    cmp     rdx, WM_CTLCOLORDLG
+    je      stp_col
+    cmp     rdx, WM_ERASEBKGND
+    je      stp_erase
+    cmp     rdx, WM_PAINT
+    je      stp_paint
+    xor     eax, eax
+    jmp     stp_ret
+stp_col:
+    call    theme_ctlcolor
+    jmp     stp_ret
+stp_erase:
+    mov     rcx, r8
+    mov     rdx, qword ptr [rbp-8]
+    call    theme_erase
+    jmp     stp_ret
+stp_paint:
+    mov     rcx, qword ptr [rbp-8]
+    call    theme_paint
+    jmp     stp_ret
+stp_init:
+    mov     eax, 1
+    jmp     stp_ret
+stp_fwd:
+    mov     qword ptr [rbp-16], rdx             ; msg
+    mov     qword ptr [rbp-24], r8              ; wParam
+    mov     qword ptr [rbp-32], r9              ; lParam
+    WINCALL GetParent, qword ptr [rbp-8]
+    WINCALL SendMessageW, rax, qword ptr [rbp-16], qword ptr [rbp-24], qword ptr [rbp-32]
+    mov     eax, 1
+stp_ret:
+    mov     rsp, rbp
+    pop     rbp
+    ret
+settings_proc endp
+
+; gui_clip_cb(rcx = child hwnd, rdx = lparam) -> BOOL - add WS_CLIPSIBLINGS.
+;   Z-order alone is not enough.  Without WS_CLIPSIBLINGS a control still paints over the
+;   area of a sibling ABOVE it, so the entry list and the search box scribbled straight
+;   over the settings child even though the child sat on top.  With it, the window
+;   manager excludes the overlapping sibling from their clip region and the overlay holds
+;   without anyone hiding anything by hand.
+;   DIRECT children of the vault only.  EnumChildWindows recurses, and clipping the
+;   SETTINGS child's own controls breaks them: the template overlaps each numeric edit
+;   with the label to its left by ~4 DLU, and the label sits above it in z-order, so a
+;   clipped edit loses its own left edge ("20" renders as "!0").  Those controls have no
+;   overlay to defend against - only the vault's do.
+gui_clip_cb proc frame
+    FRAME_PROLOG 72                            ; locals clear of the callees' home areas
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], rdx            ; the vault hwnd
+    WINCALL GetParent, qword ptr [rbp-24]
+    cmp     rax, qword ptr [rbp-32]
+    jne     gcc_next                           ; a grandchild: leave it alone
+    WINCALL GetWindowLongPtrW, qword ptr [rbp-24], GWL_STYLE_
+    or      rax, WS_CLIPSIBLINGS_
+    mov     qword ptr [rbp-40], rax
+    WINCALL SetWindowLongPtrW, qword ptr [rbp-24], GWL_STYLE_, qword ptr [rbp-40]
+gcc_next:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gui_clip_cb endp
+
+; gui_clip_children(rcx = hdlg) - apply it to the vault's direct children.  Called again
+;   whenever settings opens: the left-margin buttons are created at RUNTIME, after the
+;   init-time pass, so they would otherwise still paint over the panel.
+gui_clip_children proc frame
     FRAME_PROLOG 48
     mov     qword ptr [rbp-24], rcx
-    mov     rcx, qword ptr [rbp-24]
-    lea     rdx, [g_vault_ids]
-    mov     r8d, VAULT_ID_COUNT
-    mov     r9d, SW_HIDE
-    call    gui_show_ids
+    WINCALL EnumChildWindows, qword ptr [rbp-24], addr gui_clip_cb, qword ptr [rbp-24]
+    FRAME_EPILOG
+    ret
+gui_clip_children endp
+
+; gui_settings_size(rcx = vault hdlg) - keep the child covering the vault's content.
+;   It sits BELOW the custom title strip, so the close button and the strip stay live,
+;   and on TOP of its siblings - without that the search box and the margin glyphs paint
+;   over it, which is the whole failure mode this refactor exists to remove.
+gui_settings_size proc frame
+    FRAME_PROLOG 120                          ; locals must clear SetWindowPos's 7-arg area
+    cmp     qword ptr [g_settings_hwnd], 0
+    je      gss2_done
+    mov     qword ptr [rbp-24], rcx
+    WINCALL GetClientRect, qword ptr [rbp-24], addr rbp-56
+    mov     eax, dword ptr [rbp-44]            ; height below the strip
+    sub     eax, TBAR_H
+    jns     @F
+    xor     eax, eax
+@@: mov     dword ptr [rbp-64], eax
+    WINCALL MoveWindow, qword ptr [g_settings_hwnd], 0, TBAR_H, \
+            dword ptr [rbp-48], dword ptr [rbp-64], 1
+    WINCALL SetWindowPos, qword ptr [g_settings_hwnd], 0, 0, 0, 0, 0, \
+            <SWP_NOMOVE_ or SWP_NOSIZE_ or SWP_NOACTIVATE_>   ; above every sibling...
+    ; ...except the settings cogwheel, which is what CLOSES this panel.  Covering it left
+    ; no way out but Escape.  The other two margin glyphs (new item, generator) stay
+    ; behind, which is what they should do while settings is up.
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_T_SET
+    mov     qword ptr [rbp-72], rax
+    test    rax, rax
+    jz      gss2_done
+    WINCALL SetWindowPos, qword ptr [rbp-72], 0, 0, 0, 0, 0, \
+            <SWP_NOMOVE_ or SWP_NOSIZE_ or SWP_NOACTIVATE_>
+gss2_done:
+    FRAME_EPILOG
+    ret
+gui_settings_size endp
+
+gui_menu_open proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx           ; the VAULT window
     mov     rcx, qword ptr [rbp-24]           ; drop the revealed-secret overlay FIRST: it
-    call    gui_colorpw_hide                  ;   re-shows the plaintext value edit, which the
-    mov     rcx, qword ptr [rbp-24]           ;   row-hide below then hides (else it would show
-    mov     edx, SW_HIDE                      ;   through the settings overlay)
-    call    gui_rows_show
+    call    gui_colorpw_hide                  ;   re-shows the plaintext value edit
+    mov     rcx, qword ptr [rbp-24]           ; re-apply: the margin buttons and the detail
+    call    gui_clip_children                 ;   rows are created after vp_init's pass
     mov     rcx, qword ptr [rbp-24]
-    lea     rdx, [g_menu_ids]
-    mov     r8d, MENU_ID_COUNT
-    mov     r9d, SW_SHOW
-    call    gui_show_ids
+    call    gui_settings_size                 ; cover the client area, then show
+    WINCALL ShowWindow, qword ptr [g_settings_hwnd], SW_SHOW
     ; prefill the policy fields
-    mov     rcx, qword ptr [rbp-24]
+    mov     rcx, qword ptr [g_settings_hwnd]
     mov     edx, IDC_V_MLEN
     mov     r8d, dword ptr [g_cfg_pwminlen]
     xor     r9d, r9d
     call    SetDlgItemInt
-    mov     rcx, qword ptr [rbp-24]
+    mov     rcx, qword ptr [g_settings_hwnd]
     mov     edx, IDC_V_MCLS
     mov     r8d, dword ptr [g_cfg_pwminclasses]
     xor     r9d, r9d
     call    SetDlgItemInt
-    mov     rcx, qword ptr [rbp-24]                 ; clipboard timeout (seconds)
+    mov     rcx, qword ptr [g_settings_hwnd]                 ; clipboard timeout (seconds)
     mov     edx, IDC_V_MCLIP
     mov     r8d, dword ptr [g_clip_secs]
     xor     r9d, r9d
     call    SetDlgItemInt
     cmp     dword ptr [g_clip_lock], 0              ; disable if HKLM-locked
     je      mo_clip_ok
-    mov     rcx, qword ptr [rbp-24]
+    mov     rcx, qword ptr [g_settings_hwnd]
     mov     edx, IDC_V_MCLIP
     call    GetDlgItem
     mov     rcx, rax
     xor     edx, edx
     call    EnableWindow
 mo_clip_ok:
-    mov     rcx, qword ptr [rbp-24]                 ; auto-lock idle (minutes)
+    mov     rcx, qword ptr [g_settings_hwnd]                 ; auto-lock idle (minutes)
     mov     edx, IDC_V_MIDLE
     mov     r8d, dword ptr [g_idle_min]
     xor     r9d, r9d
     call    SetDlgItemInt
     cmp     dword ptr [g_idle_lock], 0              ; disable if HKLM-locked
     je      mo_idle_ok
-    mov     rcx, qword ptr [rbp-24]
+    mov     rcx, qword ptr [g_settings_hwnd]
     mov     edx, IDC_V_MIDLE
     call    GetDlgItem
     mov     rcx, rax
     xor     edx, edx
     call    EnableWindow
 mo_idle_ok:
-    mov     rcx, qword ptr [rbp-24]                 ; C9 password reminder (days)
+    mov     rcx, qword ptr [g_settings_hwnd]                 ; C9 password reminder (days)
     mov     edx, IDC_V_MPWD
     mov     r8d, dword ptr [g_pwdays]
     xor     r9d, r9d
     call    SetDlgItemInt
     cmp     dword ptr [g_pwdays_lock], 0            ; disable if HKLM-locked
     je      mo_pwd_ok
-    mov     rcx, qword ptr [rbp-24]
+    mov     rcx, qword ptr [g_settings_hwnd]
     mov     edx, IDC_V_MPWD
     call    GetDlgItem
     mov     rcx, rax
@@ -10318,7 +10432,7 @@ mo_pwd_ok:
     ; disable policy fields locked by HKLM
     cmp     dword ptr [g_pol_len_lock], 0
     je      mo_len_ok
-    mov     rcx, qword ptr [rbp-24]
+    mov     rcx, qword ptr [g_settings_hwnd]
     mov     edx, IDC_V_MLEN
     call    GetDlgItem
     mov     rcx, rax
@@ -10327,7 +10441,7 @@ mo_pwd_ok:
 mo_len_ok:
     cmp     dword ptr [g_pol_cls_lock], 0
     je      mo_cls_ok
-    mov     rcx, qword ptr [rbp-24]
+    mov     rcx, qword ptr [g_settings_hwnd]
     mov     edx, IDC_V_MCLS
     call    GetDlgItem
     mov     rcx, rax
@@ -10337,7 +10451,7 @@ mo_cls_ok:
     ; TPM toggle: g_tpm_want / g_tpm_lock were loaded once at startup
     ; (gui_load_policy: HKLM > HKCU > default ON).  Just enable the control when
     ; hardware is present and no HKLM policy locks it.
-    mov     rcx, qword ptr [rbp-24]
+    mov     rcx, qword ptr [g_settings_hwnd]
     mov     edx, IDC_V_MTPM
     call    GetDlgItem
     mov     rcx, rax
@@ -10348,7 +10462,7 @@ mo_cls_ok:
     mov     edx, eax
     call    EnableWindow
     ; the two privacy toggles: disable them when HKLM policy locks the value
-    mov     rcx, qword ptr [rbp-24]
+    mov     rcx, qword ptr [g_settings_hwnd]
     mov     edx, IDC_V_MNOHIST
     call    GetDlgItem
     mov     rcx, rax
@@ -10356,7 +10470,7 @@ mo_cls_ok:
     xor     eax, 1                            ; enable = NOT locked
     mov     edx, eax
     call    EnableWindow
-    mov     rcx, qword ptr [rbp-24]
+    mov     rcx, qword ptr [g_settings_hwnd]
     mov     edx, IDC_V_MNOPHON
     call    GetDlgItem
     mov     rcx, rax
@@ -10365,7 +10479,7 @@ mo_cls_ok:
     mov     edx, eax
     call    EnableWindow
     ; Secure Unlock toggle: disable when HKLM policy locks it
-    mov     rcx, qword ptr [rbp-24]
+    mov     rcx, qword ptr [g_settings_hwnd]
     mov     edx, IDC_V_MSECD
     call    GetDlgItem
     mov     rcx, rax
@@ -10374,7 +10488,7 @@ mo_cls_ok:
     mov     edx, eax
     call    EnableWindow
     ; Lock-with-Windows toggle: disable when HKLM policy locks it
-    mov     rcx, qword ptr [rbp-24]
+    mov     rcx, qword ptr [g_settings_hwnd]
     mov     edx, IDC_V_MWLK
     call    GetDlgItem
     mov     rcx, rax
@@ -10383,7 +10497,7 @@ mo_cls_ok:
     mov     edx, eax
     call    EnableWindow
     ; Disable-attachment-preview toggle: disable when HKLM policy locks it
-    mov     rcx, qword ptr [rbp-24]
+    mov     rcx, qword ptr [g_settings_hwnd]
     mov     edx, IDC_V_MNOPREV
     call    GetDlgItem
     mov     rcx, rax
@@ -10392,7 +10506,7 @@ mo_cls_ok:
     mov     edx, eax
     call    EnableWindow
     ; colour-scheme button: disable when HKLM policy locks the scheme
-    mov     rcx, qword ptr [rbp-24]
+    mov     rcx, qword ptr [g_settings_hwnd]
     mov     edx, IDC_V_MTHEME
     call    GetDlgItem
     mov     rcx, rax
@@ -10400,8 +10514,7 @@ mo_cls_ok:
     xor     eax, 1
     mov     edx, eax
     call    EnableWindow
-    mov     rcx, qword ptr [rbp-24]           ; show the live summon combo on its button
-    call    gui_hotkey_label
+    call    gui_hotkey_label                  ; show the live summon combo on its button
     mov     dword ptr [g_menu_open], 1
     mov     ecx, 1                            ; opaque backdrop in theme_paint
     call    theme_overlay
@@ -10420,20 +10533,16 @@ gui_menu_close proc frame
     mov     r8d, VAULT_ID_COUNT
     mov     r9d, SW_SHOW
     call    gui_show_ids
-    mov     rcx, qword ptr [rbp-24]
-    lea     rdx, [g_menu_ids]
-    mov     r8d, MENU_ID_COUNT
-    mov     r9d, SW_HIDE
-    call    gui_show_ids
-    mov     rcx, qword ptr [rbp-24]           ; restore field rows + edit-mode state
-    mov     edx, SW_SHOW
-    call    gui_rows_show
-    mov     rcx, qword ptr [rbp-24]
+    WINCALL ShowWindow, qword ptr [g_settings_hwnd], SW_HIDE
+    mov     rcx, qword ptr [rbp-24]           ; restore edit-mode state
     mov     edx, dword ptr [g_editmode]
     call    gui_set_editmode
     mov     dword ptr [g_menu_open], 0
-    xor     ecx, ecx
-    call    theme_overlay
+    xor     ecx, ecx                          ; ...and theme.asm's half of the same fact.
+    call    theme_overlay                     ;   gui_menu_open sets BOTH; leaving this one
+                                              ;   at 1 made theme_erase skip theme_sidecard
+                                              ;   for the rest of the session, so the frame
+                                              ;   around the list never came back.
     WINCALL RedrawWindow, qword ptr [rbp-24], 0, 0, 0185h
     FRAME_EPILOG
     ret
@@ -10460,10 +10569,14 @@ gui_menu_toggle endp
 ;   then close the overlay.  HKLM-locked policy values are left untouched.
 gui_menu_save proc frame
     FRAME_PROLOG 64
-    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-24], rcx           ; the VAULT window (timers below), NOT the
+                                              ;   settings child - a store to
+                                              ;   g_settings_hwnd here overwrote the live
+                                              ;   child handle with it, and the caller's
+                                              ;   ShowWindow(SW_HIDE) then hid the vault.
     cmp     dword ptr [g_pol_len_lock], 0
     jne     msv_cls
-    WINCALL GetDlgItemInt, qword ptr [rbp-24], IDC_V_MLEN, 0, 0
+    WINCALL GetDlgItemInt, qword ptr [g_settings_hwnd], IDC_V_MLEN, 0, 0
     test    eax, eax
     jz      msv_cls
     cmp     eax, 256
@@ -10476,7 +10589,7 @@ gui_menu_save proc frame
 msv_cls:
     cmp     dword ptr [g_pol_cls_lock], 0
     jne     msv_tpm
-    WINCALL GetDlgItemInt, qword ptr [rbp-24], IDC_V_MCLS, 0, 0
+    WINCALL GetDlgItemInt, qword ptr [g_settings_hwnd], IDC_V_MCLS, 0, 0
     test    eax, eax
     jz      msv_tpm
     cmp     eax, 4
@@ -10488,7 +10601,7 @@ msv_cls:
     call    cfg_set_dword_hkcu
     cmp     dword ptr [g_clip_lock], 0          ; clipboard auto-clear timeout (seconds)
     jne     msv_idle
-    WINCALL GetDlgItemInt, qword ptr [rbp-24], IDC_V_MCLIP, 0, 0
+    WINCALL GetDlgItemInt, qword ptr [g_settings_hwnd], IDC_V_MCLIP, 0, 0
     cmp     eax, 3600                           ; 0 = off is allowed; clamp the top
     jbe     @F
     mov     eax, 3600
@@ -10499,7 +10612,7 @@ msv_cls:
 msv_idle:
     cmp     dword ptr [g_idle_lock], 0          ; auto-lock idle timeout (minutes)
     jne     msv_idle_arm
-    WINCALL GetDlgItemInt, qword ptr [rbp-24], IDC_V_MIDLE, 0, 0
+    WINCALL GetDlgItemInt, qword ptr [g_settings_hwnd], IDC_V_MIDLE, 0, 0
     cmp     eax, 1440                           ; 0 = off is allowed; clamp to 24 h
     jbe     @F
     mov     eax, 1440
@@ -10509,7 +10622,7 @@ msv_idle:
     call    cfg_set_dword_hkcu
     cmp     dword ptr [g_pwdays_lock], 0        ; C9 master-password reminder (days)
     jne     msv_idle_arm
-    WINCALL GetDlgItemInt, qword ptr [rbp-24], IDC_V_MPWD, 0, 0
+    WINCALL GetDlgItemInt, qword ptr [g_settings_hwnd], IDC_V_MPWD, 0, 0
     cmp     eax, C9_DAYS_MAX                    ; 0 = off is allowed; clamp the top
     jbe     @F
     mov     eax, C9_DAYS_MAX
@@ -10630,6 +10743,13 @@ frame_shift_cb proc frame
     FRAME_PROLOG 128                            ; spill area must clear the locals (down to -76)
     mov     qword ptr [rbp-24], rcx
     mov     qword ptr [rbp-32], rdx
+    ; DIRECT children only.  EnumChildWindows recurses, so this used to shift the settings
+    ; child's own 34 controls down by TBAR_H as well - on top of the child already being
+    ; placed at TBAR_H - which is what pushed the whole panel down the screen.  A
+    ; grandchild's position is relative to its own parent and must not be touched here.
+    WINCALL GetParent, qword ptr [rbp-24]
+    cmp     rax, qword ptr [rbp-32]
+    jne     fsc_skip
     WINCALL GetWindowRect, qword ptr [rbp-24], addr rbp-64   ; L-64 T-60 R-56 B-52
     WINCALL MapWindowPoints, 0, qword ptr [rbp-32], addr rbp-64, 2
     mov     eax, dword ptr [rbp-56]            ; w = R - L
@@ -10643,6 +10763,7 @@ frame_shift_cb proc frame
     mov     dword ptr [rbp-76], eax
     WINCALL MoveWindow, qword ptr [rbp-24], dword ptr [rbp-64], dword ptr [rbp-76], \
             dword ptr [rbp-68], dword ptr [rbp-72], 1
+fsc_skip:
     mov     eax, 1                             ; continue enumeration
     FRAME_EPILOG
     ret
@@ -10826,6 +10947,9 @@ vp_nchit_def:
 vp_size:
     mov     rcx, qword ptr [rbp-8]           ; responsive reflow of anchored controls
     call    gui_reflow
+    mov     rcx, qword ptr [rbp-8]           ; the settings child covers the client area,
+    call    gui_settings_size                ;   so it resizes with it - one MoveWindow
+                                             ;   instead of anchoring 34 controls
     cmp     dword ptr [g_cur_idx], 0         ; re-paginate the detail for the new height
     jl      vp_size_nopag
     mov     rcx, qword ptr [rbp-8]
@@ -11121,6 +11245,10 @@ vp_init:
     mov     qword ptr [g_dlgfont], rax
     mov     dword ptr [g_field_count], 0
     mov     dword ptr [g_menu_open], 0
+    WINCALL CreateDialogParamW, qword ptr [g_hinst], DLG_SETTINGS, qword ptr [rbp-8],             addr settings_proc, 0             ; the settings screen, created hidden
+    mov     qword ptr [g_settings_hwnd], rax
+    mov     rcx, qword ptr [rbp-8]           ; every child must clip its siblings, or they
+    call    gui_clip_children                ;   repaint straight over the settings child
     xor     ecx, ecx                         ; ...and theme.asm's copy of that state, which
     call    theme_overlay                    ;   OUTLIVES the dialog.  Locking with settings
                                              ;   open (Esc, Ctrl+L, the hotkey, idle, Win+L)
@@ -11353,15 +11481,8 @@ vp_mtpm:
     mov     eax, dword ptr [g_tpm_want]
     xor     eax, 1
     mov     dword ptr [g_tpm_want], eax
-    mov     rcx, qword ptr [rbp-8]
-    mov     edx, IDC_V_MTPM
-    call    GetDlgItem
-    sub     rsp, 32
-    mov     rcx, rax
-    xor     edx, edx
-    mov     r8d, 1
-    call    InvalidateRect
-    add     rsp, 32
+    mov     ecx, IDC_V_MTPM                ; repaint the toggle in the settings child
+    call    gui_inval_setting
     jmp     vp_handled
 vp_mwlk:
     cmp     dword ptr [g_winlock_lock], 0     ; HKLM-locked -> ignore the click
@@ -11369,15 +11490,8 @@ vp_mwlk:
     mov     eax, dword ptr [g_winlock]
     xor     eax, 1
     mov     dword ptr [g_winlock], eax
-    mov     rcx, qword ptr [rbp-8]
-    mov     edx, IDC_V_MWLK
-    call    GetDlgItem
-    sub     rsp, 32
-    mov     rcx, rax
-    xor     edx, edx
-    mov     r8d, 1
-    call    InvalidateRect
-    add     rsp, 32
+    mov     ecx, IDC_V_MWLK                ; repaint the toggle in the settings child
+    call    gui_inval_setting
     jmp     vp_handled
 vp_mnoprev:
     cmp     dword ptr [g_nopreview_lock], 0   ; HKLM-locked -> ignore the click
@@ -11385,15 +11499,8 @@ vp_mnoprev:
     mov     eax, dword ptr [g_nopreview]
     xor     eax, 1
     mov     dword ptr [g_nopreview], eax
-    mov     rcx, qword ptr [rbp-8]
-    mov     edx, IDC_V_MNOPREV
-    call    GetDlgItem
-    sub     rsp, 32
-    mov     rcx, rax
-    xor     edx, edx
-    mov     r8d, 1
-    call    InvalidateRect
-    add     rsp, 32
+    mov     ecx, IDC_V_MNOPREV                ; repaint the toggle in the settings child
+    call    gui_inval_setting
     jmp     vp_handled
 vp_mnohist:
     cmp     dword ptr [g_nohist_lock], 0      ; HKLM-locked -> ignore the click
@@ -11401,15 +11508,8 @@ vp_mnohist:
     mov     eax, dword ptr [g_no_history]
     xor     eax, 1
     mov     dword ptr [g_no_history], eax
-    mov     rcx, qword ptr [rbp-8]
-    mov     edx, IDC_V_MNOHIST
-    call    GetDlgItem
-    sub     rsp, 32
-    mov     rcx, rax
-    xor     edx, edx
-    mov     r8d, 1
-    call    InvalidateRect
-    add     rsp, 32
+    mov     ecx, IDC_V_MNOHIST                ; repaint the toggle in the settings child
+    call    gui_inval_setting
     jmp     vp_handled
 vp_mnophon:
     cmp     dword ptr [g_nophon_lock], 0
@@ -11417,15 +11517,8 @@ vp_mnophon:
     mov     eax, dword ptr [g_no_phonetic]
     xor     eax, 1
     mov     dword ptr [g_no_phonetic], eax
-    mov     rcx, qword ptr [rbp-8]
-    mov     edx, IDC_V_MNOPHON
-    call    GetDlgItem
-    sub     rsp, 32
-    mov     rcx, rax
-    xor     edx, edx
-    mov     r8d, 1
-    call    InvalidateRect
-    add     rsp, 32
+    mov     ecx, IDC_V_MNOPHON                ; repaint the toggle in the settings child
+    call    gui_inval_setting
     jmp     vp_handled
 vp_msecd:
     cmp     dword ptr [g_secunlock_lock], 0    ; HKLM-locked -> ignore the click
@@ -11433,15 +11526,8 @@ vp_msecd:
     mov     eax, dword ptr [g_secunlock]
     xor     eax, 1
     mov     dword ptr [g_secunlock], eax
-    mov     rcx, qword ptr [rbp-8]
-    mov     edx, IDC_V_MSECD
-    call    GetDlgItem
-    sub     rsp, 32
-    mov     rcx, rax
-    xor     edx, edx
-    mov     r8d, 1
-    call    InvalidateRect
-    add     rsp, 32
+    mov     ecx, IDC_V_MSECD                ; repaint the toggle in the settings child
+    call    gui_inval_setting
     jmp     vp_handled
 vp_msecinfo:
     WINCALL gui_msgbox, qword ptr [rbp-8], addr m_msecinfo, addr t_msecinfo, \
@@ -16145,24 +16231,45 @@ gui_hotkey_capture proc frame
 ghc_taken:
     WINCALL gui_msgbox, qword ptr [rbp-24], addr hk_taken, addr hk_ttl, 030h
 ghc_refresh:
-    mov     rcx, qword ptr [rbp-24]             ; repaint the settings row either way
-    call    gui_hotkey_label
+    call    gui_hotkey_label                    ; repaint the settings row either way
 ghc_done:
     FRAME_EPILOG
     ret
 gui_hotkey_capture endp
 
 ; gui_hotkey_label(rcx = hdlg) - show the live combo on the settings button.
+; gui_hotkey_label() - no argument on purpose.  IDC_V_MHOTK exists in exactly one
+;   window, the settings child, so taking an hwnd only creates the opportunity to pass
+;   the wrong one: gui_hotkey_capture passed the vault, the write went nowhere, and the
+;   new hotkey did not appear on the button until settings was closed and reopened.
 gui_hotkey_label proc frame
     FRAME_PROLOG 48
-    mov     qword ptr [rbp-24], rcx
     mov     ecx, dword ptr [g_hk_vk]
     mov     edx, dword ptr [g_hk_mods]
     call    hk_fmt
-    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_MHOTK, addr g_hk_txt
+    WINCALL SetDlgItemTextW, qword ptr [g_settings_hwnd], IDC_V_MHOTK, addr g_hk_txt
     FRAME_EPILOG
     ret
 gui_hotkey_label endp
+
+; gui_inval_setting(ecx = control id) - repaint one owner-draw control in the settings
+;   child after the global behind it changed.
+;   Six toggle handlers did this inline against the VAULT window.  GetDlgItem returned
+;   NULL there, and InvalidateRect(NULL, ...) does not no-op: it invalidates EVERY
+;   window on the desktop.  The toggle did repaint - as collateral damage of a
+;   system-wide repaint - which is exactly why the miss was invisible on screen.
+gui_inval_setting proc frame
+    FRAME_PROLOG 48
+    mov     dword ptr [rbp-24], ecx
+    WINCALL GetDlgItem, qword ptr [g_settings_hwnd], dword ptr [rbp-24]
+    mov     qword ptr [rbp-32], rax
+    test    rax, rax                          ; never hand NULL to InvalidateRect
+    jz      gis_done
+    WINCALL InvalidateRect, qword ptr [rbp-32], 0, 1
+gis_done:
+    FRAME_EPILOG
+    ret
+gui_inval_setting endp
 
 ; gui_tray_menu(rcx = hwnd) - the right-click context menu (About / Open / Exit).
 gui_tray_menu proc frame
