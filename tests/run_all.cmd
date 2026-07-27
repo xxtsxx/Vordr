@@ -102,7 +102,7 @@ set /a T_SELFTEST=!T1!-!T0!
 
 rem -------------------------------------------------------------- roundtrip --
 call :now T0
-echo === stage: roundtrip (seedtest / atgen / zitest / phtest / secscan / secfreedup / tmptest / fztest / trtest / vfuzz / fuzzzip / jfuzz / bktest / mactest / rbtest / sysitemkat / vexselkat / c9kat / xctest / reload / attfuzz / zexcap / zexname / convcap / healthkat / pkat / kdfparam / vaultexportkat / vaultexpattkat) ===
+echo === stage: roundtrip (seedtest / atgen / zitest / phtest / secscan / secfreedup / tmptest / fztest / trtest / vfuzz / fuzzzip / jfuzz / bktest / mactest / rbtest / sysitemkat / vexselkat / c9kat / vimpkat / xctest / reload / attfuzz / zexcap / zexname / convcap / healthkat / pkat / kdfparam / vaultexportkat / vaultexpattkat) ===
 set RT=PASS
 
 rem --- data-loss guard: the RELEASE binary (still in bin\ from the build stage)
@@ -182,6 +182,9 @@ if not "!errorlevel!"=="0" ( echo   vexselkat: FAIL ^(exit !errorlevel!, .vordr 
 
 bin\vordr.exe c9kat "%WORK%\c9.vault" > "%WORK%\c9kat.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   c9kat: FAIL ^(exit !errorlevel!, C9 re-verify interval/grace/escalation^) & set RT=FAIL )
+
+bin\vordr.exe vimpkat "%WORK%\vi.vault" > "%WORK%\vimpkat.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   vimpkat: FAIL ^(exit !errorlevel!, .vordr import foreign-read/selection^) & set RT=FAIL )
 
 bin\vordr.exe xctest "%WORK%\xc.vault" > "%WORK%\xctest.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   xctest: FAIL ^(exit !errorlevel!, external-change detection^) & set RT=FAIL )

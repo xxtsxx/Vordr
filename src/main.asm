@@ -64,6 +64,7 @@ extern cmd_reload:proc                  ; C8: vault_reload refresh probe (vault.
 extern cmd_sysitemkat:proc              ; system-item hide/round-trip KAT (vault.asm)
 extern cmd_vexselkat:proc               ; .vordr export: selection + master untouched (vault.asm)
 extern cmd_c9kat:proc                   ; C9 re-verify policy KAT (vault.asm)
+extern cmd_vimpkat:proc                 ; .vordr import: foreign read + selection (vault.asm)
 extern cmd_cowrite:proc                 ; C8: write-lock exclusivity probe (vault.asm)
 extern cmd_attfuzz:proc                 ; G8: attachment-index fuzzer (vault.asm)
 extern cmd_healthkat:proc               ; E6: vault-health analysis KAT (vault.asm)
@@ -218,6 +219,7 @@ WSTR w_reload,   <reload>                ; C8: vault_reload refresh probe
 WSTR w_sysitemkat, <sysitemkat>          ; system-item hide/round-trip KAT
 WSTR w_vexselkat, <vexselkat>            ; .vordr export selection KAT
 WSTR w_c9kat,     <c9kat>                ; C9 re-verify policy KAT
+WSTR w_vimpkat,   <vimpkat>              ; .vordr import KAT
 WSTR w_cowrite,  <cowrite>               ; C8: write-lock exclusivity probe
 WSTR w_attfuzz,  <attfuzz>               ; G8: attachment-index fuzzer
 WSTR w_healthkat,<healthkat>             ; E6: vault-health analysis KAT
@@ -293,6 +295,7 @@ cmd_table label CMDENT
     CMDENT { w_sysitemkat, cmd_sysitemkat, 1, 0 } ; system-item hide/round-trip KAT
     CMDENT { w_vexselkat, cmd_vexselkat, 1, 0 }   ; .vordr export selection KAT
     CMDENT { w_c9kat, cmd_c9kat, 1, 0 }           ; C9 re-verify policy KAT
+    CMDENT { w_vimpkat, cmd_vimpkat, 1, 0 }       ; .vordr import KAT
     CMDENT { w_cowrite,   cmd_cowrite,   1, 0 }   ; C8: write-lock exclusivity probe
     CMDENT { w_attfuzz,   cmd_attfuzz,   0, 0 }   ; G8: attachment-index fuzzer
     CMDENT { w_healthkat, cmd_healthkat, 0, 0 }   ; E6: vault-health analysis KAT

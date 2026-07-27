@@ -219,6 +219,8 @@ CSTR xs_okm,  "vexselkat: PASS (selection honoured, master untouched, child re-k
 CSTR xs_badm, "vexselkat: FAIL",13,10
 CSTR c9_okm,  "c9kat: PASS (interval boundary, reminder is pure + never escalates, pw check)",13,10
 CSTR c9_badm, "c9kat: FAIL",13,10
+CSTR vi_okm,  "vimpkat: PASS (foreign vault read, master untouched, selection, idempotent)",13,10
+CSTR vi_badm, "vimpkat: FAIL",13,10
 CSTR mt_leak,"mactest: FAIL (file-MAC did not catch the trailer tamper)",13,10
 CSTR rb_ok,  "rbtest: PASS (older counter flagged, current one not)",13,10
 CSTR rb_bad, "rbtest: FAIL",13,10
@@ -265,6 +267,9 @@ g_ext_hash  db 32 dup (?)                   ; BLAKE2b of the header snapshotted 
 ; the master stays open and untouched throughout.  g_xs_vkey holds key material and is
 ; wiped the moment it has been restored.
 align 8
+public g_merge_sel
+g_merge_sel dd ?                            ; 1 = fed_merge honours g_sel (GUI import);
+                                            ;   0 = merge every source entry (headless)
 g_seal_noadopt dd ?                         ; 1 = this seal writes a DIFFERENT vault, so
                                             ;   vault_seal_write must not adopt the image
                                             ;   it just wrote as the live one
@@ -3350,6 +3355,169 @@ c9_fail:
 cmd_c9kat endp
 
 ; ===========================================================================
+; cmd_vimpkat <path> - .vordr import: read a FOREIGN vault while the master is open,
+;   merge only the ticked entries, and leave the master byte-identical.  Builds the
+;   source at <path>.src under its own password first, since do_seed seals and closes.
+; ===========================================================================
+LANDING_PAD
+public cmd_vimpkat
+cmd_vimpkat proc frame
+    FRAME_PROLOG 128
+    ; [rbp-24]=src path [rbp-32]=src body [rbp-40]=master body
+    ; [rbp-48]=filebuf [rbp-56]=filesize [rbp-64]=attidx_n
+    lea     r10, [g_argv]
+    mov     rax, qword ptr [r10+16]
+    mov     qword ptr [g_cfg_in], rax
+    mov     r10, rax                            ; g_vx_pathb = <path> + ".src"
+    lea     r11, [g_vx_pathb]
+    xor     r8d, r8d
+vi_pcpy:
+    mov     ax, word ptr [r10+r8*2]
+    mov     word ptr [r11+r8*2], ax
+    test    ax, ax
+    jz      vi_pdone
+    inc     r8d
+    cmp     r8d, MAX_PATH_CHARS-8
+    jb      vi_pcpy
+vi_pdone:
+    mov     word ptr [r11+r8*2], '.'
+    inc     r8d
+    mov     word ptr [r11+r8*2], 's'
+    inc     r8d
+    mov     word ptr [r11+r8*2], 'r'
+    inc     r8d
+    mov     word ptr [r11+r8*2], 'c'
+    inc     r8d
+    mov     word ptr [r11+r8*2], 0
+    lea     rax, [g_vx_pathb]
+    mov     qword ptr [rbp-24], rax
+    ; ---- source vault: 3 entries under its OWN password ----------------------
+    mov     qword ptr [g_cfg_in], rax
+    lea     r10, [vxk_exppw]
+    lea     r11, [g_cfg_pass]
+    xor     ecx, ecx
+vi_pw1:
+    mov     al, byte ptr [r10+rcx]
+    mov     byte ptr [r11+rcx], al
+    test    al, al
+    jz      vi_pw1d
+    inc     ecx
+    cmp     ecx, 32
+    jb      vi_pw1
+vi_pw1d:
+    mov     dword ptr [g_cfg_passlen], 9
+    mov     dword ptr [g_cfg_t], 1
+    mov     dword ptr [g_cfg_m], 8192
+    mov     ecx, 3
+    call    do_seed
+    test    eax, eax
+    jnz     vi_fail
+    ; ---- master vault: 2 entries, and leave it OPEN --------------------------
+    lea     r10, [g_argv]
+    mov     rax, qword ptr [r10+16]
+    mov     qword ptr [g_cfg_in], rax
+    lea     r10, [ffk_seedpw]
+    lea     r11, [g_cfg_pass]
+    xor     ecx, ecx
+vi_pw2:
+    mov     al, byte ptr [r10+rcx]
+    mov     byte ptr [r11+rcx], al
+    test    al, al
+    jz      vi_pw2d
+    inc     ecx
+    cmp     ecx, 32
+    jb      vi_pw2
+vi_pw2d:
+    mov     dword ptr [g_cfg_passlen], 9
+    mov     ecx, 2
+    call    do_seed
+    test    eax, eax
+    jnz     vi_fail
+    call    vault_unlock
+    test    eax, eax
+    jnz     vi_fail
+    mov     rax, qword ptr [g_body_ptr]
+    mov     qword ptr [rbp-40], rax
+    mov     rax, qword ptr [g_filebuf]
+    mov     qword ptr [rbp-48], rax
+    mov     rax, qword ptr [g_filesize]
+    mov     qword ptr [rbp-56], rax
+    mov     eax, dword ptr [g_attidx_n]
+    mov     dword ptr [rbp-64], eax
+    ; ---- read the foreign vault WITHOUT disturbing the open master -----------
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [vxk_exppw]
+    mov     r8d, 9
+    lea     r9, [rbp-32]
+    call    vault_open_foreign
+    test    eax, eax
+    jnz     vi_faillk
+    ; the master's live state must be exactly as it was - same body, same resident
+    ; image, same attachment index, and its on-disk snapshot still its own
+    mov     rax, qword ptr [g_body_ptr]
+    cmp     rax, qword ptr [rbp-40]
+    jne     vi_faillk
+    mov     rax, qword ptr [g_filebuf]
+    cmp     rax, qword ptr [rbp-48]
+    jne     vi_faillk
+    mov     rax, qword ptr [g_filesize]
+    cmp     rax, qword ptr [rbp-56]
+    jne     vi_faillk
+    mov     eax, dword ptr [g_attidx_n]
+    cmp     eax, dword ptr [rbp-64]
+    jne     vi_faillk
+    call    vault_count
+    cmp     eax, 2
+    jne     vi_faillk
+    call    vault_ext_changed
+    test    eax, eax
+    jnz     vi_faillk
+    ; ---- merge only the ticked source entries -------------------------------
+    lea     r10, [g_sel]
+    mov     byte ptr [r10+0], 1
+    mov     byte ptr [r10+1], 0                 ; this one must NOT arrive
+    mov     byte ptr [r10+2], 1
+    mov     dword ptr [g_merge_sel], 1
+    mov     rcx, qword ptr [rbp-32]
+    call    fed_merge
+    mov     dword ptr [g_merge_sel], 0
+    cmp     eax, 2                              ; two added, not three
+    jne     vi_faillk
+    call    vault_count
+    cmp     eax, 4                              ; 2 master + 2 imported
+    jne     vi_faillk
+    ; ---- re-merging the same source changes nothing (dedup by entry id) ------
+    mov     dword ptr [g_merge_sel], 1
+    mov     rcx, qword ptr [rbp-32]
+    call    fed_merge
+    mov     dword ptr [g_merge_sel], 0
+    test    eax, eax
+    jnz     vi_faillk
+    call    vault_count
+    cmp     eax, 4
+    jne     vi_faillk
+    mov     rcx, qword ptr [rbp-32]
+    mov     rdx, VAULT_BODY_MAX
+    call    secmem_free
+    call    vault_lock
+    lea     rcx, [vi_okm]
+    mov     edx, vi_okm_len
+    call    print_a
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+vi_faillk:
+    call    vault_lock
+vi_fail:
+    lea     rcx, [vi_badm]
+    mov     edx, vi_badm_len
+    call    print_a
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_vimpkat endp
+
+; ===========================================================================
 ; cmd_cowrite <path> - C8: prove the <vault>.lock write lock is exclusive and
 ;   reacquirable.  Acquire (must succeed), acquire again while held (must fail),
 ;   release, then re-acquire (must succeed).
@@ -4456,6 +4624,154 @@ xs_novault:
     ret
 vault_export_sel endp
 
+; ===========================================================================
+; vault_open_foreign(rcx = path wide, rdx = utf8 password, r8d = pwlen,
+;                    r9 = *out body ptr) -> eax = 0 / EXIT_*.
+;   Decrypt ANOTHER .vordr while the master vault stays open, handing the caller its
+;   plaintext body (secmem-owned; caller frees with VAULT_BODY_MAX).
+;
+;   vault_unlock works entirely through the live globals, so this parks every one it
+;   writes and puts them back - the same discipline vault_export_sel needs, for the same
+;   reason: the master must be byte-identical afterwards.  On success it also frees the
+;   FOREIGN file image; only the body survives, which is all a merge needs (attachment
+;   fields are stripped by entry_copy_filtered, so the foreign blob store is not wanted).
+; ===========================================================================
+public vault_open_foreign
+vault_open_foreign proc frame
+    FRAME_PROLOG 176
+    ; [rbp-24]=path [rbp-32]=pw [rbp-40]=pwlen [rbp-48]=out
+    ; parked: [rbp-56]=body [rbp-64]=bodylen [rbp-72]=cfg_in [rbp-80]=counter
+    ;         [rbp-88]=ext_size [rbp-96]=filebuf [rbp-104]=filesize [rbp-112]=fmac_len
+    ;         [rbp-120]=att_total [rbp-124]=newatt_n [rbp-128]=attidx_n [rbp-132]=passlen
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], rdx
+    mov     dword ptr [rbp-40], r8d
+    mov     qword ptr [rbp-48], r9
+    mov     rax, qword ptr [g_body_ptr]
+    mov     qword ptr [rbp-56], rax
+    mov     rax, qword ptr [g_body_len]
+    mov     qword ptr [rbp-64], rax
+    mov     rax, qword ptr [g_cfg_in]
+    mov     qword ptr [rbp-72], rax
+    mov     rax, qword ptr [g_save_counter]
+    mov     qword ptr [rbp-80], rax
+    mov     rax, qword ptr [g_ext_size]
+    mov     qword ptr [rbp-88], rax
+    mov     rax, qword ptr [g_filebuf]
+    mov     qword ptr [rbp-96], rax
+    mov     rax, qword ptr [g_filesize]
+    mov     qword ptr [rbp-104], rax
+    mov     rax, qword ptr [g_fmac_len]
+    mov     qword ptr [rbp-112], rax
+    mov     rax, qword ptr [g_att_total]
+    mov     qword ptr [rbp-120], rax
+    mov     eax, dword ptr [g_newatt_n]
+    mov     dword ptr [rbp-124], eax
+    mov     eax, dword ptr [g_attidx_n]
+    mov     dword ptr [rbp-128], eax
+    mov     eax, dword ptr [g_cfg_passlen]
+    mov     dword ptr [rbp-132], eax
+    lea     rcx, [g_xs_hdr]
+    lea     rdx, [g_hdr]
+    mov     r8d, VH_TOTAL
+    call    copy_bytes
+    lea     rcx, [g_xs_vkey]
+    lea     rdx, [g_vkey]
+    mov     r8d, 32
+    call    copy_bytes
+    lea     rcx, [g_xs_ehash]
+    lea     rdx, [g_ext_hash]
+    mov     r8d, 32
+    call    copy_bytes
+    ; ---- open the foreign file in place of the live one ----------------------
+    mov     rax, qword ptr [rbp-24]
+    mov     qword ptr [g_cfg_in], rax
+    lea     rcx, [g_cfg_pass]
+    mov     rdx, qword ptr [rbp-32]
+    mov     r8d, dword ptr [rbp-40]
+    call    copy_bytes
+    mov     eax, dword ptr [rbp-40]
+    mov     dword ptr [g_cfg_passlen], eax
+    mov     dword ptr [g_use_tpm], 0            ; a foreign vault is never TPM-enrolled here
+    mov     dword ptr [g_reuse_key], 0          ; and its key must be derived, not reused
+    mov     qword ptr [g_body_ptr], 0           ; vault_unlock allocates its own
+    mov     qword ptr [g_filebuf], 0            ; read_file OVERWRITES this rather than
+                                                ;   freeing, so the master's image survives
+                                                ;   regardless - nulling is belt and braces
+                                                ;   in case that contract ever changes
+    call    vault_unlock
+    mov     dword ptr [rbp-136], eax
+    test    eax, eax
+    jnz     vof_failed
+    mov     rax, qword ptr [g_body_ptr]         ; hand the body to the caller
+    mov     r10, qword ptr [rbp-48]
+    mov     qword ptr [r10], rax
+    mov     rcx, qword ptr [g_filebuf]          ; the foreign image itself is not wanted
+    test    rcx, rcx
+    jz      vof_restore
+    mov     rdx, qword ptr [g_filesize]
+    call    mem_free
+    jmp     vof_restore
+vof_failed:
+    mov     rcx, qword ptr [g_body_ptr]         ; partial open: release whatever it took
+    test    rcx, rcx
+    jz      vof_f2
+    mov     rdx, VAULT_BODY_MAX
+    call    secmem_free
+vof_f2:
+    mov     rcx, qword ptr [g_filebuf]
+    test    rcx, rcx
+    jz      vof_restore
+    mov     rdx, qword ptr [g_filesize]
+    call    mem_free
+vof_restore:
+    ; ---- put the master back, byte for byte ---------------------------------
+    mov     rax, qword ptr [rbp-56]
+    mov     qword ptr [g_body_ptr], rax
+    mov     rax, qword ptr [rbp-64]
+    mov     qword ptr [g_body_len], rax
+    mov     rax, qword ptr [rbp-72]
+    mov     qword ptr [g_cfg_in], rax
+    mov     rax, qword ptr [rbp-80]
+    mov     qword ptr [g_save_counter], rax
+    mov     rax, qword ptr [rbp-88]
+    mov     qword ptr [g_ext_size], rax
+    mov     rax, qword ptr [rbp-96]
+    mov     qword ptr [g_filebuf], rax
+    mov     rax, qword ptr [rbp-104]
+    mov     qword ptr [g_filesize], rax
+    mov     rax, qword ptr [rbp-112]
+    mov     qword ptr [g_fmac_len], rax
+    mov     rax, qword ptr [rbp-120]
+    mov     qword ptr [g_att_total], rax
+    mov     eax, dword ptr [rbp-124]
+    mov     dword ptr [g_newatt_n], eax
+    mov     eax, dword ptr [rbp-128]
+    mov     dword ptr [g_attidx_n], eax
+    lea     rcx, [g_hdr]
+    lea     rdx, [g_xs_hdr]
+    mov     r8d, VH_TOTAL
+    call    copy_bytes
+    lea     rcx, [g_vkey]
+    lea     rdx, [g_xs_vkey]
+    mov     r8d, 32
+    call    copy_bytes
+    lea     rcx, [g_ext_hash]
+    lea     rdx, [g_xs_ehash]
+    mov     r8d, 32
+    call    copy_bytes
+    lea     rcx, [g_xs_vkey]                    ; no second copy of the master key survives
+    mov     edx, 32
+    call    secure_zero
+    lea     rcx, [g_cfg_pass]                   ; nor the foreign password we were handed
+    mov     edx, MAX_PASSWORD_BYTES+1
+    call    secure_zero
+    mov     dword ptr [g_cfg_passlen], 0
+    mov     eax, dword ptr [rbp-136]
+    FRAME_EPILOG
+    ret
+vault_open_foreign endp
+
 ; fed_merge(rcx = source body ptr) -> eax = number of entries added or updated.
 ;   Merge every source entry into the live body, deduped by the 16-byte entry id:
 ;   an id already present is updated only if the source's `modified` is newer, else
@@ -4475,11 +4791,23 @@ fm_loop:
     mov     eax, dword ptr [rbp-44]
     cmp     eax, dword ptr [rbp-32]
     jae     fm_done
+    cmp     dword ptr [g_merge_sel], 0        ; GUI import: honour the checklist.  Off by
+    je      fm_nosel                          ;   default, so the headless callers that
+    lea     r11, [g_sel]                      ;   merge everything are unchanged.
+    movzx   ecx, byte ptr [r11+rax]
+    test    ecx, ecx
+    jz      fm_next
+fm_nosel:
     mov     rcx, qword ptr [rbp-40]           ; never merge in a foreign system item: dedup is
     call    sys_first_kind                    ;   by ENTRY id, so it would not collide with
     cmp     eax, VF_SYSTEM                    ;   ours - it would land as a SECOND system item,
     je      fm_next                           ;   and vault_sys_find takes the first, silently
                                               ;   shadowing this vault's own stamp.
+    mov     rcx, qword ptr [rbp-40]           ; nor a record the SOURCE had in its trash -
+    mov     edx, VF_DELETED                   ;   importing someone's deleted secrets back
+    call    entry_has_field                   ;   into a live vault is never wanted.  Scans
+    test    eax, eax                          ;   the fields: VF_DELETED is appended, not
+    jnz     fm_next                           ;   field[0], so sys_first_kind cannot see it.
     mov     rcx, qword ptr [rbp-40]           ; src entry (id at +0)
     call    fed_find_by_id
     cmp     eax, -1
@@ -5487,6 +5815,35 @@ vasi_fail:
     FRAME_EPILOG
     ret
 vault_add_system_item endp
+
+; entry_has_field(rcx = entry ptr, edx = field kind) -> eax = 1 if that entry carries one.
+;   POINTER-based, so it works on a FOREIGN body (an import source) where the
+;   index-based vault_is_deleted - which resolves against the live g_body_ptr - would
+;   inspect the wrong vault entirely.  Leaf; walks the entry's own field list.
+entry_has_field proc
+    test    rcx, rcx
+    jz      ehf_no
+    mov     r9d, dword ptr [rcx+32]             ; field_count
+    lea     r10, [rcx+36]
+ehf_lp:
+    test    r9d, r9d
+    jz      ehf_no
+    movzx   eax, word ptr [r10]
+    and     eax, VF_KINDMASK
+    cmp     eax, edx
+    je      ehf_yes
+    mov     eax, dword ptr [r10+2]              ; field len
+    add     r10, 6
+    add     r10, rax
+    dec     r9d
+    jmp     ehf_lp
+ehf_yes:
+    mov     eax, 1
+    ret
+ehf_no:
+    xor     eax, eax
+    ret
+entry_has_field endp
 
 ; vault_is_deleted(ecx = index) -> eax = 1 if that entry is in the trash.
 ;   The vault-side twin of gui_entry_is_deleted, so the export paths can refuse trashed
