@@ -26,6 +26,7 @@ extern mem_free:proc
 extern secure_zero:proc
 extern vault_count:proc
 extern vault_is_system:proc             ; never export the system item (SYSITEM_DESIGN.md)
+extern vault_is_deleted:proc            ; nor anything the user put in the trash
 extern vault_title_at:proc
 extern vault_field_count:proc
 extern vault_field_get:proc
@@ -598,6 +599,10 @@ zbj_elp:
     call    vault_is_system                     ;   keep it out of the export whatever the
     test    eax, eax                            ;   selection says (it would otherwise be
     jnz     zbj_eskip                           ;   written to the JSON in cleartext)
+    mov     ecx, dword ptr [rbp-28]             ; and never export a TRASHED record - the
+    call    vault_is_deleted                    ;   user deleted it; it must not leave in a
+    test    eax, eax                            ;   file they are about to share
+    jnz     zbj_eskip
     mov     eax, dword ptr [rbp-28]
     lea     r10, [g_sel]                        ; export selection: skip unchecked entries
     movzx   ecx, byte ptr [r10+rax]
@@ -964,6 +969,10 @@ zea_elp:
     mov     ecx, eax                            ; system items carry no attachments today,
     call    vault_is_system                     ;   but skip them explicitly so a future
     test    eax, eax                            ;   VF_SYS_* field can never be exported
+    jnz     zea_enext
+    mov     ecx, dword ptr [rbp-44]             ; a trashed record's attachments must not
+    call    vault_is_deleted                    ;   ship either (its json entry is gone, so
+    test    eax, eax                            ;   these would be orphaned blobs anyway)
     jnz     zea_enext
     mov     ecx, dword ptr [rbp-44]
     call    vault_field_count

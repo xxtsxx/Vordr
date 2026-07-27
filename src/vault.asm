@@ -2828,8 +2828,22 @@ si_pwd:
     call    vault_pwverify_get                  ; nothing stored yet
     test    rax, rax
     jnz     si_faillk
+    ; --- lazy creation: a vault with no system item gains one on first set ------
+    ; This is the migration path for vaults made before system items existed - no
+    ; rewrite on unlock, just an item when there is finally something to keep.
+    mov     rcx, 4142434445464748h
+    call    vault_pwverify_set
+    test    eax, eax
+    jz      si_faillk
+    call    vault_count                         ; the set created it: 3 users + 1 system
+    cmp     eax, 4
+    jne     si_faillk
+    call    vault_pwverify_get
+    mov     rcx, 4142434445464748h
+    cmp     rax, rcx
+    jne     si_faillk
     ; --- add one: physical 4, user still 3 -------------------------------------
-    call    vault_add_system_item
+    call    vault_add_system_item               ; already present -> must be a no-op
     test    eax, eax
     jz      si_faillk
     call    vault_count
@@ -3041,6 +3055,30 @@ xk_pw1d:
     call    vault_unlock
     test    eax, eax
     jnz     xk_fail
+    ; Put entry 2 in the trash BEFORE the system item is appended, while it is still the
+    ; last entry - a field can then be appended to it by extending the body, with nothing
+    ; after it to shift.  (VF_DELETED's value is a 16-hex timestamp; the exporters only
+    ; test for the field's presence, so a placeholder is enough here.)
+    mov     ecx, 2
+    call    vault_entry_ptr
+    mov     qword ptr [rbp-40], rax
+    mov     r10, qword ptr [g_body_ptr]
+    add     r10, qword ptr [g_body_len]
+    mov     word ptr [r10], VF_DELETED
+    mov     dword ptr [r10+2], 16
+    xor     r8d, r8d
+xk_delv:
+    mov     byte ptr [r10+6+r8], '0'
+    inc     r8d
+    cmp     r8d, 16
+    jb      xk_delv
+    add     qword ptr [g_body_len], 6 + 16
+    mov     rax, qword ptr [rbp-40]
+    inc     dword ptr [rax+32]                  ; that entry now carries one more field
+    mov     ecx, 2
+    call    vault_is_deleted
+    test    eax, eax
+    jz      xk_faillk
     call    vault_add_system_item               ; 3 users + 1 system = 4 physical
     test    eax, eax
     jz      xk_faillk
@@ -3049,8 +3087,9 @@ xk_pw1d:
     jnz     xk_faillk
     mov     rax, qword ptr [g_body_ptr]
     mov     qword ptr [rbp-24], rax
-    ; tick entries 0 and 2 only; leave 1 unticked and the system item at 3 ticked,
-    ; so the export has to reject it on its own merits rather than by luck.
+    ; Tick 0, 2 and 3, leaving 1 unticked.  All three exclusions then have to fire on
+    ; their own merits rather than by luck: 1 is dropped by the SELECTION, 2 by being
+    ; TRASHED, 3 by being the SYSTEM item - so only entry 0 may reach the child.
     lea     r10, [g_sel]
     mov     byte ptr [r10+0], 1
     mov     byte ptr [r10+1], 0
@@ -3096,8 +3135,8 @@ xk_pw2d:
     call    vault_unlock                        ; g_cfg_pass is still the export password
     test    eax, eax
     jnz     xk_fail
-    call    vault_count                         ; entries 0 and 2 - NOT 1, NOT the system
-    cmp     eax, 2
+    call    vault_count                         ; entry 0 only: 1 unticked, 2 trashed,
+    cmp     eax, 1                              ;   3 the system item
     jne     xk_faillk
     call    vault_sys_find
     cmp     eax, -1
@@ -4107,6 +4146,10 @@ xs_loop:
     call    sys_first_kind
     cmp     eax, VF_SYSTEM
     je      xs_next
+    mov     ecx, dword ptr [rbp-92]           ; nor anything sitting in the trash: a record
+    call    vault_is_deleted                  ;   the user deleted must not walk back out
+    test    eax, eax                          ;   in a file they are about to share
+    jnz     xs_next
     mov     rcx, qword ptr [rbp-88]
     call    vault_entry_len
     mov     r8, qword ptr [rbp-80]
@@ -5255,6 +5298,23 @@ vasi_fail:
     ret
 vault_add_system_item endp
 
+; vault_is_deleted(ecx = index) -> eax = 1 if that entry is in the trash.
+;   The vault-side twin of gui_entry_is_deleted, so the export paths can refuse trashed
+;   records without reaching into gui.asm.
+public vault_is_deleted
+vault_is_deleted proc frame
+    FRAME_PROLOG 48
+    mov     edx, VF_DELETED
+    lea     r8, [rbp-24]
+    call    vault_field_at
+    xor     ecx, ecx
+    test    rax, rax
+    setnz   cl
+    mov     eax, ecx
+    FRAME_EPILOG
+    ret
+vault_is_deleted endp
+
 ; vault_last_user() -> eax = index of the LAST non-system entry, or -1 if none.
 ;   The GUI selects "the entry just written" with count-1.  That is only safe while the
 ;   system item is not last - true for a vault created with one, false for a vault that
@@ -5303,12 +5363,26 @@ vault_pwverify_get endp
 ; vault_pwverify_set(rcx = FILETIME) -> eax = 1 ok / 0 no slot.  Updates in place (the
 ;   field is fixed-width), so it never moves the body.  Does NOT reseal - the caller
 ;   decides when to persist, and on a read-only vault it simply never will.
+;
+;   Creates the system item on demand.  That is how a vault made before system items
+;   existed acquires one: LAZILY, at the moment there is a real setting to store, riding
+;   the save the caller was going to make anyway.  Migrating on unlock instead would
+;   mean rewriting every existing vault the first time it is opened - a silent write to
+;   the user's file for no benefit, and impossible on a read-only vault.
 public vault_pwverify_set
 vault_pwverify_set proc frame
     FRAME_PROLOG 48
     mov     qword ptr [rbp-24], rcx
     mov     ecx, VF_SYS_PWVERIFY
     call    sys_field_ptr
+    test    rax, rax
+    jnz     vps_have
+    call    vault_add_system_item
+    test    eax, eax
+    jz      vps_no
+    mov     ecx, VF_SYS_PWVERIFY
+    call    sys_field_ptr
+vps_have:
     test    rax, rax
     jz      vps_no
     cmp     rdx, 8

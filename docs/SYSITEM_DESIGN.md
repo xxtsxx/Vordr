@@ -127,6 +127,22 @@ The merge case deliberately flips a byte of the snapshot's entry id: merging a b
 itself proves nothing, because dedup would skip the item as "not newer" whether or not
 the filter exists.
 
+## 3b. Creation — wired 2026-07-27
+
+Two paths, deliberately different:
+
+- **New vault:** `gui_create_do` adds the item right after the first `vault_unlock`
+  and reseals, so it is entry 0 and every later record sits after it. This is the real
+  creation path only — `do_init`/`do_seed` stay system-item-free (§4).
+- **Existing vault: no migration.** Opening an old vault does **not** rewrite it.
+  `vault_pwverify_set` creates the item **on demand**, the first time there is actually
+  a setting to store, riding a save the caller was making anyway. Migrating on unlock
+  would mean a silent write to every existing vault the first time it is opened, for no
+  benefit — and would be impossible on a read-only vault, which can never persist one.
+
+The consequence to remember: on a migrated vault the system item is **last**, not first.
+That is exactly what `vault_last_user()` (§3) exists for.
+
 ## 4. Probe suite: keep test vaults system-item-free
 
 `do_seed` / `do_init` must **not** create a system item, so every existing probe that

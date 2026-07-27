@@ -58,6 +58,8 @@ extern vault_remove_at:proc
 extern vault_count:proc
 extern vault_is_system:proc             ; system items are hidden from every user-facing list
 extern vault_last_user:proc             ;   (docs/SYSITEM_DESIGN.md)
+extern vault_add_system_item:proc       ; new vaults get one at creation; old ones lazily
+extern vault_is_deleted:proc            ; trashed records are never exported
 extern vault_health:proc                ; E6: {weak,reused,old,total} analysis
 extern vault_title_at:proc
 extern vault_field_at:proc
@@ -12125,6 +12127,18 @@ cd_open:
     call    vault_unlock
     test    eax, eax
     jnz     cd_unlockfail
+    ; Give a brand-new vault its system item straight away, so it is entry 0 and every
+    ; later record sits after it.  This is the REAL creation path only - do_init and
+    ; do_seed stay system-item-free, which is what keeps the probe suite's physical
+    ; entry counts unchanged (docs/SYSITEM_DESIGN.md).  An EXISTING vault is never
+    ; migrated here: it gains one lazily, the first time there is actually a setting to
+    ; store, so opening a vault never rewrites it behind the user's back.
+    call    vault_add_system_item
+    test    eax, eax
+    jz      cd_sysfail
+    call    vault_reseal                     ; persist it now; the vault is empty, so cheap
+    test    eax, eax
+    jnz     cd_sysfail
     ; enroll TPM unlock for a new vault when supported AND the setting/policy
     ; allows it (g_tpm_want: HKLM > HKCU > default ON, loaded at startup)
     cmp     dword ptr [g_tpm_present], 0
@@ -12133,6 +12147,8 @@ cd_open:
     je      cd_done
     call    vault_tpm_remember
     jmp     cd_done
+cd_sysfail:
+    call    vault_lock                       ; do not hand back a half-built vault
 cd_unlockfail:
     lea     rax, [s_createfail]
     mov     qword ptr [rbp-56], rax
@@ -12657,6 +12673,34 @@ gst_imp:
     ret
 gui_sel_title endp
 
+; gui_sel_exportable(rcx = index) -> eax = 1 if that entry belongs in the export list.
+;   Excludes the system item (not a user record at all) and anything in the TRASH - the
+;   user deleted it, so offering it for export, and ticking it under "All", is wrong.
+;   Applied in PHYSICAL index space alongside the search filter, so rows are only ever
+;   skipped and no row->index remapping is needed anywhere.
+;   Staged import rows have no vault semantics and always pass.
+gui_sel_exportable proc frame
+    FRAME_PROLOG 48
+    cmp     dword ptr [g_sel_src], 0
+    jne     gse_yes
+    mov     qword ptr [rbp-24], rcx
+    call    vault_is_system
+    test    eax, eax
+    jnz     gse_no
+    mov     ecx, dword ptr [rbp-24]
+    call    vault_is_deleted
+    test    eax, eax
+    jnz     gse_no
+gse_yes:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gse_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gui_sel_exportable endp
+
 ; gui_sel_match(rcx = index) -> eax = 1 if the row matches g_search_w, else 0.
 ;   Vault rows delegate to gui_entry_matches; staged rows fold the title into
 ;   g_match_w and substring-scan for the (already upper-cased) query.
@@ -12714,6 +12758,10 @@ gsp_loop:
     jae     gsp_done
     cmp     eax, MAX_SEL
     jae     gsp_done
+    mov     ecx, dword ptr [rbp-44]             ; system items and trashed records are never
+    call    gui_sel_exportable                  ;   offered, whatever the query says
+    test    eax, eax
+    jz      gsp_next
     cmp     dword ptr [rbp-36], 0               ; empty query -> everything matches
     je      gsp_show
     mov     ecx, dword ptr [rbp-44]
@@ -12972,18 +13020,27 @@ select_proc endp
 ; gui_sel_all(rcx = count) - preselect entries 0..count-1 (capped at MAX_SEL) and
 ;   clear the rest, so the checklist opens with everything ticked.
 gui_sel_all proc frame
-    FRAME_PROLOG 32
-    lea     r10, [g_sel]
-    xor     r11d, r11d
+    FRAME_PROLOG 48
+    ; [rbp-24] = count, [rbp-32] = i.  "All" must tick exactly what the list SHOWS -
+    ; ticking a hidden system item or a trashed record would hand it straight to the
+    ; exporters, which is the very thing the row filter exists to prevent.
+    mov     dword ptr [rbp-24], ecx
+    mov     dword ptr [rbp-32], 0
 gsa_lp:
-    cmp     r11d, MAX_SEL
+    cmp     dword ptr [rbp-32], MAX_SEL
     jae     gsa_done
-    xor     eax, eax
-    cmp     r11d, ecx
-    jae     @F
-    mov     eax, 1
-@@: mov     byte ptr [r10+r11], al
-    inc     r11d
+    mov     eax, dword ptr [rbp-32]
+    xor     r8d, r8d
+    cmp     eax, dword ptr [rbp-24]
+    jae     gsa_put
+    mov     ecx, eax
+    call    gui_sel_exportable
+    mov     r8d, eax
+gsa_put:
+    lea     r10, [g_sel]
+    mov     eax, dword ptr [rbp-32]
+    mov     byte ptr [r10+rax], r8b
+    inc     dword ptr [rbp-32]
     jmp     gsa_lp
 gsa_done:
     FRAME_EPILOG
