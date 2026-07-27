@@ -91,6 +91,28 @@ def main():
             mismatches += 1
             print(f"[MISMATCH] {name}: {os.path.basename(args.rc)}={rc_ids[name]} "
                   f"vs {os.path.basename(args.asm)}={asm_ids[name]}")
+
+    # --- two IDC_* names sharing one value --------------------------------------
+    # Agreement between rc and asm is not enough: within a dialog, GetDlgItem(id)
+    # returns only the FIRST control carrying that id, so a duplicate silently
+    # half-works - one control responds and its twin can never be found, shown or
+    # hidden.  IDC_V_MPWDL was given 267, already IDC_V_PGPREV's, and the settings
+    # row it named could not be hidden and bled onto the main screen.
+    # DLG_* are dialog-template ids and live in their own namespace, so only IDC_*
+    # is gated here.  A few IDC_*_BASE values are deliberate range anchors.
+    BASE_OK = re.compile(r'_BASE$')
+    byval = {}
+    for name, v in rc_ids.items():
+        if not name.startswith("IDC_") or BASE_OK.search(name):
+            continue
+        byval.setdefault(v, []).append(name)
+    dups = 0
+    for v, names in sorted(byval.items()):
+        if len(names) > 1:
+            dups += 1
+            mismatches += 1
+            print(f"[DUPLICATE] id {v} used by {', '.join(sorted(names))} - "
+                  f"GetDlgItem can only ever find the first of them")
     rc_only  = sorted(set(rc_ids) - set(asm_ids))
     asm_only = sorted(set(asm_ids) - set(rc_ids))
     for name in rc_only:
@@ -101,6 +123,7 @@ def main():
               f"(= {asm_ids[name]}; asm-side, not gated)")
     print(f"idcheck: {mismatches} mismatches across {shared} shared IDs "
           f"({'clean' if mismatches == 0 else 'ID DRIFT PRESENT'}); "
+          f"{dups} duplicate id(s); "
           f"{len(rc_only)} rc-only, {len(asm_only)} asm-only (informational)")
     sys.exit(min(mismatches, 255))
 

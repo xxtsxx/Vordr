@@ -120,7 +120,18 @@ VF_SPACER           equ 16         ; layout block: a blank gap (no label, no val
 ; Fields are written raw (VFL_RAW), never labelled.
 VF_SYSTEM           equ 17         ; marker, MUST be field[0]; value = u8 schema version
 VF_SYS_PWVERIFY     equ 18         ; C9: u64 FILETIME the master password was last typed
+;                    19+           ; free: the next per-vault setting takes 19
 SYSITEM_VER         equ 1          ; VF_SYSTEM value byte
+; C9 - periodic master-password reminder under TPM Unlock.
+; A REMINDER ONLY: nothing is ever withheld and TPM enrolment is never revoked.  Locking
+; someone out of their own vault is the worst possible response to the very situation
+; this exists to detect - if the password really has been forgotten, the useful thing is
+; to let them in and suggest exporting to a new vault while they still can.  So there is
+; no grace window and no enforcement: past the interval the prompt simply appears, and
+; dismissing it is always allowed.
+C9_DAYS_DEFAULT     equ 30         ; default reminder interval (0 = off)
+C9_DAYS_MAX         equ 3650       ; clamp; 10 years is already "effectively off"
+FT_PER_DAY          equ 864000000000   ; 100ns ticks per day (10e6 * 60 * 60 * 24)
 
 ; Runtime detail-row control ids start here (IDC_DYN_BASE + row*DYN_SLOTS + slot).
 ; Shared so theme.asm can tell a card row button from a fixed header glyph when it

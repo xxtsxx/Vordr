@@ -60,6 +60,9 @@ extern vault_is_system:proc             ; system items are hidden from every use
 extern vault_last_user:proc             ;   (docs/SYSITEM_DESIGN.md)
 extern vault_add_system_item:proc       ; new vaults get one at creation; old ones lazily
 extern vault_is_deleted:proc            ; trashed records are never exported
+extern vault_pw_due:proc                ; C9: is the master-password reminder due?
+extern vault_pw_check:proc              ;   and does this password open this vault?
+extern vault_pwverify_set:proc          ;   stamp it once confirmed
 extern vault_health:proc                ; E6: {weak,reused,old,total} analysis
 extern vault_title_at:proc
 extern vault_field_at:proc
@@ -513,6 +516,10 @@ IDC_V_MWLKL  equ 261                  ; "Lock with Windows" label
 IDC_V_MWLK   equ 262                  ; lock-with-Windows toggle
 IDC_V_MNOPREVL   equ 263              ; "Disable attachment preview" label
 IDC_V_MTOUTS equ 266                  ; "Timeouts" section heading
+IDC_V_MPWDL  equ 277                  ; C9: "Password reminder (days)" label
+IDC_V_MPWD   equ 278                  ; C9: reminder interval edit
+IDC_RM_TEXT  equ 810                  ; C9 reminder dialog: explanatory text
+IDC_RM_PW    equ 811                  ;   and the password field
 IDC_V_MNOPREV    equ 264              ; disable-attachment-preview toggle
 IDC_V_MNOPREVINFO equ 265            ; "Disable attachment preview" info (i)
 IDC_V_MTHEME equ 240                  ; color-scheme cycle button (settings)
@@ -552,6 +559,7 @@ IDC_XP_WARN  equ 723
 IDC_XP_PWL   equ 724
 IDC_XP_PW2L  equ 725
 DLG_IMPPW    equ 730                  ; import-password prompt (single field)
+DLG_PWREMIND equ 795                  ; C9 master-password reminder
 DLG_SELECT   equ 750                  ; export/import entry-selection checklist
 IDC_SEL_SEARCH equ 751
 IDC_SEL_LIST equ 752                  ; SysListView32 checkbox list of entries
@@ -846,6 +854,10 @@ req_p4 label word
     dw 118,101,114,121,116,104,105,110,103,32,105,115,32,103,111,110
     dw 101,46,0
 WSTR wv_clip,       <ClipSeconds>
+WSTR wv_pwdays,     <PwVerifyDays>
+ifdef DBG_TRACE
+WSTR wv_pwnow,      <PwVerifyNow>            ; test builds: force the reminder every unlock
+endif
 WSTR wv_idlemin,    <IdleLockMin>
 WSTR wv_winlock,    <LockOnWinLock>
 WSTR wv_nopreview,  <NoPreview>
@@ -978,6 +990,10 @@ WSTR xp_mm_empty,    <Please enter an export password.>
 WSTR xp_mm_mismatch, <The two passwords do not match. Please re-enter them.>
 WSTR xp_mm_fail,     <The export could not be completed.>
 WSTR cue_xppw,       <Export password>
+WSTR cue_rmpw,       <Master password>
+WSTR rm_wrong,       <That is not the master password for this vault. Try again, or choose "Not now".>
+WSTR rm_title,       <Vordr - Master password check>
+WSTR rm_okmsg,       <Confirmed - that is the master password for this vault.>
 WSTR cue_xppw2,      <Confirm password>
 WSTR cue_ippw,       <Workbook password>
 WSTR imp_pw_title,   <Import from Excel>
@@ -1300,10 +1316,11 @@ g_menu_ids label dword ; controls menu IDs which are hidden and displayed betwee
     dd IDC_V_MSECDL, IDC_V_MSECD, IDC_V_MSECINFO
     dd IDC_V_MCLIPL, IDC_V_MCLIP
     dd IDC_V_MIDLEL, IDC_V_MIDLE, IDC_V_MWLKL, IDC_V_MWLK
+    dd IDC_V_MPWDL, IDC_V_MPWD
     dd IDC_V_MNOPREVL, IDC_V_MNOPREV, IDC_V_MNOPREVINFO
     dd IDC_V_MTOUTS
     dd IDC_V_MHOTKL, IDC_V_MHOTK
-MENU_ID_COUNT equ 33
+MENU_ID_COUNT equ 35
 
 .data?
 align 8
@@ -1379,6 +1396,13 @@ g_revealed  dd ?
 g_clip_seq  dd ?                      ; clipboard sequence number at last copy
 g_clip_secs dd ?                      ; auto-clear timeout in seconds (0 = off); HKLM>HKCU>20
 g_clip_lock dd ?                      ; 1 = clipboard timeout forced by HKLM policy
+public g_pwdays
+g_pwdays    dd ?                      ; C9: re-verify the master password every N days
+                                      ;   under TPM Unlock (0 = off); HKLM>HKCU>30
+g_pwdays_lock dd ?                    ; 1 = PwVerifyDays forced by HKLM policy
+ifdef DBG_TRACE
+g_pwnow_lock dd ?                     ; cfg_get_dword out-param for the dbg force switch
+endif
 g_idle_min  dd ?                      ; auto-lock after N idle minutes (0 = off); HKLM>HKCU>10
 g_idle_lock dd ?                      ; 1 = idle timeout forced by HKLM policy
 g_winlock   dd ?                      ; 1 = lock the vault when Windows locks (Win+L)
@@ -10250,6 +10274,20 @@ mo_clip_ok:
     xor     edx, edx
     call    EnableWindow
 mo_idle_ok:
+    mov     rcx, qword ptr [rbp-24]                 ; C9 password reminder (days)
+    mov     edx, IDC_V_MPWD
+    mov     r8d, dword ptr [g_pwdays]
+    xor     r9d, r9d
+    call    SetDlgItemInt
+    cmp     dword ptr [g_pwdays_lock], 0            ; disable if HKLM-locked
+    je      mo_pwd_ok
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_V_MPWD
+    call    GetDlgItem
+    mov     rcx, rax
+    xor     edx, edx
+    call    EnableWindow
+mo_pwd_ok:
     ; disable policy fields locked by HKLM
     cmp     dword ptr [g_pol_len_lock], 0
     je      mo_len_ok
@@ -10441,6 +10479,16 @@ msv_idle:
 @@: mov     dword ptr [g_idle_min], eax
     lea     rcx, [wv_idlemin]
     mov     edx, dword ptr [g_idle_min]
+    call    cfg_set_dword_hkcu
+    cmp     dword ptr [g_pwdays_lock], 0        ; C9 master-password reminder (days)
+    jne     msv_idle_arm
+    WINCALL GetDlgItemInt, qword ptr [rbp-24], IDC_V_MPWD, 0, 0
+    cmp     eax, C9_DAYS_MAX                    ; 0 = off is allowed; clamp the top
+    jbe     @F
+    mov     eax, C9_DAYS_MAX
+@@: mov     dword ptr [g_pwdays], eax
+    lea     rcx, [wv_pwdays]
+    mov     edx, dword ptr [g_pwdays]
     call    cfg_set_dword_hkcu
 msv_idle_arm:
     WINCALL KillTimer, qword ptr [rbp-24], IDLE_TIMER   ; re-arm the poll (auto-lock + C8.4)
@@ -11939,6 +11987,13 @@ lp_tpm_done:
     jbe     @F
     mov     eax, 3600
 @@: mov     dword ptr [g_clip_secs], eax
+    ; C9: re-verify the master password every N days under TPM Unlock
+    ; (HKLM > HKCU > default 30; 0 = off)
+    WINCALL cfg_get_dword, addr wv_pwdays, C9_DAYS_DEFAULT, addr g_pwdays_lock
+    cmp     eax, C9_DAYS_MAX
+    jbe     @F
+    mov     eax, C9_DAYS_MAX
+@@: mov     dword ptr [g_pwdays], eax
     ; auto-lock idle timeout (minutes; HKLM > HKCU > default 10; 0 = off)
     WINCALL cfg_get_dword, addr wv_idlemin, 10, addr g_idle_lock
     cmp     eax, 1440                           ; clamp to [0, 24 h]
@@ -14672,6 +14727,160 @@ xlpw_proc endp
 ;   (single field, no confirm, no policy check) to open a Vordr WinZip-AES
 ;   .vaultz for import.  Fills g_xlpw / g_xlpwlen.  Raw frame.
 ; =============================================================================
+; =============================================================================
+; C9 - master-password reminder (docs/SYSITEM_DESIGN.md).
+;   Under TPM Unlock the password is never typed, so it rots.  After PwVerifyDays we
+;   ask for it once per unlock.  This is a REMINDER: "Not now" always works, nothing is
+;   withheld, and TPM enrolment is never revoked - if the password really has been
+;   forgotten, the vault is open right now and the useful advice is to export while
+;   that is still true.  The dialog says exactly that.
+; =============================================================================
+; pwremind_proc - returns 1 from EndDialog once the password has been confirmed.
+pwremind_proc proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 64
+    mov     qword ptr [rbp-8], rcx
+    cmp     rdx, WM_INITDIALOG
+    je      rmp_init
+    cmp     rdx, WM_COMMAND
+    je      rmp_cmd
+    cmp     rdx, WM_CTLCOLORSTATIC
+    je      rmp_col
+    cmp     rdx, WM_CTLCOLOREDIT
+    je      rmp_col
+    cmp     rdx, WM_CTLCOLORBTN
+    je      rmp_col
+    cmp     rdx, WM_CTLCOLORDLG
+    je      rmp_col
+    cmp     rdx, WM_PAINT
+    je      rmp_paint
+    cmp     rdx, WM_ERASEBKGND
+    je      rmp_erase
+    cmp     rdx, WM_DRAWITEM
+    je      rmp_draw
+    xor     eax, eax
+    jmp     rmp_ret
+rmp_col:
+    call    theme_ctlcolor
+    jmp     rmp_ret
+rmp_paint:
+    mov     rcx, qword ptr [rbp-8]
+    call    theme_paint
+    jmp     rmp_ret
+rmp_erase:
+    mov     rcx, r8
+    mov     rdx, qword ptr [rbp-8]
+    call    theme_erase
+    jmp     rmp_ret
+rmp_draw:
+    mov     rcx, r9
+    call    theme_drawitem
+    jmp     rmp_ret
+rmp_init:
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDOK
+    call    theme_attach
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_set_winicon
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_RM_PW, EM_SETCUEBANNER, 1, addr cue_rmpw
+    mov     eax, 1
+    jmp     rmp_ret
+rmp_cmd:
+    movzx   eax, r8w
+    cmp     eax, IDOK
+    je      rmp_ok
+    cmp     eax, IDCANCEL
+    je      rmp_cancel
+    xor     eax, eax
+    jmp     rmp_ret
+rmp_ok:
+    WINCALL GetDlgItemTextW, qword ptr [rbp-8], IDC_RM_PW, addr g_pwbuf, 1023
+    test    eax, eax
+    jz      rmp_again                            ; empty -> just ask again
+    lea     rcx, [g_pwbuf]
+    call    password_to_utf8                     ; -> g_cfg_pass; wipes g_pwbuf
+    test    eax, eax
+    jz      rmp_again
+    lea     rcx, [g_cfg_pass]                    ; vault_pw_check wipes g_cfg_pass itself,
+    mov     edx, dword ptr [g_cfg_passlen]       ;   whichever way the comparison goes
+    call    vault_pw_check
+    test    eax, eax
+    jz      rmp_bad
+    WINCALL EndDialog, qword ptr [rbp-8], 1
+    mov     eax, 1
+    jmp     rmp_ret
+rmp_bad:
+    WINCALL gui_msgbox, qword ptr [rbp-8], addr rm_wrong, addr rm_title, \
+            <MB_OK or MB_ICONWARNING>
+rmp_again:
+    WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_RM_PW, 0
+    mov     eax, 1
+    jmp     rmp_ret
+rmp_cancel:
+    WINCALL EndDialog, qword ptr [rbp-8], 0      ; "Not now" is always available
+    mov     eax, 1
+rmp_ret:
+    mov     rsp, rbp
+    pop     rbp
+    ret
+pwremind_proc endp
+
+; gui_pwremind() - ask for the master password if the reminder is due.  Called after a
+;   successful TPM auto-unlock only: a normal password unlock has just proved the user
+;   knows it, and stamps the vault itself.
+gui_pwremind proc frame
+    FRAME_PROLOG 72                              ; 72 -> 80 bytes: the FILETIME slot must
+                                                 ;   clear DialogBoxParamW's home area
+    ; [rbp-24] = now, [rbp-32] = its FILETIME landing slot
+    lea     rcx, [rbp-32]
+    call    GetSystemTimeAsFileTime
+    mov     rax, qword ptr [rbp-32]
+    mov     qword ptr [rbp-24], rax
+ifdef DBG_TRACE
+    ; Test builds only: HKCU ...\Vordr\PwVerifyNow = 1 fires the reminder on EVERY
+    ; unlock, so the dialog can be seen without waiting out the interval or hand-editing
+    ; a stamp.  It bypasses the interval entirely, including 0 = off.  Never compiled
+    ; into a release build - a release must not have a registry switch that changes when
+    ; a master password is asked for.
+    WINCALL cfg_get_dword, addr wv_pwnow, 0, addr g_pwnow_lock
+    test    eax, eax
+    jnz     gpr_show
+endif
+    cmp     dword ptr [g_pwdays], 0
+    je      gpr_done                             ; reminder switched off
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, dword ptr [g_pwdays]
+    call    vault_pw_due
+    test    eax, eax
+    jz      gpr_done
+gpr_show:
+    ; A master password is being typed, so honour the secure-desktop setting exactly as
+    ; the unlock and export prompts do.
+    cmp     dword ptr [g_secunlock], 0
+    je      gpr_normal
+    mov     ecx, DLG_PWREMIND
+    lea     rdx, [pwremind_proc]
+    call    gui_secdesk_show
+    jmp     gpr_res
+gpr_normal:
+    WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_PWREMIND, qword ptr [g_vaulthwnd], \
+            addr pwremind_proc, 0
+gpr_res:
+    cmp     rax, 1
+    jne     gpr_done                             ; dismissed - ask again next unlock
+    mov     rcx, qword ptr [rbp-24]              ; confirmed: restart the clock
+    call    vault_pwverify_set
+    test    eax, eax
+    jz      gpr_done
+    call    vault_reseal                         ; on a read-only vault this is a no-op and
+                                                 ;   the reminder simply returns next time
+gpr_done:
+    call    gui_wipepw
+    FRAME_EPILOG
+    ret
+gui_pwremind endp
+
 imppw_proc proc
     push    rbp
     mov     rbp, rsp
@@ -15270,7 +15479,10 @@ gui_open proc frame
     jne     go_create
     call    gui_try_tpm_auto                ; silent unlock if this device is enrolled
     test    eax, eax
-    jnz     go_vault
+    jz      go_askpw
+    call    gui_pwremind                    ; C9: the password was NOT typed just now, so
+    jmp     go_vault                        ;   remind if it has gone stale
+go_askpw:
     cmp     dword ptr [g_secunlock], 0     ; enter the master password on a private desktop?
     je      go_unlock_normal
     mov     ecx, DLG_UNLOCK

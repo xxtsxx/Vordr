@@ -64,6 +64,10 @@
 #define IDC_V_MSECDL   254
 #define IDC_V_MSECD    255
 #define IDC_V_MSECINFO 256
+#define IDC_V_MPWDL    277
+#define IDC_V_MPWD     278
+#define IDC_RM_TEXT    810
+#define IDC_RM_PW      811
 #define IDC_V_MCLIPL   257
 #define IDC_V_MCLIP    258
 #define IDC_V_MIDLEL   259
@@ -105,6 +109,7 @@
 #define IDC_XP_PWL   724
 #define IDC_XP_PW2L  725
 #define DLG_IMPPW    730
+#define DLG_PWREMIND 795
 #define DLG_SELECT   750
 #define IDC_SEL_SEARCH 751
 #define IDC_SEL_LIST 752
@@ -209,15 +214,17 @@ FONT 9, "Segoe UI"
     EDITTEXT IDC_V_MCLIP, 170, 184, 36, 11, ES_NUMBER | ES_AUTOHSCROLL | NOT WS_BORDER , 0
     LTEXT "Auto-lock idle (minutes, 0=off):", IDC_V_MIDLEL, 44, 198, 130, 10
     EDITTEXT IDC_V_MIDLE, 170, 198, 36, 11, ES_NUMBER | ES_AUTOHSCROLL | NOT WS_BORDER , 0
+    LTEXT "Password reminder (days, 0=off):", IDC_V_MPWDL, 44, 212, 130, 10
+    EDITTEXT IDC_V_MPWD, 170, 212, 36, 11, ES_NUMBER | ES_AUTOHSCROLL | NOT WS_BORDER , 0
 
 
-    LTEXT "Summon hotkey", IDC_V_MHOTKL, 30, 222, 90, 10
-    PUSHBUTTON "", IDC_V_MHOTK, 130, 222, 96, 14, BS_OWNERDRAW
+    LTEXT "Summon hotkey", IDC_V_MHOTKL, 30, 236, 90, 10
+    PUSHBUTTON "", IDC_V_MHOTK, 130, 236, 96, 14, BS_OWNERDRAW
 
-    LTEXT "Color scheme", IDC_V_MTHEMEL, 30, 250, 90, 10
-    PUSHBUTTON "Dark", IDC_V_MTHEME, 130, 250, 96, 14, BS_OWNERDRAW
-    PUSHBUTTON "Import secrets...", IDC_V_MIMPORT, 30, 300, 110, 14, BS_OWNERDRAW
-    PUSHBUTTON "Export secrets...", IDC_V_MEXPORT, 30, 320, 110, 14, BS_OWNERDRAW
+    LTEXT "Color scheme", IDC_V_MTHEMEL, 30, 262, 90, 10
+    PUSHBUTTON "Dark", IDC_V_MTHEME, 130, 262, 96, 14, BS_OWNERDRAW
+    PUSHBUTTON "Import secrets...", IDC_V_MIMPORT, 30, 304, 110, 14, BS_OWNERDRAW
+    PUSHBUTTON "Export secrets...", IDC_V_MEXPORT, 30, 324, 110, 14, BS_OWNERDRAW
 }
 
 DLG_CREATE DIALOGEX 0, 0, 300, 292
@@ -243,6 +250,17 @@ BEGIN
     EDITTEXT IDC_XP_PW2, 16, 80, 232, 12, ES_PASSWORD | ES_AUTOHSCROLL | NOT WS_BORDER, 0
     PUSHBUTTON "Export", IDOK, 134, 104, 54, 18, BS_OWNERDRAW
     PUSHBUTTON "Cancel", IDCANCEL, 194, 104, 54, 18, BS_OWNERDRAW
+END
+
+DLG_PWREMIND DIALOGEX 0, 0, 274, 132
+STYLE DS_CENTER | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Vordr - Master password check"
+FONT 9, "Segoe UI"
+BEGIN
+    LTEXT "This device unlocks your vault for you, so the master password is rarely typed - and easy to forget. Confirm you still know it. If you no longer do, your vault is still open right now: export your secrets to a new vault before you lose access.", IDC_RM_TEXT, 16, 12, 242, 52, 0
+    EDITTEXT IDC_RM_PW, 16, 72, 242, 12, ES_PASSWORD | ES_AUTOHSCROLL | NOT WS_BORDER, 0
+    PUSHBUTTON "Confirm", IDOK, 124, 100, 60, 18, BS_OWNERDRAW
+    PUSHBUTTON "Not now", IDCANCEL, 194, 100, 64, 18, BS_OWNERDRAW
 END
 
 DLG_IMPPW DIALOGEX 0, 0, 264, 100

@@ -217,6 +217,8 @@ CSTR si_ok,  "sysitemkat: PASS (hidden, stamp round-trips, idempotent, not expor
 CSTR si_bad, "sysitemkat: FAIL",13,10
 CSTR xs_okm,  "vexselkat: PASS (selection honoured, master untouched, child re-keyed)",13,10
 CSTR xs_badm, "vexselkat: FAIL",13,10
+CSTR c9_okm,  "c9kat: PASS (interval boundary, reminder is pure + never escalates, pw check)",13,10
+CSTR c9_badm, "c9kat: FAIL",13,10
 CSTR mt_leak,"mactest: FAIL (file-MAC did not catch the trailer tamper)",13,10
 CSTR rb_ok,  "rbtest: PASS (older counter flagged, current one not)",13,10
 CSTR rb_bad, "rbtest: FAIL",13,10
@@ -3163,6 +3165,147 @@ xk_fail:
 cmd_vexselkat endp
 
 ; ===========================================================================
+; cmd_c9kat <path> - C9 policy: the interval, the anchored grace window, the
+;   escalation to "required", and the password check.  Time is passed in, so the whole
+;   schedule is exercised without waiting days for it.
+; ===========================================================================
+LANDING_PAD
+public cmd_c9kat
+cmd_c9kat proc frame
+    FRAME_PROLOG 96
+    ; [rbp-24] = a fixed "now"; [rbp-32] = now + 31 days; [rbp-40] = now + 35 days
+    lea     r10, [g_argv]
+    mov     rax, qword ptr [r10+16]
+    mov     qword ptr [g_cfg_in], rax
+    lea     r10, [ffk_seedpw]
+    lea     r11, [g_cfg_pass]
+    xor     ecx, ecx
+c9_pwcp:
+    mov     al, byte ptr [r10+rcx]
+    mov     byte ptr [r11+rcx], al
+    test    al, al
+    jz      c9_pwd
+    inc     ecx
+    cmp     ecx, 32
+    jb      c9_pwcp
+c9_pwd:
+    mov     dword ptr [g_cfg_passlen], 9
+    mov     dword ptr [g_cfg_t], 1
+    mov     dword ptr [g_cfg_m], 8192
+    mov     ecx, 2
+    call    do_seed
+    test    eax, eax
+    jnz     c9_fail
+    call    vault_unlock
+    test    eax, eax
+    jnz     c9_fail
+    ; A fixed epoch-ish "now", well clear of 0 so day arithmetic has room either way.
+    ; Day offsets go through a register: FT_PER_DAY * n exceeds a 32-bit immediate.
+    mov     r11, FT_PER_DAY
+    mov     rax, r11
+    imul    rax, rax, 1000
+    mov     qword ptr [rbp-24], rax             ; now
+    mov     rdx, r11
+    imul    rdx, rdx, 31
+    add     rdx, rax
+    mov     qword ptr [rbp-32], rdx             ; now + 31 days
+    mov     rdx, r11
+    imul    rdx, rdx, 35
+    add     rdx, rax
+    mov     qword ptr [rbp-40], rdx             ; now + 35 days
+    ; ---- interval 0 disables the feature entirely -----------------------------
+    mov     rcx, qword ptr [rbp-24]
+    xor     edx, edx
+    call    vault_pw_due
+    test    eax, eax
+    jnz     c9_faillk
+    ; ---- freshly stamped -> not due -------------------------------------------
+    mov     rcx, qword ptr [rbp-24]
+    call    vault_pwverify_set
+    test    eax, eax
+    jz      c9_faillk
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, C9_DAYS_DEFAULT
+    call    vault_pw_due
+    test    eax, eax
+    jnz     c9_faillk
+    ; ---- one day short of the interval -> still not due ----------------------
+    mov     rcx, FT_PER_DAY
+    imul    rcx, rcx, C9_DAYS_DEFAULT-1
+    add     rcx, qword ptr [rbp-24]
+    mov     edx, C9_DAYS_DEFAULT
+    call    vault_pw_due
+    test    eax, eax
+    jnz     c9_faillk
+    ; ---- 31 days on -> due, and it STAYS due; nothing escalates --------------
+    mov     rcx, qword ptr [rbp-32]
+    mov     edx, C9_DAYS_DEFAULT
+    call    vault_pw_due
+    cmp     eax, 1
+    jne     c9_faillk
+    mov     rcx, qword ptr [rbp-40]             ; days later, still just a reminder
+    mov     edx, C9_DAYS_DEFAULT
+    call    vault_pw_due
+    cmp     eax, 1
+    jne     c9_faillk
+    ; ---- the query is PURE: being due must not have written anything ---------
+    mov     rcx, qword ptr [rbp-24]             ; the stamp is untouched, so a smaller
+    call    vault_pwverify_get                  ;   interval still reads the original
+    cmp     rax, qword ptr [rbp-24]
+    jne     c9_faillk
+    ; ---- verifying clears it ------------------------------------------------
+    mov     rcx, qword ptr [rbp-40]
+    call    vault_pwverify_set
+    test    eax, eax
+    jz      c9_faillk
+    mov     rcx, qword ptr [rbp-40]
+    mov     edx, C9_DAYS_DEFAULT
+    call    vault_pw_due
+    test    eax, eax
+    jnz     c9_faillk
+    ; ---- a never-stamped vault is due at once (it has demonstrably not been typed)
+    xor     ecx, ecx
+    call    vault_pwverify_set
+    test    eax, eax
+    jz      c9_faillk
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, C9_DAYS_DEFAULT
+    call    vault_pw_due
+    cmp     eax, 1
+    jne     c9_faillk
+    ; ---- the password check accepts only the real master password ------------
+    lea     rcx, [ffk_seedpw]
+    mov     edx, 9
+    call    vault_pw_check
+    cmp     eax, 1
+    jne     c9_faillk
+    lea     rcx, [vxk_exppw]                    ; a different, valid-looking password
+    mov     edx, 9
+    call    vault_pw_check
+    test    eax, eax
+    jnz     c9_faillk
+    call    vault_count                         ; and the vault is still usable after both
+    cmp     eax, 3                              ;   (2 seeded + the lazily added system item)
+    jne     c9_faillk
+    call    vault_lock
+    lea     rcx, [c9_okm]
+    mov     edx, c9_okm_len
+    call    print_a
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+c9_faillk:
+    call    vault_lock
+c9_fail:
+    lea     rcx, [c9_badm]
+    mov     edx, c9_badm_len
+    call    print_a
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_c9kat endp
+
+; ===========================================================================
 ; cmd_cowrite <path> - C8: prove the <vault>.lock write lock is exclusive and
 ;   reacquirable.  Acquire (must succeed), acquire again while held (must fail),
 ;   release, then re-acquire (must succeed).
@@ -5314,6 +5457,112 @@ vault_is_deleted proc frame
     FRAME_EPILOG
     ret
 vault_is_deleted endp
+
+; ===========================================================================
+; C9 - periodic master-password re-verification (docs/SYSITEM_DESIGN.md).
+;   Under TPM Unlock the master password is never typed, so it rots.  After
+;   PwVerifyDays we start asking for it at every unlock; the user may skip for
+;   C9_GRACE_DAYS, after which entry is required.
+; ===========================================================================
+
+; ft_days(rcx = FILETIME) -> rax = whole days since the FILETIME epoch.  Leaf.
+;   Day granularity throughout: the policy is expressed in days, and comparing whole
+;   days avoids "29.99 days" behaving differently from 30.
+ft_days proc
+    mov     rax, rcx
+    xor     edx, edx
+    mov     r10, FT_PER_DAY
+    div     r10
+    ret
+ft_days endp
+
+; vault_pw_due(rcx = now FILETIME, edx = interval days) -> eax = 1 if the master-password
+;   reminder is due.
+;   A pure query: no writes, nothing to reseal, and no read-only special case.  It was
+;   briefly stateful, anchoring a grace window so the prompt could escalate to "entry
+;   required" - but the reminder does not enforce anything, so there was nothing for the
+;   window to escalate TO and the whole mechanism went away with it.
+;   A vault that has never stored a stamp reads 0 and is simply due now, which is right:
+;   the password has demonstrably not been typed within any interval.
+public vault_pw_due
+vault_pw_due proc frame
+    FRAME_PROLOG 48
+    ; [rbp-24] = interval, [rbp-32] = today
+    mov     dword ptr [rbp-24], edx
+    test    edx, edx
+    jz      vpd_no                              ; 0 = off
+    call    ft_days                             ; rcx is still `now`
+    mov     qword ptr [rbp-32], rax
+    call    vault_pwverify_get
+    test    rax, rax
+    jz      vpd_due                             ; never verified -> due
+    mov     rcx, rax
+    call    ft_days
+    mov     ecx, dword ptr [rbp-24]
+    add     rax, rcx                            ; last + interval
+    cmp     qword ptr [rbp-32], rax
+    jae     vpd_due
+vpd_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+vpd_due:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+vault_pw_due endp
+
+; vault_pw_check(rcx = utf8 password, edx = length) -> eax = 1 if it derives the key
+;   this vault is already open under.
+;   The vault is open (TPM gave us g_vkey), so the check is: derive from the typed
+;   password under THIS vault's salt and compare, constant time.  g_vkey is parked and
+;   restored around vk_derive, which writes straight into it.
+public vault_pw_check
+vault_pw_check proc frame
+    FRAME_PROLOG 64
+    ; [rbp-24]=pw [rbp-32]=len [rbp-40]=saved passlen [rbp-48]=result
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-32], edx
+    lea     rcx, [g_xs_vkey]                    ; park the live key
+    lea     rdx, [g_vkey]
+    mov     r8d, 32
+    call    copy_bytes
+    mov     eax, dword ptr [g_cfg_passlen]
+    mov     dword ptr [rbp-40], eax
+    lea     rcx, [g_cfg_pass]                   ; vk_derive reads g_cfg_pass
+    mov     rdx, qword ptr [rbp-24]
+    mov     r8d, dword ptr [rbp-32]
+    call    copy_bytes
+    mov     eax, dword ptr [rbp-32]
+    mov     dword ptr [g_cfg_passlen], eax
+    call    vk_derive
+    mov     dword ptr [rbp-48], 0
+    test    eax, eax
+    jnz     vpc_restore                         ; derive failed -> not a match
+    lea     rcx, [g_vkey]
+    lea     rdx, [g_xs_vkey]
+    mov     r8, 32
+    call    ct_memcmp
+    test    eax, eax
+    jnz     vpc_restore
+    mov     dword ptr [rbp-48], 1
+vpc_restore:
+    lea     rcx, [g_vkey]                       ; the live key comes back either way
+    lea     rdx, [g_xs_vkey]
+    mov     r8d, 32
+    call    copy_bytes
+    lea     rcx, [g_xs_vkey]
+    mov     edx, 32
+    call    secure_zero
+    lea     rcx, [g_cfg_pass]                   ; never leave the typed password behind
+    mov     edx, MAX_PASSWORD_BYTES+1
+    call    secure_zero
+    mov     eax, dword ptr [rbp-40]
+    mov     dword ptr [g_cfg_passlen], 0
+    mov     eax, dword ptr [rbp-48]
+    FRAME_EPILOG
+    ret
+vault_pw_check endp
 
 ; vault_last_user() -> eax = index of the LAST non-system entry, or -1 if none.
 ;   The GUI selects "the entry just written" with count-1.  That is only safe while the

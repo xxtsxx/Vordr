@@ -16,10 +16,19 @@ metadata**.
 First customer is the **C9** master-password re-verify stamp (`pwverify`). The
 mechanism is the deliverable; the stamp is the proof it works.
 
-> **C9 — periodic master-password re-verification (new ID, 2026-07-27).** Under TPM
-> Unlock the master password is never typed, so it rots. C9 re-prompts for it every
-> N days (HKCU `PwVerifyDays`, HKLM override, default 30, 0 = off), skippable for 3
-> days past due, after which TPM enrolment is dropped.
+> **C9 — periodic master-password reminder (new ID, 2026-07-27).** Under TPM Unlock the
+> master password is never typed, so it rots. C9 prompts for it every N days (HKCU
+> `PwVerifyDays`, HKLM override, default 30, 0 = off).
+>
+> **Reminder only — no enforcement.** An earlier draft made it mandatory after a 3-day
+> grace and dropped TPM enrolment on refusal. That was wrong: locking someone out of
+> their own vault is the worst possible response to the very situation this exists to
+> detect. If the password really has been forgotten, the useful move is to let them in
+> and suggest exporting to a new vault while they still can. Dropping the enforcement
+> also deleted the grace window (nothing left to escalate to), which took `VF_SYS_PWGRACE`,
+> the anchor logic and the stateful query with it — `vault_pw_due` is now pure.
+> Tag 19 is **retired, not free**: vaults created while that draft was live carry the
+> field, and unknown tags are skipped, so it is harmless — but must never be reused.
 > **Not C4.** C4 is complete and covers only the opt-in `TpmRequireHello` UI policy
 > (`tpm_seal`/`tpm_unseal`). C9 is adjacent — same TPM-unlock area — but a separate
 > item; the roadmap's house rule was that plan IDs are stable. C1–C8 are in use.
