@@ -99,11 +99,16 @@ actually needed a change.
 | `gui.asm:9869` `gui_first_deleted` | same `VF_DELETED` gate; returns a physical index |
 | `gui.asm:12968` `gui_export` | sizes the selection array, which is indexed physically |
 
-**Known cosmetic gap:** `gui.asm:12594` `gui_sel_count` still returns the physical count,
-so the export checklist would show one blank row for the system item. The export itself
-is correct regardless — `ze_build_json` skips it whatever the selection says. Fixing the
-row needs the select dialog to skip while keeping physical row→index mapping, which is a
-display-gated change and is not attempted here.
+**~~Known cosmetic gap~~ — closed 2026-07-27, and the note above was stale.** This section
+claimed the export checklist would still show a blank row for the system item because
+`gui_sel_count` returns the physical count. That caveat was written *before* the row
+filter existed and never revised: `gui_sel_exportable` skips system items and trashed
+records in the checklist's own loop, and `gui_sel_all` ticks only what the list shows.
+
+`gui_sel_count` returning the PHYSICAL count is correct and must stay that way — it is
+the loop bound, and the loop indexes entries. The skip is what hides the row; the count
+never needed changing. Making it a user count would have reintroduced the off-by-one this
+whole design exists to avoid.
 
 **`vault_last_user()`** exists because `count-1` ("the entry just written") is only safe
 while the system item is not last. It is last on any vault that gained one on a later
