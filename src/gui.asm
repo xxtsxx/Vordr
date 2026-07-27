@@ -161,6 +161,8 @@ extern DialogBoxParamW:proc
 ; secure-desktop (anti-keylogger) master-password entry
 extern CreateDesktopW:proc
 extern OpenInputDesktop:proc
+extern OpenDesktopW:proc                ; last-resort restore: switch to "Default" by name
+extern Sleep:proc
 extern SwitchDesktop:proc
 extern SetThreadDesktop:proc
 extern CloseDesktop:proc
@@ -940,6 +942,8 @@ tray_wt label word
     dw 'V','o','r','d','r', 0
 secdesk_name label word                          ; private desktop for password entry
     dw 'V','o','r','d','r','-','S','e','c','u','r','e', 0
+desk_default label word                          ; the normal interactive desktop, by name:
+    dw 'D','e','f','a','u','l','t', 0            ;   secdesk_restore's last resort
 WSTR cf_hist_name,  <CanIncludeInClipboardHistory>
 WSTR cf_cloud_name, <CanUploadToCloudClipboard>
 WSTR cf_excl_name,  <ExcludeClipboardContentFromMonitorProcessing>
@@ -15325,6 +15329,54 @@ gui_try_tpm_auto endp
 DESKTOP_MAXALLOWED equ 02000000h                 ; MAXIMUM_ALLOWED access
 WAIT_FOREVER       equ 0FFFFFFFFh                 ; INFINITE
 
+; secdesk_restore() -> eax = 1 if the user is back on their own desktop, else 0.
+;   SwitchDesktop FAILS BY RETURNING FALSE, not by raising - and it genuinely can, when
+;   another process holds the input desktop, during a secure-attention sequence, or under
+;   policy.  Both restores used to ignore that, so one transient failure at exactly the
+;   wrong moment left the user stranded on the private desktop with the app still running
+;   happily: box accepted and dismissed, desktop never comes back, no crash to explain it.
+;   So: retry, and if the remembered handle stays unusable, fall back to switching to
+;   "Default" by name - that is the normal interactive desktop, and reaching it is far
+;   better than leaving someone on a desktop with no shell.
+SECDESK_TRIES equ 6
+SECDESK_WAIT  equ 40                                 ; ms between attempts
+secdesk_restore proc frame
+    FRAME_PROLOG 72                                  ; 72 -> 80 bytes: [rbp-40] holds the
+                                                     ;   SwitchDesktop result ACROSS the
+                                                     ;   CloseDesktop below, so it must sit
+                                                     ;   clear of that call's home area
+    mov     dword ptr [rbp-24], 0
+sdr_loop:
+    cmp     qword ptr [g_secdesk_orig], 0
+    je      sdr_byname
+    WINCALL SwitchDesktop, qword ptr [g_secdesk_orig]
+    test    eax, eax
+    jnz     sdr_ok
+    inc     dword ptr [rbp-24]
+    cmp     dword ptr [rbp-24], SECDESK_TRIES
+    jae     sdr_byname
+    WINCALL Sleep, SECDESK_WAIT
+    jmp     sdr_loop
+sdr_byname:
+    WINCALL OpenDesktopW, addr desk_default, 0, 0, DESKTOP_MAXALLOWED
+    test    rax, rax
+    jz      sdr_fail
+    mov     qword ptr [rbp-32], rax
+    WINCALL SwitchDesktop, qword ptr [rbp-32]
+    mov     dword ptr [rbp-40], eax
+    WINCALL CloseDesktop, qword ptr [rbp-32]
+    cmp     dword ptr [rbp-40], 0
+    je      sdr_fail
+sdr_ok:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+sdr_fail:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+secdesk_restore endp
+
 ; secdesk_thread(rcx = unused) - worker: bind to the private desktop, make it
 ;   the visible input desktop, run the dialog, then switch back.  eax = 0.
 secdesk_body proc frame
@@ -15337,9 +15389,7 @@ sdt_run:
     WINCALL DialogBoxParamW, qword ptr [g_hinst], dword ptr [g_secdesk_dlg], 0, \
             qword ptr [g_secdesk_proc], 0
     mov     qword ptr [g_secdesk_res], rax       ; marshal the result back to the caller
-    cmp     qword ptr [g_secdesk_orig], 0        ; return the user to their own desktop
-    je      sdt_done
-    WINCALL SwitchDesktop, qword ptr [g_secdesk_orig]
+    call    secdesk_restore                      ; checked + retried, never fire-and-forget
 sdt_done:
     xor     eax, eax
     FRAME_EPILOG
@@ -15388,9 +15438,16 @@ gui_secdesk_show proc frame
     mov     qword ptr [g_secdesk_proc], rdx
     mov     qword ptr [g_secdesk_res], 0
     mov     qword ptr [g_secdesk_hd], 0
-    ; remember the desktop currently receiving input, to restore afterwards
+    ; Remember the desktop currently receiving input, to restore afterwards.  If this
+    ; fails there is NO handle to switch back to, and both restore paths (secdesk_body
+    ; and gss_cleanup) are guarded on it being non-null - so switching away anyway would
+    ; leave the user on a shell-less desktop with no code able to return them, silently
+    ; and without a crash.  Never switch away from a desktop you cannot get back to:
+    ; degrade to the plain modal instead.
     WINCALL OpenInputDesktop, 0, 0, DESKTOP_MAXALLOWED
     mov     qword ptr [g_secdesk_orig], rax
+    test    rax, rax
+    jz      gss_fallback
     ; create the private desktop the dialog will live on
     WINCALL CreateDesktopW, addr secdesk_name, 0, 0, 0, DESKTOP_MAXALLOWED, 0
     mov     qword ptr [g_secdesk_hd], rax
@@ -15418,13 +15475,13 @@ gss_fallback:
             qword ptr [g_secdesk_proc], 0
     mov     qword ptr [g_secdesk_res], rax
 gss_cleanup:
-    ; belt-and-braces: secdesk_body switches back itself on the normal path, but a
-    ; worker that died mid-dialog never reached that line.  Switching to the desktop
-    ; that is already current is a harmless no-op, and it MUST precede CloseDesktop
-    ; (the desktop currently receiving input cannot be closed).
+    ; belt-and-braces: secdesk_body restores itself on the normal path, but a worker that
+    ; died mid-dialog never reached that line.  Switching to the desktop that is already
+    ; current is a harmless no-op, and it MUST precede CloseDesktop (the desktop currently
+    ; receiving input cannot be closed).
     cmp     qword ptr [g_secdesk_orig], 0
     je      gss_closehd
-    WINCALL SwitchDesktop, qword ptr [g_secdesk_orig]
+    call    secdesk_restore
 gss_closehd:
     cmp     qword ptr [g_secdesk_hd], 0
     je      gss_orig
