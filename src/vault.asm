@@ -2779,8 +2779,9 @@ cmd_reload endp
 LANDING_PAD
 public cmd_sysitemkat
 cmd_sysitemkat proc frame
-    FRAME_PROLOG 48
-    ; [rbp-24] = the stamp we plant and expect back
+    FRAME_PROLOG 80                             ; 80 -> 96 bytes: the 16-byte health struct at
+                                                ;   [rbp-48] must clear the callee home area
+    ; [rbp-24] = the stamp we plant and expect back; [rbp-48..-36] = vault_health out
     lea     r10, [g_argv]
     mov     rax, qword ptr [r10+16]             ; argv[2] = vault path
     mov     qword ptr [g_cfg_in], rax
@@ -2868,6 +2869,18 @@ si_pwd:
     jne     si_faillk
     call    vault_pwverify_get                  ; ...and the stamp came back intact
     cmp     rax, qword ptr [rbp-24]
+    jne     si_faillk
+    ; --- the exclusions: health totals and last-user selection -------------------
+    ; vault_health's loop bound stays physical (it indexes entries) but its reported
+    ; total must not count the system item.
+    lea     rcx, [rbp-48]                       ; health {weak,reused,old,total}
+    call    vault_health
+    cmp     dword ptr [rbp-36], 3               ; total = users only, not 4
+    jne     si_faillk
+    ; "the entry just written" must never resolve to the system item, which sits LAST
+    ; here because this vault gained it after seeding (the migrated-vault shape).
+    call    vault_last_user
+    cmp     eax, 2                              ; entries 0..2 are users, 3 is the system item
     jne     si_faillk
     call    vault_lock
     lea     rcx, [si_ok]
@@ -4035,10 +4048,12 @@ vault_health proc frame
     mov     dword ptr [rbp-64], 0
     mov     dword ptr [rbp-72], 0
     mov     dword ptr [rbp-88], 0
-    call    vault_count
-    mov     dword ptr [rbp-32], eax
+    call    vault_count                         ; PHYSICAL: the loop below indexes entries,
+    mov     dword ptr [rbp-32], eax             ;   so its bound must include system items
+    call    vault_user_count                    ; the REPORTED total must not
     mov     r10, qword ptr [rbp-24]
     mov     dword ptr [r10+12], eax             ; total
+    mov     eax, dword ptr [rbp-32]
     test    eax, eax
     jz      vh_done
     mov     ecx, dword ptr [rbp-32]
@@ -4062,8 +4077,12 @@ vh_loop:
     imul    rcx, rcx, HSTRIDE
     mov     byte ptr [rax+rcx+16], 0
 vh_pw:
-    mov     ecx, dword ptr [rbp-48]
-    mov     edx, VF_SECRET
+    mov     ecx, dword ptr [rbp-48]             ; a system item is not a user record.  It
+    call    vault_is_system                     ;   carries no VF_SECRET so it could never
+    test    eax, eax                            ;   score weak/old/reused anyway - skip it
+    jnz     vh_next                             ;   explicitly rather than lean on that.
+    mov     ecx, dword ptr [rbp-48]             ;   (haspw is already 0, so the dup pass
+    mov     edx, VF_SECRET                      ;    ignores it too.)
     lea     r8, [rbp-56]
     call    vault_field_at                      ; rax=ptr, [rbp-56]=len
     test    rax, rax
@@ -4800,6 +4819,32 @@ vasi_fail:
     FRAME_EPILOG
     ret
 vault_add_system_item endp
+
+; vault_last_user() -> eax = index of the LAST non-system entry, or -1 if none.
+;   The GUI selects "the entry just written" with count-1.  That is only safe while the
+;   system item is not last - true for a vault created with one, false for a vault that
+;   gained it on a later save, where it is APPENDED.  Walks down from the end.
+public vault_last_user
+vault_last_user proc frame
+    FRAME_PROLOG 48
+    call    vault_count
+    mov     dword ptr [rbp-24], eax
+vlu_loop:
+    cmp     dword ptr [rbp-24], 0
+    jle     vlu_none
+    dec     dword ptr [rbp-24]
+    mov     ecx, dword ptr [rbp-24]
+    call    vault_is_system
+    test    eax, eax
+    jnz     vlu_loop
+    mov     eax, dword ptr [rbp-24]
+    FRAME_EPILOG
+    ret
+vlu_none:
+    mov     eax, -1
+    FRAME_EPILOG
+    ret
+vault_last_user endp
 
 ; vault_pwverify_get() -> rax = the stored FILETIME (0 = never / no system item).
 public vault_pwverify_get

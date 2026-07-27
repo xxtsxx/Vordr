@@ -61,23 +61,44 @@ an off-by-one count, or a system item exported in cleartext JSON.
 `vault_count` stays the **physical** count. New: `vault_is_system(ecx=idx)`,
 `vault_user_count()`, `vault_sys_find() -> idx/-1`.
 
-**Must exclude (user-facing):**
+**Corrected after reading every site (2026-07-27).** The table below originally listed
+all 13 as "must exclude". That was derived from the grep, not from the code, and it was
+wrong: most of those `vault_count` calls bound a loop that *indexes* entries, or guard a
+**physical** index handed back by the listbox. Switching those to `vault_user_count`
+would have introduced the exact off-by-one the design exists to prevent. Only 5 sites
+actually needed a change.
 
-| site | proc | consequence if missed |
+**Changed:**
+
+| site | proc | fix |
 |---|---|---|
-| `gui.asm:2037` | `poplist_into` | phantom row in the list |
-| `gui.asm:4279` | `gui_lb_seldata` | stale-index guard off by one |
-| `gui.asm:4341` | `gui_copy_topmost` | copies from the wrong entry |
-| `gui.asm:5443` | `gui_commit` | save targets the wrong entry |
-| `gui.asm:5500` | `gui_check_refresh` | — |
-| `gui.asm:9764` | `gui_purge_trash` | **could purge the system item** |
-| `gui.asm:9869` | `gui_first_deleted` | — |
-| `gui.asm:11620` | `vault_proc` (post-add) | — |
-| `gui.asm:12594` | `gui_sel_count` | "N items" off by one |
-| `gui.asm:12968` | `gui_export` | system item pre-ticked for export |
-| `zipexport.asm:587` | `ze_build_json` | **system item written to the export JSON** |
-| `zipexport.asm:883` | `ze_add_attachments` | — |
-| `vault.asm:3965` | `vault_health` | health totals off by one |
+| `gui.asm:2047` | `poplist_into` | skip in the fill loop; bound + item data stay physical |
+| `gui.asm:5443` | `gui_commit` | `vault_last_user()` instead of `count-1` |
+| `gui.asm:11620` | `vault_proc` (post-add) | same |
+| `zipexport.asm:587` | `ze_build_json` | skip, **whatever the selection says** |
+| `zipexport.asm:883` | `ze_add_attachments` | skip (defensive; none carried today) |
+| `vault.asm:4053` | `vault_health` | reported total from `vault_user_count`; loop skips |
+
+**Deliberately unchanged — physical is correct:**
+
+| site | why |
+|---|---|
+| `gui.asm:4279` `gui_lb_seldata` | guards a **physical** index from `LB_GETITEMDATA` |
+| `gui.asm:4341` `gui_copy_topmost` | same; and the list never shows a system row |
+| `gui.asm:5500` `gui_check_refresh` | liveness probe: 0 = locked/closed |
+| `gui.asm:9764` `gui_purge_trash` | purges only entries carrying `VF_DELETED`, which a system item never has — the "could purge it" claim was wrong |
+| `gui.asm:9869` `gui_first_deleted` | same `VF_DELETED` gate; returns a physical index |
+| `gui.asm:12968` `gui_export` | sizes the selection array, which is indexed physically |
+
+**Known cosmetic gap:** `gui.asm:12594` `gui_sel_count` still returns the physical count,
+so the export checklist would show one blank row for the system item. The export itself
+is correct regardless — `ze_build_json` skips it whatever the selection says. Fixing the
+row needs the select dialog to skip while keeping physical row→index mapping, which is a
+display-gated change and is not attempted here.
+
+**`vault_last_user()`** exists because `count-1` ("the entry just written") is only safe
+while the system item is not last. It is last on any vault that gained one on a later
+save, which is every pre-existing vault.
 
 **Must stay physical (do not touch):** `vault_body_validate` (1771),
 `vault_entry_ptr` (3791), `attach_build` (5088), `fed_export`/`fed_merge` (3612/3720),

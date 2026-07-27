@@ -54,6 +54,8 @@ extern vault_reseal:proc
 extern vault_ext_changed:proc           ; vault.asm: on-disk file changed since load?
 extern vault_remove_at:proc
 extern vault_count:proc
+extern vault_is_system:proc             ; system items are hidden from every user-facing list
+extern vault_last_user:proc             ;   (docs/SYSITEM_DESIGN.md)
 extern vault_health:proc                ; E6: {weak,reused,old,total} analysis
 extern vault_title_at:proc
 extern vault_field_at:proc
@@ -2048,6 +2050,10 @@ pi_loop:
     mov     eax, dword ptr [rbp-40]
     cmp     eax, dword ptr [rbp-32]
     jae     pi_done
+    mov     ecx, dword ptr [rbp-40]             ; system items are never user rows.  The bound
+    call    vault_is_system                     ;   above stays PHYSICAL and the item data set
+    test    eax, eax                            ;   below is the PHYSICAL index, so this is a
+    jnz     pi_next                             ;   pure skip - nothing downstream remaps.
     mov     ecx, dword ptr [rbp-40]             ; trash filter: show deleted iff in trash view
     call    gui_entry_is_deleted
     cmp     eax, dword ptr [g_trash_view]
@@ -5440,10 +5446,9 @@ gco_reseal:
     jnz     gco_resealerr
     mov     rcx, qword ptr [rbp-24]
     call    gui_poplist
-    call    vault_count
-    test    eax, eax
-    jz      gco_done
-    dec     eax
+    call    vault_last_user                     ; NOT count-1: a vault that gained its system
+    cmp     eax, 0                              ;   item on a later save has it appended LAST
+    jl      gco_done
     mov     dword ptr [g_cur_idx], eax
     mov     rcx, qword ptr [rbp-24]              ; reselect by vault index (list is sorted)
     mov     edx, dword ptr [g_cur_idx]
@@ -11617,10 +11622,9 @@ va_build:
     call    vault_reseal
     mov     rcx, qword ptr [rbp-8]
     call    gui_poplist
-    call    vault_count
-    test    eax, eax
-    jz      vp_handled
-    dec     eax
+    call    vault_last_user                   ; NOT count-1 (see gui_commit)
+    cmp     eax, 0
+    jl      vp_handled
     mov     dword ptr [g_cur_idx], eax
     mov     rcx, qword ptr [rbp-8]            ; reselect by vault index (list is sorted)
     mov     edx, dword ptr [g_cur_idx]

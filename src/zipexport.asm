@@ -25,6 +25,7 @@ extern print_a:proc
 extern mem_free:proc
 extern secure_zero:proc
 extern vault_count:proc
+extern vault_is_system:proc             ; never export the system item (SYSITEM_DESIGN.md)
 extern vault_title_at:proc
 extern vault_field_count:proc
 extern vault_field_get:proc
@@ -592,6 +593,11 @@ zbj_elp:
     mov     eax, dword ptr [rbp-28]
     cmp     eax, dword ptr [rbp-24]
     jae     zbj_edone
+    mov     ecx, eax                            ; the system item is never a user record:
+    call    vault_is_system                     ;   keep it out of the export whatever the
+    test    eax, eax                            ;   selection says (it would otherwise be
+    jnz     zbj_eskip                           ;   written to the JSON in cleartext)
+    mov     eax, dword ptr [rbp-28]
     lea     r10, [g_sel]                        ; export selection: skip unchecked entries
     movzx   ecx, byte ptr [r10+rax]
     test    ecx, ecx
@@ -887,6 +893,10 @@ zea_elp:
     mov     eax, dword ptr [rbp-44]
     cmp     eax, dword ptr [rbp-40]
     jae     zea_fin
+    mov     ecx, eax                            ; system items carry no attachments today,
+    call    vault_is_system                     ;   but skip them explicitly so a future
+    test    eax, eax                            ;   VF_SYS_* field can never be exported
+    jnz     zea_enext
     mov     ecx, dword ptr [rbp-44]
     call    vault_field_count
     mov     dword ptr [rbp-48], eax             ; fc
