@@ -1327,6 +1327,76 @@ g_empty_w label word
 ; (the settings screen is DLG_SETTINGS, a child window: it hides as ONE hwnd, so the
 ;  hand-maintained id partition that used to fake that is gone)
 
+; =============================================================================
+; The settings table.  One row per control that maps to a dword global; it drives
+; populate (gui_settings_populate) and save (gui_settings_store) so that adding a
+; setting is ONE row here plus the rc template, instead of edits in seven places.
+;
+; It also removes a whole class of bug the open-coded version had: those two paths
+; were a chain of fallthroughs sharing skip labels, so an early-out in one row
+; silently skipped later, unrelated rows.  Two real cases: typing 0 into "Minimum
+; character types" jumped past the clipboard, idle, reminder and lock-on-Windows
+; saves, and an HKLM lock on that same policy did exactly the same.  A row here
+; cannot affect its neighbours - each iteration is independent.
+; =============================================================================
+SK_NUM equ 0                    ; edit box  <-> dword global; clamped, persisted
+SK_TOG equ 1                    ; Fluent toggle: its click handler owns the global,
+                                ;   we only gate the control and persist the value
+SK_BTN equ 2                    ; button owning its own state (theme): gate only
+
+SF_ZEROOK equ 1                 ; 0 is a legal value ("off").  Without this, a 0
+                                ;   read leaves the global untouched.
+SF_NEEDHW equ 2                 ; additionally requires g_tpm_present to be enabled
+
+SR_ID    equ 0                  ; dd  control id
+SR_KIND  equ 4                  ; dd  SK_*
+SR_VAL   equ 8                  ; dq  -> dword holding the value (0 = none)
+SR_REG   equ 16                 ; dq  -> HKCU value name  (0 = not persisted here)
+SR_LOCK  equ 24                 ; dq  -> dword HKLM lock flag (0 = never locked)
+SR_MAX   equ 32                 ; dd  clamp ceiling (SK_NUM)
+SR_FLAGS equ 36                 ; dd  SF_*
+SR_SIZE  equ 40
+
+align 8
+g_setrows label byte
+    dd IDC_V_MLEN,    SK_NUM
+    dq g_cfg_pwminlen,     wv_pwlen,     g_pol_len_lock
+    dd 256,           0
+    dd IDC_V_MCLS,    SK_NUM
+    dq g_cfg_pwminclasses, wv_pwcls,     g_pol_cls_lock
+    dd 4,             0
+    dd IDC_V_MCLIP,   SK_NUM
+    dq g_clip_secs,        wv_clip,      g_clip_lock
+    dd 3600,          SF_ZEROOK
+    dd IDC_V_MIDLE,   SK_NUM
+    dq g_idle_min,         wv_idlemin,   g_idle_lock
+    dd 1440,          SF_ZEROOK
+    dd IDC_V_MPWD,    SK_NUM
+    dq g_pwdays,           wv_pwdays,    g_pwdays_lock
+    dd C9_DAYS_MAX,   SF_ZEROOK
+    dd IDC_V_MTPM,    SK_TOG
+    dq g_tpm_want,         wv_tpm,       g_tpm_lock
+    dd 0,             SF_NEEDHW
+    dd IDC_V_MSECD,   SK_TOG
+    dq g_secunlock,        wv_secunlock, g_secunlock_lock
+    dd 0,             0
+    dd IDC_V_MWLK,    SK_TOG
+    dq g_winlock,          wv_winlock,   g_winlock_lock
+    dd 0,             0
+    dd IDC_V_MNOPREV, SK_TOG
+    dq g_nopreview,        wv_nopreview, g_nopreview_lock
+    dd 0,             0
+    dd IDC_V_MNOPHON, SK_TOG
+    dq g_no_phonetic,      wv_nophon,    g_nophon_lock
+    dd 0,             0
+    dd IDC_V_MNOHIST, SK_TOG
+    dq g_no_history,       wv_nohist,    g_nohist_lock
+    dd 0,             0
+    dd IDC_V_MTHEME,  SK_BTN            ; gated by policy; gui_save_prefs persists it
+    dq 0,                  0,            g_scheme_lock
+    dd 0,             0
+g_setrows_end label byte
+
 .data?
 align 8
 g_hinst     dq ?
@@ -10319,6 +10389,110 @@ gss2_done:
     ret
 gui_settings_size endp
 
+; gui_settings_populate() - push every table row's live value into its control and
+;   gate the control on its HKLM lock.  Targets g_settings_hwnd, never a parameter:
+;   these controls exist in exactly one window (see tools/dlgtarget.py).
+gui_settings_populate proc frame
+    FRAME_PROLOG 96
+    lea     rax, [g_setrows]
+    mov     qword ptr [rbp-24], rax               ; row cursor
+gsp_loop:
+    lea     rax, [g_setrows_end]
+    cmp     qword ptr [rbp-24], rax
+    jae     gsp_done
+    mov     r11, qword ptr [rbp-24]
+    mov     eax, dword ptr [r11+SR_ID]
+    mov     dword ptr [rbp-56], eax               ; id
+    mov     eax, 1                                ; enabled unless HKLM says otherwise
+    mov     r10, qword ptr [r11+SR_LOCK]
+    test    r10, r10
+    jz      gsp_hw
+    mov     eax, dword ptr [r10]
+    xor     eax, 1
+    and     eax, 1
+gsp_hw:
+    test    dword ptr [r11+SR_FLAGS], SF_NEEDHW   ; TPM: also needs the hardware
+    jz      gsp_enable
+    cmp     dword ptr [g_tpm_present], 0
+    jne     gsp_enable
+    xor     eax, eax
+gsp_enable:
+    mov     dword ptr [rbp-40], eax               ; enable
+    cmp     dword ptr [r11+SR_KIND], SK_NUM       ; only numerics carry a value
+    jne     gsp_gate
+    mov     r10, qword ptr [r11+SR_VAL]
+    mov     eax, dword ptr [r10]
+    mov     dword ptr [rbp-48], eax
+    WINCALL SetDlgItemInt, qword ptr [g_settings_hwnd], dword ptr [rbp-56], \
+            dword ptr [rbp-48], 0
+gsp_gate:
+    WINCALL GetDlgItem, qword ptr [g_settings_hwnd], dword ptr [rbp-56]
+    mov     qword ptr [rbp-64], rax
+    test    rax, rax
+    jz      gsp_next
+    WINCALL EnableWindow, qword ptr [rbp-64], dword ptr [rbp-40]
+gsp_next:
+    add     qword ptr [rbp-24], SR_SIZE
+    jmp     gsp_loop
+gsp_done:
+    FRAME_EPILOG
+    ret
+gui_settings_populate endp
+
+; gui_settings_store() - read every table row back and persist it to HKCU.  A row
+;   locked by HKLM is skipped entirely so the policy value is never overwritten.
+gui_settings_store proc frame
+    FRAME_PROLOG 96
+    lea     rax, [g_setrows]
+    mov     qword ptr [rbp-24], rax
+gss_loop:
+    lea     rax, [g_setrows_end]
+    cmp     qword ptr [rbp-24], rax
+    jae     gss_done
+    mov     r11, qword ptr [rbp-24]
+    mov     r10, qword ptr [r11+SR_LOCK]          ; HKLM-locked -> leave it alone
+    test    r10, r10
+    jz      gss_kind
+    cmp     dword ptr [r10], 0
+    jne     gss_next
+gss_kind:
+    cmp     dword ptr [r11+SR_KIND], SK_NUM
+    jne     gss_persist
+    mov     eax, dword ptr [r11+SR_ID]
+    mov     dword ptr [rbp-56], eax
+    WINCALL GetDlgItemInt, qword ptr [g_settings_hwnd], dword ptr [rbp-56], 0, 0
+    mov     dword ptr [rbp-48], eax
+    mov     r11, qword ptr [rbp-24]
+    test    eax, eax
+    jnz     gss_clamp
+    test    dword ptr [r11+SR_FLAGS], SF_ZEROOK   ; 0 illegal here -> keep the old
+    jz      gss_next                              ;   value rather than store junk
+gss_clamp:
+    mov     eax, dword ptr [rbp-48]
+    cmp     eax, dword ptr [r11+SR_MAX]
+    jbe     @F
+    mov     eax, dword ptr [r11+SR_MAX]
+@@: mov     r10, qword ptr [r11+SR_VAL]
+    mov     dword ptr [r10], eax
+gss_persist:
+    mov     r11, qword ptr [rbp-24]
+    mov     r10, qword ptr [r11+SR_REG]           ; no reg name -> nothing to write
+    test    r10, r10
+    jz      gss_next
+    mov     rax, qword ptr [r11+SR_VAL]
+    test    rax, rax
+    jz      gss_next
+    mov     rcx, r10
+    mov     edx, dword ptr [rax]
+    call    cfg_set_dword_hkcu
+gss_next:
+    add     qword ptr [rbp-24], SR_SIZE
+    jmp     gss_loop
+gss_done:
+    FRAME_EPILOG
+    ret
+gui_settings_store endp
+
 gui_menu_open proc frame
     FRAME_PROLOG 48
     mov     qword ptr [rbp-24], rcx           ; the VAULT window
@@ -10329,144 +10503,7 @@ gui_menu_open proc frame
     mov     rcx, qword ptr [rbp-24]
     call    gui_settings_size                 ; cover the client area, then show
     WINCALL ShowWindow, qword ptr [g_settings_hwnd], SW_SHOW
-    ; prefill the policy fields
-    mov     rcx, qword ptr [g_settings_hwnd]
-    mov     edx, IDC_V_MLEN
-    mov     r8d, dword ptr [g_cfg_pwminlen]
-    xor     r9d, r9d
-    call    SetDlgItemInt
-    mov     rcx, qword ptr [g_settings_hwnd]
-    mov     edx, IDC_V_MCLS
-    mov     r8d, dword ptr [g_cfg_pwminclasses]
-    xor     r9d, r9d
-    call    SetDlgItemInt
-    mov     rcx, qword ptr [g_settings_hwnd]                 ; clipboard timeout (seconds)
-    mov     edx, IDC_V_MCLIP
-    mov     r8d, dword ptr [g_clip_secs]
-    xor     r9d, r9d
-    call    SetDlgItemInt
-    cmp     dword ptr [g_clip_lock], 0              ; disable if HKLM-locked
-    je      mo_clip_ok
-    mov     rcx, qword ptr [g_settings_hwnd]
-    mov     edx, IDC_V_MCLIP
-    call    GetDlgItem
-    mov     rcx, rax
-    xor     edx, edx
-    call    EnableWindow
-mo_clip_ok:
-    mov     rcx, qword ptr [g_settings_hwnd]                 ; auto-lock idle (minutes)
-    mov     edx, IDC_V_MIDLE
-    mov     r8d, dword ptr [g_idle_min]
-    xor     r9d, r9d
-    call    SetDlgItemInt
-    cmp     dword ptr [g_idle_lock], 0              ; disable if HKLM-locked
-    je      mo_idle_ok
-    mov     rcx, qword ptr [g_settings_hwnd]
-    mov     edx, IDC_V_MIDLE
-    call    GetDlgItem
-    mov     rcx, rax
-    xor     edx, edx
-    call    EnableWindow
-mo_idle_ok:
-    mov     rcx, qword ptr [g_settings_hwnd]                 ; C9 password reminder (days)
-    mov     edx, IDC_V_MPWD
-    mov     r8d, dword ptr [g_pwdays]
-    xor     r9d, r9d
-    call    SetDlgItemInt
-    cmp     dword ptr [g_pwdays_lock], 0            ; disable if HKLM-locked
-    je      mo_pwd_ok
-    mov     rcx, qword ptr [g_settings_hwnd]
-    mov     edx, IDC_V_MPWD
-    call    GetDlgItem
-    mov     rcx, rax
-    xor     edx, edx
-    call    EnableWindow
-mo_pwd_ok:
-    ; disable policy fields locked by HKLM
-    cmp     dword ptr [g_pol_len_lock], 0
-    je      mo_len_ok
-    mov     rcx, qword ptr [g_settings_hwnd]
-    mov     edx, IDC_V_MLEN
-    call    GetDlgItem
-    mov     rcx, rax
-    xor     edx, edx
-    call    EnableWindow
-mo_len_ok:
-    cmp     dword ptr [g_pol_cls_lock], 0
-    je      mo_cls_ok
-    mov     rcx, qword ptr [g_settings_hwnd]
-    mov     edx, IDC_V_MCLS
-    call    GetDlgItem
-    mov     rcx, rax
-    xor     edx, edx
-    call    EnableWindow
-mo_cls_ok:
-    ; TPM toggle: g_tpm_want / g_tpm_lock were loaded once at startup
-    ; (gui_load_policy: HKLM > HKCU > default ON).  Just enable the control when
-    ; hardware is present and no HKLM policy locks it.
-    mov     rcx, qword ptr [g_settings_hwnd]
-    mov     edx, IDC_V_MTPM
-    call    GetDlgItem
-    mov     rcx, rax
-    mov     eax, dword ptr [g_tpm_present]    ; enable = present AND not policy-locked
-    mov     edx, dword ptr [g_tpm_lock]
-    xor     edx, 1
-    and     eax, edx
-    mov     edx, eax
-    call    EnableWindow
-    ; the two privacy toggles: disable them when HKLM policy locks the value
-    mov     rcx, qword ptr [g_settings_hwnd]
-    mov     edx, IDC_V_MNOHIST
-    call    GetDlgItem
-    mov     rcx, rax
-    mov     eax, dword ptr [g_nohist_lock]
-    xor     eax, 1                            ; enable = NOT locked
-    mov     edx, eax
-    call    EnableWindow
-    mov     rcx, qword ptr [g_settings_hwnd]
-    mov     edx, IDC_V_MNOPHON
-    call    GetDlgItem
-    mov     rcx, rax
-    mov     eax, dword ptr [g_nophon_lock]
-    xor     eax, 1
-    mov     edx, eax
-    call    EnableWindow
-    ; Secure Unlock toggle: disable when HKLM policy locks it
-    mov     rcx, qword ptr [g_settings_hwnd]
-    mov     edx, IDC_V_MSECD
-    call    GetDlgItem
-    mov     rcx, rax
-    mov     eax, dword ptr [g_secunlock_lock]
-    xor     eax, 1
-    mov     edx, eax
-    call    EnableWindow
-    ; Lock-with-Windows toggle: disable when HKLM policy locks it
-    mov     rcx, qword ptr [g_settings_hwnd]
-    mov     edx, IDC_V_MWLK
-    call    GetDlgItem
-    mov     rcx, rax
-    mov     eax, dword ptr [g_winlock_lock]
-    xor     eax, 1
-    mov     edx, eax
-    call    EnableWindow
-    ; Disable-attachment-preview toggle: disable when HKLM policy locks it
-    mov     rcx, qword ptr [g_settings_hwnd]
-    mov     edx, IDC_V_MNOPREV
-    call    GetDlgItem
-    mov     rcx, rax
-    mov     eax, dword ptr [g_nopreview_lock]
-    xor     eax, 1
-    mov     edx, eax
-    call    EnableWindow
-    ; colour-scheme button: disable when HKLM policy locks the scheme
-    mov     rcx, qword ptr [g_settings_hwnd]
-    mov     edx, IDC_V_MTHEME
-    call    GetDlgItem
-    mov     rcx, rax
-    mov     eax, dword ptr [g_scheme_lock]
-    xor     eax, 1
-    mov     edx, eax
-    call    EnableWindow
+    call    gui_settings_populate             ; every row: value + HKLM gating
     call    gui_hotkey_label                  ; show the live summon combo on its button
     mov     dword ptr [g_menu_open], 1
     WINCALL RedrawWindow, qword ptr [rbp-24], 0, 0, 0185h  ; INVALIDATE|ERASE|ALLCHILDREN|UPDATENOW
@@ -10515,74 +10552,20 @@ gui_menu_save proc frame
                                               ;   g_settings_hwnd here overwrote the live
                                               ;   child handle with it, and the caller's
                                               ;   ShowWindow(SW_HIDE) then hid the vault.
-    cmp     dword ptr [g_pol_len_lock], 0
-    jne     msv_cls
-    WINCALL GetDlgItemInt, qword ptr [g_settings_hwnd], IDC_V_MLEN, 0, 0
-    test    eax, eax
-    jz      msv_cls
-    cmp     eax, 256
-    jbe     @F
-    mov     eax, 256
-@@: mov     dword ptr [g_cfg_pwminlen], eax
-    lea     rcx, [wv_pwlen]
-    mov     edx, dword ptr [g_cfg_pwminlen]
-    call    cfg_set_dword_hkcu
-msv_cls:
-    cmp     dword ptr [g_pol_cls_lock], 0
-    jne     msv_tpm
-    WINCALL GetDlgItemInt, qword ptr [g_settings_hwnd], IDC_V_MCLS, 0, 0
-    test    eax, eax
-    jz      msv_tpm
-    cmp     eax, 4
-    jbe     @F
-    mov     eax, 4
-@@: mov     dword ptr [g_cfg_pwminclasses], eax
-    lea     rcx, [wv_pwcls]
-    mov     edx, dword ptr [g_cfg_pwminclasses]
-    call    cfg_set_dword_hkcu
-    cmp     dword ptr [g_clip_lock], 0          ; clipboard auto-clear timeout (seconds)
-    jne     msv_idle
-    WINCALL GetDlgItemInt, qword ptr [g_settings_hwnd], IDC_V_MCLIP, 0, 0
-    cmp     eax, 3600                           ; 0 = off is allowed; clamp the top
-    jbe     @F
-    mov     eax, 3600
-@@: mov     dword ptr [g_clip_secs], eax
-    lea     rcx, [wv_clip]
-    mov     edx, dword ptr [g_clip_secs]
-    call    cfg_set_dword_hkcu
-msv_idle:
-    cmp     dword ptr [g_idle_lock], 0          ; auto-lock idle timeout (minutes)
-    jne     msv_idle_arm
-    WINCALL GetDlgItemInt, qword ptr [g_settings_hwnd], IDC_V_MIDLE, 0, 0
-    cmp     eax, 1440                           ; 0 = off is allowed; clamp to 24 h
-    jbe     @F
-    mov     eax, 1440
-@@: mov     dword ptr [g_idle_min], eax
-    lea     rcx, [wv_idlemin]
-    mov     edx, dword ptr [g_idle_min]
-    call    cfg_set_dword_hkcu
-    cmp     dword ptr [g_pwdays_lock], 0        ; C9 master-password reminder (days)
-    jne     msv_idle_arm
-    WINCALL GetDlgItemInt, qword ptr [g_settings_hwnd], IDC_V_MPWD, 0, 0
-    cmp     eax, C9_DAYS_MAX                    ; 0 = off is allowed; clamp the top
-    jbe     @F
-    mov     eax, C9_DAYS_MAX
-@@: mov     dword ptr [g_pwdays], eax
-    lea     rcx, [wv_pwdays]
-    mov     edx, dword ptr [g_pwdays]
-    call    cfg_set_dword_hkcu
-msv_idle_arm:
-    WINCALL KillTimer, qword ptr [rbp-24], IDLE_TIMER   ; re-arm the poll (auto-lock + C8.4)
-    WINCALL SetTimer, qword ptr [rbp-24], IDLE_TIMER, IDLE_POLL_MS, 0
-msv_wlk:
-    cmp     dword ptr [g_winlock_lock], 0       ; lock-with-Windows toggle
-    jne     msv_tpm
-    lea     rcx, [wv_winlock]
-    mov     edx, dword ptr [g_winlock]
-    call    cfg_set_dword_hkcu
+    call    gui_settings_store                ; every row: clamp, store, persist
+    WINCALL KillTimer, qword ptr [rbp-24], IDLE_TIMER   ; re-arm the poll (auto-lock +
+    WINCALL SetTimer, qword ptr [rbp-24], IDLE_TIMER, IDLE_POLL_MS, 0   ;   C8.4).
+                                              ; Unconditional now: the old chain reached
+                                              ;   this only on one path, so a changed
+                                              ;   idle timeout often did not take effect
+                                              ;   until the next unlock.
+    ; TPM is the one row with a side effect beyond the registry - enrolling seals the
+    ; vault key to the chip - so the enrol/forget decision stays hand-written here.
+    ; Persisting g_tpm_want is the table's job (neither call touches it, so the order
+    ; of the two does not matter).
 msv_tpm:
     cmp     dword ptr [g_tpm_present], 0
-    je      msv_apply_close                 ; no TPM -> nothing to enrol/forget
+    je      msv_done                        ; no TPM -> nothing to enrol/forget
     mov     eax, dword ptr [g_tpm_want]     ; Fluent toggle state
     mov     dword ptr [rbp-32], eax         ; want enrolled?
     call    vault_tpm_has
@@ -10590,43 +10573,13 @@ msv_tpm:
     cmp     dword ptr [rbp-32], 0
     je      msv_unwant
     cmp     dword ptr [rbp-36], 0
-    jne     msv_tpm_persist                 ; want + have -> just persist
+    jne     msv_done                        ; want + have -> already sealed
     call    vault_tpm_remember
-    jmp     msv_tpm_persist
+    jmp     msv_done
 msv_unwant:
     cmp     dword ptr [rbp-36], 0
-    je      msv_tpm_persist                 ; !want + !have
+    je      msv_done                        ; !want + !have
     call    vault_tpm_forget
-msv_tpm_persist:
-    cmp     dword ptr [g_tpm_lock], 0       ; persist the toggle (HKCU) unless HKLM locks it
-    jne     msv_apply_close
-    lea     rcx, [wv_tpm]
-    mov     edx, dword ptr [g_tpm_want]
-    call    cfg_set_dword_hkcu
-msv_apply_close:
-    cmp     dword ptr [g_nohist_lock], 0    ; persist the privacy toggles (HKCU) unless
-    jne     msv_phon                        ;   HKLM policy locks them
-    lea     rcx, [wv_nohist]
-    mov     edx, dword ptr [g_no_history]
-    call    cfg_set_dword_hkcu
-msv_phon:
-    cmp     dword ptr [g_nophon_lock], 0
-    jne     msv_secd
-    lea     rcx, [wv_nophon]
-    mov     edx, dword ptr [g_no_phonetic]
-    call    cfg_set_dword_hkcu
-msv_secd:
-    cmp     dword ptr [g_secunlock_lock], 0    ; HKLM policy -> don't overwrite with HKCU
-    jne     msv_noprev
-    lea     rcx, [wv_secunlock]
-    mov     edx, dword ptr [g_secunlock]
-    call    cfg_set_dword_hkcu
-msv_noprev:
-    cmp     dword ptr [g_nopreview_lock], 0    ; disable-attachment-preview toggle
-    jne     msv_done
-    lea     rcx, [wv_nopreview]
-    mov     edx, dword ptr [g_nopreview]
-    call    cfg_set_dword_hkcu
 msv_done:
     FRAME_EPILOG
     ret

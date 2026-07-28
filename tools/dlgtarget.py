@@ -147,6 +147,36 @@ def parse_asm(path):
     return hits
 
 
+def check_table(path, owner, asmname):
+    """The settings table (g_setrows) drives populate/save through ONE pair of calls, so
+    per-call checking cannot see its ids - they arrive as data.  Check the data instead:
+    every row must name a control that really is in DLG_SETTINGS, and no id twice.
+    Without this, table-driving the calls would have silently blinded this gate."""
+    src = open(path, encoding="latin-1").read()
+    try:
+        body = src[src.index("g_setrows label byte"):src.index("g_setrows_end")]
+    except ValueError:
+        return 0, 0
+    rows = re.findall(r'^\s*dd\s+(IDC_\w+)\s*,\s*(SK_\w+)', body, re.M)
+    bad, seen = 0, {}
+    for idc, kind in rows:
+        dlgs = owner.get(idc)
+        if dlgs and "DLG_SETTINGS" not in dlgs:
+            bad += 1
+            print(f"[MISMATCH] {asmname}: g_setrows row {idc} ({kind}) - that control is "
+                  f"in {'/'.join(sorted(dlgs))}, not DLG_SETTINGS; the settings loops "
+                  f"would never find it")
+        elif not dlgs:
+            bad += 1
+            print(f"[MISMATCH] {asmname}: g_setrows row {idc} ({kind}) - no such control "
+                  f"in any dialog template")
+        if idc in seen:
+            bad += 1
+            print(f"[MISMATCH] {asmname}: g_setrows lists {idc} twice")
+        seen[idc] = kind
+    return bad, len(rows)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rc", default=DEF_RC)
@@ -185,10 +215,13 @@ def main():
         else:
             ok += 1
 
+    tbad, trows = check_table(args.asm, owner, asmname)
+    bad += tbad
     if args.strict_unknown:
         bad += unknown
     print(f"dlgtarget: {bad} mismatch(es), {unknown} unattributable, {ok} verified, "
-          f"{skipped} not applicable across {len(hits)} dialog-item call(s) "
+          f"{skipped} not applicable across {len(hits)} dialog-item call(s); "
+          f"{trows} settings-table row(s) checked "
           f"({'clean' if bad == 0 else 'WRONG-WINDOW CALL PRESENT'})")
     sys.exit(min(bad, 255))
 

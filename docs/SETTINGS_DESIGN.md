@@ -1,6 +1,6 @@
 # Settings screen — why it keeps breaking, and how to get out
 
-**Status: ACCEPTED — option C, staged. Stages (i) and (ii) landed 2026-07-28; (iii) open.**
+**Status: DONE — option C, all three stages landed 2026-07-28.**
 §7 is what stage (i) actually cost; §8 is what stage (ii) deleted, and the one prediction
 in §4 that did not survive contact.
 
@@ -164,3 +164,35 @@ break. That is a deliberate change on its own, not a line in a cleanup commit.
 
 So `g_menu_open` survives as §4 said — one flag, one module — but it still has one painter
 reading it. The duplication is gone; the coupling is not entirely.
+
+## 9. Stage (iii): the settings table
+
+Option B's table, folded in on top of C as §5.2 anticipated. `g_setrows` carries one row
+per control that maps to a dword global — `{id, kind, value global, HKCU value name, HKLM
+lock flag, clamp, flags}` — and two loops consume it: `gui_settings_populate` (prefill +
+policy gating) and `gui_settings_store` (read back, clamp, persist). `gui_menu_open` went
+from 154 lines to 16. Adding a setting is now one row plus the rc template.
+
+**It fixed two real bugs, which is why this stage was worth doing at all.** Both open-coded
+paths were chains of fallthroughs sharing skip labels, so an early-out in one row skipped
+later, unrelated rows:
+
+- typing `0` into "Minimum character types" jumped past the clipboard, idle, reminder and
+  lock-on-Windows saves — those settings were silently discarded;
+- an HKLM lock on that same policy did exactly the same, so locking one policy stopped four
+  unrelated settings from persisting.
+
+A row cannot affect its neighbours now. The idle-timer re-arm also became unconditional; it
+previously sat on one path only, so a changed auto-lock timeout often did not take effect
+until the next unlock.
+
+TPM stays hand-written: enrolling seals the vault key to the chip, a side effect no table
+should imply. Only its persist is table-driven, which is safe because neither
+`vault_tpm_remember` nor `vault_tpm_forget` touches `g_tpm_want`.
+
+**A gate can be blinded by a refactor.** Moving the ids into data dropped `dlgtarget`'s
+verified-call count from 24 to 2 — the check added in stage (i) could no longer see what it
+was built to see. It now validates the table directly (every row names a control that is
+really in `DLG_SETTINGS`; no id twice), negative-tested both ways. Worth remembering when a
+future refactor moves something else out of a checker's reach: **coverage that silently
+drops to near-zero still reports "clean".**
