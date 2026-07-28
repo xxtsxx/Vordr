@@ -5,7 +5,7 @@
 ## What Vordr is
 
 Vordr is a self-contained password manager for Windows x64, written entirely in
-64-bit assembly. It keeps all of your secrets — passwords, TOTP keys, notes,
+64-bit assembler. It keeps all of your secrets — passwords, TOTP keys, notes,
 custom fields, and file attachments — in **one encrypted file** (`.vordr`),
 sealed with **AES-256-GCM** under a key derived from your master password with
 **Argon2id** (512 MiB memory-hard). It is a single small executable with **no
@@ -28,7 +28,7 @@ plainly:
   on an isolated desktop — but user-mode software cannot defeat a hostile
   kernel. We state this rather than overclaim.
 - **Hardware attackers.** DMA devices, firmware implants, and cold-boot attacks
-  are out of scope.
+  and physical data bus attacks are out of scope.
 - **You, while the vault is open.** A revealed secret is on your screen; a
   copied secret is in the clipboard until cleared; a previewed attachment is
   handed in plaintext to another program. Vordr minimizes each window (auto-
@@ -131,9 +131,12 @@ immediately via fail-fast, with the secrets wiped.
 Assembly removes the trust gap between source and binary: what you read is
 what executes, instruction for instruction. There is no undefined behavior, no
 optimizer re-arranging your constant-time compare, no CRT startup code you
-didn't write. Static tooling (`tools/framecheck.py`) mechanically scans every
-procedure for the one systematic mistake hand-written Win64 code invites
-(stack-argument spills past the frame), and the strict build gates on it.
+didn't write. Six static checkers in `tools/` mechanically scan the source for
+the mistakes hand-written Win64 code invites — stack-argument spills past a
+frame, control-id drift between the resource script and the assembly, a
+constant that disagrees between modules, a dialog call aimed at the wrong
+window — and the strict build fails on any of them. Every one was added after a
+bug of that shape got past both the assembler and a careful read.
 
 ### No communication
 
@@ -299,21 +302,38 @@ clears the clipboard if it is still ours, and destroys tracked temp files.
 
 ### Import and export
 
-Export uses a standard WinZip AES-256 (AE-2) archive file format
-containing `vordr.json` plus the attachments, openable with 7-Zip or any
-AES-zip tool — your guaranteed exit path from Vordr, with no proprietary
-lock-in. Export is selective (pick which entries), always under a password
-that must satisfy the vault's policy. Import lets you pick entries, and
-appends them (never overwrites). Password history is deliberately not
-exported.
+Export is selective — you choose the entries — and always writes a separate,
+independently encrypted file under a password of its own that must satisfy the
+vault's policy. Because the exported file gets its own password, its
+master-password reminder interval starts fresh rather than inheriting the
+parent's. Password history and system records are never exported.
 
-Import accepts **STORED** (uncompressed) AES-zip members only — the format
-Vordr's own export writes. Archives whose members are DEFLATE-compressed (the
-default for 7-Zip and WinRAR when you re-zip `vordr.json` yourself) decrypt but
-then fail to parse, because there is no inflate implementation in the codebase
-(zero third-party code is a deliberate design constraint). To move a hand-built
-archive in, re-create it with **no compression** (STORE). Vordr-produced
-`.vaultz` files always import.
+Two formats:
+
+- **`.vordr` — the default.** A complete Vordr vault containing only the
+  entries you picked: same format, same AEAD, same protections as the vault it
+  came from. This is the right choice for splitting a vault, handing a subset
+  to someone else, or making a backup you intend to keep.
+- **`.zip` — only if you ask for it.** A standard WinZip AES-256 (AE-2)
+  archive holding `vordr.json` plus the attachments, openable with 7-Zip or any
+  AES-zip tool: your guaranteed exit path, with no lock-in. Vordr warns before
+  writing one, because it is the weaker of the two and worth choosing only when
+  something other than Vordr has to read the result. Attachment names inside
+  the archive are anonymized but keep their extensions so the files stay
+  usable — a deliberate trade that leaks which *kinds* of file are present, and
+  the warning says so.
+
+Import accepts either format and dispatches on the file's magic bytes rather
+than its extension, so a `.vordr` renamed to `.zip` still imports correctly.
+You pick which entries to bring in, and they are appended — never overwritten.
+
+For ZIP specifically, import accepts **STORED** (uncompressed) AES-zip members
+only — the format Vordr's own export writes. Archives whose members are
+DEFLATE-compressed (the default for 7-Zip and WinRAR when you re-zip
+`vordr.json` yourself) decrypt but then fail to parse, because there is no
+inflate implementation in the codebase (zero third-party code is a deliberate
+design constraint). To move a hand-built archive in, re-create it with **no
+compression** (STORE). Vordr-produced archives always import.
 
 ### OneDrive storage
 
@@ -351,7 +371,7 @@ remembers the last one used).
 
 ## Testing and verification
 
-Four independent gates, all runnable with one command (`tests\run_all.cmd`)
+Five independent gates, all runnable with one command (`tests\run_all.cmd`)
 and enforced in CI on every push:
 
 1. **Known-answer self-tests — on every launch, not just in CI.** SHA-256
@@ -364,12 +384,26 @@ and enforced in CI on every push:
    compare primitives. Any mismatch → the program refuses to run.
 2. **Red-team fault injection** (debug build): each hardening control is
    deliberately attacked and must fire.
-3. **Strict static analysis**: `framecheck.py` scans every procedure's stack
-   discipline; findings fail the build.
+3. **Strict static analysis**: six checkers over the source, any finding
+   failing the build — `framecheck` (stack discipline: argument spills past a
+   procedure's frame), `idcheck` (rc↔asm control-id drift, duplicate ids, ids
+   inside a range reserved for runtime-created controls), `constcheck` (an
+   `equ` that disagrees between modules), `dlgtarget` (a dialog-item call aimed
+   at a window the control does not live in — Win32 fails those silently),
+   `deadcode` and `aligncheck` (odd-address wide strings). Each exists because
+   a whole class of bug was found to be invisible to both the assembler and to
+   review.
 4. **Headless round-trip probes**: seed 5000 entries, export, re-import,
    verify (`seedtest`/`atgen`/`zitest`); capture password history (`phtest`);
    scan process memory for post-wipe secret residue (`secscan`); verify
-   temp-file destruction (`tmptest`).
+   temp-file destruction (`tmptest`); fuzz the vault, ZIP and JSON parsers
+   (`vfuzz`/`fuzzzip`/`jfuzz`).
+5. **Differential crypto proof** (`cryptodiff`): every primitive is re-run
+   against an independent Python reference and against the published
+   FIPS/RFC/NIST vectors by [`tests/verify_crypto.py`](tests/verify_crypto.py),
+   which shares no code with the assembly. A self-test can only tell you the
+   implementation agrees with itself; this tells you it agrees with the
+   standard as a third party reads it.
 
 ## Risk assessment
 
@@ -436,11 +470,19 @@ Native Tools Command Prompt**:
 
 ```
 build            release build  ->  bin\vordr.exe
-build strict     release + fail the build on any framecheck static finding
+build strict     release + fail the build on any static-checker finding
+build release    reproducible build: byte-identical for a given commit
 build dbg        debug build: startup breadcrumbs + redteam/tpmtest/cttest verbs
 build nohw       software mitigations only (no /CETCOMPAT)
 tests\run_all    the full gate: redteam + strict build + selftest + round-trip
+                 + cryptodiff
 ```
+
+`build release` pins the two sources of nondeterminism in a normal link (the PE
+timestamp, and the absolute PDB path), so two clean builds of the same commit
+produce the same bytes. That is what makes a published hash worth checking —
+see [docs/RELEASES.md](docs/RELEASES.md) for how to verify a binary you
+downloaded.
 
 The output is a single hybrid executable — GUI when launched without
 arguments, diagnostics CLI otherwise (`selftest`, `bench`, and headless test
@@ -462,7 +504,7 @@ command line**, where it would leak into shell history and process listings.
 | `tpm.asm` | Optional TPM-wrapped fast unlock (ncrypt) |
 | `regcfg.asm` | Registry settings (HKLM > HKCU > default), vault path, OneDrive detection |
 | `pwgen.asm` | Password generator (5 styles) + policy checks |
-| `zipexport.asm`, `zipimport.asm` | `.vaultz` (WinZip AE-2) export / staged import |
+| `zipexport.asm`, `zipimport.asm` | `.zip` (WinZip AE-2) export / staged import; `.vordr` export and cross-vault import live in `vault.asm` |
 | `gui.asm` | All windows: unlock/create, vault, settings, generator, history (owner-drawn) |
 | `theme.asm` | Color schemes, owner-draw painters, DWM dark title bar |
 | `fileio.asm`, `console.asm`, `log.asm` | Atomic file I/O, console, audit log |
@@ -509,6 +551,22 @@ mistakes, and x64-Windows-only. Those risks are managed structurally — shared
 macros for the error-prone patterns, a static frame checker gating the build,
 fault-injection tests proving the hardening, and known-answer tests proving
 the crypto — rather than by hoping for careful reading alone.
+
+## Reporting a security issue
+
+**Please do not open a public issue for a vulnerability.** Vordr has no
+auto-update: every user is running a binary they downloaded, so a public report
+is a working exploit against all of them until each one updates by hand.
+
+Report privately through GitHub's
+[security advisory form](https://github.com/xxtsxx/Vordr/security/advisories/new).
+[SECURITY.md](SECURITY.md) has the full policy — what is in and out of scope,
+what to expect and when, and the coordinated-disclosure terms.
+
+Two things worth reading before you report: the out-of-scope list is drawn from
+the threat model above, so a finding that assumes an attacker already past those
+limits is not a vulnerability; and **never attach a real vault file or a real
+master password** — a synthetic one demonstrates the same bug.
 
 ## License
 
