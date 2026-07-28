@@ -101,7 +101,6 @@ COL_ONACC    equ 00000000h                  ; text on accent fill          #0000
 
 .data
 align 8
-g_overlay   dd 0                            ; 1 while the settings overlay is open
 ; ---- runtime-selectable colour scheme -------------------------------------
 ; g_col_* are 13 consecutive dwords (order matches each schemes[] row).
 public g_scheme, g_col_bg, g_col_panel, g_col_text, g_col_textdim, g_col_frame, g_col_dark
@@ -768,16 +767,6 @@ theme_paint proc frame
     ret
 theme_paint endp
 
-; =============================================================================
-; theme_overlay(ecx = 0/1) - mark the settings overlay open so theme_paint draws
-;   an opaque backdrop.
-; =============================================================================
-public theme_overlay
-theme_overlay proc
-    mov     dword ptr [g_overlay], ecx
-    ret
-theme_overlay endp
-
 ; frame_cb(rcx=child, rdx=lparam) -> BOOL - draw a Fluent bottom-border underline
 ;   under each visible Edit: 1px #3D3D3D at rest, 2px accent when focused.
 ;   EnumChildWindows callback.  src RECT @ [rbp-40], underline RECT @ [rbp-72].
@@ -917,9 +906,7 @@ te_scanlp:
 te_scandone:
     WINCALL DeleteObject, qword ptr [rbp-40]
 te_noscan:
-    cmp     dword ptr [g_overlay], 0          ; draw the sidebar card (flat path)
-    jne     te_noside
-    mov     rax, qword ptr [rbp-32]           ; only on the vault window
+    mov     rax, qword ptr [rbp-32]           ; sidebar card: vault window only
     cmp     rax, qword ptr [g_vaulthwnd]
     jne     te_noside
     mov     rcx, qword ptr [rbp-32]

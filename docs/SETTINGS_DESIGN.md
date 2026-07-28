@@ -1,7 +1,8 @@
 # Settings screen — why it keeps breaking, and how to get out
 
-**Status: ACCEPTED — option C, staged. Stage (i) landed 2026-07-28; (ii) and (iii) open.**
-See §7 for what stage (i) actually cost.
+**Status: ACCEPTED — option C, staged. Stages (i) and (ii) landed 2026-07-28; (iii) open.**
+§7 is what stage (i) actually cost; §8 is what stage (ii) deleted, and the one prediction
+in §4 that did not survive contact.
 
 ## 1. What it is today
 
@@ -67,7 +68,7 @@ What C deletes outright:
   vault, so nothing needs hiding.
 - `g_overlay` and its `theme_erase` guard — the child paints its own background.
 - `gui_draw_field_cards`'s guard and the row-painter guard — those painters can no longer
-  be seen when settings is up.
+  be seen when settings is up. **(Half wrong — see §8.)**
 - `IDC_V_MBACK` — the child *is* the backdrop.
 - The layout coupling: settings gets its own coordinate space, so a new row can never
   disturb the vault's.
@@ -132,3 +133,34 @@ control id, reads gui.asm for which window each call targets, and fails a strict
 when they disagree. Its limits are real — it can only attribute hwnd expressions naming
 a known global, so calls reaching a control through a local are reported as
 unattributable (`--strict-unknown`) rather than proven.
+
+## 8. Stage (ii): what actually deleted, and one prediction that was wrong
+
+Landed 2026-07-28. Removed, with the strict build's dead-code check confirming nothing
+was left referencing them:
+
+| symbol | why it is gone |
+|---|---|
+| `g_vault_ids` / `VAULT_ID_COUNT` | the child occludes the vault; nothing to re-show |
+| `g_menu_ids` / `MENU_ID_COUNT` | the settings controls hide as one hwnd |
+| `gui_show_ids` | both callers gone |
+| `IDC_V_MBACK` (+ rc define, + anchor entry) | the child *is* the backdrop |
+| `g_overlay`, `theme_overlay`, the `theme_erase` guard | the mirrored half of `g_menu_open` |
+
+Deleting `gui_menu_close`'s `gui_show_ids(g_vault_ids, SW_SHOW)` also fixed a live bug:
+nothing hides those controls any more, so that call was unconditionally *showing*
+pagination arrows, Save and Add-field on close regardless of the current mode.
+
+**The prediction in §4 that both painter guards could go was half wrong.**
+`gui_apply_layout`'s guard went (it skipped a layout pass, not a paint; rows are covered
+now rather than hidden, so laying them out while settings is up is simply unseen).
+`gui_draw_field_cards`'s guard had to stay: **`DLG_VAULT` has no `WS_CLIPCHILDREN`**, so
+`WM_ERASEBKGND` still paints the region the child occupies. Steady state hides that, but a
+drag-resize erases the parent before the child repaints and the cards flash through — the
+same tearing class as the title-strip glyphs. `WS_CLIPCHILDREN` on `DLG_VAULT` would fix it
+at the root and make the guard genuinely deletable, but it changes painting for *every*
+child: anything relying on the parent's backdrop showing through its unpainted pixels would
+break. That is a deliberate change on its own, not a line in a cleanup commit.
+
+So `g_menu_open` survives as §4 said — one flag, one module — but it still has one painter
+reading it. The duplication is gone; the coupling is not entirely.

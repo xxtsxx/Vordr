@@ -269,7 +269,6 @@ extern theme_toggle:proc
 extern theme_toggle_labeled:proc
 extern theme_progressbar:proc
 extern g_font_totp:qword
-extern theme_overlay:proc
 ; --- system-tray / message-loop imports ---------------------------------------
 extern Shell_NotifyIconW:proc
 extern RegisterClassW:proc
@@ -507,7 +506,6 @@ IDC_V_TKEY   equ 227
 IDC_V_TKEYREVEAL equ 229
 EM_SETPASSWORDCHAR equ 0CCh
 SECRET_MASK  equ 2022h                ; bullet mask char for the secret field
-IDC_V_MBACK  equ 217
 IDC_V_MTITLE equ 218
 IDC_V_MPOLL  equ 219
 IDC_V_MLENL  equ 220
@@ -1198,7 +1196,6 @@ tmpl_table label qword
     dq tmpl_login, tmpl_card, tmpl_ident, tmpl_note, tmpl_blank
 ; resize anchors (redesign 1.3): {control id, anchor flags} for gui_reflow
 g_anchor_def label dword
-    dd IDC_V_MBACK,    ANCH_STRETCHW or ANCH_STRETCHH
     dd IDC_V_REMOVE,   ANCH_BOTTOM
     dd IDC_V_HEADER,   ANCH_STRETCHW
     dd IDC_V_TITLE,    ANCH_STRETCHW
@@ -1327,34 +1324,8 @@ g_impfilter label word          ; "Vordr files\0*.vordr;*.zip\0...\0\0"
     dw '*','.','*',0,0
 g_empty_w label word
     dw 0                                          ; empty wide string (default field value)
-; control-id groups toggled when the settings overlay opens/closes
-align 4
-g_vault_ids label dword
-    dd IDC_V_LIST, IDC_V_TITLE, IDC_V_SEARCH
-    dd IDC_V_ADDFIELD, IDC_V_SAVE
-    ; header cluster: hide with the vault so it does not shine through the settings
-    ; overlay (gui_menu_close re-shows these, then gui_set_editmode re-gates them).
-    dd IDC_V_HDREDIT, IDC_V_FAV, IDC_V_OVFL, IDC_V_HEADER
-    dd IDC_V_PGPREV, IDC_V_PGIND, IDC_V_PGNEXT
-    ; left-margin glyphs: New and Generate act on the vault, so they have no
-    ; meaning over the settings screen and shone through it.  Settings itself
-    ; (IDC_T_SET) stays put - it is the way back out.
-    dd IDC_T_NEW, IDC_T_GEN
-VAULT_ID_COUNT equ 14
-g_menu_ids label dword ; controls menu IDs which are hidden and displayed between settings and main screen.
-    dd IDC_V_MBACK, IDC_V_MTITLE, IDC_V_MPOLL, IDC_V_MLENL, IDC_V_MLEN
-    dd IDC_V_MCLSL, IDC_V_MCLS, IDC_V_MTPM, IDC_V_MTPML, IDC_V_MTPMINFO
-    dd IDC_V_MTHEMEL, IDC_V_MTHEME, IDC_V_MEXPORT
-    dd IDC_V_MIMPORT
-    dd IDC_V_MNOHISTL, IDC_V_MNOHIST, IDC_V_MNOPHONL, IDC_V_MNOPHON
-    dd IDC_V_MSECDL, IDC_V_MSECD, IDC_V_MSECINFO
-    dd IDC_V_MCLIPL, IDC_V_MCLIP
-    dd IDC_V_MIDLEL, IDC_V_MIDLE, IDC_V_MWLKL, IDC_V_MWLK
-    dd IDC_V_MPWDL, IDC_V_MPWD
-    dd IDC_V_MNOPREVL, IDC_V_MNOPREV, IDC_V_MNOPREVINFO
-    dd IDC_V_MTOUTS
-    dd IDC_V_MHOTKL, IDC_V_MHOTK
-MENU_ID_COUNT equ 35
+; (the settings screen is DLG_SETTINGS, a child window: it hides as ONE hwnd, so the
+;  hand-maintained id partition that used to fake that is gone)
 
 .data?
 align 8
@@ -3472,12 +3443,19 @@ gui_draw_field_cards proc frame
                                            ;   being dead by then.
     mov     qword ptr [rbp-24], rcx            ; hdc
     mov     qword ptr [rbp-32], rdx            ; hdlg
-    cmp     dword ptr [g_menu_open], 0         ; settings up: the vault is not on screen,
-    jne     gfc_ret                            ;   so its cards must not be painted.  This
-                                               ;   runs from WM_ERASEBKGND, i.e. UNDER the
-                                               ;   overlay backdrop - relying on that
-                                               ;   backdrop to cover them left the cards
-                                               ;   showing wherever it did not reach.
+    cmp     dword ptr [g_menu_open], 0         ; SETTINGS.md predicted this guard could go
+    jne     gfc_ret                            ;   with the overlay.  It cannot: DLG_VAULT
+                                               ;   has no WS_CLIPCHILDREN, so WM_ERASEBKGND
+                                               ;   still paints the region the settings
+                                               ;   child occupies.  Steady state hides it,
+                                               ;   but a drag-resize erases the parent
+                                               ;   before the child repaints and the cards
+                                               ;   flash through - the tearing class we
+                                               ;   already hit on the title strip.  Adding
+                                               ;   WS_CLIPCHILDREN would fix it properly and
+                                               ;   is too broad a change for a cleanup: any
+                                               ;   child relying on the parent's backdrop
+                                               ;   showing through would break.
     mov     eax, dword ptr [g_layout]          ; flat (Compact) layout draws no cards
     lea     r10, [lay_band]
     cmp     dword ptr [r10+rax*4], 0
@@ -5757,31 +5735,6 @@ gui_set_editmode endp
 ; =============================================================================
 ; Settings overlay (burger menu) helpers for DLG_VAULT.
 ; =============================================================================
-
-; gui_show_ids(rcx=hdlg, rdx=*id array, r8d=count, r9d=SW_* cmd) - ShowWindow
-;   each listed control.
-gui_show_ids proc frame
-    FRAME_PROLOG 80
-    mov     qword ptr [rbp-24], rcx
-    mov     qword ptr [rbp-32], rdx
-    mov     dword ptr [rbp-40], r8d
-    mov     dword ptr [rbp-44], r9d
-    mov     dword ptr [rbp-48], 0           ; index
-gsi_loop:
-    mov     eax, dword ptr [rbp-48]
-    cmp     eax, dword ptr [rbp-40]
-    jae     gsi_done
-    mov     r11, qword ptr [rbp-32]
-    mov     eax, dword ptr [r11+rax*4]      ; ids[i]
-    mov     dword ptr [rbp-52], eax
-    WINCALL GetDlgItem, qword ptr [rbp-24], dword ptr [rbp-52]
-    WINCALL ShowWindow, rax, dword ptr [rbp-44]
-    inc     dword ptr [rbp-48]
-    jmp     gsi_loop
-gsi_done:
-    FRAME_EPILOG
-    ret
-gui_show_ids endp
 
 ; =============================================================================
 ; Modular field rows - runtime-built, composable detail form.
@@ -9580,9 +9533,9 @@ gui_apply_layout proc frame
     mov     rcx, qword ptr [rbp-24]
     mov     edx, dword ptr [g_cur_idx]
     call    gui_lb_selbydata
-@@: cmp     dword ptr [g_menu_open], 0           ; settings open: rows are hidden, don't
-    jne     gal_paint                            ;   re-show them (re-lays out on close)
-    cmp     dword ptr [g_cur_idx], 0
+@@: cmp     dword ptr [g_cur_idx], 0             ; rows are covered by the settings child
+                                                 ;   now, not hidden - laying them out
+                                                 ;   while it is up is simply unseen
     jl      gal_paint
     mov     rcx, qword ptr [rbp-24]
     call    gui_rows_layout
@@ -10516,8 +10469,6 @@ mo_cls_ok:
     call    EnableWindow
     call    gui_hotkey_label                  ; show the live summon combo on its button
     mov     dword ptr [g_menu_open], 1
-    mov     ecx, 1                            ; opaque backdrop in theme_paint
-    call    theme_overlay
     WINCALL RedrawWindow, qword ptr [rbp-24], 0, 0, 0185h  ; INVALIDATE|ERASE|ALLCHILDREN|UPDATENOW
     FRAME_EPILOG
     ret
@@ -10528,21 +10479,11 @@ gui_menu_close proc frame
     FRAME_PROLOG 48
     mov     qword ptr [rbp-24], rcx
     call    gui_menu_save                    ; save all settings on leaving the screen
-    mov     rcx, qword ptr [rbp-24]
-    lea     rdx, [g_vault_ids]
-    mov     r8d, VAULT_ID_COUNT
-    mov     r9d, SW_SHOW
-    call    gui_show_ids
-    WINCALL ShowWindow, qword ptr [g_settings_hwnd], SW_HIDE
+    WINCALL ShowWindow, qword ptr [g_settings_hwnd], SW_HIDE   ; one hwnd, not 35 ids
     mov     rcx, qword ptr [rbp-24]           ; restore edit-mode state
     mov     edx, dword ptr [g_editmode]
     call    gui_set_editmode
     mov     dword ptr [g_menu_open], 0
-    xor     ecx, ecx                          ; ...and theme.asm's half of the same fact.
-    call    theme_overlay                     ;   gui_menu_open sets BOTH; leaving this one
-                                              ;   at 1 made theme_erase skip theme_sidecard
-                                              ;   for the rest of the session, so the frame
-                                              ;   around the list never came back.
     WINCALL RedrawWindow, qword ptr [rbp-24], 0, 0, 0185h
     FRAME_EPILOG
     ret
@@ -11249,19 +11190,6 @@ vp_init:
     mov     qword ptr [g_settings_hwnd], rax
     mov     rcx, qword ptr [rbp-8]           ; every child must clip its siblings, or they
     call    gui_clip_children                ;   repaint straight over the settings child
-    xor     ecx, ecx                         ; ...and theme.asm's copy of that state, which
-    call    theme_overlay                    ;   OUTLIVES the dialog.  Locking with settings
-                                             ;   open (Esc, Ctrl+L, the hotkey, idle, Win+L)
-                                             ;   destroys the window with g_overlay still 1,
-                                             ;   and theme_erase then skips theme_sidecard -
-                                             ;   so the sidebar card stayed unpainted for the
-                                             ;   whole next session.  g_menu_open was already
-                                             ;   reset here; this is the half that was missed.
-    mov     rcx, qword ptr [rbp-8]           ; keep the settings overlay hidden
-    lea     rdx, [g_menu_ids]
-    mov     r8d, MENU_ID_COUNT
-    mov     r9d, SW_HIDE
-    call    gui_show_ids
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_ADD, addr wb_add
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_EDIT, addr wb_edit
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_REMOVE, addr wb_rem

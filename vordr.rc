@@ -47,7 +47,6 @@
 #define IDC_V_CANCEL 238
 #define IDC_V_DONE   271
 #define IDC_V_GENERATE 273
-#define IDC_V_MBACK  217
 #define IDC_V_MTITLE 218
 #define IDC_V_MPOLL  219
 #define IDC_V_MLENL  220
