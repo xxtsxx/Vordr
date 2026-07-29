@@ -43,12 +43,24 @@ re-run) yield the identical exe.
 
 ## Published hashes
 
-Release hashes are recorded per tagged version. When a version is tagged, the
-CI release job runs `build.cmd release` and records the resulting SHA-256 here:
+Release hashes are recorded per tagged version. There is no automated release
+job yet: at tag time `build.cmd release` is run twice from a clean tree, the two
+hashes are compared, and the result is recorded here by hand.
 
 | version | commit | SHA-256 (`bin\vordr.exe`) |
 |---------|--------|---------------------------|
-| _(unreleased)_ | — | — |
+| v0.2.0 | `48cc1df` | `811b5cd6f56845daf747bc8e4d18f89f35a7bb815463611a1f090009a8279faa` |
+
+The row records the hash of a build of the **tagged** commit. This file is
+updated immediately after tagging, so the commit that adds a row is not itself
+the commit that row describes — check out the tag, not `master`, when
+reproducing a hash:
+
+```
+git checkout v0.2.0
+build.cmd release
+certutil -hashfile bin\vordr.exe SHA256
+```
 
 To check a downloaded binary, hash it and compare against the row for its
 version. A mismatch means the binary does **not** correspond to this source at
