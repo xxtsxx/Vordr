@@ -1,4 +1,4 @@
-# Vordr — hardened password manager (MASM64)
+# Vordr — hardened password manager
 
 > Old Norse *vörðr*, "watchman / guardian."
 
