@@ -66,7 +66,10 @@ extern vault_remove_at:proc
 extern vault_count:proc
 extern vault_is_system:proc             ; system items are hidden from every user-facing list
 extern vault_last_user:proc             ;   (docs/SYSITEM_DESIGN.md)
-extern vault_add_system_item:proc       ; new vaults get one at creation; old ones lazily
+extern vault_add_system_item:proc
+externdef g_io_err:dword                 ; Win32 reason behind an EXIT_IO
+extern vault_preload:proc                ; read the vault image BEFORE the unlock
+extern vault_preload_end:proc            ;   dialog, so no file I/O runs on the       ; new vaults get one at creation; old ones lazily
 extern vault_is_deleted:proc            ; trashed records are never exported
 extern vault_pw_due:proc                ; C9: is the master-password reminder due?
 extern vault_pw_check:proc              ;   and does this password open this vault?
@@ -211,6 +214,7 @@ extern GetParent:proc
 extern SetDlgItemInt:proc
 extern GetDlgItemInt:proc
 extern GetFileAttributesW:proc
+extern GetModuleFileNameW:proc           ; to know where WE live (see gui_path_under)
 extern SetFileAttributesW:proc
 extern CreateFileW:proc                   ; secure temp-file wipe
 extern WriteFile:proc
@@ -814,6 +818,11 @@ WSTR s_lkdiag2,     <, working-set-grow error >
 WSTR s_lkdiag3,     <. (VirtualLock is limited by the working-set quota, not by free RAM.)>
 ; C5: GUI security-event names for the audit log (log_result classifies the code)
 WSTR ev_unlock,     <gui-unlock>
+WSTR s_createfail_n, <Could not create the vault. Windows error>
+WSTR s_nodir_n,      <Could not create the folder for the vault. Check the vault location in Settings. Windows error>
+WSTR m_exedir,       <This vault would be created in the folder Vordr itself runs from. Program folders get replaced on update and are often temporary or removable, so the vault could be lost. Create it here anyway?>
+WSTR t_exedir,       <Vordr - unusual location>
+WSTR s_exedir_no,    <Cancelled. Pick a different location for the vault.>
 WSTR ev_save,       <gui-save>
 WSTR ev_export,     <gui-export>
 WSTR ev_import,     <gui-import>
@@ -1201,7 +1210,13 @@ g_anchor_def label dword
     dd IDC_V_TITLE,    ANCH_STRETCHW
 ; the entry list (sidebar_layout) and the command controls (gui_cmd_dock_layout)
 ; are NOT delta-anchored - they are laid out from the live client rect.
-ANCHOR_N equ 4
+;
+; Derived from the table, never hand-counted.  It was hand-counted, and when
+; IDC_V_MBACK was deleted from the table the 4 stayed: the reflow then read one
+; entry PAST the end, straight into tag_xw, and got {id 215, flags 0x0070006F} -
+; IDC_V_TOTPBAR, a real control, stretched in both axes and anchored right+bottom.
+; It landed across the title edit.  Two dwords per row.
+ANCHOR_N equ ($ - g_anchor_def) / 8
 tag_xw label word
     dw 0D7h, 0                             ; multiplication sign, used as the tag 'x'
 verb_open label word
@@ -1422,6 +1437,11 @@ g_secdesk_hd    dq ?                  ; HDESK of the private desktop
 public g_secdesk_orig
 g_secdesk_orig  dq ?                  ; HDESK of the original input desktop (restore on exit)
 g_secdesk_res   dq ?                  ; DialogBox result marshalled back to the caller
+g_secdesk_orphan dd ?                 ; 1 = the watchdog gave up on a wedged worker
+align 2
+g_errbuf    dw 256 dup (?)            ; "<prefix> <number>" built by gui_num_msg
+g_exedir    dw 1024 dup (?)           ; folder holding vordr.exe
+g_initdir   dw 1024 dup (?)           ; explicit start folder for the vault picker
 align 8
 ; The software shadow stack (g_sstk_base/g_sstk_index) is a process-global, but
 ; the Secure-Unlock dialog runs on a SEPARATE worker thread (secdesk_thread) that
@@ -1805,6 +1825,239 @@ gu_done:
 gui_unlock endp
 
 ; gui_wipepw() - scrub the UTF-8 master password buffer.
+; gui_num_msg(rcx = wide prefix, edx = number) -> rax = the composed wide string.
+;   Appends " <n>" to the prefix in g_errbuf.  There is no wide number formatter
+;   anywhere else in the codebase, and log_result deliberately maps codes to fixed
+;   text rather than printing them - so a failure that only the user can reproduce
+;   had no way to carry its Win32 error back to us.  That is what turned one I/O
+;   error into two rounds of guesswork.
+; gui_exe_dir(rcx = dst wide, edx = cap chars) -> eax = 1 ok.  The directory the
+;   running binary sits in, with the filename stripped.
+gui_exe_dir proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-32], edx
+    WINCALL GetModuleFileNameW, 0, qword ptr [rbp-24], dword ptr [rbp-32]
+    test    eax, eax
+    jz      gxd_fail
+    mov     r10, qword ptr [rbp-24]
+    xor     r8d, r8d
+    mov     r9d, -1
+gxd_scan:
+    movzx   ecx, word ptr [r10+r8*2]
+    test    ecx, ecx
+    jz      gxd_cut
+    cmp     ecx, 5Ch
+    jne     @F
+    mov     r9d, r8d
+@@: inc     r8d
+    jmp     gxd_scan
+gxd_cut:
+    cmp     r9d, 0
+    jle     gxd_fail
+    movsxd  r11, r9d
+    mov     word ptr [r10+r11*2], 0             ; strip "ordr.exe"
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gxd_fail:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gui_exe_dir endp
+
+; gui_path_under(rcx = path, rdx = dir) -> eax = 1 if path lies inside dir.
+;   Case-folded ASCII, same rule as cfg_wstr_ieq; requires a separator (or the end
+;   of the string) right after dir, so "...\VordrData" is not "inside" "...\Vordr".
+;   Leaf proc.
+gui_path_under proc
+gpu_lp:
+    movzx   r10d, word ptr [rdx]
+    test    r10d, r10d
+    jz      gpu_diroff
+    movzx   eax, word ptr [rcx]
+    test    eax, eax
+    jz      gpu_no
+    lea     r11d, [rax-'A']
+    cmp     r11d, 25
+    ja      @F
+    add     eax, 32
+@@: lea     r11d, [r10-'A']
+    cmp     r11d, 25
+    ja      @F
+    add     r10d, 32
+@@: cmp     eax, r10d
+    jne     gpu_no
+    add     rcx, 2
+    add     rdx, 2
+    jmp     gpu_lp
+gpu_diroff:
+    movzx   eax, word ptr [rcx]
+    test    eax, eax
+    jz      gpu_yes
+    cmp     eax, 5Ch
+    je      gpu_yes
+gpu_no:
+    xor     eax, eax
+    ret
+gpu_yes:
+    mov     eax, 1
+    ret
+gui_path_under endp
+
+; gui_vault_initdir() -> rax = an EXISTING folder for the picker to open in, or 0.
+;   Without this the dialog only gets lpstrFile, and Windows silently falls back to
+;   the process's current directory when that file's folder is missing - which is how
+;   a vault ended up proposed inside the program's own install folder.
+gui_vault_initdir proc frame
+    FRAME_PROLOG 64
+    lea     r10, [g_initdir]                    ; try the configured vault's folder
+    lea     r11, [g_vpath]
+    xor     r8d, r8d
+gvi_cpy:
+    mov     ax, word ptr [r11+r8*2]
+    mov     word ptr [r10+r8*2], ax
+    test    ax, ax
+    jz      gvi_cut
+    inc     r8d
+    cmp     r8d, 1000
+    jb      gvi_cpy
+gvi_cut:
+    lea     r10, [g_initdir]
+    mov     r9d, -1
+    xor     r8d, r8d
+gvi_scan:
+    movzx   ecx, word ptr [r10+r8*2]
+    test    ecx, ecx
+    jz      gvi_trim
+    cmp     ecx, 5Ch
+    jne     @F
+    mov     r9d, r8d
+@@: inc     r8d
+    jmp     gvi_scan
+gvi_trim:
+    cmp     r9d, 0
+    jle     gvi_default
+    movsxd  r11, r9d
+    mov     word ptr [r10+r11*2], 0
+    WINCALL GetFileAttributesW, addr g_initdir
+    cmp     eax, -1
+    je      gvi_default
+    test    eax, 10h                            ; FILE_ATTRIBUTE_DIRECTORY
+    jz      gvi_default
+    lea     rax, [g_initdir]
+    FRAME_EPILOG
+    ret
+gvi_default:
+    ; no usable folder -> derive the default one (which creates it) and use that
+    lea     rcx, [g_initdir]
+    call    cfg_default_vault
+    test    eax, eax
+    jz      gvi_none
+    lea     r10, [g_initdir]
+    mov     r9d, -1
+    xor     r8d, r8d
+gvi_scan2:
+    movzx   ecx, word ptr [r10+r8*2]
+    test    ecx, ecx
+    jz      gvi_trim2
+    cmp     ecx, 5Ch
+    jne     @F
+    mov     r9d, r8d
+@@: inc     r8d
+    jmp     gvi_scan2
+gvi_trim2:
+    cmp     r9d, 0
+    jle     gvi_none
+    movsxd  r11, r9d
+    mov     word ptr [r10+r11*2], 0
+    lea     rax, [g_initdir]
+    FRAME_EPILOG
+    ret
+gvi_none:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gui_vault_initdir endp
+
+; gui_exe_dir_check() -> eax = 1 to proceed, 0 if the user declined.
+;   A vault inside the program's own folder is almost never deliberate: it is what
+;   you get when the file picker falls back to the current directory.  On this
+;   machine that was a build output folder; elsewhere it is Downloads, a temp
+;   extract, or a USB stick.  Warn once, default to No, and let a deliberate
+;   portable install through.
+gui_exe_dir_check proc frame
+    FRAME_PROLOG 48
+    lea     rcx, [g_exedir]
+    mov     edx, 1000
+    call    gui_exe_dir
+    test    eax, eax
+    jnz     gedc_have
+    mov     eax, 1                              ; cannot tell -> do not block
+    FRAME_EPILOG
+    ret
+gedc_have:
+    lea     rcx, [g_vpath]
+    lea     rdx, [g_exedir]
+    call    gui_path_under
+    test    eax, eax
+    jz      gedc_ok
+    WINCALL gui_msgbox, qword ptr [g_vaulthwnd], addr m_exedir, addr t_exedir,             <MB_YESNO or MB_ICONWARNING or MB_DEFBUTTON2>
+    cmp     eax, IDYES
+    jne     gedc_no
+gedc_ok:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gedc_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gui_exe_dir_check endp
+
+gui_num_msg proc frame
+    FRAME_PROLOG 96                          ; [rbp-80] = digit scratch (no calls inside)
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-32], edx
+    lea     r10, [g_errbuf]
+    mov     r11, qword ptr [rbp-24]
+    xor     r8, r8
+gnm_cpy:
+    mov     ax, word ptr [r11+r8*2]
+    test    ax, ax
+    jz      gnm_sep
+    mov     word ptr [r10+r8*2], ax
+    inc     r8
+    cmp     r8, 200                          ; leave room for the number + NUL
+    jb      gnm_cpy
+gnm_sep:
+    mov     word ptr [r10+r8*2], 20h         ; space
+    inc     r8
+    mov     eax, dword ptr [rbp-32]          ; decimal digits, least significant first
+    lea     r9, [rbp-80]
+    xor     ecx, ecx
+    mov     r11d, 10
+gnm_div:
+    xor     edx, edx                         ; EDX:EAX / 10 -> EAX rem EDX
+    div     r11d
+    add     dl, 30h
+    mov     byte ptr [r9+rcx], dl
+    inc     rcx
+    test    eax, eax
+    jnz     gnm_div
+gnm_emit:                                    ; ...then reversed into the message
+    dec     rcx
+    movzx   eax, byte ptr [r9+rcx]
+    mov     word ptr [r10+r8*2], ax
+    inc     r8
+    test    rcx, rcx
+    jnz     gnm_emit
+    mov     word ptr [r10+r8*2], 0
+    lea     rax, [g_errbuf]
+    FRAME_EPILOG
+    ret
+gui_num_msg endp
+
 gui_wipepw proc frame
     FRAME_PROLOG 32
     lea     rcx, [g_cfg_pass]
@@ -1953,7 +2206,12 @@ gui_pick_vault proc frame
     mov     dword ptr [r10].OPENFILENAMEW.nMaxFile, 1024
     mov     dword ptr [r10].OPENFILENAMEW.nFilterIndex, 1
     mov     dword ptr [r10].OPENFILENAMEW.Flags, OFN_PATHMUSTEXIST or OFN_HIDEREADONLY or OFN_EXPLORER
-    WINCALL GetOpenFileNameW, addr g_ofn
+    call    gui_vault_initdir                 ; never let comdlg32 fall back to the CWD
+    test    rax, rax                          ;   (= the program folder) when the vault's
+    jz      @F                                ;   own folder is missing
+    lea     r10, [g_ofn]
+    mov     qword ptr [r10].OPENFILENAMEW.lpstrInitialDir, rax
+@@: WINCALL GetOpenFileNameW, addr g_ofn
     test    eax, eax
     jz      gpv_done                           ; cancelled -> keep the old path
     mov     dword ptr [g_vpath_set], 1
@@ -12051,8 +12309,17 @@ gui_file_exists endp
 ;   the default folder; a path from the registry (or a removed folder) otherwise
 ;   makes do_init fail with EXIT_IO ("could not create the vault").  Creates the
 ;   immediate parent directory (ignoring "already exists").
+; gui_ensure_vault_dir(rcx = wide path to the vault FILE) -> eax = 1 if its parent
+;   directory exists (or was just created), 0 if it could not be made.
+;
+;   Creates EVERY missing component, and checks the outcome.  The old version made a
+;   single CreateDirectoryW for the deepest folder and discarded the result, so a path
+;   whose chain was missing more than one level - a vault location carried over from
+;   another machine, or a %OneDrive% root that does not exist here - could never be
+;   created.  Nothing noticed until the write itself failed, deep inside vault_seal_write,
+;   as a bare ERROR_PATH_NOT_FOUND (3) reported as "I/O or out of memory".
 gui_ensure_vault_dir proc frame
-    FRAME_PROLOG 64
+    FRAME_PROLOG 80
     mov     qword ptr [rbp-24], rcx          ; path
     mov     r10, rcx
     xor     r8d, r8d                          ; index
@@ -12068,16 +12335,64 @@ ged_scan:
     jmp     ged_scan
 ged_split:
     cmp     r9d, 0
-    jl      ged_done                          ; no directory component
+    jle     ged_ok                            ; no directory component (or root) -> nothing
     movsxd  r11, r9d
-    mov     qword ptr [rbp-32], r11           ; remember the backslash position
+    mov     qword ptr [rbp-32], r11           ; index of the final separator
+    ; Skip the root so we never try to create "C:" or a UNC share: start after the
+    ; drive colon, or after "\\server\share" for a UNC path.
     mov     r10, qword ptr [rbp-24]
+    mov     qword ptr [rbp-40], 1             ; default start index
+    cmp     word ptr [r10+2], 3Ah             ; ':' at index 1  ...
+    jne     @F
+    cmp     word ptr [r10+4], 5Ch             ; ... and '\' at index 2 -> "X:\"
+    jne     @F
+    mov     qword ptr [rbp-40], 3
+@@: cmp     word ptr [r10], 5Ch               ; "\\server\share\..."
+    jne     ged_walk
+    cmp     word ptr [r10+2], 5Ch
+    jne     ged_walk
+    mov     qword ptr [rbp-40], 2
+ged_walk:
+    ; create each intermediate directory in turn; per-component failures are ignored
+    ; (already-exists is the normal case) - the single check that matters is at the end
+    mov     rax, qword ptr [rbp-40]
+    mov     qword ptr [rbp-48], rax           ; i
+ged_loop:
+    mov     rax, qword ptr [rbp-48]
+    cmp     rax, qword ptr [rbp-32]
+    jae     ged_final
+    mov     r10, qword ptr [rbp-24]
+    cmp     word ptr [r10+rax*2], 5Ch
+    jne     ged_next
+    mov     word ptr [r10+rax*2], 0           ; terminate at this component
+    WINCALL CreateDirectoryW, qword ptr [rbp-24], 0
+    mov     r10, qword ptr [rbp-24]
+    mov     rax, qword ptr [rbp-48]
+    mov     word ptr [r10+rax*2], 5Ch         ; restore
+ged_next:
+    inc     qword ptr [rbp-48]
+    jmp     ged_loop
+ged_final:
+    mov     r10, qword ptr [rbp-24]
+    mov     r11, qword ptr [rbp-32]
     mov     word ptr [r10+r11*2], 0           ; terminate at the parent directory
     WINCALL CreateDirectoryW, qword ptr [rbp-24], 0
+    WINCALL GetFileAttributesW, qword ptr [rbp-24]     ; the answer that matters: is it
+    mov     dword ptr [rbp-56], eax                    ;   there NOW, however it got there
     mov     r10, qword ptr [rbp-24]
     mov     r11, qword ptr [rbp-32]
     mov     word ptr [r10+r11*2], 5Ch         ; restore the separator
-ged_done:
+    mov     eax, dword ptr [rbp-56]
+    cmp     eax, -1                           ; INVALID_FILE_ATTRIBUTES
+    je      ged_fail
+    test    eax, 10h                          ; FILE_ATTRIBUTE_DIRECTORY
+    jz      ged_fail
+ged_ok:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+ged_fail:
+    xor     eax, eax
     FRAME_EPILOG
     ret
 gui_ensure_vault_dir endp
@@ -12124,89 +12439,8 @@ cd_pwok:
     mov     qword ptr [rbp-56], rax
     jmp     cd_status
 cd_polok:
-    lea     rax, [g_vpath]
-    mov     qword ptr [g_cfg_in], rax
-    ; never silently overwrite an existing vault file - confirm first
-    lea     rcx, [g_vpath]
-    call    gui_file_exists
-    test    eax, eax
-    jz      cd_doinit
-    WINCALL gui_msgbox, qword ptr [rbp-24], addr m_overwrite, addr t_overwrite, \
-            <MB_YESNO or MB_ICONWARNING or MB_DEFBUTTON2>
-    cmp     eax, IDYES
-    je      cd_doinit
-    lea     rax, [s_kept]                    ; declined -> keep existing vault
-    mov     qword ptr [rbp-56], rax
-    jmp     cd_status
-cd_doinit:
-    mov     dword ptr [g_readonly], 0        ; E9: a newly created vault is always writable
-    lea     rcx, [g_vpath]                   ; make sure the target folder exists
-    call    gui_ensure_vault_dir
-    call    do_init
-    test    eax, eax
-    jz      cd_created
-    lea     rax, [s_createfail]
-    mov     qword ptr [rbp-56], rax
-    jmp     cd_status
-cd_created:
-    ; Persist the freshly created vault as the startup vault, so it is reopened
-    ; next launch.  Always - not only on the auto-default path (g_is_default).
-    ; DLG_CREATE only ever makes the MASTER vault; foreign vaults are added via
-    ; the M4 screen, which deliberately does NOT touch the startup path.  Without
-    ; this, a second create in the same (tray-persistent) process left g_is_default
-    ; at 0 and never recorded the new vault.
-    lea     rcx, [g_vpath]
-    call    reg_save_vault
-    mov     dword ptr [g_is_default], 0
-cd_savepol:
-    cmp     dword ptr [g_pol_len_lock], 0
-    jne     cd_savecls
-    lea     rcx, [wv_pwlen]
-    mov     edx, dword ptr [g_cfg_pwminlen]
-    call    cfg_set_dword_hkcu
-cd_savecls:
-    cmp     dword ptr [g_pol_cls_lock], 0
-    jne     cd_open
-    lea     rcx, [wv_pwcls]
-    mov     edx, dword ptr [g_cfg_pwminclasses]
-    call    cfg_set_dword_hkcu
-cd_open:
-    ; unlock the freshly created vault for the vault window
-    mov     dword ptr [g_use_tpm], 0
-    call    vault_unlock
-    test    eax, eax
-    jnz     cd_unlockfail
-    ; Give a brand-new vault its system item straight away, so it is entry 0 and every
-    ; later record sits after it.  This is the REAL creation path only - do_init and
-    ; do_seed stay system-item-free, which is what keeps the probe suite's physical
-    ; entry counts unchanged (docs/SYSITEM_DESIGN.md).  An EXISTING vault is never
-    ; migrated here: it gains one lazily, the first time there is actually a setting to
-    ; store, so opening a vault never rewrites it behind the user's back.
-    call    vault_add_system_item
-    test    eax, eax
-    jz      cd_sysfail
-    call    vault_reseal                     ; persist it now; the vault is empty, so cheap
-    test    eax, eax
-    jnz     cd_sysfail
-    ; enroll TPM unlock for a new vault when supported AND the setting/policy
-    ; allows it (g_tpm_want: HKLM > HKCU > default ON, loaded at startup)
-    cmp     dword ptr [g_tpm_present], 0
-    je      cd_done
-    cmp     dword ptr [g_tpm_want], 0
-    je      cd_done
-    call    vault_tpm_remember
-    jmp     cd_done
-cd_sysfail:
-    call    vault_lock                       ; do not hand back a half-built vault
-cd_unlockfail:
-    lea     rax, [s_createfail]
-    mov     qword ptr [rbp-56], rax
-    jmp     cd_status
-cd_done:
-    mov     dword ptr [g_create], 0
-    call    gui_wipepw
-    call    gui_wipepw_create
-    mov     eax, 1
+    call    gui_wipepw_create                ; wide buffers done with; the password now
+    mov     eax, 1                           ;   lives in g_cfg_pass for the commit step
     FRAME_EPILOG
     ret
 cd_status:
@@ -12217,6 +12451,150 @@ cd_status:
     FRAME_EPILOG
     ret
 gui_create_do endp
+
+; =============================================================================
+; gui_create_commit(rcx = owner hwnd) -> eax = 1 if the vault was created, opened
+;   and (where applicable) TPM-enrolled.
+;
+; This is everything gui_create_do used to do after the password was accepted, and
+; it is a separate proc for one reason: it must NOT run on the private desktop.
+;
+; The private desktop exists to keep keystrokes away from same-session hooks.  It
+; does nothing for file I/O - but the desktop is only restored after the dialog
+; returns, so every blocking call made from inside it holds the user on a desktop
+; with no shell.  Writing the vault into a OneDrive-synced folder does exactly
+; that: file_rename retries a sync-tool lock for up to 10s by design, and the
+; cloud-files filter can stall CreateFile/WriteFile/FlushFileBuffers with no
+; timeout at all.  That stranded users on the private desktop with Ctrl+Alt+Del
+; as the only exit, and surfaced as "Could not create the vault" when the retry
+; budget ran out instead.
+;
+; So the dialog now only captures the password (into the VirtualLock'd g_cfg_pass,
+; which outlives it), and the caller runs this once the desktop is its own again -
+; where a slow disk merely looks slow, and an error box is on a desktop that has a
+; shell to show it.
+; =============================================================================
+gui_create_commit proc frame
+    FRAME_PROLOG 112
+    mov     qword ptr [rbp-24], rcx          ; owner hwnd (error box parent)
+    lea     rax, [g_vpath]
+    mov     qword ptr [g_cfg_in], rax
+    ; never silently overwrite an existing vault file - confirm first
+    lea     rcx, [g_vpath]
+    call    gui_file_exists
+    test    eax, eax
+    jz      ccm_doinit
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr m_overwrite, addr t_overwrite, \
+            <MB_YESNO or MB_ICONWARNING or MB_DEFBUTTON2>
+    cmp     eax, IDYES
+    je      ccm_doinit
+    lea     rax, [s_kept]                    ; declined -> keep existing vault
+    mov     qword ptr [rbp-56], rax
+    jmp     ccm_status
+ccm_doinit:
+    mov     dword ptr [g_readonly], 0        ; E9: a newly created vault is always writable
+    call    gui_exe_dir_check                ; not beside the executable, please
+    test    eax, eax
+    jz      ccm_status_kept
+    lea     rcx, [g_vpath]                   ; make sure the target folder exists - and
+    call    gui_ensure_vault_dir             ;   say so HERE if it does not, instead of
+    test    eax, eax                         ;   letting the write fail later with a bare
+    jnz     ccm_dirok                        ;   ERROR_PATH_NOT_FOUND nobody can act on
+    call    GetLastError
+    mov     qword ptr [rbp-64], rax
+    lea     rcx, [s_nodir_n]
+    mov     edx, dword ptr [rbp-64]
+    call    gui_num_msg
+    mov     qword ptr [rbp-56], rax
+    jmp     ccm_status
+ccm_dirok:
+    call    do_init
+    test    eax, eax
+    jz      ccm_created
+    lea     rcx, [s_createfail_n]            ; carry the Win32 error INTO the message: the
+    mov     edx, dword ptr [g_io_err]        ;   generic "(I/O or out of memory)" cost two
+    call    gui_num_msg                      ;   rounds of guessing on a box with 110 GB free
+    mov     qword ptr [rbp-56], rax
+    jmp     ccm_status
+ccm_created:
+    ; Persist the freshly created vault as the startup vault, so it is reopened
+    ; next launch.  Always - not only on the auto-default path (g_is_default).
+    ; DLG_CREATE only ever makes the MASTER vault; foreign vaults are added via
+    ; the M4 screen, which deliberately does NOT touch the startup path.  Without
+    ; this, a second create in the same (tray-persistent) process left g_is_default
+    ; at 0 and never recorded the new vault.
+    lea     rcx, [g_vpath]
+    call    reg_save_vault
+    mov     dword ptr [g_is_default], 0
+ccm_savepol:
+    cmp     dword ptr [g_pol_len_lock], 0
+    jne     ccm_savecls
+    lea     rcx, [wv_pwlen]
+    mov     edx, dword ptr [g_cfg_pwminlen]
+    call    cfg_set_dword_hkcu
+ccm_savecls:
+    cmp     dword ptr [g_pol_cls_lock], 0
+    jne     ccm_open
+    lea     rcx, [wv_pwcls]
+    mov     edx, dword ptr [g_cfg_pwminclasses]
+    call    cfg_set_dword_hkcu
+ccm_open:
+    ; unlock the freshly created vault for the vault window
+    mov     dword ptr [g_use_tpm], 0
+    call    vault_unlock
+    test    eax, eax
+    jnz     ccm_unlockfail
+    ; Give a brand-new vault its system item straight away, so it is entry 0 and every
+    ; later record sits after it.  This is the REAL creation path only - do_init and
+    ; do_seed stay system-item-free, which is what keeps the probe suite's physical
+    ; entry counts unchanged (docs/SYSITEM_DESIGN.md).  An EXISTING vault is never
+    ; migrated here: it gains one lazily, the first time there is actually a setting to
+    ; store, so opening a vault never rewrites it behind the user's back.
+    call    vault_add_system_item
+    test    eax, eax
+    jz      ccm_sysfail
+    ; C9: the master password was typed seconds ago, so start its clock NOW.  Leaving
+    ; the stamp at 0 means "never verified", which vault_pw_due reads as due - so a
+    ; brand-new vault demanded a Master Password Check on its very first unlock.
+    lea     rcx, [rbp-80]
+    call    GetSystemTimeAsFileTime
+    mov     rcx, qword ptr [rbp-80]
+    call    vault_pwverify_set
+    call    vault_reseal                     ; persist it now; the vault is empty, so cheap
+    test    eax, eax
+    jnz     ccm_sysfail
+    ; enroll TPM unlock for a new vault when supported AND the setting/policy
+    ; allows it (g_tpm_want: HKLM > HKCU > default ON, loaded at startup)
+    cmp     dword ptr [g_tpm_present], 0
+    je      ccm_done
+    cmp     dword ptr [g_tpm_want], 0
+    je      ccm_done
+    call    vault_tpm_remember
+    jmp     ccm_done
+ccm_sysfail:
+    call    vault_lock                       ; do not hand back a half-built vault
+ccm_unlockfail:
+    lea     rax, [s_createfail]
+    mov     qword ptr [rbp-56], rax
+    jmp     ccm_status
+ccm_done:
+    mov     dword ptr [g_create], 0
+    call    gui_wipepw
+    call    gui_wipepw_create
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+ccm_status_kept:
+    lea     rax, [s_exedir_no]
+    mov     qword ptr [rbp-56], rax
+ccm_status:
+    call    gui_wipepw
+    call    gui_wipepw_create
+    WINCALL gui_msgbox, qword ptr [rbp-24], qword ptr [rbp-56], addr t_err,             <MB_OK or MB_ICONWARNING>
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gui_create_commit endp
 
 ; gui_pw_strength(rcx = hdlg) - recompute the strength level (g_pw_level) and
 ;   confirm-match (g_pw_match) from the two password boxes, enable Create only
@@ -15330,6 +15708,8 @@ gui_resolve_vault proc frame
     test    eax, eax
     jz      grv_none
     mov     dword ptr [g_is_default], 1     ; first run registers this path in HKCU
+    lea     rcx, [g_vpath]                  ; make the folder we are about to OFFER real,
+    call    gui_ensure_vault_dir            ;   so the picker prefill resolves to it
 grv_havepath:
     mov     dword ptr [g_vpath_set], 1
     ; create vs open is decided purely by whether a file exists at the path
@@ -15390,7 +15770,8 @@ gui_try_tpm_auto endp
 ; to a normal on-desktop dialog so the user is never locked out.
 ; =============================================================================
 DESKTOP_MAXALLOWED equ 02000000h                 ; MAXIMUM_ALLOWED access
-WAIT_FOREVER       equ 0FFFFFFFFh                 ; INFINITE
+                                                 ; (no INFINITE here any more - see the
+                                                 ;  watchdog in gui_secdesk_show)
 
 ; secdesk_restore() -> eax = 1 if the user is back on their own desktop, else 0.
 ;   SwitchDesktop FAILS BY RETURNING FALSE, not by raising - and it genuinely can, when
@@ -15403,6 +15784,10 @@ WAIT_FOREVER       equ 0FFFFFFFFh                 ; INFINITE
 ;   better than leaving someone on a desktop with no shell.
 SECDESK_TRIES equ 6
 SECDESK_WAIT  equ 40                                 ; ms between attempts
+SECDESK_SLICE_MS equ 500                             ; watchdog poll interval
+SECDESK_MAX_MS   equ 600000                          ; 10 min: longer than any real
+                                                     ;   password entry, short enough
+                                                     ;   that a wedge is not forever
 secdesk_restore proc frame
     FRAME_PROLOG 72                                  ; 72 -> 80 bytes: [rbp-40] holds the
                                                      ;   SwitchDesktop result ACROSS the
@@ -15440,6 +15825,37 @@ sdr_fail:
     ret
 secdesk_restore endp
 
+; secdesk_switch(rcx = hdesk) -> eax = 1 if that desktop now receives input.
+;   The FORWARD switch can fail exactly as the restore can (another process owns the
+;   input desktop, a secure-attention sequence, policy) - secdesk_restore learned that
+;   the hard way and this path never did.  Ignoring the result is worse here than
+;   anywhere else: SetThreadDesktop has already bound this thread to the private
+;   desktop, so the dialog is created THERE while input stays on the user's desktop.
+;   Nothing is visible, the main thread is parked in the wait, and the app is wedged
+;   with no window to close.
+secdesk_switch proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-32], 0
+sds_loop:
+    WINCALL SwitchDesktop, qword ptr [rbp-24]
+    test    eax, eax
+    jnz     sds_ok
+    inc     dword ptr [rbp-32]
+    cmp     dword ptr [rbp-32], SECDESK_TRIES
+    jae     sds_fail
+    WINCALL Sleep, SECDESK_WAIT
+    jmp     sds_loop
+sds_ok:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+sds_fail:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+secdesk_switch endp
+
 ; secdesk_thread(rcx = unused) - worker: bind to the private desktop, make it
 ;   the visible input desktop, run the dialog, then switch back.  eax = 0.
 secdesk_body proc frame
@@ -15447,11 +15863,20 @@ secdesk_body proc frame
     WINCALL SetThreadDesktop, qword ptr [g_secdesk_hd]
     test    eax, eax
     jz      sdt_run                              ; couldn't bind -> show on current desktop
-    WINCALL SwitchDesktop, qword ptr [g_secdesk_hd]
+    mov     rcx, qword ptr [g_secdesk_hd]
+    call    secdesk_switch
+    test    eax, eax
+    jnz     sdt_run
+    ; It could not be made the input desktop.  Unbind (safe: this thread owns no
+    ; windows yet) and show the dialog on the desktop the user is actually looking
+    ; at, rather than on an invisible one.
+    WINCALL SetThreadDesktop, qword ptr [g_secdesk_orig]
 sdt_run:
     WINCALL DialogBoxParamW, qword ptr [g_hinst], dword ptr [g_secdesk_dlg], 0, \
             qword ptr [g_secdesk_proc], 0
     mov     qword ptr [g_secdesk_res], rax       ; marshal the result back to the caller
+    cmp     dword ptr [g_secdesk_orphan], 0      ; the watchdog already restored the user's
+    jne     sdt_done                             ;   desktop and released these handles
     call    secdesk_restore                      ; checked + retried, never fire-and-forget
 sdt_done:
     xor     eax, eax
@@ -15501,6 +15926,7 @@ gui_secdesk_show proc frame
     mov     qword ptr [g_secdesk_proc], rdx
     mov     qword ptr [g_secdesk_res], 0
     mov     qword ptr [g_secdesk_hd], 0
+    mov     dword ptr [g_secdesk_orphan], 0
     ; Remember the desktop currently receiving input, to restore afterwards.  If this
     ; fails there is NO handle to switch back to, and both restore paths (secdesk_body
     ; and gss_cleanup) are guarded on it being non-null - so switching away anyway would
@@ -15520,7 +15946,30 @@ gui_secdesk_show proc frame
     mov     qword ptr [rbp-24], rax              ; worker thread handle
     test    rax, rax
     jz      gss_fallback                         ; no thread -> plain dialog
-    WINCALL WaitForSingleObject, qword ptr [rbp-24], WAIT_FOREVER
+    ; Bounded wait, not INFINITE.  The desktop restore lives at the END of the
+    ; worker's dialog, so ANYTHING that blocks inside that dialog leaves the user on
+    ; a shell-less desktop with no way back but Ctrl+Alt+Del - which is exactly what
+    ; a blocking write into a OneDrive-synced folder did.  The password entry itself
+    ; is unbounded by nature, so the ceiling is generous; it exists only to break a
+    ; genuine wedge, never to interrupt someone typing.
+    mov     dword ptr [rbp-32], 0                ; elapsed ms
+gss_wait:
+    WINCALL WaitForSingleObject, qword ptr [rbp-24], SECDESK_SLICE_MS
+    test    eax, eax                             ; WAIT_OBJECT_0 -> the worker finished
+    jz      gss_worker_done
+    add     dword ptr [rbp-32], SECDESK_SLICE_MS
+    cmp     dword ptr [rbp-32], SECDESK_MAX_MS
+    jb      gss_wait
+    ; Wedged.  Hand the user their desktop back and abandon the worker.  Deliberately
+    ; leak the desktop and thread handles: the worker is still inside the dialog and
+    ; would use them, and two leaked handles cost far less than a stranded user.
+    mov     dword ptr [g_secdesk_orphan], 1
+    call    secdesk_restore
+    mov     qword ptr [g_secdesk_res], 0         ; treat as cancelled
+    mov     qword ptr [g_secdesk_hd], 0          ; skip the closes in gss_cleanup
+    mov     qword ptr [g_secdesk_orig], 0
+    jmp     gss_ret
+gss_worker_done:
     ; secdesk_thread restores these itself on the normal path; repeat it here so a
     ; worker that died mid-dialog cannot leave the main thread running on the
     ; worker's shadow stack.  Same saved values, so the normal path is a no-op.
@@ -15605,6 +16054,15 @@ gui_open proc frame
     call    gui_pwremind                    ; C9: the password was NOT typed just now, so
     jmp     go_vault                        ;   remind if it has gone stale
 go_askpw:
+    ; Read the vault image here, on the caller's desktop.  vault_unlock then works
+    ; from memory, so a slow or stalled OneDrive read can no longer happen while the
+    ; user is parked on the private desktop with no shell and no way back.
+    cmp     dword ptr [g_vpath_set], 0
+    je      go_nopreload
+    lea     rax, [g_vpath]
+    mov     qword ptr [g_cfg_in], rax
+    call    vault_preload
+go_nopreload:
     cmp     dword ptr [g_secunlock], 0     ; enter the master password on a private desktop?
     je      go_unlock_normal
     mov     ecx, DLG_UNLOCK
@@ -15614,7 +16072,13 @@ go_askpw:
 go_unlock_normal:
     WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_UNLOCK, qword ptr [rbp-24], addr unlock_proc, 0
 go_unlock_res:
-    cmp     rax, 1
+    mov     qword ptr [rbp-32], rax        ; preload claim ends either way: on success the
+    xor     ecx, ecx                       ;   image is the live vault's, otherwise nobody
+    cmp     qword ptr [rbp-32], 1          ;   owns it and it must be released
+    jne     @F
+    mov     ecx, 1
+@@: call    vault_preload_end
+    cmp     qword ptr [rbp-32], 1
     jne     go_reset
     jmp     go_vault
 go_create:
@@ -15629,6 +16093,10 @@ go_create_normal:
 go_create_res:
     cmp     rax, 1
     jne     go_reset
+    mov     rcx, qword ptr [rbp-24]         ; create the vault HERE, not in the dialog:
+    call    gui_create_commit               ;   on the secure-unlock path the private
+    test    eax, eax                        ;   desktop is gone by now, so blocking I/O
+    jz      go_reset                        ;   can no longer strand the user on it
 go_vault:
     ; single-vault: vault_unlock / TPM already set the live globals (g_body_ptr/g_hdr/
     ; g_vkey) - there is no context to register and nothing to fan out.

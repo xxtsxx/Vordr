@@ -52,6 +52,8 @@ cfg_fname label word
     dw 5Ch,'v','a','u','l','t','.','v','o','r','d','r', 0
 env_onedrive label word
     dw 'O','n','e','D','r','i','v','e', 0
+env_userprofile label word
+    dw 'U','S','E','R','P','R','O','F','I','L','E', 0
 onedrive_sub label word
     dw 5Ch,'V','o','r','d','r', 0
 od_accounts label word
@@ -598,27 +600,26 @@ cfg_default_vault proc frame
     call    cfg_od_linked
     test    eax, eax
     jz      cdv_docs
-    ; dst = "%OneDrive%"; append "\Vordr"
-    mov     r8d, eax                          ; char count (zero-extended)
+    ; dst = "%OneDrive%"; append "\Vordr" + the filename through the shared tail.
+    ;
+    ; This used to take the append offset from eax, commented "char count" - but eax
+    ; here holds cfg_od_linked's 1/0 result, NOT the length GetEnvironmentVariableW
+    ; returned.  So "\Vordr" was written at character index 1 and
+    ; "C:\Users\<user>\OneDrive" became "C\Vordr" - a RELATIVE path, which then
+    ; resolved against the process's current directory.  The vault appeared next to
+    ; vordr.exe and followed it when the exe was moved, the stray "C" folder being the
+    ; first character of "C:\".  Only machines where OneDrive is actually linked ever
+    ; reach this line, which is why it reproduced on one box and not another.
+    ;
+    ; The length is not needed at all: the shared tail scans for the NUL, exactly as
+    ; the Documents and %USERPROFILE% paths do.
     mov     r11, qword ptr [rbp-24]
-    lea     r10, [r11+r8*2]                   ; end (GetEnv returned char count)
-    lea     r9, [onedrive_sub]
-    xor     ecx, ecx
-cdv_od_cpy:
-    movzx   eax, word ptr [r9+rcx*2]
-    mov     word ptr [r10+rcx*2], ax
-    test    eax, eax
-    jz      cdv_od_dir
-    inc     ecx
-    jmp     cdv_od_cpy
-cdv_od_dir:
-    WINCALL CreateDirectoryW, qword ptr [rbp-24], 0   ; ignore "already exists"
-    mov     rcx, qword ptr [rbp-24]
-    jmp     cdv_app                           ; append "\vault.vordr" to it
+    xor     r8d, r8d
+    jmp     cdv_docs_end
 cdv_docs:
     WINCALL SHGetFolderPathW, 0, CSIDL_PERSONAL, 0, 0, qword ptr [rbp-24]
     test    eax, eax                         ; S_OK = 0
-    jnz     cdv_fail
+    jnz     cdv_profile                      ; no Documents -> %USERPROFILE%, never nothing
     ; dst = "<Documents>"; append "\Vordr" and create it, mirroring OneDrive
     mov     r11, qword ptr [rbp-24]
     xor     r8d, r8d
@@ -665,6 +666,19 @@ cdv_done:
     mov     eax, 1
     FRAME_EPILOG
     ret
+cdv_profile:
+    ; Last resort, so this can never come back empty-handed.  Returning failure leaves
+    ; the GUI with no vault path at all, and the file picker then opens wherever the
+    ; process happens to be - which on a test machine was the program's own folder,
+    ; and is how a vault ended up living next to the exe.
+    WINCALL GetEnvironmentVariableW, addr env_userprofile, qword ptr [rbp-24], 980
+    test    eax, eax
+    jz      cdv_fail
+    cmp     eax, 980
+    jae     cdv_fail
+    mov     r11, qword ptr [rbp-24]
+    xor     r8d, r8d
+    jmp     cdv_docs_end                     ; shared subfolder + filename tail
 cdv_fail:
     xor     eax, eax
     FRAME_EPILOG

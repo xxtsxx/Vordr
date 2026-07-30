@@ -50,6 +50,8 @@ extern file_rename:proc
 extern MoveFileExW:proc
 extern CopyFileW:proc
 extern DeleteFileW:proc
+extern Sleep:proc                       ; back-off between contended temp-write tries
+externdef g_io_err:dword                ; Win32 reason from the last failed write
 extern CreateFileW:proc                 ; C8: <vault>.lock write coordination
 extern CloseHandle:proc
 externdef g_wf_disp:dword               ; C7: one-shot write_file disposition (fileio)
@@ -305,6 +307,8 @@ g_conv      db CONV_CAP dup (?)
 g_convlabel db MAX_LABEL_BYTES dup (?)        ; utf8 label scratch (va_field_labeled)
 align 2
 g_tmppath   dw MAX_PATH_CHARS dup (?)        ; "<vault>.tmp" for atomic replace
+g_preloaded dd ?                             ; 1 = g_filebuf was filled by vault_preload;
+                                             ;   vault_unlock must not re-read or free it
 g_bak_a     dw MAX_PATH_CHARS dup (?)        ; backup-rotation path scratch (from)
 g_bak_b     dw MAX_PATH_CHARS dup (?)        ; backup-rotation path scratch (to)
 g_ts        dq ?                ; GetSystemTimeAsFileTime scratch
@@ -789,7 +793,7 @@ vault_rotate_backups endp
 ;   -> eax = 0 / EXIT_IO / EXIT_OOM.
 ; ===========================================================================
 vault_seal_write proc frame
-    FRAME_PROLOG 80
+    FRAME_PROLOG 96
     ; [rbp-32] = attachment section bytes (entries + trailer)  [rbp-40] = base len
     xor     ecx, ecx                            ; emit=0: size the attachment section
     xor     edx, edx
@@ -899,14 +903,38 @@ vsw_pdone:
     ; write the image to the temp file.  C7: delete any stale/pre-planted temp,
     ; then create it exclusively (CREATE_NEW) so a re-planted symlink at that name
     ; is refused rather than silently followed.
+    ; Retry the delete+create pair, not just the rename below.  A vault in a synced
+    ; folder (OneDrive) is routinely held open by the sync client: the DeleteFileW
+    ; then fails, the exclusive CREATE_NEW that follows fails with ERROR_FILE_EXISTS,
+    ; and nothing retried it - which is what surfaced as "Could not create the vault"
+    ; on a machine with 110 GB free and an idle disk.  Same cadence as file_rename.
+    mov     dword ptr [rbp-48], 0                ; attempt count
+vsw_wtry:
     WINCALL DeleteFileW, addr g_tmppath
-    mov     dword ptr [g_wf_disp], 1             ; CREATE_NEW (one-shot)
+    mov     dword ptr [g_wf_disp], 1             ; CREATE_NEW (one-shot; re-armed per try)
     lea     rcx, [g_tmppath]
     mov     rdx, qword ptr [g_outbuf]
     mov     r8, qword ptr [g_outlen]
     call    write_file
     test    eax, eax
-    jnz     vsw_io
+    jz      vsw_wok
+    mov     r10d, dword ptr [g_io_err]           ; only transient contention is retried;
+    cmp     r10d, 80                             ;   a real failure still fails at once
+    je      vsw_wretry                           ; ERROR_FILE_EXISTS (stale temp still held)
+    cmp     r10d, 32
+    je      vsw_wretry                           ; ERROR_SHARING_VIOLATION
+    cmp     r10d, 33
+    je      vsw_wretry                           ; ERROR_LOCK_VIOLATION
+    cmp     r10d, 5
+    je      vsw_wretry                           ; ERROR_ACCESS_DENIED
+    jmp     vsw_io
+vsw_wretry:
+    inc     dword ptr [rbp-48]
+    cmp     dword ptr [rbp-48], 10               ; 10 attempts (~9s), then give up
+    jae     vsw_io
+    WINCALL Sleep, 1000
+    jmp     vsw_wtry
+vsw_wok:
     ; roll the current file into .bak1..N before we overwrite it (best-effort)
     call    vault_rotate_backups
     ; atomic replace: rename temp -> the real vault path
@@ -993,13 +1021,17 @@ vault_unlock proc frame
     FRAME_PROLOG 48
     ; [rbp-24] = ciphertext length
     mov     qword ptr [g_body_ptr], 0
-    ; read the whole file
+    ; read the whole file - unless the caller already did it for us, off the
+    ; secure desktop (vault_preload)
+    cmp     dword ptr [g_preloaded], 0
+    jne     vu_haveimage
     mov     rcx, qword ptr [g_cfg_in]
     lea     rdx, [g_filebuf]
     lea     r8, [g_filesize]
     call    read_file
     test    eax, eax
     jnz     vu_io
+vu_haveimage:
     ; minimum size: header + 4-byte empty body + tag
     mov     rax, qword ptr [g_filesize]
     cmp     rax, VH_TOTAL + 4 + 16
@@ -1206,6 +1238,11 @@ vu_cleanfile2:
     mov     eax, dword ptr [rbp-24]
 vu_cleanfile:
     mov     qword ptr [rbp-24], rax
+    cmp     dword ptr [g_preloaded], 0          ; a preloaded image belongs to the caller:
+    jne     vu_ret                              ;   freeing it here would send the next
+                                                ;   wrong-password retry back to the file,
+                                                ;   which is the I/O we moved off the
+                                                ;   secure desktop in the first place
     mov     rcx, qword ptr [g_filebuf]
     test    rcx, rcx
     jz      vu_ret
@@ -1217,6 +1254,69 @@ vu_ret:
     FRAME_EPILOG
     ret
 vault_unlock endp
+
+; =============================================================================
+; vault_preload() -> eax = 0 ok / EXIT_*.  Read the vault image into g_filebuf
+;   BEFORE the unlock dialog opens, so vault_unlock does no file I/O.
+;
+;   The unlock dialog can run on a private desktop, and that desktop is only
+;   restored once the dialog returns - so a read that blocks inside it (a vault in
+;   a OneDrive-synced folder, a cloud placeholder being materialised, a busy sync
+;   engine) strands the user on a desktop with no shell.  Argon2 and the AEAD are
+;   bounded CPU and stay in the dialog, where a wrong password can keep it open;
+;   only the unbounded part moves out.
+;
+;   No-op when something is already resident: this is only for the clean
+;   launch -> unlock path, and silently discarding a live image would be worse
+;   than the read it saves.
+; =============================================================================
+public vault_preload
+vault_preload proc frame
+    FRAME_PROLOG 48
+    mov     dword ptr [g_preloaded], 0
+    cmp     qword ptr [g_filebuf], 0
+    jne     vpl_skip
+    cmp     qword ptr [g_cfg_in], 0
+    je      vpl_skip
+    mov     rcx, qword ptr [g_cfg_in]
+    lea     rdx, [g_filebuf]
+    lea     r8, [g_filesize]
+    call    read_file
+    test    eax, eax
+    jnz     vpl_ret                              ; leave it unset: vault_unlock will
+    mov     dword ptr [g_preloaded], 1           ;   read (and report) the error itself
+vpl_skip:
+    xor     eax, eax
+vpl_ret:
+    FRAME_EPILOG
+    ret
+vault_preload endp
+
+; =============================================================================
+; vault_preload_end(ecx = 1 if the vault is now open) - drop the preload claim.
+;   On success the image IS the live vault image and vault_unlock owns it from
+;   here.  On failure or cancel nobody owns it, so release it - vault_unlock's
+;   cleanup deliberately left it alone while retries were still possible.
+; =============================================================================
+public vault_preload_end
+vault_preload_end proc frame
+    FRAME_PROLOG 48
+    mov     dword ptr [rbp-24], ecx
+    cmp     dword ptr [g_preloaded], 0
+    je      vpe_ret
+    mov     dword ptr [g_preloaded], 0
+    cmp     dword ptr [rbp-24], 0
+    jne     vpe_ret                              ; opened: the image is the vault's now
+    mov     rcx, qword ptr [g_filebuf]
+    test    rcx, rcx
+    jz      vpe_ret
+    mov     rdx, qword ptr [g_filesize]
+    call    mem_free
+    mov     qword ptr [g_filebuf], 0
+vpe_ret:
+    FRAME_EPILOG
+    ret
+vault_preload_end endp
 
 ; vault_lock() - wipe + free the secmem body and wipe the master key.
 public vault_lock

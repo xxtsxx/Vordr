@@ -43,6 +43,11 @@ PAGE_READWRITE      equ 04h
 IO_CHUNK            equ 1000000h         ; 16 MiB per ReadFile/WriteFile
 
 .data?
+public g_io_err
+g_io_err    dd ?                 ; Win32 error from the last failed write/rename.
+                                 ;   Lets a caller distinguish transient contention
+                                 ;   (a sync client holding the file) from a real
+                                 ;   failure, instead of seeing a flat EXIT_IO.
 align 4
 public g_wf_disp
 g_wf_disp   dd ?                       ; C7: one-shot write_file disposition override
@@ -202,10 +207,14 @@ wf_ok:
     xor     eax, eax
     jmp     wf_done
 wf_io_close:
+    call    GetLastError                         ; capture BEFORE CloseHandle overwrites it
+    mov     dword ptr [g_io_err], eax
     WINCALL CloseHandle, qword ptr [rbp-40]
     mov     eax, EXIT_IO
     jmp     wf_done
 wf_io:
+    call    GetLastError
+    mov     dword ptr [g_io_err], eax
     mov     eax, EXIT_IO
 wf_done:
     FRAME_EPILOG
@@ -244,6 +253,7 @@ frn_try:
     test    eax, eax
     jnz     frn_ok
     call    GetLastError                        ; read the failure reason immediately
+    mov     dword ptr [g_io_err], eax
     cmp     eax, 32                             ; ERROR_SHARING_VIOLATION
     je      frn_retry
     cmp     eax, 33                             ; ERROR_LOCK_VIOLATION
