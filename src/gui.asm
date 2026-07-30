@@ -16100,6 +16100,17 @@ go_create_res:
 go_vault:
     ; single-vault: vault_unlock / TPM already set the live globals (g_body_ptr/g_hdr/
     ; g_vkey) - there is no context to register and nothing to fan out.
+    ; Drop the previous window's anchor base BEFORE this one exists.  Windows sends
+    ; WM_SIZE while the dialog is being created - i.e. BEFORE WM_INITDIALOG, so before
+    ; gui_anchor_init has recorded anything - and gui_reflow only skips when the base
+    ; is 0.  Locking destroys the vault window but left g_base_* set, so the second and
+    ; every later unlock in one process reflowed the fresh controls against the DEAD
+    ; window's rects: the entry-name edit moved before it was ever measured, and
+    ; gui_anchor_init then recorded that wrong position as the new base.  Always fine
+    ; on the first unlock, wrong on some of the ones after - which is exactly how it
+    ; presented.  ([[vordr-vaultwindow-state-reset]]: state outliving the window.)
+    mov     dword ptr [g_base_cx], 0
+    mov     dword ptr [g_base_cy], 0
     WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_VAULT, qword ptr [rbp-24], addr vault_proc, 0
     call    vault_lock                      ; wipe body + key, minimise to tray
     call    gui_clipclear
