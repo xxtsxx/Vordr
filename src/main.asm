@@ -174,6 +174,8 @@ CSTR msg_nocpu,    "error: CPU lacks required features (AES-NI, PCLMULQDQ, SSE4.
 CSTR fs_seedlabel, "fuzz seed: "       ; G7: precedes the decimal seed on stdout
 fs_nl db 13,10
 CSTR msg_badnum,   "error: numeric argument out of range",13,10
+CSTR msg_seedn_ok,  "seeded the requested test entries.  unlock the vault with password: vordrtest",13,10
+CSTR msg_seedn_bad, "error: seedn needs <path> <count>, count a plain number 1..200000",13,10
 CSTR msg_testverb, "error: that diagnostic runs only in test (PROBE_IO/dbg) builds; a release build exposes only 'selftest' and 'katreport'",13,10
 CSTR msg_st_ok,    "all self-tests passed",13,10
 CSTR msg_st_fail,  "SELFTEST FAILURE",13,10
@@ -196,6 +198,7 @@ WSTR w_selftest, <selftest>
 WSTR w_bench,    <bench>
 WSTR w_genpw,    <genpw>
 WSTR w_seedtest, <seedtest>
+WSTR w_seedn,    <seedn>                 ; seedtest with a caller-chosen count
 WSTR w_atgen,    <atgen>
 WSTR w_zitest,   <zitest>
 WSTR w_phtest,   <phtest>
@@ -273,6 +276,7 @@ cmd_table label CMDENT
     CMDENT { w_bench,     cmd_bench,     0, 0 }
     CMDENT { w_genpw,     cmd_genpw,     0, 0 }   ; print one sample of each generator style
     CMDENT { w_seedtest,  cmd_seedtest,  1, 0 }   ; bulk-fill a test vault with 5000 entries
+    CMDENT { w_seedn,     cmd_seedn,     2, 0 }   ; ...same, but <path> <count> (perf testing)
     CMDENT { w_atgen,     cmd_atgen,     1, 0 }   ; headless attachment-export probe: <out.zip>
     CMDENT { w_zitest,    cmd_zitest,    2, 0 }   ; headless encrypted-zip import probe
     CMDENT { w_phtest,    cmd_phtest,    0, 0 }   ; headless pw-history capture probe
@@ -1126,6 +1130,96 @@ cst_fail:
     FRAME_EPILOG
     ret
 cmd_seedtest endp
+
+; ---------------------------------------------------------------------------
+; cmd_seedn - seedtest with a caller-chosen count: <path> <count>.
+;   Same fixed test password ("vordrtest") and the same generator; only the entry
+;   count differs, for perf work that needs a vault larger than the gate's 5000.
+;   seedtest keeps its exact-1-positional signature so run_all.cmd is untouched.
+;   PROBE_IO / dbg only, like every other path-taking verb.
+; ---------------------------------------------------------------------------
+SEEDN_MAX equ 200000                       ; refuse absurd counts rather than churn
+
+; wtou32(rcx = wide decimal) -> eax = value, or 0 if it is not a plain number.
+;   Leaf.  Saturates at SEEDN_MAX so a typo cannot ask for a billion entries.
+wtou32 proc
+    xor     eax, eax                       ; accumulator
+    xor     r10d, r10d                     ; digits seen
+wtu_lp:
+    movzx   r11d, word ptr [rcx]
+    test    r11d, r11d
+    jz      wtu_done
+    cmp     r11d, '0'
+    jb      wtu_bad
+    cmp     r11d, '9'
+    ja      wtu_bad
+    imul    eax, eax, 10
+    sub     r11d, '0'
+    add     eax, r11d
+    cmp     eax, SEEDN_MAX
+    ja      wtu_cap
+    inc     r10d
+    add     rcx, 2
+    jmp     wtu_lp
+wtu_cap:
+    mov     eax, SEEDN_MAX
+    ret
+wtu_done:
+    test    r10d, r10d                     ; empty string is not a number
+    jz      wtu_bad
+    ret
+wtu_bad:
+    xor     eax, eax
+    ret
+wtou32 endp
+
+LANDING_PAD
+cmd_seedn proc frame
+    FRAME_PROLOG 48
+    lea     r10, [g_argv]
+    mov     rax, qword ptr [r10+16]           ; argv[2] = vault path
+    mov     qword ptr [g_cfg_in], rax
+    lea     r10, [seed_pw]                    ; same fixed test password as seedtest
+    lea     r11, [g_cfg_pass]
+    xor     ecx, ecx
+csn_cp:
+    mov     al, byte ptr [r10+rcx]
+    mov     byte ptr [r11+rcx], al
+    test    al, al
+    jz      csn_cpd
+    inc     ecx
+    cmp     ecx, 32
+    jb      csn_cp
+csn_cpd:
+    mov     dword ptr [g_cfg_passlen], 9
+    lea     r11, [g_positionals]              ; positional[1] = count
+    mov     rcx, qword ptr [r11+8]
+    test    rcx, rcx
+    jz      csn_bad
+    call    wtou32
+    test    eax, eax
+    jz      csn_bad
+    mov     dword ptr [rbp-32], eax
+    mov     ecx, dword ptr [rbp-32]
+    call    do_seed
+    mov     dword ptr [rbp-24], eax
+    test    eax, eax
+    jnz     csn_fail
+    WINCALL print_a, addr msg_seedn_ok, msg_seedn_ok_len   ; seedtest's line names 5000
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+csn_bad:
+    WINCALL print_err, addr msg_seedn_bad, msg_seedn_bad_len
+    mov     eax, EXIT_USAGE
+    FRAME_EPILOG
+    ret
+csn_fail:
+    mov     eax, dword ptr [rbp-24]
+    FRAME_EPILOG
+    ret
+cmd_seedn endp
+
 
 ; cmd_atgen - headless attachment-export probe.  Build an in-memory vault with a
 ;   single entry carrying one staged attachment, JSON-export it WITH attachments
