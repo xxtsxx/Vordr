@@ -43,7 +43,9 @@ externdef g_sel:byte                      ; per-entry import selection mask (fro
 ARF_SIZE    equ 68
 CP_UTF8_    equ 65001
 ZI_MAXMEM   equ 8192                      ; max archive members
-ZI_MAXENT   equ 8192                      ; max stageable entries (matches MAX_SEL)
+MAX_SEL     equ 8192                      ; mirrors gui.asm/vault.asm - constcheck gates
+ZI_MAXENT   equ MAX_SEL                   ;   the trio, so the checklist, the selection
+                                          ;   mask and the merge cannot drift apart
 ZI_ARENA    equ 4*1024*1024              ; per-entry wide/blob scratch
 ZI_SBUF     equ 256*1024                  ; one string's decoded UTF-8
 ZI_TBUF     equ 1024*1024                 ; persistent staged-title wide storage
@@ -90,8 +92,10 @@ g_zi_jptr   dq ?                          ; decrypted vordr.json ptr (persists s
 g_zi_jlen   dd ?
 g_zi_tap    dd ?                          ; staged-title arena bump offset
 align 8
-public g_zi_stg_n
+public g_zi_stg_n, g_zi_trunc
 g_zi_stg_n  dd ?                          ; number of entries staged (titles ready)
+g_zi_trunc  dd ?                          ; source total when it exceeded ZI_MAXENT
+                                          ;   (0 = everything fitted)
 public g_zi_titles
 g_zi_titles dq ZI_MAXENT dup (?)          ; per-entry wide title ptr (into g_zi_tbuf)
 public g_zi_tlens
@@ -760,9 +764,11 @@ zi_stage_vault proc frame
     test    rcx, rcx
     jz      zsv_done
     mov     eax, dword ptr [rcx]
+    mov     dword ptr [g_zi_trunc], 0
     cmp     eax, ZI_MAXENT
     jbe     @F
-    mov     eax, ZI_MAXENT                      ; stage what fits; the rest stay unticked
+    mov     dword ptr [g_zi_trunc], eax         ; remember the REAL total: silently importing
+    mov     eax, ZI_MAXENT                      ;   a subset of someone's vault is the kind of
 @@: mov     dword ptr [rbp-48], eax
     lea     r10, [rcx+4]
     mov     qword ptr [rbp-32], r10

@@ -115,6 +115,7 @@ extern zi_abort:proc                    ; discard a staged import
 externdef g_zi_titles:qword             ; staged entry titles (wide ptr array)
 externdef g_zi_tlens:dword              ; staged entry title lengths (wchars)
 externdef g_zi_stg_n:dword              ; staged entry count
+externdef g_zi_trunc:dword              ; >0 = the source had more than the list can hold
 extern ze_free:proc
 externdef g_zbuf:qword
 extern ShellExecuteW:proc
@@ -822,6 +823,15 @@ WSTR s_createfail_n, <Could not create the vault. Windows error>
 WSTR s_nodir_n,      <Could not create the folder for the vault. Check the vault location in Settings. Windows error>
 WSTR m_exedir,       <This vault would be created in the folder Vordr itself runs from. Program folders get replaced on update and are often temporary or removable, so the vault could be lost. Create it here anyway?>
 WSTR t_exedir,       <Vordr - unusual location>
+WSTR h_title,        <Vault health>
+WSTR h_secrets,      <secrets>
+WSTR h_weak,         <weak>
+WSTR h_reused,       <reused>
+WSTR h_ageing,       <ageing>
+WSTR h_allclear,     <Everything looks healthy.>
+WSTR h_attention,    <Some secrets could use attention.>
+WSTR h_pick,         <Select an entry on the left to view it.>
+WSTR h_empty,        <This vault is empty. Press + to add your first secret.>
 WSTR s_exedir_no,    <Cancelled. Pick a different location for the vault.>
 WSTR ev_save,       <gui-save>
 WSTR ev_export,     <gui-export>
@@ -993,6 +1003,8 @@ WSTR imp_g_none,     <No importable entries were found. Vordr imports uncompress
 ; the ordinary case of re-importing a file this vault already contains - which is not a
 ; failure at all.  These two say what actually happened.
 WSTR imp_v_none,     <That vault has no entries to import. Its records are either already in the trash or carry no title.>
+WSTR imp_v_trunc,    <This vault holds more entries than the selection list can show. Only the first 8192 are listed and importable; the rest are not included. Import in stages if you need them all.>
+WSTR t_imp_trunc,    <Vordr - partial import>
 WSTR imp_v_same,     <Nothing to import - this vault already has every entry you selected, and none of them was newer. Re-importing the same file is always safe.>
 WSTR imp_g_bad,      <That file is not a Vordr encrypted export (.zip), or the password was wrong.>
 WSTR zip_title,      <Export to encrypted archive>
@@ -1440,6 +1452,11 @@ g_secdesk_res   dq ?                  ; DialogBox result marshalled back to the 
 g_secdesk_orphan dd ?                 ; 1 = the watchdog gave up on a wedged worker
 align 2
 g_errbuf    dw 256 dup (?)            ; "<prefix> <number>" built by gui_num_msg
+align 4
+g_home_stats dd 4 dup (?)             ; vault_health: {weak, reused, old, total}
+g_home_valid dd ?                     ; 0 = recompute on the next home paint
+g_home_alert dd ?                     ; 1 = this tile's count is a finding, not a total
+g_home_numw  dw 16 dup (?)            ; one stat rendered as digits
 g_exedir    dw 1024 dup (?)           ; folder holding vordr.exe
 g_initdir   dw 1024 dup (?)           ; explicit start folder for the vault picker
 align 8
@@ -2015,6 +2032,291 @@ gedc_no:
     ret
 gui_exe_dir_check endp
 
+; =============================================================================
+; The home panel - what the detail pane shows when nothing is selected.
+;
+; Four stat tiles from vault_health {weak, reused, old, total}, then a line of
+; plain English.  Painted onto the erased background from vp_terase, alongside the
+; field cards, so it picks up the active scheme's colours for free.
+;
+; vault_health walks every entry and runs a duplicate pass, so the result is
+; CACHED: WM_ERASEBKGND fires on every repaint and resize, and rescanning a large
+; vault there would make dragging the window crawl.  gui_poplist invalidates it -
+; that is the funnel every add / edit / delete / trash change already goes through.
+; =============================================================================
+HOME_PAD   equ 18                        ; inset from the detail-pane edges (px)
+HOME_GAP   equ 12                        ; gap between tiles (px)
+HOME_TILEH equ 76                        ; tile height (px)
+HOME_R     equ 10                        ; tile corner radius (px)
+
+; home_num(ecx = value) -> rax = g_home_numw as wide decimal.  Leaf, no allocation.
+home_num proc frame
+    FRAME_PROLOG 64                      ; [rbp-48] = digit scratch (no calls inside)
+    mov     dword ptr [rbp-24], ecx
+    mov     eax, dword ptr [rbp-24]
+    lea     r9, [rbp-48]
+    xor     ecx, ecx
+    mov     r11d, 10
+hn_div:
+    xor     edx, edx
+    div     r11d
+    add     dl, 30h
+    mov     byte ptr [r9+rcx], dl
+    inc     rcx
+    test    eax, eax
+    jnz     hn_div
+    lea     r10, [g_home_numw]
+    xor     r8, r8
+hn_emit:
+    dec     rcx
+    movzx   eax, byte ptr [r9+rcx]
+    mov     word ptr [r10+r8*2], ax
+    inc     r8
+    test    rcx, rcx
+    jnz     hn_emit
+    mov     word ptr [r10+r8*2], 0
+    lea     rax, [g_home_numw]
+    FRAME_EPILOG
+    ret
+home_num endp
+
+; home_tile(rcx=hdc, rdx=*rect{L,T,R,B}, r8d=value, r9=label) - one tile: rounded
+;   panel, the count large, the label dimmed beneath it.  A non-zero count is drawn
+;   in the accent colour only when g_home_alert is set, so the plain totals never
+;   shout and a genuine finding stands out.
+home_tile proc frame
+    FRAME_PROLOG 192                     ; RoundRect spills 7 args, DrawTextW 5
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], rdx
+    mov     dword ptr [rbp-40], r8d
+    mov     qword ptr [rbp-48], r9
+    mov     r10, qword ptr [rbp-32]
+    mov     eax, dword ptr [r10+0]
+    mov     dword ptr [rbp-88], eax
+    mov     eax, dword ptr [r10+4]
+    mov     dword ptr [rbp-92], eax
+    mov     eax, dword ptr [r10+8]
+    mov     dword ptr [rbp-96], eax
+    mov     eax, dword ptr [r10+12]
+    mov     dword ptr [rbp-100], eax
+    WINCALL CreateSolidBrush, dword ptr [g_col_panel]
+    mov     qword ptr [rbp-56], rax
+    WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-56]
+    mov     qword ptr [rbp-64], rax
+    WINCALL GetStockObject, 8            ; NULL_PEN
+    mov     qword ptr [rbp-72], rax
+    WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-72]
+    mov     qword ptr [rbp-80], rax
+    WINCALL RoundRect, qword ptr [rbp-24], dword ptr [rbp-88], dword ptr [rbp-92], \
+            dword ptr [rbp-96], dword ptr [rbp-100], HOME_R, HOME_R
+    WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-64]
+    WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-80]
+    WINCALL DeleteObject, qword ptr [rbp-56]
+    WINCALL SetBkMode, qword ptr [rbp-24], 1          ; TRANSPARENT
+    mov     eax, dword ptr [g_col_text]
+    cmp     dword ptr [g_home_alert], 0
+    je      ht_col
+    cmp     dword ptr [rbp-40], 0
+    je      ht_col
+    mov     eax, dword ptr [g_col_accent]
+ht_col:
+    mov     dword ptr [rbp-132], eax
+    WINCALL SetTextColor, qword ptr [rbp-24], dword ptr [rbp-132]
+    WINCALL SelectObject, qword ptr [rbp-24], qword ptr [g_titlefont]
+    mov     qword ptr [rbp-108], rax                  ; old font
+    mov     eax, dword ptr [rbp-88]                   ; number rect, inset in the tile
+    add     eax, 14
+    mov     dword ptr [rbp-128], eax
+    mov     eax, dword ptr [rbp-92]
+    add     eax, 10
+    mov     dword ptr [rbp-124], eax
+    mov     eax, dword ptr [rbp-96]
+    sub     eax, 10
+    mov     dword ptr [rbp-120], eax
+    mov     eax, dword ptr [rbp-124]
+    add     eax, 34
+    mov     dword ptr [rbp-116], eax
+    mov     ecx, dword ptr [rbp-40]
+    call    home_num
+    mov     qword ptr [rbp-136], rax
+    WINCALL DrawTextW, qword ptr [rbp-24], qword ptr [rbp-136], -1, addr rbp-128, \
+            DT_NAMEFLAGS
+    WINCALL SelectObject, qword ptr [rbp-24], qword ptr [g_subfont]
+    WINCALL SetTextColor, qword ptr [rbp-24], dword ptr [g_col_textdim]
+    mov     eax, dword ptr [rbp-116]                  ; label sits under the number
+    mov     dword ptr [rbp-124], eax
+    add     eax, 22
+    mov     dword ptr [rbp-116], eax
+    WINCALL DrawTextW, qword ptr [rbp-24], qword ptr [rbp-48], -1, addr rbp-128, \
+            DT_NAMEFLAGS
+    WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-108]
+    FRAME_EPILOG
+    ret
+home_tile endp
+
+; gui_draw_home(rcx = hdc, rdx = hdlg) - the panel.  No-op unless the detail pane
+;   is genuinely idle.
+public gui_draw_home
+gui_draw_home proc frame
+    FRAME_PROLOG 224
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], rdx
+    cmp     dword ptr [g_cur_idx], 0             ; an entry is showing -> cards own the pane
+    jge     gdh_ret
+    cmp     dword ptr [g_menu_open], 0           ; settings covers it
+    jne     gdh_ret
+    cmp     dword ptr [g_trash_view], 0          ; the trash has its own idea of "empty"
+    jne     gdh_ret
+    cmp     dword ptr [g_home_valid], 0
+    jne     gdh_have
+    lea     rcx, [g_home_stats]
+    call    vault_health
+    mov     dword ptr [g_home_valid], 1
+gdh_have:
+    mov     rcx, qword ptr [rbp-32]
+    lea     rdx, [rbp-64]                        ; sidebar frame {L,T,R,B}
+    call    sidebar_rect
+    WINCALL GetClientRect, qword ptr [rbp-32], addr rbp-96
+    mov     eax, dword ptr [rbp-56]              ; pane L = sidebar R + pad
+    add     eax, HOME_PAD
+    mov     dword ptr [rbp-104], eax
+    mov     eax, dword ptr [rbp-60]              ; pane T = sidebar T + pad
+    add     eax, HOME_PAD
+    mov     dword ptr [rbp-108], eax
+    mov     eax, dword ptr [rbp-88]              ; pane R = client right - pad
+    sub     eax, HOME_PAD
+    mov     dword ptr [rbp-112], eax
+    mov     eax, dword ptr [rbp-112]             ; too narrow to lay out -> draw nothing
+    sub     eax, dword ptr [rbp-104]
+    cmp     eax, 200
+    jl      gdh_ret
+    WINCALL SetBkMode, qword ptr [rbp-24], 1
+    WINCALL SetTextColor, qword ptr [rbp-24], dword ptr [g_col_text]
+    WINCALL SelectObject, qword ptr [rbp-24], qword ptr [g_titlefont]
+    mov     qword ptr [rbp-120], rax
+    mov     eax, dword ptr [rbp-104]
+    mov     dword ptr [rbp-160], eax
+    mov     eax, dword ptr [rbp-108]
+    mov     dword ptr [rbp-156], eax
+    mov     eax, dword ptr [rbp-112]
+    mov     dword ptr [rbp-152], eax
+    mov     eax, dword ptr [rbp-156]
+    add     eax, 32
+    mov     dword ptr [rbp-148], eax
+    WINCALL DrawTextW, qword ptr [rbp-24], addr h_title, -1, addr rbp-160, DT_NAMEFLAGS
+    WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-120]
+    mov     eax, dword ptr [rbp-112]             ; tileW = (paneW - gap) / 2
+    sub     eax, dword ptr [rbp-104]
+    sub     eax, HOME_GAP
+    shr     eax, 1
+    mov     dword ptr [rbp-144], eax
+    mov     eax, dword ptr [rbp-148]             ; first tile row under the heading
+    add     eax, 14
+    mov     dword ptr [rbp-140], eax
+    ; ---- row 1 : total | weak ---------------------------------------------
+    mov     dword ptr [g_home_alert], 0
+    mov     eax, dword ptr [rbp-104]
+    mov     dword ptr [rbp-192], eax
+    mov     eax, dword ptr [rbp-140]
+    mov     dword ptr [rbp-188], eax
+    mov     eax, dword ptr [rbp-192]
+    add     eax, dword ptr [rbp-144]
+    mov     dword ptr [rbp-184], eax
+    mov     eax, dword ptr [rbp-188]
+    add     eax, HOME_TILEH
+    mov     dword ptr [rbp-180], eax
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [rbp-192]
+    mov     r8d, dword ptr [g_home_stats+12]
+    lea     r9, [h_secrets]
+    call    home_tile
+    mov     dword ptr [g_home_alert], 1
+    mov     eax, dword ptr [rbp-184]
+    add     eax, HOME_GAP
+    mov     dword ptr [rbp-192], eax
+    mov     eax, dword ptr [rbp-112]
+    mov     dword ptr [rbp-184], eax
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [rbp-192]
+    mov     r8d, dword ptr [g_home_stats+0]
+    lea     r9, [h_weak]
+    call    home_tile
+    ; ---- row 2 : reused | ageing ------------------------------------------
+    mov     eax, dword ptr [rbp-104]
+    mov     dword ptr [rbp-192], eax
+    add     eax, dword ptr [rbp-144]
+    mov     dword ptr [rbp-184], eax
+    mov     eax, dword ptr [rbp-140]
+    add     eax, HOME_TILEH
+    add     eax, HOME_GAP
+    mov     dword ptr [rbp-188], eax
+    add     eax, HOME_TILEH
+    mov     dword ptr [rbp-180], eax
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [rbp-192]
+    mov     r8d, dword ptr [g_home_stats+4]
+    lea     r9, [h_reused]
+    call    home_tile
+    mov     eax, dword ptr [rbp-184]
+    add     eax, HOME_GAP
+    mov     dword ptr [rbp-192], eax
+    mov     eax, dword ptr [rbp-112]
+    mov     dword ptr [rbp-184], eax
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [rbp-192]
+    mov     r8d, dword ptr [g_home_stats+8]
+    lea     r9, [h_ageing]
+    call    home_tile
+    mov     dword ptr [g_home_alert], 0
+    ; ---- the sentence under the grid ---------------------------------------
+    WINCALL SelectObject, qword ptr [rbp-24], qword ptr [g_subfont]
+    mov     qword ptr [rbp-120], rax
+    WINCALL SetTextColor, qword ptr [rbp-24], dword ptr [g_col_textdim]
+    mov     eax, dword ptr [rbp-104]
+    mov     dword ptr [rbp-160], eax
+    mov     eax, dword ptr [rbp-180]
+    add     eax, 22
+    mov     dword ptr [rbp-156], eax
+    mov     eax, dword ptr [rbp-112]
+    mov     dword ptr [rbp-152], eax
+    mov     eax, dword ptr [rbp-156]
+    add     eax, 22
+    mov     dword ptr [rbp-148], eax
+    lea     rax, [h_pick]                        ; an empty vault gets a first step
+    cmp     dword ptr [g_home_stats+12], 0
+    jne     gdh_hint
+    lea     rax, [h_empty]
+gdh_hint:
+    mov     qword ptr [rbp-168], rax
+    WINCALL DrawTextW, qword ptr [rbp-24], qword ptr [rbp-168], -1, addr rbp-160, \
+            DT_NAMEFLAGS
+    cmp     dword ptr [g_home_stats+12], 0       ; no verdict on an empty vault
+    je      gdh_font
+    mov     eax, dword ptr [rbp-148]             ; next line down
+    mov     dword ptr [rbp-156], eax
+    add     eax, 22
+    mov     dword ptr [rbp-148], eax
+    mov     eax, dword ptr [g_home_stats+0]
+    add     eax, dword ptr [g_home_stats+4]
+    add     eax, dword ptr [g_home_stats+8]
+    test    eax, eax
+    jz      gdh_clear
+    WINCALL SetTextColor, qword ptr [rbp-24], dword ptr [g_col_accent]
+    lea     rax, [h_attention]
+    jmp     gdh_verdict
+gdh_clear:
+    lea     rax, [h_allclear]
+gdh_verdict:
+    mov     qword ptr [rbp-168], rax
+    WINCALL DrawTextW, qword ptr [rbp-24], qword ptr [rbp-168], -1, addr rbp-160, \
+            DT_NAMEFLAGS
+gdh_font:
+    WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-120]
+gdh_ret:
+    FRAME_EPILOG
+    ret
+gui_draw_home endp
+
 gui_num_msg proc frame
     FRAME_PROLOG 96                          ; [rbp-80] = digit scratch (no calls inside)
     mov     qword ptr [rbp-24], rcx
@@ -2396,6 +2698,7 @@ unlock_proc endp
 ; gui_poplist(rcx = hdlg) - clear and repopulate the entry list from the vault.
 ; =============================================================================
 gui_poplist proc frame
+    mov     dword ptr [g_home_valid], 0   ; the entry set changed -> restat on next paint
     FRAME_PROLOG 32                              ; single-vault: fill IDC_V_LIST from the one
     mov     edx, IDC_V_LIST                      ; open vault, filtered by the sidebar search box
     mov     r8d, IDC_V_SEARCH                    ; (empty box -> shows every entry)
@@ -10301,6 +10604,10 @@ gui_detail_clear proc frame
     WINCALL ShowWindow, rax, SW_HIDE
     WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_V_LIST, LB_SETCURSEL, \
             -1, 0
+    ; The pane is empty now, so the home panel is what belongs there - force the
+    ; erase that draws it.  Neither caller repaints, and without this the panel only
+    ; appeared the next time something else happened to invalidate the window.
+    WINCALL InvalidateRect, qword ptr [rbp-24], 0, 1
     FRAME_EPILOG
     ret
 gui_detail_clear endp
@@ -11184,6 +11491,9 @@ vp_terase:
     mov     rcx, qword ptr [rbp-16]           ; draw the field cards on the erased bg
     mov     rdx, qword ptr [rbp-8]
     call    gui_draw_field_cards
+    mov     rcx, qword ptr [rbp-16]           ; ...or the home panel, when the detail
+    mov     rdx, qword ptr [rbp-8]            ;   pane has nothing to show
+    call    gui_draw_home
     mov     eax, 1
     jmp     vp_ret
 vp_tdraw:
@@ -14483,7 +14793,10 @@ gim_vault:
     mov     dword ptr [rbp-64], eax
     test    eax, eax
     jz      gim_vempty
-    mov     dword ptr [g_sel_src], 1
+    cmp     dword ptr [g_zi_trunc], 0           ; say so BEFORE the checklist: importing a
+    je      @F                                  ;   silent subset of someone's vault is
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr imp_v_trunc, addr t_imp_trunc,             <MB_OK or MB_ICONWARNING>           ;   exactly the surprise to avoid
+@@: mov     dword ptr [g_sel_src], 1
     mov     ecx, dword ptr [rbp-64]
     call    gui_sel_all
     WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_SELECT, qword ptr [rbp-24], addr select_proc, 0

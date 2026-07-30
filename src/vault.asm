@@ -273,6 +273,7 @@ g_ext_hash  db 32 dup (?)                   ; BLAKE2b of the header snapshotted 
 ; wiped the moment it has been restored.
 align 8
 public g_merge_sel
+MAX_SEL     equ 8192                        ; mirrors gui.asm (constcheck gates the pair)
 g_merge_sel dd ?                            ; 1 = fed_merge honours g_sel (GUI import);
                                             ;   0 = merge every source entry (headless)
 g_seal_noadopt dd ?                         ; 1 = this seal writes a DIFFERENT vault, so
@@ -4927,7 +4928,15 @@ fm_loop:
     jae     fm_done
     cmp     dword ptr [g_merge_sel], 0        ; GUI import: honour the checklist.  Off by
     je      fm_nosel                          ;   default, so the headless callers that
-    lea     r11, [g_sel]                      ;   merge everything are unchanged.
+                                              ;   merge everything are unchanged.
+    cmp     eax, MAX_SEL                      ; g_sel is MAX_SEL BYTES and the checklist
+    jae     fm_next                           ;   cannot list more, so an entry past the
+                                              ;   end was never selectable.  Reading it
+                                              ;   ran off the array into whatever global
+                                              ;   follows: a 10000-entry source imported
+                                              ;   8602 records - the 8192 genuinely ticked
+                                              ;   plus ~410 decided by adjacent memory.
+    lea     r11, [g_sel]
     movzx   ecx, byte ptr [r11+rax]
     test    ecx, ecx
     jz      fm_next

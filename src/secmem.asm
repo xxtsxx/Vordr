@@ -54,10 +54,16 @@ MEM_RESERVE         equ 2000h
 MEM_RELEASE         equ 8000h
 PAGE_READWRITE      equ 04h
 ; The working-set MIN is the hard lockable-page quota; it MUST exceed the total
-; VirtualLock'd bytes.  That's dominated by the single decrypted body arena
-; (VAULT_BODY_MAX = 16 MiB).  Single-vault: exactly one body is ever resident, so
-; the reservation is a fixed statics + one body arena (sec_ws_grow).
-SEC_BODY_RESERVE    equ 01000000h   ; 16 MiB decrypted body (matches VAULT_BODY_MAX)
+; VirtualLock'd bytes.  That is dominated by the decrypted body arenas
+; (VAULT_BODY_MAX = 16 MiB each).
+;
+; TWO can be resident at once: vault_open_foreign decrypts another vault's body
+; while the master's is still open, which is exactly what a cross-vault import
+; does.  Reserving for one was left over from when that could not happen, and it
+; showed up as the C3 warning (VirtualLock 1453 = ERROR_WORKING_SET_QUOTA) after
+; importing a large vault - a quota failure, not a shortage of RAM, on a machine
+; with 110 GB free.
+SEC_BODY_RESERVE    equ 02000000h   ; 2 x 16 MiB: master + foreign body during import
 SEC_WS_STATICS      equ 00800000h   ; 8 MiB for the static secret buffers + headroom
 SEC_WS_MAX          equ 10000000h   ; 256 MiB cap (ample for one body + statics)
 ; QUOTA_LIMITS_HARDWS_MIN_ENABLE (1) | QUOTA_LIMITS_HARDWS_MAX_DISABLE (8): make
@@ -174,8 +180,8 @@ sec_lock endp
 public sec_ws_grow
 sec_ws_grow proc frame
     FRAME_PROLOG 48
-    ; min = statics + one 16 MiB body arena (single-vault: only one decrypted body is
-    ; ever resident).  Clamp to the max.
+    ; min = statics + both body arenas (master + a foreign one during import).
+    ; Clamp to the max.
     mov     eax, SEC_BODY_RESERVE
     add     eax, SEC_WS_STATICS
     cmp     eax, SEC_WS_MAX
