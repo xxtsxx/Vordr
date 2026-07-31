@@ -210,6 +210,21 @@ foreach ($u in $upg) {
 }
 if ($names -notcontains "RemoveExistingProducts") { Bad "RemoveExistingProducts is not sequenced - detection would happen and nothing would be removed" }
 
+# Property-establishing actions run in the CLIENT process.  When the client's
+# sequence completes, the installer marks them done; a server-side pass then logs
+# "Skipping <action>: already done on client side" and returns 0.  So an action
+# present only in InstallExecuteSequence never runs AT ALL on a UI install - the
+# install succeeds, the property is empty, and whatever depended on it silently
+# does nothing.  That is exactly how RemoveExistingProducts came to run against
+# an empty OLDERVERSIONBEINGUPGRADED and report success.
+$uiRows   = Rows "SELECT ``Action`` FROM ``InstallUISequence``" 1
+$uiNames  = @($uiRows | ForEach-Object { $_[0] })
+foreach ($a in @("FindRelatedProducts","AppSearch","LaunchConditions","CCPSearch","RMCCPSearch")) {
+    if (($names -contains $a) -and ($uiNames -notcontains $a)) {
+        Bad "$a is in InstallExecuteSequence but not InstallUISequence - the server skips it as 'already done on client side', so it never runs on a UI install"
+    }
+}
+
 # What this package would actually displace on THIS machine.  Informational -
 # it depends on machine state, not on the package - but it is the check that
 # would have caught the bug above the moment it was tested twice.

@@ -321,9 +321,17 @@ try {
 
     # Standard sequence.  RemoveExistingProducts runs after InstallFiles so an
     # upgrade never leaves the user without the exe if it fails mid-way.
-    $seq = @(
-        @("FindRelatedProducts",   "",  25),
+    # Actions that establish properties for later actions run in the CLIENT
+    # process.  Once the client's sequence finishes, the installer marks them
+    # done - so if one is missing from InstallUISequence, the server-side pass
+    # logs "Skipping <action>: already done on client side" and returns 0 without
+    # running it.  It never ran anywhere, and nothing says so above verbose level.
+    # $clientSide below is the shared list; both sequences get all of it.
+    $clientSide = @(
         @("LaunchConditions",      "",  100),
+        @("FindRelatedProducts",   "",  200)
+    )
+    $seq = $clientSide + @(
         @("CostInitialize",        "",  800),
         @("FileCost",              "",  900),
         @("CostFinalize",          "", 1000),
@@ -361,7 +369,12 @@ try {
     foreach ($s in $seq) {
         Exec ("INSERT INTO ``InstallExecuteSequence`` (``Action``,``Condition``,``Sequence``) VALUES ('{0}','{1}',{2})" -f $s[0], $s[1], $s[2])
     }
-    foreach ($a in @(@("CostInitialize",800),@("FileCost",900),@("CostFinalize",1000),@("ExecuteAction",1300))) {
+    # ,@(...) - without the leading comma ForEach-Object unrolls each pair into
+    # the pipeline and the list becomes a flat run of strings, so $a[0] indexes
+    # into "LaunchConditions" and inserts the single character 'L'.
+    $uiSeq = @($clientSide | ForEach-Object { ,@($_[0], $_[2]) }) +
+             @(@("CostInitialize",800),@("FileCost",900),@("CostFinalize",1000),@("ExecuteAction",1300))
+    foreach ($a in $uiSeq) {
         Exec ("INSERT INTO ``InstallUISequence`` (``Action``,``Condition``,``Sequence``) VALUES ('{0}','',{1})" -f $a[0], $a[1])
     }
     foreach ($a in @(@("CostInitialize",800),@("FileCost",900),@("CostFinalize",1000),@("InstallValidate",1400),@("InstallInitialize",1500),@("InstallAdminPackage",3900),@("InstallFiles",4000),@("InstallFinalize",6600))) {
@@ -415,6 +428,14 @@ try {
         if ($names -notcontains $a) { throw "$a is missing - the Registry table would never be processed" }
     }
     Write-Host ("  policy check   : {0} properties secure, unique and sequenced" -f $Policies.Count)
+
+    $uiNames = @($uiSeq | ForEach-Object { $_[0] })
+    foreach ($a in $clientSide) {
+        if ($uiNames -notcontains $a[0]) {
+            throw ("{0} is in InstallExecuteSequence but not InstallUISequence - the server would skip it as 'already done on client side' and it would never run at all" -f $a[0])
+        }
+    }
+    Write-Host ("  client-side    : {0} present in both sequences" -f (($clientSide | ForEach-Object { $_[0] }) -join ", "))
 
     if (-not ($UPG_ATTR -band 512)) {
         throw "Upgrade.Attributes lacks VersionMaxInclusive (0x200) - a rebuild of $productVersion would install ALONGSIDE the existing one instead of replacing it"
