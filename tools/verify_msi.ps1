@@ -65,24 +65,64 @@ $secure = if ($scp.Count) { $scp[0][0] -split ";" } else { @() }
 $byName = @{}; foreach ($c in $comp) { $byName[$c[0]] = $c }
 $inFeature = @{}; foreach ($f in $fc) { $inFeature[$f[1]] = $true }
 
-Write-Host ("registry values : {0}" -f $reg.Count)
-foreach ($r in $reg) {
+# Policy rows and file-association rows are checked differently, so split them
+# by the component they belong to rather than guessing from the key.
+$polRows   = @($reg | Where-Object { $_[5] -like "Pol*" })
+$assocRows = @($reg | Where-Object { $_[5] -eq "FileAssoc" })
+$other     = @($reg | Where-Object { $_[5] -notlike "Pol*" -and $_[5] -ne "FileAssoc" })
+foreach ($r in $other) { Bad "$($r[0]) belongs to $($r[5]), which this script knows nothing about - add a rule for it rather than leaving it unchecked" }
+
+function CommonChecks($r) {
     $rk, $root, $key, $name, $value, $cname = $r
     $c = $byName[$cname]
-    if (-not $c) { Bad "$rk names component $cname, which does not exist"; continue }
-    Write-Host ("  HKLM\{0}\{1} = {2}   [{3}]" -f $key, $name, $value, $cname)
-
-    if ([int]$root -ne 2)                  { Bad "$rk writes to root $root, not HKLM (2)" }
+    if (-not $c) { Bad "$rk names component $cname, which does not exist"; return $null }
+    if ([int]$root -ne 2)               { Bad "$rk writes to root $root, not HKLM (2)" }
     # 256 = write to the 64-bit view.  Without it, an x64 package silently
     # redirects into WOW6432Node, where the 64-bit vordr.exe never looks: the
-    # install succeeds and the policy simply has no effect.
-    if (-not ([int]$c[2] -band 256))       { Bad "$cname is not marked 64-bit; the value would land in WOW6432Node" }
-    if (-not ([int]$c[2] -band 4))         { Bad "$cname does not use its registry row as the key path" }
-    if ([string]::IsNullOrEmpty($c[3]))    { Bad "$cname has no condition - it would be written unconditionally" }
-    if (-not $inFeature[$cname])           { Bad "$cname is in no feature, so it is never installed" }
-    if ($value -notmatch '^#\[[A-Z0-9_]+\]$') { Bad "$rk value '$value' is not '#[PROPERTY]' - it would not be a REG_DWORD driven by a property" }
-    if ($c[3] -cne $c[3].ToUpper())        { Bad "$cname's condition '$($c[3])' is not a public (uppercase) property" }
-    if ($secure -notcontains $c[3])        { Bad "$($c[3]) is missing from SecureCustomProperties - dropped before the elevated half of the install" }
+    # install succeeds and the entry simply has no effect.
+    if (-not ([int]$c[2] -band 256))    { Bad "$cname is not marked 64-bit; the value would land in WOW6432Node" }
+    if (-not ([int]$c[2] -band 4))      { Bad "$cname does not use a registry row as the key path" }
+    if (-not $inFeature[$cname])        { Bad "$cname is in no feature, so it is never installed" }
+    if ([string]::IsNullOrEmpty($c[3])) { Bad "$cname has no condition" }
+    else {
+        $prop = ($c[3] -replace '^NOT\s+', '')
+        if ($prop -cne $prop.ToUpper()) { Bad "$cname's condition '$($c[3])' is not a public (uppercase) property" }
+        if ($secure -notcontains $prop) { Bad "$prop is missing from SecureCustomProperties - dropped before the elevated half of the install" }
+    }
+    $c
+}
+
+Write-Host ("policy values   : {0}" -f $polRows.Count)
+foreach ($r in $polRows) {
+    Write-Host ("  HKLM\{0}\{1} = {2}   [{3}]" -f $r[2], $r[3], $r[4], $r[5])
+    $c = CommonChecks $r
+    if (-not $c) { continue }
+    if ($r[4] -notmatch '^#\[[A-Z0-9_]+\]$') { Bad "$($r[0]) value '$($r[4])' is not '#[PROPERTY]' - it would not be a REG_DWORD driven by a property" }
+    if ($c[3] -match '^NOT\s')               { Bad "$($r[5]) is conditioned on the ABSENCE of its property - it would be written when nobody asked" }
+}
+
+Write-Host ""
+Write-Host ("file assoc      : {0} rows" -f $assocRows.Count)
+foreach ($r in $assocRows) {
+    Write-Host ("  HKLM\{0}  {1} = {2}" -f $r[2], $(if ($r[3]) { $r[3] } else { "(default)" }), $r[4])
+    $null = CommonChecks $r
+    if ($r[2] -notlike "SOFTWARE\Classes\*") { Bad "$($r[0]) writes outside SOFTWARE\Classes" }
+}
+if ($assocRows.Count) {
+    $ext = $assocRows | Where-Object { $_[2] -eq "SOFTWARE\Classes\.vordr" }
+    $cmd = $assocRows | Where-Object { $_[2] -like "*\shell\open\command" }
+    $ico = $assocRows | Where-Object { $_[2] -like "*\DefaultIcon" }
+    $del = $assocRows | Where-Object { $_[3] -eq "-" }
+    if (-not $ext) { Bad "nothing associates the .vordr extension with the ProgId" }
+    elseif ($ext[3]) { Bad "the .vordr row sets a named value, not the key's default - the extension would stay unassociated" }
+    if (-not $cmd) { Bad "no shell\open\command - double-clicking a .vordr would do nothing" }
+    else {
+        if ($cmd[4] -notlike '*[[]INSTALLDIR]vordr.exe*') { Bad "the open command does not run [INSTALLDIR]vordr.exe: $($cmd[4])" }
+        if ($cmd[4] -notlike '*"%1"*') { Bad "the open command does not pass a QUOTED %1 - a vault path containing a space would arrive split into fragments: $($cmd[4])" }
+    }
+    if (-not $ico) { Bad "no DefaultIcon - .vordr files would show a blank document icon" }
+    if (-not $del) { Bad "nothing removes the ProgId key on uninstall - .vordr would keep pointing at a class that no longer opens" }
+    elseif ($del[2] -eq "SOFTWARE\Classes\.vordr") { Bad "the '-' row deletes the .vordr key itself, taking any other application's OpenWithProgids with it" }
 }
 
 $dup = $comp | Group-Object { $_[1] } | Where-Object { $_.Count -gt 1 -and $_.Name }
@@ -108,27 +148,40 @@ function Cost([hashtable]$set) {
 
 # INSTALLSTATE_LOCAL = 3.  Anything else means "not going to be written".
 $LOCAL = 3
+$before = $fail
 $none = Cost @{}
 Write-Host ""
 Write-Host "costing with no properties set:"
-foreach ($r in $reg) {
-    if ($none[$r[5]] -eq $LOCAL) { Bad "$($r[5]) installs with no property set - $($r[3]) would be written, and its presence LOCKS the setting against the user" }
+foreach ($r in $polRows) {
+    if ($none[$r[5]] -eq $LOCAL) { Bad "$($r[5]) installs with no property set - $($r[3]) would be written, and its PRESENCE locks the setting against the user" }
 }
-if (-not $fail) { Write-Host "  no policy value is written unless asked for - ok" }
+if ($assocRows.Count -and $none["FileAssoc"] -ne $LOCAL) {
+    Bad "the file association is not registered by default - a plain install would leave .vordr unopenable"
+}
+if ($fail -eq $before) { Write-Host "  no policy value written; the association registered - ok" }
 
+$before = $fail
 Write-Host ""
 Write-Host "costing each property individually:"
-foreach ($r in $reg) {
+foreach ($r in $polRows) {
     $prop = $byName[$r[5]][3]
     $one  = Cost @{ $prop = "1" }
     if ($one[$r[5]] -ne $LOCAL) { Bad "$prop=1 does not install $($r[5]) - the property would be accepted and do nothing" }
-    foreach ($other in $reg) {
-        if ($other[5] -ne $r[5] -and $one[$other[5]] -eq $LOCAL) {
-            Bad "$prop=1 also writes $($other[3]) - properties are not independent"
-        }
+    foreach ($o in $polRows) {
+        if ($o[5] -ne $r[5] -and $one[$o[5]] -eq $LOCAL) { Bad "$prop=1 also writes $($o[3]) - properties are not independent" }
     }
 }
-if (-not $fail) { Write-Host ("  each of the {0} properties writes exactly its own value - ok" -f $reg.Count) }
+if ($fail -eq $before) { Write-Host ("  each of the {0} properties writes exactly its own value - ok" -f $polRows.Count) }
+
+if ($assocRows.Count) {
+    $before = $fail
+    Write-Host ""
+    Write-Host "costing the association opt-out:"
+    $off = Cost @{ "VORDR_NOASSOC" = "1" }
+    if ($off["FileAssoc"] -eq $LOCAL) { Bad "VORDR_NOASSOC=1 still registers the association" }
+    if ($off["VordrExe"] -ne $LOCAL)  { Bad "VORDR_NOASSOC=1 also suppresses the exe" }
+    if ($fail -eq $before) { Write-Host "  VORDR_NOASSOC=1 drops the association and nothing else - ok" }
+}
 
 [void][Runtime.InteropServices.Marshal]::ReleaseComObject($db)
 [void][Runtime.InteropServices.Marshal]::ReleaseComObject($installer)

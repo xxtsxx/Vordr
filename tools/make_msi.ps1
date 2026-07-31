@@ -11,6 +11,7 @@
       * a Start Menu shortcut
       * an Add/Remove Programs entry carrying ProductName + ProductVersion
       * HKLM policy values - ONLY those the installing admin asks for by name
+      * the .vordr file association (VORDR_NOASSOC=1 to skip it)
 
     It owns NOTHING else.  No vault, no HKCU settings.  That is deliberate:
     uninstall removes only what MSI installed, so a user who uninstalls Vordr
@@ -103,6 +104,17 @@ $Policies = @(
 # literal path - reg_query_sz accepts REG_EXPAND_SZ but never expands it, so
 # "%USERPROFILE%\..." would be taken verbatim and fail.  A shared machine would
 # end up with every account fighting over one vault file.
+
+# --- .vordr file association -------------------------------------------------
+# Registered per-machine under HKLM\SOFTWARE\Classes (which is what HKCR resolves
+# to for an ALLUSERS install).  Double-clicking a .vordr opens it as an IMPORT
+# source - never as the vault Vordr opens from then on; gui.asm enforces that,
+# not the installer.
+$AssocComp = "FileAssoc"
+$AssocGuid = "{4B1E86D2-95AF-4C33-9F0E-2A6D74C1B5E8}"
+$AssocProp = "VORDR_NOASSOC"            # set to anything to skip the registration
+$ProgId    = "Vordr.Vault"
+$ClassesKey= "SOFTWARE\Classes"
 
 function Resolve-Full([string]$p) {
     if ([System.IO.Path]::IsPathRooted($p)) { $p } else { Join-Path (Get-Location) $p }
@@ -214,7 +226,7 @@ try {
         # Public properties reach the elevated half of a per-machine install only
         # if they are listed here.  Miss one and it silently has no effect - the
         # property is set, the component condition still evaluates false.
-        "SecureCustomProperties" = (@("OLDERVERSIONBEINGUPGRADED") + ($Policies | ForEach-Object { $_.Prop })) -join ";"
+        "SecureCustomProperties" = (@("OLDERVERSIONBEINGUPGRADED", $AssocProp) + ($Policies | ForEach-Object { $_.Prop })) -join ";"
     }
     foreach ($k in $props.Keys) {
         $v = $props[$k] -replace "'", "''"
@@ -247,6 +259,34 @@ try {
         Exec ("INSERT INTO ``Registry`` (``Registry``,``Root``,``Key``,``Name``,``Value``,``Component_``) VALUES ('{0}',2,'{1}','{2}','#[{3}]','{4}')" -f $reg, $PolicyKey, $p.Value, $p.Prop, $p.Comp)
     }
     Write-Host ("  policy values  : {0} exposed as properties" -f $Policies.Count)
+
+    # --- .vordr association ---------------------------------------------------
+    # On by default, because a file type nobody can open is not much of a file
+    # type; VORDR_NOASSOC=1 skips it for deployments that manage associations
+    # centrally.
+    Exec ("INSERT INTO ``Component`` (``Component``,``ComponentId``,``Directory_``,``Attributes``,``Condition``,``KeyPath``) VALUES ('{0}','{1}','INSTALLDIR',260,'NOT {2}','RegAssocExt')" -f $AssocComp, $AssocGuid, $AssocProp)
+    Exec ("INSERT INTO ``FeatureComponents`` (``Feature_``,``Component_``) VALUES ('Main','{0}')" -f $AssocComp)
+
+    # A null Name column is how the Registry table writes a key's DEFAULT value,
+    # so these INSERTs leave Name out entirely rather than passing an empty
+    # string - an empty Name would create a value literally called "".
+    function RegDefault([string]$key, [string]$path, [string]$value, [string]$comp) {
+        Exec ("INSERT INTO ``Registry`` (``Registry``,``Root``,``Key``,``Value``,``Component_``) VALUES ('{0}',2,'{1}','{2}','{3}')" -f $key, $path, $value, $comp)
+    }
+    RegDefault "RegAssocExt"    "$ClassesKey\.vordr"                       $ProgId                      $AssocComp
+    RegDefault "RegAssocProgId" "$ClassesKey\$ProgId"                      "Vordr vault"                $AssocComp
+    RegDefault "RegAssocIcon"   "$ClassesKey\$ProgId\DefaultIcon"          "[INSTALLDIR]vordr.exe,0"    $AssocComp
+    # "%1" is literal here - MSI's Formatted syntax reserves [] and {}, not %.
+    # The quotes matter: without them a vault path containing a space arrives as
+    # several arguments and gui_shell_arg sees only the first fragment.
+    RegDefault "RegAssocCmd"    "$ClassesKey\$ProgId\shell\open\command"   '"[INSTALLDIR]vordr.exe" "%1"' $AssocComp
+    # Name "-" deletes the key and everything under it on uninstall.  Aimed at
+    # the ProgId we created and nothing else: removing only the VALUES would
+    # leave .vordr pointing at an empty class, which Explorer renders as a file
+    # type that exists and cannot be opened.  Deliberately NOT aimed at the
+    # .vordr key itself, which other applications may have added themselves to.
+    Exec ("INSERT INTO ``Registry`` (``Registry``,``Root``,``Key``,``Name``,``Component_``) VALUES ('RegAssocClean',2,'{0}\{1}','-','{2}')" -f $ClassesKey, $ProgId, $AssocComp)
+    Write-Host ("  file assoc     : .vordr -> {0} (skip with {1}=1)" -f $ProgId, $AssocProp)
 
     $size = (Get-Item $exePath).Length
     Exec "INSERT INTO ``File`` (``File``,``Component_``,``FileName``,``FileSize``,``Version``,``Language``,``Attributes``,``Sequence``) VALUES ('vordr.exe','VordrExe','vordr.exe',$size,'$fv','1033',512,1)"
@@ -338,6 +378,10 @@ try {
             throw ("{0} is not all-uppercase, so MSI treats it as private and the command line cannot set it" -f $p.Prop)
         }
     }
+    if ($secure -notcontains $AssocProp) { throw "$AssocProp is missing from SecureCustomProperties - the opt-out would be ignored" }
+    if ($AssocGuid -in ($Policies | ForEach-Object { $_.Guid }) -or $AssocGuid -eq $ComponentGuid) {
+        throw "the file-association component reuses another component's GUID"
+    }
     $dupGuid = $Policies | Group-Object { $_.Guid } | Where-Object { $_.Count -gt 1 }
     if ($dupGuid) { throw ("component GUID reused by: " + ($dupGuid[0].Group.Comp -join ", ")) }
     $dupComp = $Policies | Group-Object { $_.Comp } | Where-Object { $_.Count -gt 1 }
@@ -411,6 +455,9 @@ try {
     Write-Host ""
     Write-Host "  MSI does not remember properties: repeat them on upgrades too, or the"
     Write-Host "  old product's policy values are removed along with it."
+    Write-Host ""
+    Write-Host ("  .vordr        -> {0}, opened as an IMPORT source by [INSTALLDIR]vordr.exe" -f $ProgId)
+    Write-Host ("                   registered by default; {0}=1 to leave associations alone" -f $AssocProp)
 }
 finally {
     if (Test-Path $work) { Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue }

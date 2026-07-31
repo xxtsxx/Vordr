@@ -398,6 +398,12 @@ repeat them on upgrades or the old package's values are removed with it; and the
 vault *path* is deliberately **not** exposed, since one literal path shared by
 every account on a machine is not a deployment anyone wants.
 
+The same package registers the `.vordr` file association under
+`HKLM\SOFTWARE\Classes`, so a vault someone sends you opens as an import source
+on double-click. Pass `VORDR_NOASSOC=1` to leave file associations alone.
+Uninstalling removes the class again, rather than leaving `.vordr` pointing at a
+program that is no longer there.
+
 ## Testing and verification
 
 Five independent gates, all runnable with one command (`tests\run_all.cmd`)
