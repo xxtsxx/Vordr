@@ -11,6 +11,19 @@
       <gdiScaling xmlns="http://schemas.microsoft.com/SMI/2017/WindowsSettings">true</gdiScaling>
     </windowsSettings>
   </application>
+  <!-- State the execution level explicitly.  Vordr never needs elevation: it reads
+       HKLM policy but only ever WRITES to HKCU and to the vault file, so asInvoker is
+       the truth rather than a concession.  Saying so also keeps it clear of Windows'
+       installer-detection heuristic, and of the reputation systems that treat a
+       silent execution level as one more unknown about an unsigned binary.
+       uiAccess=false: Vordr never drives another process's UI. -->
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
   <dependency>
     <dependentAssembly>
       <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/>

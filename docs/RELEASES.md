@@ -43,6 +43,12 @@ re-run) yield the identical exe.
 
 ## Published hashes
 
+After tagging, submit the new binary to Microsoft as a false positive:
+<https://www.microsoft.com/en-us/wdsi/filesubmission>.  Vordr is unsigned, so
+Defender's ML classifier flags each new build until it is reviewed - and the hash
+changes every release, so a previous clearance does not carry over.  See
+[ANTIVIRUS.md](ANTIVIRUS.md).
+
 Release hashes are recorded per tagged version. There is no automated release
 job yet: at tag time `build.cmd release` is run twice from a clean tree, the two
 hashes are compared, and the result is recorded here by hand.

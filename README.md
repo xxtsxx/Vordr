@@ -83,6 +83,13 @@ you should be able to **verify** it:
   (`redteam`) deliberately triggers each exploit-mitigation control and fails
   the build if any of them does not fire.
 
+- **A virus scanner may flag it, and that is expected.** Vordr is unsigned, new,
+  and - being a password manager - it registers a global hotkey, switches to a
+  private desktop and touches the clipboard, which is indistinguishable from a
+  credential stealer by API calls alone. The answer is not "trust us": rebuild the
+  tagged commit and check the hash matches. See
+  [docs/ANTIVIRUS.md](docs/ANTIVIRUS.md).
+
 The one thing we cannot give you yet is an **independent external security
 review** — none has been performed. Until one is, treat Vordr as what it is:
 a carefully built, fully inspectable implementation that has not had hostile
