@@ -4613,6 +4613,13 @@ xs_loop:
     mov     r10, qword ptr [rbp-32]
     cmp     eax, dword ptr [r10]
     jae     xs_built
+    cmp     eax, MAX_SEL                      ; the checklist cannot list more than this, so
+    jae     xs_next                           ;   an entry past it was never SELECTED.  Reading
+                                              ;   g_sel here ran off the array into the next
+                                              ;   global - on a vault of >8192 entries that
+                                              ;   decided what got written into a file the user
+                                              ;   was about to share.  Same defect as fed_merge,
+                                              ;   mirrored onto export, where it is worse.
     lea     r11, [g_sel]                      ; honour the checklist, exactly as the ZIP
     movzx   ecx, byte ptr [r11+rax]           ;   export does
     test    ecx, ecx

@@ -32,6 +32,8 @@ extern vault_field_count:proc
 extern vault_field_get:proc
 extern attach_open:proc
 externdef g_sel:byte                     ; per-entry export selection mask (gui.asm)
+MAX_SEL     equ 8192                     ; its size - mirrors gui/vault/zipimport,
+                                         ;   constcheck gates the set
 extern WideCharToMultiByte:proc
 VF_IMAGE_   equ 9
 VF_FILE_    equ 10
@@ -615,6 +617,8 @@ zbj_elp:
     test    eax, eax                            ;   file they are about to share
     jnz     zbj_eskip
     mov     eax, dword ptr [rbp-28]
+    cmp     eax, MAX_SEL                        ; past the checklist -> never selectable, and
+    jae     zbj_eskip                           ;   reading g_sel there runs off the array
     lea     r10, [g_sel]                        ; export selection: skip unchecked entries
     movzx   ecx, byte ptr [r10+rax]
     test    ecx, ecx

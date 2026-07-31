@@ -1099,7 +1099,11 @@ sn_sapphire dw 'S','a','p','p','h','i','r','e',0
 sn_gruvbox dw 'G','r','u','v','b','o','x',0
 align 8
 scheme_names dq sn_light,sn_sepia,sn_nord,sn_midnight,sn_commodore,sn_amethyst,sn_emerald,sn_sapphire,sn_gruvbox
-GUI_SCHEME_COUNT equ 9
+SCHEME_COUNT equ 9                    ; mirrors theme.asm - SAME NAME on purpose, so
+                                      ;   constcheck gates the pair.  It was
+                                      ;   SCHEME_COUNT, which no check could
+                                      ;   relate to theme.asm's SCHEME_COUNT: the
+                                      ;   ANCHOR_N / MAX_SEL failure shape, waiting.
 GUI_SCHEME_GRUVBOX equ 8               ; default scheme (index into schemes[])
 layout_gaps  dd 7, 3, 14                          ; inter-card gap (DLU) per layout
 lay_band     dd 14, 0, 18                         ; label band: card(top) vs 0=flat(left)
@@ -10278,7 +10282,7 @@ gui_save_prefs endp
 gui_load_prefs proc frame
     FRAME_PROLOG 48
     WINCALL cfg_get_dword, addr pref_scheme, GUI_SCHEME_GRUVBOX, addr g_scheme_lock
-    cmp     eax, GUI_SCHEME_COUNT               ; clamp out-of-range to the default
+    cmp     eax, SCHEME_COUNT               ; clamp out-of-range to the default
     jb      @F
     mov     eax, GUI_SCHEME_GRUVBOX
 @@: mov     dword ptr [g_scheme], eax
@@ -12133,7 +12137,7 @@ vp_menu:
 vp_theme:
     mov     eax, dword ptr [g_scheme]            ; cycle color scheme
     inc     eax
-    cmp     eax, GUI_SCHEME_COUNT
+    cmp     eax, SCHEME_COUNT
     jb      @F
     xor     eax, eax
 @@: mov     dword ptr [g_scheme], eax
