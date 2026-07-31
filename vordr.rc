@@ -421,8 +421,8 @@ FONT 9, "Segoe UI"
 }
 
 1 VERSIONINFO
- FILEVERSION    0,2,1,0
- PRODUCTVERSION 0,2,1,0
+ FILEVERSION    0,2,2,0
+ PRODUCTVERSION 0,2,2,0
  FILEFLAGSMASK  0x3fL
  FILEFLAGS      0x0L
  FILEOS         0x40004L            /* VOS_NT_WINDOWS32 */
@@ -435,12 +435,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "Thomas Smistad"
             VALUE "FileDescription",  "Vordr password manager https://github.com/xxtsxx/vordr"
-            VALUE "FileVersion",      "0.2.1.0"
+            VALUE "FileVersion",      "0.2.2.0"
             VALUE "InternalName",     "vordr"
             VALUE "LegalCopyright",   "Copyright (C) 2026 Thomas Smistad"
             VALUE "OriginalFilename", "vordr.exe"
             VALUE "ProductName",      "Vordr"
-            VALUE "ProductVersion",   "0.2.1.0"
+            VALUE "ProductVersion",   "0.2.2.0"
         END
     END
     BLOCK "VarFileInfo"
