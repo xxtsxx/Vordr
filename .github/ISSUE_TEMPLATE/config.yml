@@ -1,0 +1,32 @@
+# The issue chooser is where someone with a security finding actually lands -
+# not SECURITY.md - so the private route is offered here, above the option to
+# file publicly.
+#
+# blank_issues_enabled stays TRUE on purpose.  There are no issue templates, so
+# turning it off would leave the chooser showing these links and no way to open
+# an issue at all: bug reports would be silently impossible.  The goal is to put
+# the private channel in front of a reporter, not to shut the front door.
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability (private)
+    url: https://github.com/xxtsxx/Vordr/security/advisories/new
+    about: >
+      Do NOT open a public issue for a vulnerability. Vordr has no auto-update,
+      so a public report is a working exploit against every installed copy until
+      each one is updated by hand. This form is private to you and the maintainer.
+  - name: Security policy - scope, timelines, disclosure
+    url: https://github.com/xxtsxx/Vordr/blob/master/SECURITY.md
+    about: >
+      What is in and out of scope, what to expect and when, and the
+      coordinated-disclosure terms.
+  - name: My antivirus flags Vordr as malware
+    url: https://github.com/xxtsxx/Vordr/blob/master/docs/ANTIVIRUS.md
+    about: >
+      A known false positive. Vordr is unsigned and new, and a password manager
+      necessarily uses the same APIs a credential stealer would. Please read this
+      before filing.
+  - name: Verify a binary you downloaded
+    url: https://github.com/xxtsxx/Vordr/blob/master/docs/RELEASES.md
+    about: >
+      Every release is reproducible: rebuild the tag and compare the SHA-256
+      against the published hash. A mismatch means the binary is not this source.
