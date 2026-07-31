@@ -493,8 +493,16 @@ downloaded.
 
 The output is a single hybrid executable — GUI when launched without
 arguments, diagnostics CLI otherwise (`selftest`, `bench`, and headless test
-probes). **No vault path, master password, or secret is ever accepted on the
-command line**, where it would leak into shell history and process listings.
+probes). **No master password or secret is ever accepted on the command line**,
+where it would leak into shell history and process listings.
+
+The one path the GUI accepts is a `.vordr` file passed as the first argument,
+which is how the shell file association works: double-clicking a vault opens it
+as an *import source*. It is validated by magic bytes rather than by extension,
+it never becomes the registered vault, and it still has to clear the usual
+gates — the master vault is unlocked first, the source password is typed in the
+GUI, and the entries to copy are ticked by hand. Nothing is imported by the
+double-click alone.
 
 ### Module map
 

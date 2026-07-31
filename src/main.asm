@@ -115,6 +115,7 @@ ARGBUF_CHARS         equ 20000h      ; total UTF-16 units for all parsed args
 .data
 public g_cfg_in, g_cfg_out, g_cfg_passlen, g_cfg_t, g_cfg_m
 public g_cfg_pwminlen, g_cfg_pwminclasses
+public g_argc                           ; gui.asm reads argv[1] for a shell-associated .vordr
 g_argc          dd 0
 g_cfg_in        dq 0                ; -> UTF-16 input path  (into g_argbuf)
 g_cfg_out       dq 0                ; -> UTF-16 output path (into g_argbuf)

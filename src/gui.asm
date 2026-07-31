@@ -117,6 +117,8 @@ externdef g_zi_tlens:dword              ; staged entry title lengths (wchars)
 externdef g_zi_stg_n:dword              ; staged entry count
 externdef g_zi_trunc:dword              ; >0 = the source had more than the list can hold
 externdef g_kat_n:dword                 ; known-answer tests run by the launch gate
+externdef g_argc:dword                  ; a .vordr passed by the shell arrives as argv[1]
+externdef g_argv:qword
 extern ze_free:proc
 externdef g_zbuf:qword
 extern ShellExecuteW:proc
@@ -183,6 +185,7 @@ extern CreateThread:proc
 extern GetCurrentThreadId:proc
 extern WaitForSingleObject:proc
 extern CloseHandle:proc
+extern ReadFile:proc                    ; magic check on an associated .vordr
 extern EndDialog:proc
 extern GetDlgItemTextW:proc
 extern SetDlgItemTextW:proc
@@ -332,6 +335,14 @@ ANCH_STRETCHH       equ 2
 ANCH_RIGHT          equ 4
 ANCH_BOTTOM         equ 8
 WM_COMMAND          equ 111h
+WM_COPYDATA         equ 04Ah            ; a running instance receives the file to import
+; mirrored from fileio.asm so the magic-check can open a file without pulling in
+; the whole IO layer's header - constcheck gates the four against their originals
+GENERIC_READ        equ 80000000h
+FILE_SHARE_RWD      equ 7
+OPEN_EXISTING       equ 3
+FILE_ATTR_NORMAL    equ 80h
+COPYDATA_OPENVAULT  equ 4E504F56h       ; 'VOPN' - our dwData tag; ignore anything else
 ; ghost buttons (frameless glyph controls: theme_drawitem tdi_ghost path)
 GHOST_STYLE_        equ 2               ; GWL_USERDATA style byte
 TME_LEAVE_          equ 2
@@ -1469,6 +1480,12 @@ g_home_valid dd ?                     ; 0 = recompute on the next home paint
 g_home_alert dd ?                     ; 1 = this tile's count is a finding, not a total
 g_home_numw  dw 16 dup (?)            ; one stat rendered as digits
 g_katline    dw 96 dup (?)            ; "<n> known-answer tests verified at launch"
+align 8
+g_openfile     dw 1024 dup (?)        ; .vordr handed to us by the shell, to IMPORT
+g_openfile_set dd ?                   ; 1 = an import is pending for the open vault
+g_imp_preset   dd ?                   ; 1 = gui_import must use g_imgpath as-is
+align 8
+g_cds          db 24 dup (?)          ; COPYDATASTRUCT {dwData, cbData, pad, lpData}
 g_exedir    dw 1024 dup (?)           ; folder holding vordr.exe
 g_initdir   dw 1024 dup (?)           ; explicit start folder for the vault picker
 align 8
@@ -1860,6 +1877,133 @@ gui_unlock endp
 ;   text rather than printing them - so a failure that only the user can reproduce
 ;   had no way to carry its Win32 error back to us.  That is what turned one I/O
 ;   error into two rounds of guesswork.
+; gui_vault_file_ok(rcx = wide path) -> eax = 1 if that file starts with VAULT_MAGIC.
+;   The extension decides nothing: a shell association can hand us any path, and a
+;   ".vordr" that is not a vault must never reach the importer.  Opened read-only
+;   with full sharing, four bytes read, closed - it is a gate, not a load.
+gui_vault_file_ok proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-32], 0                ; magic lands here
+    mov     qword ptr [rbp-40], 0                ; bytes read
+    WINCALL GetFileAttributesW, qword ptr [rbp-24]
+    cmp     eax, -1
+    je      gvfo_no
+    test    eax, 10h                             ; FILE_ATTRIBUTE_DIRECTORY
+    jnz     gvfo_no
+    WINCALL CreateFileW, qword ptr [rbp-24], GENERIC_READ, FILE_SHARE_RWD, 0, \
+            OPEN_EXISTING, FILE_ATTR_NORMAL, 0
+    cmp     rax, -1
+    je      gvfo_no
+    mov     qword ptr [rbp-48], rax
+    WINCALL ReadFile, qword ptr [rbp-48], addr rbp-32, 4, addr rbp-40, 0
+    mov     dword ptr [rbp-56], eax
+    WINCALL CloseHandle, qword ptr [rbp-48]
+    cmp     dword ptr [rbp-56], 0
+    je      gvfo_no
+    cmp     dword ptr [rbp-40], 4
+    jne     gvfo_no
+    cmp     dword ptr [rbp-32], VAULT_MAGIC
+    jne     gvfo_no
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gvfo_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gui_vault_file_ok endp
+
+; gui_stash_openfile(rcx = wide path) -> eax = 1 if accepted.
+;   Copies a validated vault path into g_openfile and marks an import pending.
+;   NOTE what this deliberately does NOT do: it never touches g_vpath and never
+;   calls reg_save_vault.  A file arriving from the shell - or from another
+;   process via WM_COPYDATA - is an import SOURCE and nothing else.  Letting it
+;   become the registered vault would mean a mailed .vordr could decide which
+;   vault Vordr opens from then on.
+public gui_stash_openfile
+gui_stash_openfile proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    call    gui_vault_file_ok
+    test    eax, eax
+    jz      gso_no
+    lea     r10, [g_openfile]
+    mov     r11, qword ptr [rbp-24]
+    xor     r8d, r8d
+gso_cpy:
+    mov     ax, word ptr [r11+r8*2]
+    mov     word ptr [r10+r8*2], ax
+    test    ax, ax
+    jz      gso_done
+    inc     r8d
+    cmp     r8d, 1022
+    jb      gso_cpy
+    mov     word ptr [r10], 0                    ; too long: reject outright rather
+    jmp     gso_no                               ;   than import a truncated path
+gso_done:
+    mov     dword ptr [g_openfile_set], 1
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gso_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gui_stash_openfile endp
+
+; gui_shell_arg() -> eax = 1 if argv[1] named a real vault file (now stashed).
+;   The shell association passes the path as argv[1].  is_cli_command already
+;   matched it against the verb table and found nothing, which is why we are in
+;   the GUI path at all - so nothing here can reach the CLI dispatcher, and the
+;   release build's refusal of path-taking VERBS is untouched.
+public gui_shell_arg
+gui_shell_arg proc frame
+    FRAME_PROLOG 48
+    cmp     dword ptr [g_argc], 2
+    jb      gsa2_no
+    lea     r10, [g_argv]
+    mov     rcx, qword ptr [r10+8]                ; argv[1]
+    test    rcx, rcx
+    jz      gsa2_no
+    call    gui_stash_openfile
+    FRAME_EPILOG
+    ret
+gsa2_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gui_shell_arg endp
+
+; gui_send_openfile(rcx = target hwnd) -> eax = 1 if delivered.  Hands g_openfile
+;   to the already-running instance.  SendMessageW (not Post) because the receiver
+;   must copy the buffer while it is still alive.
+public gui_send_openfile
+gui_send_openfile proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    lea     r10, [g_openfile]                     ; byte length incl. the NUL
+    xor     r8d, r8d
+gsof_len:
+    cmp     word ptr [r10+r8*2], 0
+    je      gsof_have
+    inc     r8d
+    cmp     r8d, 1023
+    jb      gsof_len
+gsof_have:
+    inc     r8d
+    add     r8d, r8d                              ; wchars -> bytes
+    lea     r11, [g_cds]
+    mov     qword ptr [r11+0], COPYDATA_OPENVAULT
+    mov     dword ptr [r11+8], r8d
+    lea     rax, [g_openfile]
+    mov     qword ptr [r11+16], rax
+    WINCALL SendMessageW, qword ptr [rbp-24], WM_COPYDATA, 0, addr g_cds
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gui_send_openfile endp
+
 ; gui_exe_dir(rcx = dst wide, edx = cap chars) -> eax = 1 ok.  The directory the
 ;   running binary sits in, with the filename stripped.
 gui_exe_dir proc frame
@@ -11916,6 +12060,20 @@ vp_init:
     call    gui_cmd_dock_layout
     mov     rcx, qword ptr [rbp-8]            ; fit the entry list inside the sidebar frame
     call    sidebar_layout
+    ; A .vordr was double-clicked while the vault was locked: the path was stashed,
+    ; the unlock ran, and only now is there a vault to import INTO.  Posted, not
+    ; called, so the import dialog opens on a finished window.  The flag is cleared
+    ; here and not in the handler - if the user locks again before the message is
+    ; pumped, the next unlock must not resurrect it.
+    cmp     dword ptr [g_openfile_set], 0
+    je      @F
+    mov     dword ptr [g_openfile_set], 0
+    lea     rcx, [g_imgpath]
+    lea     rdx, [g_openfile]
+    call    gui_wstrcpy
+    mov     dword ptr [g_imp_preset], 1
+    WINCALL PostMessageW, qword ptr [rbp-8], WM_COMMAND, IDC_V_MIMPORT, 0
+@@:
     xor     eax, eax                          ; we set focus ourselves -> return FALSE
     jmp     vp_ret
 vp_cmd:
@@ -14804,6 +14962,14 @@ gui_import proc frame
     mov     dword ptr [rbp-64], 0               ; imported count
     mov     qword ptr [rbp-32], 0               ; raw ptr (0 = not allocated)
     mov     qword ptr [rbp-56], 0               ; foreign body ptr (.vordr path)
+    ; A shell-associated .vordr arrives with the path already chosen and its magic
+    ; already checked, so skip the picker.  The flag is one-shot: every other entry
+    ; into import still asks the user which file.
+    cmp     dword ptr [g_imp_preset], 0
+    je      gim_ask
+    mov     dword ptr [g_imp_preset], 0
+    jmp     gim_havefile
+gim_ask:
     lea     rax, [g_impfilter]
     mov     qword ptr [g_pickfilter], rax
     mov     rcx, qword ptr [rbp-24]
@@ -14811,6 +14977,7 @@ gui_import proc frame
     call    img_pick
     test    eax, eax
     jz      gim_done
+gim_havefile:
     lea     rcx, [g_imgpath]
     lea     rdx, [rbp-32]                       ; *raw
     lea     r8, [rbp-40]                        ; *rawlen
@@ -17085,7 +17252,48 @@ tray_wndproc proc
     je      twp_measure
     cmp     rdx, WM_DRAWITEM
     je      twp_draw
+    cmp     rdx, WM_COPYDATA                    ; another instance handing us a .vordr
+    je      twp_copydata
     WINCALL DefWindowProcW, qword ptr [rbp-8], qword ptr [rbp-16], qword ptr [rbp-24], qword ptr [rbp-32]
+    jmp     twp_ret
+twp_copydata:
+    ; A second instance was started on a .vordr and handed us the path.  ANY
+    ; process can send this, so treat it as untrusted input: check the tag, bound
+    ; the length, and re-validate the file itself (gui_stash_openfile reads its
+    ; magic).  Even then all it can do is put us in front of the import prompt -
+    ; the source password still has to be typed and the entries ticked, and the
+    ; path can never become the registered vault.
+    mov     r10, qword ptr [rbp-32]              ; COPYDATASTRUCT*
+    test    r10, r10
+    jz      twp_cd_no
+    cmp     qword ptr [r10+0], COPYDATA_OPENVAULT
+    jne     twp_cd_no
+    mov     eax, dword ptr [r10+8]               ; cbData
+    cmp     eax, 4
+    jb      twp_cd_no
+    cmp     eax, 2048
+    ja      twp_cd_no
+    test    eax, 1                               ; wide chars: must be even
+    jnz     twp_cd_no
+    mov     rcx, qword ptr [r10+16]              ; lpData
+    test    rcx, rcx
+    jz      twp_cd_no
+    call    gui_stash_openfile
+    test    eax, eax
+    jz      twp_cd_no
+    cmp     qword ptr [g_vaulthwnd], 0           ; vault already open -> import now
+    je      twp_open                             ; otherwise run the usual open flow
+    WINCALL SetForegroundWindow, qword ptr [g_vaulthwnd]
+    lea     rcx, [g_imgpath]                    ; arm the import BEFORE posting it
+    lea     rdx, [g_openfile]
+    call    gui_wstrcpy
+    mov     dword ptr [g_imp_preset], 1
+    mov     dword ptr [g_openfile_set], 0
+    WINCALL PostMessageW, qword ptr [g_vaulthwnd], WM_COMMAND, IDC_V_MIMPORT, 0
+    mov     eax, 1
+    jmp     twp_ret
+twp_cd_no:
+    xor     eax, eax
     jmp     twp_ret
 twp_measure:
     mov     rcx, qword ptr [rbp-32]
@@ -17507,8 +17715,21 @@ gm_trayhwnd:
     call    gui_tray_add
     mov     rcx, qword ptr [g_trayhwnd]       ; Alt + | summons the vault from anywhere
     call    gui_hotkey_add
+    ; The shell double-clicked a .vordr while Vordr was not running.  We start
+    ; minimised to the tray, so without this the double-click would look like it
+    ; did nothing at all: post ourselves an Open so the unlock/create flow runs,
+    ; and vp_init collects the pending file once there is a vault to import into.
+    cmp     dword ptr [g_openfile_set], 0
+    je      @F
+    cmp     qword ptr [g_trayhwnd], 0
+    je      @F
+    WINCALL PostMessageW, qword ptr [g_trayhwnd], WM_COMMAND, IDM_OPEN, 0
+@@:
 ifdef DBG_SHOW
+    cmp     dword ptr [g_openfile_set], 0     ; unless an Open is already queued above
+    jne     @F
     WINCALL PostMessageW, qword ptr [g_trayhwnd], WM_TRAYICON, 0, WM_LBUTTONUP  ; auto-open the vault
+@@:
 endif
     ; ---- message loop (start minimised to the tray) -----------------------
 gm_msg:
@@ -17581,10 +17802,24 @@ ws_gui:
     ; single-instance guard: two GUIs on one vault would clobber each other's
     ; saves.  If the named mutex already exists, surface the running instance
     ; (focus its open dialog, or ask its tray window to open the flow), then exit.
+    call    gui_shell_arg                   ; a .vordr from the shell association?
     WINCALL CreateMutexW, 0, 1, addr g_singleton_name
     call    GetLastError
     cmp     eax, 183                        ; ERROR_ALREADY_EXISTS
     jne     ws_gui_go
+    ; Already running.  If the shell handed US a vault, the running instance is
+    ; the one that must import it - just focusing it would drop the file on the
+    ; floor, which is what a double-click would do every time given Vordr lives
+    ; in the tray.
+    cmp     dword ptr [g_openfile_set], 0
+    je      ws_gui_focuschain
+    WINCALL FindWindowW, addr tray_cls, 0
+    test    rax, rax
+    jz      ws_gui_exit
+    mov     rcx, rax
+    call    gui_send_openfile
+    jmp     ws_gui_exit
+ws_gui_focuschain:
     WINCALL FindWindowW, 0, addr g_vault_title
     test    rax, rax
     jnz     ws_gui_focus
