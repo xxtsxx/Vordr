@@ -19,10 +19,14 @@
     the wrong directory is all it takes.  There are none here, and there must
     never be.
 
-    PER-USER on purpose: installs to LocalAppData with no elevation, matching the
-    asInvoker execution level vordr.manifest declares.  A per-machine MSI would
-    contradict it and would need admin rights to install a program that never
-    needs them.
+    PER-MACHINE: installs into Program Files, so installing and uninstalling need
+    elevation.  That is deliberate.  It is the only scope in which HKLM policy
+    defaults and .vordr file associations can be registered, and Program Files is
+    read-only to standard users - a password manager binary that any non-admin
+    process could overwrite would be a poor idea.
+
+    This does not contradict vordr.manifest's asInvoker: that governs how the
+    program RUNS (never elevated), not how it is installed.
 
     The version is read from the exe's own version resource, so vordr.rc stays
     the single source of truth - the MSI cannot drift from the binary it wraps.
@@ -142,8 +146,14 @@ try {
         "Manufacturer"       = $Manufacturer
         "UpgradeCode"        = $UpgradeCode
         "ProductLanguage"    = "1033"
-        # per-user, no elevation: matches the asInvoker manifest
-        "MSIINSTALLPERUSER"  = "1"      # ALLUSERS deliberately ABSENT = per-user
+        # PER-MACHINE.  This began as a per-user package but still demanded
+        # elevation - the worst of both: admin required, yet the exe landing in one
+        # user's LocalAppData where nobody else can see it.  Per-machine is what it
+        # actually wants: the only scope in which HKLM policy defaults and .vordr
+        # file associations can be registered, and Program Files is read-only to
+        # standard users, so the binary cannot be replaced by anything running
+        # without admin.
+        "ALLUSERS"           = "1"
         "ARPNOMODIFY"        = "1"
         "ARPNOREPAIR"        = "1"
         "ARPURLINFOABOUT"    = "https://github.com/xxtsxx/Vordr"
@@ -157,8 +167,8 @@ try {
     }
 
     Exec "INSERT INTO ``Directory`` (``Directory``,``Directory_Parent``,``DefaultDir``) VALUES ('TARGETDIR','','SourceDir')"
-    Exec "INSERT INTO ``Directory`` (``Directory``,``Directory_Parent``,``DefaultDir``) VALUES ('LocalAppDataFolder','TARGETDIR','.')"
-    Exec "INSERT INTO ``Directory`` (``Directory``,``Directory_Parent``,``DefaultDir``) VALUES ('INSTALLDIR','LocalAppDataFolder','$InstallDir')"
+    Exec "INSERT INTO ``Directory`` (``Directory``,``Directory_Parent``,``DefaultDir``) VALUES ('ProgramFiles64Folder','TARGETDIR','.')"
+    Exec "INSERT INTO ``Directory`` (``Directory``,``Directory_Parent``,``DefaultDir``) VALUES ('INSTALLDIR','ProgramFiles64Folder','$InstallDir')"
     Exec "INSERT INTO ``Directory`` (``Directory``,``Directory_Parent``,``DefaultDir``) VALUES ('ProgramMenuFolder','TARGETDIR','.')"
 
     # Component attributes 0 = per-machine-style file component; msidbComponentAttributes
@@ -283,7 +293,8 @@ try {
     Write-Host ("  ProductCode    : {0}" -f $productCode)
     Write-Host ("  UpgradeCode    : {0}  (never change this)" -f $UpgradeCode)
     Write-Host ""
-    Write-Host "  installs   %LOCALAPPDATA%\$InstallDir\vordr.exe + a Start Menu shortcut"
+    Write-Host "  installs   %ProgramFiles%\$InstallDir\vordr.exe + an all-users Start Menu shortcut"
+    Write-Host "  scope      per-machine: elevation required, binary read-only to standard users"
     Write-Host "  owns       that file only - no vault, no HKCU settings, nothing else"
     Write-Host "  uninstall  removes the exe and the shortcut; the vault is untouched"
 }
