@@ -22,3 +22,4 @@
 
 tools/__pycache__/
 tests/__pycache__/
+*.msi

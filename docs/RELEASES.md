@@ -91,6 +91,22 @@ Defects that are not security-relevant are noted as "superseded" below instead.
 > secure desktop at first unlock, and reads past the import selection mask on a
 > vault with more than 8192 entries. Use v0.2.1.
 
+### The MSI is a wrapper, not the artifact the hash covers
+
+`tools\make_msi.ps1` builds a per-user MSI around `binordr.exe`. It exists so
+Vordr has an Add/Remove Programs identity - which is what software inventory and
+winget can see, and what a portable exe is invisible to - not to replace the
+portable binary, which remains the primary download.
+
+**The published SHA-256 is the hash of `vordr.exe`, never of the MSI.** An MSI
+embeds a fresh ProductCode and package GUID on every build, so its own hash
+changes even when the payload does not. Verify the exe: extract it from the MSI
+with `msiexec /a vordr-<version>.msi /qn TARGETDIR=<dir>` and hash the result, or
+just download the exe.
+
+The MSI installs one file and owns nothing else - no vault, no registry values -
+so uninstalling Vordr never touches a user's secrets.
+
 To check a downloaded binary, hash it and compare against the row for its
 version. A mismatch means the binary does **not** correspond to this source at
 that commit — do not trust it.
