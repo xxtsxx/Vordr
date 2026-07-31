@@ -284,6 +284,12 @@ g_st_verbose    dd ?
 
 .code
 
+.data?
+align 4
+public g_kat_n
+g_kat_n         dd ?                 ; known-answer tests passed in the last run
+.code
+
 ; STPRINT msg, len - print a line only when running verbose (the `selftest`
 ; verb); silent under the startup gate.
 STPRINT macro msg, len
@@ -293,6 +299,16 @@ STPRINT macro msg, len
     mov     edx, len
     call    print_a
 @@:
+endm
+
+; STPASS msg, len - report a PASSED known-answer test.  Prints like STPRINT when
+; verbose, and ALWAYS counts, so g_kat_n is the number of KATs this build actually
+; ran rather than a figure someone has to remember to update.  The home panel
+; shows that count; hardcoding it there would have gone stale the first time a
+; vector was added.
+STPASS macro msg, len
+    inc     dword ptr [g_kat_n]
+    STPRINT msg, len
 endm
 
 ; LOADPW src,len - copy a test password into g_cfg_pass, set g_cfg_passlen
@@ -321,6 +337,7 @@ run_selftest proc frame
     mov     qword ptr [rbp-56], r13
     mov     qword ptr [rbp-64], r15
     ; [rbp-24] = failure count
+    mov     dword ptr [g_kat_n], 0
     mov     dword ptr [g_st_verbose], ecx
     mov     qword ptr [rbp-24], 0
 
@@ -337,7 +354,7 @@ run_selftest proc frame
     call    ct_memcmp
     test    eax, eax
     jnz     st_sha_fail
-    STPRINT st_pass_sha, st_pass_sha_len
+    STPASS st_pass_sha, st_pass_sha_len
     jmp     st_after_sha
 st_sha_fail:
     STPRINT st_fail_sha, st_fail_sha_len
@@ -387,7 +404,7 @@ st_after_sha:
     call    ct_memcmp
     test    eax, eax
     jnz     st_gcm_fail
-    STPRINT st_pass_gcm, st_pass_gcm_len
+    STPASS st_pass_gcm, st_pass_gcm_len
     jmp     st_after_gcm
 st_gcm_fail:
     STPRINT st_fail_gcm, st_fail_gcm_len
@@ -425,7 +442,7 @@ st_after_gcm:
     call    ct_memcmp
     test    eax, eax
     jnz     st_aad_fail
-    STPRINT st_pass_aad, st_pass_aad_len
+    STPASS st_pass_aad, st_pass_aad_len
     jmp     st_after_aad
 st_aad_fail:
     STPRINT st_fail_aad, st_fail_aad_len
@@ -462,7 +479,7 @@ st_after_aad:
     call    ct_memcmp
     test    eax, eax
     jnz     st_ip_fail
-    STPRINT st_pass_ip, st_pass_ip_len
+    STPASS st_pass_ip, st_pass_ip_len
     jmp     st_after_ip
 st_ip_fail:
     STPRINT st_fail_ip, st_fail_ip_len
@@ -481,7 +498,7 @@ st_after_ip:
     call    ct_memcmp
     test    eax, eax
     jnz     st_b2b_fail
-    STPRINT st_pass_b2b, st_pass_b2b_len
+    STPASS st_pass_b2b, st_pass_b2b_len
     jmp     st_after_b2b
 st_b2b_fail:
     STPRINT st_fail_b2b, st_fail_b2b_len
@@ -523,7 +540,7 @@ st_acsum:
     mov     r10, qword ptr [arg_out0]
     cmp     rax, r10
     jne     st_ac_fail
-    STPRINT st_pass_ac, st_pass_ac_len
+    STPASS st_pass_ac, st_pass_ac_len
     jmp     st_after_ac
 st_ac_fail:
     STPRINT st_fail_ac, st_fail_ac_len
@@ -590,7 +607,7 @@ st_fad:
     call    ct_memcmp
     test    eax, eax
     jnz     st_a2_fail
-    STPRINT st_pass_a2, st_pass_a2_len
+    STPASS st_pass_a2, st_pass_a2_len
     jmp     st_after_a2
 st_a2_fail:
     STPRINT st_fail_a2, st_fail_a2_len
@@ -658,7 +675,7 @@ st_a2v_fail:
     inc     qword ptr [rbp-24]
     jmp     st_after_a2v
 st_a2v_ok:
-    STPRINT st_pass_a2v, st_pass_a2v_len
+    STPASS st_pass_a2v, st_pass_a2v_len
 st_after_a2v:
 
     ; ---- password policy (default min 12 chars / 3 of 4 classes) ------------
@@ -676,7 +693,7 @@ st_after_a2v:
     call    check_password_policy
     test    eax, eax
     jnz     st_pw_fail
-    STPRINT st_pass_pw, st_pass_pw_len
+    STPASS st_pass_pw, st_pass_pw_len
     jmp     st_after_pw
 st_pw_fail:
     STPRINT st_fail_pw, st_fail_pw_len
@@ -701,7 +718,7 @@ st_gen_scan:
     inc     r10
     dec     ecx
     jnz     st_gen_scan
-    STPRINT st_pass_gen, st_pass_gen_len
+    STPASS st_pass_gen, st_pass_gen_len
     jmp     st_after_gen
 st_gen_fail:
     STPRINT st_fail_gen, st_fail_gen_len
@@ -760,7 +777,7 @@ st_gx_pin:
     call    pwgen_ex
     cmp     eax, 64                             ; 16 * 4 bits
     jne     st_gx_fail
-    STPRINT st_pass_gx, st_pass_gx_len
+    STPASS st_pass_gx, st_pass_gx_len
     jmp     st_after_gx
 st_gx_fail:
     STPRINT st_fail_gx, st_fail_gx_len
@@ -771,7 +788,7 @@ st_after_gx:
     call    vault_selftest
     test    eax, eax
     jnz     st_vlt_fail
-    STPRINT st_pass_vlt, st_pass_vlt_len
+    STPASS st_pass_vlt, st_pass_vlt_len
     jmp     st_after_vlt
 st_vlt_fail:
     STPRINT st_fail_vlt, st_fail_vlt_len
@@ -786,7 +803,7 @@ st_after_vlt:
     call    ct_memcmp
     test    eax, eax
     jnz     st_mac_fail
-    STPRINT st_pass_mac, st_pass_mac_len
+    STPASS st_pass_mac, st_pass_mac_len
     jmp     st_after_mac
 st_mac_fail:
     STPRINT st_fail_mac, st_fail_mac_len
@@ -803,7 +820,7 @@ st_after_mac:
     call    ct_memcmp
     test    eax, eax
     jnz     st_b32_fail
-    STPRINT st_pass_b32, st_pass_b32_len
+    STPASS st_pass_b32, st_pass_b32_len
     jmp     st_after_b32
 st_b32_fail:
     STPRINT st_fail_b32, st_fail_b32_len
@@ -818,7 +835,7 @@ st_after_b32:
     call    ct_memcmp
     test    eax, eax
     jnz     st_otp_fail
-    STPRINT st_pass_otp, st_pass_otp_len
+    STPASS st_pass_otp, st_pass_otp_len
     jmp     st_after_otp
 st_otp_fail:
     STPRINT st_fail_otp, st_fail_otp_len
@@ -833,7 +850,7 @@ st_after_otp:
     call    ct_memcmp
     test    eax, eax
     jnz     st_mac2_fail
-    STPRINT st_pass_mac2, st_pass_mac2_len
+    STPASS st_pass_mac2, st_pass_mac2_len
     jmp     st_after_mac2
 st_mac2_fail:
     STPRINT st_fail_mac2, st_fail_mac2_len
@@ -858,7 +875,7 @@ st_after_mac2:
     call    ct_memcmp
     test    eax, eax
     jnz     st_o16_fail
-    STPRINT st_pass_o16, st_pass_o16_len
+    STPASS st_pass_o16, st_pass_o16_len
     jmp     st_after_o16
 st_o16_fail:
     STPRINT st_fail_o16, st_fail_o16_len
@@ -912,7 +929,7 @@ st_after_o16:
     call    gui_wstr_eq
     test    eax, eax
     jnz     st_ctm_fail                       ; prefix vs longer -> different
-    STPRINT st_pass_ctm, st_pass_ctm_len
+    STPASS st_pass_ctm, st_pass_ctm_len
     jmp     st_after_ctm
 st_ctm_fail:
     STPRINT st_fail_ctm, st_fail_ctm_len

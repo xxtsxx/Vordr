@@ -116,6 +116,7 @@ externdef g_zi_titles:qword             ; staged entry titles (wide ptr array)
 externdef g_zi_tlens:dword              ; staged entry title lengths (wchars)
 externdef g_zi_stg_n:dword              ; staged entry count
 externdef g_zi_trunc:dword              ; >0 = the source had more than the list can hold
+externdef g_kat_n:dword                 ; known-answer tests run by the launch gate
 extern ze_free:proc
 externdef g_zbuf:qword
 extern ShellExecuteW:proc
@@ -830,8 +831,14 @@ WSTR h_reused,       <reused>
 WSTR h_ageing,       <ageing>
 WSTR h_allclear,     <Everything looks healthy.>
 WSTR h_attention,    <Some secrets could use attention.>
-WSTR h_pick,         <Select an entry on the left to view it.>
 WSTR h_empty,        <This vault is empty. Press + to add your first secret.>
+; The launch gate refuses to start Vordr if any of these fail, so this line can
+; only ever be drawn on a passing build.  It therefore does NOT say "passed" - a
+; tick that cannot show anything else is decoration.  What it reports is WHAT was
+; checked and against which published vectors, which is a fact the reader can go
+; and verify.
+WSTR h_kat_suf,      < known-answer tests verified at launch>
+WSTR h_kat_std,      <FIPS 180-4, SP 800-38D, RFC 9106, RFC 7693, RFC 2202, RFC 4226, RFC 4648>
 WSTR s_exedir_no,    <Cancelled. Pick a different location for the vault.>
 WSTR ev_save,       <gui-save>
 WSTR ev_export,     <gui-export>
@@ -1457,6 +1464,7 @@ g_home_stats dd 4 dup (?)             ; vault_health: {weak, reused, old, total}
 g_home_valid dd ?                     ; 0 = recompute on the next home paint
 g_home_alert dd ?                     ; 1 = this tile's count is a finding, not a total
 g_home_numw  dw 16 dup (?)            ; one stat rendered as digits
+g_katline    dw 96 dup (?)            ; "<n> known-answer tests verified at launch"
 g_exedir    dw 1024 dup (?)           ; folder holding vordr.exe
 g_initdir   dw 1024 dup (?)           ; explicit start folder for the vault picker
 align 8
@@ -2158,7 +2166,7 @@ home_tile endp
 ;   is genuinely idle.
 public gui_draw_home
 gui_draw_home proc frame
-    FRAME_PROLOG 224
+    FRAME_PROLOG 288
     mov     qword ptr [rbp-24], rcx
     mov     qword ptr [rbp-32], rdx
     cmp     dword ptr [g_cur_idx], 0             ; an entry is showing -> cards own the pane
@@ -2268,34 +2276,55 @@ gdh_have:
     lea     r9, [h_ageing]
     call    home_tile
     mov     dword ptr [g_home_alert], 0
-    ; ---- the sentence under the grid ---------------------------------------
-    WINCALL SelectObject, qword ptr [rbp-24], qword ptr [g_subfont]
-    mov     qword ptr [rbp-120], rax
-    WINCALL SetTextColor, qword ptr [rbp-24], dword ptr [g_col_textdim]
+    ; ---- where this vault lives, directly under the tiles ------------------
+    ; Same glyph + label as the unlock screen (gui_storage_parts), so the two
+    ; screens can never describe the vault's location differently.
+    lea     rcx, [rbp-200]                       ; glyph out
+    lea     rdx, [rbp-208]                       ; label out
+    call    gui_storage_parts
     mov     eax, dword ptr [rbp-104]
     mov     dword ptr [rbp-160], eax
-    mov     eax, dword ptr [rbp-180]
-    add     eax, 22
+    mov     eax, dword ptr [rbp-180]             ; bottom of the tile grid
+    add     eax, 18
     mov     dword ptr [rbp-156], eax
     mov     eax, dword ptr [rbp-112]
     mov     dword ptr [rbp-152], eax
     mov     eax, dword ptr [rbp-156]
     add     eax, 22
     mov     dword ptr [rbp-148], eax
-    lea     rax, [h_pick]                        ; an empty vault gets a first step
-    cmp     dword ptr [g_home_stats+12], 0
-    jne     gdh_hint
-    lea     rax, [h_empty]
-gdh_hint:
-    mov     qword ptr [rbp-168], rax
-    WINCALL DrawTextW, qword ptr [rbp-24], qword ptr [rbp-168], -1, addr rbp-160, \
+    mov     eax, dword ptr [rbp-104]             ; label starts right of the glyph
+    add     eax, 20
+    mov     dword ptr [rbp-216], eax
+    WINCALL SetTextColor, qword ptr [rbp-24], dword ptr [g_col_accent]
+    WINCALL SelectObject, qword ptr [rbp-24], qword ptr [g_font_icon]
+    mov     qword ptr [rbp-224], rax             ; old font
+    WINCALL DrawTextW, qword ptr [rbp-24], qword ptr [rbp-200], -1, addr rbp-160, \
             DT_NAMEFLAGS
-    cmp     dword ptr [g_home_stats+12], 0       ; no verdict on an empty vault
-    je      gdh_font
-    mov     eax, dword ptr [rbp-148]             ; next line down
+    WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-224]
+    WINCALL SelectObject, qword ptr [rbp-24], qword ptr [g_subfont]
+    WINCALL SetTextColor, qword ptr [rbp-24], dword ptr [g_col_textdim]
+    mov     eax, dword ptr [rbp-216]
+    mov     dword ptr [rbp-160], eax
+    WINCALL DrawTextW, qword ptr [rbp-24], qword ptr [rbp-208], -1, addr rbp-160, \
+            DT_NAMEFLAGS
+    ; ---- the verdict, one step louder than everything else -----------------
+    ; g_cardfont is -14 semibold against g_subfont's -12 regular: the line that
+    ; tells you whether anything needs doing should not be the quietest on the
+    ; panel, but it is still a sentence, not a headline.
+    mov     eax, dword ptr [rbp-104]
+    mov     dword ptr [rbp-160], eax
+    mov     eax, dword ptr [rbp-148]
+    add     eax, 14
     mov     dword ptr [rbp-156], eax
-    add     eax, 22
+    add     eax, 24
     mov     dword ptr [rbp-148], eax
+    cmp     dword ptr [g_home_stats+12], 0
+    jne     gdh_vpick
+    WINCALL SetTextColor, qword ptr [rbp-24], dword ptr [g_col_textdim]
+    lea     rax, [h_empty]                       ; empty vault: say how to start
+    mov     qword ptr [rbp-168], rax
+    jmp     gdh_vdraw
+gdh_vpick:
     mov     eax, dword ptr [g_home_stats+0]
     add     eax, dword ptr [g_home_stats+4]
     add     eax, dword ptr [g_home_stats+8]
@@ -2303,12 +2332,45 @@ gdh_hint:
     jz      gdh_clear
     WINCALL SetTextColor, qword ptr [rbp-24], dword ptr [g_col_accent]
     lea     rax, [h_attention]
-    jmp     gdh_verdict
+    jmp     gdh_vset
 gdh_clear:
+    WINCALL SetTextColor, qword ptr [rbp-24], dword ptr [g_col_textdim]
     lea     rax, [h_allclear]
-gdh_verdict:
+gdh_vset:
     mov     qword ptr [rbp-168], rax
+gdh_vdraw:
+    WINCALL SelectObject, qword ptr [rbp-24], qword ptr [g_cardfont]
+    mov     qword ptr [rbp-232], rax
     WINCALL DrawTextW, qword ptr [rbp-24], qword ptr [rbp-168], -1, addr rbp-160, \
+            DT_NAMEFLAGS
+    WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-232]
+    ; ---- what the launch gate verified -------------------------------------
+    ; g_kat_n is counted by the gate itself, not written down here, so this stays
+    ; true when a vector is added.
+    WINCALL SetTextColor, qword ptr [rbp-24], dword ptr [g_col_textdim]
+    mov     eax, dword ptr [rbp-104]
+    mov     dword ptr [rbp-160], eax
+    mov     eax, dword ptr [rbp-148]
+    add     eax, 12
+    mov     dword ptr [rbp-156], eax
+    add     eax, 20
+    mov     dword ptr [rbp-148], eax
+    mov     ecx, dword ptr [g_kat_n]
+    call    home_num
+    mov     qword ptr [rbp-240], rax
+    lea     rcx, [g_katline]
+    mov     rdx, qword ptr [rbp-240]
+    call    gui_wstrcpy
+    mov     rcx, rax
+    lea     rdx, [h_kat_suf]
+    call    gui_wstrcpy
+    WINCALL DrawTextW, qword ptr [rbp-24], addr g_katline, -1, addr rbp-160, \
+            DT_NAMEFLAGS
+    mov     eax, dword ptr [rbp-148]
+    mov     dword ptr [rbp-156], eax
+    add     eax, 20
+    mov     dword ptr [rbp-148], eax
+    WINCALL DrawTextW, qword ptr [rbp-24], addr h_kat_std, -1, addr rbp-160, \
             DT_NAMEFLAGS
 gdh_font:
     WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-120]
@@ -2389,6 +2451,80 @@ gui_set_winicon endp
 ;   as an icon + friendly name: OneDrive / Documents (when the vault lives there)
 ;   else the full path, drawn in the accent colour to read as a clickable link.
 ; =============================================================================
+; gui_storage_parts(rcx = *out glyph ptr, rdx = *out label ptr) -> eax = class
+;   (0 = OneDrive, 1 = Documents, 2 = other).  Where the vault lives, rendered the
+;   way the unlock screen renders it: a Fluent glyph plus either "<folder> . <vault
+;   file>" for the two friendly locations, or the full path for anywhere else.
+;
+;   Factored out rather than copied when the home panel needed the same line - two
+;   descriptions of where the vault is would eventually disagree, and the one on
+;   the unlock screen is the one people check before typing a master password.
+public gui_storage_parts
+gui_storage_parts proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx           ; *out glyph
+    mov     qword ptr [rbp-32], rdx           ; *out label
+    lea     rcx, [g_vpath]                    ; classify: 0 OneDrive / 1 Documents / 2 other
+    call    cfg_classify_path
+    mov     dword ptr [rbp-40], eax
+    lea     r8, [gl_cloud]
+    lea     r9, [st_onedrive]
+    cmp     eax, 0
+    je      gsp2_have
+    cmp     eax, 1
+    jne     gsp2_other
+    lea     r8, [gl_doc]
+    lea     r9, [st_documents]
+    jmp     gsp2_have
+gsp2_other:
+    lea     r8, [gl_folder]
+    lea     r9, [g_vpath]
+gsp2_have:
+    mov     r10, qword ptr [rbp-24]
+    mov     qword ptr [r10], r8               ; glyph
+    mov     r10, qword ptr [rbp-32]
+    mov     qword ptr [r10], r9               ; label (default)
+    ; A friendly location names only the folder, so append the vault file name -
+    ; otherwise it never says WHICH vault.  'other' is already a full path ending
+    ; in the file name.
+    cmp     dword ptr [rbp-40], 2
+    jae     gsp2_done
+    mov     qword ptr [rbp-48], r9            ; survives the wstrcpy calls
+    lea     rcx, [g_storagelabel]
+    mov     rdx, qword ptr [rbp-48]
+    call    gui_wstrcpy
+    mov     rcx, rax
+    lea     rdx, [s_stor_sep]                 ; " . "
+    call    gui_wstrcpy
+    mov     qword ptr [rbp-56], rax           ; append point
+    lea     r10, [g_vpath]                    ; basename = text after the last \ or /
+    mov     r11, r10
+gsp2_bn:
+    movzx   edx, word ptr [r10]
+    test    edx, edx
+    jz      gsp2_bn_done
+    cmp     edx, '\'
+    je      gsp2_bn_sep
+    cmp     edx, '/'
+    jne     gsp2_bn_next
+gsp2_bn_sep:
+    lea     r11, [r10+2]
+gsp2_bn_next:
+    add     r10, 2
+    jmp     gsp2_bn
+gsp2_bn_done:
+    mov     rcx, qword ptr [rbp-56]
+    mov     rdx, r11
+    call    gui_wstrcpy
+    lea     rax, [g_storagelabel]
+    mov     r10, qword ptr [rbp-32]
+    mov     qword ptr [r10], rax              ; the combined label
+gsp2_done:
+    mov     eax, dword ptr [rbp-40]
+    FRAME_EPILOG
+    ret
+gui_storage_parts endp
+
 gui_draw_storage proc frame
     FRAME_PROLOG 160
     mov     qword ptr [rbp-24], rcx
@@ -2408,57 +2544,10 @@ gui_draw_storage proc frame
     WINCALL FillRect, qword ptr [rbp-32], addr rbp-80, qword ptr [rbp-40]
     WINCALL DeleteObject, qword ptr [rbp-40]
     WINCALL SetBkMode, qword ptr [rbp-32], 1
-    lea     rcx, [g_vpath]                    ; classify: 0 OneDrive / 1 Documents / 2 other
-    call    cfg_classify_path
+    lea     rcx, [rbp-48]                     ; glyph out
+    lea     rdx, [rbp-56]                     ; label out
+    call    gui_storage_parts
     mov     dword ptr [rbp-88], eax           ; keep the classification
-    lea     r8, [gl_cloud]
-    lea     r9, [st_onedrive]
-    cmp     eax, 0
-    je      gds_have
-    cmp     eax, 1
-    jne     gds_other
-    lea     r8, [gl_doc]
-    lea     r9, [st_documents]
-    jmp     gds_have
-gds_other:
-    lea     r8, [gl_folder]
-    lea     r9, [g_vpath]
-gds_have:
-    mov     qword ptr [rbp-48], r8            ; glyph ptr
-    mov     qword ptr [rbp-56], r9            ; label ptr (default)
-    ; friendly location (OneDrive/Documents) shows only the folder name - append
-    ; the vault file name so the user sees WHICH vault they are unlocking.
-    ; ('other' is the full path, which already ends in the file name.)
-    cmp     dword ptr [rbp-88], 2
-    jae     gds_labeldone
-    lea     rcx, [g_storagelabel]             ; "<location>"
-    mov     rdx, r9
-    call    gui_wstrcpy
-    mov     rcx, rax
-    lea     rdx, [s_stor_sep]                 ; " . "
-    call    gui_wstrcpy
-    lea     r10, [g_vpath]                    ; basename = text after the last \ or /
-    mov     r11, r10
-gds_bn:
-    movzx   edx, word ptr [r10]
-    test    edx, edx
-    jz      gds_bn_done
-    cmp     edx, '\'
-    je      gds_bn_sep
-    cmp     edx, '/'
-    jne     gds_bn_next
-gds_bn_sep:
-    lea     r11, [r10+2]
-gds_bn_next:
-    add     r10, 2
-    jmp     gds_bn
-gds_bn_done:
-    mov     rcx, rax                          ; append point
-    mov     rdx, r11                          ; -> vault file name
-    call    gui_wstrcpy
-    lea     rax, [g_storagelabel]
-    mov     qword ptr [rbp-56], rax           ; draw the combined label
-gds_labeldone:
     WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_accent]
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_font_icon]
     mov     qword ptr [rbp-64], rax           ; old font
