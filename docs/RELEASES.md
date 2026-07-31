@@ -43,6 +43,10 @@ re-run) yield the identical exe.
 
 ## Published hashes
 
+The full per-release procedure - including this step and what to do when a
+published version turns out to be vulnerable - is in
+[RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md).
+
 After tagging, submit the new binary to Microsoft as a false positive:
 <https://www.microsoft.com/en-us/wdsi/filesubmission>.  Vordr is unsigned, so
 Defender's ML classifier flags each new build until it is reviewed - and the hash
@@ -68,6 +72,18 @@ git checkout v0.2.0
 build.cmd release
 certutil -hashfile bin\vordr.exe SHA256
 ```
+
+## Security advisories
+
+A released version found to be security-relevant is listed here, next to its hash,
+as well as in a GitHub Security Advisory — this table is what someone checks when
+verifying a binary they already downloaded.
+
+| version | advisory | status |
+|---------|----------|--------|
+| _(none yet)_ | — | — |
+
+Defects that are not security-relevant are noted as "superseded" below instead.
 
 > **v0.2.0 is superseded and should not be used.** It creates the vault beside the
 > executable on any machine with a linked OneDrive, can strand the user on the

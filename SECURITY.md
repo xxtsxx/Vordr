@@ -99,6 +99,34 @@ Reports in the out-of-scope list are still welcome if you have found a way to
 **raise the cost** of one of them — but they will be treated as hardening
 improvements, not as vulnerabilities.
 
+## What we report about ourselves
+
+Disclosure is not only something that happens *to* this project when someone else
+finds a bug. When a defect in a **released** version turns out to be
+security-relevant — exposing vault contents, weakening the crypto, or losing data —
+it is reported by the project, about the project, without waiting to be asked:
+
+- a **GitHub Security Advisory** naming the affected and fixed versions, published
+  even when the maintainer found the bug rather than an outside reporter;
+- a **CVE** requested through that advisory when the issue is exploitable by
+  someone other than the vault's owner (GitHub is a CNA and can assign one);
+- the affected build **labelled in [docs/RELEASES.md](docs/RELEASES.md)**, beside
+  its hash — that table is what someone checks when verifying a binary they
+  already have;
+- the old tag left in place. A tag names one set of bytes permanently; deleting it
+  to bury a bad release would destroy the guarantee the published hashes exist for.
+
+The limit, stated plainly: Vordr has **no update check and no telemetry**, so
+nobody is notified automatically. That is deliberate — there is no channel through
+which anyone, including the maintainer, can reach an installed copy — but it means
+a user who never revisits this repository will not hear about any of it. Adding an
+update check would mean a password manager that phones home, and that trade is not
+made. Checking back after a release is the user's part of the bargain.
+
+Each release is also submitted to antivirus vendors as a matter of routine rather
+than after complaints; see [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md)
+and [docs/ANTIVIRUS.md](docs/ANTIVIRUS.md).
+
 ## Supported versions
 
 Vordr is pre-1.0. Only the newest release is supported; there are no backported
