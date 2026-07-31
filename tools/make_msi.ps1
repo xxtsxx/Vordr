@@ -192,12 +192,23 @@ try {
         @("RemoveFiles",           "", 3500),
         @("InstallFiles",          "", 4000),
         @("CreateShortcuts",       "", 4500),
-        @("RemoveExistingProducts","", 5000),
         @("RegisterUser",          "", 6000),
         @("RegisterProduct",       "", 6100),
         @("PublishFeatures",       "", 6300),
         @("PublishProduct",        "", 6400),
-        @("InstallFinalize",       "", 6600)
+        @("InstallFinalize",       "", 6600),
+        # RemoveExistingProducts is only legal immediately after InstallValidate,
+        # InstallInitialize, InstallExecute, InstallExecuteAgain or InstallFinalize.
+        # It was at 5000 - after InstallFiles, which is none of those - and Windows
+        # Installer rejected the package with error 2613 at install time.  /a never
+        # catches this: an administrative install does not run the upgrade logic.
+        #
+        # After InstallFinalize on purpose: the new build is fully installed before
+        # the old product is removed, so a failure part-way never leaves the user
+        # with no vordr.exe.  Safe because ComponentGuid is stable - the shared
+        # component is ref-counted, so removing the old product does not delete the
+        # file the new one still owns.
+        @("RemoveExistingProducts","", 6700)
     )
     foreach ($s in $seq) {
         Exec ("INSERT INTO ``InstallExecuteSequence`` (``Action``,``Condition``,``Sequence``) VALUES ('{0}','{1}',{2})" -f $s[0], $s[1], $s[2])
@@ -208,6 +219,25 @@ try {
     foreach ($a in @(@("CostInitialize",800),@("FileCost",900),@("CostFinalize",1000),@("InstallValidate",1400),@("InstallInitialize",1500),@("InstallAdminPackage",3900),@("InstallFiles",4000),@("InstallFinalize",6600))) {
         Exec ("INSERT INTO ``AdminExecuteSequence`` (``Action``,``Condition``,``Sequence``) VALUES ('{0}','',{1})" -f $a[0], $a[1])
     }
+
+    # --- self-check the one thing /a cannot catch ----------------------------
+    # An administrative install does not run the upgrade logic, so a badly placed
+    # RemoveExistingProducts sails through msiexec /a and then fails a REAL install
+    # with error 2613.  It is only legal immediately after one of these anchors.
+    $ordered  = $seq | Sort-Object { $_[2] }
+    $names    = @($ordered | ForEach-Object { $_[0] })
+    $idx      = [array]::IndexOf($names, "RemoveExistingProducts")
+    $anchors  = @("InstallValidate","InstallInitialize","InstallExecute",
+                  "InstallExecuteAgain","InstallFinalize")
+    if ($idx -lt 1) { throw "RemoveExistingProducts is missing from InstallExecuteSequence" }
+    $prev = $names[$idx-1]
+    if ($anchors -notcontains $prev) {
+        # -f binds tighter than +, so build the whole string first or the format
+        # placeholders in the leading fragment are never substituted.
+        $fmt = "RemoveExistingProducts follows '{0}' - Windows Installer only accepts it immediately after {1}. A real install would fail with error 2613."
+        throw ($fmt -f $prev, ($anchors -join ", "))
+    }
+    Write-Host ("  sequence check : RemoveExistingProducts follows {0} - legal" -f $prev)
 
     # --- summary information (required, and x64 must be declared) ------------
     # SummaryInformation(update-count) - Property is a PARAMETERISED property, which
