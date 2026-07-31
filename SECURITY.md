@@ -116,12 +116,30 @@ it is reported by the project, about the project, without waiting to be asked:
 - the old tag left in place. A tag names one set of bytes permanently; deleting it
   to bury a bad release would destroy the guarantee the published hashes exist for.
 
-The limit, stated plainly: Vordr has **no update check and no telemetry**, so
-nobody is notified automatically. That is deliberate — there is no channel through
-which anyone, including the maintainer, can reach an installed copy — but it means
-a user who never revisits this repository will not hear about any of it. Adding an
-update check would mean a password manager that phones home, and that trade is not
-made. Checking back after a release is the user's part of the bargain.
+A CVE does travel further than the repository. It reaches NVD, and from there the
+vulnerability-management products that inventory installed software and match it
+against known issues — Microsoft Defender Vulnerability Management among them.
+That is a genuine reason to request one rather than only filing an advisory.
+
+Its reach is worth stating accurately, though, because it is narrower than it
+sounds. Vulnerable-software categorisation is a **Defender for Endpoint** feature,
+not consumer Windows Security, so it surfaces on managed enterprise endpoints and
+reaches an *administrator* rather than the person using the vault. Vordr is also a
+portable executable that registers no uninstall entry, so it is invisible to the
+inventory methods that enumerate installed programs; only file-level inventory
+reading its version resource would see it at all.
+
+So: **no user is notified automatically**, and the ones this could reach are the
+minority running managed corporate machines. Vordr has no update check and no
+telemetry — deliberately, since there is no channel through which anyone, the
+maintainer included, can reach an installed copy. Adding one would mean a password
+manager that phones home, and that trade is not made. Checking back after a release
+is the user's part of the bargain.
+
+The one channel that could close this gap without breaking that rule is a **pull**
+mechanism the user drives: distribution through a package manager such as winget,
+where `winget upgrade` is run by the user and the application still never opens a
+socket. That is not in place today.
 
 Each release is also submitted to antivirus vendors as a matter of routine rather
 than after complaints; see [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md)

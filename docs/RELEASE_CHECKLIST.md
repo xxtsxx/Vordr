@@ -6,8 +6,9 @@ binary, and telling users when a version they already have turns out to be unsaf
 
 Vordr has **no auto-update and no telemetry**. Nothing reaches out to a user after
 they download a build. That is a deliberate property — there is no channel for
-anyone, including us, to push code to them — and it means every one of these
-notification steps is the only notification there will be.
+anyone, including us, to push code to them — and it means these notification steps
+are very nearly the only notification there will be. A CVE is the one signal that
+travels on its own, and only as far as §4 describes.
 
 ## 1. Before tagging
 
@@ -68,7 +69,14 @@ project, about the project, without waiting for anyone to ask.
       machine-readable signal this project emits.
 - [ ] **Request a CVE** through the advisory when the issue is exploitable by
       someone other than the vault's owner. GitHub is a CNA and can assign one
-      directly from the advisory, at no cost.
+      directly from the advisory, at no cost. This is the step that travels beyond
+      the repository: a CVE reaches NVD and from there the vulnerability-management
+      products that match installed software against known issues. Keep the product
+      naming in `vordr.rc` (`ProductName`, `ProductVersion`, `CompanyName`) stable
+      across releases — that version resource is what file-level inventory matches
+      on, and a portable exe with no uninstall entry has nothing else to be
+      recognised by. Do not expect it to reach consumers: that categorisation is a
+      Defender for Endpoint feature and surfaces to enterprise administrators.
 - [ ] **Mark the version in [RELEASES.md](RELEASES.md)** — the hash table is what
       someone checks when verifying a binary they already downloaded, so a
       vulnerable build must be labelled *there*, next to its hash, not only in an
@@ -80,6 +88,18 @@ project, about the project, without waiting for anyone to ask.
       that binary unable to find out what is wrong with it.
 
 The honest limit: users who never revisit the repository will not learn any of
-this. Without an update check there is no way to reach them, and adding one would
+this. A CVE does travel further — into NVD, and from there into the
+vulnerability-management tools that inventory installed software — but that path
+surfaces to enterprise administrators running Defender for Endpoint, not to the
+individual who downloaded a portable exe. Consumer Windows Security has no
+software inventory and will never raise it.
+
+Without an update check there is no way to reach the rest, and adding one would
 mean a password manager that phones home — a trade this project does not make.
-Saying so is part of the disclosure.
+The one channel that would close the gap without breaking that rule is a **pull**
+mechanism the user drives, such as distribution through winget, where
+`winget upgrade` is run by the user and Vordr still never opens a socket. Not in
+place today; worth considering, and it would help the prevalence problem in §3 at
+the same time.
+
+Saying all of this plainly is part of the disclosure, not a footnote to it.
