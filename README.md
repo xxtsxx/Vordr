@@ -378,15 +378,18 @@ remembers the last one used).
 
 ### Deploying policy
 
-Every HKLM value is exposed by the MSI as a public property, so a deployment can
-set it without touching the registry by hand:
+[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) covers this in full — the property
+table, the clamps, setting policy without the MSI, and how to verify a package
+before you push it to a fleet. In brief: every HKLM value is exposed by the MSI
+as a public property, so a deployment can set it without touching the registry by
+hand:
 
 ```
 msiexec /i vordr-0.2.2.msi /qn VORDR_SECUREUNLOCK=1 VORDR_PWMINLEN=16
 ```
 
-`tools\make_msi.ps1` prints the full table — property, registry value, range and
-default — when it builds the package. Only the properties you name are written:
+`tools\make_msi.ps1` prints the same table when it builds the package. Only the
+properties you name are written:
 the installer never writes a value you did not ask for, because in Vordr the
 *presence* of an HKLM value is what locks the setting against the user, so a
 package that helpfully wrote every default would hand you a machine where the
