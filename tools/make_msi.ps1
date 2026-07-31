@@ -294,8 +294,30 @@ try {
 
     Exec "INSERT INTO ``Shortcut`` (``Shortcut``,``Directory_``,``Name``,``Component_``,``Target``,``Arguments``,``Description``,``ShowCmd``,``WkDir``) VALUES ('VordrSC','ProgramMenuFolder','Vordr','VordrExe','[INSTALLDIR]vordr.exe','','Vordr password manager',1,'INSTALLDIR')"
 
-    # upgrade: replace an older install rather than sitting beside it
-    Exec "INSERT INTO ``Upgrade`` (``UpgradeCode``,``VersionMin``,``VersionMax``,``Language``,``Attributes``,``Remove``,``ActionProperty``) VALUES ('$UpgradeCode','0.0.0','$productVersion','',257,'','OLDERVERSIONBEINGUPGRADED')"
+    # Upgrade: replace an existing install rather than sitting beside it.
+    #
+    # Attributes is a bitfield and the two Inclusive bits are easy to get wrong,
+    # because they are NOT 1 and 2:
+    #     0x001 MigrateFeatures        0x100 VersionMinInclusive
+    #     0x002 OnlyDetect             0x200 VersionMaxInclusive
+    #     0x004 IgnoreRemoveFailure    0x400 LanguagesExclusive
+    # This was 257 (0x101) - MigrateFeatures + VersionMin*Inclusive* - which left
+    # VersionMax EXCLUSIVE.  Every version below this one was replaced correctly,
+    # so it looked right, but installing 0.2.2 over an existing 0.2.2 detected
+    # nothing and registered a SECOND product: two Add/Remove entries, two
+    # ProductCodes, one set of files.  That is not a hypothetical - every build
+    # gets a fresh ProductCode, so any test of the same version hits it.
+    #
+    # 768 = VersionMinInclusive | VersionMaxInclusive: replace anything from
+    # 0.0.0 up to and including this version.  FindRelatedProducts always skips
+    # our own ProductCode, so "including this version" can only ever match a
+    # DIFFERENT build of it - exactly the case that was broken.
+    #
+    # MigrateFeatures is deliberately not set: it needs the MigrateFeatureStates
+    # action, which is not in the sequence, and there is one always-installed
+    # feature so there is nothing to migrate.
+    $UPG_ATTR = 768
+    Exec "INSERT INTO ``Upgrade`` (``UpgradeCode``,``VersionMin``,``VersionMax``,``Language``,``Attributes``,``Remove``,``ActionProperty``) VALUES ('$UpgradeCode','0.0.0','$productVersion','',$UPG_ATTR,'','OLDERVERSIONBEINGUPGRADED')"
 
     # Standard sequence.  RemoveExistingProducts runs after InstallFiles so an
     # upgrade never leaves the user without the exe if it fails mid-way.
@@ -393,6 +415,11 @@ try {
         if ($names -notcontains $a) { throw "$a is missing - the Registry table would never be processed" }
     }
     Write-Host ("  policy check   : {0} properties secure, unique and sequenced" -f $Policies.Count)
+
+    if (-not ($UPG_ATTR -band 512)) {
+        throw "Upgrade.Attributes lacks VersionMaxInclusive (0x200) - a rebuild of $productVersion would install ALONGSIDE the existing one instead of replacing it"
+    }
+    Write-Host ("  upgrade check  : replaces 0.0.0 .. {0} inclusive" -f $productVersion)
 
     # --- summary information (required, and x64 must be declared) ------------
     # SummaryInformation(update-count) - Property is a PARAMETERISED property, which

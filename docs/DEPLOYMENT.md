@@ -20,6 +20,12 @@ surprises:
    upgrades included. Deployment tooling normally does exactly that, but it
    catches people who upgrade by hand.
 
+Installing replaces any existing Vordr from `0.0.0` up to **and including** the
+version being installed, so a rebuilt package of the same version takes over from
+the one already there rather than registering beside it. If you ever see two
+Vordr entries in Add/Remove Programs, that range is what went wrong; `verify_msi.ps1`
+checks it and reports what a package would displace on the machine it runs on.
+
 ## Installing
 
 The package is per-machine and needs elevation. It installs `vordr.exe` into

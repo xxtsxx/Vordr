@@ -183,6 +183,43 @@ if ($assocRows.Count) {
     if ($fail -eq $before) { Write-Host "  VORDR_NOASSOC=1 drops the association and nothing else - ok" }
 }
 
+# --- 3. the upgrade row -----------------------------------------------------
+# Attributes is a bitfield whose Inclusive bits are 0x100/0x200, not 0x1/0x2.
+# With VersionMax exclusive every OLDER version is still replaced, so the mistake
+# hides until someone installs a rebuild of the SAME version - and then quietly
+# registers a second product with the same files.
+Write-Host ""
+$upg   = Rows "SELECT ``VersionMin``,``VersionMax``,``Attributes``,``ActionProperty`` FROM ``Upgrade``" 4
+$pvRow = Rows "SELECT ``Value`` FROM ``Property`` WHERE ``Property``='ProductVersion'" 1
+$pv    = $pvRow[0][0]
+# Assign first, THEN pipe.  Rows returns ,$out to stop the array unrolling; that
+# wrapper is removed by assignment but NOT by piping, so "Rows ... | ForEach"
+# hands the loop the whole table as one object and quietly yields a single row.
+$seqRows = Rows "SELECT ``Action`` FROM ``InstallExecuteSequence``" 1
+$names   = @($seqRows | ForEach-Object { $_[0] })
+if (-not $upg.Count) { Bad "no Upgrade row - every install would sit beside the last one" }
+foreach ($u in $upg) {
+    $attr = [int]$u[2]
+    Write-Host ("upgrade         : {0} .. {1}  attr=0x{2:X}  -> {3}" -f $u[0], $u[1], $attr, $u[3])
+    if (-not ($attr -band 512)) { Bad "VersionMaxInclusive (0x200) is not set - a rebuild of $pv would install ALONGSIDE the existing one" }
+    if ($u[1] -ne $pv)          { Bad "VersionMax is $($u[1]) but ProductVersion is $pv - the range does not reach this build" }
+    if ($attr -band 2)          { Bad "OnlyDetect (0x2) is set - related products are found and then left installed" }
+    if (($attr -band 1) -and ($names -notcontains "MigrateFeatureStates")) {
+        Bad "MigrateFeatures (0x1) is set but MigrateFeatureStates is not sequenced"
+    }
+}
+if ($names -notcontains "RemoveExistingProducts") { Bad "RemoveExistingProducts is not sequenced - detection would happen and nothing would be removed" }
+
+# What this package would actually displace on THIS machine.  Informational -
+# it depends on machine state, not on the package - but it is the check that
+# would have caught the bug above the moment it was tested twice.
+$probe = $installer.OpenPackage($Msi, 1)
+$null  = $probe.DoAction("FindRelatedProducts")
+$found = $probe.Property("OLDERVERSIONBEINGUPGRADED")
+[void][Runtime.InteropServices.Marshal]::ReleaseComObject($probe)
+if ($found) { Write-Host ("  would replace : {0}" -f $found) }
+else        { Write-Host  "  would replace : nothing currently installed matches" }
+
 [void][Runtime.InteropServices.Marshal]::ReleaseComObject($db)
 [void][Runtime.InteropServices.Marshal]::ReleaseComObject($installer)
 
