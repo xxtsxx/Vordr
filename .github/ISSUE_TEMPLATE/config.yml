@@ -2,11 +2,13 @@
 # not SECURITY.md - so the private route is offered here, above the option to
 # file publicly.
 #
-# blank_issues_enabled stays TRUE on purpose.  There are no issue templates, so
-# turning it off would leave the chooser showing these links and no way to open
-# an issue at all: bug reports would be silently impossible.  The goal is to put
-# the private channel in front of a reporter, not to shut the front door.
-blank_issues_enabled: true
+# Blank issues are off: bug_report.md is the way in, which means every reporter
+# passes the "NOT for security vulnerabilities" notice at the top of it instead of
+# starting from an empty box.  This is only safe BECAUSE that template exists -
+# with no templates, disabling blank issues leaves no way to open an issue at all
+# and bug reports become silently impossible.  If the template is ever removed,
+# this must go back to true.
+blank_issues_enabled: false
 #
 # There is deliberately NO "report a vulnerability" link here: GitHub adds that
 # entry itself (the shield icon) because private vulnerability reporting is on and
