@@ -376,6 +376,28 @@ attachments machine-wide. HKCU holds the user's own choices, written by the
 Settings screen. The vault *path* follows the same rule (HKLM pins it; HKCU
 remembers the last one used).
 
+### Deploying policy
+
+Every HKLM value is exposed by the MSI as a public property, so a deployment can
+set it without touching the registry by hand:
+
+```
+msiexec /i vordr-0.2.2.msi /qn VORDR_SECUREUNLOCK=1 VORDR_PWMINLEN=16
+```
+
+`tools\make_msi.ps1` prints the full table — property, registry value, range and
+default — when it builds the package. Only the properties you name are written:
+the installer never writes a value you did not ask for, because in Vordr the
+*presence* of an HKLM value is what locks the setting against the user, so a
+package that helpfully wrote every default would hand you a machine where the
+user can change nothing.
+
+Values are clamped on read, so a typo degrades to the clamp rather than to
+something undefined. Two things to know: MSI does not remember properties, so
+repeat them on upgrades or the old package's values are removed with it; and the
+vault *path* is deliberately **not** exposed, since one literal path shared by
+every account on a machine is not a deployment anyone wants.
+
 ## Testing and verification
 
 Five independent gates, all runnable with one command (`tests\run_all.cmd`)

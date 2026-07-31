@@ -7,17 +7,41 @@
 
     WHAT IT INSTALLS, and just as importantly what it does not:
 
-      * one file, vordr.exe, into %LOCALAPPDATA%\Vordr
+      * one file, vordr.exe, into %ProgramFiles%\Vordr
       * a Start Menu shortcut
       * an Add/Remove Programs entry carrying ProductName + ProductVersion
+      * HKLM policy values - ONLY those the installing admin asks for by name
 
-    It owns NOTHING else.  No vault, no HKCU settings, no registry values.  That
-    is deliberate: uninstall removes only what MSI installed, so a user who
-    uninstalls Vordr keeps their vault and their configuration.  An installer
-    that "cleans up" a password manager's data on removal would destroy the
-    user's secrets, and MSI makes that mistake easy - one RemoveFile row aimed at
-    the wrong directory is all it takes.  There are none here, and there must
-    never be.
+    It owns NOTHING else.  No vault, no HKCU settings.  That is deliberate:
+    uninstall removes only what MSI installed, so a user who uninstalls Vordr
+    keeps their vault and their configuration.  An installer that "cleans up" a
+    password manager's data on removal would destroy the user's secrets, and MSI
+    makes that mistake easy - one RemoveFile row aimed at the wrong directory is
+    all it takes.  There are none here, and there must never be.
+
+    POLICY (see $Policies below).  Each HKLM value Vordr honours is exposed as a
+    public MSI property, so a deployment can set it from the command line:
+
+        msiexec /i vordr-0.2.2.msi /qn VORDR_SECUREUNLOCK=1 VORDR_PWMINLEN=16
+
+    Each value lives in its own component, conditioned on its property being
+    set, so a property that is not named is not written.  That matters more than
+    it looks: in Vordr, the PRESENCE of an HKLM value is what locks the setting
+    against the user (regcfg.asm cfg_get_dword returns locked=1 for anything it
+    finds in HKLM).  An installer that helpfully wrote every default would hand
+    the admin a machine where the user can change nothing.
+
+    Values are not validated here - they cannot be, they arrive at install time,
+    not build time.  Vordr clamps every one of them on read (gui_load_policy), so
+    a typo degrades to the clamp rather than to undefined behaviour.
+
+    CAVEAT, and it is a real one: MSI does not remember properties.  An upgrade
+    that does not repeat them installs without those components, and the old
+    product's values go away with it - so policy must be passed on EVERY install,
+    including upgrades, or it is silently dropped.  Deployment tooling normally
+    does exactly that.  Making it survive instead would need AppSearch to read
+    the current values back plus a type-51 action per value to reconcile them
+    with the command line, which is a lot of untestable machinery to add blind.
 
     PER-MACHINE: installs into Program Files, so installing and uninstalling need
     elevation.  That is deliberate.  It is the only scope in which HKLM policy
@@ -51,6 +75,34 @@ $ComponentGuid= "{2F8B5A31-4C6D-4E7A-8B90-1D3E5F7A9C24}"
 $Manufacturer = "Thomas Smistad"
 $ProductName  = "Vordr"
 $InstallDir   = "Vordr"
+$PolicyKey    = "SOFTWARE\Vordr"       # regcfg.asm cfg_subkey - HKLM wins over HKCU
+
+# The HKLM policy surface, one row per value Vordr reads.  Name/Default/Range
+# mirror gui_load_policy + gui_load_prefs; keep them in step, since this table is
+# what an administrator reads before deploying.
+#
+# Guid is the COMPONENT id and must never change: it is what lets an upgrade
+# recognise the value it already owns instead of orphaning it.
+$Policies = @(
+    @{ Prop="VORDR_PWMINLEN";        Value="PwMinLen";        Comp="PolPwMinLen";     Guid="{D19F5EA9-D38C-4D8F-AB7D-7FA755005F6A}"; Range="1-256";   Default="12";  Doc="minimum master-password length" }
+    @{ Prop="VORDR_PWMINCLASSES";    Value="PwMinClasses";    Comp="PolPwMinCls";     Guid="{A00BACFE-4D80-4660-9838-6CDACB2B4FD0}"; Range="1-4";     Default="3";   Doc="character classes a master password must mix" }
+    @{ Prop="VORDR_SECUREUNLOCK";    Value="SecureUnlock";    Comp="PolSecUnlock";    Guid="{71D60D6C-C613-4D0E-BA73-4DB5FE8BD552}"; Range="0/1";     Default="1";   Doc="type the master password on an isolated desktop" }
+    @{ Prop="VORDR_TPMUNLOCK";       Value="TpmUnlock";       Comp="PolTpmUnlock";    Guid="{E644B890-A962-45CA-923D-B1C721BBAF5A}"; Range="0/1";     Default="1";   Doc="allow TPM convenience unlock" }
+    @{ Prop="VORDR_TPMREQUIREHELLO"; Value="TpmRequireHello"; Comp="PolTpmHello";     Guid="{DABA9DC0-F726-41CE-9291-45D3ED06D498}"; Range="0/1";     Default="0";   Doc="require Hello/PIN for TPM unlock" }
+    @{ Prop="VORDR_CLIPSECONDS";     Value="ClipSeconds";     Comp="PolClipSecs";     Guid="{0E7CC768-6CA6-492F-8283-A22866EDDADE}"; Range="0-3600";  Default="20";  Doc="clipboard auto-clear delay, 0 = never copy-and-forget" }
+    @{ Prop="VORDR_IDLELOCKMIN";     Value="IdleLockMin";     Comp="PolIdleLock";     Guid="{065AAA8F-F053-4F6D-83EE-2F6CC73F6A2E}"; Range="0-1440";  Default="10";  Doc="idle minutes before auto-lock, 0 = off" }
+    @{ Prop="VORDR_LOCKONWINLOCK";   Value="LockOnWinLock";   Comp="PolWinLock";      Guid="{7DCACD47-C2DD-4E02-BA29-5BFA6C1B5258}"; Range="0/1";     Default="1";   Doc="lock the vault when Windows locks" }
+    @{ Prop="VORDR_PWVERIFYDAYS";    Value="PwVerifyDays";    Comp="PolPwDays";       Guid="{558B9574-C9E7-4A05-99B2-6792F0850BFB}"; Range="0-3650";  Default="30";  Doc="re-verify the master password every N days under TPM unlock" }
+    @{ Prop="VORDR_NOHISTORY";       Value="NoHistory";       Comp="PolNoHistory";    Guid="{835B8733-0B32-4DFF-AE70-3DDB1F261FA6}"; Range="0/1";     Default="0";   Doc="do not keep per-entry history" }
+    @{ Prop="VORDR_NOPHONETIC";      Value="NoPhonetic";      Comp="PolNoPhonetic";   Guid="{2C20D1F4-69BF-44A1-B131-44DFBE4DB6F3}"; Range="0/1";     Default="0";   Doc="disable the phonetic secret reader" }
+    @{ Prop="VORDR_NOPREVIEW";       Value="NoPreview";       Comp="PolNoPreview";    Guid="{7887784C-D701-466E-B920-14E2DD01FB71}"; Range="0/1";     Default="0";   Doc="attachments download only, never preview via another app" }
+    @{ Prop="VORDR_LOGLEVEL";        Value="LogLevel";        Comp="PolLogLevel";     Guid="{A3BD3F2C-326F-4749-A57E-A78D1EC4AC0E}"; Range="0-4";     Default="0";   Doc="audit-log verbosity, 0 = off" }
+    @{ Prop="VORDR_UISCHEME";        Value="ui_scheme";       Comp="PolUiScheme";     Guid="{9B70EE1D-7B67-44A0-8C02-06B7BD8F982F}"; Range="0-8";     Default="8";   Doc="force a colour scheme (8 = the default)" }
+)
+# NOT exposed: HKLM "vault".  It would pin every user on the machine to one
+# literal path - reg_query_sz accepts REG_EXPAND_SZ but never expands it, so
+# "%USERPROFILE%\..." would be taken verbatim and fail.  A shared machine would
+# end up with every account fighting over one vault file.
 
 function Resolve-Full([string]$p) {
     if ([System.IO.Path]::IsPathRooted($p)) { $p } else { Join-Path (Get-Location) $p }
@@ -133,6 +185,7 @@ try {
     Exec "CREATE TABLE ``AdvtExecuteSequence`` (``Action`` CHAR(72) NOT NULL, ``Condition`` CHAR(255), ``Sequence`` SHORT PRIMARY KEY ``Action``)"
     Exec "CREATE TABLE ``Upgrade`` (``UpgradeCode`` CHAR(38) NOT NULL, ``VersionMin`` CHAR(20), ``VersionMax`` CHAR(20), ``Language`` CHAR(255), ``Attributes`` LONG NOT NULL, ``Remove`` CHAR(255), ``ActionProperty`` CHAR(72) NOT NULL PRIMARY KEY ``UpgradeCode``, ``VersionMin``, ``VersionMax``, ``Language``, ``Attributes``)"
     Exec "CREATE TABLE ``Shortcut`` (``Shortcut`` CHAR(72) NOT NULL, ``Directory_`` CHAR(72) NOT NULL, ``Name`` CHAR(128) NOT NULL, ``Component_`` CHAR(72) NOT NULL, ``Target`` CHAR(72) NOT NULL, ``Arguments`` CHAR(255), ``Description`` CHAR(255), ``Hotkey`` SHORT, ``Icon_`` CHAR(72), ``IconIndex`` SHORT, ``ShowCmd`` SHORT, ``WkDir`` CHAR(72) PRIMARY KEY ``Shortcut``)"
+    Exec "CREATE TABLE ``Registry`` (``Registry`` CHAR(72) NOT NULL, ``Root`` SHORT NOT NULL, ``Key`` CHAR(255) NOT NULL, ``Name`` CHAR(255), ``Value`` CHAR(0), ``Component_`` CHAR(72) NOT NULL PRIMARY KEY ``Registry``)"
     # NO RemoveFile table.  MSI removes a component's own files on uninstall
     # automatically; RemoveFile exists to delete things the installer did NOT
     # install, which for a password manager is how you would delete someone's
@@ -158,8 +211,10 @@ try {
         "ARPNOREPAIR"        = "1"
         "ARPURLINFOABOUT"    = "https://github.com/xxtsxx/Vordr"
         "ARPHELPLINK"        = "https://github.com/xxtsxx/Vordr/blob/master/SECURITY.md"
-        "InstallScope"       = "perUser"
-        "SecureCustomProperties" = "OLDERVERSIONBEINGUPGRADED"
+        # Public properties reach the elevated half of a per-machine install only
+        # if they are listed here.  Miss one and it silently has no effect - the
+        # property is set, the component condition still evaluates false.
+        "SecureCustomProperties" = (@("OLDERVERSIONBEINGUPGRADED") + ($Policies | ForEach-Object { $_.Prop })) -join ";"
     }
     foreach ($k in $props.Keys) {
         $v = $props[$k] -replace "'", "''"
@@ -176,6 +231,22 @@ try {
     Exec "INSERT INTO ``Component`` (``Component``,``ComponentId``,``Directory_``,``Attributes``,``Condition``,``KeyPath``) VALUES ('VordrExe','$ComponentGuid','INSTALLDIR',0,'','vordr.exe')"
     Exec "INSERT INTO ``Feature`` (``Feature``,``Feature_Parent``,``Title``,``Description``,``Display``,``Level``,``Directory_``,``Attributes``) VALUES ('Main','','Vordr','Vordr password manager',1,1,'INSTALLDIR',0)"
     Exec "INSERT INTO ``FeatureComponents`` (``Feature_``,``Component_``) VALUES ('Main','VordrExe')"
+
+    # --- one component per policy value --------------------------------------
+    # Attributes 4 = the registry row is the key path; 256 = write to the 64-bit
+    # view.  Without 256 an x64 package puts these under WOW6432Node, where the
+    # 64-bit vordr.exe would never look - the install would appear to succeed and
+    # the policy would simply not take effect.
+    # Condition is the bare property name: true when it is set to anything,
+    # false when the admin left it out.
+    foreach ($p in $Policies) {
+        $reg = "Reg" + $p.Comp
+        Exec ("INSERT INTO ``Component`` (``Component``,``ComponentId``,``Directory_``,``Attributes``,``Condition``,``KeyPath``) VALUES ('{0}','{1}','INSTALLDIR',260,'{2}','{3}')" -f $p.Comp, $p.Guid, $p.Prop, $reg)
+        Exec ("INSERT INTO ``FeatureComponents`` (``Feature_``,``Component_``) VALUES ('Main','{0}')" -f $p.Comp)
+        # "#" makes it a REG_DWORD; the property supplies the decimal digits.
+        Exec ("INSERT INTO ``Registry`` (``Registry``,``Root``,``Key``,``Name``,``Value``,``Component_``) VALUES ('{0}',2,'{1}','{2}','#[{3}]','{4}')" -f $reg, $PolicyKey, $p.Value, $p.Prop, $p.Comp)
+    }
+    Write-Host ("  policy values  : {0} exposed as properties" -f $Policies.Count)
 
     $size = (Get-Item $exePath).Length
     Exec "INSERT INTO ``File`` (``File``,``Component_``,``FileName``,``FileSize``,``Version``,``Language``,``Attributes``,``Sequence``) VALUES ('vordr.exe','VordrExe','vordr.exe',$size,'$fv','1033',512,1)"
@@ -198,10 +269,15 @@ try {
         @("InstallInitialize",     "", 1500),
         @("ProcessComponents",     "", 1600),
         @("UnpublishFeatures",     "", 1800),
+        # Policy values are put back by WriteRegistryValues on every install, so
+        # removing them first is what makes a re-run with different properties
+        # actually change the machine instead of merging into the old state.
+        @("RemoveRegistryValues",  "", 2600),
         @("RemoveShortcuts",       "", 3200),
         @("RemoveFiles",           "", 3500),
         @("InstallFiles",          "", 4000),
         @("CreateShortcuts",       "", 4500),
+        @("WriteRegistryValues",   "", 5000),
         @("RegisterUser",          "", 6000),
         @("RegisterProduct",       "", 6100),
         @("PublishFeatures",       "", 6300),
@@ -249,6 +325,31 @@ try {
     }
     Write-Host ("  sequence check : RemoveExistingProducts follows {0} - legal" -f $prev)
 
+    # --- self-check the policy wiring ----------------------------------------
+    # Every one of these is a silent failure in the field: the install succeeds,
+    # the property is accepted, and nothing is written.  None of them shows up in
+    # msiexec /a either, so they have to be caught here.
+    $secure = $props["SecureCustomProperties"] -split ";"
+    foreach ($p in $Policies) {
+        if ($secure -notcontains $p.Prop) {
+            throw ("{0} is missing from SecureCustomProperties - it would be dropped on the way to the elevated half of the install and silently do nothing" -f $p.Prop)
+        }
+        if ($p.Prop -cne $p.Prop.ToUpper()) {
+            throw ("{0} is not all-uppercase, so MSI treats it as private and the command line cannot set it" -f $p.Prop)
+        }
+    }
+    $dupGuid = $Policies | Group-Object { $_.Guid } | Where-Object { $_.Count -gt 1 }
+    if ($dupGuid) { throw ("component GUID reused by: " + ($dupGuid[0].Group.Comp -join ", ")) }
+    $dupComp = $Policies | Group-Object { $_.Comp } | Where-Object { $_.Count -gt 1 }
+    if ($dupComp) { throw ("component name reused: " + $dupComp[0].Name) }
+    if ($ComponentGuid -in ($Policies | ForEach-Object { $_.Guid })) {
+        throw "a policy component reuses the exe's component GUID"
+    }
+    foreach ($a in @("WriteRegistryValues","RemoveRegistryValues")) {
+        if ($names -notcontains $a) { throw "$a is missing - the Registry table would never be processed" }
+    }
+    Write-Host ("  policy check   : {0} properties secure, unique and sequenced" -f $Policies.Count)
+
     # --- summary information (required, and x64 must be declared) ------------
     # SummaryInformation(update-count) - Property is a PARAMETERISED property, which
     # PowerShell cannot assign directly, so this one genuinely needs InvokeMember.
@@ -261,11 +362,11 @@ try {
     SetSI 3  "Vordr password manager"               # subject
     SetSI 4  $Manufacturer                          # author
     SetSI 5  "Installer,MSI,Database"               # keywords
-    SetSI 6  "Per-user install of Vordr $productVersion"
+    SetSI 6  "Per-machine install of Vordr $productVersion"
     SetSI 7  "x64;1033"                             # template: 64-bit package
     SetSI 9  ("{" + [guid]::NewGuid().ToString().ToUpper() + "}")   # package code
     SetSI 14 200                                    # min installer version
-    SetSI 15 2                                      # word count: compressed, no admin
+    SetSI 15 2                                      # word count: source is compressed
     $si.Persist()
     [void][Runtime.InteropServices.Marshal]::ReleaseComObject($si)
 
@@ -295,8 +396,21 @@ try {
     Write-Host ""
     Write-Host "  installs   %ProgramFiles%\$InstallDir\vordr.exe + an all-users Start Menu shortcut"
     Write-Host "  scope      per-machine: elevation required, binary read-only to standard users"
-    Write-Host "  owns       that file only - no vault, no HKCU settings, nothing else"
-    Write-Host "  uninstall  removes the exe and the shortcut; the vault is untouched"
+    Write-Host "  owns       that file, the shortcut, and any policy value named below"
+    Write-Host "  uninstall  removes exactly those; the vault and HKCU settings are untouched"
+    Write-Host ""
+    Write-Host ("  HKLM\{0}  - set only what you name; an unnamed value is not written," -f $PolicyKey)
+    Write-Host "  and in Vordr a value's PRESENCE is what locks it against the user."
+    Write-Host ""
+    Write-Host ("    {0,-24} {1,-18} {2,-8} {3}" -f "PROPERTY", "VALUE", "RANGE", "MEANING (default)")
+    foreach ($p in $Policies) {
+        Write-Host ("    {0,-24} {1,-18} {2,-8} {3} ({4})" -f $p.Prop, $p.Value, $p.Range, $p.Doc, $p.Default)
+    }
+    Write-Host ""
+    Write-Host "    msiexec /i `"$outMsi`" /qn VORDR_SECUREUNLOCK=1 VORDR_PWMINLEN=16"
+    Write-Host ""
+    Write-Host "  MSI does not remember properties: repeat them on upgrades too, or the"
+    Write-Host "  old product's policy values are removed along with it."
 }
 finally {
     if (Test-Path $work) { Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue }
