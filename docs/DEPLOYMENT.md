@@ -163,9 +163,13 @@ Two things to get right:
   into `WOW6432Node`, where Vordr never looks. The install *appears* to succeed
   and the policy silently does nothing. `/reg:64` pins it. (The MSI marks its
   registry components 64-bit for exactly this reason.)
-- **`REG_DWORD`, not `REG_SZ`.** The DWORD reader asks for four bytes and does not
-  check the type it got, so a value stored as the string `"1"` is not rejected —
-  it is misread as 49. Nothing warns you.
+- **`REG_DWORD`, not `REG_SZ`.** A value of the wrong type is rejected, and
+  rejection means "fall through to `HKCU`, then to the built-in default" — so a
+  mistyped policy leaves the setting where it was rather than enforcing something
+  arbitrary. Nothing reports the mistake, though, so if a policy appears to have
+  no effect, check its type first. (Until August 2026 the type was not checked at
+  all. A value stored as the string `"1"` is exactly four bytes, so `PwMinLen` set
+  that way read back as 49 and silently enforced a 49-character minimum.)
 
 To remove policy and hand a setting back to the user, delete the value rather
 than setting it to the default:
@@ -255,9 +259,27 @@ them appears as a disabled control.
 
 ## Deliberately not exposed
 
-The vault **path** (`HKLM\SOFTWARE\Vordr:vault`) is not an MSI property. It would
-pin every account on a machine to one literal path, and the string reader accepts
-`REG_EXPAND_SZ` without expanding it, so `%USERPROFILE%\Documents\vault.vordr`
-would be taken verbatim and fail to open. If you genuinely need a fixed location,
-set it by hand and use a literal path that makes sense for every user of that
-machine — which on a shared machine usually means it does not.
+The vault **path** (`HKLM\SOFTWARE\Vordr:vault`) is not an MSI property, because
+an MSI property is one literal string and no single literal path is right for
+every account on a machine.
+
+Set by hand it is better than that, as long as you write it as `REG_EXPAND_SZ`:
+environment variables in that type are expanded, so one machine-wide value can
+give every user their own vault.
+
+```
+reg add "HKLM\SOFTWARE\Vordr" /v vault /t REG_EXPAND_SZ ^
+        /d "%%USERPROFILE%%\Documents\vault.vordr" /f /reg:64
+```
+
+Note the doubled `%%` — that is `cmd` escaping, so the literal `%USERPROFILE%`
+reaches the registry instead of being expanded as you type the command. A plain
+`REG_SZ` is taken literally, which is what you want for a UNC path or a genuinely
+fixed location.
+
+An expansion that does not fit its buffer is rejected rather than truncated, and
+Vordr then behaves as though no path were configured. That is deliberate: a
+shortened path does not fail, it names a *different* file, which for a vault is
+the difference between "not found" and opening the wrong one. (Expansion arrived
+in August 2026; before that `REG_EXPAND_SZ` was accepted and then used verbatim,
+so a path containing `%USERPROFILE%` simply failed to open.)

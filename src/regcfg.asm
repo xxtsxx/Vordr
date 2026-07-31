@@ -24,6 +24,7 @@ extern RegEnumValueW:proc               ; C6: enumerate values to prune legacy n
 extern sha256_hash:proc                 ; C6: hash the per-vault value name
 extern SHGetFolderPathW:proc
 extern GetEnvironmentVariableW:proc
+extern ExpandEnvironmentStringsW:proc   ; REG_EXPAND_SZ means expand it, not accept it
 extern CreateDirectoryW:proc
 
 REG_SZ          equ 1
@@ -34,6 +35,7 @@ KEY_READ        equ 20019h
 KEY_WRITE       equ 20006h
 KEY_RW          equ 2001Fh          ; KEY_READ or KEY_WRITE (enumerate + delete values)
 CSIDL_PERSONAL  equ 5
+CFG_EXPAND_CCH  equ 1024        ; expansion scratch, in wide chars incl. the NUL
 
 .data
 align 2
@@ -75,6 +77,8 @@ align 2
 g_reg_hname dw 33 dup (?)        ; C6: hashed reg value name = 32 hex wide chars + NUL
 align 2
 g_prune_name dw 512 dup (?)      ; C6: RegEnumValueW value-name scratch (legacy prune)
+align 2
+g_cfg_expand dw CFG_EXPAND_CCH dup (?) ; REG_EXPAND_SZ expansion scratch (see reg_query_sz)
 align 2
 cc_od       dw 1024 dup (?)      ; %OneDrive% root (cfg_classify_path scratch)
 cc_docs     dw 1024 dup (?)      ; Documents root (cfg_classify_path scratch)
@@ -238,7 +242,11 @@ reg_prune_all endp
 ;   closes the key (RegOpenKeyExW fails cleanly when the key is absent).
 ; ===========================================================================
 reg_query_sz proc frame
-    FRAME_PROLOG 80
+    ; 112, not 80: the expansion path below adds a local at rbp-56, which at the
+    ; smaller size lands in RegQueryValueExW's 6th-argument slot.  It happens to
+    ; be dead at that call, but framecheck cannot know that and neither can the
+    ; next person - give it room instead of an argument.
+    FRAME_PROLOG 112
     mov     qword ptr [rbp-16], rcx          ; hkey
     mov     qword ptr [rbp-24], rdx          ; value name
     mov     qword ptr [rbp-32], r8           ; dst
@@ -278,6 +286,46 @@ qsz_term:
 @@: and     eax, 0FFFFFFFEh                     ; align to a wchar boundary
     mov     r10, qword ptr [rbp-32]             ; dst
     mov     word ptr [r10+rax], 0
+    ; A REG_EXPAND_SZ value is a TEMPLATE, not a string: the type exists to say
+    ; "%VARS% in here are meant to be expanded".  This used to accept the type
+    ; and then use the bytes verbatim, so an administrator setting the vault
+    ; path to "%USERPROFILE%\Documents\vault.vordr" - the obvious way to give
+    ; every account its own vault from one policy - got a literal path with a
+    ; percent sign in it, which simply failed to open.  Accepting a type while
+    ; ignoring what it means is worse than rejecting it: it looks like it worked.
+    ;
+    ; Expanded via a scratch buffer because the source and destination of
+    ; ExpandEnvironmentStringsW must not overlap.  The termination above runs
+    ; FIRST, so what is handed to it is guaranteed NUL-terminated.
+    cmp     dword ptr [g_cfg_type], REG_EXPAND_SZ
+    jne     qsz_ok
+    mov     ecx, dword ptr [rbp-40]             ; cap bytes
+    shr     ecx, 1                              ;   -> chars
+    mov     dword ptr [rbp-56], ecx             ; dst capacity, chars
+    WINCALL ExpandEnvironmentStringsW, qword ptr [rbp-32], addr g_cfg_expand, CFG_EXPAND_CCH
+    test    eax, eax
+    jz      qsz_no                              ; expansion failed outright
+    ; Every "does not fit" case is a REJECT, never a truncation.  A path cut
+    ; short does not fail - it names a different file, and for a vault that is
+    ; the difference between "no vault found" and opening the wrong one.
+    cmp     eax, CFG_EXPAND_CCH                 ; needed > scratch?
+    ja      qsz_no
+    cmp     eax, dword ptr [rbp-56]             ; needed > caller's buffer?
+    ja      qsz_no
+    mov     r10, qword ptr [rbp-32]             ; dst
+    lea     r11, [g_cfg_expand]
+    xor     r8d, r8d
+qsz_cpy:
+    mov     cx, word ptr [r11+r8*2]
+    mov     word ptr [r10+r8*2], cx
+    test    cx, cx
+    jz      qsz_ok
+    inc     r8d
+    cmp     r8d, dword ptr [rbp-56]
+    jb      qsz_cpy
+    mov     word ptr [r10], 0                   ; unreachable given the checks above,
+    jmp     qsz_no                              ;   but never leave a half-copied path
+qsz_ok:
     mov     eax, 1
     FRAME_EPILOG
     ret
@@ -299,11 +347,25 @@ reg_query_dw proc frame
     test    eax, eax
     jnz     qdw_no
     mov     dword ptr [g_cfg_cb], 4
-    WINCALL RegQueryValueExW, qword ptr [g_cfg_khan], qword ptr [rbp-24], 0, 0, \
+    mov     dword ptr [g_cfg_type], 0
+    WINCALL RegQueryValueExW, qword ptr [g_cfg_khan], qword ptr [rbp-24], 0, addr g_cfg_type, \
             addr g_cfg_dw, addr g_cfg_cb
     mov     dword ptr [rbp-40], eax
     WINCALL RegCloseKey, qword ptr [g_cfg_khan]
     cmp     dword ptr [rbp-40], 0
+    jne     qdw_no
+    ; The type used to be discarded (lpType = 0) and whatever landed in the four
+    ; bytes was returned.  A REG_SZ "1" is exactly four bytes - L'1' then the NUL
+    ; - so it read back as 0x00000031 = 49, and PwMinLen set that way silently
+    ; became a 49-character minimum.  Nothing warned; the value was simply wrong.
+    ; An administrator writing a policy from a .reg file or a management tool has
+    ; every opportunity to make that mistake, so the type is now checked.  A
+    ; wrong type is rejected rather than coerced, which sends cfg_get_dword on to
+    ; HKCU and then to the compiled-in default: a misconfigured policy leaves the
+    ; setting where it was instead of somewhere arbitrary.
+    cmp     dword ptr [g_cfg_type], REG_DWORD
+    jne     qdw_no
+    cmp     dword ptr [g_cfg_cb], 4             ; REG_DWORD is 4 bytes, always
     jne     qdw_no
     mov     rax, qword ptr [rbp-32]
     mov     ecx, dword ptr [g_cfg_dw]
