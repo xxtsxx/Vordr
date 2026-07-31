@@ -7,18 +7,20 @@
 # an issue at all: bug reports would be silently impossible.  The goal is to put
 # the private channel in front of a reporter, not to shut the front door.
 blank_issues_enabled: true
+#
+# There is deliberately NO "report a vulnerability" link here: GitHub adds that
+# entry itself (the shield icon) because private vulnerability reporting is on and
+# SECURITY.md exists.  Listing our own duplicate of it left two near-identical
+# rows in the chooser, which makes a reporter hesitate over which one is real.
+# The reason it matters is carried below instead.
 contact_links:
-  - name: Report a security vulnerability (private)
-    url: https://github.com/xxtsxx/Vordr/security/advisories/new
-    about: >
-      Do NOT open a public issue for a vulnerability. Vordr has no auto-update,
-      so a public report is a working exploit against every installed copy until
-      each one is updated by hand. This form is private to you and the maintainer.
-  - name: Security policy - scope, timelines, disclosure
+  - name: Security vulnerabilities - use the private report above, not an issue
     url: https://github.com/xxtsxx/Vordr/blob/master/SECURITY.md
     about: >
-      What is in and out of scope, what to expect and when, and the
-      coordinated-disclosure terms.
+      Vordr has no auto-update, so a vulnerability posted publicly is a working
+      exploit against every installed copy until each one is updated by hand. Use
+      "Report a security vulnerability" above. This policy has the scope, the
+      timelines and the disclosure terms.
   - name: My antivirus flags Vordr as malware
     url: https://github.com/xxtsxx/Vordr/blob/master/docs/ANTIVIRUS.md
     about: >
