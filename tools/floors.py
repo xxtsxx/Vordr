@@ -45,6 +45,11 @@ FLOORS = {
         "verified": 40,                  # see the note in dlgtarget.py
         "settings_rows": 10,             # 12
     },
+    "rccheck": {
+        # dialog templates and controls whose geometry was parsed and checked.
+        "dialogs": 13,                   # 15 at time of writing
+        "controls": 140,                 # 160
+    },
     "deadcode": {
         "symbols": 2000,                 # 2305
     },

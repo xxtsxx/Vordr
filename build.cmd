@@ -87,7 +87,10 @@ rem MAX_FIELDS 56-vs-96 class), dlgtarget (tools\dlgtarget.py - a dialog-item
 rem call aimed at a window the control does not live in, which Win32 fails
 rem silently; the DLG_SETTINGS-child class), deadcode (tools\deadcode.py) and
 rem aligncheck (tools\aligncheck.py - odd-address wide strings of the tray_cls
-rem class) gate the same way: any finding fails a strict build.
+rem class) and rccheck (tools\rccheck.py - dialog-template geometry: a control
+rem that overlaps a sibling, escapes its dialog, or has collapsed to zero size -
+rem the IDC_V_HEADER "dip" class) gate the same way: any finding fails a strict
+rem build.
 rem ---------------------------------------------------------------------------
 where python >nul 2>nul
 if errorlevel 1 goto :nofc
@@ -135,6 +138,15 @@ if errorlevel 1 (
         goto :failed
     )
     echo deadcode: WARNING - dead symbols above; build continues. Use "build strict" to gate.
+)
+echo === rccheck ===
+python tools\rccheck.py
+if errorlevel 1 (
+    if "%STRICT%"=="1" (
+        echo rccheck: dialog geometry - failing strict build
+        goto :failed
+    )
+    echo rccheck: WARNING - layout findings above; build continues. Use "build strict" to gate.
 )
 echo === aligncheck ===
 python tools\aligncheck.py
