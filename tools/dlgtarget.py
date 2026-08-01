@@ -20,15 +20,31 @@ Two call shapes are recognised:
     WINCALL SetDlgItemTextW, <hwnd>, IDC_FOO, ...
     mov rcx, <hwnd> / mov edx, IDC_FOO / call GetDlgItem
 
-Only hwnd expressions naming a known global (g_settings_hwnd, g_vaulthwnd) can be
-attributed.  A settings-only id reached through an unattributable hwnd (a local such
-as [rbp-8]) is reported separately: it is not provably wrong, but it is exactly the
-shape all ten bugs had, so it is worth a human look.
+Attribution used to require the hwnd to name a known global (g_settings_hwnd,
+g_vaulthwnd).  Almost nothing does: a dialog proc gets its hwnd in rcx and saves it
+to a local, and helpers take it as a parameter.  That left 122 of 135 calls
+unattributable and only 2 actually verified - a gate in name only.  Two inferences
+fix that without a hand-maintained list:
+
+  * A DLGPROC's rcx IS its dialog's hwnd, and which proc serves which template is
+    already written down in the DialogBoxParamW / CreateDialogParamW call sites.
+    Reading the map off those calls means it cannot drift from the code.
+  * A helper's hwnd parameter is whatever its callers pass.  Where EVERY call site
+    passes an already-attributed hwnd and they all agree, the parameter inherits
+    that dialog; disagreement or one unknown caller leaves it unattributed.
+
+Both are conservative: they only ever add attribution where it is provable, and an
+attribution that is wrong shows up as a loud mismatch, not as silence.
+
+A settings-only id reached through a still-unattributable hwnd is reported
+separately: it is not provably wrong, but it is exactly the shape all ten bugs
+had, so it is worth a human look.
 
 Exit code: number of mismatches (so "build strict" can gate on it).
 Usage: python tools/dlgtarget.py [--rc PATH] [--asm PATH] [--strict-unknown]
 """
 import re, os, sys, argparse, collections
+import floors                            # coverage floors: see tools/floors.py
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEF_RC  = os.path.normpath(os.path.join(HERE, "..", "vordr.rc"))
@@ -67,10 +83,121 @@ def parse_rc(path):
     return owner
 
 
-def classify_hwnd(expr):
+PROC_OPEN  = re.compile(r'^(\w+)\s+proc\b')
+PROC_CLOSE = re.compile(r'^(\w+)\s+endp\b')
+# the standard first-argument save at the top of a frame proc
+ENTRY_SAVE = re.compile(r'^\s*mov\s+qword ptr \[(rbp-\d+)\]\s*,\s*rcx\s*$')
+SLOT       = re.compile(r'\b(rbp-\d+)\b')
+DLG_CREATE = re.compile(r'\bWINCALL\s+(?:DialogBoxParamW|CreateDialogParamW)\s*,(.*)$')
+
+
+def dlgproc_map(lines):
+    """{dlgproc name: DLG_*} read off the DialogBoxParamW/CreateDialogParamW sites.
+
+    Derived, never hand-written: a new dialog is attributed the moment it is
+    created, and renaming a proc cannot leave a stale entry behind.  A proc used
+    for two templates is dropped rather than guessed at."""
+    seen = collections.defaultdict(set)
+    for ln, l in lines:
+        m = DLG_CREATE.search(l)
+        if not m:
+            continue
+        args = split_args(m.group(1))
+        if len(args) < 4:
+            continue
+        tmpl = re.search(r'\bDLG_\w+', args[1])
+        proc = re.search(r'addr\s+(\w+)', args[3])
+        if tmpl and proc:
+            seen[proc.group(1)].add(tmpl.group(0))
+    return {p: next(iter(d)) for p, d in seen.items() if len(d) == 1}
+
+
+def entry_slots(lines):
+    """{proc: 'rbp-N'} - where each proc saves its first argument."""
+    out, cur = {}, None
+    for ln, l in lines:
+        t = l.strip()
+        m = PROC_OPEN.match(t)
+        if m:
+            cur = m.group(1)
+            continue
+        if PROC_CLOSE.match(t):
+            cur = None
+            continue
+        if cur and cur not in out:
+            m = ENTRY_SAVE.match(l)
+            if m:
+                out[cur] = m.group(1)
+    return out
+
+
+def call_sites(lines):
+    """[(caller, callee, rcx expression at the call)] for plain `call foo`."""
+    out, cur, last_rcx = [], None, None
+    for ln, l in lines:
+        t = l.strip()
+        m = PROC_OPEN.match(t)
+        if m:
+            cur, last_rcx = m.group(1), None
+            continue
+        if PROC_CLOSE.match(t):
+            cur = None
+            continue
+        m_cx = re.match(r'^\s*mov\s+rcx\s*,\s*(.+?)\s*$', l)
+        if m_cx:
+            last_rcx = m_cx.group(1)
+        elif W_RCX.match(l):
+            last_rcx = None
+        m = re.match(r'^\s*call\s+(\w+)\s*$', t)
+        if m:
+            out.append((cur, m.group(1), last_rcx))
+            last_rcx = None                      # rcx is volatile across the call
+    return out
+
+
+def attribute(lines):
+    """{proc: {'rbp-N': DLG_*}} - which local, in which proc, holds which dialog.
+
+    Seeded from the dialog procs, then propagated to helpers whose every caller
+    agrees.  Iterated to a fixed point; four rounds is far more than the call
+    graph is deep, and the loop stops early when nothing changes."""
+    slots = entry_slots(lines)
+    known = {}
+    for proc, dlg in dlgproc_map(lines).items():
+        if proc in slots:
+            known[proc] = {slots[proc]: dlg}
+    sites = call_sites(lines)
+    for _ in range(4):
+        grew = False
+        implied = collections.defaultdict(set)
+        for caller, callee, rcx in sites:
+            if callee in known or callee not in slots:
+                continue                          # already known, or takes no first arg
+            if rcx is None:
+                implied[callee].add(None)         # a caller we cannot read poisons it
+                continue
+            dlg = classify_hwnd(rcx)
+            if dlg is None:
+                m = SLOT.search(rcx)
+                dlg = known.get(caller, {}).get(m.group(1)) if m else None
+            implied[callee].add(dlg)
+        for callee, dlgs in implied.items():
+            if len(dlgs) == 1 and None not in dlgs:
+                known[callee] = {slots[callee]: next(iter(dlgs))}
+                grew = True
+        if not grew:
+            break
+    return known
+
+
+def classify_hwnd(expr, proc=None, known=None):
     for name, dlg in HWND_GLOBALS:
         if name in expr:
             return dlg
+    if proc and known:
+        m = SLOT.search(expr)
+        if m:
+            return known.get(proc, {}).get(m.group(1))
     return None
 
 
@@ -115,11 +242,17 @@ W_RCX = re.compile(r'^\s*\w+\s+(?:e|r)cx\s*,')
 IS_CALL = re.compile(r'^\s*call\s+')
 
 
-def parse_asm(path):
-    """-> [(lineno, api, hwnd_expr, idc, text)] for every dialog-item call."""
+def parse_asm(path, lines=None):
+    """-> [(lineno, api, hwnd_expr, idc, text, proc)] for every dialog-item call."""
     hits = []
     last_rcx = last_edx = None
-    for ln, l in logical_lines(path):
+    cur = None
+    for ln, l in (lines if lines is not None else logical_lines(path)):
+        t = l.strip()
+        if PROC_OPEN.match(t):
+            cur = PROC_OPEN.match(t).group(1)
+        elif PROC_CLOSE.match(t):
+            cur = None
         m_id = re.match(r'^\s*mov\s+edx\s*,\s*(IDC_\w+)\s*$', l)
         m_cx = re.match(r'^\s*mov\s+rcx\s*,\s*(.+?)\s*$', l)
         if m_id:
@@ -137,11 +270,11 @@ def parse_asm(path):
             if len(args) >= 2:
                 ids = re.findall(r'\bIDC_\w+', args[1])
                 if ids:
-                    hits.append((ln, m.group(1), args[0], ids[0], l.strip()))
+                    hits.append((ln, m.group(1), args[0], ids[0], l.strip(), cur))
             continue
         m = re.match(r'^\s*call\s+(\w+)\s*$', l)
         if m and DLG_API.match(m.group(1)) and last_rcx and last_edx:
-            hits.append((ln, m.group(1), last_rcx, last_edx, l.strip()))
+            hits.append((ln, m.group(1), last_rcx, last_edx, l.strip(), cur))
         if IS_CALL.match(l):
             last_edx = last_rcx = None           # rcx/rdx are volatile across a call
     return hits
@@ -186,18 +319,20 @@ def main():
     args = ap.parse_args()
 
     owner = parse_rc(args.rc)
-    hits = parse_asm(args.asm)
+    lines = logical_lines(args.asm)
+    known = attribute(lines)
+    hits = parse_asm(args.asm, lines)
     rcname = os.path.basename(args.rc)
     asmname = os.path.basename(args.asm)
 
     bad = unknown = ok = skipped = 0
-    for ln, api, hwnd, idc, text in hits:
+    for ln, api, hwnd, idc, text, proc in hits:
         dlgs = owner.get(idc)
         if not dlgs or len(dlgs) > 1:
             skipped += 1                          # asm-only id, or shared across dialogs
             continue
         want = next(iter(dlgs))
-        got = classify_hwnd(hwnd)
+        got = classify_hwnd(hwnd, proc, known)
         if got is None:
             if want == "DLG_SETTINGS":
                 unknown += 1
@@ -221,8 +356,10 @@ def main():
         bad += unknown
     print(f"dlgtarget: {bad} mismatch(es), {unknown} unattributable, {ok} verified, "
           f"{skipped} not applicable across {len(hits)} dialog-item call(s); "
-          f"{trows} settings-table row(s) checked "
+          f"{trows} settings-table row(s) checked; {len(known)} proc(s) attributed "
           f"({'clean' if bad == 0 else 'WRONG-WINDOW CALL PRESENT'})")
+    bad += floors.check("dlgtarget", {"calls": len(hits), "verified": ok,
+                                      "settings_rows": trows})
     sys.exit(min(bad, 255))
 
 

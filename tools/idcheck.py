@@ -21,6 +21,7 @@ Exit code: number of mismatches (so "build strict" can gate on it).
 Usage: python tools/idcheck.py [--rc PATH] [--asm PATH]
 """
 import re, os, sys, argparse
+import floors                            # coverage floors: see tools/floors.py
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEF_RC  = os.path.normpath(os.path.join(HERE, "..", "vordr.rc"))
@@ -172,6 +173,7 @@ def main():
           f"({'clean' if mismatches == 0 else 'ID DRIFT PRESENT'}); "
           f"{dups} duplicate id(s); {ranged} in reserved range(s); "
           f"{len(rc_only)} rc-only, {len(asm_only)} asm-only (informational)")
+    mismatches += floors.check("idcheck", {"shared_ids": shared})
     sys.exit(min(mismatches, 255))
 
 if __name__ == "__main__":

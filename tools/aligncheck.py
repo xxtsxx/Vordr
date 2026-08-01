@@ -26,6 +26,7 @@ Exit code = number of misaligned labels (so "build strict" can gate on it).
 Usage: python tools\\aligncheck.py [--src DIR]
 """
 import re, glob, os, sys, argparse
+import floors                            # coverage floors: see tools/floors.py
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEF_SRC = os.path.normpath(os.path.join(HERE, "..", "src"))
@@ -204,6 +205,7 @@ def main():
     print(f"aligncheck: {n_str} misaligned strings"
           + (f", {n_scalar} scalars (review)" if n_scalar else "")
           + f" ({'clean' if n_str == 0 else 'MISALIGNMENT PRESENT'})")
+    n_str += floors.check("aligncheck", {"scalars": n_scalar})
     sys.exit(min(n_str, 255))
 
 if __name__ == "__main__":

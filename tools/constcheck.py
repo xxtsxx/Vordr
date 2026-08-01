@@ -26,6 +26,7 @@ Exit code: number of conflicting names, so `build strict` can gate on it.
 Usage: python tools/constcheck.py [--src DIR]
 """
 import re, os, sys, glob, argparse, collections
+import floors                            # coverage floors: see tools/floors.py
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEF_SRC = os.path.normpath(os.path.join(HERE, "..", "src"))
@@ -130,7 +131,9 @@ def main():
     print(f"constcheck: {len(conflicts)} conflicting constant(s) across "
           f"{len(files)} files, {len(shared)} mirrored "
           f"({'clean' if not conflicts else 'CROSS-MODULE DRIFT'})")
-    sys.exit(min(len(conflicts), 255))
+    bad = len(conflicts) + floors.check("constcheck",
+                                       {"mirrored": len(shared), "files": len(files)})
+    sys.exit(min(bad, 255))
 
 if __name__ == "__main__":
     main()

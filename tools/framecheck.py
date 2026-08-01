@@ -28,6 +28,7 @@ Exit code: number of FATALs (so "build strict" can gate on it); warns are
 informational.  Usage: python tools\\framecheck.py [--src DIR] [--fatal-only]
 """
 import re, glob, os, sys, argparse
+import floors                            # coverage floors: see tools/floors.py
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEF_SRC = os.path.normpath(os.path.join(HERE, "..", "src"))
@@ -346,6 +347,7 @@ def main():
     print(f"framecheck: {fatals} fatal, {n_warn} warn "
           f"({'clean' if fatals == 0 else 'FRAME BUGS PRESENT'}); "
           f"{STATS['fp']} FRAME_PROLOG procs checked ({STATS['sym']} symbolic-size)")
+    fatals += floors.check("framecheck", {"procs": STATS['fp']})
     sys.exit(min(fatals, 255))
 
 if __name__ == "__main__":

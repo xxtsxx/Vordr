@@ -22,6 +22,7 @@ Exit code = number of dead symbols found (minus the allowlist), so
     python tools\\deadcode.py [--src DIR] [--only proc|data|equ|macro] [-v]
 """
 import re, glob, os, sys, argparse
+import floors                            # coverage floors: see tools/floors.py
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEF_SRC = os.path.normpath(os.path.join(HERE, "..", "src"))
@@ -189,6 +190,7 @@ def main():
     extra = f", {advisory} advisory rcid" if advisory else ""
     print(f"deadcode: {gated} dead / {n_def} symbols{extra} "
           f"({'clean' if gated == 0 else 'DEAD CODE PRESENT'})")
+    gated += floors.check("deadcode", {"symbols": n_def})
     sys.exit(min(gated, 255))
 
 
