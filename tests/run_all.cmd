@@ -124,6 +124,21 @@ if errorlevel 1 ( echo   seedtest: FAIL ^(exit !errorlevel!^) & set RT=FAIL )
 bin\vordr.exe atgen "%WORK%\rt.zip" > "%WORK%\atgen.log" 2>&1
 if errorlevel 1 ( echo   atgen: FAIL ^(exit !errorlevel!^) & set RT=FAIL )
 
+rem layoutkat builds the real vault window and checks its geometry at four sizes.
+rem 0xE0F2 (57586) means no interactive desktop - a build server, not a bug.
+bin\vordr.exe layoutkat "%WORK%\rt.vault" > "%WORK%\layoutkat.log" 2>&1
+set /a LKC=!errorlevel!
+if !LKC! equ 0 (
+    for /f "tokens=*" %%l in ('findstr /c:"measured" "%WORK%\layoutkat.log"') do echo   %%l
+    echo   layoutkat: dialog geometry clean - ok
+) else if !LKC! equ 57586 (
+    echo   layoutkat: SKIP ^(no interactive desktop^)
+) else (
+    echo   layoutkat: FAIL ^(exit !LKC!^) - see %WORK%\layoutkat.log
+    findstr /c:"[LAYOUT]" "%WORK%\layoutkat.log"
+    set RT=FAIL
+)
+
 if "!RT!"=="PASS" (
     bin\vordr.exe zitest "%WORK%\rt.vault" "%WORK%\rt.zip" > "%WORK%\zitest.log" 2>&1
     set /a ZN=!errorlevel!

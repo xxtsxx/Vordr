@@ -68,6 +68,9 @@ extern cmd_vimpkat:proc                 ; .vordr import: foreign read + selectio
 extern cmd_cowrite:proc                 ; C8: write-lock exclusivity probe (vault.asm)
 extern cmd_attfuzz:proc                 ; G8: attachment-index fuzzer (vault.asm)
 extern cmd_healthkat:proc               ; E6: vault-health analysis KAT (vault.asm)
+ifdef PROBE_IO
+extern gui_layout_probe:proc            ; runtime dialog-geometry probe (gui.asm)
+endif
 extern cmd_xctest:proc                  ; external-change detection probe (vault.asm)
 extern cmd_vaultexportkat:proc          ; M6 vault export/merge KAT (vault.asm)
 extern cmd_vaultexpattkat:proc          ; M6 attachment-carry KAT (vault.asm)
@@ -200,6 +203,10 @@ WSTR w_bench,    <bench>
 WSTR w_genpw,    <genpw>
 WSTR w_seedtest, <seedtest>
 WSTR w_seedn,    <seedn>                 ; seedtest with a caller-chosen count
+ifdef PROBE_IO
+WSTR w_layoutkat, <layoutkat>            ; runtime dialog-geometry probe; the verb, the
+endif                                    ;   proc and the row all live or die together,
+                                         ;   or release fails on a dead string
 WSTR w_atgen,    <atgen>
 WSTR w_zitest,   <zitest>
 WSTR w_phtest,   <phtest>
@@ -304,6 +311,9 @@ cmd_table label CMDENT
     CMDENT { w_cowrite,   cmd_cowrite,   1, 0 }   ; C8: write-lock exclusivity probe
     CMDENT { w_attfuzz,   cmd_attfuzz,   0, 0 }   ; G8: attachment-index fuzzer
     CMDENT { w_healthkat, cmd_healthkat, 0, 0 }   ; E6: vault-health analysis KAT
+ifdef PROBE_IO
+    CMDENT { w_layoutkat, cmd_layoutkat, 1, 0 }   ; runtime dialog-geometry probe
+endif
     CMDENT { w_vaultexportkat, cmd_vaultexportkat, 1, 0 } ; M6 vault export/merge KAT (<path>)
     CMDENT { w_vaultexpattkat, cmd_vaultexpattkat, 1, 0 } ; M6 attachment-carry KAT (<path>)
     CMDENT { w_kdfparam,  cmd_kdfparam,  0, 0 }   ; pre-auth KDF-param DoS-guard probe
@@ -1131,6 +1141,65 @@ cst_fail:
     FRAME_EPILOG
     ret
 cmd_seedtest endp
+
+; ---------------------------------------------------------------------------
+; cmd_layoutkat - unlock the vault at argv[2], build the real vault window, and
+;   check its geometry at four sizes.  exit = number of findings (0 = clean).
+;
+;   This is the runtime half of the layout checks.  rccheck reads vordr.rc, but
+;   frame_shift, gui_anchor_init, gui_cmd_dock_layout and gui_reflow decide most
+;   of this window's geometry after it exists, and that is where the layout bugs
+;   have actually been - a delta clamp that collapsed the header, controls
+;   reflowed against a dead window's rects.  Nothing static can see those.
+;
+;   PROBE_IO / dbg only, like every other path-taking verb: it takes a vault path
+;   and it puts a window on screen, neither of which belongs in a release CLI.
+; ---------------------------------------------------------------------------
+ifdef PROBE_IO
+LANDING_PAD
+cmd_layoutkat proc frame
+    FRAME_PROLOG 64
+    lea     r10, [g_argv]
+    mov     rax, qword ptr [r10+16]            ; argv[2] = vault path
+    mov     qword ptr [g_cfg_in], rax
+    lea     r10, [seed_pw]                     ; the same fixed test password the
+    lea     r11, [g_cfg_pass]                  ;   other probes seed vaults with
+    xor     ecx, ecx
+lk_cp:
+    mov     al, byte ptr [r10+rcx]
+    mov     byte ptr [r11+rcx], al
+    test    al, al
+    jz      lk_cpd
+    inc     ecx
+    cmp     ecx, 32
+    jb      lk_cp
+lk_cpd:
+    mov     dword ptr [g_cfg_passlen], 9
+    call    vault_unlock
+    test    eax, eax
+    jnz     lk_fail
+    call    gui_layout_probe                   ; -> eax = findings, or -1 = no desktop
+    cmp     eax, -1
+    jne     lk_have
+    lea     rcx, [lk_nodesk]
+    mov     edx, lk_nodesk_len
+    call    print_err
+    WINCALL ExitProcess, 0E0F2h                ; the gate reads this as SKIP
+lk_have:
+    mov     dword ptr [rbp-24], eax
+    ; no vault_lock here: it lives in gui.asm and is not exported, and the
+    ; process exits on the next line - secmem goes with it either way
+    mov     ecx, dword ptr [rbp-24]
+    WINCALL ExitProcess, rcx
+lk_fail:
+    lea     rcx, [lk_nounlock]
+    mov     edx, lk_nounlock_len
+    call    print_err
+    WINCALL ExitProcess, 0E0F1h
+cmd_layoutkat endp
+CSTR lk_nounlock, "layoutkat: could not unlock that vault with the fixed test password",13,10
+CSTR lk_nodesk,   "layoutkat: no window could be created - no interactive desktop; skipping",13,10
+endif
 
 ; ---------------------------------------------------------------------------
 ; cmd_seedn - seedtest with a caller-chosen count: <path> <count>.
