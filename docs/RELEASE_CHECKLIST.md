@@ -91,6 +91,23 @@ behaviour.
       fresh GUIDs on every build, so two packages of the same commit differ by
       design. The reproducible-build guarantee covers the exe, and the MSI's hash
       only tells someone their download arrived intact.
+- [ ] **winget manifest**, once the release assets are uploaded and their URLs
+      are final:
+
+      ```
+      powershell -ExecutionPolicy Bypass -File tools\make_winget.ps1 -Url <asset URL>
+      winget validate --manifest bin\winget\<version>
+      ```
+
+      then a PR to `microsoft/winget-pkgs`. Every release needs a new manifest —
+      version, URL, hash and ProductCode all change together, and the ProductCode
+      is what winget matches an installed copy on, so a stale one means "not
+      installed" forever.
+
+      This is the one distribution channel that fits the project's constraints.
+      It earns the prevalence that §4 exists to work around, and `winget upgrade`
+      gives users a way to *pull* a fix — the gap §5 admits to — without Vordr
+      ever opening a socket.
 
 ## 4. Self-report the build to antivirus vendors
 
@@ -169,10 +186,11 @@ software inventory and will never raise it.
 
 Without an update check there is no way to reach the rest, and adding one would
 mean a password manager that phones home — a trade this project does not make.
-The one channel that would close the gap without breaking that rule is a **pull**
-mechanism the user drives, such as distribution through winget, where
-`winget upgrade` is run by the user and Vordr still never opens a socket. Not in
-place today; worth considering, and it would help the prevalence problem in §4 at
-the same time.
+The one channel that closes the gap without breaking that rule is a **pull**
+mechanism the user drives: distribution through winget, where `winget upgrade` is
+run by the user and Vordr still never opens a socket. `tools\make_winget.ps1`
+generates the manifests and §3 carries the step; what remains is a published
+release to point them at and a PR to `microsoft/winget-pkgs`. Until that is
+merged, this section describes the whole of the reach a fix has.
 
 Saying all of this plainly is part of the disclosure, not a footnote to it.
