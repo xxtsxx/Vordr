@@ -12,7 +12,8 @@ travels on its own, and only as far as §5 describes.
 
 ## 1. Before tagging
 
-- [ ] `tests\run_all.cmd` — all five stages pass.
+- [ ] `tests\run_all.cmd` — all six stages pass (the sixth builds and verifies
+      the installer; see §2).
 - [ ] `build.cmd release` twice from a clean tree (`obj\` and `bin\` removed
       between), hashes compared, byte-identical.
 - [ ] `selftest` passes on the exact binary being published.

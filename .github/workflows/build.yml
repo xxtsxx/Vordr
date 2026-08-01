@@ -10,6 +10,11 @@
 #   5. cryptodiff: tests\verify_crypto.py independently recomputes every crypto
 #      primitive (python stdlib + a self-validating pure-Python AES-256-GCM) and
 #      cross-checks the published FIPS/RFC/NIST vectors against `vordr katreport`.
+#   6. installer: builds the MSI from the restored release binary and verifies it
+#      by COSTING the package through Windows Installer - component conditions,
+#      64-bit registry components, the upgrade range.  Skips where makecab is
+#      absent.  Added because two upgrade faults reached a live install while
+#      these checks existed but were manual.
 #
 # windows-latest ships VS (ml64/link/rc) and Python; ilammy/msvc-dev-cmd puts
 # the x64 toolchain on PATH the same way a "x64 Native Tools" prompt does.
