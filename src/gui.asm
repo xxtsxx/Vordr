@@ -17289,6 +17289,19 @@ twp_copydata:
     mov     rcx, qword ptr [r10+16]              ; lpData
     test    rcx, rcx
     jz      twp_cd_no
+    ; cbData says how many bytes ARRIVED; it does not promise they form a
+    ; terminated string, and everything downstream scans for the NUL -
+    ; GetFileAttributesW, CreateFileW, and the copy in gui_stash_openfile.  A
+    ; sender sending cbData=4 with two non-NUL wide chars would send all three
+    ; reading past the end of the block the OS copied for us: an access
+    ; violation, or a path assembled from whatever lies after it.  Bounding the
+    ; LENGTH without requiring termination inside that length checks the wrong
+    ; half.  Require the last wide char in the block to be the terminator, so
+    ; every NUL scan below is guaranteed to stop inside it.
+    mov     edx, eax                             ; cbData (4..2048, even)
+    sub     edx, 2
+    cmp     word ptr [rcx+rdx], 0
+    jne     twp_cd_no
     call    gui_stash_openfile
     test    eax, eax
     jz      twp_cd_no
