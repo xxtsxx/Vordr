@@ -28,6 +28,13 @@ that writes to HKLM and to the shell's class registry, and the only one whose
 mistakes are invisible until someone installs it. See
 [DEPLOYMENT.md](DEPLOYMENT.md) for what it registers and why.
 
+**The first two boxes below are now the gate's sixth stage** — `run_all.cmd`
+builds the package from the restored release binary and runs the verifier on
+every push. Tick them by reading the gate output rather than by repeating the
+commands. The rest of this section is what the gate *cannot* do: it will not
+install anything, so the upgrade and uninstall checks stay manual and stay the
+ones that matter.
+
 - [ ] Build it from the **exact** binary being published, not a rebuilt one.
       `make_msi.ps1` takes the version from the exe's own resource, so a stale
       `bin\vordr.exe` yields a package correctly labelled vX.Y.Z and wrapped

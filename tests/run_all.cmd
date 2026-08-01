@@ -272,6 +272,63 @@ rem --- restore a clean RELEASE binary in bin\ (roundtrip left a PROBE_IO build,
 rem     which exposes the path-taking verbs - never leave that as the artifact) --
 if "%R_BUILD%"=="PASS" call .\build.cmd strict > "%WORK%\build_restore.log" 2>&1
 
+
+rem --- 6. installer -----------------------------------------------------------
+rem Build the MSI and verify it.  This runs LAST, after the release binary has
+rem been restored above, so the package wraps the same bytes the gate would
+rem publish - never the PROBE_IO build the roundtrip stage leaves behind.
+rem
+rem It is a stage because two upgrade faults reached a live install while these
+rem checks existed but were manual: Upgrade.Attributes using 0x1 where the
+rem Inclusive bits are 0x100/0x200, and FindRelatedProducts missing from
+rem InstallUISequence.  Both produced logs that read as success.  verify_msi.ps1
+rem COSTS the package through Windows Installer instead of only reading rows
+rem back, which is what makes the component conditions testable at all; an
+rem administrative install (msiexec /a) sees none of it.
+rem
+rem Skipped, not failed, where makecab is missing - the same way cryptodiff skips
+rem without python.
+call :now T0
+echo === stage: installer (MSI build + verify) ===
+where makecab >nul 2>&1
+if errorlevel 1 (
+    echo   installer: SKIP ^(makecab not found on PATH^)
+    set R_INSTALLER=skip
+    goto :installer_done
+)
+if not "%R_BUILD%"=="PASS" (
+    echo   installer: SKIP ^(no release binary to wrap^)
+    set R_INSTALLER=skip
+    goto :installer_done
+)
+del bin\vordr-*.msi >nul 2>nul
+powershell -ExecutionPolicy Bypass -NoProfile -File tools\make_msi.ps1 > "%WORK%\msi_build.log" 2>&1
+if errorlevel 1 (
+    echo   installer: FAIL ^(make_msi.ps1^) - see %WORK%\msi_build.log
+    set R_INSTALLER=FAIL
+    goto :installer_done
+)
+set MSIPATH=
+for %%f in (bin\vordr-*.msi) do set MSIPATH=%%f
+if "!MSIPATH!"=="" (
+    echo   installer: FAIL ^(make_msi.ps1 produced no .msi^)
+    set R_INSTALLER=FAIL
+    goto :installer_done
+)
+powershell -ExecutionPolicy Bypass -NoProfile -File tools\verify_msi.ps1 -Msi "!MSIPATH!" > "%WORK%\msi_verify.log" 2>&1
+if errorlevel 1 (
+    echo   installer: FAIL ^(verify_msi.ps1^) - see %WORK%\msi_verify.log
+    findstr /c:"FAIL:" "%WORK%\msi_verify.log"
+    set R_INSTALLER=FAIL
+) else (
+    for /f "tokens=*" %%l in ('findstr /c:"policy values" /c:"file assoc" /c:"upgrade " "%WORK%\msi_verify.log"') do echo   %%l
+    echo   installer: !MSIPATH! built and verified - ok
+    set R_INSTALLER=PASS
+)
+:installer_done
+call :now T1
+set /a T_INSTALLER=!T1!-!T0!
+
 rem ---------------------------------------------------------------- summary --
 :summary
 echo.
@@ -282,6 +339,7 @@ echo   build        %R_BUILD%     %T_BUILD%
 echo   selftest     %R_SELFTEST%     %T_SELFTEST%
 echo   roundtrip    %R_ROUNDTRIP%     %T_ROUNDTRIP%
 echo   cryptodiff   %R_CRYPTODIFF%     %T_CRYPTODIFF%
+echo   installer    %R_INSTALLER%     %T_INSTALLER%
 echo =========================================
 
 set EXITC=0
@@ -290,6 +348,7 @@ if not "%R_SELFTEST%"=="PASS" set EXITC=1
 if not "%R_ROUNDTRIP%"=="PASS" set EXITC=1
 if not "%R_REDTEAM%"=="PASS" if not "%R_REDTEAM%"=="skip" set EXITC=1
 if not "%R_CRYPTODIFF%"=="PASS" if not "%R_CRYPTODIFF%"=="skip" set EXITC=1
+if not "%R_INSTALLER%"=="PASS" if not "%R_INSTALLER%"=="skip" set EXITC=1
 if "%EXITC%"=="0" ( echo ALL STAGES PASSED ) else ( echo RUN FAILED )
 exit /b %EXITC%
 

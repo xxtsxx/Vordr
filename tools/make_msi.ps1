@@ -123,6 +123,26 @@ function Resolve-Full([string]$p) {
 $exePath = Resolve-Full $Exe
 if (-not (Test-Path $exePath)) { throw "not found: $exePath  (build first: build.cmd release)" }
 
+# --- refuse to wrap anything but a release binary ----------------------------
+# The gate's roundtrip stage leaves a PROBE_IO build in bin\, and that build
+# exposes the path-taking diagnostic verbs.  Shipping one inside an installer
+# would hand every user a binary that takes a vault path on the command line.
+# Nothing about the file says which build it is - same name, same version
+# resource - so ask it: a release refuses a path verb and touches no file.
+#
+# Start-Process -Wait, not the call operator: vordr.exe is a GUI-subsystem
+# binary, and PowerShell's & does not wait for one.  The first version of this
+# guard read $LASTEXITCODE from a process that had not finished and cheerfully
+# packaged the PROBE_IO build it was written to catch.
+$probe = Join-Path $env:TEMP ("vordrguard_" + [guid]::NewGuid().ToString("N") + ".vault")
+$run = Start-Process -FilePath $exePath -ArgumentList @("seedtest", $probe) `
+                     -Wait -PassThru -WindowStyle Hidden
+$tookIt = $run.ExitCode -eq 0
+if (Test-Path $probe) { Remove-Item $probe -Force; $tookIt = $true }
+if ($tookIt) {
+    throw "$exePath accepts path-taking verbs - that is a PROBE_IO build, not a release. Run build.cmd release (or strict) and package that."
+}
+
 # --- version comes from the binary, never typed twice ------------------------
 $vi = (Get-Item $exePath).VersionInfo
 $fv = $vi.FileVersion
