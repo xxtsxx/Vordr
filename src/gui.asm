@@ -4525,16 +4525,23 @@ grf_lp:
     test    dword ptr [rbp-68], ANCH_STRETCHH
     jz      @F
     add     eax, dword ptr [rbp-56]
-@@: mov     dword ptr [rbp-84], eax
+@@: mov     dword ptr [rbp-84], eax           ; nh - a DWORD, and the slot below it
+                                              ;   must therefore not be a QWORD
     WINCALL GetDlgItem, qword ptr [rbp-24], dword ptr [rbp-64]
     test    rax, rax
     jz      grf_next
-    mov     qword ptr [rbp-88], rax           ; stage the hwnd: WINCALL emits the
-                                              ;   32-bit memory stack args FIRST,
-                                              ;   via rax - passing rax here made
-                                              ;   MoveWindow take nHeight as its
-                                              ;   hWnd, so no anchor ever moved
-    WINCALL MoveWindow, qword ptr [rbp-88], dword ptr [rbp-72], dword ptr [rbp-76], \
+    ; The hwnd is staged because WINCALL emits the 32-bit memory stack args FIRST,
+    ; via rax - passing rax directly made MoveWindow take nHeight as its hWnd, so
+    ; no anchor ever moved.  That fix put the staging slot at rbp-88, four bytes
+    ; below nh at rbp-84, and this is an EIGHT-byte store: it covers rbp-88..-81,
+    ; so the hwnd's high dword landed exactly on nh.  A user-mode HWND's top half
+    ; is zero, so every anchored control - the detail header, the entry title and
+    ; the Remove button - was resized to height 0 on every WM_SIZE, and the entry
+    ; name vanished from the detail pane the first time the window was resized.
+    ; rbp-104 is 8-byte aligned, clear of the dword locals above it, and clear of
+    ; MoveWindow's 6-arg spill at rbp-128/-120.
+    mov     qword ptr [rbp-104], rax
+    WINCALL MoveWindow, qword ptr [rbp-104], dword ptr [rbp-72], dword ptr [rbp-76], \
             dword ptr [rbp-80], dword ptr [rbp-84], 1
 grf_next:
     inc     dword ptr [rbp-60]
@@ -17798,7 +17805,6 @@ CSTR lp_head,  "layoutkat: "
 CSTR lp_tail,  " finding(s)",13,10
 CSTR lp_size,  "layoutkat: client ",0
 CSTR lp_ok,    "layoutkat: no findings",13,10
-CSTR lp_known, "[LAYOUT-KNOWN] IDC_V_HEADER visible at zero height - unresolved, see gui_layout_probe",13,10
 CSTR lp_meas,  "layoutkat: visible controls measured: "
 CSTR lp_thin,  "layoutkat: measured almost nothing - the window or its children never became visible, so this run proves nothing",13,10
 
@@ -17841,17 +17847,10 @@ lpc_next:
     FRAME_EPILOG
     ret
 lpc_collapsed:
-    ; KNOWN, and unresolved: IDC_V_HEADER comes back visible with height 0 once
-    ; an entry is selected, at three of the four sizes.  That is the detail-pane
-    ; header - the same control as the "dip", and the same control gui_reflow's
-    ; clamp comment names as having collapsed before.  Whether it is inert by
-    ; design now (the card painter draws that strip, and the window survives only
-    ; as a hit target) or genuinely broken is a question for the screen, not for
-    ; this probe, and changing GUI geometry unattended is not something to do on
-    ; a guess.  Recorded here so it is visible and so a NEW collapse still fails.
-    WINCALL GetDlgCtrlID, qword ptr [rbp-24]
-    cmp     eax, IDC_V_HEADER
-    je      lpc_known
+    ; This is what found the gui_reflow slot overlap: IDC_V_HEADER, IDC_V_TITLE
+    ; and IDC_V_REMOVE all came back visible at height 0 after any resize.  There
+    ; is no exemption here and there should not be one - a visible control with
+    ; no height is never right.
     inc     dword ptr [g_lp_bad]
     WINCALL print_a, addr lp_tag, lp_tag_len
     WINCALL lp_id, qword ptr [rbp-24]
@@ -17860,11 +17859,6 @@ lpc_collapsed:
     WINCALL print_a, addr lp_by, lp_by_len
     WINCALL print_u64, dword ptr [rbp-40]
     WINCALL print_a, addr lp_nl, lp_nl_len
-    mov     eax, 1
-    FRAME_EPILOG
-    ret
-lpc_known:
-    WINCALL print_a, addr lp_known, lp_known_len
     mov     eax, 1
     FRAME_EPILOG
     ret
