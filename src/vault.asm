@@ -45,6 +45,7 @@ externdef g_zi_hide:byte                ;   rows the checklist must not show
 externdef g_zi_stg_n:dword              ;   staged row count
 extern secmem_free:proc
 extern read_file:proc
+extern path_io:proc                     ; the vault path in the form Win32 accepts
 extern write_file:proc
 extern file_rename:proc
 extern MoveFileExW:proc
@@ -621,11 +622,23 @@ vk_kcv_ok endp
 
 ; ===========================================================================
 ; vault_mkbak(rcx = out wide buf, dl = digit char) - write "<g_cfg_in>.bak<d>"
-;   into the caller's buffer.  Leaf; clobbers rax/r8/r10/r11, preserves rdx.
+;   into the caller's buffer.  Clobbers rax/rcx/r8/r9/r10/r11, preserves rdx.
+;
+;   The base comes through path_io rather than straight from g_cfg_in.  All three
+;   derived names - .bak<n>, .tmp, .lock - are built by copying that string and
+;   appending, so if the base is a long path that Win32 will not accept without
+;   a "\?" prefix, every derivation inherits the problem.  Converting here means
+;   it does not matter which of the thirty-odd places that set g_cfg_in did so.
 ; ===========================================================================
-vault_mkbak proc
-    mov     r10, qword ptr [g_cfg_in]
-    mov     r11, rcx
+vault_mkbak proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rdx           ; path_io is not a leaf: save the digit
+    mov     qword ptr [rbp-32], rcx
+    mov     rcx, qword ptr [g_cfg_in]
+    call    path_io
+    mov     r10, rax
+    mov     rdx, qword ptr [rbp-24]
+    mov     r11, qword ptr [rbp-32]
     xor     r8, r8
 vmb_cp:
     mov     ax, word ptr [r10+r8*2]
@@ -648,6 +661,7 @@ vmb_suf:
     mov     word ptr [r11+r8*2], ax
     inc     r8
     mov     word ptr [r11+r8*2], 0
+    FRAME_EPILOG
     ret
 vault_mkbak endp
 
@@ -761,7 +775,9 @@ vault_ext_changed endp
 ;   a harmless no-op.  Frame proc; no failure is fatal to the save.
 ; ===========================================================================
 vault_rotate_backups proc frame
-    FRAME_PROLOG 48
+    FRAME_PROLOG 80                        ; 80, not 48: the staged CopyFileW source
+                                          ;   at rbp-48 sits in the callee home
+                                          ;   area at the smaller size
     lea     rcx, [g_bak_a]                      ; delete the oldest (bak3)
     mov     dl, '0' + BAK_GENS
     call    vault_mkbak
@@ -783,7 +799,10 @@ vault_rotate_backups proc frame
     lea     rcx, [g_bak_a]                      ; live vault -> bak1 (overwrite)
     mov     dl, '1'
     call    vault_mkbak
-    WINCALL CopyFileW, qword ptr [g_cfg_in], addr g_bak_a, 0
+    mov     rcx, qword ptr [g_cfg_in]           ; the source needs the Win32 form too;
+    call    path_io                             ;   g_bak_a already has it
+    mov     qword ptr [rbp-48], rax
+    WINCALL CopyFileW, qword ptr [rbp-48], addr g_bak_a, 0
     FRAME_EPILOG
     ret
 vault_rotate_backups endp
@@ -880,7 +899,9 @@ vsw_maccp:
     mov     dword ptr [r10+FMAC_MACLEN], FMAC_MAGIC
     mov     qword ptr [g_fmac_len], FMAC_TRAILER
     ; --- atomic write: build temp path = g_cfg_in + ".tmp" -----------------
-    mov     r10, qword ptr [g_cfg_in]
+    mov     rcx, qword ptr [g_cfg_in]         ; via path_io, so a long vault path
+    call    path_io                           ;   yields a usable "<vault>.tmp"
+    mov     r10, rax
     lea     r11, [g_tmppath]
     xor     r8, r8
 vsw_pcpy:
@@ -4187,7 +4208,9 @@ LK_DELONCLOSE     equ 04000000h              ; FILE_FLAG_DELETE_ON_CLOSE
 ; vault_lock_acquire() -> eax = 1 if <vault>.lock is now held (g_lock_h), else 0.
 vault_lock_acquire proc frame
     FRAME_PROLOG 64
-    mov     r10, qword ptr [g_cfg_in]           ; g_lock_path = g_cfg_in + ".lock"
+    mov     rcx, qword ptr [g_cfg_in]           ; g_lock_path = g_cfg_in + ".lock"
+    call    path_io                             ;   in the form Win32 accepts
+    mov     r10, rax
     lea     r11, [g_lock_path]
     xor     ecx, ecx
 lka_cp:

@@ -260,6 +260,20 @@ file_rename proc frame
     FRAME_PROLOG 64   ; >= 64: keep locals clear of the callee 32-byte home area
     mov     qword ptr [rbp-24], rcx             ; from
     mov     qword ptr [rbp-32], rdx             ; to
+    ; Both ends need the Win32 form.  The atomic save renames "<vault>.tmp" onto
+    ; "<vault>", and the destination came straight from g_cfg_in - so on a long
+    ; path the temp file was written correctly and then could not be moved into
+    ; place, leaving a .tmp orphan next to a vault that never got the update.
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [fr_from]
+    mov     r8d, MAX_PATH_CHARS + 16
+    call    path_longify
+    mov     qword ptr [rbp-24], rax
+    mov     rcx, qword ptr [rbp-32]
+    lea     rdx, [fr_to]
+    mov     r8d, MAX_PATH_CHARS + 16
+    call    path_longify
+    mov     qword ptr [rbp-32], rax
     mov     dword ptr [rbp-40], 0               ; attempt count
 frn_try:
     WINCALL MoveFileExW, qword ptr [rbp-24], qword ptr [rbp-32], \
@@ -301,6 +315,8 @@ file_rename endp
 align 2
 align 2
 ci_path     dw (MAX_PATH_CHARS + 16) dup (?)   ; the vault path g_cfg_in points at
+fr_from     dw (MAX_PATH_CHARS + 16) dup (?)   ; file_rename's two paths are live at
+fr_to       dw (MAX_PATH_CHARS + 16) dup (?)   ;   the same time, so two buffers
 rf_path     dw (MAX_PATH_CHARS + 16) dup (?)   ; read_file's Win32-form path
 wf_path     dw (MAX_PATH_CHARS + 16) dup (?)   ; write_file's, kept separate so a
                                                ;   read during a write cannot share it
