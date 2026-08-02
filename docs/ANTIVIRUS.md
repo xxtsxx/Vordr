@@ -1,8 +1,9 @@
 # Antivirus false positives
 
-Microsoft Defender has flagged Vordr as `Trojan:Win32/Wacatac.B!ml`. It is a false
-positive, and this page explains why it happens, what you can check for yourself,
-and what is being done about it. It also says plainly what will **not** be done.
+Microsoft Defender has flagged Vordr as `Trojan:Win32/Wacatac.B!ml`, and v0.2.3 as
+`Trojan:Win32/Wacatac.C!ml`. Both are false positives, and this page explains why
+it happens, what you can check for yourself, and what is being done about it. It
+also says plainly what will **not** be done.
 
 ## What that detection name means
 
@@ -86,6 +87,31 @@ actually gets the verdict corrected, for everyone.
 
 Because the hash changes with every release, a submission covers **that build
 only**. Re-submitting is part of the release process (see RELEASES.md).
+
+### A VirusTotal score of 0 does not mean Defender is happy
+
+For v0.2.3, VirusTotal reported **0 detections across every engine** on the same
+day WDSI reported a live `Trojan:Win32/Wacatac.C!ml` verdict on the same file.
+That is not a contradiction, and it is worth understanding before reading too much
+into a clean VirusTotal page.
+
+The `!ml` suffix means the verdict comes from a **cloud-delivered** classifier that
+scores a file in context - its prevalence, its age, where it came from, what it
+does when it starts. VirusTotal runs a locally-installed engine against a static
+sample: no cloud lookup, no reputation history, no runtime behaviour. The two are
+answering different questions, so a clean VirusTotal row for Microsoft says
+nothing about what Defender will do on a user's machine.
+
+The practical consequence: judge clearance by WDSI's response, not by VirusTotal.
+VirusTotal is still worth submitting to - it seeds the other engines and gives a
+public record for the published hash - but it is not the thing that decides whether
+your users see a warning.
+
+### Submission log
+
+| version | submitted | Microsoft verdict at submission | outcome |
+|---------|-----------|----------------------------------|---------|
+| v0.2.3 | 2026-08-02 | `Trojan:Win32/Wacatac.C!ml` (WDSI); VirusTotal 0 detections | awaiting response |
 
 ## Signing
 
