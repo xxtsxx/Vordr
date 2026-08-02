@@ -46,6 +46,7 @@ externdef g_zi_stg_n:dword              ;   staged row count
 extern secmem_free:proc
 extern read_file:proc
 extern path_io:proc                     ; the vault path in the form Win32 accepts
+extern cfg_in_set:proc                  ; the ONLY way to set g_cfg_in
 extern write_file:proc
 extern file_rename:proc
 extern MoveFileExW:proc
@@ -2273,7 +2274,8 @@ cmd_vaultexportkat proc frame
     mov     dword ptr [g_cfg_m], 8
     lea     r10, [g_argv]                     ; source path A = argv[2]
     mov     rax, qword ptr [r10+16]
-    mov     qword ptr [g_cfg_in], rax
+    mov     rcx, rax
+    call    cfg_in_set
     mov     r10, rax                          ; build g_vx_pathb = A + ".exp"
     lea     r11, [g_vx_pathb]
     xor     r8d, r8d
@@ -2368,7 +2370,8 @@ vxk_pw2:
 vxk_pw2d:
     mov     dword ptr [g_cfg_passlen], 9
     lea     rax, [g_vx_pathb]                 ; export target = B
-    mov     qword ptr [g_cfg_in], rax
+    mov     rcx, rax
+    call    cfg_in_set
     mov     rcx, qword ptr [rbp-24]           ; source body scratch
     xor     edx, edx                          ; carry=0 (entries only)
     call    fed_export
@@ -2455,7 +2458,8 @@ cmd_vaultexpattkat proc frame
     mov     dword ptr [g_cfg_m], 8
     lea     r10, [g_argv]                     ; source path A = argv[2]
     mov     rax, qword ptr [r10+16]
-    mov     qword ptr [g_cfg_in], rax
+    mov     rcx, rax
+    call    cfg_in_set
     mov     r10, rax                          ; child path = A + ".ec"
     lea     r11, [g_vx_pathb]
     xor     r8d, r8d
@@ -2548,7 +2552,8 @@ vea_pw2:
 vea_pw2d:
     mov     dword ptr [g_cfg_passlen], 9
     lea     rax, [g_vx_pathb]                 ; export target = child
-    mov     qword ptr [g_cfg_in], rax
+    mov     rcx, rax
+    call    cfg_in_set
     mov     rcx, qword ptr [rbp-24]           ; source body scratch
     mov     edx, 1                            ; carry=1 (attachments)
     call    fed_export
@@ -2641,7 +2646,8 @@ cmd_bktest proc frame
     ; [rbp-24]=counter [rbp-32]=saved path [rbp-40]=unlock result
     lea     r10, [g_argv]
     mov     rax, qword ptr [r10+16]             ; argv[2] = vault path
-    mov     qword ptr [g_cfg_in], rax
+    mov     rcx, rax
+    call    cfg_in_set
     lea     r10, [bk_pw]                        ; fixed test password
     lea     r11, [g_cfg_pass]
     xor     ecx, ecx
@@ -2685,12 +2691,14 @@ bk_open:
     mov     dl, '1'
     call    vault_mkbak
     lea     rax, [g_bak_a]
-    mov     qword ptr [g_cfg_in], rax
+    mov     rcx, rax
+    call    cfg_in_set
     call    vault_unlock
     mov     dword ptr [rbp-40], eax
     call    vault_lock
     mov     rax, qword ptr [rbp-32]             ; restore the real path
-    mov     qword ptr [g_cfg_in], rax
+    mov     rcx, rax
+    call    cfg_in_set
     cmp     dword ptr [rbp-40], 0
     jne     bk_fail
     lea     rcx, [bk_ok]
@@ -2721,7 +2729,8 @@ cmd_mactest proc frame
     ; [rbp-24]=filebuf [rbp-32]=filesize [rbp-40]=result
     lea     r10, [g_argv]
     mov     rax, qword ptr [r10+16]
-    mov     qword ptr [g_cfg_in], rax
+    mov     rcx, rax
+    call    cfg_in_set
     lea     r10, [bk_pw]
     lea     r11, [g_cfg_pass]
     xor     ecx, ecx
@@ -2814,7 +2823,8 @@ cmd_rbtest proc frame
     FRAME_PROLOG 48
     lea     r10, [g_argv]
     mov     rax, qword ptr [r10+16]
-    mov     qword ptr [g_cfg_in], rax
+    mov     rcx, rax
+    call    cfg_in_set
     lea     r10, [bk_pw]
     lea     r11, [g_cfg_pass]
     xor     ecx, ecx
@@ -2883,7 +2893,8 @@ cmd_reload proc frame
     FRAME_PROLOG 48
     lea     r10, [g_argv]
     mov     rax, qword ptr [r10+16]             ; argv[2] = vault path
-    mov     qword ptr [g_cfg_in], rax
+    mov     rcx, rax
+    call    cfg_in_set
     lea     r10, [bk_pw]                        ; fixed test password
     lea     r11, [g_cfg_pass]
     xor     ecx, ecx
@@ -2952,7 +2963,8 @@ cmd_sysitemkat proc frame
     ; [rbp-24] = the stamp we plant and expect back; [rbp-48..-36] = vault_health out
     lea     r10, [g_argv]
     mov     rax, qword ptr [r10+16]             ; argv[2] = vault path
-    mov     qword ptr [g_cfg_in], rax
+    mov     rcx, rax
+    call    cfg_in_set
     lea     r10, [bk_pw]                        ; same fixed test password as cmd_reload
     lea     r11, [g_cfg_pass]
     xor     ecx, ecx
@@ -3121,7 +3133,8 @@ si_pdone:
     inc     r8d
     mov     word ptr [r11+r8*2], 0
     lea     rax, [g_vx_pathb]
-    mov     qword ptr [g_cfg_in], rax           ; child target
+    mov     rcx, rax
+    call    cfg_in_set           ; child target
     mov     rcx, qword ptr [g_body_ptr]         ; export the live body, text-only
     xor     edx, edx
     call    fed_export
@@ -3166,7 +3179,8 @@ cmd_vexselkat proc frame
     ; [rbp-24] = saved master body ptr, [rbp-32] = child path
     lea     r10, [g_argv]
     mov     rax, qword ptr [r10+16]             ; argv[2] = master vault path
-    mov     qword ptr [g_cfg_in], rax
+    mov     rcx, rax
+    call    cfg_in_set
     mov     r10, rax                            ; g_vx_pathb = <path> + ".exp"
     lea     r11, [g_vx_pathb]
     xor     r8d, r8d
@@ -3307,7 +3321,8 @@ xk_pw2d:
     call    vault_lock
     ; ---- the child: only the ticked user entries, under its own password ------
     mov     rax, qword ptr [rbp-32]
-    mov     qword ptr [g_cfg_in], rax
+    mov     rcx, rax
+    call    cfg_in_set
     call    vault_unlock                        ; g_cfg_pass is still the export password
     test    eax, eax
     jnz     xk_fail
@@ -3350,7 +3365,8 @@ cmd_c9kat proc frame
     ; [rbp-24] = a fixed "now"; [rbp-32] = now + 31 days; [rbp-40] = now + 35 days
     lea     r10, [g_argv]
     mov     rax, qword ptr [r10+16]
-    mov     qword ptr [g_cfg_in], rax
+    mov     rcx, rax
+    call    cfg_in_set
     lea     r10, [ffk_seedpw]
     lea     r11, [g_cfg_pass]
     xor     ecx, ecx
@@ -3492,7 +3508,8 @@ cmd_vimpkat proc frame
     ; [rbp-48]=filebuf [rbp-56]=filesize [rbp-64]=attidx_n
     lea     r10, [g_argv]
     mov     rax, qword ptr [r10+16]
-    mov     qword ptr [g_cfg_in], rax
+    mov     rcx, rax
+    call    cfg_in_set
     mov     r10, rax                            ; g_vx_pathb = <path> + ".src"
     lea     r11, [g_vx_pathb]
     xor     r8d, r8d
@@ -3517,7 +3534,8 @@ vi_pdone:
     lea     rax, [g_vx_pathb]
     mov     qword ptr [rbp-24], rax
     ; ---- source vault: 3 entries under its OWN password ----------------------
-    mov     qword ptr [g_cfg_in], rax
+    mov     rcx, rax
+    call    cfg_in_set
     lea     r10, [vxk_exppw]
     lea     r11, [g_cfg_pass]
     xor     ecx, ecx
@@ -3540,7 +3558,8 @@ vi_pw1d:
     ; ---- master vault: 2 entries, and leave it OPEN --------------------------
     lea     r10, [g_argv]
     mov     rax, qword ptr [r10+16]
-    mov     qword ptr [g_cfg_in], rax
+    mov     rcx, rax
+    call    cfg_in_set
     lea     r10, [ffk_seedpw]
     lea     r11, [g_cfg_pass]
     xor     ecx, ecx
@@ -3669,7 +3688,8 @@ cmd_cowrite proc frame
     FRAME_PROLOG 32
     lea     r10, [g_argv]
     mov     rax, qword ptr [r10+16]             ; argv[2] = a path (its ".lock" is used)
-    mov     qword ptr [g_cfg_in], rax
+    mov     rcx, rax
+    call    cfg_in_set
     call    vault_lock_acquire                  ; 1) must acquire
     cmp     eax, 1
     jne     cw_fail
@@ -3773,7 +3793,8 @@ cmd_xctest proc frame
     ; [rbp-24]=buf [rbp-32]=size
     lea     r10, [g_argv]
     mov     rax, qword ptr [r10+16]
-    mov     qword ptr [g_cfg_in], rax
+    mov     rcx, rax
+    call    cfg_in_set
     lea     r10, [bk_pw]
     lea     r11, [g_cfg_pass]
     xor     ecx, ecx
@@ -4678,7 +4699,8 @@ xs_next:
 xs_built:
     ; ---- point the seal machinery at the child ----------------------------
     mov     rax, qword ptr [rbp-24]
-    mov     qword ptr [g_cfg_in], rax
+    mov     rcx, rax
+    call    cfg_in_set
     mov     rax, qword ptr [rbp-72]
     mov     qword ptr [g_body_ptr], rax
     mov     rax, qword ptr [rbp-80]
@@ -4729,7 +4751,8 @@ xs_restore:
     mov     rax, qword ptr [rbp-40]
     mov     qword ptr [g_body_len], rax
     mov     rax, qword ptr [rbp-48]
-    mov     qword ptr [g_cfg_in], rax
+    mov     rcx, rax
+    call    cfg_in_set
     mov     rax, qword ptr [rbp-56]
     mov     qword ptr [g_save_counter], rax
     mov     rax, qword ptr [rbp-64]
@@ -4835,7 +4858,8 @@ vault_open_foreign proc frame
     call    copy_bytes
     ; ---- open the foreign file in place of the live one ----------------------
     mov     rax, qword ptr [rbp-24]
-    mov     qword ptr [g_cfg_in], rax
+    mov     rcx, rax
+    call    cfg_in_set
     lea     rcx, [g_cfg_pass]
     mov     rdx, qword ptr [rbp-32]
     mov     r8d, dword ptr [rbp-40]
@@ -4881,7 +4905,8 @@ vof_restore:
     mov     rax, qword ptr [rbp-64]
     mov     qword ptr [g_body_len], rax
     mov     rax, qword ptr [rbp-72]
-    mov     qword ptr [g_cfg_in], rax
+    mov     rcx, rax
+    call    cfg_in_set
     mov     rax, qword ptr [rbp-80]
     mov     qword ptr [g_save_counter], rax
     mov     rax, qword ptr [rbp-88]

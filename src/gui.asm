@@ -108,7 +108,7 @@ extern mem_alloc:proc
 extern mem_free:proc
 extern read_file:proc
 extern path_longify:proc                ; \\?\-prefix a path Win32 would refuse
-extern path_io:proc                     ; ...and the one used for g_cfg_in
+extern cfg_in_set:proc                  ; the ONLY way to set g_cfg_in
 extern write_file:proc
 extern ze_compose:proc                  ; encrypted-ZIP export composer (zipexport.asm)
 extern zi_stage:proc                    ; encrypted-ZIP import: stage titles (zipimport.asm)
@@ -1832,8 +1832,8 @@ gu_havepw:
     call    gui_status
     jmp     gu_done
 gu_pwok:
-    call    gui_vpath_io                     ; -> rax = the path Win32 accepts
-    mov     qword ptr [g_cfg_in], rax
+    lea     rcx, [g_vpath]
+    call    cfg_in_set
 gu_open:
     call    vault_unlock                    ; eax = 0 / EXIT_*
     mov     dword ptr [rbp-32], eax
@@ -2021,19 +2021,6 @@ gsof_have:
     FRAME_EPILOG
     ret
 gui_send_openfile endp
-
-; gui_vpath_io() -> rax = g_vpath in the form the file APIs will accept.
-;   Everything the vault layer opens - the vault, its .tmp, its .lock, its
-;   backups - is derived from the pointer handed to g_cfg_in, so converting here
-;   converts all of them, and a future file API added downstream inherits it
-;   without anyone remembering to.
-gui_vpath_io proc frame
-    FRAME_PROLOG 48
-    lea     rcx, [g_vpath]
-    call    path_io
-    FRAME_EPILOG
-    ret
-gui_vpath_io endp
 
 ; gui_exe_dir(rcx = dst wide, edx = cap chars) -> eax = 1 ok.  The directory the
 ;   running binary sits in, with the filename stripped.
@@ -13085,8 +13072,8 @@ gui_create_do endp
 gui_create_commit proc frame
     FRAME_PROLOG 112
     mov     qword ptr [rbp-24], rcx          ; owner hwnd (error box parent)
-    call    gui_vpath_io                     ; -> rax = the path Win32 accepts
-    mov     qword ptr [g_cfg_in], rax
+    lea     rcx, [g_vpath]
+    call    cfg_in_set
     ; never silently overwrite an existing vault file - confirm first
     lea     rcx, [g_vpath]
     call    gui_file_exists
@@ -16396,8 +16383,8 @@ gui_try_tpm_auto proc frame
     FRAME_PROLOG 32
     cmp     dword ptr [g_tpm_want], 0        ; TPM Unlock off (setting/HKLM) -> ask for password
     je      gta_no
-    call    gui_vpath_io                     ; -> rax = the path Win32 accepts
-    mov     qword ptr [g_cfg_in], rax
+    lea     rcx, [g_vpath]
+    call    cfg_in_set
     call    vault_tpm_has
     test    eax, eax
     jz      gta_no
@@ -16719,8 +16706,8 @@ go_askpw:
     ; user is parked on the private desktop with no shell and no way back.
     cmp     dword ptr [g_vpath_set], 0
     je      go_nopreload
-    call    gui_vpath_io                     ; -> rax = the path Win32 accepts
-    mov     qword ptr [g_cfg_in], rax
+    lea     rcx, [g_vpath]
+    call    cfg_in_set
     call    vault_preload
 go_nopreload:
     cmp     dword ptr [g_secunlock], 0     ; enter the master password on a private desktop?

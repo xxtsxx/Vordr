@@ -38,6 +38,34 @@ SETS = {
 }
 
 
+# g_cfg_in names the vault every file operation derives from - the vault itself,
+# its .tmp, its .lock, its .bak<n>.  It is set through cfg_in_set so that the
+# conversion to a Win32-usable path happens in exactly one place; a direct
+# assignment silently reintroduces the raw form for whichever flow does it.
+SOLE_SETTER = ("g_cfg_in", "cfg_in_set")
+ASSIGN = re.compile(r'^\s*mov\s+qword ptr \[' + SOLE_SETTER[0] + r'\]\s*,')
+
+
+def sole_setter_check():
+    bad = 0
+    for path in sorted(glob.glob(os.path.join(SRC, "*.asm"))):
+        base = os.path.basename(path)
+        cur = None
+        for i, raw in enumerate(open(path, encoding="latin-1").read().split("\n"), 1):
+            l = raw.split(";")[0]
+            m = re.match(r'^(\w+)\s+proc\b', l.strip())
+            if m:
+                cur = m.group(1)
+            elif re.match(r'^\w+\s+endp\b', l.strip()):
+                cur = None
+            if ASSIGN.match(l) and cur != SOLE_SETTER[1]:
+                bad += 1
+                print(f"[DIRECT SET] {base}:{i} assigns {SOLE_SETTER[0]} outside "
+                      f"{SOLE_SETTER[1]} - the path conversion would be skipped for "
+                      f"whatever flow reaches this line")
+    return bad
+
+
 def main():
     bad = total = 0
     for path in sorted(glob.glob(os.path.join(SRC, "*.asm"))):
@@ -57,6 +85,7 @@ def main():
                       f"{reg} happened to hold")
     print(f"wstrcheck: {bad} unbounded call site(s) across {total} bounded-copy call(s) "
           f"({'clean' if bad == 0 else 'UNBOUNDED COPY PRESENT'})")
+    bad += sole_setter_check()
     bad += floors.check("wstrcheck", {"calls": total})
     sys.exit(min(bad, 255))
 

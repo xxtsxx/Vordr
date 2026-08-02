@@ -86,7 +86,7 @@ endif
 
 extern con_init:proc
 extern print_a:proc
-extern path_io:proc                     ; g_cfg_in is always the Win32 form
+extern cfg_in_set:proc                  ; the ONLY way to set g_cfg_in
 extern print_u64:proc                   ; console.asm: rcx = u64 -> decimal stdout
 extern rng_fill:proc                    ; random.asm: rcx=buf, edx=len -> eax=1 ok
 extern pwgen_ex:proc                    ; styled password generator (pwgen.asm)
@@ -920,8 +920,7 @@ co_check:
     je      co_ok
     lea     r11, [g_positionals]
     mov     rcx, qword ptr [r11+0]
-    call    path_io                         ; long paths need the \\?\ form
-    mov     qword ptr [g_cfg_in], rax
+    call    cfg_in_set
 co_ok:
     mov     eax, EXIT_OK
     jmp     co_done
@@ -1115,9 +1114,8 @@ cmd_seedtest proc frame
     FRAME_PROLOG 48
     lea     r10, [g_argv]
     mov     rax, qword ptr [r10+16]           ; argv[2] = vault path
-    mov     rcx, rax                        ; long paths need the \\?\ form
-    call    path_io
-    mov     qword ptr [g_cfg_in], rax
+    mov     rcx, rax
+    call    cfg_in_set
     lea     r10, [seed_pw]                     ; fixed test password
     lea     r11, [g_cfg_pass]
     xor     ecx, ecx
@@ -1165,9 +1163,8 @@ cmd_layoutkat proc frame
     FRAME_PROLOG 64
     lea     r10, [g_argv]
     mov     rax, qword ptr [r10+16]            ; argv[2] = vault path
-    mov     rcx, rax                        ; long paths need the \\?\ form
-    call    path_io
-    mov     qword ptr [g_cfg_in], rax
+    mov     rcx, rax
+    call    cfg_in_set
     lea     r10, [seed_pw]                     ; the same fixed test password the
     lea     r11, [g_cfg_pass]                  ;   other probes seed vaults with
     xor     ecx, ecx
@@ -1254,9 +1251,8 @@ cmd_seedn proc frame
     FRAME_PROLOG 48
     lea     r10, [g_argv]
     mov     rax, qword ptr [r10+16]           ; argv[2] = vault path
-    mov     rcx, rax                        ; long paths need the \\?\ form
-    call    path_io
-    mov     qword ptr [g_cfg_in], rax
+    mov     rcx, rax
+    call    cfg_in_set
     lea     r10, [seed_pw]                    ; same fixed test password as seedtest
     lea     r11, [g_cfg_pass]
     xor     ecx, ecx
@@ -1342,9 +1338,8 @@ cmd_zitest proc frame
     FRAME_PROLOG 128
     lea     r10, [g_argv]
     mov     rax, qword ptr [r10+16]
-    mov     rcx, rax                        ; long paths need the \\?\ form
-    call    path_io
-    mov     qword ptr [g_cfg_in], rax
+    mov     rcx, rax
+    call    cfg_in_set
     lea     r10, [seed_pw]
     lea     r11, [g_cfg_pass]
     xor     ecx, ecx

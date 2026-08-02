@@ -8,6 +8,7 @@
 ; =============================================================================
 
 include macros.inc
+externdef g_cfg_in:qword                ; set ONLY through cfg_in_set below
 
 extern CreateFileW:proc
 extern GetLastError:proc
@@ -359,6 +360,38 @@ PATH_LONG_MIN   equ 248             ; MAX_PATH(260) less room for a "\name.tmp" 
 ;   converts all of them, and there is exactly one place to get it right.  The
 ;   copy is static and single-slot: g_cfg_in names one vault at a time, which is
 ;   the same assumption the rest of the vault layer already makes.
+; cfg_in_set(rcx = raw wide path) -> rax = the pointer now in g_cfg_in.
+;
+;   The ONE way g_cfg_in is set.  It used to be assigned directly in 37 places
+;   across three files, and after long-path support went in, some of those
+;   assignments stored a converted path and the rest stored a raw one.  Both
+;   worked - the consumers convert - but "is g_cfg_in raw?" had no single
+;   answer, and an invariant nobody can state is one that gets broken by the
+;   next change rather than by this one.
+;
+;   It preserves every volatile register.  Several of the 37 sites assign
+;   g_cfg_in in the middle of a sequence that has other things live, and making
+;   each of them prove it does not care is how a mechanical change turns into a
+;   bug hunt.  tools/wstrcheck.py fails the build on a direct assignment.
+public cfg_in_set
+cfg_in_set proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rdx
+    mov     qword ptr [rbp-32], r8
+    mov     qword ptr [rbp-40], r9
+    mov     qword ptr [rbp-48], r10
+    mov     qword ptr [rbp-56], r11
+    call    path_io
+    mov     qword ptr [g_cfg_in], rax
+    mov     rdx, qword ptr [rbp-24]
+    mov     r8,  qword ptr [rbp-32]
+    mov     r9,  qword ptr [rbp-40]
+    mov     r10, qword ptr [rbp-48]
+    mov     r11, qword ptr [rbp-56]
+    FRAME_EPILOG
+    ret
+cfg_in_set endp
+
 public path_io
 path_io proc frame
     FRAME_PROLOG 48
