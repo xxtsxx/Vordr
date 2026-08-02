@@ -25,6 +25,8 @@ extern DeleteFileW:proc
 extern CopyFileW:proc
 extern FlushFileBuffers:proc
 extern GetDiskFreeSpaceExW:proc
+extern GetFullPathNameW:proc            ; a relative long path must be resolved first
+extern GetCurrentDirectoryW:proc        ; ...and measured against what it resolves to
 extern secure_zero:proc
 
 MOVEFILE_REPLACE_EXISTING equ 1
@@ -404,11 +406,12 @@ path_io endp
 
 public path_longify
 path_longify proc frame
-    FRAME_PROLOG 64
+    FRAME_PROLOG 96                           ; locals to rbp-64, clear of the
+                                              ;   callee home area below them
     mov     qword ptr [rbp-24], rcx           ; src
     mov     qword ptr [rbp-32], rdx           ; dst
     mov     dword ptr [rbp-40], r8d           ; cap
-    ; ---- length, and the early outs ---------------------------------------
+    ; ---- length -----------------------------------------------------------
     mov     r10, rcx
     xor     r8d, r8d
 pl_len:
@@ -419,21 +422,48 @@ pl_len:
     jb      pl_len
 pl_have:
     mov     dword ptr [rbp-48], r8d           ; length in chars
-    cmp     r8d, PATH_LONG_MIN
-    jb      pl_asis                           ; short enough for the normal rules
+    ; ---- classify BEFORE deciding whether it is long ----------------------
+    ; The threshold cannot be applied to a relative path's own length: "v.vordr"
+    ; is seven characters and still resolves past MAX_PATH when the current
+    ; directory is deep, which is the ordinary way a relative long path happens.
+    ; A relative path is measured against the directory it will resolve against.
     mov     r10, qword ptr [rbp-24]
-    cmp     word ptr [r10], 5Ch               ; already "\\?\" ?
-    jne     pl_drive
+    cmp     word ptr [r10], 5Ch
+    jne     pl_cl_drive
     cmp     word ptr [r10+2], 5Ch
     jne     pl_asis                           ; a lone leading backslash: leave it
     cmp     word ptr [r10+4], '?'
     je      pl_asis                           ; already prefixed
+    mov     dword ptr [rbp-72], 1             ; kind = UNC
+    jmp     pl_measure
+pl_cl_drive:
+    cmp     word ptr [r10+2], ':'
+    jne     pl_cl_rel
+    cmp     word ptr [r10+4], 5Ch
+    jne     pl_cl_rel                         ; "X:name" is drive-relative
+    mov     dword ptr [rbp-72], 2             ; kind = drive-absolute
+    jmp     pl_measure
+pl_cl_rel:
+    mov     dword ptr [rbp-72], 3             ; kind = relative
+    WINCALL GetCurrentDirectoryW, 0, 0        ; -> chars needed, including the NUL
+    test    eax, eax
+    jz      pl_asis
+    add     eax, dword ptr [rbp-48]           ; + this path, + the separator the
+    mov     dword ptr [rbp-48], eax           ;   NUL already accounts for
+pl_measure:
+    mov     eax, dword ptr [rbp-48]
+    cmp     eax, PATH_LONG_MIN
+    jb      pl_asis                           ; short enough for the normal rules
+    cmp     dword ptr [rbp-72], 3
+    je      pl_rel
+    cmp     dword ptr [rbp-72], 1
+    jne     pl_drive
     ; ---- UNC: "\\server\..." -> "\\?\UNC\server\..." ----------------------
     mov     eax, dword ptr [rbp-48]
-    add     eax, 8                            ; "\\?\UNC\" is 8 chars, replacing "\\"
+    add     eax, 8
     cmp     eax, dword ptr [rbp-40]
     jae     pl_asis                           ; would not fit: unchanged, and it
-                                              ;   will fail as it did before
+                                              ;   fails exactly as it did before
     mov     rcx, qword ptr [rbp-32]
     lea     rdx, [pfx_unc]
     call    pl_copy
@@ -446,11 +476,6 @@ pl_have:
     ret
 pl_drive:
     ; ---- drive-absolute: "X:\..." -> "\\?\X:\..." -------------------------
-    mov     r10, qword ptr [rbp-24]
-    cmp     word ptr [r10+2], ':'
-    jne     pl_asis                           ; relative - cannot be prefixed
-    cmp     word ptr [r10+4], 5Ch
-    jne     pl_asis                           ; "X:name" is drive-relative
     mov     eax, dword ptr [rbp-48]
     add     eax, 5                            ; "\\?\" + NUL
     cmp     eax, dword ptr [rbp-40]
@@ -462,6 +487,56 @@ pl_drive:
     mov     rdx, qword ptr [rbp-24]
     call    pl_copy
     mov     rax, qword ptr [rbp-32]
+    FRAME_EPILOG
+    ret
+pl_rel:
+    ; ---- relative, and it resolves past what Win32 will take ---------------
+    ; "\\?\" requires a fully-qualified path, so a relative one has to be
+    ; resolved against the current directory first.
+    ;
+    ; GetFullPathNameW writes the result EIGHT CHARACTERS IN, which is the whole
+    ; trick: the longest prefix this proc ever adds is "\\?\UNC\", also eight, so
+    ; the room is already there and the prefix is written backwards into the gap.
+    ; Expanding at the start of the buffer would mean shifting the whole path
+    ; afterwards to make room for it.
+    mov     rax, qword ptr [rbp-32]
+    add     rax, 16                           ; dst + 8 chars
+    mov     qword ptr [rbp-64], rax
+    mov     eax, dword ptr [rbp-40]
+    sub     eax, 8                            ; the reserved head
+    mov     dword ptr [rbp-56], eax
+    WINCALL GetFullPathNameW, qword ptr [rbp-24], dword ptr [rbp-56], \
+            qword ptr [rbp-64], 0
+    test    eax, eax
+    jz      pl_asis                           ; could not resolve: unchanged
+    cmp     eax, dword ptr [rbp-56]
+    jae     pl_asis                           ; did not fit: unchanged
+    mov     r10, qword ptr [rbp-32]           ; dst
+    cmp     word ptr [r10+16], 5Ch            ; resolved to a UNC path?
+    jne     pl_rel_drive
+    cmp     word ptr [r10+18], 5Ch
+    jne     pl_rel_drive
+    ; "\\server\..." sits at char 8; write "\\?\UNC\" over chars 2..9 so the
+    ; "server" already at char 10 continues the string.
+    mov     word ptr [r10+4],  5Ch
+    mov     word ptr [r10+6],  5Ch
+    mov     word ptr [r10+8],  '?'
+    mov     word ptr [r10+10], 5Ch
+    mov     word ptr [r10+12], 'U'
+    mov     word ptr [r10+14], 'N'
+    mov     word ptr [r10+16], 'C'
+    mov     word ptr [r10+18], 5Ch
+    lea     rax, [r10+4]
+    FRAME_EPILOG
+    ret
+pl_rel_drive:
+    cmp     word ptr [r10+18], ':'            ; "X:\..." at char 8?
+    jne     pl_asis
+    mov     word ptr [r10+8],  5Ch            ; "\\?\" over chars 4..7
+    mov     word ptr [r10+10], 5Ch
+    mov     word ptr [r10+12], '?'
+    mov     word ptr [r10+14], 5Ch
+    lea     rax, [r10+8]
     FRAME_EPILOG
     ret
 pl_asis:
