@@ -50,6 +50,10 @@ FLOORS = {
         "dialogs": 13,                   # 15 at time of writing
         "controls": 140,                 # 160
     },
+    "wstrcheck": {
+        # call sites whose bound-carrying register was checked.
+        "calls": 25,                     # 29 at time of writing
+    },
     "deadcode": {
         "symbols": 2000,                 # 2305
     },

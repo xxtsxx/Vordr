@@ -8,7 +8,7 @@
 ;
 ;   reg_load_vault(rcx=dst wide, edx=cap chars) -> eax = 1 if a path was found
 ;   reg_save_vault(rcx=wide path) -> eax = 1/0   (writes HKCU\SOFTWARE\Vordr)
-;   cfg_default_vault(rcx=dst wide) -> eax = 1/0  (Documents\vault.vordr)
+;   cfg_default_vault(rcx=dst wide, edx=cap chars) -> eax = 1/0 (Documents\vault.vordr)
 ; =============================================================================
 
 include macros.inc
@@ -35,6 +35,11 @@ KEY_READ        equ 20019h
 KEY_WRITE       equ 20006h
 KEY_RW          equ 2001Fh          ; KEY_READ or KEY_WRITE (enumerate + delete values)
 CSIDL_PERSONAL  equ 5
+; "\Vordr" (6) + "ault.vordr" (12) + NUL, and the filename tail on its own.
+; Both appends are bounded against the caller's capacity using these.
+CDV_MIN_CHARS   equ 280        ; MAX_PATH (260) + the tail + slack
+CDV_TAIL_CHARS  equ 19
+CDV_FNAME_CHARS equ 13
 CFG_EXPAND_CCH  equ 1024        ; expansion scratch, in wide chars incl. the NUL
 
 .data
@@ -647,14 +652,31 @@ cfg_od_linked endp
 ;   falls back to "<Documents>\Vordr\vault.vordr".
 ; ===========================================================================
 public cfg_default_vault
+; The capacity used to be implicit: the proc appended "\Vordr" and
+; "ault.vordr" to whatever it had built and trusted the caller to have passed
+; something big enough.  Both callers do pass 1024 chars, so nothing was wrong -
+; but the contract lived only in the callers' heads, and a third caller with a
+; smaller buffer would have overflowed silently.  It is now a parameter, every
+; append is bounded by it, and a buffer too small to hold a path is refused
+; rather than half-filled.
 cfg_default_vault proc frame
     FRAME_PROLOG 64
     mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-32], edx           ; capacity, wide chars incl. the NUL
+    cmp     edx, CDV_MIN_CHARS                ; SHGetFolderPathW below writes up to
+    jb      cdv_no                            ;   MAX_PATH regardless of what we
+                                              ;   want, so a buffer that cannot
+                                              ;   hold MAX_PATH + the tail is
+                                              ;   refused before anything writes
     ; ---- prefer OneDrive if the %OneDrive% folder is configured -------------
-    WINCALL GetEnvironmentVariableW, addr env_onedrive, qword ptr [rbp-24], 980
+    ; leave room for the longest tail this proc appends: "\Vordr" + "ault.vordr"
+    mov     eax, dword ptr [rbp-32]
+    sub     eax, CDV_TAIL_CHARS
+    mov     dword ptr [rbp-40], eax           ; the most the env var may occupy
+    WINCALL GetEnvironmentVariableW, addr env_onedrive, qword ptr [rbp-24], dword ptr [rbp-40]
     test    eax, eax                         ; 0 = not set / error
     jz      cdv_docs
-    cmp     eax, 980                          ; too long to fit -> use Documents
+    cmp     eax, dword ptr [rbp-40]           ; too long to fit -> use Documents
     jae     cdv_docs
     ; the env var alone is not enough: require a linked sync account too,
     ; otherwise a dormant OneDrive would capture the vault
@@ -691,6 +713,10 @@ cdv_docs_end:
     inc     r8d
     jmp     cdv_docs_end
 cdv_docs_sub:
+    mov     eax, dword ptr [rbp-32]           ; room left after the prefix?
+    sub     eax, CDV_TAIL_CHARS
+    cmp     r8d, eax
+    jae     cdv_no
     lea     r10, [r11+r8*2]
     lea     r9, [onedrive_sub]                ; "\Vordr"
     xor     ecx, ecx
@@ -714,6 +740,10 @@ cdv_end:
     inc     r8d
     jmp     cdv_end
 cdv_app2:
+    mov     eax, dword ptr [rbp-32]
+    sub     eax, CDV_FNAME_CHARS
+    cmp     r8d, eax
+    jae     cdv_no
     lea     r10, [r11+r8*2]
     lea     r9, [cfg_fname]
     xor     ecx, ecx
@@ -726,6 +756,12 @@ cdv_cpy:
     jmp     cdv_cpy
 cdv_done:
     mov     eax, 1
+    FRAME_EPILOG
+    ret
+cdv_no:
+    mov     r10, qword ptr [rbp-24]           ; never hand back a half-built path
+    mov     word ptr [r10], 0
+    xor     eax, eax
     FRAME_EPILOG
     ret
 cdv_profile:

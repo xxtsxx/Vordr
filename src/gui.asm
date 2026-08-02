@@ -2128,6 +2128,7 @@ gvi_trim:
 gvi_default:
     ; no usable folder -> derive the default one (which creates it) and use that
     lea     rcx, [g_initdir]
+    mov     edx, 1024                       ; g_initdir's declared size
     call    cfg_default_vault
     test    eax, eax
     jz      gvi_none
@@ -2512,9 +2513,11 @@ gdh_vdraw:
     mov     qword ptr [rbp-240], rax
     lea     rcx, [g_katline]
     mov     rdx, qword ptr [rbp-240]
+    lea     r8, [g_katline + (96-1)*2]        ; last slot the NUL may occupy
     call    gui_wstrcpy
     mov     rcx, rax
     lea     rdx, [h_kat_suf]
+    lea     r8, [g_katline + (96-1)*2]        ; last slot the NUL may occupy
     call    gui_wstrcpy
     WINCALL DrawTextW, qword ptr [rbp-24], addr g_katline, -1, addr rbp-160, \
             DT_NAMEFLAGS
@@ -2644,9 +2647,11 @@ gsp2_have:
     mov     qword ptr [rbp-48], r9            ; survives the wstrcpy calls
     lea     rcx, [g_storagelabel]
     mov     rdx, qword ptr [rbp-48]
+    lea     r8, [g_storagelabel + (300-1)*2]        ; last slot the NUL may occupy
     call    gui_wstrcpy
     mov     rcx, rax
     lea     rdx, [s_stor_sep]                 ; " . "
+    lea     r8, [g_storagelabel + (300-1)*2]        ; last slot the NUL may occupy
     call    gui_wstrcpy
     mov     qword ptr [rbp-56], rax           ; append point
     lea     r10, [g_vpath]                    ; basename = text after the last \ or /
@@ -2667,6 +2672,7 @@ gsp2_bn_next:
 gsp2_bn_done:
     mov     rcx, qword ptr [rbp-56]
     mov     rdx, r11
+    lea     r8, [g_storagelabel + (300-1)*2]        ; last slot the NUL may occupy
     call    gui_wstrcpy
     lea     rax, [g_storagelabel]
     mov     r10, qword ptr [rbp-32]
@@ -8900,9 +8906,11 @@ guo_next:
 guo_bare:
     lea     rcx, [g_urlbuf2]                    ; target = "https://" + url
     lea     rdx, [url_https]
+    lea     r8, [g_urlbuf2 + (1040-1)*2]        ; last slot the NUL may occupy
     call    gui_wstrcpy
     mov     rcx, rax
     lea     rdx, [g_urlbuf]
+    lea     r8, [g_urlbuf2 + (1040-1)*2]        ; last slot the NUL may occupy
     call    gui_wstrcpy
     lea     rax, [g_urlbuf2]
     mov     qword ptr [rbp-48], rax
@@ -12081,6 +12089,7 @@ vp_init:
     mov     dword ptr [g_openfile_set], 0
     lea     rcx, [g_imgpath]
     lea     rdx, [g_openfile]
+    lea     r8, [g_imgpath + (1024-1)*2]        ; last slot the NUL may occupy
     call    gui_wstrcpy
     mov     dword ptr [g_imp_preset], 1
     WINCALL PostMessageW, qword ptr [rbp-8], WM_COMMAND, IDC_V_MIMPORT, 0
@@ -14818,17 +14827,38 @@ gop_done:
 gui_open_pwhist endp
 
 ; gui_wstrcpy(rcx=dst, rdx=src wide) -> rax = ptr to the terminating NUL in dst.  Leaf.
+; gui_wstrcpy(rcx = dst, rdx = src, r8 = last address the NUL may occupy)
+;   -> rax = the NUL it wrote, so appends chain through rcx.
+;
+;   r8 is the LIMIT, not a length: it is the address of the final writable wide
+;   char in the destination buffer, so the same value serves every call in an
+;   append chain no matter where each one starts.  Copies until the source's NUL
+;   or until the limit, and always terminates.
+;
+;   It used to copy until the NUL with no destination bound at all.  All 27 call
+;   sites were in fact safe, but three of them only by argument rather than by
+;   check - one relied on NTFS capping a path component at 255 characters, one on
+;   a buffer being sized 1024+16 for exactly this reason.  Those are the kind of
+;   invariants that hold until someone edits a declaration.  tools/wstrcheck.py
+;   fails the build if a call site does not set r8.
 gui_wstrcpy proc
-    xor     r8d, r8d
+    xor     r9d, r9d
 gwsc_l:
-    movzx   eax, word ptr [rdx+r8*2]
-    mov     word ptr [rcx+r8*2], ax
+    lea     rax, [rcx+r9*2]
+    cmp     rax, r8                           ; no room left for another char?
+    jae     gwsc_cut
+    movzx   eax, word ptr [rdx+r9*2]
+    mov     word ptr [rcx+r9*2], ax
     test    eax, eax
     jz      gwsc_d
-    inc     r8d
+    inc     r9d
     jmp     gwsc_l
+gwsc_cut:
+    mov     rax, r8                           ; truncate: terminate at the limit
+    mov     word ptr [rax], 0
+    ret
 gwsc_d:
-    lea     rax, [rcx+r8*2]
+    lea     rax, [rcx+r9*2]
     ret
 gui_wstrcpy endp
 
@@ -14884,33 +14914,40 @@ gui_show_health proc frame
 gsh_build:
     lea     rcx, [g_health_msgw]
     lea     rdx, [hb_l1]
+    lea     r8, [g_health_msgw + (200-1)*2]        ; last slot the NUL may occupy
     call    gui_wstrcpy                         ; "Entries: "
     mov     ecx, dword ptr [rbp-36]             ; total
     mov     rdx, rax
     call    gui_u32w
     mov     rcx, rax
     lea     rdx, [hb_crlf]
+    lea     r8, [g_health_msgw + (200-1)*2]        ; last slot the NUL may occupy
     call    gui_wstrcpy
     mov     rcx, rax
     lea     rdx, [hb_l2]
+    lea     r8, [g_health_msgw + (200-1)*2]        ; last slot the NUL may occupy
     call    gui_wstrcpy                         ; "Weak passwords: "
     mov     ecx, dword ptr [rbp-48]             ; weak
     mov     rdx, rax
     call    gui_u32w
     mov     rcx, rax
     lea     rdx, [hb_crlf]
+    lea     r8, [g_health_msgw + (200-1)*2]        ; last slot the NUL may occupy
     call    gui_wstrcpy
     mov     rcx, rax
     lea     rdx, [hb_l3]
+    lea     r8, [g_health_msgw + (200-1)*2]        ; last slot the NUL may occupy
     call    gui_wstrcpy                         ; "Reused passwords: "
     mov     ecx, dword ptr [rbp-44]             ; reused
     mov     rdx, rax
     call    gui_u32w
     mov     rcx, rax
     lea     rdx, [hb_crlf]
+    lea     r8, [g_health_msgw + (200-1)*2]        ; last slot the NUL may occupy
     call    gui_wstrcpy
     mov     rcx, rax
     lea     rdx, [hb_l4]
+    lea     r8, [g_health_msgw + (200-1)*2]        ; last slot the NUL may occupy
     call    gui_wstrcpy                         ; "Unchanged over a year: "
     mov     ecx, dword ptr [rbp-40]             ; old
     mov     rdx, rax
@@ -14932,27 +14969,33 @@ gui_seclock_warn proc frame
     mov     qword ptr [rbp-24], rcx
     lea     rcx, [g_lockmsg]
     lea     rdx, [s_nolock]
+    lea     r8, [g_lockmsg + (400-1)*2]        ; last slot the NUL may occupy
     call    gui_wstrcpy
     mov     rcx, rax
     lea     rdx, [hb_crlf]
+    lea     r8, [g_lockmsg + (400-1)*2]        ; last slot the NUL may occupy
     call    gui_wstrcpy
     mov     rcx, rax
     lea     rdx, [hb_crlf]
+    lea     r8, [g_lockmsg + (400-1)*2]        ; last slot the NUL may occupy
     call    gui_wstrcpy                         ; blank line
     mov     rcx, rax
     lea     rdx, [s_lkdiag1]                    ; "Diagnostic - VirtualLock error "
+    lea     r8, [g_lockmsg + (400-1)*2]        ; last slot the NUL may occupy
     call    gui_wstrcpy
     mov     ecx, dword ptr [g_lockerr_vl]
     mov     rdx, rax
     call    gui_u32w
     mov     rcx, rax
     lea     rdx, [s_lkdiag2]                    ; ", working-set-grow error "
+    lea     r8, [g_lockmsg + (400-1)*2]        ; last slot the NUL may occupy
     call    gui_wstrcpy
     mov     ecx, dword ptr [g_lockerr_wss]
     mov     rdx, rax
     call    gui_u32w
     mov     rcx, rax
     lea     rdx, [s_lkdiag3]                    ; ". (VirtualLock is limited by ...)"
+    lea     r8, [g_lockmsg + (400-1)*2]        ; last slot the NUL may occupy
     call    gui_wstrcpy
     WINCALL gui_msgbox, qword ptr [rbp-24], addr g_lockmsg, addr t_nolock, \
             <MB_OK or MB_ICONWARNING>
@@ -15127,12 +15170,14 @@ gim_ok:
     call    gui_poplist
     lea     rcx, [g_imp_msgw]                   ; "Imported N entries."
     lea     rdx, [imp_g_pre]
+    lea     r8, [g_imp_msgw + (160-1)*2]        ; last slot the NUL may occupy
     call    gui_wstrcpy
     mov     ecx, dword ptr [rbp-64]
     mov     rdx, rax
     call    gui_u32w
     mov     rcx, rax
     lea     rdx, [imp_g_post]
+    lea     r8, [g_imp_msgw + (160-1)*2]        ; last slot the NUL may occupy
     call    gui_wstrcpy
     WINCALL gui_msgbox, qword ptr [rbp-24], addr g_imp_msgw, addr imp_g_title, 040h
     jmp     gim_done
@@ -15205,11 +15250,13 @@ gui_pg_sync proc frame
     ; style button
     lea     rcx, [g_pg_tmpw]
     lea     rdx, [pg_style_pre]
+    lea     r8, [g_pg_tmpw + (128-1)*2]        ; last slot the NUL may occupy
     call    gui_wstrcpy
     mov     rcx, rax
     mov     eax, dword ptr [g_pg_style]
     lea     r10, [pg_snames]
     mov     rdx, qword ptr [r10+rax*8]
+    lea     r8, [g_pg_tmpw + (128-1)*2]        ; last slot the NUL may occupy
     call    gui_wstrcpy
     WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_PG_STYLE, addr g_pg_tmpw
     ; length readout
@@ -15258,8 +15305,9 @@ pgr_bits:
     mov     ecx, dword ptr [g_pg_bits]
     lea     rdx, [g_pg_tmpw]
     call    gui_u32w
-    mov     rcx, rax
+    mov     rcx, rax                          ; append after the digits gui_u32w wrote
     lea     rdx, [pg_bits_suf]
+    lea     r8, [g_pg_tmpw + (128-1)*2]       ; last slot the NUL may occupy
     call    gui_wstrcpy
     WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_PG_BITS, addr g_pg_tmpw
     FRAME_EPILOG
@@ -16288,6 +16336,7 @@ gui_resolve_vault proc frame
     jnz     grv_havepath
     ; nothing in the registry -> fall back to the default Documents\vault.vordr
     lea     rcx, [g_vpath]
+    mov     edx, 1024                       ; g_vpath's declared size
     call    cfg_default_vault
     test    eax, eax
     jz      grv_none
@@ -17310,6 +17359,7 @@ twp_copydata:
     WINCALL SetForegroundWindow, qword ptr [g_vaulthwnd]
     lea     rcx, [g_imgpath]                    ; arm the import BEFORE posting it
     lea     rdx, [g_openfile]
+    lea     r8, [g_imgpath + (1024-1)*2]        ; last slot the NUL may occupy
     call    gui_wstrcpy
     mov     dword ptr [g_imp_preset], 1
     mov     dword ptr [g_openfile_set], 0

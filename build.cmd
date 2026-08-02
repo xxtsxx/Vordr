@@ -148,6 +148,15 @@ if errorlevel 1 (
     )
     echo rccheck: WARNING - layout findings above; build continues. Use "build strict" to gate.
 )
+echo === wstrcheck ===
+python tools\wstrcheck.py
+if errorlevel 1 (
+    if "%STRICT%"=="1" (
+        echo wstrcheck: a bounded copy called without its bound - failing strict build
+        goto :failed
+    )
+    echo wstrcheck: WARNING - unbounded call sites above; build continues. Use "build strict" to gate.
+)
 echo === aligncheck ===
 python tools\aligncheck.py
 if errorlevel 1 (
