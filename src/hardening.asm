@@ -81,7 +81,6 @@ g_crash_h       dq 0                    ; breadcrumb file handle
 g_crash_nw      dd 0                    ; WriteFile bytes-written out
 g_crash_dumped  db 0                    ; reentry guard: dump once
 align 2
-g_crashpath     dw MAX_PATH_CHARS dup (?)  ; %TEMP%\vordr_crash.bin
 
 SEM_FAILCRITICALERRORS  equ 1
 SEM_NOGPFAULTERRORBOX   equ 2
@@ -532,6 +531,11 @@ tagged_check endp
 ;   constant-time compare must stay within 2x.  exit 0 = pass, 1 = fail.
 ; =============================================================================
 .data?
+align 2
+; .data? and not .data: "dup (?)" in an initialised section emits the bytes.
+; This was 260 chars until long paths went in; at MAX_PATH_CHARS it put 64 KB
+; of zeros in the image for a path that is only ever under %TEMP%.
+g_crashpath     dw MAX_PATH_CHARS dup (?)  ; %TEMP%\vordr_crash.bin
 ctt_a   db 4096 dup (?)
 ctt_b   db 4096 dup (?)
 

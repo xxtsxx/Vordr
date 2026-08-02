@@ -56,6 +56,25 @@ public g_wf_disp
 g_wf_disp   dd ?                       ; C7: one-shot write_file disposition override
 align 2                               ;     (0 = CREATE_ALWAYS default; caller sets CREATE_NEW)
 
+; These are single-slot and process-wide.  That is safe because file work is
+; serialised: the only worker thread (secdesk) runs while the main thread blocks
+; waiting for it, so one caller is in here at a time.  The exception is the
+; watchdog's orphan path in gui_secdesk_show - see the comment there - where an
+; abandoned worker keeps running; in that window these are shared, along with
+; every other piece of vault state, and the answer is not a lock on these.
+;
+; .data? and not .data.  "dup (?)" in an INITIALISED section is not a promise
+; to leave the bytes alone - it emits them.  Five 64 KB buffers put 320 KB of
+; zeros in the image and nearly doubled the exe.  Uninitialised data costs
+; virtual size only.
+align 2
+ci_path     dw (MAX_PATH_CHARS + 16) dup (?)   ; the vault path g_cfg_in points at
+fr_from     dw (MAX_PATH_CHARS + 16) dup (?)   ; file_rename's two paths are live at
+fr_to       dw (MAX_PATH_CHARS + 16) dup (?)   ;   the same time, so two buffers
+rf_path     dw (MAX_PATH_CHARS + 16) dup (?)   ; read_file's Win32-form path
+wf_path     dw (MAX_PATH_CHARS + 16) dup (?)   ; write_file's, kept separate so a
+                                               ;   read during a write cannot share it
+
 .code
 
 
@@ -316,19 +335,6 @@ file_rename endp
 
 .data
 align 2
-align 2
-; These are single-slot and process-wide.  That is safe because file work is
-; serialised: the only worker thread (secdesk) runs while the main thread blocks
-; waiting for it, so one caller is in here at a time.  The exception is the
-; watchdog's orphan path in gui_secdesk_show - see the comment there - where an
-; abandoned worker keeps running; in that window these are shared, along with
-; every other piece of vault state, and the answer is not a lock on these.
-ci_path     dw (MAX_PATH_CHARS + 16) dup (?)   ; the vault path g_cfg_in points at
-fr_from     dw (MAX_PATH_CHARS + 16) dup (?)   ; file_rename's two paths are live at
-fr_to       dw (MAX_PATH_CHARS + 16) dup (?)   ;   the same time, so two buffers
-rf_path     dw (MAX_PATH_CHARS + 16) dup (?)   ; read_file's Win32-form path
-wf_path     dw (MAX_PATH_CHARS + 16) dup (?)   ; write_file's, kept separate so a
-                                               ;   read during a write cannot share it
 pfx_q       dw 5Ch,5Ch,'?',5Ch,0                     ; "\\?\"
 pfx_unc     dw 5Ch,5Ch,'?',5Ch,'U','N','C',5Ch,0     ; "\\?\UNC\"
 
