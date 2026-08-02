@@ -41,6 +41,18 @@ $Publisher  = "Thomas Smistad"
 $RepoUrl    = "https://github.com/xxtsxx/Vordr"
 $ManifestVer = "1.6.0"
 
+
+# winget-pkgs validation requires CRLF and rejects a manifest without it
+# (Validation-Line-Endings-Error).  A here-string carries whatever line endings
+# the SCRIPT FILE has, and this one is stored LF - so the first submission went
+# up as LF and failed.  Normalise on write rather than depending on how this file
+# happens to be saved, which is not a property anyone checks when editing it.
+function Write-Manifest([string]$Path, [string]$Text) {
+    $crlf = ($Text -replace "`r`n", "`n") -replace "`n", "`r`n"
+    $utf8bom = New-Object System.Text.UTF8Encoding $true
+    [System.IO.File]::WriteAllText($Path, $crlf + "`r`n", $utf8bom)
+}
+
 if (-not $Msi) {
     $found = Get-ChildItem "bin\vordr-*.msi" -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $found) { throw "no bin\vordr-*.msi - run tools\make_msi.ps1 first" }
@@ -92,7 +104,7 @@ PackageVersion: $version
 DefaultLocale: en-US
 ManifestType: version
 ManifestVersion: $ManifestVer
-"@ | Set-Content (Join-Path $dir "$PackageId.yaml") -Encoding utf8
+"@ | ForEach-Object { Write-Manifest (Join-Path $dir "$PackageId.yaml") $_ }
 
 # Scope machine + /qn: the package is per-machine and a silent install from an
 # unelevated shell fails with 1925, so winget must run it elevated - which it
@@ -120,7 +132,7 @@ Installers:
   InstallerSha256: $sha
 ManifestType: installer
 ManifestVersion: $ManifestVer
-"@ | Set-Content (Join-Path $dir "$PackageId.installer.yaml") -Encoding utf8
+"@ | ForEach-Object { Write-Manifest (Join-Path $dir "$PackageId.installer.yaml") $_ }
 
 @"
 $header
@@ -150,7 +162,7 @@ Tags:
 ReleaseNotesUrl: $RepoUrl/releases/tag/v$version
 ManifestType: defaultLocale
 ManifestVersion: $ManifestVer
-"@ | Set-Content (Join-Path $dir "$PackageId.locale.en-US.yaml") -Encoding utf8
+"@ | ForEach-Object { Write-Manifest (Join-Path $dir "$PackageId.locale.en-US.yaml") $_ }
 
 Write-Host ""
 Write-Host "  manifests   : $dir"
