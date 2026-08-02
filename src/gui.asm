@@ -16610,6 +16610,19 @@ gss_wait:
     ; Wedged.  Hand the user their desktop back and abandon the worker.  Deliberately
     ; leak the desktop and thread handles: the worker is still inside the dialog and
     ; would use them, and two leaked handles cost far less than a stranded user.
+    ;
+    ; THIS IS THE ONE WINDOW IN WHICH TWO THREADS RUN APPLICATION CODE AT ONCE.
+    ; Everywhere else the main thread is parked in the wait above, and that is what
+    ; lets everything process-wide be shared without a lock: the shadow-stack swap in
+    ; secdesk_thread, g_cfg_in, g_cfg_pass, g_hdr, g_body_ptr, and fileio.asm's
+    ; single-slot path buffers.  Past this line an orphaned worker can still finish
+    ; its dialog and reach vault_unlock, and it shares all of that with the main
+    ; thread - so none of those are safe here, not merely some of them.
+    ;
+    ; Locking one of them would make the code look safer than it is.  The question to
+    ; answer, if this is ever closed, is whether a worker the watchdog has given up on
+    ; should be allowed to touch vault state at all - it already knows, via
+    ; g_secdesk_orphan, that nobody is waiting for its answer.
     mov     dword ptr [g_secdesk_orphan], 1
     call    secdesk_restore
     mov     qword ptr [g_secdesk_res], 0         ; treat as cancelled
