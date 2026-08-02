@@ -355,6 +355,13 @@ pfx_unc     dw 5Ch,5Ch,'?',5Ch,'U','N','C',5Ch,0     ; "\\?\UNC\"
 ; path) and is returned unchanged; so is one that is already prefixed.
 ; =============================================================================
 PATH_LONG_MIN   equ 248             ; MAX_PATH(260) less room for a "\name.tmp" tail
+; The smallest destination this will write into.  pl_rel subtracts the 8-char
+; prefix head from the caller's capacity and hands the remainder to
+; GetFullPathNameW as nBufferLength - so a capacity under 8 would wrap to
+; ~4 billion and invite it to write as far as it liked.  Every caller passes
+; MAX_PATH_CHARS + 16, but that is a fact about the callers, not a property of
+; this proc, and it is the callers that change.
+PATH_MIN_CAP    equ 32
 
 ; path_io(rcx = raw wide path) -> rax = the path to store in g_cfg_in.
 ;   Everything the vault layer touches is derived from g_cfg_in as a string -
@@ -411,6 +418,8 @@ path_longify proc frame
     mov     qword ptr [rbp-24], rcx           ; src
     mov     qword ptr [rbp-32], rdx           ; dst
     mov     dword ptr [rbp-40], r8d           ; cap
+    cmp     r8d, PATH_MIN_CAP                 ; too small to build anything in:
+    jb      pl_asis                           ;   hand the path back untouched
     ; ---- length -----------------------------------------------------------
     mov     r10, rcx
     xor     r8d, r8d
