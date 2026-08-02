@@ -244,6 +244,11 @@ CSTR e_oom,     "error: out of memory",13,10
 CSTR m_created, "vault created.",13,10
 
 .data?
+align 2
+; convcap's scratch output buffer - written by every caller before it is read,
+; so it needs no initial contents.  In .data it was 4 KB of zeros in the image;
+; aligncheck now refuses a "dup (?)" array this size in an initialised section.
+cvc_out db 4096 dup (?)
 align 16
 g_vx_pathb  dw MAX_PATH_CHARS dup (?)  ; vaultexportkat: export target path (source + ".exp")
 align 16
@@ -7169,7 +7174,6 @@ align 2
 cvc_hi  dw 'h','i',0
 cvc_mt  dw 0
 cvc_big dw 300 dup ('A'), 0                 ; 300 chars into a 64-byte buffer
-cvc_out db 4096 dup (?)
 .code
 LANDING_PAD
 public cmd_convcap

@@ -38,6 +38,57 @@ ALLOWLIST = {
 
 DIRECTIVE_SIZE = {"db": 1, "dw": 2, "dd": 4, "dq": 8, "dt": 10,
                   "byte": 1, "word": 2, "dword": 4, "qword": 8}
+
+# --- second rule: big uninitialised arrays belong in .data? -----------------
+# "dup (?)" reads like a declaration of intent not to initialise, but in an
+# INITIALISED section the assembler emits the bytes anyway.  Six path buffers
+# grown to MAX_PATH_CHARS landed in .data and put 394 KB of zeros in the image -
+# the exe more than doubled for a change that added 1.5 KB of code.  It built,
+# it ran, every gate passed; the only symptom was the file size, which for a
+# project that publishes a reproducible hash is not a symptom to leave lying
+# around.
+#
+# Small ones are not worth the noise: a scalar or a short scratch in .data costs
+# nothing and moving it would churn code for no gain.
+BSS_MIN_BYTES = 4096
+DUP_DECL = re.compile(r'^(\w+)\s+(db|dw|dd|dq)\s+(.+?)\s+dup\s*\(\s*\?\s*\)', re.I)
+COUNT_CONST = {"MAX_PATH_CHARS": 32768}
+
+
+def dup_bytes(count_expr, unit):
+    """Byte size of a `N dup (?)`, where N may be a known constant expression."""
+    expr = count_expr.strip()
+    for name, val in COUNT_CONST.items():
+        expr = expr.replace(name, str(val))
+    if not re.fullmatch(r'[\d\s()+\-*]+', expr):
+        return None
+    try:
+        return eval(expr, {"__builtins__": {}}, {}) * unit    # digits and + - * ( ) only
+    except Exception:
+        return None
+
+
+def scan_sections(path, results):
+    """Flag `N dup (?)` arrays of BSS_MIN_BYTES or more sitting in .data."""
+    sec = None
+    for ln, raw in enumerate(open(path, encoding="latin-1").read().split("\n"), 1):
+        code = raw.split(";")[0].rstrip()
+        t = code.strip()
+        low = t.lower()
+        if low in (".data", ".data?", ".code", ".const"):
+            sec = low
+            continue
+        if sec != ".data":
+            continue
+        m = DUP_DECL.match(t)
+        if not m:
+            continue
+        n = dup_bytes(m.group(3), DIRECTIVE_SIZE[m.group(2).lower()])
+        if n is not None and n >= BSS_MIN_BYTES:
+            results.append(("initialised-bss", os.path.basename(path), ln, m.group(1),
+                            m.group(2),  0,
+                            f"{n} bytes of `dup (?)` in .data - the assembler emits every "
+                            f"one of them into the image; .data? costs virtual size only"))
 LABEL_ALIGN   = {"db": 1, "dw": 2, "dd": 4, "dq": 8, "dt": 4,
                  "byte": 1, "word": 2, "dword": 4, "qword": 8}
 
@@ -192,17 +243,25 @@ def main():
     for f in sorted(glob.glob(os.path.join(args.src, "*.asm"))) + \
              sorted(glob.glob(os.path.join(args.src, "*.inc"))):
         scan_file(f, results)
+        scan_sections(f, results)
     n_str = 0
     n_scalar = 0
+    n_bss = 0
     for cat, fname, line, name, kind, off, msg in results:
         if name in ALLOWLIST: continue
+        if cat == "initialised-bss":
+            n_bss += 1
+            print(f"[BLOAT] {fname}:{line} {name}: {msg}")
+            continue
         if cat == "scalar" and not args.scalars:
             n_scalar += 1
             continue
         if cat == "string": n_str += 1
         else: n_scalar += 1
         print(f"[{cat}] {fname}:{line} {name}: {msg}")
-    print(f"aligncheck: {n_str} misaligned strings"
+    n_str += n_bss
+    print(f"aligncheck: {n_str - n_bss} misaligned strings"
+          + (f", {n_bss} oversized .data array(s)" if n_bss else "")
           + (f", {n_scalar} scalars (review)" if n_scalar else "")
           + f" ({'clean' if n_str == 0 else 'MISALIGNMENT PRESENT'})")
     n_str += floors.check("aligncheck", {"scalars": n_scalar})
