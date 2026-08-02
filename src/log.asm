@@ -79,7 +79,7 @@ CSTR sep_crlf,   13,10
 align 16
 g_logline   db LINELEN dup (?)        ; assembled UTF-8 line
 align 2
-g_logpath   dw 1024 dup (?)           ; resolved default log path
+g_logpath   dw MAX_PATH_CHARS dup (?)  ; resolved default log path
 g_systime   db 16 dup (?)             ; SYSTEMTIME
 g_logwrote  dd ?
 
@@ -194,7 +194,7 @@ log_open proc frame
     mov     qword ptr [rbp-32], rax
     jmp     lo_open
 lo_default:
-    WINCALL GetEnvironmentVariableW, addr w_localappdata, addr g_logpath, 1024
+    WINCALL GetEnvironmentVariableW, addr w_localappdata, addr g_logpath, MAX_PATH_CHARS-64
     test    eax, eax
     jz      lo_fail
     cmp     eax, 1000                   ; value didn't fit (returns required size), or

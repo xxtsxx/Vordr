@@ -107,6 +107,8 @@ extern attach_open:proc
 extern mem_alloc:proc
 extern mem_free:proc
 extern read_file:proc
+extern path_longify:proc                ; \\?\-prefix a path Win32 would refuse
+extern path_io:proc                     ; ...and the one used for g_cfg_in
 extern write_file:proc
 extern ze_compose:proc                  ; encrypted-ZIP export composer (zipexport.asm)
 extern zi_stage:proc                    ; encrypted-ZIP import: stage titles (zipimport.asm)
@@ -1485,13 +1487,13 @@ g_home_alert dd ?                     ; 1 = this tile's count is a finding, not 
 g_home_numw  dw 16 dup (?)            ; one stat rendered as digits
 g_katline    dw 96 dup (?)            ; "<n> known-answer tests verified at launch"
 align 8
-g_openfile     dw 1024 dup (?)        ; .vordr handed to us by the shell, to IMPORT
+g_openfile     dw MAX_PATH_CHARS dup (?)  ; .vordr handed to us by the shell, to IMPORT
 g_openfile_set dd ?                   ; 1 = an import is pending for the open vault
 g_imp_preset   dd ?                   ; 1 = gui_import must use g_imgpath as-is
 align 8
 g_cds          db 24 dup (?)          ; COPYDATASTRUCT {dwData, cbData, pad, lpData}
-g_exedir    dw 1024 dup (?)           ; folder holding vordr.exe
-g_initdir   dw 1024 dup (?)           ; explicit start folder for the vault picker
+g_exedir    dw MAX_PATH_CHARS dup (?)  ; folder holding vordr.exe
+g_initdir   dw MAX_PATH_CHARS dup (?)  ; explicit start folder for the vault picker
 align 8
 ; The software shadow stack (g_sstk_base/g_sstk_index) is a process-global, but
 ; the Secure-Unlock dialog runs on a SEPARATE worker thread (secdesk_thread) that
@@ -1572,7 +1574,13 @@ align 4
 g_search_len dd ?                     ; active query length in chars (0 = no query -> title sort)
 g_entry_score dd SCORE_CAP dup (?)    ; fuzzy score per vault index (for score-descending sort)
 public g_vpath, g_is_default, g_vault_lock  ; live vault path / default-loc flag / share lock
-g_vpath     dw 1024 dup (?)        ; chosen vault path (wide, NUL-terminated)
+g_vpath     dw MAX_PATH_CHARS dup (?)  ; chosen vault path (wide, NUL-terminated)
+align 2
+; g_vpath stays exactly as the user typed it - that is what the UI shows and what
+; goes in the registry.  The Win32-usable form lives in fileio.asm, behind
+; path_io, so there is one copy and one owner; this is only the scratch that
+; gui_vault_file_ok needs to validate a file WITHOUT disturbing it.
+g_vfok_io   dw (MAX_PATH_CHARS + 16) dup (?)
 g_xlpw      dw 256 dup (?)         ; export password (wide; wiped after use)
 g_xlpw2     dw 256 dup (?)         ; export confirm password (wide; wiped)
 g_xlpwlen   dd ?                   ; export password length in bytes
@@ -1712,13 +1720,13 @@ g_settings_hwnd dq ?                       ; the settings child dialog (0 = not 
                                            ;   array (docs/SETTINGS_DESIGN.md)
 g_exp_iszip   dd ?                         ; export format the user chose: 0 = .vordr, 1 = .zip
                                            ;   (from the save dialog's filter index)
-g_tmpfile     dw 1024 dup (?)              ; temp path for opening an attachment (wide)
+g_tmpfile     dw MAX_PATH_CHARS dup (?)    ; temp path for opening an attachment (wide)
 align 8
 g_tempfiles   db MAX_TEMPFILES*TEMPREC dup (?)  ; tracked decrypt-to-temp paths + sizes
 g_tempfile_n  dd ?                         ; number of live tracked temp files
 g_wipezeros   db WIPE_CHUNK dup (?)        ; source of zeros for overwriting temp files
 align 2
-g_imgpath     dw 1024 dup (?)             ; import/export file path (wide)
+g_imgpath     dw MAX_PATH_CHARS dup (?)   ; import/export file path (wide)
 g_valblob   dw 32768 dup (?)          ; commit scratch: field values, NUL-joined
 g_lblblob   dw LBLBLOB_W dup (?)      ; commit scratch: custom labels, NUL-joined
 g_rlabel    dw 128 dup (?)            ; per-row label read scratch
@@ -1824,7 +1832,7 @@ gu_havepw:
     call    gui_status
     jmp     gu_done
 gu_pwok:
-    lea     rax, [g_vpath]
+    call    gui_vpath_io                     ; -> rax = the path Win32 accepts
     mov     qword ptr [g_cfg_in], rax
 gu_open:
     call    vault_unlock                    ; eax = 0 / EXIT_*
@@ -1890,6 +1898,12 @@ gui_vault_file_ok proc frame
     mov     qword ptr [rbp-24], rcx
     mov     dword ptr [rbp-32], 0                ; magic lands here
     mov     qword ptr [rbp-40], 0                ; bytes read
+    ; the shell can hand us a path longer than Win32 accepts unprefixed
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [g_vfok_io]                    ; its own scratch: validating a file
+    mov     r8d, MAX_PATH_CHARS + 16            ;   must not disturb the open vault's
+    call    path_longify                        ;   path
+    mov     qword ptr [rbp-24], rax
     WINCALL GetFileAttributesW, qword ptr [rbp-24]
     cmp     eax, -1
     je      gvfo_no
@@ -1941,7 +1955,7 @@ gso_cpy:
     test    ax, ax
     jz      gso_done
     inc     r8d
-    cmp     r8d, 1022
+    cmp     r8d, MAX_PATH_CHARS-2
     jb      gso_cpy
     mov     word ptr [r10], 0                    ; too long: reject outright rather
     jmp     gso_no                               ;   than import a truncated path
@@ -2007,6 +2021,19 @@ gsof_have:
     FRAME_EPILOG
     ret
 gui_send_openfile endp
+
+; gui_vpath_io() -> rax = g_vpath in the form the file APIs will accept.
+;   Everything the vault layer opens - the vault, its .tmp, its .lock, its
+;   backups - is derived from the pointer handed to g_cfg_in, so converting here
+;   converts all of them, and a future file API added downstream inherits it
+;   without anyone remembering to.
+gui_vpath_io proc frame
+    FRAME_PROLOG 48
+    lea     rcx, [g_vpath]
+    call    path_io
+    FRAME_EPILOG
+    ret
+gui_vpath_io endp
 
 ; gui_exe_dir(rcx = dst wide, edx = cap chars) -> eax = 1 ok.  The directory the
 ;   running binary sits in, with the filename stripped.
@@ -2128,7 +2155,7 @@ gvi_trim:
 gvi_default:
     ; no usable folder -> derive the default one (which creates it) and use that
     lea     rcx, [g_initdir]
-    mov     edx, 1024                       ; g_initdir's declared size
+    mov     edx, MAX_PATH_CHARS             ; g_initdir's declared size
     call    cfg_default_vault
     test    eax, eax
     jz      gvi_none
@@ -2167,7 +2194,7 @@ gui_vault_initdir endp
 gui_exe_dir_check proc frame
     FRAME_PROLOG 48
     lea     rcx, [g_exedir]
-    mov     edx, 1000
+    mov     edx, MAX_PATH_CHARS-24          ; room for the name this appends below
     call    gui_exe_dir
     test    eax, eax
     jnz     gedc_have
@@ -2752,7 +2779,7 @@ gui_pick_vault proc frame
     mov     qword ptr [r10].OPENFILENAMEW.lpstrFilter, rax
     lea     rax, [g_vpath]                    ; prefilled -> dialog opens at its folder
     mov     qword ptr [r10].OPENFILENAMEW.lpstrFile, rax
-    mov     dword ptr [r10].OPENFILENAMEW.nMaxFile, 1024
+    mov     dword ptr [r10].OPENFILENAMEW.nMaxFile, MAX_PATH_CHARS
     mov     dword ptr [r10].OPENFILENAMEW.nFilterIndex, 1
     mov     dword ptr [r10].OPENFILENAMEW.Flags, OFN_PATHMUSTEXIST or OFN_HIDEREADONLY or OFN_EXPLORER
     call    gui_vault_initdir                 ; never let comdlg32 fall back to the CWD
@@ -7622,7 +7649,7 @@ img_pick proc frame
 @@: mov     qword ptr [r10].OPENFILENAMEW.lpstrFilter, rax
     lea     rax, [g_imgpath]
     mov     qword ptr [r10].OPENFILENAMEW.lpstrFile, rax
-    mov     dword ptr [r10].OPENFILENAMEW.nMaxFile, 1024
+    mov     dword ptr [r10].OPENFILENAMEW.nMaxFile, MAX_PATH_CHARS
     mov     dword ptr [r10].OPENFILENAMEW.nFilterIndex, 1
     cmp     dword ptr [rbp-32], 0
     jne     ip_save
@@ -7683,7 +7710,7 @@ gui_basename endp
 gui_tile_make_temp proc frame
     FRAME_PROLOG 64   ; >= 64: keep locals clear of the callee 32-byte home area
     mov     dword ptr [rbp-24], ecx
-    WINCALL GetTempPathW, 512, addr g_tmpfile
+    WINCALL GetTempPathW, MAX_PATH_CHARS, addr g_tmpfile
     mov     dword ptr [rbp-32], eax                  ; base length incl trailing '\'
     mov     ecx, dword ptr [rbp-24]
     call    tf_entry
@@ -7922,7 +7949,7 @@ public gui_tmptest
 gui_tmptest proc frame
     FRAME_PROLOG 48
     mov     dword ptr [g_tempfile_n], 0               ; isolated table for the probe
-    WINCALL GetTempPathW, 512, addr g_tmpfile         ; g_tmpfile = %TEMP%\
+    WINCALL GetTempPathW, MAX_PATH_CHARS, addr g_tmpfile   ; g_tmpfile = %TEMP%\
     lea     r10, [g_tmpfile]                          ; append the fixed test name
     lea     r10, [r10+rax*2]
     lea     r11, [wtmptest_name]
@@ -12089,7 +12116,7 @@ vp_init:
     mov     dword ptr [g_openfile_set], 0
     lea     rcx, [g_imgpath]
     lea     rdx, [g_openfile]
-    lea     r8, [g_imgpath + (1024-1)*2]        ; last slot the NUL may occupy
+    lea     r8, [g_imgpath + (MAX_PATH_CHARS-1)*2]        ; last slot the NUL may occupy
     call    gui_wstrcpy
     mov     dword ptr [g_imp_preset], 1
     WINCALL PostMessageW, qword ptr [rbp-8], WM_COMMAND, IDC_V_MIMPORT, 0
@@ -13058,7 +13085,7 @@ gui_create_do endp
 gui_create_commit proc frame
     FRAME_PROLOG 112
     mov     qword ptr [rbp-24], rcx          ; owner hwnd (error box parent)
-    lea     rax, [g_vpath]
+    call    gui_vpath_io                     ; -> rax = the path Win32 accepts
     mov     qword ptr [g_cfg_in], rax
     ; never silently overwrite an existing vault file - confirm first
     lea     rcx, [g_vpath]
@@ -16329,14 +16356,14 @@ gui_resolve_vault proc frame
     mov     dword ptr [g_is_default], 0
     mov     dword ptr [g_vault_lock], 0
     lea     rcx, [g_vpath]
-    mov     edx, 1024
+    mov     edx, MAX_PATH_CHARS
     lea     r8, [g_vault_lock]
     call    reg_load_vault                  ; HKLM>HKCU registered path, if any
     test    eax, eax
     jnz     grv_havepath
     ; nothing in the registry -> fall back to the default Documents\vault.vordr
     lea     rcx, [g_vpath]
-    mov     edx, 1024                       ; g_vpath's declared size
+    mov     edx, MAX_PATH_CHARS             ; g_vpath's declared size
     call    cfg_default_vault
     test    eax, eax
     jz      grv_none
@@ -16369,7 +16396,7 @@ gui_try_tpm_auto proc frame
     FRAME_PROLOG 32
     cmp     dword ptr [g_tpm_want], 0        ; TPM Unlock off (setting/HKLM) -> ask for password
     je      gta_no
-    lea     rax, [g_vpath]
+    call    gui_vpath_io                     ; -> rax = the path Win32 accepts
     mov     qword ptr [g_cfg_in], rax
     call    vault_tpm_has
     test    eax, eax
@@ -16692,7 +16719,7 @@ go_askpw:
     ; user is parked on the private desktop with no shell and no way back.
     cmp     dword ptr [g_vpath_set], 0
     je      go_nopreload
-    lea     rax, [g_vpath]
+    call    gui_vpath_io                     ; -> rax = the path Win32 accepts
     mov     qword ptr [g_cfg_in], rax
     call    vault_preload
 go_nopreload:
@@ -17359,7 +17386,7 @@ twp_copydata:
     WINCALL SetForegroundWindow, qword ptr [g_vaulthwnd]
     lea     rcx, [g_imgpath]                    ; arm the import BEFORE posting it
     lea     rdx, [g_openfile]
-    lea     r8, [g_imgpath + (1024-1)*2]        ; last slot the NUL may occupy
+    lea     r8, [g_imgpath + (MAX_PATH_CHARS-1)*2]        ; last slot the NUL may occupy
     call    gui_wstrcpy
     mov     dword ptr [g_imp_preset], 1
     mov     dword ptr [g_openfile_set], 0

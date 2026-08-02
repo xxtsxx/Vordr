@@ -81,7 +81,7 @@ g_crash_h       dq 0                    ; breadcrumb file handle
 g_crash_nw      dd 0                    ; WriteFile bytes-written out
 g_crash_dumped  db 0                    ; reentry guard: dump once
 align 2
-g_crashpath     dw 260 dup (?)          ; %TEMP%\vordr_crash.bin
+g_crashpath     dw MAX_PATH_CHARS dup (?)  ; %TEMP%\vordr_crash.bin
 
 SEM_FAILCRITICALERRORS  equ 1
 SEM_NOGPFAULTERRORBOX   equ 2
@@ -229,7 +229,7 @@ crash_dump proc frame
     cmp     byte ptr [g_crash_dumped], 0
     jne     cd_ret
     mov     byte ptr [g_crash_dumped], 1
-    WINCALL GetTempPathW, 260, addr g_crashpath
+    WINCALL GetTempPathW, MAX_PATH_CHARS-32, addr g_crashpath
     test    rax, rax
     jz      cd_ret
     lea     r10, [g_crashpath]

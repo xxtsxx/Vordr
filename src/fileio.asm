@@ -87,12 +87,21 @@ mem_free endp
 ; read_file(rcx = wpath, rdx = *outbuf, r8 = *outsize) -> eax
 ; =============================================================================
 public read_file
+; Both entry points convert the path here rather than at their call sites.  A
+; long path is otherwise refused by CreateFileW no matter how big our buffers
+; are, and doing it at the two chokepoints means an import, an export, an
+; attachment and anything added later all get it without being told.
 read_file proc frame
     FRAME_PROLOG 96
     ; [rbp-24]=outbuf* [rbp-32]=outsize* [rbp-40]=handle
     ; [rbp-48]=filesize [rbp-56]=buf [rbp-64]=cursor [rbp-72]=remaining
-    mov     qword ptr [rbp-24], rdx
-    mov     qword ptr [rbp-32], r8
+    mov     qword ptr [rbp-24], rdx           ; stash the OUT-PARAMS first: they live
+    mov     qword ptr [rbp-32], r8            ;   in the two registers path_longify
+                                              ;   needs for its own arguments
+    lea     rdx, [rf_path]                    ; -> the form Win32 accepts
+    mov     r8d, MAX_PATH_CHARS + 16
+    call    path_longify
+    mov     rcx, rax
 
     WINCALL CreateFileW, rcx, GENERIC_READ, FILE_SHARE_RWD, 0, OPEN_EXISTING, FILE_ATTR_NORMAL, 0
     cmp     rax, -1
@@ -166,8 +175,13 @@ public write_file
 write_file proc frame
     FRAME_PROLOG 96
     ; [rbp-24]=buf [rbp-32]=size [rbp-40]=handle [rbp-48]=cursor [rbp-56]=remaining
-    mov     qword ptr [rbp-24], rdx
-    mov     qword ptr [rbp-32], r8
+    mov     qword ptr [rbp-24], rdx           ; stash the buffer and size first - they
+    mov     qword ptr [rbp-32], r8            ;   are in path_longify's argument
+                                              ;   registers
+    lea     rdx, [wf_path]                    ; -> the form Win32 accepts
+    mov     r8d, MAX_PATH_CHARS + 16
+    call    path_longify
+    mov     rcx, rax
 
     mov     r10d, dword ptr [g_wf_disp]          ; C7: one-shot disposition (0 = default)
     mov     dword ptr [g_wf_disp], 0             ;     auto-reset so it applies once
@@ -281,5 +295,148 @@ frn_ok:
     ret
 file_rename endp
 
+
+
+.data
+align 2
+align 2
+ci_path     dw (MAX_PATH_CHARS + 16) dup (?)   ; the vault path g_cfg_in points at
+rf_path     dw (MAX_PATH_CHARS + 16) dup (?)   ; read_file's Win32-form path
+wf_path     dw (MAX_PATH_CHARS + 16) dup (?)   ; write_file's, kept separate so a
+                                               ;   read during a write cannot share it
+pfx_q       dw 5Ch,5Ch,'?',5Ch,0                     ; "\\?\"
+pfx_unc     dw 5Ch,5Ch,'?',5Ch,'U','N','C',5Ch,0     ; "\\?\UNC\"
+
+.code
+
+; =============================================================================
+; path_longify(rcx = src wide path, rdx = dst buffer, r8d = dst cap in chars)
+;   -> rax = the path to hand to Win32: dst when a prefix was added, otherwise
+;      rcx unchanged.
+;
+; vordr.manifest declares longPathAware, which is necessary and not sufficient:
+; it only takes effect when the machine also has
+; HKLM\SYSTEM\CurrentControlSet\Control\FileSystem : LongPathsEnabled = 1, and
+; that is 0 by default.  On such a machine every Win32 path API still enforces
+; MAX_PATH (260), whatever the manifest says.  The "\\?\" prefix does not depend
+; on the policy - it is the escape hatch the kernel honours unconditionally - so
+; that is what actually buys long paths.
+;
+; Applied only to paths that NEED it (>= PATH_LONG_MIN).  "\\?\" also switches
+; off path normalisation: no "." or ".." collapsing, no trailing-space or
+; trailing-dot trimming, forward slashes no longer accepted.  Turning that off
+; for every path in a program that opens the user's vault would be a semantic
+; change for the sake of a case almost nobody hits, so short paths are handed
+; back untouched and keep the normal rules.
+;
+; Handles the two forms that can be prefixed:
+;     C:\very\long\...        ->  \\?\C:\very\long\...
+;     \\server\share\...      ->  \\?\UNC\server\share\...
+; A relative path cannot be prefixed at all ("\\?\" requires a fully-qualified
+; path) and is returned unchanged; so is one that is already prefixed.
+; =============================================================================
+PATH_LONG_MIN   equ 248             ; MAX_PATH(260) less room for a "\name.tmp" tail
+
+; path_io(rcx = raw wide path) -> rax = the path to store in g_cfg_in.
+;   Everything the vault layer touches is derived from g_cfg_in as a string -
+;   "<vault>.tmp", "<vault>.lock", "<vault>.bak0" - so converting the base here
+;   converts all of them, and there is exactly one place to get it right.  The
+;   copy is static and single-slot: g_cfg_in names one vault at a time, which is
+;   the same assumption the rest of the vault layer already makes.
+public path_io
+path_io proc frame
+    FRAME_PROLOG 48
+    lea     rdx, [ci_path]
+    mov     r8d, MAX_PATH_CHARS + 16
+    call    path_longify
+    FRAME_EPILOG
+    ret
+path_io endp
+
+public path_longify
+path_longify proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx           ; src
+    mov     qword ptr [rbp-32], rdx           ; dst
+    mov     dword ptr [rbp-40], r8d           ; cap
+    ; ---- length, and the early outs ---------------------------------------
+    mov     r10, rcx
+    xor     r8d, r8d
+pl_len:
+    cmp     word ptr [r10+r8*2], 0
+    je      pl_have
+    inc     r8d
+    cmp     r8d, MAX_PATH_CHARS
+    jb      pl_len
+pl_have:
+    mov     dword ptr [rbp-48], r8d           ; length in chars
+    cmp     r8d, PATH_LONG_MIN
+    jb      pl_asis                           ; short enough for the normal rules
+    mov     r10, qword ptr [rbp-24]
+    cmp     word ptr [r10], 5Ch               ; already "\\?\" ?
+    jne     pl_drive
+    cmp     word ptr [r10+2], 5Ch
+    jne     pl_asis                           ; a lone leading backslash: leave it
+    cmp     word ptr [r10+4], '?'
+    je      pl_asis                           ; already prefixed
+    ; ---- UNC: "\\server\..." -> "\\?\UNC\server\..." ----------------------
+    mov     eax, dword ptr [rbp-48]
+    add     eax, 8                            ; "\\?\UNC\" is 8 chars, replacing "\\"
+    cmp     eax, dword ptr [rbp-40]
+    jae     pl_asis                           ; would not fit: unchanged, and it
+                                              ;   will fail as it did before
+    mov     rcx, qword ptr [rbp-32]
+    lea     rdx, [pfx_unc]
+    call    pl_copy
+    mov     rcx, rax
+    mov     rdx, qword ptr [rbp-24]
+    add     rdx, 4                            ; skip the leading "\\"
+    call    pl_copy
+    mov     rax, qword ptr [rbp-32]
+    FRAME_EPILOG
+    ret
+pl_drive:
+    ; ---- drive-absolute: "X:\..." -> "\\?\X:\..." -------------------------
+    mov     r10, qword ptr [rbp-24]
+    cmp     word ptr [r10+2], ':'
+    jne     pl_asis                           ; relative - cannot be prefixed
+    cmp     word ptr [r10+4], 5Ch
+    jne     pl_asis                           ; "X:name" is drive-relative
+    mov     eax, dword ptr [rbp-48]
+    add     eax, 5                            ; "\\?\" + NUL
+    cmp     eax, dword ptr [rbp-40]
+    jae     pl_asis
+    mov     rcx, qword ptr [rbp-32]
+    lea     rdx, [pfx_q]
+    call    pl_copy
+    mov     rcx, rax
+    mov     rdx, qword ptr [rbp-24]
+    call    pl_copy
+    mov     rax, qword ptr [rbp-32]
+    FRAME_EPILOG
+    ret
+pl_asis:
+    mov     rax, qword ptr [rbp-24]
+    FRAME_EPILOG
+    ret
+path_longify endp
+
+; pl_copy(rcx = dst, rdx = src) -> rax = the NUL written.  Bounded by the caller
+;   having checked the total above; kept private so nothing else can call it
+;   without that check.
+pl_copy proc
+    xor     r8d, r8d
+plc_l:
+    mov     ax, word ptr [rdx+r8*2]
+    mov     word ptr [rcx+r8*2], ax
+    test    ax, ax
+    jz      plc_d
+    inc     r8d
+    cmp     r8d, MAX_PATH_CHARS
+    jb      plc_l
+plc_d:
+    lea     rax, [rcx+r8*2]
+    ret
+pl_copy endp
 
 end
