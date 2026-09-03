@@ -7812,6 +7812,12 @@ gui_tag_open proc frame
     mov     qword ptr [rbp-56], rax                  ; plaintext
     mov     ecx, dword ptr [rbp-32]
     call    gui_tile_make_temp                       ; -> g_tmpfile
+    ; Register the path BEFORE CREATE_ALWAYS can put plaintext on disk.  Thus a
+    ; partial write, an early error, or a crash after file creation still leaves
+    ; a path known to the normal purge path (and the error path purges now).
+    lea     rcx, [g_tmpfile]
+    mov     rdx, qword ptr [rbp-48]
+    call    gui_temp_track
     lea     rcx, [g_tmpfile]
     mov     rdx, qword ptr [rbp-56]
     mov     r8, qword ptr [rbp-48]
@@ -7821,11 +7827,11 @@ gui_tag_open proc frame
     mov     rdx, qword ptr [rbp-48]
     call    mem_free
     cmp     dword ptr [rbp-60], 0                     ; only open if the temp was written
-    jne     gto_done
+    je      gto_written
+    call    gui_temp_purge                            ; remove a partial plaintext file now
+    jmp     gto_done
+gto_written:
     WINCALL SetFileAttributesW, addr g_tmpfile, FILE_ATTRIBUTE_TEMPORARY  ; hint: keep in cache
-    lea     rcx, [g_tmpfile]                          ; track for deterministic wipe on lock
-    mov     rdx, qword ptr [rbp-48]
-    call    gui_temp_track
     WINCALL ShellExecuteW, 0, addr verb_open, addr g_tmpfile, 0, 0, 1
 gto_done:
     FRAME_EPILOG

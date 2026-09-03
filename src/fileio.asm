@@ -239,8 +239,18 @@ wf_ok:
     ; live vault): without this the temp file can still be in the cache when the
     ; atomic replace happens, so a power cut would leave a truncated vault.
     WINCALL FlushFileBuffers, qword ptr [rbp-40]
+    test    eax, eax
+    jz      wf_flush_close
     WINCALL CloseHandle, qword ptr [rbp-40]
     xor     eax, eax
+    jmp     wf_done
+wf_flush_close:
+    ; A failed flush means durability was not established.  Never let an
+    ; upstream atomic-replace path publish this image as a successful save.
+    call    GetLastError
+    mov     dword ptr [g_io_err], eax
+    WINCALL CloseHandle, qword ptr [rbp-40]
+    mov     eax, EXIT_IO
     jmp     wf_done
 wf_io_close:
     call    GetLastError                         ; capture BEFORE CloseHandle overwrites it

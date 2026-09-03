@@ -5,7 +5,9 @@
 ;
 ; Primary source : BCryptGenRandom(NULL, buf, len, USE_SYSTEM_PREFERRED_RNG)
 ; Defense in depth: if the CPU supports RDSEED, every 8-byte lane is XOR-mixed
-; with hardware entropy.  Mixing can only add entropy, never remove it.
+; with an independent hardware source.  Security relies on the OS CSPRNG; the
+; hardware contribution is supplemental and assumes the sources are not
+; maliciously correlated.
 ; Policy        : if the OS RNG fails we FAIL - we never fall back to a
 ;                 weaker source for key material.
 ; =============================================================================

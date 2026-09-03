@@ -221,9 +221,10 @@ be exploited quietly:
   (full-RELRO equivalent), blocking import-address patching.
 - **W^X, ASLR (high-entropy), DEP/NX** — verified in the build by a dumpbin
   mitigation check.
-- **VirtualLock'd secret memory**: every buffer that ever holds the master
-  password, the derived key, or a plaintext secret is pinned (never paged to
-  disk) and `secure_zero`'d after use — audited buffer-by-buffer in
+- **VirtualLock'd secret memory**: dynamic secret arenas fail allocation unless
+  they can be pinned; fixed secret buffers are pinned at startup and produce a
+  visible warning if Windows refuses the lock. All are `secure_zero`'d after
+  use — audited buffer-by-buffer in
   [docs/SECRETS.md](docs/SECRETS.md), and proven by a scanner (`secscan`) that
   plants a sentinel, wipes, and sweeps all process memory for residue.
 - **Deterministic temp-file destruction**: attachments previewed via an
@@ -422,13 +423,14 @@ and enforced in CI on every push:
    compare primitives. Any mismatch → the program refuses to run.
 2. **Red-team fault injection** (debug build): each hardening control is
    deliberately attacked and must fire.
-3. **Strict static analysis**: six checkers over the source, any finding
+3. **Strict static analysis**: eight checkers over the source, any finding
    failing the build — `framecheck` (stack discipline: argument spills past a
    procedure's frame), `idcheck` (rc↔asm control-id drift, duplicate ids, ids
    inside a range reserved for runtime-created controls), `constcheck` (an
    `equ` that disagrees between modules), `dlgtarget` (a dialog-item call aimed
    at a window the control does not live in — Win32 fails those silently),
-   `deadcode` and `aligncheck` (odd-address wide strings). Each exists because
+   `deadcode`, `rccheck` (dialog geometry), `wstrcheck` (bounded wide-string
+   copies), and `aligncheck` (odd-address wide strings). Each exists because
    a whole class of bug was found to be invisible to both the assembler and to
    review.
 4. **Headless round-trip probes**: seed 5000 entries, export, re-import,
@@ -559,7 +561,7 @@ double-click alone.
 ### File format
 
 Full specification in [docs/formats.md](docs/formats.md). In brief — `.vordr`
-(magic `VRDR`, v1):
+(magic `VRDR`, v2):
 
 ```
 VAULT_HDR (64 B, used verbatim as the GCM AAD):

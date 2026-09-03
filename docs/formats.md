@@ -159,8 +159,10 @@ a missing trailer) is no longer accepted.
   counter (above).
 
 ### Hostile-OS resistance is best-effort in user mode
-Vordr raises the cost of compromise — VirtualLock keeps decrypted secrets out
-of the pagefile, the IAT is locked read-only, W^X / ASLR / DEP / NX / CET +
+Vordr raises the cost of compromise — dynamic decrypted arenas fail allocation
+if VirtualLock cannot keep them out of the pagefile; a lock failure for fixed
+secret buffers produces a visible warning. The IAT is locked read-only,
+W^X / ASLR / DEP / NX / CET +
 software shadow stack / stack canaries / DLPV / tagged heap are all on, and all
 key material is `secure_zero`'d. But against a **fully compromised kernel** (or a
 DMA-capable attacker), user-mode defenses cannot be absolute. We state this

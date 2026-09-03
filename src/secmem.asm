@@ -10,12 +10,11 @@
 ;       secure_zero the region, VirtualUnlock, VirtualFree.  Fail-closed: a NULL
 ;       pointer is a no-op; the wipe always runs before the pages are released.
 ;
-; NOTE: VirtualLock is best-effort (it can fail if the process working-set
-; minimum is too small).  We treat a lock failure as non-fatal here but the
-; allocation still succeeds; a future step may raise the working-set quota via
-; SetProcessWorkingSetSize so the lock is guaranteed.  Against a fully
-; compromised *kernel* this is a cost-raiser, not an absolute guarantee
-; (documented in docs/formats.md).
+; Fixed static buffers are locked best-effort and produce a visible warning if
+; pinning fails.  Dynamic secret arenas (including the decrypted vault body)
+; fail allocation when VirtualLock fails, so pageable plaintext is never handed
+; to a caller.  Against a fully compromised *kernel* this is still a cost-raiser,
+; not an absolute guarantee (documented in docs/formats.md).
 ; =============================================================================
 
 include macros.inc
@@ -57,15 +56,20 @@ PAGE_READWRITE      equ 04h
 ; VirtualLock'd bytes.  That is dominated by the decrypted body arenas
 ; (VAULT_BODY_MAX = 16 MiB each).
 ;
-; TWO can be resident at once: vault_open_foreign decrypts another vault's body
-; while the master's is still open, which is exactly what a cross-vault import
-; does.  Reserving for one was left over from when that could not happen, and it
+; THREE can be resident at once: attachment-carry export holds the live body, a
+; stable source snapshot, and the child body while it is sealed.  Cross-vault
+; import normally needs two.  Reserving for one was left over from when that
+; could not happen, and it
 ; showed up as the C3 warning (VirtualLock 1453 = ERROR_WORKING_SET_QUOTA) after
 ; importing a large vault - a quota failure, not a shortage of RAM, on a machine
 ; with 110 GB free.
-SEC_BODY_RESERVE    equ 02000000h   ; 2 x 16 MiB: master + foreign body during import
-SEC_WS_STATICS      equ 00800000h   ; 8 MiB for the static secret buffers + headroom
-SEC_WS_MAX          equ 10000000h   ; 256 MiB cap (ample for one body + statics)
+SEC_BODY_RESERVE    equ 03000000h   ; 3 x 16 MiB: live + snapshot + export child
+; Static buffers plus page rounding and transient locked allocations need more
+; than the historical 8 MiB estimate during cross-vault export.  With dynamic
+; arenas now correctly failing closed on a lock error, under-reserving this
+; quota becomes an availability failure instead of silently pageable memory.
+SEC_WS_STATICS      equ 02000000h   ; 32 MiB for statics, rounding, and transient headroom
+SEC_WS_MAX          equ 10000000h   ; 256 MiB hard maximum
 ; QUOTA_LIMITS_HARDWS_MIN_ENABLE (1) | QUOTA_LIMITS_HARDWS_MAX_DISABLE (8): make
 ; the MIN a HARD reservation so VirtualLock actually gets quota.  Plain
 ; SetProcessWorkingSetSize sets only a soft hint -> VirtualLock still fails
@@ -180,7 +184,7 @@ sec_lock endp
 public sec_ws_grow
 sec_ws_grow proc frame
     FRAME_PROLOG 48
-    ; min = statics + both body arenas (master + a foreign one during import).
+    ; min = statics + all concurrently live body arenas.
     ; Clamp to the max.
     mov     eax, SEC_BODY_RESERVE
     add     eax, SEC_WS_STATICS
@@ -334,6 +338,8 @@ secmem_alloc proc frame
     mov     rcx, qword ptr [rbp-32]
     mov     rdx, qword ptr [rbp-24]
     call    sec_lock
+    test    eax, eax
+    jz      sa_lockfail
 
     mov     rcx, qword ptr [rbp-32]         ; register the live base (double-free guard)
     call    secreg_add
@@ -341,6 +347,17 @@ secmem_alloc proc frame
     jz      sa_regfull
 
     mov     rax, qword ptr [rbp-32]         ; return the (locked) base
+    FRAME_EPILOG
+    ret
+sa_lockfail:
+    ; A secret arena that cannot be pinned must never escape to a caller.  It is
+    ; still zero-filled by VirtualAlloc, but wipe it explicitly before release
+    ; so this cleanup remains correct if the allocation strategy changes.
+    mov     rcx, qword ptr [rbp-32]
+    mov     rdx, qword ptr [rbp-24]
+    call    secure_zero
+    WINCALL VirtualFree, qword ptr [rbp-32], 0, MEM_RELEASE
+    xor     eax, eax
     FRAME_EPILOG
     ret
 sa_regfull:
@@ -526,7 +543,8 @@ cmd_secscan endp
 
 ; ===========================================================================
 ; cmd_lktest (probe) - C3: prove a VirtualLock failure is detected (g_seclock_
-;   failed set) via the force hook, and that a normal lock still works after.
+;   failed set), prevents a dynamic secret allocation from escaping, and that a
+;   normal lock still works after.
 ; ===========================================================================
 LANDING_PAD
 public cmd_lktest
@@ -534,12 +552,11 @@ cmd_lktest proc frame
     FRAME_PROLOG 48
     mov     dword ptr [g_seclock_failed], 0
     mov     dword ptr [g_force_lockfail], 1     ; force the next lock to fail
-    lea     rcx, [secscan_ref]
-    mov     edx, 16
-    call    sec_lock
+    mov     ecx, 16
+    call    secmem_alloc                        ; dynamic arena must fail closed
     mov     dword ptr [g_force_lockfail], 0
     test    eax, eax
-    jnz     lk_fail                             ; forced call must report failure
+    jnz     lk_fail                             ; pageable allocation must not escape
     cmp     dword ptr [g_seclock_failed], 0
     je      lk_fail                             ; and must set the flag
     mov     dword ptr [g_seclock_failed], 0     ; a real lock must still succeed

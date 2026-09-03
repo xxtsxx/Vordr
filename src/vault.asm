@@ -4341,11 +4341,9 @@ vault_reseal endp
 ;   from a decrypted source body into the live vault, deduped by the 16-byte entry
 ;   id (newer `modified` wins), so a re-merge is idempotent.  Both PRESERVE each
 ;   entry's id16/created/modified (raw-ish copy, not a rebuild).
-;   v1 does NOT carry attachments: an entry's VF_IMAGE/VF_FILE fields are filtered
-;   out so the copy never leaves a dangling AttachRef (the blob lives in the source
-;   file's section).  Attachment carry is a documented M6 follow-up - the blob ct is
-;   keyed by its own per-attachment key in the AttachRef, so a later version can copy
-;   it verbatim while the source image is the live g_attidx.
+;   Text-only export strips VF_IMAGE/VF_FILE fields so the copy never leaves a
+;   dangling AttachRef.  Full export carries the attachment ciphertext verbatim;
+;   its per-attachment key remains protected inside the newly sealed vault body.
 ; ===========================================================================
 
 ; entry_copy_filtered(rcx = src entry ptr, rdx = dst ptr) -> eax = bytes written.
