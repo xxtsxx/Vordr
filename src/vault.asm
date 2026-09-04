@@ -288,6 +288,8 @@ g_seal_noadopt dd ?                         ; 1 = this seal writes a DIFFERENT v
                                             ;   it just wrote as the live one
 align 8
 g_xs_hdr    db VH_TOTAL dup (?)             ; parked live header
+align 2
+g_xs_path   dw (MAX_PATH_CHARS + 16) dup (?) ; owned path snapshot, never ci_path alias
 public g_xs_vkey
 g_xs_vkey   db 32 dup (?)                   ; parked live vault key (wiped after restore)
 g_xs_ehash  db 32 dup (?)                   ; parked external-change hash
@@ -2179,6 +2181,7 @@ cmd_vfuzz endp
 
 ; ===========================================================================
 ; copy_bytes(rcx=dst, rdx=src, r8d=len) - byte copy using volatile regs only.  Leaf.
+public copy_bytes
 copy_bytes proc
     xor     r9d, r9d
 cpb_lp:
@@ -3291,6 +3294,14 @@ xk_pw2:
 xk_pw2d:
     mov     dword ptr [g_cfg_passlen], 9
     mov     rcx, qword ptr [rbp-32]
+    ; File pickers return ordinary long paths, not an already-prefixed copy.
+    ; Exercise conversion of the child while the master points into ci_path.
+    cmp     word ptr [rcx+4], '?'
+    jne     xk_rawpath
+    cmp     word ptr [rcx+10], ':'            ; only strip a drive prefix, not UNC
+    jne     xk_rawpath
+    add     rcx, 8
+xk_rawpath:
     call    vault_export_sel
     test    eax, eax
     jnz     xk_faillk
@@ -3595,6 +3606,12 @@ vi_pw2d:
     mov     dword ptr [rbp-64], eax
     ; ---- read the foreign vault WITHOUT disturbing the open master -----------
     mov     rcx, qword ptr [rbp-24]
+    cmp     word ptr [rcx+4], '?'
+    jne     vi_rawpath
+    cmp     word ptr [rcx+10], ':'
+    jne     vi_rawpath
+    add     rcx, 8                            ; ordinary long file-picker path
+vi_rawpath:
     lea     rdx, [vxk_exppw]
     mov     r8d, 9
     lea     r9, [rbp-32]
@@ -4604,6 +4621,24 @@ fed_export endp
 ;   Note it deliberately does NOT consult g_readonly: exporting never writes to the
 ;   master, so it stays available on a read-only vault.
 ; ===========================================================================
+; Export and foreign-open are serialized and already share g_xs_hdr/key.
+; Copy the path too: cfg_in_set can overwrite the storage behind g_cfg_in.
+vault_park_path proc
+    lea     rax, [g_xs_path]
+    xor     r8d, r8d
+vpp_copy:
+    mov     cx, word ptr [rdx+r8*2]
+    mov     word ptr [rax+r8*2], cx
+    test    cx, cx
+    jz      vpp_done
+    inc     r8d
+    cmp     r8d, MAX_PATH_CHARS+15
+    jb      vpp_copy
+    mov     word ptr [rax+r8*2], 0
+vpp_done:
+    ret
+vault_park_path endp
+
 public vault_export_sel
 vault_export_sel proc frame
     FRAME_PROLOG 160
@@ -4631,6 +4666,9 @@ vault_export_sel proc frame
     mov     dword ptr [rbp-108], eax
     mov     eax, dword ptr [g_attidx_n]
     mov     dword ptr [rbp-112], eax
+    mov     rdx, qword ptr [rbp-48]
+    call    vault_park_path
+    mov     qword ptr [rbp-48], rax
     lea     rcx, [g_xs_hdr]                   ; header, key and change-hash are too big
     lea     rdx, [g_hdr]                      ;   for the frame - park them in statics
     mov     r8d, VH_TOTAL
@@ -4847,6 +4885,9 @@ vault_open_foreign proc frame
     mov     dword ptr [rbp-128], eax
     mov     eax, dword ptr [g_cfg_passlen]
     mov     dword ptr [rbp-132], eax
+    mov     rdx, qword ptr [rbp-72]
+    call    vault_park_path
+    mov     qword ptr [rbp-72], rax
     lea     rcx, [g_xs_hdr]
     lea     rdx, [g_hdr]
     mov     r8d, VH_TOTAL

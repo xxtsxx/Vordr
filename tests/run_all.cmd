@@ -254,6 +254,16 @@ bin\vordr.exe vaultexpattkat "%WORK%\vea.vault" > "%WORK%\vaultexpattkat.log" 2>
 if not "!errorlevel!"=="0" ( echo   vaultexpattkat: FAIL ^(exit !errorlevel!, M6 attachment carry^) & set RT=FAIL )
 
 :roundtrip_publish
+where python >nul 2>&1
+if not errorlevel 1 (
+    python tests\verify_persistence.py --exe bin\vordr.exe > "%WORK%\persistence.log" 2>&1
+    if errorlevel 1 (
+        echo   persistence regressions: FAIL - see %WORK%\persistence.log
+        set RT=FAIL
+    ) else (
+        echo   persistence regressions: PASS
+    )
+)
 set R_ROUNDTRIP=!RT!
 call :now T1
 set /a T_ROUNDTRIP=!T1!-!T0!

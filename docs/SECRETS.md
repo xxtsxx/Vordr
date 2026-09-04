@@ -20,6 +20,7 @@ Heap secrets go through `secmem_alloc`, which VirtualLock's on allocation.
 | `g_e_totp` | gui.asm (`.data?`) | 512 B | entry-form TOTP key (wide) | `sec_lock_statics` | `vault_proc` close/lock path (gui.asm) |
 | `g_totp_b32` | gui.asm (`.data?`) | 256 B | selected entry TOTP key (UTF-8) | `sec_lock_statics` | `vault_proc` close/lock path (gui.asm) |
 | vault body | `secmem_alloc` (called from `vault_unlock` / `do_init`, vault.asm) | ≤ `VAULT_BODY_MAX` | decrypted entries (all field plaintext, incl. archived pw-history) | `secmem_alloc` (VirtualLock) | `secmem_free` (`secure_zero` before release) |
+| edit transaction | gui.asm (`g_edit_backup`, `g_edit_history`) | original body plus history snapshot | original entries and history while an edited body is being saved | original body and working arena both use `secmem_alloc` | successful save wipes/releases the original; failure restores it and wipes/releases the working copy; history snapshot wiped on either outcome; `secmem_panic_wipe` covers both snapshots |
 
 Every static buffer above is additionally wiped on the crash-containment path
 by `secmem_panic_wipe` (secmem.asm), which the VEH runs before terminating.
@@ -51,9 +52,14 @@ by `secmem_panic_wipe` (secmem.asm), which the VEH runs before terminating.
 - **Attachment decrypt-to-temp** (gui.asm `gui_tag_open`) — opening an attachment
   writes its plaintext to `%TEMP%` so the OS default app can read it (unavoidable
   for the ShellExecute hand-off). This is *not* left to the OS: every such path is
-  tracked in `g_tempfiles` and, on vault lock/exit, `gui_temp_purge` overwrites
-  the file's whole length with zeros, `FlushFileBuffers`, then `DeleteFileW`
-  (secure temp-file tracking; regression-tested by the `tmptest` verb). The
+  created exclusively inside its own random directory and tracked in `g_tempfiles`.
+  On vault lock/exit, `gui_temp_purge` attempts to overwrite the current file length,
+  flush, delete the file, and remove its directory. Failed cleanup remains tracked;
+  while locked, the tray retries every five seconds. Normal Exit asks the user to
+  close viewers if cleanup remains blocked, rather than forgetting the plaintext.
+  Forced process termination or OS shutdown can still leave files behind.
+  Unique paths, collision refusal, retained failures, and later cleanup are tested
+  by `tmptest`. The
   **Disable attachment preview** setting (`NoPreview`) suppresses the temp file
   entirely — attachments are then download-only, so no plaintext copy is ever
   written outside the vault.

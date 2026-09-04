@@ -54,6 +54,8 @@ g_io_err    dd ?                 ; Win32 error from the last failed write/rename
 align 4
 public g_wf_disp
 g_wf_disp   dd ?                       ; C7: one-shot write_file disposition override
+public g_wf_created
+g_wf_created dd ?                     ; last write_file actually created/opened its file
 align 2                               ;     (0 = CREATE_ALWAYS default; caller sets CREATE_NEW)
 
 ; These are single-slot and process-wide.  That is safe because file work is
@@ -196,6 +198,7 @@ read_file endp
 public write_file
 write_file proc frame
     FRAME_PROLOG 96
+    mov     dword ptr [g_wf_created], 0
     ; [rbp-24]=buf [rbp-32]=size [rbp-40]=handle [rbp-48]=cursor [rbp-56]=remaining
     mov     qword ptr [rbp-24], rdx           ; stash the buffer and size first - they
     mov     qword ptr [rbp-32], r8            ;   are in path_longify's argument
@@ -217,6 +220,7 @@ write_file proc frame
     mov     qword ptr [rbp-40], rax
 
     mov     rax, qword ptr [rbp-24]
+    mov     dword ptr [g_wf_created], 1
     mov     qword ptr [rbp-48], rax              ; cursor
     mov     rax, qword ptr [rbp-32]
     mov     qword ptr [rbp-56], rax              ; remaining

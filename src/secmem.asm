@@ -265,6 +265,9 @@ sec_lock_statics endp
 ;   time.  Safe to call redundantly.
 ; =============================================================================
 public secmem_panic_wipe
+externdef g_edit_backup:qword
+externdef g_edit_backup_len:qword
+externdef g_edit_history:qword
 secmem_panic_wipe proc frame
     FRAME_PROLOG 32
     lea     rcx, [g_cfg_pass]
@@ -310,6 +313,17 @@ secmem_panic_wipe proc frame
     mov     rdx, qword ptr [g_body_len]
     call    secure_zero
 spw_slots:
+    mov     rcx, qword ptr [g_edit_backup]
+    test    rcx, rcx
+    jz      spw_history
+    mov     rdx, qword ptr [g_edit_backup_len]
+    call    secure_zero
+spw_history:
+    mov     rcx, qword ptr [g_edit_history]
+    test    rcx, rcx
+    jz      spw_done
+    mov     edx, MAX_PWHIST*PWHIST_ENTRY
+    call    secure_zero
 spw_done:
     FRAME_EPILOG
     ret

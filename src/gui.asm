@@ -37,6 +37,16 @@ extern is_cli_command:proc
 extern dispatch:proc
 extern run_selftest:proc
 extern secure_zero:proc
+extern secmem_alloc:proc
+extern rng_fill:proc
+extern RemoveDirectoryW:proc
+extern GetFileSizeEx:proc
+extern secmem_free:proc
+extern copy_bytes:proc
+externdef g_body_ptr:qword
+externdef g_body_len:qword
+externdef g_wf_disp:dword
+externdef g_wf_created:dword
 extern secmem_panic_wipe:proc           ; wipe every pinned secret (shutdown/logoff)
 extern print_err:proc
 
@@ -678,7 +688,10 @@ MAX_TFILES  equ 24             ; <= MAX_FIELDS minus the other fields of an entr
 MAX_TEMPFILES equ 16           ; tracked decrypt-to-temp files per session
 TEMP_PATHW    equ 300          ; wide chars reserved per temp path
 TEMP_SIZEOFF  equ TEMP_PATHW*2 ; qword plaintext size lives after the path
-TEMPREC       equ TEMP_SIZEOFF+8
+TEMP_DIROFF   equ TEMP_SIZEOFF+8 ; directory terminator offset in WCHARs, 0 = none
+TEMPREC       equ TEMP_SIZEOFF+16
+TEMP_RETRY_TIMER equ 5
+VAULT_BODY_MAX equ 16777216
 GENERIC_WRITE_ equ 40000000h
 OPEN_EXISTING_ equ 3
 FILE_ATTR_NORMAL_ equ 80h
@@ -867,6 +880,8 @@ WSTR g_unlock_title,   <Vordr - Unlock vault>
 WSTR g_create_title,   <Vordr - Set master password>
 WSTR s_createfail,  <Could not create the vault (I/O or out of memory).>
 WSTR s_notitle,     <An entry needs a title.>
+WSTR s_tempbusy,    <Some preview files are still in use. Close their applications and try exiting again. Cleanup will keep retrying while Vordr is running.>
+WSTR s_editnomem,   <Could not allocate secure memory for this edit. Your changes have not been saved. Please retry.>
 WSTR s_nofieldroom, <This record already has the maximum number of fields.>
 WSTR s_resealfail,  <Unable to write to the vault file - it may be read-only or locked by another program. Your changes are kept in memory. Retry saving now?>
 WSTR t_overwrite,   <Vordr - vault already exists>
@@ -1561,6 +1576,11 @@ g_cf_cloud  dd ?                      ; registered format: CanUploadToCloudClipb
 g_cf_excl   dd ?                      ; registered format: ExcludeClipboardContentFromMonitorProcessing
 g_cur_idx   dd ?                      ; entry currently shown/edited inline (-1=none)
 g_dirty     dd ?                      ; 1 = inline fields edited since last load/save
+align 8
+public g_edit_backup, g_edit_backup_len, g_edit_history
+g_edit_backup dq ?                    ; original body while a Save transaction is active
+g_edit_backup_len dq ?                ; panic wipe must cover both copies
+g_edit_history dq ?                   ; history rollback copy in the working arena's tail
 g_loading   dd ?                      ; 1 = programmatically loading fields (ignore EN_CHANGE)
 g_editmode  dd ?                      ; 1 = detail fields editable (view/edit toggle)
 g_new_pending dd ?                    ; 1 = current entry is a just-added placeholder (delete on Cancel)
@@ -1724,6 +1744,7 @@ g_tmpfile     dw MAX_PATH_CHARS dup (?)    ; temp path for opening an attachment
 align 8
 g_tempfiles   db MAX_TEMPFILES*TEMPREC dup (?)  ; tracked decrypt-to-temp paths + sizes
 g_tempfile_n  dd ?                         ; number of live tracked temp files
+g_tmpdir_len dd ?                          ; owned directory length for this preview
 g_wipezeros   db WIPE_CHUNK dup (?)        ; source of zeros for overwriting temp files
 align 2
 g_imgpath     dw MAX_PATH_CHARS dup (?)   ; import/export file path (wide)
@@ -6359,8 +6380,10 @@ gui_pwhist_emit endp
 ;   record back (remove the old entry, rebuild via vault_build_entry, reseal).
 ;   Reselects the entry.  Refuses to save an empty title (keeps the old entry).
 gui_commit proc frame
-    FRAME_PROLOG 48
+    FRAME_PROLOG 96
     mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-40], 0             ; original body (transaction not started)
+    mov     dword ptr [g_dirty], 1           ; suppress refresh during nested error dialogs
     cmp     dword ptr [g_cur_idx], 0
     jl      gco_done                          ; nothing selected
     ; external-change guard: warn before overwriting a file another program or
@@ -6380,11 +6403,6 @@ gco_noext:
     jz      gco_notitle
     cmp     word ptr [r10], 0                 ; empty title -> keep the old entry
     je      gco_notitle
-    cmp     dword ptr [g_no_history], 0        ; "Do not save history" -> neither capture
-    jne     gco_nohist                         ;   new overwrites nor re-emit existing ones
-    call    gui_pwhist_capture                ; archive any overwritten value, then
-    call    gui_pwhist_emit                   ; write history back as VF_PWHIST fields
-gco_nohist:
     mov     ecx, dword ptr [g_cur_idx]        ; preserve the original creation date
     call    vault_entry_ptr
     test    rax, rax
@@ -6392,6 +6410,36 @@ gco_nohist:
     mov     rdx, qword ptr [rax+16]           ; original created FILETIME
     mov     qword ptr [g_carry_created], rdx
 gco_nocarry:
+    ; Build on a locked copy. A failed save must not replace the old entry in
+    ; memory or leave g_cur_idx pointing at its former neighbour on Retry.
+    mov     rcx, VAULT_BODY_MAX + MAX_PWHIST*PWHIST_ENTRY
+    call    secmem_alloc
+    test    rax, rax
+    jz      gco_allocerr
+    mov     rcx, rax
+    mov     rdx, qword ptr [g_body_ptr]
+    mov     qword ptr [rbp-40], rdx
+    mov     qword ptr [g_edit_backup], rdx
+    mov     r8, qword ptr [g_body_len]
+    mov     qword ptr [rbp-48], r8
+    mov     qword ptr [g_edit_backup_len], r8
+    mov     qword ptr [g_body_ptr], rax
+    call    copy_bytes
+    ; Snapshot the history too, including full-capacity eviction. Repeated
+    ; failed Saves must not append duplicate events or discard old history.
+    mov     rcx, qword ptr [g_body_ptr]
+    add     rcx, VAULT_BODY_MAX
+    mov     qword ptr [g_edit_history], rcx
+    lea     rdx, [g_pwhist]
+    mov     r8d, MAX_PWHIST*PWHIST_ENTRY
+    call    copy_bytes
+    mov     eax, dword ptr [g_pwhist_n]
+    mov     dword ptr [rbp-56], eax
+    cmp     dword ptr [g_no_history], 0
+    jne     gco_nohist
+    call    gui_pwhist_capture
+    call    gui_pwhist_emit
+gco_nohist:
     mov     ecx, dword ptr [g_cur_idx]
     call    vault_remove_at
     call    vault_build_entry
@@ -6406,20 +6454,32 @@ gco_reseal:
     mov     eax, dword ptr [rbp-32]
     test    eax, eax
     jnz     gco_resealerr
+    mov     rcx, qword ptr [g_edit_history]
+    mov     edx, MAX_PWHIST*PWHIST_ENTRY
+    call    secure_zero
+    mov     qword ptr [g_edit_history], 0
+    mov     rcx, qword ptr [rbp-40]
+    mov     rdx, VAULT_BODY_MAX
+    call    secmem_free
+    mov     qword ptr [rbp-40], 0
+    mov     qword ptr [g_edit_backup], 0
+    mov     qword ptr [g_edit_backup_len], 0
     mov     rcx, qword ptr [rbp-24]
     call    gui_poplist
     call    vault_last_user                     ; NOT count-1: a vault that gained its system
     cmp     eax, 0                              ;   item on a later save has it appended LAST
-    jl      gco_done
+    jl      gco_success
     mov     dword ptr [g_cur_idx], eax
     mov     rcx, qword ptr [rbp-24]              ; reselect by vault index (list is sorted)
     mov     edx, dword ptr [g_cur_idx]
     call    gui_lb_selbydata
-    jmp     gco_done
+    jmp     gco_success
 gco_notitle:
     WINCALL gui_msgbox, qword ptr [rbp-24], addr s_notitle, addr t_err, <MB_OK or MB_ICONERROR>
-    FRAME_EPILOG
-    ret
+    jmp     gco_done
+gco_allocerr:
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr s_editnomem, addr t_err, <MB_OK or MB_ICONWARNING>
+    jmp     gco_done
 gco_resealerr:
     cmp     eax, EXIT_CHANGED                   ; C8: change caught in the TOCTOU window
     je      gco_reload
@@ -6431,16 +6491,60 @@ gco_resealerr:
     je      gco_reseal
     jmp     gco_done
 gco_reload:
+    ; Undo the edit transaction before reload replaces the original body.
+    mov     rcx, rbp
+    call    gco_rollback
     mov     rcx, qword ptr [rbp-24]
     call    gui_reload_safe
     jmp     gco_done
 gco_busy:
     WINCALL gui_msgbox, qword ptr [rbp-24], addr s_busy, addr t_exttitle, <MB_OK or MB_ICONWARNING>
 gco_done:
+    mov     rcx, rbp
+    call    gco_rollback
+    mov     dword ptr [g_dirty], 1
+    mov     eax, 1                           ; failure: retain rows and edit mode
+    FRAME_EPILOG
+    ret
+gco_success:
     mov     dword ptr [g_dirty], 0
+    xor     eax, eax
     FRAME_EPILOG
     ret
 gui_commit endp
+
+; Private helper receives gui_commit's transaction frame in rcx.
+gco_rollback proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    cmp     qword ptr [rcx-40], 0
+    je      gcrb_done
+    lea     rcx, [g_pwhist]
+    mov     rdx, qword ptr [g_edit_history]
+    mov     r8d, MAX_PWHIST*PWHIST_ENTRY
+    call    copy_bytes
+    mov     r10, qword ptr [rbp-24]
+    mov     eax, dword ptr [r10-56]
+    mov     dword ptr [g_pwhist_n], eax
+    mov     rcx, qword ptr [g_edit_history]
+    mov     edx, MAX_PWHIST*PWHIST_ENTRY
+    call    secure_zero
+    mov     qword ptr [g_edit_history], 0
+    mov     rcx, qword ptr [g_body_ptr]
+    mov     rdx, VAULT_BODY_MAX
+    call    secmem_free
+    mov     r10, qword ptr [rbp-24]
+    mov     rax, qword ptr [r10-40]
+    mov     qword ptr [g_body_ptr], rax
+    mov     rax, qword ptr [r10-48]
+    mov     qword ptr [g_body_len], rax
+    mov     qword ptr [r10-40], 0
+    mov     qword ptr [g_edit_backup], 0
+    mov     qword ptr [g_edit_backup_len], 0
+gcrb_done:
+    FRAME_EPILOG
+    ret
+gco_rollback endp
 
 ; gui_reload_safe(rcx = hdlg) - C8: the vault changed on disk under us; reload it
 ;   (vault_reload, existing key - no re-KDF), refresh the list, and tell the user
@@ -7690,15 +7794,47 @@ gui_basename endp
 ; Generic file attachments (VF_FILE)
 ; =============================================================================
 
-; gui_tile_make_temp(ecx = file index) - build g_tmpfile = %TEMP%\<basename>.
+; gui_tile_make_temp(ecx = file index) -> eax=1 with an exclusively created
+;   random directory and g_tmpfile beneath it, or eax=0 on failure.
 ;   The stored filename can be attacker-controlled (imported from a zip), so any
 ;   directory part is stripped (basename after the last '\' or '/') to keep the
 ;   written+opened file confined to %TEMP% - no "..\" path traversal out of it.
 gui_tile_make_temp proc frame
-    FRAME_PROLOG 64   ; >= 64: keep locals clear of the callee 32-byte home area
+    FRAME_PROLOG 96
     mov     dword ptr [rbp-24], ecx
-    WINCALL GetTempPathW, MAX_PATH_CHARS, addr g_tmpfile
+    mov     dword ptr [g_tmpdir_len], 0
+    ; Reserve space for a 32-hex random directory, slash and 120-char basename.
+    WINCALL GetTempPathW, TEMP_PATHW-160, addr g_tmpfile
+    test    eax, eax
+    jz      gtmt_fail
+    cmp     eax, TEMP_PATHW-160
+    jae     gtmt_fail
     mov     dword ptr [rbp-32], eax                  ; base length incl trailing '\'
+    lea     rcx, [rbp-64]
+    mov     edx, 16
+    call    rng_fill
+    test    eax, eax
+    jz      gtmt_fail
+    mov     eax, dword ptr [rbp-32]
+    lea     rdx, [g_tmpfile]
+    lea     rdx, [rdx+rax*2]
+    mov     rcx, qword ptr [rbp-64]
+    call    gui_ft_hex16
+    mov     eax, dword ptr [rbp-32]
+    lea     rdx, [g_tmpfile+32]
+    lea     rdx, [rdx+rax*2]
+    mov     rcx, qword ptr [rbp-56]
+    call    gui_ft_hex16
+    WINCALL CreateDirectoryW, addr g_tmpfile, 0
+    test    eax, eax
+    jz      gtmt_fail                         ; never reuse or remove a pre-existing name
+    mov     eax, dword ptr [rbp-32]
+    add     eax, 32
+    mov     dword ptr [g_tmpdir_len], eax
+    lea     r10, [g_tmpfile]
+    mov     word ptr [r10+rax*2], 5Ch
+    inc     eax
+    mov     dword ptr [rbp-32], eax
     mov     ecx, dword ptr [rbp-24]
     call    tf_entry
     add     rax, TFILE_NAME
@@ -7728,6 +7864,11 @@ gtmt_scandone:
     jnz     @F
     lea     rdx, [name_default_att]
 @@: call    gui_wcpy_capped
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gtmt_fail:
+    xor     eax, eax
     FRAME_EPILOG
     ret
 gui_tile_make_temp endp
@@ -7812,17 +7953,30 @@ gui_tag_open proc frame
     mov     qword ptr [rbp-56], rax                  ; plaintext
     mov     ecx, dword ptr [rbp-32]
     call    gui_tile_make_temp                       ; -> g_tmpfile
+    test    eax, eax
+    jz      gto_free
     ; Register the path BEFORE CREATE_ALWAYS can put plaintext on disk.  Thus a
     ; partial write, an early error, or a crash after file creation still leaves
     ; a path known to the normal purge path (and the error path purges now).
     lea     rcx, [g_tmpfile]
     mov     rdx, qword ptr [rbp-48]
+    mov     r8d, dword ptr [g_tmpdir_len]
     call    gui_temp_track
+    test    eax, eax
+    jz      gto_rmdir
+    mov     dword ptr [g_wf_disp], 1                ; CREATE_NEW: never overwrite another file
     lea     rcx, [g_tmpfile]
     mov     rdx, qword ptr [rbp-56]
     mov     r8, qword ptr [rbp-48]
     call    write_file
     mov     dword ptr [rbp-60], eax                  ; write_file result
+    cmp     dword ptr [g_wf_created], 0
+    jne     gto_free_written
+    ; Creation failed: the colliding file is not ours. Unregister it before
+    ; cleanup so neither this error nor a later lock can erase that file.
+    dec     dword ptr [g_tempfile_n]
+    jmp     gto_rmdir
+gto_free_written:
     mov     rcx, qword ptr [rbp-56]
     mov     rdx, qword ptr [rbp-48]
     call    mem_free
@@ -7833,6 +7987,16 @@ gui_tag_open proc frame
 gto_written:
     WINCALL SetFileAttributesW, addr g_tmpfile, FILE_ATTRIBUTE_TEMPORARY  ; hint: keep in cache
     WINCALL ShellExecuteW, 0, addr verb_open, addr g_tmpfile, 0, 0, 1
+    jmp     gto_done
+gto_rmdir:
+    mov     eax, dword ptr [g_tmpdir_len]
+    lea     r10, [g_tmpfile]
+    mov     word ptr [r10+rax*2], 0
+    WINCALL RemoveDirectoryW, addr g_tmpfile       ; only removes an empty owned directory
+gto_free:
+    mov     rcx, qword ptr [rbp-56]
+    mov     rdx, qword ptr [rbp-48]
+    call    mem_free
 gto_done:
     FRAME_EPILOG
     ret
@@ -7842,14 +8006,17 @@ gui_tag_open endp
 ;   file so gui_temp_purge can overwrite + delete it on lock/exit.  If the table is
 ;   full, purge it first (flushing the older files) then record this one.
 gui_temp_track proc frame
-    FRAME_PROLOG 48
+    FRAME_PROLOG 80
     mov     qword ptr [rbp-24], rcx
     mov     qword ptr [rbp-32], rdx
+    mov     dword ptr [rbp-48], r8d              ; owned directory, or 0 for plain test files
     mov     eax, dword ptr [g_tempfile_n]
     cmp     eax, MAX_TEMPFILES
     jb      gtt_have
     call    gui_temp_purge                            ; full -> flush, then start over
-    xor     eax, eax
+    mov     eax, dword ptr [g_tempfile_n]
+    cmp     eax, MAX_TEMPFILES
+    jae     gtt_full
 gtt_have:
     imul    eax, eax, TEMPREC                         ; &g_tempfiles[n]
     lea     r10, [g_tempfiles]
@@ -7870,16 +8037,23 @@ gtt_cpdone:
     mov     r10, qword ptr [rbp-40]
     mov     rax, qword ptr [rbp-32]
     mov     qword ptr [r10+TEMP_SIZEOFF], rax          ; plaintext size for the wipe
+    mov     eax, dword ptr [rbp-48]
+    mov     dword ptr [r10+TEMP_DIROFF], eax
     inc     dword ptr [g_tempfile_n]
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gtt_full:
+    xor     eax, eax                         ; caller must not write an untracked file
     FRAME_EPILOG
     ret
 gui_temp_track endp
 
 ; gui_temp_purge() -> eax = count of files purged.  For each tracked temp file:
 ;   open it, overwrite its whole length with zeros, flush to disk, close, delete.
-;   Clears the table.  Best-effort per file (a vanished/locked file is skipped).
+;   Removes successful entries only; failed files/directories remain for retry.
 gui_temp_purge proc frame
-    FRAME_PROLOG 96                            ; CreateFileW(7)/WriteFile(5) arg spill below rbp-56
+    FRAME_PROLOG 144                           ; locals through -72 plus CreateFileW spill
     ; [rbp-24]=i, [rbp-32]=handle, [rbp-40]=remaining, [rbp-48]=&entry, [rbp-56]=purged
     ; [rbp-64] = WriteFile bytes-written (throwaway, in the spill zone)
     mov     dword ptr [rbp-56], 0
@@ -7890,18 +8064,18 @@ gui_temp_purge proc frame
 gtp_loop:
     mov     eax, dword ptr [rbp-24]
     cmp     eax, dword ptr [g_tempfile_n]
-    jae     gtp_clear
+    jae     gtp_done
     imul    eax, eax, TEMPREC
     lea     r10, [g_tempfiles]
     add     r10, rax
     mov     qword ptr [rbp-48], r10                    ; &entry (path @ +0)
     WINCALL CreateFileW, r10, GENERIC_WRITE_, 0, 0, OPEN_EXISTING_, FILE_ATTR_NORMAL_, 0
     cmp     rax, -1
-    je      gtp_del                                    ; can't open -> still try to delete
+    je      gtp_openfail
     mov     qword ptr [rbp-32], rax
-    mov     r10, qword ptr [rbp-48]
-    mov     rax, qword ptr [r10+TEMP_SIZEOFF]
-    mov     qword ptr [rbp-40], rax                    ; remaining bytes to overwrite
+    WINCALL GetFileSizeEx, qword ptr [rbp-32], addr rbp-40
+    test    eax, eax
+    jz      gtp_flush
 gtp_wipe:
     cmp     qword ptr [rbp-40], 0
     je      gtp_flush
@@ -7922,39 +8096,79 @@ gtp_flush:
     WINCALL CloseHandle, qword ptr [rbp-32]
 gtp_del:
     WINCALL DeleteFileW, qword ptr [rbp-48]
+    test    eax, eax
+    jz      gtp_keep
+gtp_dir:
+    mov     r10, qword ptr [rbp-48]
+    mov     eax, dword ptr [r10+TEMP_DIROFF]
+    test    eax, eax
+    jz      gtp_removed
+    mov     word ptr [r10+rax*2], 0
+    WINCALL RemoveDirectoryW, qword ptr [rbp-48]
+    mov     dword ptr [rbp-72], eax
+    call    GetLastError
+    mov     r10, qword ptr [rbp-48]
+    mov     ecx, dword ptr [r10+TEMP_DIROFF]
+    mov     word ptr [r10+rcx*2], 5Ch
+    cmp     dword ptr [rbp-72], 0
+    jne     gtp_removed
+    cmp     eax, 2
+    je      gtp_removed
+    cmp     eax, 3
+    jne     gtp_keep
+gtp_removed:
+    ; Compact only successful removals. Failed files retain their full paths.
     inc     dword ptr [rbp-56]
+    dec     dword ptr [g_tempfile_n]
+    mov     eax, dword ptr [g_tempfile_n]
+    imul    eax, eax, TEMPREC
+    lea     rdx, [g_tempfiles]
+    add     rdx, rax
+    mov     qword ptr [rbp-72], rdx
+    mov     rcx, qword ptr [rbp-48]
+    mov     r8d, TEMPREC
+    call    copy_bytes
+    mov     rcx, qword ptr [rbp-72]
+    mov     edx, TEMPREC
+    call    secure_zero
+    jmp     gtp_loop
+gtp_openfail:
+    call    GetLastError
+    cmp     eax, 2                           ; already removed file: still remove its directory
+    je      gtp_dir
+    cmp     eax, 3
+    je      gtp_removed
+gtp_keep:
     inc     dword ptr [rbp-24]
     jmp     gtp_loop
-gtp_clear:
-    lea     rcx, [g_tempfiles]                         ; scrub the path table itself
-    mov     edx, MAX_TEMPFILES*TEMPREC
-    call    secure_zero
-    mov     dword ptr [g_tempfile_n], 0
+gtp_done:
     mov     eax, dword ptr [rbp-56]
     FRAME_EPILOG
     ret
 gui_temp_purge endp
 
 ; gui_tmptest() -> eax = 0 pass / 1 fail (headless probe for the secure temp
-;   lifecycle).  Writes a %TEMP% file, tracks it, confirms it exists, purges,
-;   then confirms gui_temp_purge overwrote + deleted it.
+;   lifecycle). Checks unique directories, exclusive-create collision refusal,
+;   partial cleanup with a held viewer handle, and successful later retry.
 public gui_tmptest
 gui_tmptest proc frame
-    FRAME_PROLOG 48
-    mov     dword ptr [g_tempfile_n], 0               ; isolated table for the probe
-    WINCALL GetTempPathW, MAX_PATH_CHARS, addr g_tmpfile   ; g_tmpfile = %TEMP%\
-    lea     r10, [g_tmpfile]                          ; append the fixed test name
-    lea     r10, [r10+rax*2]
-    lea     r11, [wtmptest_name]
+    FRAME_PROLOG 112
+    mov     qword ptr [rbp-24], -1           ; held preview handle
+    mov     dword ptr [rbp-32], 1            ; default result = fail
+    mov     dword ptr [g_tempfile_n], 0
     xor     ecx, ecx
-gtt2_cp:
-    mov     dx, word ptr [r11+rcx*2]
-    mov     word ptr [r10+rcx*2], dx
-    test    dx, dx
-    jz      gtt2_cpd
-    inc     ecx
-    jmp     gtt2_cp
-gtt2_cpd:
+    call    tf_entry
+    lea     rcx, [rax+TFILE_NAME]
+    lea     rdx, [wtmptest_name]
+    call    gui_wcpy_capped
+    xor     ecx, ecx
+    call    gui_tile_make_temp
+    test    eax, eax
+    jz      gtt2_fail
+    lea     rcx, [g_imgpath]                 ; first path survives creation of the second
+    lea     rdx, [g_tmpfile]
+    lea     r8, [g_imgpath+MAX_PATH_CHARS*2-2]
+    call    gui_wstrcpy
     lea     r10, [g_wipezeros]                        ; 4096 bytes of a nonzero pattern
     mov     ecx, 4096
 gtt2_fill:
@@ -7962,29 +8176,86 @@ gtt2_fill:
     dec     ecx
     jnz     gtt2_fill
     lea     rcx, [g_tmpfile]
+    mov     edx, 4096
+    mov     r8d, dword ptr [g_tmpdir_len]
+    call    gui_temp_track
+    test    eax, eax
+    jz      gtt2_fail
+    mov     dword ptr [g_wf_disp], 1
+    lea     rcx, [g_tmpfile]
     lea     rdx, [g_wipezeros]
     mov     r8, 4096
     call    write_file
     test    eax, eax
     jnz     gtt2_fail                                 ; couldn't write the probe file
-    lea     rcx, [g_tmpfile]                          ; track it (size 4096)
-    mov     rdx, 4096
-    call    gui_temp_track
-    WINCALL GetFileAttributesW, addr g_tmpfile        ; must exist now
-    cmp     eax, -1
+    ; Reusing the exact path must fail without touching the existing bytes.
+    mov     dword ptr [g_wf_disp], 1
+    lea     rcx, [g_imgpath]
+    lea     rdx, [g_wipezeros]
+    xor     r8d, r8d
+    call    write_file
+    test    eax, eax
+    jz      gtt2_fail
+    cmp     dword ptr [g_wf_created], 0
+    jne     gtt2_fail
+    WINCALL CreateFileW, addr g_imgpath, GENERIC_READ, 0, 0, OPEN_EXISTING, FILE_ATTR_NORMAL, 0
+    cmp     rax, -1
     je      gtt2_fail
-    call    gui_temp_purge                            ; overwrite + delete
+    mov     qword ptr [rbp-24], rax
+    WINCALL GetFileSizeEx, qword ptr [rbp-24], addr rbp-40
+    test    eax, eax
+    jz      gtt2_fail
+    cmp     qword ptr [rbp-40], 4096
+    jne     gtt2_fail
+    ; The same attachment name must get a different directory.
+    xor     ecx, ecx
+    call    gui_tile_make_temp
+    test    eax, eax
+    jz      gtt2_fail
+    lea     rcx, [g_imgpath]
+    lea     rdx, [g_tmpfile]
+    call    gui_wstr_eq
+    test    eax, eax
+    jnz     gtt2_fail
+    lea     rcx, [g_tmpfile]
+    mov     edx, 4096
+    mov     r8d, dword ptr [g_tmpdir_len]
+    call    gui_temp_track
+    test    eax, eax
+    jz      gtt2_fail
+    mov     dword ptr [g_wf_disp], 1
+    lea     rcx, [g_tmpfile]
+    lea     rdx, [g_wipezeros]
+    mov     r8d, 4096
+    call    write_file
+    test    eax, eax
+    jnz     gtt2_fail
+    call    gui_temp_purge                   ; second removed, first locked and retained
+    cmp     eax, 1
+    jne     gtt2_fail
+    cmp     dword ptr [g_tempfile_n], 1
+    jne     gtt2_fail
     WINCALL GetFileAttributesW, addr g_tmpfile        ; must be gone now
     cmp     eax, -1
-    jne     gtt2_fail_del
-    xor     eax, eax
-    FRAME_EPILOG
-    ret
-gtt2_fail_del:
-    WINCALL DeleteFileW, addr g_tmpfile               ; don't leak the probe file on failure
+    jne     gtt2_fail
+    ; Once its viewer closes, a later cleanup must remove the retained file.
+    WINCALL CloseHandle, qword ptr [rbp-24]
+    mov     qword ptr [rbp-24], -1
+    ; Dispatch the same tray timer message used while the vault is locked.
+    WINCALL tray_wndproc, 0, WM_TIMER, TEMP_RETRY_TIMER, 0
+    cmp     dword ptr [g_tempfile_n], 0
+    jne     gtt2_fail
+    WINCALL GetFileAttributesW, addr g_imgpath
+    cmp     eax, -1
+    jne     gtt2_fail
+    mov     dword ptr [rbp-32], 0
 gtt2_fail:
-    mov     dword ptr [g_tempfile_n], 0
-    mov     eax, 1
+    cmp     qword ptr [rbp-24], -1
+    je      gtt2_cleanup
+    WINCALL CloseHandle, qword ptr [rbp-24]
+gtt2_cleanup:
+    call    gui_temp_purge
+    mov     eax, dword ptr [rbp-32]
     FRAME_EPILOG
     ret
 gui_tmptest endp
@@ -10955,7 +11226,8 @@ gui_restore_entry proc frame
     mov     dword ptr [g_deleted_state], 0       ; clear the deleted marker + reseal
     mov     rcx, qword ptr [rbp-24]
     call    gui_commit
-    mov     dword ptr [g_dirty], 0
+    test    eax, eax
+    jnz     gre_done
     mov     dword ptr [g_cur_idx], -1            ; it left the trash: clear the detail
     mov     rcx, qword ptr [rbp-24]
     call    gui_rows_clear
@@ -10963,6 +11235,7 @@ gui_restore_entry proc frame
     call    gui_poplist                          ; refresh the recover list
     mov     rcx, qword ptr [rbp-24]
     call    gui_detail_clear                     ; empty the detail (no stale entry shown)
+gre_done:
     FRAME_EPILOG
     ret
 gui_restore_entry endp
@@ -12655,9 +12928,11 @@ vp_save_real:
     je      vp_handled
     cmp     dword ptr [g_cur_idx], 0
     jl      vp_handled
-    mov     dword ptr [g_new_pending], 0     ; an explicit Save keeps the entry
     mov     rcx, qword ptr [rbp-8]
     call    gui_commit
+    test    eax, eax
+    jnz     vp_handled
+    mov     dword ptr [g_new_pending], 0     ; only a successful Save keeps the entry
     cmp     dword ptr [g_cur_idx], 0
     jl      vsr_view
     mov     rcx, qword ptr [rbp-8]            ; rebuild the rows first...
@@ -12682,6 +12957,8 @@ vp_remove:
     call    gui_set_deleted_now
     mov     rcx, qword ptr [rbp-8]
     call    gui_commit
+    test    eax, eax
+    jnz     vp_handled
     jmp     vpr_teardown
 vpr_forever:
     WINCALL gui_msgbox, qword ptr [rbp-8], addr t_delforever, addr t_err, <MB_YESNO or MB_ICONWARNING>
@@ -17333,6 +17610,8 @@ tray_wndproc proc
     mov     qword ptr [rbp-32], r9           ; lParam
     cmp     rdx, WM_TRAYICON
     je      twp_tray
+    cmp     rdx, WM_TIMER
+    je      twp_temp_retry
     cmp     rdx, WM_HOTKEY
     je      twp_hotkey
     cmp     rdx, WM_COMMAND
@@ -17348,6 +17627,15 @@ tray_wndproc proc
     cmp     rdx, WM_COPYDATA                    ; another instance handing us a .vordr
     je      twp_copydata
     WINCALL DefWindowProcW, qword ptr [rbp-8], qword ptr [rbp-16], qword ptr [rbp-24], qword ptr [rbp-32]
+    jmp     twp_ret
+twp_temp_retry:
+    cmp     qword ptr [rbp-24], TEMP_RETRY_TIMER
+    jne     twp_ret_zero
+    cmp     qword ptr [g_vaulthwnd], 0         ; active previews stay live until lock
+    jne     twp_ret_zero
+    call    gui_temp_purge
+twp_ret_zero:
+    xor     eax, eax
     jmp     twp_ret
 twp_copydata:
     ; A second instance was started on a .vordr and handed us the path.  ANY
@@ -17472,6 +17760,13 @@ twp_about:
     xor     eax, eax
     jmp     twp_ret
 twp_exit:
+    call    gui_temp_purge
+    cmp     dword ptr [g_tempfile_n], 0
+    je      twp_exit_clean
+    WINCALL gui_msgbox, qword ptr [rbp-8], addr s_tempbusy, addr t_err, <MB_OK or MB_ICONWARNING>
+    xor     eax, eax
+    jmp     twp_ret
+twp_exit_clean:
     WINCALL DestroyWindow, qword ptr [rbp-8]
     xor     eax, eax
     jmp     twp_ret
@@ -17483,6 +17778,7 @@ twp_endsession:
     je      twp_endsession_ret
     call    gui_clipclear
     call    secmem_panic_wipe
+    call    gui_temp_purge
 twp_endsession_ret:
     xor     eax, eax
     jmp     twp_ret
@@ -17505,6 +17801,15 @@ tray_wndproc endp
 ; =============================================================================
 gui_msgbox proc frame
     FRAME_PROLOG 48
+ifdef PROBE_IO
+    cmp     dword ptr [g_sp_active], 0
+    je      gmb_normal
+    inc     dword ptr [g_sp_messages]
+    mov     eax, IDNO                       ; regression probes never need user interaction
+    FRAME_EPILOG
+    ret
+gmb_normal:
+endif
     mov     qword ptr [rbp-24], rcx
     mov     qword ptr [g_msg_text], rdx
     mov     qword ptr [g_msg_title], r8
@@ -17818,7 +18123,8 @@ gm_clsok:
             0, 0, 0, 0, 0, 0, qword ptr [g_hinst], 0
 gm_trayhwnd:
     mov     qword ptr [g_trayhwnd], rax
-    mov     rcx, rax
+    WINCALL SetTimer, qword ptr [g_trayhwnd], TEMP_RETRY_TIMER, 5000, 0
+    mov     rcx, qword ptr [g_trayhwnd]
     call    gui_tray_add
     mov     rcx, qword ptr [g_trayhwnd]       ; Alt + | summons the vault from anywhere
     call    gui_hotkey_add
@@ -17889,6 +18195,8 @@ g_lp_cx     dd ?                     ; its client width  ... the box everything
 g_lp_cy     dd ?                     ; its client height ... must stay inside
 align 8
 g_lp_rc     dd 4 dup (?)             ; scratch RECT for the callback
+g_sp_active dd ?
+g_sp_messages dd ?
 
 .code
 CSTR lp_tag,   "[LAYOUT] id="
@@ -17901,6 +18209,10 @@ CSTR lp_head,  "layoutkat: "
 CSTR lp_tail,  " finding(s)",13,10
 CSTR lp_size,  "layoutkat: client ",0
 CSTR lp_ok,    "layoutkat: no findings",13,10
+CSTR sp_ok,    "savefail: PASS (busy/I-O failures retain edits, entry and history; retry persists)",13,10
+CSTR sp_bad,   "savefail: FAIL",13,10
+CSTR sp_title_a, "Retry regression"
+WSTR sp_title_w, <Retry regression>
 CSTR lp_meas,  "layoutkat: visible controls measured: "
 CSTR lp_thin,  "layoutkat: measured almost nothing - the window or its children never became visible, so this run proves nothing",13,10
 
@@ -18019,6 +18331,137 @@ lp_measure proc frame
 lp_measure endp
 
 ; gui_layout_probe() -> eax = findings.  The vault must already be unlocked.
+extern vault_lock_acquire:proc
+extern vault_lock_release:proc
+; Exercise the actual Save command with a held write lock, twice, then retry.
+gui_save_probe proc frame
+    FRAME_PROLOG 144
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [g_sp_active], 1
+    mov     dword ptr [g_sp_messages], 0
+    mov     rax, qword ptr [g_body_ptr]
+    mov     qword ptr [rbp-32], rax
+    mov     rax, qword ptr [g_body_len]
+    mov     qword ptr [rbp-40], rax
+    mov     eax, dword ptr [g_cur_idx]
+    mov     dword ptr [rbp-48], eax
+    mov     edx, 1
+    call    gui_set_editmode
+    mov     dword ptr [g_no_history], 0
+    mov     eax, dword ptr [g_pwhist_n]
+    mov     dword ptr [rbp-80], eax
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_TITLE, addr sp_title_w
+    xor     ecx, ecx
+gsp_findfield:
+    cmp     ecx, dword ptr [g_field_count]
+    jae     gsp_fail
+    imul    eax, ecx, DESCSZ
+    lea     r10, [g_fields]
+    add     r10, rax
+    mov     eax, dword ptr [r10+FD_KIND]
+    cmp     eax, VF_USERNAME
+    je      gsp_editfield
+    cmp     eax, VF_SECRET
+    je      gsp_editfield
+    cmp     eax, VF_NOTES
+    je      gsp_editfield
+    inc     ecx
+    jmp     gsp_findfield
+gsp_editfield:
+    mov     rcx, qword ptr [r10+FD_HANDLES+DS_VALUE*8]
+    WINCALL SetWindowTextW, rcx, addr sp_title_w
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_V_TITLE
+    WINCALL SetFocus, rax
+    mov     dword ptr [g_dirty], 1
+    call    vault_lock_acquire
+    test    eax, eax
+    jz      gsp_fail
+    mov     dword ptr [rbp-56], 2
+gsp_retry:
+    WINCALL SendMessageW, qword ptr [rbp-24], WM_COMMAND, IDC_V_SAVE, 0
+    cmp     dword ptr [g_dirty], 1
+    jne     gsp_fail_release
+    cmp     dword ptr [g_editmode], 1
+    jne     gsp_fail_release
+    mov     eax, dword ptr [g_pwhist_n]
+    cmp     eax, dword ptr [rbp-80]
+    jne     gsp_fail_release
+    mov     rax, qword ptr [g_body_ptr]
+    cmp     rax, qword ptr [rbp-32]
+    jne     gsp_fail_release
+    mov     rax, qword ptr [g_body_len]
+    cmp     rax, qword ptr [rbp-40]
+    jne     gsp_fail_release
+    mov     eax, dword ptr [g_cur_idx]
+    cmp     eax, dword ptr [rbp-48]
+    jne     gsp_fail_release
+    dec     dword ptr [rbp-56]
+    jnz     gsp_retry
+    cmp     dword ptr [g_sp_messages], 2
+    jne     gsp_fail_release
+    call    vault_lock_release
+    ; A reader that denies delete-sharing allows the pre-save read but blocks
+    ; atomic replacement. This exercises the real I/O failure and declined retry.
+    WINCALL CreateFileW, qword ptr [g_cfg_in], GENERIC_READ, 1, 0, OPEN_EXISTING, FILE_ATTR_NORMAL, 0
+    cmp     rax, -1
+    je      gsp_fail
+    mov     qword ptr [rbp-72], rax
+    WINCALL SendMessageW, qword ptr [rbp-24], WM_COMMAND, IDC_V_SAVE, 0
+    WINCALL CloseHandle, qword ptr [rbp-72]
+    cmp     dword ptr [g_sp_messages], 3
+    jne     gsp_fail
+    cmp     dword ptr [g_dirty], 1
+    jne     gsp_fail
+    cmp     dword ptr [g_editmode], 1
+    jne     gsp_fail
+    mov     eax, dword ptr [g_pwhist_n]
+    cmp     eax, dword ptr [rbp-80]
+    jne     gsp_fail
+    mov     rax, qword ptr [g_body_ptr]
+    cmp     rax, qword ptr [rbp-32]
+    jne     gsp_fail
+    mov     eax, dword ptr [g_cur_idx]
+    cmp     eax, dword ptr [rbp-48]
+    jne     gsp_fail
+    WINCALL SendMessageW, qword ptr [rbp-24], WM_COMMAND, IDC_V_SAVE, 0
+    cmp     dword ptr [g_dirty], 0
+    jne     gsp_fail
+    cmp     dword ptr [g_editmode], 0
+    jne     gsp_fail
+    call    vault_reload
+    test    eax, eax
+    jnz     gsp_fail
+    mov     ecx, dword ptr [g_cur_idx]
+    lea     rdx, [rbp-64]
+    call    vault_title_at
+    test    rax, rax
+    jz      gsp_fail
+    cmp     qword ptr [rbp-64], sp_title_a_len
+    jne     gsp_fail
+    lea     rdx, [sp_title_a]
+    xor     ecx, ecx
+gsp_compare:
+    mov     r8b, byte ptr [rax+rcx]
+    cmp     r8b, byte ptr [rdx+rcx]
+    jne     gsp_fail
+    inc     ecx
+    cmp     ecx, sp_title_a_len
+    jb      gsp_compare
+    mov     dword ptr [g_sp_active], 0
+    WINCALL print_a, addr sp_ok, sp_ok_len
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gsp_fail_release:
+    call    vault_lock_release
+gsp_fail:
+    mov     dword ptr [g_sp_active], 0
+    WINCALL print_a, addr sp_bad, sp_bad_len
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gui_save_probe endp
+
 public gui_layout_probe
 gui_layout_probe proc frame
     FRAME_PROLOG 128
@@ -18094,6 +18537,9 @@ gui_layout_probe proc frame
     call    lp_pump
     mov     rcx, qword ptr [rbp-32]
     call    lp_measure
+    mov     rcx, qword ptr [rbp-32]
+    call    gui_save_probe
+    add     dword ptr [g_lp_bad], eax
     WINCALL DestroyWindow, qword ptr [rbp-32]
     call    lp_pump
     jmp     glp_nowin                       ; do NOT fall into the no-desktop answer

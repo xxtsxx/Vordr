@@ -227,10 +227,10 @@ be exploited quietly:
   use — audited buffer-by-buffer in
   [docs/SECRETS.md](docs/SECRETS.md), and proven by a scanner (`secscan`) that
   plants a sentinel, wipes, and sweeps all process memory for residue.
-- **Deterministic temp-file destruction**: attachments previewed via an
-  external app are tracked, overwritten with zeros, flushed, and deleted on
-  every lock (proven by `tmptest`) — or never written at all (see *Attachment
-  preview*).
+- **Tracked temp-file cleanup**: attachment previews use exclusively created
+  files in separate random directories. Locking attempts to overwrite, flush,
+  and delete them; files held by another application stay tracked for retry
+  (tested by `tmptest`). See *Attachment preview*.
 
 None of this is taken on faith: the `redteam` suite injects each fault class —
 canary smash, shadow-stack mismatch, DLPV bypass, buffer overflow, bounds
@@ -278,7 +278,10 @@ failing to unlock.
 
 Opening an attachment in its default app requires writing its plaintext to a
 temp file (that is how the ShellExecute hand-off works). Vordr tracks every
-such file and overwrites-then-deletes it on lock. If you prefer that the
+such file and attempts to overwrite-then-delete it on lock. If a viewer blocks
+cleanup, Vordr retains the path and retries every five seconds while locked.
+Normal Exit waits for blocked previews to be closed; forced termination or
+shutdown can still leave plaintext files behind. If you prefer that the
 plaintext **never** leaves the vault unrequested, enable **"Disable attachment
 preview"** (`NoPreview`, default off): attachments then become download-only —
 you explicitly choose where the plaintext copy goes, exactly as executable
