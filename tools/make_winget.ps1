@@ -39,7 +39,7 @@ $ErrorActionPreference = "Stop"
 $PackageId  = "ThomasSmistad.Vordr"
 $Publisher  = "Thomas Smistad"
 $RepoUrl    = "https://github.com/xxtsxx/Vordr"
-$ManifestVer = "1.6.0"
+$ManifestVer = "1.12.0"
 
 
 # winget-pkgs validation requires CRLF and rejects a manifest without it
