@@ -105,7 +105,7 @@ see [the exact format](formats.md#file-authentication-trailer).
 
 The TPM key-length property request is best-effort, and existing keys are reused
 without a length check. Provider UI policy is also best-effort. The
-[risk assessment](RISK_ASSESSMENT.md#local-access-password-entry-and-tpm--r4-and-r5)
+[risk assessment](RISK_ASSESSMENT.md#r5--unintended-access-through-tpm-convenience-unlock)
 explains why neither should be treated as a stronger enforcement guarantee.
 
 Random generation fails if the OS RNG fails. RDSEED is optional, can run out of
