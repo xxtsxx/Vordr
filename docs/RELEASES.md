@@ -1,113 +1,94 @@
-# Reproducible release builds
+# Release verification and hashes
 
-A password manager asks for a lot of trust, so a Vordr release must be
-*auditable*: anyone with the toolchain can rebuild the exact commit and get a
-**byte-identical** `bin\vordr.exe`, then confirm its SHA-256 matches the
-published hash. If they match, the published binary provably corresponds to the
-public source — no hidden changes slipped in between source and binary.
+[Documentation](README.md) · [Release checklist](RELEASE_CHECKLIST.md)
 
-## Building a release
+A matching hash identifies a particular file. Reproducing that hash from a
+reviewed tag provides evidence that the executable corresponds to the source
+built with that toolchain. Neither comparison proves that the source is safe.
 
-```
-build.cmd release
-```
+## Verify a download
 
-This adds two linker flags on top of the normal security/mitigation flags:
+Hash the downloaded executable in PowerShell:
 
-| flag | why it is needed for reproducibility |
-|------|--------------------------------------|
-| `/Brepro` | Replaces every embedded timestamp (the PE header `TimeDateStamp`, the debug-directory entry, and the PDB signature GUID) with a deterministic hash of the binary content, instead of the wall-clock time of the build. |
-| `/pdbaltpath:vordr.pdb` | Embeds only the bare PDB filename in the exe, never the machine's absolute build path — so two people building in different directories still get identical bytes. |
-
-The security mitigations are orthogonal and stay on in release builds:
-CET shadow stack (`/CETCOMPAT`), DEP/NX (`/nxcompat`), ASLR
-(`/dynamicbase` + `/highentropyva`). `build.cmd` prints the mitigation summary
-and the release SHA-256 at the end.
-
-## Verifying a release
-
-Two independent clean builds of the same commit must produce the same hash:
-
-```
-build.cmd release
-certutil -hashfile bin\vordr.exe SHA256
-
-rmdir /s /q obj bin        &  rem force a full rebuild
-build.cmd release
-certutil -hashfile bin\vordr.exe SHA256      rem must match the first hash
+```powershell
+Get-FileHash .\vordr.exe -Algorithm SHA256
 ```
 
-Determinism was verified this way: two clean release builds (with `obj\` wiped
-between them, so the assemble + resource-compile + link pipeline is fully
-re-run) yield the identical exe.
+Compare it with the row for that exact version below. A mismatch means the
+files differ: do not use the download until you have checked the version, source,
+and transfer. Do not compare an MSI's hash with the executable hash.
 
-## Published hashes
+## Published executable hashes
 
-The full per-release procedure - including this step and what to do when a
-published version turns out to be vulnerable - is in
-[RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md).
+These are historical release records, retained unchanged. The supported-version
+policy is in [SECURITY.md](../SECURITY.md); an old hash does not imply support.
 
-After tagging, submit the new binary to Microsoft as a false positive:
-<https://www.microsoft.com/en-us/wdsi/filesubmission>.  Vordr is unsigned, so
-Defender's ML classifier flags each new build until it is reviewed - and the hash
-changes every release, so a previous clearance does not carry over.  See
-[ANTIVIRUS.md](ANTIVIRUS.md).
-
-Release hashes are recorded per tagged version. There is no automated release
-job yet: at tag time `build.cmd release` is run twice from a clean tree, the two
-hashes are compared, and the result is recorded here by hand.
-
-| version | commit | SHA-256 (`bin\vordr.exe`) |
-|---------|--------|---------------------------|
+| Version | Commit | SHA-256 of `vordr.exe` |
+|---|---|---|
 | v0.2.0 | `48cc1df` | `811b5cd6f56845daf747bc8e4d18f89f35a7bb815463611a1f090009a8279faa` |
 | v0.2.1 | `1ba8413` | `01baa66ff49e1869dc6b68b4c4528c5cb534282b54f98745222e0f628898e664` |
 | v0.2.2 | `4482251` | `eaa45139c4941e6516c17ebf880c5fb78dee0bd0c5db88024e99b51833ad914d` |
 | v0.2.3 | `378c28e` | `197e5ef014c8be0093ed7a0e7960358cdeb2b118c4dbb5680a949dcf55c2d343` |
 
-The row records the hash of a build of the **tagged** commit. This file is
-updated immediately after tagging, so the commit that adds a row is not itself
-the commit that row describes — check out the tag, not `master`, when
-reproducing a hash:
+A row may have been added after the tag it describes. Rebuild the tag, not
+the current `master` branch, when checking a published hash.
 
-```
-git checkout v0.2.0
+## Reproduce an executable
+
+Use a separate clean checkout and the matching MSVC/SDK versions. Build flags
+remove common sources of variation but do not make different toolchains
+interchangeable.
+
+```bat
+git clone --branch v0.2.3 --depth 1 https://github.com/xxtsxx/Vordr.git vordr-v0.2.3-check
+cd vordr-v0.2.3-check
 build.cmd release
 certutil -hashfile bin\vordr.exe SHA256
 ```
 
-## Security advisories
+The tag is an example; choose the version being verified. For two-build
+verification, repeat in a second fresh directory instead of deleting an
+existing working tree's `bin` and `obj` folders.
 
-A released version found to be security-relevant is listed here, next to its hash,
-as well as in a GitHub Security Advisory — this table is what someone checks when
-verifying a binary they already downloaded.
+| Linker option | Purpose |
+|---|---|
+| `/Brepro` | Uses deterministic content-derived build metadata |
+| `/pdbaltpath:vordr.pdb` | Avoids embedding a machine-specific absolute PDB path |
 
-| version | advisory | status |
-|---------|----------|--------|
-| _(none yet)_ | — | — |
+The ASLR, DEP/NX, high-entropy VA, and CET compatibility flags remain enabled.
+Record tool versions alongside hashes when preparing a release.
 
-Defects that are not security-relevant are noted as "superseded" below instead.
+## MSI payloads
 
-> **v0.2.0 is superseded and should not be used.** It creates the vault beside the
-> executable on any machine with a linked OneDrive, can strand the user on the
-> secure desktop at first unlock, and reads past the import selection mask on a
-> vault with more than 8192 entries. Use v0.2.1.
+The MSI is a per-machine wrapper around the executable. It installs into
+`%ProgramFiles%\Vordr`, registers an installed-product identity, and can add
+a shortcut, file association, and administrator-selected policy values.
+Uninstall does not remove vaults or HKCU user data.
 
-### The MSI is a wrapper, not the artifact the hash covers
+The MSI gets new product/package identifiers when built, so its hash can change
+even when its executable payload does not. Publish a separate MSI hash and
+ProductCode. Verify its extracted executable against the table above.
 
-`tools\make_msi.ps1` builds a per-user MSI around `binordr.exe`. It exists so
-Vordr has an Add/Remove Programs identity - which is what software inventory and
-winget can see, and what a portable exe is invisible to - not to replace the
-portable binary, which remains the primary download.
+An administrative extraction can be used to inspect the payload:
 
-**The published SHA-256 is the hash of `vordr.exe`, never of the MSI.** An MSI
-embeds a fresh ProductCode and package GUID on every build, so its own hash
-changes even when the payload does not. Verify the exe: extract it from the MSI
-with `msiexec /a vordr-<version>.msi /qn TARGETDIR=<dir>` and hash the result, or
-just download the exe.
+```bat
+msiexec /a "C:\Downloads\vordr-0.2.3.msi" /qn TARGETDIR="C:\Temp\vordr-extracted"
+```
 
-The MSI installs one file and owns nothing else - no vault, no registry values -
-so uninstalling Vordr never touches a user's secrets.
+Use an empty, task-owned destination and inspect the extracted tree for
+`vordr.exe`. Extraction does not test installation policy, upgrades, or uninstall;
+see [Deployment](DEPLOYMENT.md).
 
-To check a downloaded binary, hash it and compare against the row for its
-version. A mismatch means the binary does **not** correspond to this source at
-that commit — do not trust it.
+## Historical known issues
+
+**v0.2.0 is superseded and should not be used.** The existing release record
+notes an incorrect default vault location on OneDrive-linked machines, a
+first-unlock private-desktop problem, and an import-selection bounds issue
+above 8192 entries. Use the newest supported release, not an old version simply
+because its hash is listed.
+
+The previous release documentation contained no advisory entries. This page is
+not a live advisory feed; check
+[GitHub security advisories](https://github.com/xxtsxx/Vordr/security/advisories)
+and current release notes before deployment. Add affected/fixed versions here
+when publishing an advisory, without deleting or repointing old tags.

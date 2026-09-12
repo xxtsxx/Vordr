@@ -1,36 +1,19 @@
-# The issue chooser is where someone with a security finding actually lands -
-# not SECURITY.md - so the private route is offered here, above the option to
-# file publicly.
-#
-# Blank issues are off: bug_report.md is the way in, which means every reporter
-# passes the "NOT for security vulnerabilities" notice at the top of it instead of
-# starting from an empty box.  This is only safe BECAUSE that template exists -
-# with no templates, disabling blank issues leaves no way to open an issue at all
-# and bug reports become silently impossible.  If the template is ever removed,
-# this must go back to true.
+# Keep an ordinary bug template available while blank issues are disabled.
+# GitHub supplies its private-report entry when private reporting is enabled.
 blank_issues_enabled: false
-#
-# There is deliberately NO "report a vulnerability" link here: GitHub adds that
-# entry itself (the shield icon) because private vulnerability reporting is on and
-# SECURITY.md exists.  Listing our own duplicate of it left two near-identical
-# rows in the chooser, which makes a reporter hesitate over which one is real.
-# The reason it matters is carried below instead.
 contact_links:
-  - name: Security vulnerabilities - use the private report above, not an issue
+  - name: Security reporting policy
     url: https://github.com/xxtsxx/Vordr/blob/master/SECURITY.md
     about: >
-      Vordr has no auto-update, so a vulnerability posted publicly is a working
-      exploit against every installed copy until each one is updated by hand. Use
-      "Report a security vulnerability" above. This policy has the scope, the
-      timelines and the disclosure terms.
-  - name: My antivirus flags Vordr as malware
+      Report suspected vulnerabilities privately. Read the scope, response
+      expectations, and coordinated-disclosure terms before submitting.
+  - name: My antivirus flags Vordr
     url: https://github.com/xxtsxx/Vordr/blob/master/docs/ANTIVIRUS.md
     about: >
-      A known false positive. Vordr is unsigned and new, and a password manager
-      necessarily uses the same APIs a credential stealer would. Please read this
-      before filing.
-  - name: Verify a binary you downloaded
+      Check the download and its hash, keep protection enabled, and learn how to
+      submit a suspected false positive. A past warning does not explain every new one.
+  - name: Verify a downloaded executable
     url: https://github.com/xxtsxx/Vordr/blob/master/docs/RELEASES.md
     about: >
-      Every release is reproducible: rebuild the tag and compare the SHA-256
-      against the published hash. A mismatch means the binary is not this source.
+      Compare the executable with its published hash or rebuild the exact tag
+      with a matching toolchain. Investigate mismatches before using the file.

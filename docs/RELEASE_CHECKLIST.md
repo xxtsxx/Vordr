@@ -1,197 +1,138 @@
 # Release checklist
 
-Every release runs through this list in order. It exists because two of the steps
-are easy to skip and expensive to skip: telling antivirus vendors about a new
-binary, and telling users when a version they already have turns out to be unsafe.
+[Documentation](README.md) · [Release hashes](RELEASES.md) · [Deployment](DEPLOYMENT.md)
 
-Vordr has **no auto-update and no telemetry**. Nothing reaches out to a user after
-they download a build. That is a deliberate property — there is no channel for
-anyone, including us, to push code to them — and it means these notification steps
-are very nearly the only notification there will be. A CVE is the one signal that
-travels on its own, and only as far as §5 describes.
+Prepare releases from a reviewed commit in an isolated checkout. Test only
+synthetic vaults, and do not publish debug/probe builds or private test artifacts.
+Vordr has no automatic updater, so clear release notes and security advisories
+are part of the release work.
 
-## 1. Before tagging
+```mermaid
+flowchart LR
+    A["Review and test"] --> B["Build reproducible executable"]
+    B --> C["Package and test MSI"]
+    C --> D["Tag and publish exact artifacts"]
+    D --> E["Generate and validate WinGet manifests"]
+    D --> F["Vendor submissions and release notes"]
+```
 
-- [ ] `tests\run_all.cmd` — all six stages pass (the sixth builds and verifies
-      the installer; see §2).
-- [ ] `build.cmd release` twice from a clean tree (`obj\` and `bin\` removed
-      between), hashes compared, byte-identical.
-- [ ] `selftest` passes on the exact binary being published.
-- [ ] The version resource in `vordr.rc` matches the tag being cut. A binary whose
-      properties disagree with its tag defeats the published-hash scheme.
-- [ ] Anything fixed since the last release that affected a *published* version is
-      recorded in §5 below.
+## 1. Review and test
 
-## 2. Build and check the installer
+- [ ] Confirm the selected commit and version resource in `vordr.rc`.
+- [ ] Review changes since the last release, including effects on published versions.
+- [ ] Update user/reference docs and release notes.
+- [ ] Run `tests\run_all.cmd` in a safe test environment. It stops Vordr processes
+  and replaces build outputs; see [Development](DEVELOPMENT.md).
+- [ ] Inspect every stage and skip. Do not treat “ALL STAGES PASSED” with missing
+  Python, installer tooling, or desktop checks as complete release evidence.
+- [ ] Exercise GUI unlock, edit/save/retry, lock, preview cleanup, import/export,
+  backup restoration, and policy behavior with synthetic data.
 
-The MSI is optional to ship but not optional to check: it is the only artefact
-that writes to HKLM and to the shell's class registry, and the only one whose
-mistakes are invisible until someone installs it. See
-[DEPLOYMENT.md](DEPLOYMENT.md) for what it registers and why.
+## 2. Produce the executable
 
-**The first two boxes below are now the gate's sixth stage** — `run_all.cmd`
-builds the package from the restored release binary and runs the verifier on
-every push. Tick them by reading the gate output rather than by repeating the
-commands. The rest of this section is what the gate *cannot* do: it will not
-install anything, so the upgrade and uninstall checks stay manual and stay the
-ones that matter.
+- [ ] Build with `build.cmd release strict`, with Python and the intended toolchain.
+- [ ] Repeat in a second clean checkout of the same commit with the same toolchain.
+- [ ] Compare executable hashes and investigate differences.
+- [ ] Record the source commit, toolchain versions, build command, and SHA-256.
+- [ ] Run `selftest` and the Python crypto verifier against the exact executable
+  being published.
+- [ ] Confirm no `dbg`, `probeio`, or `guishow` flags were used.
 
-- [ ] Build it from the **exact** binary being published, not a rebuilt one.
-      `make_msi.ps1` takes the version from the exe's own resource, so a stale
-      `bin\vordr.exe` yields a package correctly labelled vX.Y.Z and wrapped
-      around the wrong bytes.
+The gate's normal restored build is not the final reproducible release artifact.
+Build the intended release explicitly before packaging it.
 
-      ```
-      powershell -ExecutionPolicy Bypass -File tools\make_msi.ps1
-      ```
+## 3. Package and test the MSI
 
-- [ ] `tools\verify_msi.ps1 -Msi bin\vordr-X.Y.Z.msi` exits 0. It runs the
-      package's costing through Windows Installer rather than only reading rows
-      back, so it catches the silent ones: a property that never reaches the elevated half of
-      the install, a component that writes into `WOW6432Node` where the 64-bit
-      exe never looks, a policy value written with no condition, an unquoted `%1`
-      in the open command.
-- [ ] **Install over the previous release**, not onto a clean machine, and
-      confirm exactly one entry remains in Add/Remove Programs.
+The gate includes MSI creation and table/costing verification, but does not
+perform a real installation. Repeat packaging against the exact final release
+executable, not a stale or diagnostic `bin\vordr.exe`.
 
-      This is the step that earns its place. Two upgrade faults have shipped past
-      inspection here — `Upgrade.Attributes` using `0x1` where the Inclusive bits
-      are `0x100`/`0x200`, and `FindRelatedProducts` missing from
-      `InstallUISequence` so the server skipped it as *"already done on client
-      side"* and it ran nowhere. Both produced logs that read as success, both
-      left two products registered, and `msiexec /a` cannot see either. Only a
-      real install found them.
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\make_msi.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\verify_msi.ps1 -Msi bin\vordr-X.Y.Z.msi
+```
 
-- [ ] Uninstall and confirm what is gone and what is not: the exe, the shortcut,
-      the `.vordr` class and the policy values go; **the vault and `HKCU` stay**.
-      That half of the check matters most — an installer that tidies away a
-      password manager's data on removal destroys the user's secrets, and MSI
-      makes it a one-row mistake.
-- [ ] Confirm the installed `%ProgramFiles%\Vordr\vordr.exe` hashes to the
-      SHA-256 being published. The cab is built from a copy; this proves the copy
-      is the same file.
-- [ ] Record the ProductCode in the release notes. The **UpgradeCode never
-      changes** — it is the only thing that lets a future package recognise this
-      one instead of installing beside it.
+Replace `X.Y.Z` with the release version.
 
-Two notes on running these by hand. Installing needs elevation, and `/qn`
-suppresses the UI that a UAC prompt would appear in, so a silent install from a
-normal shell fails with error 1925 and prints nothing at all — drop `/qn` and
-msiexec prompts. And a per-user association in `HKCU\Software\Classes` shadows
-the per-machine one, so clear any test association before judging the shell
-behaviour.
+- [ ] Verify tables, policy components, 64-bit registry view, and upgrade range.
+- [ ] In an isolated VM, install over the previous release and confirm exactly
+  one Vordr entry remains in installed applications.
+- [ ] Test same-version replacement if repackaging is part of the workflow.
+- [ ] Repeat policy properties on upgrade; verify only requested settings are locked.
+- [ ] Verify the shortcut and quoted `.vordr` association with a path containing spaces.
+- [ ] Confirm the installed executable's hash matches the final release executable.
+- [ ] Uninstall and verify vaults and HKCU user data remain.
+- [ ] Record the MSI hash and ProductCode separately. Keep the UpgradeCode unchanged.
 
-## 3. Tag and publish
+Use an elevated shell for silent per-machine installation. Administrative
+extraction (`msiexec /a`) alone does not exercise installation or upgrade logic.
 
-- [ ] Annotated tag on the built commit (`git tag -a vX.Y.Z <commit>`).
-- [ ] Row added to [RELEASES.md](RELEASES.md): version, commit, SHA-256.
-- [ ] Previous release marked superseded there if it carries known defects.
-- [ ] If the MSI is published alongside the exe, its hash is listed as *this
-      file*, never as something to check a rebuild against. The exe is
-      reproducible; the MSI deliberately is not — ProductCode and PackageCode are
-      fresh GUIDs on every build, so two packages of the same commit differ by
-      design. The reproducible-build guarantee covers the exe, and the MSI's hash
-      only tells someone their download arrived intact.
-- [ ] **winget manifest**, once the release assets are uploaded and their URLs
-      are final:
+## 4. Tag and publish
 
-      ```
-      powershell -ExecutionPolicy Bypass -File tools\make_winget.ps1 -Url <asset URL>
-      winget validate --manifest bin\winget\<version>
-      ```
+- [ ] Create an annotated version tag pointing to the reviewed, built commit.
+- [ ] Add its executable hash and commit to [RELEASES.md](RELEASES.md).
+- [ ] Publish the exact tested executable and, if offered, the exact tested MSI.
+- [ ] State supported Windows/CPU requirements and changes from the previous release.
+- [ ] Label known affected/superseded versions without deleting or moving their tags.
+- [ ] Download the published files and compare them with the tested bytes.
 
-      then a PR to `microsoft/winget-pkgs`. Every release needs a new manifest —
-      version, URL, hash and ProductCode all change together, and the ProductCode
-      is what winget matches an installed copy on, so a stale one means "not
-      installed" forever.
+A tag permanently identifies a source state. Hash documentation can be added
+after tagging, but must clearly describe the tagged build rather than the
+documentation commit.
 
-      This is the one distribution channel that fits the project's constraints.
-      It earns the prevalence that §4 exists to work around, and `winget upgrade`
-      gives users a way to *pull* a fix — the gap §5 admits to — without Vordr
-      ever opening a socket.
+## 5. Submit the WinGet update
 
-## 4. Self-report the build to antivirus vendors
+Generate manifests from the **published MSI bytes**, not a locally rebuilt MSI.
+Rebuilding produces a new ProductCode and hash even with the same executable.
 
-**Do this at every release, before or immediately after publishing the binary —
-not after a user complains.**
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\make_winget.ps1 -Url https://github.com/xxtsxx/Vordr/releases/download/vX.Y.Z/vordr-X.Y.Z.msi -Msi bin\vordr-X.Y.Z.msi -ReleaseDate YYYY-MM-DD
+winget validate --manifest bin\winget\X.Y.Z
+```
 
-Vordr is unsigned, has near-zero prevalence, and (being a password manager)
-registers a global hotkey, switches desktops and uses the clipboard. Machine
-learning classifiers score that as malware; Defender has flagged a release as
-`Trojan:Win32/Wacatac.B!ml` already. See [ANTIVIRUS.md](ANTIVIRUS.md).
+Replace the version and date placeholders. Pass `-Msi` explicitly to avoid
+accidentally selecting a different local package.
 
-**A clearance applies to one hash only.** Every release is a new binary and starts
-from scratch, which is exactly why this is a per-release step and not a one-off.
+- [ ] Verify version, URL, SHA-256, ProductCode, and release date.
+- [ ] Confirm all three files have the correct schema-reference comment:
+  `version`, `installer`, and `defaultLocale`, matching `ManifestVersion`.
+- [ ] Preserve CRLF endings in the submitted files.
+- [ ] Run local validation and test the manifest in an isolated installation.
+- [ ] Submit one version under `manifests/t/ThomasSmistad/Vordr/X.Y.Z/` in
+  `microsoft/winget-pkgs`.
+- [ ] Read reviewer comments and remote validation results. Local validation
+  does not guarantee repository-policy validation.
+- [ ] Record the PR link and wait for acceptance before claiming the version is
+  available through the community source.
 
-- [ ] **Microsoft** — <https://www.microsoft.com/en-us/wdsi/filesubmission>,
-      submitting as *software developer*. This is the one that matters most:
-      Defender and SmartScreen are what most Windows users meet. Typical
-      turnaround is one to three days.
-- [ ] **Upload to VirusTotal.** Not a vendor, but the sample is distributed to the
-      engines that participate, so it seeds many vendors at once and gives a public
-      record of the scan for the published hash.
-- [ ] **Submit the MSI too, if one is published.** It is a separate binary with
-      its own hash and the same near-zero prevalence, and clearing the exe does
-      nothing for it. An installer that writes to HKLM and registers a file type
-      is, if anything, the more suspicious-looking of the two.
-- [ ] **Any vendor that has flagged a previous release** — most run a
-      false-positive submission form or a `samples@` address; check the vendor's
-      current page rather than trusting a URL cached here, as these move.
-- [ ] Record the date and outcome in the release notes so the next person can see
-      which vendors have already cleared the project.
+The 0.2.3 submission exposed a useful distinction: locally valid manifests can
+still need repository-required schema-reference headers. Diagnose the actual
+reviewer feedback before treating a generic Azure error as a service outage.
 
-If a vendor rejects the submission or does not respond, say so publicly in the
-release notes rather than quietly leaving users with a scary warning.
+## 6. Vendor submissions
 
-## 5. When a released version turns out to be vulnerable
+- [ ] Submit each new public executable and MSI to Microsoft's
+  [file submission portal](https://www.microsoft.com/en-us/wdsi/filesubmission)
+  and relevant vendors, using their current process.
+- [ ] Include the exact hashes and any observed detection names.
+- [ ] If using a public multi-engine service, upload only intended public release
+  artifacts, never vaults or user data.
+- [ ] Record dates and responses in [ANTIVIRUS.md](ANTIVIRUS.md) or release notes.
+- [ ] Distinguish a submitted sample, an awaiting response, and an actual vendor
+  determination. Do not promise clearance or a response time.
 
-If a defect in a **published** version is security-relevant — anything that could
-expose vault contents, weaken the crypto, or lose data — it gets reported by the
-project, about the project, without waiting for anyone to ask.
+## 7. Security-relevant released defects
 
-- [ ] **Publish a GitHub Security Advisory** on the repository, naming the exact
-      affected versions and the fixed version. Do this even when the finding came
-      from the maintainer rather than an outside reporter: an advisory is how a
-      version already in someone's hands gets flagged, and it is the only
-      machine-readable signal this project emits.
-- [ ] **Request a CVE** through the advisory when the issue is exploitable by
-      someone other than the vault's owner. GitHub is a CNA and can assign one
-      directly from the advisory, at no cost. This is the step that travels beyond
-      the repository: a CVE reaches NVD and from there the vulnerability-management
-      products that match installed software against known issues. Keep the product
-      naming in `vordr.rc` (`ProductName`, `ProductVersion`, `CompanyName`) stable
-      across releases — that version resource is what file-level inventory matches
-      on, and a portable exe unzipped into a folder has nothing else to be
-      recognised by. An MSI install is the exception worth knowing about: it
-      registers ProductName and ProductVersion in Add/Remove Programs, which is
-      the entry software inventory reads first, so machines installed that way are
-      the ones a CVE can actually reach. Do not expect it to reach consumers
-      either way: that categorisation is a Defender for Endpoint feature and
-      surfaces to enterprise administrators.
-- [ ] **Mark the version in [RELEASES.md](RELEASES.md)** — the hash table is what
-      someone checks when verifying a binary they already downloaded, so a
-      vulnerable build must be labelled *there*, next to its hash, not only in an
-      advisory they may never see.
-- [ ] **Ship the fix as a new release** and mark the old one superseded.
-- [ ] Do **not** silently delete or repoint the old tag. A tag names one set of
-      bytes permanently; removing it to hide a bad release destroys the very
-      guarantee the published hashes exist to provide, and leaves anyone holding
-      that binary unable to find out what is wrong with it.
+Follow [SECURITY.md](../SECURITY.md), including coordinated disclosure.
 
-The honest limit: users who never revisit the repository will not learn any of
-this. A CVE does travel further — into NVD, and from there into the
-vulnerability-management tools that inventory installed software — but that path
-surfaces to enterprise administrators running Defender for Endpoint, not to the
-individual who downloaded a portable exe. Consumer Windows Security has no
-software inventory and will never raise it.
+- [ ] Identify the affected and fixed versions.
+- [ ] Publish a GitHub Security Advisory when a released defect exposes data,
+  weakens encryption, or loses data, including maintainer-discovered defects.
+- [ ] Request a CVE through the advisory when exploitation is available to
+  someone other than the vault owner.
+- [ ] Mark affected versions beside their hashes in [RELEASES.md](RELEASES.md).
+- [ ] Ship a new release; retain the old tag and explain the upgrade path.
 
-Without an update check there is no way to reach the rest, and adding one would
-mean a password manager that phones home — a trade this project does not make.
-The one channel that closes the gap without breaking that rule is a **pull**
-mechanism the user drives: distribution through winget, where `winget upgrade` is
-run by the user and Vordr still never opens a socket. `tools\make_winget.ps1`
-generates the manifests and §3 carries the step; what remains is a published
-release to point them at and a PR to `microsoft/winget-pkgs`. Until that is
-merged, this section describes the whole of the reach a fix has.
-
-Saying all of this plainly is part of the disclosure, not a footnote to it.
+Package managers and enterprise inventories can help users discover updates or
+advisories, but their coverage is not guaranteed. Do not imply that Vordr itself
+notifies all installed users.

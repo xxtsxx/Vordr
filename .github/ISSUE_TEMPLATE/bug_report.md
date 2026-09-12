@@ -7,17 +7,19 @@ assignees: ''
 
 ---
 
-<!-- NOT for security vulnerabilities.  Go back and use "Report a security
-     vulnerability" instead: Vordr has no auto-update, so a vulnerability posted
-     here is a working exploit against every installed copy until each one is
-     updated by hand.
-
-     Screenshots of a password manager can show your secrets, your entry names or
-     where your vault lives - crop or redact them, and never attach a vault file,
-     an export, or your master password. -->
+<!-- For a suspected vulnerability, use GitHub's private reporting form instead:
+     https://github.com/xxtsxx/Vordr/security/advisories/new
+     Never attach a real vault, export, master password, or secret-bearing dump.
+     Use synthetic data and redact screenshots, entry names, paths, and logs. -->
 
 **What happened**
 
 **What you expected instead**
 
+**Steps to reproduce with synthetic data**
+
 **Vordr version** (exe → Properties → Details) and **Windows version**:
+
+**Installation method** (portable executable or MSI):
+
+**Relevant settings, error text, and redacted screenshots**:

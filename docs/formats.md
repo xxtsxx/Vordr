@@ -1,185 +1,213 @@
-# Vordr — file format and security model
+# Vault file format
 
-This document specifies the on-disk vault format and states the security
-guarantees (and their limits) honestly. Constants live in `src/macros.inc`;
-the encoder/decoder is `src/vault.asm`.
+[Documentation](README.md) · [Architecture](ARCHITECTURE.md)
 
-The format follows a strict container discipline:
+This is a reference for the current version-2 reader and writer.
+Constants are in `src/macros.inc` and `src/vault.asm`; serialization is in
+`src/vault.asm`. Integer fields are little-endian unless a field explicitly
+uses textual hexadecimal. Offsets below are bytes from the beginning of the file.
 
-- a fixed **80-byte header** (the 64-byte `VAULT_HDR` parameter block plus the
-  16-byte KCV) fed **verbatim as the GCM AAD**, so header tampering breaks
-  authentication;
-- a **key-check value** `KCV = SHA-256(key)[0..15]`, so a wrong master password
-  is rejected immediately after the KDF (and the construction is
-  key-committing);
-- a 32-byte **CSPRNG salt generated once at vault creation** (it stays fixed
-  for the life of the file) and a 12-byte GCM **nonce refreshed from the
-  CSPRNG on every save** (`rng_fill` = OS CSPRNG ⊕ RDSEED);
-- a **full-file keyed MAC + monotonic save counter** trailer, so any rewrite
-  of any byte fails authentication and a stale copy of the file is flagged;
-- **atomic writes** via a temp file + `MoveFileExW`, with the previous
-  generation rotated into `.bak1`..`.bak3` before the replace.
+## Container layout
 
----
-
-## Vault file `.vordr` (magic `"VRDR"`, v2)
-
-One encrypted file holds the entire vault. On unlock it is decrypted into
-`secmem` (VirtualLock'd) memory; on change it is re-sealed and atomically
-replaced.
-
-```
-[80-byte header][body ciphertext][GCM tag 16][attachment section][file trailer]
-
-header (80 bytes, = GCM AAD):
-    magic       dd    "VRDR"
-    version     dd    2                      ; v2 = FMAC trailer mandatory
-    t_cost      dd    Argon2id passes        (default 3)
-    m_cost_kib  dd    Argon2id memory KiB    (default 524288 = 512 MiB)
-    lanes       dd    Argon2id parallelism   (1)
-    salt        db 32 CSPRNG salt            (fixed at creation)
-    nonce       db 12 GCM nonce              (refreshed per save)
-KCV             db 16 SHA-256(key)[0..15]
-body                AES-256-GCM( serialized entry stream )   ; ≤ 16 MiB plaintext
-tag             db 16 GCM tag
+```text
+┌──────────────────────────────┐
+│ Header + KCV          80 B   │ ← complete GCM associated data
+├──────────────────────────────┤
+│ Encrypted record body       │
+│ Body GCM tag          16 B   │
+├──────────────────────────────┤
+│ Attachment records          │ optional
+│ VATT footer           12 B  │ present with attachment records
+├──────────────────────────────┤
+│ Save counter           8 B  │
+│ File MAC              32 B  │
+│ VMAC marker            4 B  │
+└──────────────────────────────┘
 ```
 
-Key: `Argon2id(master password, salt, t, m, p=1) → 32-byte AES-256 key`.
+The file MAC covers all bytes preceding it, including the counter.
+The final `VMAC` marker is checked separately. The attachment section is
+authenticated before its lengths are used to locate the body.
 
-### Body plaintext (TLV record stream — no JSON/CRT parser)
+## Header
 
+| Offset | Size | Field | Meaning |
+|---|---|---|---|
+| 0 | 4 | magic | ASCII `VRDR` |
+| 4 | 4 | version | 2; other versions are rejected |
+| 8 | 4 | t_cost | Argon2id passes; default 3 |
+| 12 | 4 | m_cost_kib | Argon2id memory in KiB; default 524288 |
+| 16 | 4 | lanes | 1 for native vaults |
+| 20 | 32 | salt | Random password-derivation salt |
+| 52 | 12 | nonce | Random body GCM nonce, refreshed on each reseal |
+| 64 | 16 | KCV | First 16 bytes of SHA-256 of the vault key |
+| 80 | variable | body ciphertext | Followed by a 16-byte GCM tag |
+
+`VAULT_HDR` is the first 64 bytes; `VH_TOTAL` includes the KCV and is 80.
+**All 80 bytes are passed as GCM AAD**, not just the parameter structure.
+
+```text
+key = Argon2id(UTF-8 password, salt, t_cost, m_cost_kib, lanes)  // 32 bytes
+KCV = SHA-256(key)[0:16]
 ```
+
+The salt and derived key normally remain unchanged across saves. Native exports
+create their own header salt and key. The save counter is not used as a nonce.
+
+Before derivation, `vk_params_ok` accepts t_cost from 1 through 16 and a nonzero
+memory cost no greater than 4194304 KiB (4 GiB); the reader separately checks
+the supported lane count. These caps bound resource use but still permit
+expensive files. Do not confuse the reader's accepted minimum with the production
+default. Small diagnostic vaults deliberately use cheaper parameters.
+
+## Record body
+
+Plaintext is limited to `VAULT_BODY_MAX` (16 MiB). Attachments are stored outside
+this body.
+
+```text
 u32 entry_count
-entry* :  id db16 | created u64 (FILETIME) | modified u64 (FILETIME) |
-          u32 field_count |
-          field* { u16 type, u32 len, bytes }
+repeat entry_count:
+    byte[16] entry_id
+    u64 created_FILETIME
+    u64 modified_FILETIME
+    u32 field_count
+    repeat field_count:
+        u16 type
+        u32 length
+        byte[length] value
 ```
 
-Field type tags (`VF_*` in `macros.inc`): `VF_TITLE`=1, `VF_USERNAME`=2,
-`VF_SECRET`=3, `VF_URL`=4, `VF_NOTES`=5, `VF_TOTP`=7 (base32 TOTP secret,
-RFC 6238), `VF_TEXT`=8 (generic single-line text), `VF_IMAGE`=9 /
-`VF_FILE`=10 (attachments — the value is an AttachRef, see below),
-`VF_FAV`=11 (favorite marker, value `"1"`), `VF_ICON`=12 (custom icon
-override, 12 hex chars `"GGGGCCCCCCCC"`), `VF_PWHIST`=13 (one field-history
-event — see below), `VF_DELETED`=14 (trash marker: 16 hex FILETIME chars of
-when it was deleted).
+A field's base kind is `type & 0x00ff`. The `0x8000` flag (`VF_LABELED`)
+means the value starts with a custom label:
 
-`VF_PWHIST` is written raw (`VFL_RAW`), one field per recorded event:
-
-```
-u64 FILETIME | label wide\0 | old value wide\0 | u32 action
+```text
+u16 label_length_in_bytes | UTF-8 label | remaining value bytes
 ```
 
-`action` is 0 = CHANGED (the value was overwritten; `old value` is the
-superseded one) or 1 = ADDED (the label first came to hold data; `old value`
-is empty — history never stores a value that is still live in the record).
-Two older shapes still load: without the trailing `action` (read as CHANGED),
-and without the label either — just `u64 FILETIME | old password wide\0`,
-which is attributed to the default "Password" label. Records are never
-exported (see `zipexport.asm`).
+Text fields use UTF-8. Raw fields such as attachment references and history
+have their own encodings. Lengths are checked against the containing record/body.
+Skipping an unknown field during interpretation is not permission to discard it
+when rewriting metadata.
 
-A stored field type carries the base kind in its low byte
-(`VF_KINDMASK = 00FFh`); `VF_LABELED = 8000h` in the high byte marks a field
-whose value bytes are prefixed with a custom label:
+### Field kinds
 
-```
-labeled:  bytes = u16 labellen | label_utf8 | value_utf8
-plain:    bytes = value_utf8
-```
+| Tag | Symbol | Value |
+|---|---|---|
+| 1 | `VF_TITLE` | Title |
+| 2 | `VF_USERNAME` | Username |
+| 3 | `VF_SECRET` | Secret |
+| 4 | `VF_URL` | URL |
+| 5 | `VF_NOTES` | Notes |
+| 7 | `VF_TOTP` | Base32 TOTP key |
+| 8 | `VF_TEXT` | Generic single-line text |
+| 9, 10 | `VF_IMAGE`, `VF_FILE` | Attachment reference |
+| 11 | `VF_FAV` | Favorite marker, text `1` |
+| 12 | `VF_ICON` | 12 hex characters: glyph and COLORREF (`GGGGCCCCCCCC`) |
+| 13 | `VF_PWHIST` | Raw field-history event |
+| 14 | `VF_DELETED` | Trash timestamp, 16 hexadecimal FILETIME characters |
+| 15 | `VF_GROUP` | Section-heading text |
+| 16 | `VF_SPACER` | Blank layout gap |
+| 17 | `VF_SYSTEM` | First-field system marker; one-byte schema version |
+| 18 | `VF_SYS_PWVERIFY` | u64 reminder FILETIME |
+| 19 | Retired | Earlier grace-period field; do not reuse |
 
-Every length is bounds-checked against the remaining body and the 16 MiB
-plaintext cap (`VAULT_BODY_MAX`, record fields only). A custom label is
-capped on the WRITER side at `MAX_LABEL_BYTES` (384 = the label edit's 127
-wide chars at up to 3 UTF-8 bytes each); the reader bounds a label only by
-its own field length, so this cap can be raised without invalidating an
-existing vault. Unknown `VF_*` tags are skipped, so old readers tolerate
-newer files (that is how FAV/ICON/PWHIST/DELETED were added without a
-version bump).
+The writer limits labels to `MAX_LABEL_BYTES` (384 bytes). The reader checks
+a label against the containing field rather than imposing that writer limit.
+GUI field values are limited to `CONVW_MAX - 1` wide characters (16383);
+the UTF-8 conversion capacity must accommodate them. The `convcap` probe guards
+against silently writing an overlong conversion as an empty field.
 
-A field value is capped at `CONVW_MAX - 1` (16383 wide chars), enforced by
-`EM_LIMITTEXT` on the edit itself, and `CONV_CAP` is sized to hold that many
-characters even when every one of them costs 3 UTF-8 bytes. The two must stay
-in step: a value that converts to more bytes than the buffer holds cannot be
-written, and writing it as an empty field instead would destroy it silently.
-The `convcap` probe asserts the relationship.
+### History
 
-### Attachment section (`VATT`)
+A current raw `VF_PWHIST` event is:
 
-Large blobs stay out of the record body: a `VF_IMAGE`/`VF_FILE` field's value
-is a 68-byte **AttachRef** `{id16 | key32 | nonce12 | u64 ptlen}`, and the
-bytes themselves live in a trailing section, each attachment individually
-AES-256-GCM'd under its own random key/nonce — which is therefore stored
-encrypted, inside the body:
-
-```
-( [id16][u64 ctlen][ct][tag16] )*   [u32 "VATT"][u64 entries_len]
+```text
+u64 FILETIME | UTF-16 label + NUL | UTF-16 old value + NUL | u32 action
 ```
 
-The 12-byte `"VATT"` trailer is present only when at least one attachment
-exists, so an attachment-free vault is byte-identical to the pre-attachment
-format.
+Action 0 means CHANGED; action 1 means ADDED and has an empty old value.
+The reader also accepts older shapes without the action (CHANGED), and
+without a label (attributed to the default Password field). History is excluded
+from native and ZIP exports.
 
-### File trailer (full-file MAC + anti-rollback counter)
+### System items
 
-Appended after everything else (44 bytes):
+A system item is an ordinary entry whose first field is `VF_SYSTEM`.
+Its physical index remains part of the body even though user lists hide it.
+Native/ZIP exchange excludes the source system metadata.
 
+See [System items](SYSITEM_DESIGN.md) for creation, preservation, filtering,
+and the distinction between physical indexes and user-visible counts.
+
+## Attachments
+
+A `VF_IMAGE` or `VF_FILE` value contains a 68-byte reference:
+
+```text
+byte[16] id | byte[32] key | byte[12] nonce | u64 plaintext_length
 ```
-[u64 save_counter][32-byte keyed BLAKE2b MAC][u32 "VMAC"]
+
+Each attachment has its own AES-256-GCM key and nonce. The reference is inside
+the encrypted body. Its ciphertext lives in the optional trailing section:
+
+```text
+repeat for attachment records:
+    byte[16] id | u64 ciphertext_length | ciphertext | byte[16] GCM_tag
+u32 "VATT" | u64 total_attachment_record_bytes
 ```
 
-`MAC = BLAKE2b("vordr-file-mac-v1" || vault_key || image || save_counter)` —
-BLAKE2b is not length-extendable, so prefix-keying with a domain-separation
-string is a sound MAC (`vault_file_mac`). It covers the whole file image up
-to and including the counter: header, body ciphertext, GCM tag, and the
-attachment section. The counter increments on every save and is mirrored
-per-vault under `HKCU\SOFTWARE\Vordr\Rollback` (value name = vault path); on
-unlock, a file whose counter is *older* than the mirror sets `g_rollback`
-and the GUI warns — a served-stale-copy / accidental-restore tripwire (a
-user-writable mirror is not a hard boundary, and is documented as such in
-`regcfg.asm`). **The trailer is mandatory in v2:** `vault_unlock` rejects any
-file whose header version is not the current `VAULT_VERSION`, and independently
-rejects a v2 image that lacks a valid FMAC trailer (`EXIT_AUTH`). This closes a
-downgrade where an attacker stripped the trailer to splice unauthenticated bytes
-into the attachment section (which GCM does not cover). Every save writes the
-trailer, so a well-formed v2 vault always has it; the v1 format (which tolerated
-a missing trailer) is no longer accepted.
+Attachment GCM AAD is the 24-byte record prefix (ID and length).
+GCM ciphertext length equals plaintext length. The VATT footer is omitted
+when there are no attachments; the mandatory version-2 VMAC trailer remains.
 
----
+New content is staged with fresh random key/nonce metadata. Unchanged
+attachments can be copied as ciphertext during a save or native export.
+Keeping an attachment key/nonce is safe only for the unchanged message and AAD;
+do not mutate staged plaintext under retained metadata.
 
-## Security model — guarantees and limits
+## File authentication trailer
 
-### Confidentiality / integrity
-- **At rest:** AES-256-GCM (AEAD) + Argon2id. Quantum-hardened by construction —
-  Grover only halves symmetric strength (→ ~128-bit) and Argon2id's
-  memory-hardness is unaffected by Shor. There is no public-key crypto anywhere,
-  so nothing is exposed to Shor's algorithm.
-- A wrong master password is caught by the KCV right after the KDF
-  (`EXIT_LOCKED`); any tampering with the file fails GCM authentication or the
-  full-file MAC (`EXIT_AUTH`); a whole-file rollback is flagged via the save
-  counter (above).
+The final 44 bytes are:
 
-### Hostile-OS resistance is best-effort in user mode
-Vordr raises the cost of compromise — dynamic decrypted arenas fail allocation
-if VirtualLock cannot keep them out of the pagefile; a lock failure for fixed
-secret buffers produces a visible warning. The IAT is locked read-only,
-W^X / ASLR / DEP / NX / CET +
-software shadow stack / stack canaries / DLPV / tagged heap are all on, and all
-key material is `secure_zero`'d. But against a **fully compromised kernel** (or a
-DMA-capable attacker), user-mode defenses cannot be absolute. We state this
-plainly rather than overclaiming.
+```text
+u64 save_counter | byte[32] MAC | u32 "VMAC"
+```
 
-### Concurrent access (shared network drive)
-Multiple users may have the same vault open. Vordr opens the file read-only with
-full share (`GENERIC_READ` + `FILE_SHARE_READ|WRITE|DELETE`, handle closed after
-loading into memory) and only takes a **brief exclusive write lock** — an advisory
-`<vault>.lock` (`CREATE_NEW` + `FILE_FLAG_DELETE_ON_CLOSE`) held just around a
-save, then released. A save first re-checks `vault_ext_changed` under the lock and
-**refuses to overwrite** a vault another writer changed since we loaded it
-(reload-safe: the GUI reloads via `vault_reload` — re-decrypt with the existing
-key, no re-KDF — rather than clobber). A held lock reports "another user is
-saving"; the idle poll silently refreshes a clean vault when it changes on disk;
-a read-only vault file opens in read-only mode. A crashed lock holder's lock
-auto-vanishes (delete-on-close) and an orphan is reclaimed on next save.
+`vault_file_mac` initializes BLAKE2b with a 32-byte digest length and feeds:
 
-### Not yet addressed
-- No external security review.
+```text
+MAC = BLAKE2b-256(
+    ASCII("vordr-file-mac-v1") || vault_key ||
+    file_bytes_before_counter || little_endian_u64(save_counter)
+)
+```
+
+The 17-byte domain string has no NUL terminator in the hash. This is a
+prefix-keyed construction, **not** the native keyed-BLAKE2 parameter mode,
+and not a truncated BLAKE2b-512 digest. Matching the digest-length parameter
+matters for interoperability.
+
+A version-2 image must have a valid file MAC. Version 1, which could omit the
+trailer, is not accepted. The KCV and GCM tag use constant-time comparisons;
+the full-file MAC is also verified before record data is exposed.
+
+The counter is mirrored per vault path under
+`HKCU\SOFTWARE\Vordr\Rollback`. An older counter sets a rollback warning.
+The mirror is user-writable local evidence, not a hardware monotonic counter.
+It cannot detect rollback of both copies or establish history on a fresh machine.
+
+## Writes and concurrency
+
+`vault_reseal` takes a short advisory `<vault>.lock` file lock, checks for
+external changes, refreshes the body nonce, and calls the sealing writer.
+The writer flushes a temporary image before replacement and rotates nearby
+`.bak1`–`.bak3` generations. A failed flush must not be reported as a successful
+save.
+
+Multiple readers are allowed. A save refuses an externally changed image
+instead of blindly overwriting it. A clean GUI can reload through
+`vault_reload` using the existing key. These mechanisms rely on cooperating
+writers and filesystem semantics; they are not a distributed merge protocol.
+
+For the transaction and failure flow, see [Architecture](ARCHITECTURE.md#save-and-retry).

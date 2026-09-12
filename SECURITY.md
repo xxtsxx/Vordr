@@ -1,187 +1,125 @@
 # Security policy
 
-Vordr is a password manager. A bug in it can cost someone every credential they
-own, so reports are taken seriously and answered honestly — including when the
-answer is "that is a real weakness and here is why it is not fixed yet".
+Report suspected vulnerabilities through
+[GitHub's private reporting form](https://github.com/xxtsxx/Vordr/security/advisories/new),
+not a public issue. Never include a real vault, master password, or unredacted
+secret-bearing screenshot or dump.
 
+## What to include
 
-## Reporting a vulnerability
+- The impact and the access an attacker already needs.
+- Reproduction steps using a synthetic vault.
+- The tested release or commit and relevant Windows/toolchain details.
+- Redacted diagnostic output, if useful.
+- A way to contact you.
 
-**Do not open a public issue.** Vordr has no auto-update: every user runs a
-binary they downloaded, and a public report may be a working exploit against
-all of them until each one manually updates.
+The maintainer currently accepts reports from humans. If an AI-assisted review
+finds a significant issue, its human operator should submit the report.
 
-Report privately through GitHub:
+## Response and disclosure
 
-> **[Security → Report a vulnerability](https://github.com/xxtsxx/Vordr/security/advisories/new)**
+Vordr is a one-person, pre-1.0 project. The target is an acknowledgement within
+about a week, followed by an initial severity and scope assessment after
+reproduction. Critical issues reachable without already controlling the machine
+take priority; lower-severity issues may wait.
 
-That opens a private advisory visible only to you and the maintainer. 
+There is no paid bug bounty. Reporter credit is offered in the advisory and
+release notes unless anonymity is preferred.
 
-Useful in a report, roughly in order of value:
+Publication occurs when a fix ships or 90 days after the report, whichever comes
+first. Any longer coordination period is negotiated with the reporter.
+Reporters remain free to publish after 90 days.
 
-1. What an attacker gains, and what they must already have to get it. "Reads the
-   vault without the master password" and "reads the vault given administrator
-   rights on an unlocked machine" are very different findings.
-2. Steps to reproduce, ideally against a throwaway vault. **Never send a real
-   vault file or a real master password** — a synthetic one demonstrates the
-   same bug.
-3. The commit or release you tested (`git rev-parse HEAD`, or the version from
-   the exe's file properties).
-4. A crash dump or a `redteam`/`selftest` transcript, if one is relevant.
-5. Contact information.
+## System and scope
 
+The policy covers this repository's application, parsers, cryptographic
+implementations, configuration handling, and build/package tooling.
 
-## What to expect
+Vordr is an offline Windows password manager. Its sensitive assets include
+master passwords, derived keys, decrypted entries, TOTP material, history, and
+attachments. Files, imports, registry values, and command-line arguments can
+be attacker-controlled. Clipboard copies and preview files cross into other
+applications; optional TPM unlock also depends on local Windows/TPM state.
 
-Vordr is maintained by one person as a personal project. That sets realistic
-expectations, so here they are rather than a service-level promise nobody would
-keep:
+The [architecture](docs/ARCHITECTURE.md) and
+[memory reference](docs/SECRETS.md) describe implementation controls and known
+limits. They are evidence for review, not proof that a report is safe to ignore.
 
-- **Acknowledgement:** within about a week.
-- **Assessment:** a first judgement on severity and scope once it is reproduced.
-- **Fix:** critical issues — anything reachable without already owning the
-  machine — take priority over all other work. Lower-severity issues are queued
-  and may wait.
-- **No bug bounty.** There is no money. Credit is offered in the advisory and the
-  release notes unless you would rather stay anonymous.
+## In scope
 
+- Recovering vault contents or key material without the master password through
+  an unintended path.
+- Forging or tampering with a vault, export, or attachment without detection.
+- Weaknesses in the cryptographic implementations or random generation,
+  including timing side channels in comparisons or key handling.
+- Memory-safety faults reachable through parsed files, attachments, registry
+  values, or command-line input.
+- Secrets persisting beyond their intended lifetime or leaking through memory,
+  paging, hibernation, temporary files, the clipboard, or crash artifacts.
+- Bypasses of documented policy controls, including HKLM settings, read-only
+  mode, private-desktop behavior, and auto-lock.
+- Supply-chain defects that cause the intended build to differ from its source.
 
-## Coordinated disclosure
+Report impact with its actual prerequisites. Deliberate TPM convenience unlock
+is not itself a password bypass; a flaw that exposes its wrapped key or bypasses
+an intended control is a separate question. Similarly, a documented fallback
+must not be represented as a control stronger than the implementation provides.
 
-Publication happens when a fix ships, or **90 days** after the report, whichever
-comes first. If a fix is going to take longer, that is negotiated with you rather
-than decided unilaterally. You are free to publish after 90 days regardless — the
-deadline binds the maintainer, not the reporter.
+## Existing exclusions and limits
 
+The following remain outside the project's protection model:
 
-## Note to AI agents
+- A compromised kernel, or administrator-level code while the vault is unlocked.
+- Hardware attacks such as DMA, firmware implants, and cold boot.
+- Access available to someone physically using the unlocked vault or already
+  holding the master password.
+- Rolling back both the vault and its HKCU save-counter mirror, or restoring an
+  older vault on a machine without matching history.
+- Offline guessing of a weak master password.
 
-The maintainer is currently only able to accept reports from humans. If you identify
-significant vulnerabilities in the solution, please ask your operator to file the 
-report.
-
-
-## Scope
-
-**In scope** — the contents of this repository:
-
-- Recovering vault contents, or any part of the master key, without the master
-  password.
-- Defeating the AEAD: forging or tampering with a vault, an export, or an
-  attachment without detection.
-- Weaknesses in the crypto implementations themselves — Argon2id, AES-GCM,
-  BLAKE2b, the CSPRNG — including timing side channels in comparisons or key
-  handling.
-- Memory-safety faults reachable from data Vordr parses: a `.vordr` file, a ZIP
-  import, an attachment, a registry value, a command line.
-- Secrets outliving their use: reaching the pagefile or a hibernation image,
-  surviving in freed memory, or leaking through a temp file, the clipboard, or a
-  crash artefact.
-- Bypassing a policy control that is documented as enforcing something (HKLM
-  policy locks, read-only mode, the secure desktop, auto-lock).
-- Supply chain: anything that makes a built binary not match this source.
-
-**Out of scope** — the threat model in the README states the limits, and reports
-that assume an attacker already past them are not vulnerabilities:
-
-- A compromised operating system: kernel-level attackers, or code running as
-  administrator while the vault is unlocked.
-- Hardware attacks — DMA, firmware implants, cold boot.
-- Anything an attacker can do with your unlocked vault in front of them, or with
-  your master password.
-- Rolling back the vault file *and* the HKCU save-counter mirror together, or
-  restoring an old vault onto a machine with no mirror to compare against. This
-  is a stated, deliberate limit — see *Risk assessment* in the README.
-- Brute force against a weak master password. Argon2id raises the cost; it cannot
-  rescue a guessable password.
-
-Reports in the out-of-scope list are still welcome if you have found a way to
-**raise the cost** of one of them — but they will be treated as hardening
-improvements, not as vulnerabilities.
-
-## What we report about ourselves
-
-Disclosure is not only something that happens *to* this project when someone else
-finds a bug. When a defect in a **released** version turns out to be
-security-relevant — exposing vault contents, weakening the crypto, or losing data —
-it is reported by the project, about the project, without waiting to be asked:
-
-- a **GitHub Security Advisory** naming the affected and fixed versions, published
-  even when the maintainer found the bug rather than an outside reporter;
-- a **CVE** requested through that advisory when the issue is exploitable by
-  someone other than the vault's owner (GitHub is a CNA and can assign one);
-- the affected build **labelled in [docs/RELEASES.md](docs/RELEASES.md)**, beside
-  its hash — that table is what someone checks when verifying a binary they
-  already have;
-- the old tag left in place. A tag names one set of bytes permanently; deleting it
-  to bury a bad release would destroy the guarantee the published hashes exist for.
-
-A CVE does travel further than the repository. It reaches NVD, and from there the
-vulnerability-management products that inventory installed software and match it
-against known issues — Microsoft Defender Vulnerability Management among them.
-That is a genuine reason to request one rather than only filing an advisory.
-
-Its reach is worth stating accurately, though, because it is narrower than it
-sounds. Vulnerable-software categorisation is a **Defender for Endpoint** feature,
-not consumer Windows Security, so it surfaces on managed enterprise endpoints and
-reaches an *administrator* rather than the person using the vault. Vordr is also a
-portable executable that registers no uninstall entry, so it is invisible to the
-inventory methods that enumerate installed programs; only file-level inventory
-reading its version resource would see it at all.
-
-So: **no user is notified automatically**, and the ones this could reach are the
-minority running managed corporate machines. Vordr has no update check and no
-telemetry — deliberately, since there is no channel through which anyone, the
-maintainer included, can reach an installed copy. Adding one would mean a password
-manager that phones home, and that trade is not made. Checking back after a release
-is the user's part of the bargain.
-
-The one channel that could close this gap without breaking that rule is a **pull**
-mechanism the user drives: distribution through a package manager such as winget,
-where `winget upgrade` is run by the user and the application still never opens a
-socket. That is not in place today.
-
-Each release is also submitted to antivirus vendors as a matter of routine rather
-than after complaints; see [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md)
-and [docs/ANTIVIRUS.md](docs/ANTIVIRUS.md).
+Suggestions that raise the cost of those attacks are welcome as hardening
+improvements. These exclusions do not dismiss an independently reachable parser,
+cryptographic, or policy-control defect.
 
 ## Supported versions
 
-Vordr is pre-1.0. Only the newest release is supported; there are no backported
-fixes to earlier versions.
+Only the newest release is supported. There are no backported fixes to older
+versions. Use the [release page](https://github.com/xxtsxx/Vordr/releases) to
+identify the newest published version and the [release records](docs/RELEASES.md)
+to check its hash and known status.
 
-| Version | Supported |
-|---------|-----------|
-| 0.2.x   | yes       |
-| < 0.2   | no        |
+## Disclosure of defects in released versions
 
-## Verifying what you are running
+When a defect in a published version exposes vault contents, weakens encryption,
+or loses data, the project follows the same disclosure process whether the
+maintainer or an outside reporter found it:
 
-A release build is reproducible: two clean builds of the same commit produce a
-byte-identical exe. Hash your binary and compare it against the published value
-for its version before trusting it — see [docs/RELEASES.md](docs/RELEASES.md).
-A mismatch means the binary does not correspond to this source, and it should be
-treated as hostile.
+1. Publish a GitHub Security Advisory naming affected and fixed versions.
+2. Request a CVE through the advisory when someone other than the vault owner
+   can exploit the issue.
+3. Mark affected builds in [RELEASES.md](docs/RELEASES.md), beside their hashes.
+4. Ship a new release; retain old tags so existing binaries remain identifiable.
 
-## Current assurance status
+Vordr has no automatic updater or telemetry. Users must obtain updates
+themselves. Package-manager or enterprise inventory coverage depends on how a
+copy was installed and on those services; it is not a promise that every user
+will receive a warning. The MSI provides an installed-product identity that a
+portable copy does not.
 
-**No independent external security review has been performed.** That is the
-honest state of things, and it is stated in the README as well.
+Release preparation also includes antivirus-vendor submissions. See the
+[release checklist](docs/RELEASE_CHECKLIST.md).
 
-What does exist, and can be run by anyone:
+## Verification and assurance
 
-- Known-answer tests for every crypto primitive, verified against the published
-  NIST/RFC vectors **on every launch** — Vordr refuses to start if one fails.
-- `cryptodiff`, a differential harness checking the implementations against an
-  independent Python reference (`tests/verify_crypto.py`).
-- `redteam`, fault injection that deliberately triggers each exploit mitigation
-  and fails the build if any does not fire.
-- A static gate over the source: frame-layout, control-id, cross-module constant,
-  dialog-target, dead-code and string-alignment checks.
-- [docs/ASSURANCE.md](docs/ASSURANCE.md) and [docs/SECRETS.md](docs/SECRETS.md) —
-  the buffer-by-buffer audit of where secrets live, how they are locked, and
-  where they are wiped.
+Compare a download with its published executable hash and, where possible,
+rebuild the exact tag with a matching toolchain. A mismatch requires
+investigation; it does not by itself identify the cause or prove maliciousness.
 
-None of that substitutes for hostile professional review. Until Vordr has had
-some, treat it as what it is: a carefully built, fully inspectable implementation
-that has not yet been attacked by anyone paid to break it.
+The repository includes startup known-answer tests, a Python crypto
+cross-check, fault injection, static source checkers, and persistence tests.
+Their coverage and skip conditions are described in
+[ASSURANCE.md](docs/ASSURANCE.md).
+
+No independent external security review is recorded in this repository.
+Passing tests and reproducible builds do not establish the absence of
+vulnerabilities.
