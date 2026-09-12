@@ -6,10 +6,6 @@ Start with the guide for your task. User instructions describe the current
 source tree; an older release may behave differently. Release hashes are
 historical records and must be matched to the exact tag.
 
-For security review, start with the [risk assessment](RISK_ASSESSMENT.md).
-It consolidates the protection model, residual risks, evidence gaps, and
-acceptance decisions in one document. The references below provide deeper detail.
-
 ## Use and deployment
 
 - [User guide](USER_GUIDE.md): create a vault, manage secrets, back up, and move data.
@@ -20,7 +16,6 @@ acceptance decisions in one document. The references below provide deeper detail
 
 ## Development and review
 
-- [Risk assessment](RISK_ASSESSMENT.md): the complete security assessment and reviewer starting point.
 - [Development](DEVELOPMENT.md): toolchain, build variants, tests, and contribution workflow.
 - [Architecture](ARCHITECTURE.md): modules, trust boundaries, unlock, and save flows.
 - [File format](formats.md): header offsets, fields, attachments, and authentication.

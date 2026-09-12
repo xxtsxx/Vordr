@@ -38,14 +38,7 @@ derivation (default: 512 MiB, three passes, one lane). Each save uses a fresh
 random body nonce. The [architecture guide](docs/ARCHITECTURE.md) explains the
 data flow; the [format reference](docs/formats.md) defines the bytes on disk.
 
-<a id="security-limits"></a>
-
-## Risk assessment
-
-The [complete risk assessment](docs/RISK_ASSESSMENT.md) is the starting point
-for security review. It brings the threat model, implemented protections,
-residual risks, evidence gaps, and deployment decisions together in one place.
-The main conclusions are summarized below.
+## Security limits
 
 Vordr implements standard cryptographic algorithms itself. Its tests check
 known vectors, selected failure paths, and persistence behavior; they are not a
@@ -91,7 +84,6 @@ terminates running Vordr processes and replaces build outputs.
 | Use Vordr and protect my backups | [User guide](docs/USER_GUIDE.md) |
 | Install or enforce policy across machines | [Deployment](docs/DEPLOYMENT.md) |
 | Understand the implementation | [Architecture](docs/ARCHITECTURE.md) |
-| Assess security risks and deployment suitability | [Risk assessment](docs/RISK_ASSESSMENT.md) |
 | Build, change, or test the code | [Development](docs/DEVELOPMENT.md) |
 | Evaluate the evidence and limitations | [Assurance](docs/ASSURANCE.md) |
 | Verify a release or prepare a new one | [Release hashes](docs/RELEASES.md) · [Checklist](docs/RELEASE_CHECKLIST.md) |

@@ -6,10 +6,6 @@ This guide maps claims to tests and explains their limits. It is not a
 certification, a live CI dashboard, or a claim that every possible input is safe.
 No independent external security review is recorded in the repository.
 
-Read the [risk assessment](RISK_ASSESSMENT.md) for the overall security judgment,
-threat scenarios, and residual risks. This guide supplies the test evidence;
-it is not a substitute for that assessment.
-
 ## Reproduce the checks
 
 Use Windows with the x64 MSVC/SDK toolchain and Python 3 on PATH. Read the

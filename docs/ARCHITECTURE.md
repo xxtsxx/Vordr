@@ -1,6 +1,6 @@
 # Architecture
 
-[Documentation](README.md) · [Risk assessment](RISK_ASSESSMENT.md) · [Format reference](formats.md) · [Assurance](ASSURANCE.md)
+[Documentation](README.md) · [Format reference](formats.md) · [Assurance](ASSURANCE.md)
 
 ## System overview
 
@@ -104,9 +104,8 @@ the file MAC uses an explicit prefix construction, not BLAKE2's native keyed mod
 see [the exact format](formats.md#file-authentication-trailer).
 
 The TPM key-length property request is best-effort, and existing keys are reused
-without a length check. Provider UI policy is also best-effort. The
-[risk assessment](RISK_ASSESSMENT.md#r5--unintended-access-through-tpm-convenience-unlock)
-explains why neither should be treated as a stronger enforcement guarantee.
+without a length check. Provider UI policy is also best-effort. Neither should
+be treated as a guaranteed enforcement control.
 
 Random generation fails if the OS RNG fails. RDSEED is optional, can run out of
 retries, and only mixes complete eight-byte lanes; the OS output remains the
