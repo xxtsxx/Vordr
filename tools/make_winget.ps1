@@ -99,6 +99,8 @@ $header = "# Created for Vordr $version by tools\make_winget.ps1 - do not hand-e
 
 @"
 $header
+# yaml-language-server: `$schema=https://aka.ms/winget-manifest.version.$ManifestVer.schema.json
+
 PackageIdentifier: $PackageId
 PackageVersion: $version
 DefaultLocale: en-US
@@ -111,6 +113,8 @@ ManifestVersion: $ManifestVer
 # does for a machine-scope installer.
 @"
 $header
+# yaml-language-server: `$schema=https://aka.ms/winget-manifest.installer.$ManifestVer.schema.json
+
 PackageIdentifier: $PackageId
 PackageVersion: $version
 MinimumOSVersion: 10.0.17763.0
@@ -136,6 +140,8 @@ ManifestVersion: $ManifestVer
 
 @"
 $header
+# yaml-language-server: `$schema=https://aka.ms/winget-manifest.defaultLocale.$ManifestVer.schema.json
+
 PackageIdentifier: $PackageId
 PackageVersion: $version
 PackageLocale: en-US
