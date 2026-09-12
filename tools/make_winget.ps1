@@ -49,8 +49,9 @@ $ManifestVer = "1.12.0"
 # happens to be saved, which is not a property anyone checks when editing it.
 function Write-Manifest([string]$Path, [string]$Text) {
     $crlf = ($Text -replace "`r`n", "`n") -replace "`n", "`r`n"
-    $utf8bom = New-Object System.Text.UTF8Encoding $true
-    [System.IO.File]::WriteAllText($Path, $crlf + "`r`n", $utf8bom)
+    # Match winget-pkgs Tools/YamlCreate.ps1: UTF-8 without a byte-order mark.
+    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+    [System.IO.File]::WriteAllText($Path, $crlf + "`r`n", $utf8NoBom)
 }
 
 if (-not $Msi) {

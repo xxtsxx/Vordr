@@ -96,7 +96,9 @@ accidentally selecting a different local package.
 - [ ] Verify version, URL, SHA-256, ProductCode, and release date.
 - [ ] Confirm all three files have the correct schema-reference comment:
   `version`, `installer`, and `defaultLocale`, matching `ManifestVersion`.
-- [ ] Preserve CRLF endings in the submitted files.
+- [ ] Preserve CRLF endings and UTF-8 without a byte-order mark, matching
+  Microsoft's manifest generator. Run `python -m unittest discover -s tests -p test_winget.py`
+  on Windows to check the writer's encoding and newline handling.
 - [ ] Run local validation and test the manifest in an isolated installation.
 - [ ] Submit one version under `manifests/t/ThomasSmistad/Vordr/X.Y.Z/` in
   `microsoft/winget-pkgs`.
