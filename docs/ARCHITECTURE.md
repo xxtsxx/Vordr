@@ -1,6 +1,6 @@
 # Architecture
 
-[Documentation](README.md) · [Format reference](formats.md) · [Assurance](ASSURANCE.md)
+[Documentation](README.md) · [Risk assessment](RISK_ASSESSMENT.md) · [Format reference](formats.md) · [Assurance](ASSURANCE.md)
 
 ## System overview
 
@@ -96,12 +96,17 @@ conflict. Nearby rotating backups are not an independent backup.
 | TOTP | HMAC-SHA-1, base32 keys, HOTP/TOTP |
 | ZIP interoperability | WinZip AE-2: PBKDF2-HMAC-SHA1, AES-256-CTR, truncated HMAC-SHA1 |
 | Randomness | `BCryptGenRandom`, supplemented by RDSEED when available |
-| TPM convenience | RSA-2048 OAEP with SHA-256 through Microsoft Platform Crypto Provider |
+| TPM convenience | RSA-OAEP with SHA-256 through Microsoft Platform Crypto Provider; RSA-2048 requested |
 
 These are in-repository implementations of published primitives. That does not
 make their composition or implementation automatically secure. In particular,
 the file MAC uses an explicit prefix construction, not BLAKE2's native keyed mode;
 see [the exact format](formats.md#file-authentication-trailer).
+
+The TPM key-length property request is best-effort, and existing keys are reused
+without a length check. Provider UI policy is also best-effort. The
+[risk assessment](RISK_ASSESSMENT.md#local-access-password-entry-and-tpm--r4-and-r5)
+explains why neither should be treated as a stronger enforcement guarantee.
 
 Random generation fails if the OS RNG fails. RDSEED is optional, can run out of
 retries, and only mixes complete eight-byte lanes; the OS output remains the

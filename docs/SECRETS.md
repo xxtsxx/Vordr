@@ -1,6 +1,6 @@
 # Secret memory and plaintext exposure
 
-[Documentation](README.md) · [Architecture](ARCHITECTURE.md) · [Assurance](ASSURANCE.md)
+[Documentation](README.md) · [Risk assessment](RISK_ASSESSMENT.md) · [Architecture](ARCHITECTURE.md) · [Assurance](ASSURANCE.md)
 
 This is a source-oriented inventory for reviewing secret lifetimes. It covers
 the named buffers and paths below; it is not an exhaustive proof that every
