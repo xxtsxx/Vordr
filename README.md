@@ -11,12 +11,31 @@ provides installation, a Start Menu shortcut, and file association.
 
 ## Start here
 
-1. Download a build from [Releases](https://github.com/xxtsxx/Vordr/releases).
+Install through the WinGet community source:
+
+```powershell
+winget install --id ThomasSmistad.Vordr --exact --source winget
+```
+
+This installs the published MSI for all users and requires administrator approval.
+WinGet downloads the installer; Vordr itself remains offline.
+
+1. Install with WinGet, or download a portable executable or MSI from
+   [Releases](https://github.com/xxtsxx/Vordr/releases).
 2. [Verify the executable](docs/RELEASES.md#verify-a-download) before using it.
 3. Run `vordr.exe`, open Vordr from the notification area, and create a vault.
 4. Choose a strong, unique master password and keep a secure record of it.
    Vordr has no password-reset or recovery service.
 5. Back up the encrypted vault and confirm you can open the backup.
+
+When a newer version is published to WinGet, update an installed copy with:
+
+```powershell
+winget upgrade --id ThomasSmistad.Vordr --exact --source winget
+```
+
+Updates are not automatic. See the [update instructions](docs/USER_GUIDE.md#updates)
+for backups, portable copies, and managed installations.
 
 Read the [user guide](docs/USER_GUIDE.md) for everyday use, backups, TPM unlock,
 and import/export. If antivirus software flags a download, follow the

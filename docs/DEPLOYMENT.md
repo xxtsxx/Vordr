@@ -34,6 +34,30 @@ Uninstall removes the executable, shortcut, association registrations it owns,
 and installer-owned policy values. It does not remove vaults or HKCU user data.
 Do not add broad `RemoveFile` cleanup to the package.
 
+### WinGet deployment
+
+The community package ID is `ThomasSmistad.Vordr`. WinGet downloads the published
+MSI from the project's GitHub release; it is not a different application build
+or a Microsoft Store edition.
+
+```powershell
+winget install --id ThomasSmistad.Vordr --exact --source winget
+winget upgrade --id ThomasSmistad.Vordr --exact --source winget
+```
+
+These commands use the machine-wide MSI and require elevation for installation
+or upgrade. They do not enable an updater inside Vordr or move vault data.
+
+**Do not use a plain WinGet upgrade as a policy-preservation strategy.** It does
+not repeat your custom MSI properties. For policy-managed installations, use
+your deployment system to supply the required properties on every upgrade,
+or reapply and verify centrally managed registry policy after installation.
+Check the effective settings before returning the application to use.
+
+The portable executable has no equivalent MSI installed-product identity;
+do not assume WinGet will inventory or update arbitrary portable copies.
+For user instructions, see [Updates](USER_GUIDE.md#updates).
+
 ## How policy is resolved
 
 For supported configuration values, Vordr checks the 64-bit registry view in

@@ -33,6 +33,32 @@ policy is in [SECURITY.md](../SECURITY.md); an old hash does not imply support.
 A row may have been added after the tag it describes. Rebuild the tag, not
 the current `master` branch, when checking a published hash.
 
+## WinGet publication
+
+Vordr **0.2.3** was approved, merged, and published to the WinGet community source
+on **2026-09-14** through
+[PR #411202](https://github.com/microsoft/winget-pkgs/pull/411202).
+All ten validation stages passed, and publication was confirmed by querying
+`ThomasSmistad.Vordr` through WinGet. This is a historical publication record,
+not a claim that 0.2.3 will always be the latest version.
+
+The listing uses the existing GitHub release MSI, with SHA-256:
+
+```text
+683202773f1307952f7c9d6705c1cc09c082bdd28570625aa5ba1a2640d894e6
+```
+
+This is the **MSI hash**, not the executable hash in the table above.
+Publication did not rebuild or change the release. Query the live listing with:
+
+```powershell
+winget show --id ThomasSmistad.Vordr --exact --source winget
+```
+
+See [installation and updates](USER_GUIDE.md#updates) for everyday use.
+Each future release needs a separate manifest update and successful publication;
+uploading a GitHub release alone does not update WinGet.
+
 ## Reproduce an executable
 
 Use a separate clean checkout and the matching MSVC/SDK versions. Build flags

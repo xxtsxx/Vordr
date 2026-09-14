@@ -104,12 +104,26 @@ accidentally selecting a different local package.
   `microsoft/winget-pkgs`.
 - [ ] Read reviewer comments and remote validation results. Local validation
   does not guarantee repository-policy validation.
-- [ ] Record the PR link and wait for acceptance before claiming the version is
-  available through the community source.
+- [ ] Record the PR link, confirm validation and moderator approval, and wait
+  for merge and a successful publish pipeline.
+- [ ] Query the live community source and confirm the intended version, installer
+  URL, and hash before announcing WinGet availability:
 
-The 0.2.3 submission exposed a useful distinction: locally valid manifests can
-still need repository-required schema-reference headers. Diagnose the actual
-reviewer feedback before treating a generic Azure error as a service outage.
+  ```powershell
+  winget source update --name winget
+  winget show --id ThomasSmistad.Vordr --exact --source winget --version X.Y.Z
+  ```
+
+- [ ] Record the publication date and PR link in [RELEASES.md](RELEASES.md).
+  Repeat this process for each new release; GitHub publication alone is not
+  WinGet publication.
+
+The 0.2.3 submission required schema-reference headers and was updated to schema
+1.12.0. Remote schema validation still failed while local validation passed;
+removing the UTF-8 byte-order marks was the change after which remote validation
+succeeded. Preserve BOM-less UTF-8 and CRLF output from the generator. A generic
+schema error alone does not establish a service outage. Merge and publication
+were confirmed on 2026-09-14; see [the record](RELEASES.md#winget-publication).
 
 ## 6. Vendor submissions
 

@@ -8,12 +8,24 @@ Vordr runs on Windows x64. Its CPU gate requires AES-NI, PCLMULQDQ, SSE4.1, and
 SHA-NI; AVX2 and RDSEED are optional. The default password derivation allocates
 512 MiB in addition to the application's other memory.
 
-Choose a download from [Releases](https://github.com/xxtsxx/Vordr/releases) and
-[verify its executable](RELEASES.md#verify-a-download).
+Install from the WinGet community source, or choose a download from
+[Releases](https://github.com/xxtsxx/Vordr/releases). See
+[executable verification](RELEASES.md#verify-a-download) for checking the build.
 
+- **WinGet:** run the command below to download and install the published MSI.
 - **Portable executable:** run `vordr.exe` from a folder you control.
 - **MSI:** installs for all users in `%ProgramFiles%\Vordr` and requires elevation.
   Vordr itself runs with the launching user's privileges.
+
+```powershell
+winget install --id ThomasSmistad.Vordr --exact --source winget
+```
+
+WinGet uses the MSI's machine-wide installation and may request administrator
+approval. It does not create or upload your vault. WinGet needs network access
+to retrieve packages; Vordr's offline behavior is unchanged. If WinGet is not
+available, use a manual download or follow Microsoft's
+[WinGet setup guidance](https://learn.microsoft.com/en-us/windows/package-manager/winget/).
 
 Open Vordr from the notification area. On first use, create the vault and choose
 a strong, unique master password. The default policy requires 12 characters
@@ -35,6 +47,37 @@ The application does not synchronize data itself. A sync client sees the encrypt
 file, but can still observe file sizes and update times, lose updates, or restore
 an older copy. Keep an independent backup and avoid editing on two devices before
 their sync clients have caught up.
+
+## Updates
+
+Vordr does not check for or install updates itself. For an installed copy,
+WinGet can check the community listing and install a newer published version:
+
+```powershell
+winget show --id ThomasSmistad.Vordr --exact --source winget
+winget upgrade --id ThomasSmistad.Vordr --exact --source winget
+```
+
+Save your work, back up the encrypted vault, and exit Vordr before upgrading.
+An upgrade may request administrator approval. If no newer version is listed,
+there is nothing to upgrade through this source. A GitHub release can appear
+before its WinGet submission is approved and published.
+
+WinGet does not replace an arbitrary portable `vordr.exe` in a folder you chose.
+For portable use, download and verify the new executable, then replace your
+old executable after exiting it; keep the vault and backups. Installing the MSI
+does not remove a separate portable copy, so avoid accidentally running an old one.
+
+On managed machines, follow your administrator's update process. A plain WinGet
+upgrade does not repeat custom MSI policy properties; see
+[deployment and upgrades](DEPLOYMENT.md#installation-and-upgrades).
+
+WinGet publication is not Microsoft security certification or code signing,
+and does not guarantee the absence of antivirus warnings. Continue to follow
+the [verification guidance](ANTIVIRUS.md). For command behavior, see Microsoft's
+[install](https://learn.microsoft.com/en-us/windows/package-manager/winget/install)
+and [upgrade](https://learn.microsoft.com/en-us/windows/package-manager/winget/upgrade)
+references.
 
 ## Work with entries
 
