@@ -105,6 +105,23 @@ in [docs/RELEASES.md](docs/RELEASES.md).
   stay. The vault window's background is composed off screen and put up in one
   blit, and the hot paint paths use the DC's own brush instead of creating one
   per row.
+- **Faster, steadier painting** (measured on a 5,000-entry vault):
+  - showing an entry rebuilds its rows with the window's painting suspended and
+    repaints the pane once - it used to repaint the window background 38 times
+    (78 for a 40-field entry), once per control created, moved or destroyed:
+    42 ms -> 20 ms per switch, 299 ms -> 125 ms for 40 fields, and no flicker;
+  - a search refill takes 0.3 s instead of 3.5 s: looking an entry up by index
+    walked the vault from its first entry, and sorting does ~60,000 lookups. Bulk
+    reads (a refill, a list paint, an entry rebuild) now use a one-pass index
+    that lives only for that read;
+  - a list repaint costs ~1.1 ms instead of ~6.8 ms; icon tiles come from a
+    cache of pre-rendered bitmaps (emptied at lock), pixel-identical to drawing
+    them;
+  - the edit boxes are left out of the background paint (they paint every pixel
+    themselves), so a full repaint no longer shows them empty for a frame;
+  - moving the keyboard focus repaints the underline strips, not the whole
+    window and every control in it;
+  - the sliding selection repaints only the rows it crosses.
 - **Reproducible release builds.** Two builds of one commit differed (ml64 stamps
   every object, so `/Brepro` hashed different inputs each time).
   `tools\pe_normalise.py` zeroes the build stamps after the link, `build.cmd

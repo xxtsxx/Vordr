@@ -249,6 +249,13 @@ CSTR e_oom,     "error: out of memory",13,10
 CSTR m_created, "vault created.",13,10
 
 .data?
+align 8
+g_eidx      dq ?                        ; vault_index_begin: one entry pointer per entry
+g_eidx_body dq ?                        ;   built from this body,
+g_eidx_blen dq ?                        ;   of this length
+g_eidx_cap  dd ?                        ; entries the array holds
+g_eidx_n    dd ?                        ; entries indexed (0 = no index in use)
+g_eidx_dep  dd ?                        ; begin/end nesting
 align 2
 ; convcap's scratch output buffer - written by every caller before it is read,
 ; so it needs no initial contents.  In .data it was 4 KB of zeros in the image;
@@ -1405,6 +1412,14 @@ vault_preload_end endp
 public vault_lock
 vault_lock proc frame
     FRAME_PROLOG 32
+    mov     dword ptr [g_eidx_n], 0              ; no entry index survives a lock
+    mov     dword ptr [g_eidx_dep], 0
+    mov     rcx, qword ptr [g_eidx]
+    mov     edx, dword ptr [g_eidx_cap]
+    shl     rdx, 3
+    call    mem_free
+    mov     qword ptr [g_eidx], 0
+    mov     dword ptr [g_eidx_cap], 0
     mov     rcx, qword ptr [g_body_ptr]
     test    rcx, rcx
     jz      vl_key
@@ -5849,6 +5864,22 @@ vault_entry_ptr proc frame
     mov     eax, dword ptr [r10]
     cmp     rcx, rax
     jae     vep_none
+    ; inside a vault_index_begin/end bracket, and the body still the one indexed:
+    ; one load instead of a walk from the first entry
+    cmp     dword ptr [g_eidx_n], 0
+    je      vep_walk
+    cmp     r10, qword ptr [g_eidx_body]
+    jne     vep_walk
+    mov     rax, qword ptr [g_body_len]
+    cmp     rax, qword ptr [g_eidx_blen]
+    jne     vep_walk
+    cmp     ecx, dword ptr [g_eidx_n]
+    jae     vep_walk
+    mov     r11, qword ptr [g_eidx]
+    mov     rax, qword ptr [r11+rcx*8]
+    FRAME_EPILOG
+    ret
+vep_walk:
     mov     qword ptr [rbp-24], rcx
     lea     r10, [r10+4]
     mov     qword ptr [rbp-32], r10
@@ -5871,6 +5902,90 @@ vep_none:
     FRAME_EPILOG
     ret
 vault_entry_ptr endp
+
+; vault_index_begin / vault_index_end - a bracket inside which entry lookups by
+;   index take one load instead of a walk from the first entry.  vault_entry_ptr
+;   walks because entries are variable-length records packed in the body; a
+;   bulk read (a search refill: ~60,000 sort comparisons, each looking up two
+;   titles; a list paint near the end of a large vault) made that O(n^2) - 3.5 s
+;   to refill 5,000 entries.  The index is built in one pass at the outermost
+;   begin and used only until the outermost end, so it never outlives a body it
+;   was built from: nothing writes the body in between (the UI thread is busy
+;   with the read).  A lookup also checks the body's pointer and length against
+;   the ones indexed, and walks if either differs.
+public vault_index_begin, vault_index_end
+vault_index_begin proc frame
+    FRAME_PROLOG 64
+    inc     dword ptr [g_eidx_dep]
+    cmp     dword ptr [g_eidx_dep], 1
+    jne     vib_ret
+    mov     dword ptr [g_eidx_n], 0
+    mov     r10, qword ptr [g_body_ptr]
+    test    r10, r10
+    jz      vib_ret
+    mov     eax, dword ptr [r10]
+    test    eax, eax
+    jz      vib_ret
+    mov     dword ptr [rbp-24], eax              ; entries
+    cmp     eax, dword ptr [g_eidx_cap]
+    jbe     vib_have
+    mov     rcx, qword ptr [g_eidx]              ; grow (whole KiB of entries)
+    mov     edx, dword ptr [g_eidx_cap]
+    shl     rdx, 3
+    call    mem_free
+    mov     qword ptr [g_eidx], 0
+    mov     dword ptr [g_eidx_cap], 0
+    mov     eax, dword ptr [rbp-24]
+    add     eax, 1023
+    and     eax, -1024
+    mov     dword ptr [rbp-28], eax
+    mov     ecx, eax
+    shl     rcx, 3
+    call    mem_alloc
+    test    rax, rax
+    jz      vib_ret                              ; no index: lookups walk, as before
+    mov     qword ptr [g_eidx], rax
+    mov     eax, dword ptr [rbp-28]
+    mov     dword ptr [g_eidx_cap], eax
+vib_have:
+    mov     r10, qword ptr [g_body_ptr]
+    lea     rcx, [r10+4]
+    mov     qword ptr [rbp-40], rcx              ; cursor
+    mov     dword ptr [rbp-32], 0                ; i
+vib_lp:
+    mov     eax, dword ptr [rbp-32]
+    cmp     eax, dword ptr [rbp-24]
+    jae     vib_done
+    mov     r10, qword ptr [g_eidx]
+    mov     rcx, qword ptr [rbp-40]
+    mov     qword ptr [r10+rax*8], rcx
+    call    vault_entry_len
+    add     qword ptr [rbp-40], rax
+    inc     dword ptr [rbp-32]
+    jmp     vib_lp
+vib_done:
+    mov     rax, qword ptr [g_body_ptr]
+    mov     qword ptr [g_eidx_body], rax
+    mov     rax, qword ptr [g_body_len]
+    mov     qword ptr [g_eidx_blen], rax
+    mov     eax, dword ptr [rbp-24]
+    mov     dword ptr [g_eidx_n], eax
+vib_ret:
+    FRAME_EPILOG
+    ret
+vault_index_begin endp
+
+vault_index_end proc frame
+    FRAME_PROLOG 32
+    cmp     dword ptr [g_eidx_dep], 0
+    je      vie_ret
+    dec     dword ptr [g_eidx_dep]
+    jnz     vie_ret
+    mov     dword ptr [g_eidx_n], 0
+vie_ret:
+    FRAME_EPILOG
+    ret
+vault_index_end endp
 
 ; vault_title_at(rcx = index, rdx = *outlen) -> rax = title bytes ptr (0 if none)
 public vault_title_at

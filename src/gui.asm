@@ -272,6 +272,10 @@ extern SetDCBrushColor:proc
 extern IntersectClipRect:proc
 extern ExcludeClipRect:proc
 extern IsCharAlphaNumericW:proc
+extern GetClipBox:proc
+extern TransparentBlt:proc               ; the tile cache (msimg32, like AlphaBlend)
+extern vault_index_begin:proc            ; vault.asm: O(1) entry lookups for a bulk read
+extern vault_index_end:proc
 extern anim_tick:proc                    ; anim.asm
 extern anim_reset:proc
 extern anim_settings:proc
@@ -435,6 +439,12 @@ PILL_MS             equ 170               ; ms: the selection pill's slide
 XFADE_MS            equ 150               ; ms: old entry fading out over the new one
 PILL_INSET          equ 3                 ; px each side of the selection pill
 TILE_X              equ 11                ; px: the row's icon tile, right of the pill bar
+TILE_CACHE          equ 64                ; pre-rendered icon tiles kept (direct-mapped)
+TILE_KEY            equ 00FF00FFh         ; their transparent colour: no tile or glyph is
+                                          ;   magenta (a tile that were bypasses the cache)
+IDC_TEST_FLAGS      equ 7F00h             ; test builds: WM_COMMAND lParam -> g_test_flags
+TF_NOEXCL           equ 1                 ;   paint the background under the edits again
+TF_NOTILECACHE      equ 2                 ;   draw every tile directly
 LVM_MSG_FIRST       equ 1000h
 LVM_MSG_LAST        equ 10FFh
 WM_NCCALCSIZE_      equ 083h
@@ -1765,6 +1775,21 @@ g_dsb_wheelacc dd ?                   ; wheel delta not yet a whole card
 g_lbsb_hwnd   dq ?                    ; the list whose thumb ANIM_LBSB fades (vp_init)
 g_lbsb_selbusy dd ?                   ; re-entrancy guard for lbsb_selcheck
 g_lbsb_painting dd ?                  ; inside lbsb_wmpaint's WM_PRINTCLIENT
+g_freeze_depth dd ?                   ; gui_freeze nesting (vp_init zeroes)
+g_freeze_on   dd ?                    ; the outermost freeze really suspended painting
+g_pill_lastv  dd ?                    ; pill content y last repainted (narrow repaints)
+g_test_flags  dd ?                    ; TF_* (only a test build can set them)
+g_excl_par    dq ?                    ; erase_excl_cb / uline_cb context
+g_excl_hdc    dq ?
+align 8
+tc_key        dq TILE_CACHE dup (?)   ; colour | glyph << 24 | size << 40 | valid bit 63
+tc_bmp        dq TILE_CACHE dup (?)
+tc_dc         dq ?                    ; one memory DC the cached tiles are drawn from
+public g_stat_verase, g_stat_lbpaint, g_stat_erasepx
+g_stat_erasepx dq ?                   ; pixels those background paints covered (clip box)
+g_stat_verase dd ?                    ; vault-window background paints so far, and
+g_stat_lbpaint dd ?                   ;   entry-list paints: what the tests (and a
+                                      ;   profile) count to see how much repaints
 g_pill_idx    dd ?                    ; list row the selection pill marks (-1 none)
 g_lhot_idx    dd ?                    ; row under the pointer, tint fading in (-1)
 g_lold_idx    dd ?                    ; row the pointer just left, fading out (-1)
@@ -3220,6 +3245,15 @@ poplist_into proc frame
     mov     qword ptr [rbp-24], rcx
     mov     dword ptr [rbp-64], edx              ; listId
     mov     dword ptr [rbp-68], r8d              ; queryId
+    ; Redraw off for the refill: up to 5000 removals and additions, each of which
+    ; would otherwise invalidate and re-measure the list.  One repaint at the end.
+    WINCALL GetDlgItem, qword ptr [rbp-24], dword ptr [rbp-64]
+    mov     qword ptr [rbp-48], rax
+    test    rax, rax
+    jz      pi_frozen
+    WINCALL SendMessageW, qword ptr [rbp-48], WM_SETREDRAW_, 0, 0
+pi_frozen:
+    call    vault_index_begin                    ; the sort's ~60,000 title lookups
     WINCALL SendDlgItemMessageW, qword ptr [rbp-24], dword ptr [rbp-64], LB_RESETCONTENT, 0, 0
     WINCALL GetDlgItemTextW, qword ptr [rbp-24], dword ptr [rbp-68], addr g_search_w, 255
     mov     dword ptr [rbp-56], eax              ; query length (chars)
@@ -3269,6 +3303,12 @@ pi_next:
     inc     dword ptr [rbp-40]
     jmp     pi_loop
 pi_done:
+    call    vault_index_end
+    cmp     qword ptr [rbp-48], 0
+    je      pi_ret
+    WINCALL SendMessageW, qword ptr [rbp-48], WM_SETREDRAW_, 1, 0
+    WINCALL InvalidateRect, qword ptr [rbp-48], 0, 0
+pi_ret:
     FRAME_EPILOG
     ret
 poplist_into endp
@@ -3900,8 +3940,158 @@ ges_have:
 gui_entry_subtitle endp
 
 ; gui_draw_tile(rcx=hdc, edx=x, r8d=y, r9d=size) - filled rounded square (g_tilecolor)
-;   with the centered glyph in g_glyph_w drawn white.
+;   with the centered glyph in g_glyph_w drawn white - from a cache of pre-rendered
+;   tiles: each (colour, glyph, size) is drawn once into a bitmap with magenta
+;   (TILE_KEY) around the rounded corners and put up with TransparentBlt after
+;   that.  Pixel-for-pixel what tile_render draws: GDI's RoundRect is not
+;   antialiased, and the glyph's ClearType edges blend only with the tile colour.
+;   A list repaint used to set a font and run DrawTextW for every row, every frame
+;   of an animation.
 gui_draw_tile proc frame
+    FRAME_PROLOG 192
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-28], edx
+    mov     dword ptr [rbp-32], r8d
+    mov     dword ptr [rbp-36], r9d
+    test    dword ptr [g_test_flags], TF_NOTILECACHE
+    jnz     gdtc_direct
+    mov     eax, dword ptr [g_tilecolor]
+    and     eax, 0FFFFFFh
+    cmp     eax, TILE_KEY
+    je      gdtc_direct
+    mov     ecx, dword ptr [rbp-36]
+    test    ecx, ecx
+    jle     gdtc_direct
+    cmp     ecx, 255
+    ja      gdtc_direct
+    ; key = colour | glyph << 24 | size << 40 | valid
+    mov     eax, eax                             ; (zero-extend the colour)
+    movzx   ecx, word ptr [g_glyph_w]
+    shl     rcx, 24
+    or      rax, rcx
+    mov     ecx, dword ptr [rbp-36]
+    shl     rcx, 40
+    or      rax, rcx
+    bts     rax, 63
+    mov     qword ptr [rbp-48], rax
+    ; slot: a multiplicative hash of the three
+    mov     eax, dword ptr [g_tilecolor]
+    movzx   ecx, word ptr [g_glyph_w]
+    imul    ecx, ecx, 40503
+    xor     eax, ecx
+    mov     ecx, dword ptr [rbp-36]
+    imul    ecx, ecx, 1103
+    xor     eax, ecx
+    imul    eax, eax, -1640531535                ; 0x9E3779B1
+    shr     eax, 26                              ; 0..63
+    mov     dword ptr [rbp-52], eax
+    lea     r10, [tc_key]
+    mov     rcx, qword ptr [rbp-48]
+    cmp     qword ptr [r10+rax*8], rcx
+    je      gdtc_hit
+    ; a miss: render it into the slot
+    cmp     qword ptr [tc_dc], 0
+    jne     gdtc_havedc
+    WINCALL CreateCompatibleDC, qword ptr [rbp-24]
+    mov     qword ptr [tc_dc], rax
+    test    rax, rax
+    jz      gdtc_direct
+gdtc_havedc:
+    mov     eax, dword ptr [rbp-52]
+    lea     r10, [tc_key]
+    mov     qword ptr [r10+rax*8], 0             ; invalid until it is drawn
+    lea     r10, [tc_bmp]
+    mov     rcx, qword ptr [r10+rax*8]
+    mov     qword ptr [r10+rax*8], 0
+    test    rcx, rcx
+    jz      gdtc_newbmp
+    WINCALL DeleteObject, rcx
+gdtc_newbmp:
+    WINCALL CreateCompatibleBitmap, qword ptr [rbp-24], dword ptr [rbp-36], dword ptr [rbp-36]
+    test    rax, rax
+    jz      gdtc_direct
+    mov     qword ptr [rbp-64], rax
+    mov     ecx, dword ptr [rbp-52]
+    lea     r10, [tc_bmp]
+    mov     qword ptr [r10+rcx*8], rax
+    WINCALL SelectObject, qword ptr [tc_dc], qword ptr [rbp-64]
+    mov     qword ptr [rbp-72], rax              ; the DC's own 1x1 bitmap
+    mov     dword ptr [rbp-96], 0                ; RECT {0, 0, size, size}
+    mov     dword ptr [rbp-92], 0
+    mov     eax, dword ptr [rbp-36]
+    mov     dword ptr [rbp-88], eax
+    mov     dword ptr [rbp-84], eax
+    WINCALL GetStockObject, DC_BRUSH_
+    mov     qword ptr [rbp-80], rax
+    WINCALL SetDCBrushColor, qword ptr [tc_dc], TILE_KEY
+    WINCALL FillRect, qword ptr [tc_dc], addr rbp-96, qword ptr [rbp-80]
+    mov     rcx, qword ptr [tc_dc]
+    xor     edx, edx
+    xor     r8d, r8d
+    mov     r9d, dword ptr [rbp-36]
+    call    tile_render
+    WINCALL SelectObject, qword ptr [tc_dc], qword ptr [rbp-72]
+    mov     eax, dword ptr [rbp-52]
+    lea     r10, [tc_key]
+    mov     rcx, qword ptr [rbp-48]
+    mov     qword ptr [r10+rax*8], rcx
+gdtc_hit:
+    mov     eax, dword ptr [rbp-52]
+    lea     r10, [tc_bmp]
+    mov     rcx, qword ptr [r10+rax*8]
+    mov     qword ptr [rbp-64], rcx
+    WINCALL SelectObject, qword ptr [tc_dc], qword ptr [rbp-64]
+    mov     qword ptr [rbp-72], rax
+    WINCALL TransparentBlt, qword ptr [rbp-24], dword ptr [rbp-28], dword ptr [rbp-32], \
+            dword ptr [rbp-36], dword ptr [rbp-36], qword ptr [tc_dc], 0, 0, \
+            dword ptr [rbp-36], dword ptr [rbp-36], TILE_KEY
+    WINCALL SelectObject, qword ptr [tc_dc], qword ptr [rbp-72]
+    FRAME_EPILOG
+    ret
+gdtc_direct:
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-28]
+    mov     r8d, dword ptr [rbp-32]
+    mov     r9d, dword ptr [rbp-36]
+    call    tile_render
+    FRAME_EPILOG
+    ret
+gui_draw_tile endp
+
+; tile_cache_flush - drop every cached tile (at lock: they carry the first letters
+;   of entry titles).
+tile_cache_flush proc frame
+    FRAME_PROLOG 48
+    mov     dword ptr [rbp-24], 0
+tcf_lp:
+    mov     eax, dword ptr [rbp-24]
+    cmp     eax, TILE_CACHE
+    jae     tcf_dc
+    lea     r10, [tc_key]
+    mov     qword ptr [r10+rax*8], 0
+    lea     r10, [tc_bmp]
+    mov     rcx, qword ptr [r10+rax*8]
+    mov     qword ptr [r10+rax*8], 0
+    test    rcx, rcx
+    jz      tcf_next
+    WINCALL DeleteObject, rcx
+tcf_next:
+    inc     dword ptr [rbp-24]
+    jmp     tcf_lp
+tcf_dc:
+    mov     rcx, qword ptr [tc_dc]
+    mov     qword ptr [tc_dc], 0
+    test    rcx, rcx
+    jz      tcf_ret
+    WINCALL DeleteDC, rcx
+tcf_ret:
+    FRAME_EPILOG
+    ret
+tile_cache_flush endp
+
+; tile_render(rcx=hdc, edx=x, r8d=y, r9d=size) - draw one tile (what gui_draw_tile
+;   used to do directly).
+tile_render proc frame
     FRAME_PROLOG 160
     mov     qword ptr [rbp-24], rcx
     mov     dword ptr [rbp-32], edx
@@ -3946,7 +4136,7 @@ gdt_font:
     WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-80]   ; restore font
     FRAME_EPILOG
     ret
-gui_draw_tile endp
+tile_render endp
 
 ; gui_draw_listitem(rcx=lpdis) - draw one owner-draw list entry card.
 gui_draw_listitem proc frame
@@ -5703,7 +5893,7 @@ gui_copy_topmost endp
 ; gui_showdetail(rcx = hdlg, edx = index) - fill the detail fields; secret is
 ;   captured into g_secret_w and shown masked.
 ; =============================================================================
-gui_showdetail proc frame
+gui_showdetail_rows proc frame
     FRAME_PROLOG 128
     mov     qword ptr [rbp-24], rcx
     mov     dword ptr [rbp-32], edx
@@ -5975,7 +6165,79 @@ gsd_fdone:
     mov     dword ptr [g_dirty], 0
     FRAME_EPILOG
     ret
+gui_showdetail_rows endp
+
+; gui_showdetail(rcx = hdlg, edx = entry) - show an entry: the rows are destroyed,
+;   created and laid out with the window's painting suspended (gui_freeze), then
+;   the pane is painted once.  Unsuspended, every one of those dozens of child
+;   windows made Windows erase the area it uncovered on the spot: 38 full window
+;   repaints for one ordinary entry, 78 for a 40-field one - the flicker, and most
+;   of the time a selection took.
+gui_showdetail proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-28], edx
+    call    gui_freeze
+    call    vault_index_begin                    ; reads only (no body writes in here)
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-28]
+    call    gui_showdetail_rows
+    call    vault_index_end
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_thaw
+    FRAME_EPILOG
+    ret
 gui_showdetail endp
+
+; gui_freeze(rcx = hdlg) / gui_thaw(rcx = hdlg) - suspend the vault window's
+;   painting around a rebuild of the detail pane; the outermost thaw repaints the
+;   pane once (children included).  Nested pairs only count.  A window that is not
+;   visible is left alone: nothing paints anyway, and WM_SETREDRAW TRUE would set
+;   WS_VISIBLE on a window hidden in the tray.
+gui_freeze proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    inc     dword ptr [g_freeze_depth]
+    cmp     dword ptr [g_freeze_depth], 1
+    jne     gfz_ret
+    mov     dword ptr [g_freeze_on], 0
+    WINCALL IsWindowVisible, qword ptr [rbp-24]
+    test    eax, eax
+    jz      gfz_ret
+    WINCALL SendMessageW, qword ptr [rbp-24], WM_SETREDRAW_, 0, 0
+    mov     dword ptr [g_freeze_on], 1
+gfz_ret:
+    FRAME_EPILOG
+    ret
+gui_freeze endp
+
+gui_thaw proc frame
+    FRAME_PROLOG 112
+    mov     qword ptr [rbp-24], rcx
+    cmp     dword ptr [g_freeze_depth], 0
+    je      gth2_ret
+    dec     dword ptr [g_freeze_depth]
+    jnz     gth2_ret
+    cmp     dword ptr [g_freeze_on], 0
+    je      gth2_ret
+    mov     dword ptr [g_freeze_on], 0
+    WINCALL SendMessageW, qword ptr [rbp-24], WM_SETREDRAW_, 1, 0
+    WINCALL GetClientRect, qword ptr [rbp-24], addr rbp-56
+    mov     dword ptr [rbp-80], 210              ; the pane: DLU x 210 to the right edge
+    mov     dword ptr [rbp-76], 0                ;   (as gui_inval_detail)
+    mov     dword ptr [rbp-72], 210
+    mov     dword ptr [rbp-68], 8
+    WINCALL MapDialogRect, qword ptr [rbp-24], addr rbp-80
+    mov     dword ptr [rbp-76], 0
+    mov     eax, dword ptr [rbp-48]
+    mov     dword ptr [rbp-72], eax
+    mov     eax, dword ptr [rbp-44]
+    mov     dword ptr [rbp-68], eax
+    WINCALL RedrawWindow, qword ptr [rbp-24], addr rbp-80, 0, 0185h   ; INVALIDATE|ERASE|
+gth2_ret:                                                        ;   ALLCHILDREN|UPDATENOW
+    FRAME_EPILOG
+    ret
+gui_thaw endp
 
 ; gui_totp_refresh(rcx = hdlg) - recompute the live code + countdown and show it.
 gui_totp_refresh proc frame
@@ -7041,7 +7303,7 @@ gui_ro_disable_btns endp
 ; gui_set_editmode(rcx=hdlg, edx=on) - 1 = detail fields editable (edit mode),
 ;   0 = read-only (view).  Toggles EM_SETREADONLY on the six fields and swaps
 ;   the toolbar pencil glyph for a check mark while editing.
-gui_set_editmode proc frame
+gui_set_editmode_rows proc frame
     FRAME_PROLOG 128
     cmp     dword ptr [g_readonly], 0           ; E9: read-only never enters edit mode -
     je      sem_modeok                          ; force view so the edit UI stays hidden
@@ -7160,6 +7422,22 @@ sem_addcmd:
     mov     rcx, qword ptr [rbp-24]
     call    gui_rows_layout
     ; the pencil button stays a pencil in both modes (Save handles committing)
+    FRAME_EPILOG
+    ret
+gui_set_editmode_rows endp
+
+; gui_set_editmode(rcx = hdlg, edx = 1 edit / 0 view) - as gui_showdetail: the
+;   switch rebuilds and re-styles the rows, so it runs with painting suspended.
+gui_set_editmode proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-28], edx
+    call    gui_freeze
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-28]
+    call    gui_set_editmode_rows
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_thaw
     FRAME_EPILOG
     ret
 gui_set_editmode endp
@@ -8283,6 +8561,7 @@ lbsb_paint endp
 ;   locals: PAINTSTRUCT [rbp-176], RECT [rbp-96]; BitBlt takes 9 args.
 lbsb_wmpaint proc frame
     FRAME_PROLOG 288
+    inc     dword ptr [g_stat_lbpaint]
     mov     qword ptr [rbp-24], rcx
     mov     qword ptr [rbp-40], 0                ; memory DC
     mov     qword ptr [rbp-48], 0                ;   and its bitmap
@@ -8328,7 +8607,9 @@ lwp_lvbk:
     WINCALL DeleteObject, qword ptr [rbp-64]
 lwp_rows:
     mov     dword ptr [g_lbsb_painting], 1
+    call    vault_index_begin                    ; each row looks its entry up several times
     WINCALL DefSubclassProc, qword ptr [rbp-24], WM_PRINTCLIENT_, qword ptr [rbp-40], PRF_CLIENT_
+    call    vault_index_end
     mov     dword ptr [g_lbsb_painting], 0
     mov     rcx, qword ptr [rbp-24]
     mov     rdx, qword ptr [rbp-40]
@@ -8339,7 +8620,9 @@ lwp_rows:
     jmp     lwp_end
 lwp_direct:                                      ; no buffer (GDI exhausted): straight
     mov     dword ptr [g_lbsb_painting], 1
+    call    vault_index_begin
     WINCALL DefSubclassProc, qword ptr [rbp-24], WM_PRINTCLIENT_, qword ptr [rbp-32], PRF_CLIENT_
+    call    vault_index_end
     mov     dword ptr [g_lbsb_painting], 0
     mov     rcx, qword ptr [rbp-24]              ;   to the screen, as before
     mov     rdx, qword ptr [rbp-32]
@@ -8650,10 +8933,7 @@ gaa_dsb:
     call    gui_dsb_inval
     jmp     gaa_ret
 gaa_pill:
-    call    gui_lb_hwnd
-    test    rax, rax
-    jz      gaa_ret
-    WINCALL InvalidateRect, rax, 0, 0
+    call    gui_pill_inval
     jmp     gaa_ret
 gaa_lhot:
     mov     ecx, dword ptr [g_lhot_idx]
@@ -8699,6 +8979,44 @@ gaa_ret:
     FRAME_EPILOG
     ret
 gui_anim_apply endp
+
+; gui_pill_inval - the pill moved: repaint the band of rows between where it was
+;   last painted and where it is now (content y -> client y via the top row), not
+;   the whole list.
+gui_pill_inval proc frame
+    FRAME_PROLOG 96
+    call    gui_lb_hwnd
+    test    rax, rax
+    jz      gpi_ret
+    mov     qword ptr [rbp-24], rax
+    mov     ecx, ANIM_PILL
+    call    anim_get
+    mov     dword ptr [rbp-28], eax              ; now
+    mov     ecx, dword ptr [g_pill_lastv]
+    mov     dword ptr [g_pill_lastv], eax
+    cmp     ecx, eax                             ; band = [min, max]
+    jle     gpi_ord
+    xchg    ecx, eax
+gpi_ord:
+    mov     dword ptr [rbp-32], ecx              ; low
+    mov     dword ptr [rbp-36], eax              ; high
+    WINCALL SendMessageW, qword ptr [rbp-24], LB_GETITEMHEIGHT_, 0, 0
+    mov     dword ptr [rbp-40], eax
+    WINCALL SendMessageW, qword ptr [rbp-24], LB_GETTOPINDEX_, 0, 0
+    imul    eax, dword ptr [rbp-40]              ; content y of the top row
+    sub     dword ptr [rbp-32], eax
+    sub     dword ptr [rbp-36], eax
+    WINCALL GetClientRect, qword ptr [rbp-24], addr rbp-72
+    mov     eax, dword ptr [rbp-32]
+    mov     dword ptr [rbp-68], eax              ; top
+    mov     eax, dword ptr [rbp-36]
+    add     eax, dword ptr [rbp-40]
+    mov     dword ptr [rbp-60], eax              ; bottom
+    WINCALL InvalidateRect, qword ptr [rbp-24], addr rbp-72, 0
+gpi_ret:
+    FRAME_EPILOG
+    ret
+gui_pill_inval endp
 
 ; gui_lb_hwnd -> rax = the vault window's entry list (0 if there is none).
 gui_lb_hwnd proc frame
@@ -9086,6 +9404,73 @@ gxs_ret:
     ret
 gui_xfade_step endp
 
+; gui_inval_underlines(rcx = hdlg) - repaint the strip under each edit that has a
+;   Fluent underline (frame_cb: the vault's own edits, not the rows').  A focus
+;   change used to invalidate the whole window with erase - and, the window not
+;   clipping its children, every child with it: the list, every field, every
+;   button, to move one 2px line.
+gui_inval_underlines proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [g_excl_par], rcx
+    WINCALL EnumChildWindows, rcx, addr uline_cb, 0
+    FRAME_EPILOG
+    ret
+gui_inval_underlines endp
+
+; uline_cb(rcx = hwnd, rdx = 0) -> 1 - EnumChildWindows callback for the above.
+uline_cb proc frame
+    FRAME_PROLOG 128
+    mov     qword ptr [rbp-24], rcx
+    WINCALL GetParent, rcx
+    cmp     rax, qword ptr [g_excl_par]
+    jne     ulc_ret
+    WINCALL GetClassNameW, qword ptr [rbp-24], addr rbp-64, 16
+    cmp     word ptr [rbp-64], 'E'
+    jne     ulc_ret
+    cmp     word ptr [rbp-62], 'd'
+    jne     ulc_ret
+    WINCALL GetDlgCtrlID, qword ptr [rbp-24]
+    cmp     eax, IDC_DYN_BASE                    ; row edits have no underline
+    jae     ulc_ret
+    WINCALL GetWindowRect, qword ptr [rbp-24], addr rbp-88
+    WINCALL MapWindowPoints, 0, qword ptr [g_excl_par], addr rbp-88, 2
+    mov     eax, dword ptr [rbp-76]              ; the strip: {L, B, R, B + 3}
+    mov     dword ptr [rbp-84], eax
+    add     eax, 3
+    mov     dword ptr [rbp-76], eax
+    WINCALL InvalidateRect, qword ptr [g_excl_par], addr rbp-88, 1
+ulc_ret:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+uline_cb endp
+
+; erase_excl_cb(rcx = hwnd, rdx = 0) -> 1 - leave a visible edit (a direct child of
+;   g_excl_par) out of the background paint going on in g_excl_hdc.
+erase_excl_cb proc frame
+    FRAME_PROLOG 128
+    mov     qword ptr [rbp-24], rcx
+    WINCALL GetParent, rcx
+    cmp     rax, qword ptr [g_excl_par]
+    jne     eec_ret
+    WINCALL IsWindowVisible, qword ptr [rbp-24]
+    test    eax, eax
+    jz      eec_ret
+    WINCALL GetClassNameW, qword ptr [rbp-24], addr rbp-64, 16
+    cmp     word ptr [rbp-64], 'E'
+    jne     eec_ret
+    cmp     word ptr [rbp-62], 'd'
+    jne     eec_ret
+    WINCALL GetWindowRect, qword ptr [rbp-24], addr rbp-88
+    WINCALL MapWindowPoints, 0, qword ptr [g_excl_par], addr rbp-88, 2
+    WINCALL ExcludeClipRect, qword ptr [g_excl_hdc], dword ptr [rbp-88], dword ptr [rbp-84], \
+            dword ptr [rbp-80], dword ptr [rbp-76]
+eec_ret:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+erase_excl_cb endp
+
 ; gui_erase_into(rcx = hdc, rdx = hdlg) - everything the vault window paints
 ;   behind its controls: background, field cards (or the home panel), the pane's
 ;   thumb.
@@ -9114,9 +9499,20 @@ gui_erase_into endp
 ;   blit: it paints every one of its own pixels (lbsb_wmpaint), so painting the
 ;   background under it first only flashed it.
 gui_erase_buffered proc frame
-    FRAME_PROLOG 192
+    FRAME_PROLOG 224                             ; (the clip box below clears BitBlt's args)
+    inc     dword ptr [g_stat_verase]
     mov     qword ptr [rbp-24], rcx
     mov     qword ptr [rbp-32], rdx
+    WINCALL GetClipBox, qword ptr [rbp-24], addr rbp-144   ; how much is being repainted
+    cmp     eax, 1                               ; NULLREGION / ERROR: nothing
+    jle     geb_counted
+    mov     eax, dword ptr [rbp-136]
+    sub     eax, dword ptr [rbp-144]
+    mov     ecx, dword ptr [rbp-132]
+    sub     ecx, dword ptr [rbp-140]
+    imul    eax, ecx
+    add     qword ptr [g_stat_erasepx], rax
+geb_counted:
     mov     qword ptr [rbp-40], 0                ; memory DC
     mov     qword ptr [rbp-48], 0                ;   and its bitmap
     WINCALL GetClientRect, qword ptr [rbp-32], addr rbp-80
@@ -9132,6 +9528,17 @@ gui_erase_buffered proc frame
     WINCALL ExcludeClipRect, qword ptr [rbp-24], dword ptr [rbp-112], dword ptr [rbp-108], \
             dword ptr [rbp-104], dword ptr [rbp-100]
 geb_buf:
+    ; ...and so do the edit boxes: theme_ctlcolor hands every one an opaque brush the
+    ; colour of the card under it.  Painting the card there first showed the boxes
+    ; empty for a frame on every full repaint, before their text came back.
+    test    dword ptr [g_test_flags], TF_NOEXCL
+    jnz     geb_buf2
+    mov     rax, qword ptr [rbp-24]
+    mov     qword ptr [g_excl_hdc], rax
+    mov     rax, qword ptr [rbp-32]
+    mov     qword ptr [g_excl_par], rax
+    WINCALL EnumChildWindows, qword ptr [rbp-32], addr erase_excl_cb, 0
+geb_buf2:
     cmp     dword ptr [rbp-72], 0
     jle     geb_direct
     cmp     dword ptr [rbp-68], 0
@@ -14929,6 +15336,9 @@ vp_init:
     mov     qword ptr [g_lbsb_hwnd], 0
     mov     dword ptr [g_lbsb_selbusy], 0
     mov     dword ptr [g_lbsb_painting], 0
+    mov     dword ptr [g_freeze_depth], 0
+    mov     dword ptr [g_freeze_on], 0
+    mov     dword ptr [g_pill_lastv], 0
     mov     dword ptr [g_pill_idx], -1
     mov     dword ptr [g_lhot_idx], -1
     mov     dword ptr [g_lold_idx], -1
@@ -15106,6 +15516,13 @@ vp_cmd:
     movzx   eax, r8w                        ; control id
     mov     r10d, r8d
     shr     r10d, 16                        ; notification code
+ifdef PROBE_IO
+    cmp     eax, IDC_TEST_FLAGS             ; the GUI test switches a renderer path off to
+    jne     vp_cmd_notest                   ;   compare its pixels with the other
+    mov     dword ptr [g_test_flags], r9d
+    jmp     vp_handled
+vp_cmd_notest:
+endif
     cmp     r10d, EN_SETFOCUS               ; focus moved -> redraw Fluent underlines
     je      vp_focusin
     cmp     r10d, EN_KILLFOCUS
@@ -15328,7 +15745,8 @@ vpf_caretdone:
     mov     edx, dword ptr [rbp-16]
     call    gui_url_open
 vp_refocus:
-    WINCALL InvalidateRect, qword ptr [rbp-8], 0, 1
+    mov     rcx, qword ptr [rbp-8]            ; the focus underlines moved: repaint the
+    call    gui_inval_underlines              ;   strips they sit in, not the window
     jmp     vp_handled
 vp_menu:
     mov     rcx, qword ptr [rbp-8]
@@ -15448,12 +15866,16 @@ vp_list:
 vl_load:
     mov     rcx, qword ptr [rbp-8]            ; the pane as it is, over itself: the
     call    gui_xfade_begin                   ;   new entry fades in from under it
+    mov     rcx, qword ptr [rbp-8]            ; build and restyle under one freeze:
+    call    gui_freeze                        ;   one repaint, not two
     mov     rcx, qword ptr [rbp-8]
     mov     edx, dword ptr [rbp-16]
     call    gui_showdetail
     mov     rcx, qword ptr [rbp-8]            ; viewing another record -> view mode
     xor     edx, edx
     call    gui_set_editmode
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_thaw
     mov     rcx, qword ptr [rbp-8]
     call    gui_xfade_go
     jmp     vp_handled
@@ -19894,6 +20316,7 @@ go_vault:
     mov     dword ptr [g_base_cy], 0
     WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_VAULT, qword ptr [rbp-24], addr vault_proc, 0
     call    vault_lock                      ; wipe body + key, minimise to tray
+    call    tile_cache_flush                ; the cached tiles carry title first letters
     ; ...and every static buffer that held this vault's plaintext: password history
     ; and originals, the display/commit scratch, the attachment tile's AttachRefs
     ; (each carries its file key).  vault_lock wipes only the body and the key.

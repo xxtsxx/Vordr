@@ -302,6 +302,71 @@ try {
     Start-Sleep -Milliseconds 1500
     $p.Refresh(); $c1 = $p.TotalProcessorTime.TotalMilliseconds
     Check ((& $G 'g_anim_tmr') -eq 0 -and ($c1 - $c0) -lt 100) ("at rest no animation timer runs and the app is idle ({0:N0} ms CPU in 1.5 s)" -f ($c1 - $c0))
+    # ---- rendering work: what a switch, a refill and a focus change cost --------
+    $G2 = { param($s) [int64](& $G $s) }
+    # an entry switch rebuilds its rows with painting suspended: one background
+    # paint, not one per child window created, moved or destroyed (38 for this one)
+    [void](Send-VordrMessage -Hwnd $lb -Msg 0x186 -W ([IntPtr]4))
+    $e0 = & $G2 'g_stat_verase'
+    Send-VordrCommand -Window $v -Id $IDC_V_LIST -Notify 1 -LParam $lb -Sync
+    [void][VordrGui.Native]::RedrawWindow($v, [IntPtr]::Zero, [IntPtr]::Zero, 0x0180)        # UPDATENOW|ALLCHILDREN
+    $e1 = & $G2 'g_stat_verase'
+    Check (($e1 - $e0) -le 2) ("an entry switch repaints the window background once, not once per control ({0})" -f ($e1 - $e0))
+    # a focus change repaints the underline strips only - not the list (the whole
+    # window and every child used to be invalidated to move one 2px line)
+    Start-Sleep -Milliseconds 300
+    $srch = Get-VordrControl -Window $v -Id $IDC_V_SEARCH
+    $star = Get-VordrControl -Window $v -Id 237
+    [void](Send-VordrMessage -Hwnd $v -Msg 0x0028 -W $star -L ([IntPtr]1))           # off the list first: losing
+    Start-Sleep -Milliseconds 300                                                    #   the focus repaints it itself
+    $l0 = & $G2 'g_stat_lbpaint'; $a0 = & $G2 'g_stat_erasepx'
+    [void](Send-VordrMessage -Hwnd $v -Msg 0x0028 -W $srch -L ([IntPtr]1))           # WM_NEXTDLGCTL: the search box
+    Start-Sleep -Milliseconds 250
+    $vo = Get-VordrClientOrigin $v; $so2 = Get-VordrClientOrigin $srch; $sr2 = Get-VordrRect $srch -Client
+    $ux = $so2.X - $vo.X + 10; $uy = $so2.Y - $vo.Y + $sr2.B
+    $dc = [VordrGui.Native]::GetDC($v); $ulOn = [VordrGui.Native]::GetPixel($dc, $ux, $uy); [void][VordrGui.Native]::ReleaseDC($v, $dc)
+    [void](Send-VordrMessage -Hwnd $v -Msg 0x0028 -W $star -L ([IntPtr]1))           # ... and away to the star
+    Start-Sleep -Milliseconds 250
+    $dc = [VordrGui.Native]::GetDC($v); $ulOff = [VordrGui.Native]::GetPixel($dc, $ux, $uy); [void][VordrGui.Native]::ReleaseDC($v, $dc)
+    $l1 = & $G2 'g_stat_lbpaint'; $a1 = & $G2 'g_stat_erasepx'
+    $vca = (Get-VordrRect $v -Client); $full = [int64]$vca.R * $vca.B
+    Check (($l1 - $l0) -eq 0 -and ($a1 - $a0) -lt ($full / 20)) ("two focus moves repaint {0:N0} px of background ({1:P1} of the window) and no list" -f ($a1 - $a0), (($a1 - $a0) / $full))
+    Check ($ulOn -eq 0xFFFFFFFF -or ($ulOn -eq (& $G 'g_col_accent') -and $ulOff -ne $ulOn)) ("the focus underline still follows: accent under the focused search box (0x{0:X6}), not after (0x{1:X6})" -f $ulOn, $ulOff)
+    # a 5,000-entry search refill (it took 3.5 s: every sort comparison walked the
+    # vault from its first entry to find two titles)
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    Set-VordrText -Hwnd $srch -Text 'a'
+    [void](Send-VordrMessage -Hwnd $v -Msg 0x0113 -W ([IntPtr]3))                    # WM_TIMER SEARCH_TIMER
+    Set-VordrText -Hwnd $srch -Text ''
+    [void](Send-VordrMessage -Hwnd $v -Msg 0x0113 -W ([IntPtr]3))
+    $sw.Stop()
+    Check ($sw.Elapsed.TotalMilliseconds -lt 1500 -and [int](Send-VordrMessage -Hwnd $lb -Msg 0x018B) -eq 5000) ("two 5,000-entry search refills take {0:N0} ms (was ~7,000)" -f $sw.Elapsed.TotalMilliseconds)
+    # the tile cache and leaving the edit boxes out of the background paint change
+    # no pixel: the window drawn with both, and drawn with neither, are identical
+    [void](Send-VordrMessage -Hwnd $lb -Msg 0x186 -W ([IntPtr]1))
+    Send-VordrCommand -Window $v -Id $IDC_V_LIST -Notify 1 -LParam $lb -Sync
+    [void](Send-VordrMessage -Hwnd $v -Msg 0x0028 -W $star -L ([IntPtr]1))
+    Start-Sleep -Milliseconds 600
+    Add-Type -AssemblyName System.Drawing
+    $vcr = Get-VordrRect $v -Client
+    $grab = {
+        [void][VordrGui.Native]::RedrawWindow($v, [IntPtr]::Zero, [IntPtr]::Zero, 0x0185)    # everything, now
+        Start-Sleep -Milliseconds 300
+        $bm = New-Object Drawing.Bitmap $vcr.R, $vcr.B
+        $gr = [Drawing.Graphics]::FromImage($bm); $gr.CopyFromScreen($vo.X, $vo.Y, 0, 0, $bm.Size); $gr.Dispose()
+        $bd = $bm.LockBits((New-Object Drawing.Rectangle 0, 0, $bm.Width, $bm.Height), 'ReadOnly', 'Format32bppArgb')
+        $bytes = New-Object byte[] ($bd.Stride * $bd.Height)
+        [Runtime.InteropServices.Marshal]::Copy($bd.Scan0, $bytes, 0, $bytes.Length)
+        $bm.UnlockBits($bd); $bm.Dispose()
+        , $bytes
+    }
+    $withBoth = & $grab
+    Send-VordrCommand -Window $v -Id 0x7F00 -LParam ([IntPtr]3) -Sync                 # TF_NOEXCL | TF_NOTILECACHE
+    $withNone = & $grab
+    Send-VordrCommand -Window $v -Id 0x7F00 -LParam ([IntPtr]0) -Sync
+    $diff = 0; for ($i = 0; $i -lt $withBoth.Length; $i += 4) { if ($withBoth[$i] -ne $withNone[$i] -or $withBoth[$i+1] -ne $withNone[$i+1] -or $withBoth[$i+2] -ne $withNone[$i+2]) { $diff++ } }
+    Check ($diff -eq 0) ("the tile cache and the edit-box exclusion change no pixel of the window ({0} differ of {1})" -f $diff, ($withBoth.Length / 4))
+
     # each switch snapshots the pane: 20 of them must leak nothing
     $gdi0 = [VordrT.Gr]::GetGuiResources($p.Handle, 0); $usr0 = [VordrT.Gr]::GetGuiResources($p.Handle, 1)
     for ($k = 0; $k -lt 20; $k++) {
@@ -358,6 +423,7 @@ try {
         Check ($null -ne $b -and -not ($b | Where-Object { $_ -ne 0 })) "$sym is zero after lock"
     }
     Check ((Read-VordrGlobal -Process $p -Map $map -Symbol 'g_body_ptr' -Size 8) -eq 0) 'no decrypted body after lock'
+    Check ((Read-VordrGlobal -Process $p -Map $map -Symbol 'tc_dc' -Size 8) -eq 0) 'no cached icon tiles after lock (they carry title letters)'
 
     # ---- and it unlocks again cleanly ------------------------------------------
     $u2 = Open-Unlock $p
