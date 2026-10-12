@@ -262,9 +262,11 @@ extern CreateRoundRectRgn:proc
 extern SelectClipRgn:proc
 extern CreateCompatibleDC:proc
 extern CreateCompatibleBitmap:proc
+extern BeginPaint:proc                   ; the drawn-scrollbar lists paint double-buffered
+extern EndPaint:proc
+extern BitBlt:proc
+extern DeleteDC:proc
 extern SetPixel:proc
-extern GetDC:proc
-extern ReleaseDC:proc
 extern SetCapture:proc
 extern ReleaseCapture:proc
 extern ShowScrollBar:proc
@@ -384,8 +386,8 @@ LB_MSG_LAST         equ 1B0h          ;   .. the listbox message range
 ; window region - does not carry over: a few thousand cards is a window far
 ; taller than the 16-bit sizes WM_SIZE reports.)
 LBSB_HOT            equ 16            ; the strip at the right edge that hovers/clicks
-LBSB_W_IDLE         equ 3             ; thumb width at rest
-LBSB_W_HOT          equ 8             ;   and while hovered or dragged
+LBSB_W_HOT          equ 8             ; thumb width; drawn only while the strip is
+                                      ;   pointed at or the thumb dragged (as Myrkr)
 LBSB_INSET          equ 3             ; held off the right edge
 LBSB_MINH           equ 28            ; shorter than this cannot be grabbed
 LBSB_ALPHA          equ 150           ; ~59% over the card colour
@@ -395,6 +397,13 @@ AC_SRC_OVER_        equ 0
 LVM_GETITEMRECT_    equ 100Eh         ; ListView messages the export/import checklist's
 LVM_SCROLL_         equ 1014h         ;   drawn scrollbar uses (same lbsb_* code, kind 1)
 LVM_GETTOPINDEX_    equ 1027h
+LVM_GETBKCOLOR_     equ 1000h
+WM_PRINTCLIENT_     equ 318h
+PRF_CLIENT_         equ 4
+WM_SETREDRAW_       equ 0Bh
+RDW_INVALIDATE_     equ 1
+RDW_UPDATENOW_      equ 100h
+SRCCOPY_            equ 0CC0020h
 LVM_MSG_FIRST       equ 1000h
 LVM_MSG_LAST        equ 10FFh
 WM_NCCALCSIZE_      equ 083h
@@ -7500,14 +7509,12 @@ gui_draw_dthumb proc frame
     call    gui_dsb_geom
     test    eax, eax
     jz      gdt_ret
-    mov     eax, LBSB_W_IDLE
-    cmp     dword ptr [g_dsb_hover], 0
-    jne     gdt_hot
+    cmp     dword ptr [g_dsb_hover], 0           ; as the lists: only while pointed at
+    jne     gdt_hot                              ;   or dragged
     cmp     dword ptr [g_dsb_track], 0
-    je      gdt_w
+    je      gdt_ret
 gdt_hot:
     mov     eax, LBSB_W_HOT
-gdt_w:
     mov     dword ptr [rbp-36], eax              ; width
     mov     ecx, dword ptr [g_dsb_cardr]
     add     ecx, 6
@@ -8007,25 +8014,25 @@ lg_none:
     ret
 lbsb_geom endp
 
-; lbsb_paint(rcx = list) - draw the thumb over what the list just painted.
-;   Translucency: a 1x1 source pixel stretched over the thumb with AlphaBlend's
-;   constant alpha; the rounded ends are the clip (AlphaBlend knows no shapes).
-;   A DC from GetDC has its origin at the client's top-left, so the region needs
-;   no viewport offset (Myrkr's double-buffered listview did).
+; lbsb_paint(rcx = list, rdx = hdc) - draw the thumb over the rows, into the
+;   paint buffer (lbsb_wmpaint).  Translucency: a 1x1 source pixel stretched over
+;   the thumb with AlphaBlend's constant alpha; the rounded ends are the clip
+;   (AlphaBlend knows no shapes).  The buffer's origin is the client's top-left,
+;   so the region needs no viewport offset.  Always refreshes the geometry
+;   (g_lbsb_curtop), even when there is no thumb to draw.
 lbsb_paint proc frame
     FRAME_PROLOG 160                             ; AlphaBlend: 11 args
     mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-48], rdx              ; hdc
     call    lbsb_geom
     test    eax, eax
     jz      lp_ret
-    mov     eax, LBSB_W_IDLE
-    cmp     dword ptr [g_lbsb_hover], 0
-    jne     lp_hot
-    cmp     dword ptr [g_lbsb_track], 0
-    je      lp_width
+    cmp     dword ptr [g_lbsb_hover], 0          ; at rest there is no bar at all;
+    jne     lp_hot                               ;   pointing at the strip or dragging
+    cmp     dword ptr [g_lbsb_track], 0          ;   shows it
+    je      lp_ret
 lp_hot:
     mov     eax, LBSB_W_HOT
-lp_width:
     mov     dword ptr [rbp-32], eax              ; width
     mov     ecx, dword ptr [g_lbsb_w]
     sub     ecx, LBSB_INSET
@@ -8038,32 +8045,108 @@ lp_width:
     add     eax, dword ptr [g_lbsb_thh]
     inc     eax
     mov     dword ptr [rbp-60], eax              ; region bottom
-    WINCALL GetDC, qword ptr [rbp-24]
-    mov     qword ptr [rbp-48], rax
-    test    rax, rax
-    jz      lp_ret
     mov     rcx, qword ptr [rbp-48]              ; the scheme's dim text colour: light
     call    lbsb_source                          ;   on dark schemes, dark on light ones
     test    rax, rax
-    jz      lp_rel
+    jz      lp_ret
 lp_draw:
     WINCALL CreateRoundRectRgn, dword ptr [rbp-40], dword ptr [g_lbsb_thy], dword ptr [rbp-56], \
             dword ptr [rbp-60], LBSB_RADIUS*2, LBSB_RADIUS*2
     mov     qword ptr [rbp-64], rax
     test    rax, rax
-    jz      lp_rel
+    jz      lp_ret
     WINCALL SelectClipRgn, qword ptr [rbp-48], qword ptr [rbp-64]
     WINCALL AlphaBlend, qword ptr [rbp-48], dword ptr [rbp-40], dword ptr [g_lbsb_thy], \
             dword ptr [rbp-32], dword ptr [g_lbsb_thh], qword ptr [g_lbsb_sdc], 0, 0, 1, 1, \
             <AC_SRC_OVER_ or (LBSB_ALPHA shl 16)>
     WINCALL SelectClipRgn, qword ptr [rbp-48], 0
     WINCALL DeleteObject, qword ptr [rbp-64]
-lp_rel:
-    WINCALL ReleaseDC, qword ptr [rbp-24], qword ptr [rbp-48]
 lp_ret:
     FRAME_EPILOG
     ret
 lbsb_paint endp
+
+; lbsb_wmpaint(rcx = list) - WM_PAINT for both drawn-scrollbar lists, double-
+;   buffered: background, the rows (WM_PRINTCLIENT into a memory DC), the thumb,
+;   then ONE blit.  Rows painted to the screen with the thumb drawn after them
+;   showed a frame without the thumb on every repaint - the flicker - and a strip
+;   repaint without erase never cleared the space below the last card, so the
+;   wide hover thumb left its bottom end there.  Every client pixel now comes
+;   from the buffer.  The list's own WM_ERASEBKGND is swallowed (the subclasses).
+;   locals: PAINTSTRUCT [rbp-176], RECT [rbp-96]; BitBlt takes 9 args.
+lbsb_wmpaint proc frame
+    FRAME_PROLOG 288
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-40], 0                ; memory DC
+    mov     qword ptr [rbp-48], 0                ;   and its bitmap
+    WINCALL BeginPaint, qword ptr [rbp-24], addr rbp-176
+    mov     qword ptr [rbp-32], rax
+    test    rax, rax
+    jz      lwp_ret
+    WINCALL GetClientRect, qword ptr [rbp-24], addr rbp-96
+    cmp     dword ptr [rbp-88], 0
+    jle     lwp_end
+    cmp     dword ptr [rbp-84], 0
+    jle     lwp_end
+    WINCALL CreateCompatibleDC, qword ptr [rbp-32]
+    mov     qword ptr [rbp-40], rax
+    test    rax, rax
+    jz      lwp_direct
+    WINCALL CreateCompatibleBitmap, qword ptr [rbp-32], dword ptr [rbp-88], dword ptr [rbp-84]
+    mov     qword ptr [rbp-48], rax
+    test    rax, rax
+    jz      lwp_direct
+    WINCALL SelectObject, qword ptr [rbp-40], qword ptr [rbp-48]
+    mov     qword ptr [rbp-56], rax
+    ; ---- background: what the list's own erase would have used --------------
+    cmp     dword ptr [g_lbsb_kind], 0
+    jne     lwp_lvbk
+    WINCALL GetParent, qword ptr [rbp-24]
+    mov     qword ptr [rbp-64], rax
+    WINCALL SendMessageW, qword ptr [rbp-64], WM_CTLCOLORLISTBOX, qword ptr [rbp-40], \
+            qword ptr [rbp-24]
+    mov     qword ptr [rbp-64], rax              ; the theme's brush (not ours to free)
+    test    rax, rax
+    jz      lwp_rows
+    WINCALL FillRect, qword ptr [rbp-40], addr rbp-96, qword ptr [rbp-64]
+    jmp     lwp_rows
+lwp_lvbk:
+    WINCALL SendMessageW, qword ptr [rbp-24], LVM_GETBKCOLOR_, 0, 0
+    mov     ecx, eax
+    WINCALL CreateSolidBrush, rcx
+    mov     qword ptr [rbp-64], rax
+    test    rax, rax
+    jz      lwp_rows
+    WINCALL FillRect, qword ptr [rbp-40], addr rbp-96, qword ptr [rbp-64]
+    WINCALL DeleteObject, qword ptr [rbp-64]
+lwp_rows:
+    WINCALL DefSubclassProc, qword ptr [rbp-24], WM_PRINTCLIENT_, qword ptr [rbp-40], PRF_CLIENT_
+    mov     rcx, qword ptr [rbp-24]
+    mov     rdx, qword ptr [rbp-40]
+    call    lbsb_paint
+    WINCALL BitBlt, qword ptr [rbp-32], 0, 0, dword ptr [rbp-88], dword ptr [rbp-84], \
+            qword ptr [rbp-40], 0, 0, SRCCOPY_
+    WINCALL SelectObject, qword ptr [rbp-40], qword ptr [rbp-56]
+    jmp     lwp_end
+lwp_direct:                                      ; no buffer (GDI exhausted): straight
+    WINCALL DefSubclassProc, qword ptr [rbp-24], WM_PRINTCLIENT_, qword ptr [rbp-32], PRF_CLIENT_
+    mov     rcx, qword ptr [rbp-24]              ;   to the screen, as before
+    mov     rdx, qword ptr [rbp-32]
+    call    lbsb_paint
+lwp_end:
+    cmp     qword ptr [rbp-48], 0
+    je      lwp_nobmp
+    WINCALL DeleteObject, qword ptr [rbp-48]
+lwp_nobmp:
+    cmp     qword ptr [rbp-40], 0
+    je      lwp_nodc
+    WINCALL DeleteDC, qword ptr [rbp-40]
+lwp_nodc:
+    WINCALL EndPaint, qword ptr [rbp-24], addr rbp-176
+lwp_ret:
+    FRAME_EPILOG
+    ret
+lbsb_wmpaint endp
 
 ; lbsb_strip_inval(rcx = list) - repaint just the strip the thumb lives in.
 lbsb_strip_inval proc frame
@@ -8092,22 +8175,26 @@ lst_lo:
     mov     edx, dword ptr [g_lbsb_topmax]
 lst_hi:
     mov     dword ptr [rbp-28], edx
+    ; Redraw off while scrolling: the list would blit its pixels - the thumb with
+    ; them - and paint the exposed band, then the strip would repaint: three
+    ; partial frames.  Instead, one full (buffered) repaint below.
+    WINCALL SendMessageW, qword ptr [rbp-24], WM_SETREDRAW_, 0, 0
     cmp     dword ptr [g_lbsb_kind], 0
     jne     lst_lv
     WINCALL SendMessageW, qword ptr [rbp-24], LB_SETTOPINDEX_, dword ptr [rbp-28], 0
     jmp     lst_done
 lst_lv:
-    mov     eax, edx
+    mov     eax, dword ptr [rbp-28]
     sub     eax, dword ptr [g_lbsb_curtop]
     imul    eax, dword ptr [g_lbsb_ih]
     movsxd  rax, eax
     mov     qword ptr [rbp-40], rax
     WINCALL SendMessageW, qword ptr [rbp-24], LVM_SCROLL_, 0, qword ptr [rbp-40]
 lst_done:
+    WINCALL SendMessageW, qword ptr [rbp-24], WM_SETREDRAW_, 1, 0
+    WINCALL RedrawWindow, qword ptr [rbp-24], 0, 0, RDW_INVALIDATE_ or RDW_UPDATENOW_
     mov     eax, dword ptr [rbp-28]
     mov     dword ptr [g_lbsb_top], eax
-    mov     rcx, qword ptr [rbp-24]
-    call    lbsb_strip_inval
     FRAME_EPILOG
     ret
 lbsb_settop endp
@@ -8320,6 +8407,8 @@ sel_list_subclass proc frame
     je      sls_nccalc
     cmp     rdx, WM_PAINT
     je      sls_paint
+    cmp     rdx, WM_ERASEBKGND
+    je      sls_erase
     cmp     rdx, WM_MOUSEWHEEL
     je      sls_wheel
     cmp     rdx, WM_LBUTTONDOWN_
@@ -8360,17 +8449,30 @@ sls_ret:
     FRAME_EPILOG
     ret
 sls_nccalc:
+    ; Strip both scrollbar styles BEFORE the frame is computed, so it never makes
+    ; room for them.  Hiding them afterwards (ShowScrollBar) lost to the ListView,
+    ; which re-adds WS_HSCROLL: its 17px stayed reserved as an unthemed white band
+    ; under the last row.
+    WINCALL GetWindowLongPtrW, qword ptr [rbp-24], GWL_STYLE_
+    mov     qword ptr [rbp-80], rax
+    and     rax, not 300000h                     ; WS_HSCROLL | WS_VSCROLL
+    cmp     rax, qword ptr [rbp-80]
+    je      sls_nc_def
+    mov     qword ptr [rbp-80], rax
+    WINCALL SetWindowLongPtrW, qword ptr [rbp-24], GWL_STYLE_, qword ptr [rbp-80]
+sls_nc_def:
     WINCALL DefSubclassProc, qword ptr [rbp-24], qword ptr [rbp-32], qword ptr [rbp-40], \
             qword ptr [rbp-48]
     mov     qword ptr [rbp-72], rax
-    WINCALL ShowScrollBar, qword ptr [rbp-24], SB_BOTH_, 0     ; both: the column is sized to fit
     jmp     sls_ret
+sls_erase:                                       ; lbsb_wmpaint paints every pixel
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
 sls_paint:
-    WINCALL DefSubclassProc, qword ptr [rbp-24], qword ptr [rbp-32], qword ptr [rbp-40], \
-            qword ptr [rbp-48]
-    mov     qword ptr [rbp-72], rax
     mov     rcx, qword ptr [rbp-24]
-    call    lbsb_paint
+    call    lbsb_wmpaint
+    mov     qword ptr [rbp-72], 0
     mov     eax, dword ptr [g_lbsb_curtop]
     cmp     eax, dword ptr [g_lbsb_top]
     je      sls_ret
@@ -8444,6 +8546,8 @@ search_type_subclass proc frame
     mov     dword ptr [g_lbsb_kind], 0           ; a listbox
     cmp     rdx, WM_PAINT
     je      sts_paint
+    cmp     rdx, WM_ERASEBKGND
+    je      sts_erase
     cmp     rdx, WM_MOUSEWHEEL
     je      sts_wheel
     cmp     rdx, WM_LBUTTONDOWN_
@@ -8512,12 +8616,14 @@ sts_ret:
     mov     rax, qword ptr [rbp-72]
     FRAME_EPILOG
     ret
+sts_erase:                                       ; lbsb_wmpaint paints every pixel
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
 sts_paint:
-    WINCALL DefSubclassProc, qword ptr [rbp-24], qword ptr [rbp-32], qword ptr [rbp-40], \
-            qword ptr [rbp-48]
-    mov     qword ptr [rbp-72], rax
-    mov     rcx, qword ptr [rbp-24]              ; the rows are on screen: the thumb on top,
-    call    lbsb_paint                           ;   in the same message
+    mov     rcx, qword ptr [rbp-24]              ; rows + thumb, composed off screen
+    call    lbsb_wmpaint
+    mov     qword ptr [rbp-72], 0
     mov     eax, dword ptr [g_lbsb_curtop]       ; scrolled since the strip last painted?
     cmp     eax, dword ptr [g_lbsb_top]          ;   the old thumb was blitted along with the
     je      sts_ret                              ;   rows - repaint the strip once more

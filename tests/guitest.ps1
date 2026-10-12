@@ -169,19 +169,45 @@ try {
         [void](Send-VordrMessage -Hwnd $lb -Msg 0x0200 -L ([IntPtr](20 * 65536 + 30)))
         Check ((& $G 'g_lbsb_hover') -eq 0) 'moving off the strip clears the hover'
     } finally { [Windows.Forms.Cursor]::Position = $saved }
-    # the thumb actually reaches the screen: a pixel inside it differs from the same
-    # column outside it (drawing can be silently discarded - Myrkr measured exactly that)
-    [void](Send-VordrMessage -Hwnd $lb -Msg 0x197 -W ([IntPtr]0))
-    Start-Sleep -Milliseconds 400
-    [void](Send-VordrMessage -Hwnd $lb -Msg 0x020A -W ([IntPtr]0))
-    $thy = & $G 'g_lbsb_thy'; $thh = & $G 'g_lbsb_thh'
-    $px = $cr.R - 3 - 2                                     # inside the 3px idle thumb
-    $dc = [VordrGui.Native]::GetDC($lb)
-    $in  = [VordrGui.Native]::GetPixel($dc, $px, $thy + [int]($thh / 2))
-    $out = [VordrGui.Native]::GetPixel($dc, $px, [Math]::Min($cr.B - 4, $thy + $thh + 40))
-    [void][VordrGui.Native]::ReleaseDC($lb, $dc)
-    if ($in -eq 0xFFFFFFFF -or $out -eq 0xFFFFFFFF) { Write-Host '  (thumb pixel check skipped: the window is not on screen)' }
-    else { Check ($in -ne $out) ("the thumb is drawn on screen (0x{0:X6} inside vs 0x{1:X6} below)" -f $in, $out) }
+    # ---- what reaches the screen (drawing can be silently discarded - Myrkr measured
+    # exactly that).  At rest there is no bar at all; pointing at the strip shows it;
+    # leaving clears it - at the very bottom too, below the last card, where a strip
+    # repaint without erase used to leave the wide thumb's bottom end behind.
+    $saved = [Windows.Forms.Cursor]::Position
+    try {
+        $away = { [void][VordrGui.Native]::SetCursorPos($wr.L + 30, $wr.T + 20)
+                  [void](Send-VordrMessage -Hwnd $lb -Msg 0x0200 -L ([IntPtr](20 * 65536 + 30))) }
+        & $away
+        $cnt = [int](Send-VordrMessage -Hwnd $lb -Msg 0x018B)                           # LB_GETCOUNT
+        [void](Send-VordrMessage -Hwnd $lb -Msg 0x197 -W ([IntPtr]($cnt - 1)))          # to the end (an index
+                                                                                        #   past it is LB_ERR)
+        [void][VordrGui.Native]::RedrawWindow($lb, [IntPtr]::Zero, [IntPtr]::Zero, 0x0185)
+        Start-Sleep -Milliseconds 400
+        [void](Send-VordrMessage -Hwnd $lb -Msg 0x020A -W ([IntPtr]0))
+        $thy = & $G 'g_lbsb_thy'; $thh = & $G 'g_lbsb_thh'
+        $px = $cr.R - 5                                         # inside the 8px thumb AND the
+                                                                # 3px one a resting bar used to have
+        $ym = $thy + [int]($thh / 2); $yb = $cr.B - 2           # its middle; the last pixels
+        $pix = { param($y) $dc = [VordrGui.Native]::GetDC($lb)
+                 try { [VordrGui.Native]::GetPixel($dc, $px, $y) } finally { [void][VordrGui.Native]::ReleaseDC($lb, $dc) } }
+        $restM = & $pix $ym; $restB = & $pix $yb
+        $dc = [VordrGui.Native]::GetDC($lb)                     # plain background, left of the strip
+        try { $bgM = [VordrGui.Native]::GetPixel($dc, $cr.R - 18, $ym) } finally { [void][VordrGui.Native]::ReleaseDC($lb, $dc) }
+        [void][VordrGui.Native]::SetCursorPos($wr.L + $x, $wr.T + $ym)
+        [void](Send-VordrMessage -Hwnd $lb -Msg 0x0200 -L ([IntPtr]($ym * 65536 + $x)))
+        Start-Sleep -Milliseconds 400
+        $hotM = & $pix $ym; $hotB = & $pix $yb
+        $hov = & $G 'g_lbsb_hover'
+        & $away
+        Start-Sleep -Milliseconds 400
+        $offM = & $pix $ym; $offB = & $pix $yb
+        if ($restM -eq 0xFFFFFFFF -or $hotM -eq 0xFFFFFFFF) { Write-Host '  (thumb pixel checks skipped: the window is not on screen)' }
+        else {
+            Check ($hov -eq 1 -and $hotM -ne $restM -and $hotB -ne $restB) ("pointing at the strip draws the thumb, down to the bottom edge (mid 0x{0:X6} -> 0x{1:X6}, bottom 0x{2:X6} -> 0x{3:X6}; thumb {4}+{5} of {6}, top {7}/{8}; hovered {9})" -f $restM, $hotM, $restB, $hotB, $thy, $thh, $cr.B, (& $G 'g_lbsb_curtop'), (& $G 'g_lbsb_topmax'), $hov)
+            Check ($restM -eq $bgM) ("at rest there is no bar at all (0x{0:X6} where it would be, 0x{1:X6} beside it)" -f $restM, $bgM)
+            Check ($offM -eq $restM -and $offB -eq $restB) ("leaving the strip removes it completely, bottom end included (mid 0x{0:X6}, bottom 0x{1:X6}; at rest 0x{2:X6}, 0x{3:X6})" -f $offM, $offB, $restM, $restB)
+        }
+    } finally { [Windows.Forms.Cursor]::Position = $saved }
 
     # ---- no GDI/USER handle leak from the thumb (a region + a DC every paint) -----
     Add-Type -Name Gr -Namespace VordrT -MemberDefinition '[DllImport("user32.dll")] public static extern uint GetGuiResources(IntPtr p, uint f);'
@@ -204,7 +230,10 @@ try {
     if ($sel -ne [IntPtr]::Zero) {
         $lv = Get-VordrControl -Window $sel -Id 752
         Start-Sleep -Milliseconds 500
-        Check ((([VordrT.GwlS]::GetWindowLongW($lv, -16)) -band 0x00200000) -eq 0) 'the checklist has no native scrollbar'
+        Check ((([VordrT.GwlS]::GetWindowLongW($lv, -16)) -band 0x00300000) -eq 0) 'the checklist has no native scrollbar, vertical or horizontal'
+        $lwr = Get-VordrRect $lv; $lcr = Get-VordrRect $lv -Client
+        $fx = ($lwr.R - $lwr.L) - $lcr.R; $fy = ($lwr.B - $lwr.T) - $lcr.B
+        Check ($fx -eq $fy) ("and its frame reserves no room for one: border {0}px across, {1}px down" -f $fx, $fy)
         $lt0 = [int](Send-VordrMessage -Hwnd $lv -Msg 0x1027)                          # LVM_GETTOPINDEX
         [void](Send-VordrMessage -Hwnd $lv -Msg 0x020A -W ([IntPtr]([int64](0xFF88) -shl 16)))
         $lt1 = [int](Send-VordrMessage -Hwnd $lv -Msg 0x1027)
@@ -269,6 +298,7 @@ try {
         Check ((& $G 'g_cur_page') -eq 0 -and $tops -gt 1 -and $last0 -ge 0 -and $last0 -lt 39) ("40 cards do not fit: rows 0..{0} show, {1} top positions" -f $last0, $tops)
         Check ((& $G 'g_dsb_thh') -ge 28) 'the pane has a thumb'
         $wr = Get-VordrRect $vb
+        $co = Get-VordrClientOrigin $vb                                                 # client (0,0) on screen
         $sp = { param($x, $y) [IntPtr]([int64]((($y -band 0xFFFF) -shl 16) -bor ($x -band 0xFFFF))) }
         $pane = & $sp ($wr.L + 600) ($wr.T + 300)                                       # a screen point over the pane
         $down1 = [IntPtr]([int64](0xFF88) -shl 16)
@@ -281,10 +311,10 @@ try {
         # (the custom frame calls every other empty pixel caption, for dragging) -
         # sending WM_LBUTTONDOWN straight to the window skips that, so ask it directly
         $cr = & $G 'g_dsb_cardr'; $thy = & $G 'g_dsb_thy'
-        $ht = [int](Send-VordrMessage -Hwnd $vb -Msg 0x0084 -L (& $sp ($wr.L + 1 + $cr + 8) ($wr.T + 1 + $thy + 5)))
+        $ht = [int](Send-VordrMessage -Hwnd $vb -Msg 0x0084 -L (& $sp ($co.X + $cr + 8) ($co.Y + $thy + 5)))
         Check ($ht -eq 1) ("the thumb strip hit-tests as client, so a real press reaches it (got {0})" -f $ht)
-        $ht2 = [int](Send-VordrMessage -Hwnd $vb -Msg 0x0084 -L (& $sp ($wr.L + 1 + $cr + 8) ($wr.T + 12)))
-        Check ($ht2 -eq 2) ("empty space above it still drags the window (caption, got {0})" -f $ht2)
+        $ht2 = [int](Send-VordrMessage -Hwnd $vb -Msg 0x0084 -L (& $sp ($co.X + $cr + 8) ($co.Y + (& $G 'g_dsb_t') - 4)))
+        Check ($ht2 -eq 2) ("just above the strip, empty space still drags the window (caption, got {0})" -f $ht2)
         # a touchpad's small deltas add up to a card, not a card each
         $t0 = & $G 'g_cur_page'
         $small = [IntPtr]([int64](0xFFD8) -shl 16)                                      # -40
@@ -314,10 +344,10 @@ try {
         try {
             $thy = & $G 'g_dsb_thy'; $thh = & $G 'g_dsb_thh'; $t0 = & $G 'g_cur_page'
             $cy = $thy + [int]($thh / 2); $cx = $cr + 8
-            [void][VordrGui.Native]::SetCursorPos($wr.L + 1 + $cx, $wr.T + 1 + $cy)
+            [void][VordrGui.Native]::SetCursorPos($co.X + $cx, $co.Y + $cy)
             [void](Send-VordrMessage -Hwnd $vb -Msg 0x0201 -W ([IntPtr]1) -L (& $sp $cx $cy))
             Check ((& $G 'g_dsb_track') -eq 1) 'pressing the pane thumb starts a drag'
-            [void][VordrGui.Native]::SetCursorPos($wr.L + 1 + $cx, $wr.T + 1 + $cy + 60)
+            [void][VordrGui.Native]::SetCursorPos($co.X + $cx, $co.Y + $cy + 60)
             [void](Send-VordrMessage -Hwnd $vb -Msg 0x0200 -W ([IntPtr]1) -L (& $sp $cx ($cy + 60)))
             Check ((& $G 'g_cur_page') -gt $t0) ("dragging it scrolls the pane ({0} -> {1})" -f $t0, (& $G 'g_cur_page'))
             [void](Send-VordrMessage -Hwnd $vb -Msg 0x0202 -L (& $sp $cx ($cy + 60)))
@@ -332,7 +362,7 @@ try {
 '@
                 }
                 $thy = & $G 'g_dsb_thy'; $thh = & $G 'g_dsb_thh'
-                $sx = $wr.L + 1 + $cx; $sy = $wr.T + 1 + $thy + [int]($thh / 2)
+                $sx = $co.X + $cx; $sy = $co.Y + $thy + [int]($thh / 2)
                 [void][VordrGui.Native]::SetCursorPos($sx, $sy); Start-Sleep -Milliseconds 150
                 $under = [VordrT.Mi]::WindowFromPoint(([int64]$sy -shl 32) -bor [uint32]$sx)
                 if ($under -ne $vb) { Write-Host '  (real-mouse thumb press skipped: another window covers it)' }
@@ -360,12 +390,31 @@ try {
         [void][VordrGui.Native]::RedrawWindow($vb, [IntPtr]::Zero, [IntPtr]::Zero, 0x0185)
         Start-Sleep -Milliseconds 300
         $thy = & $G 'g_dsb_thy'; $thh = & $G 'g_dsb_thh'
-        $dc = [VordrGui.Native]::GetDC($vb)
-        $in  = [VordrGui.Native]::GetPixel($dc, $cr + 7, $thy + [int]($thh / 2))
-        $out = [VordrGui.Native]::GetPixel($dc, $cr + 7, [Math]::Max((& $G 'g_dsb_t') + 2, $thy - 20))
-        [void][VordrGui.Native]::ReleaseDC($vb, $dc)
+        $ym = $thy + [int]($thh / 2); $qx = $cr + 7                      # inside both thumb widths
+        $ppx = { param($y) $dc = [VordrGui.Native]::GetDC($vb)
+                 try { [VordrGui.Native]::GetPixel($dc, $qx, $y) } finally { [void][VordrGui.Native]::ReleaseDC($vb, $dc) } }
+        $saved = [Windows.Forms.Cursor]::Position
+        try {
+            [void][VordrGui.Native]::SetCursorPos($wr.L + 600, $wr.T + 300)              # (the drag above left
+            [void](Send-VordrMessage -Hwnd $vb -Msg 0x0200 -L (& $sp 599 299))          #   the pointer on it)
+            Start-Sleep -Milliseconds 300
+            $rest = & $ppx $ym
+            [void][VordrGui.Native]::SetCursorPos($co.X + $qx, $co.Y + $ym)
+            [void](Send-VordrMessage -Hwnd $vb -Msg 0x0200 -L (& $sp $qx $ym))
+            Start-Sleep -Milliseconds 300
+            $hov = & $G 'g_dsb_hover'
+            $in  = & $ppx $ym
+            $out = & $ppx ([Math]::Max((& $G 'g_dsb_t') + 2, $thy - 20))
+            [void][VordrGui.Native]::SetCursorPos($wr.L + 600, $wr.T + 300)
+            [void](Send-VordrMessage -Hwnd $vb -Msg 0x0200 -L (& $sp 599 299))
+            Start-Sleep -Milliseconds 300
+            $off = & $ppx $ym
+        } finally { [Windows.Forms.Cursor]::Position = $saved }
         if ($in -eq 0xFFFFFFFF -or $out -eq 0xFFFFFFFF) { Write-Host '  (pane thumb pixel check skipped: the window is not on screen)' }
-        else { Check ($in -ne $out) ("the pane thumb is drawn on screen (0x{0:X6} inside vs 0x{1:X6} above)" -f $in, $out) }
+        else {
+            Check ($hov -eq 1 -and $in -ne $out) ("pointing at the pane's strip draws its thumb (0x{0:X6} inside vs 0x{1:X6} above)" -f $in, $out)
+            Check ($rest -eq $out -and $off -eq $out) ("the pane has no thumb at rest, before or after (0x{0:X6}, 0x{1:X6} vs 0x{2:X6})" -f $rest, $off, $out)
+        }
         $pgbar = @(267, 268, 269) | ForEach-Object { Get-VordrControl -Window $vb -Id $_ } | Where-Object { $_ -ne [IntPtr]::Zero }
         Check ($pgbar.Count -eq 3 -and -not ($pgbar | Where-Object { [VordrGui.Native]::IsWindowVisible($_) })) 'the "< n / m >" page bar stays hidden: the pane scrolls instead'
     }

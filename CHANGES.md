@@ -74,8 +74,12 @@ in [docs/RELEASES.md](docs/RELEASES.md).
 ### Changed
 
 - **Drawn scrollbars**, after Myrkr: the entry list and the export/import
-  checklist have a thin translucent thumb that widens on hover, instead of the
-  native bar. Drag it, click above or below it to page, or use the wheel.
+  checklist have a translucent thumb that appears when you point at the right
+  edge, instead of the native bar. Drag it, click above or below it to page, or
+  use the wheel. The lists paint double-buffered, so the thumb no longer
+  flickers while dragged or leaves a stub behind when the pointer leaves, and
+  the checklist lost a white strip its hidden horizontal scrollbar still
+  reserved.
 - **The detail pane scrolls instead of paging.** An entry with more fields than
   fit used to split into pages behind a "< n / m >" bar; it now scrolls a whole
   card at a time with the same drawn thumb (wheel, drag, page-click), and tabbing

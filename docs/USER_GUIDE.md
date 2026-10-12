@@ -101,9 +101,9 @@ data imported from elsewhere) - opens read-only with an explanation. Every chang
 is saved by rebuilding the entry from what is on screen, so saving one that is
 only partly shown would drop the rest.
 
-Lists, and an entry with more fields than fit on screen, scroll with a thin bar
-at their right edge that widens when you point at it: drag it, click above or
-below it to move a page, or use the mouse wheel. An entry's fields scroll a whole
+Lists, and an entry with more fields than fit on screen, scroll with a bar that
+appears when you point at their right edge: drag it, click above or below it to
+move a page, or use the mouse wheel. An entry's fields scroll a whole
 card at a time, and tabbing to a field that is off screen brings it into view.
 
 ## Locking and the clipboard

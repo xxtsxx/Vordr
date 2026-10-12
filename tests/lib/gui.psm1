@@ -43,6 +43,7 @@ public static class Native {
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+  [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref long pt);
   [DllImport("user32.dll")] public static extern bool RedrawWindow(IntPtr h, IntPtr r, IntPtr g, uint f);
   [DllImport("user32.dll")] public static extern IntPtr GetDC(IntPtr h);
   [DllImport("user32.dll")] public static extern int ReleaseDC(IntPtr h, IntPtr dc);
@@ -282,6 +283,16 @@ function Get-VordrRect {
     if ($Client) { [void][VordrGui.Native]::GetClientRect($Hwnd, [ref]$r) }
     else         { [void][VordrGui.Native]::GetWindowRect($Hwnd, [ref]$r) }
     return $r
+}
+
+# The screen position of a window's client origin.  NOT the window rect plus a
+# guessed border: on Windows 11 a resizable window's rect includes an invisible
+# resize border (7px here), so "left + 1" missed the thumb by six pixels.
+function Get-VordrClientOrigin {
+    param([Parameter(Mandatory)][IntPtr]$Hwnd)
+    $pt = [int64]0
+    [void][VordrGui.Native]::ClientToScreen($Hwnd, [ref]$pt)
+    return [pscustomobject]@{ X = [int]($pt -band [int64]4294967295); Y = [int]($pt -shr 32) }
 }
 
 # ------------------------------------------------------- process memory (map) ---
