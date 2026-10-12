@@ -180,7 +180,7 @@ if errorlevel 1 (
 :nofc
 
 set ASMFLAGS=/c /nologo /W3 /Zi %ASMEXTRA%
-set SOURCES=main console hardening random loadcfg sha256 sha1 aesgcm blake2b argon2 fileio secmem vault totp tpm regcfg pwgen bench log selftest redteam theme zipexport zipimport gui
+set SOURCES=main console hardening random loadcfg sha256 sha1 aesgcm blake2b argon2 fileio secmem vault totp tpm regcfg pwgen bench log selftest redteam theme anim zipexport zipimport gui
 
 echo === assembling ===
 for %%f in (%SOURCES%) do (
@@ -218,7 +218,7 @@ link /nologo /subsystem:windows /entry:wstart /nodefaultlib /incremental:no ^
      %GUARDFLAGS% %REPROFLAGS% /debug /pdb:bin\vordr.pdb /map:bin\vordr.map ^
      /manifest:embed /manifestinput:vordr.manifest /manifestuac:no ^
      /libpath:"%SDKLIB%" ^
-     /out:bin\vordr.exe obj\main.obj obj\console.obj obj\hardening.obj obj\random.obj obj\loadcfg.obj obj\sha256.obj obj\sha1.obj obj\aesgcm.obj obj\blake2b.obj obj\argon2.obj obj\fileio.obj obj\secmem.obj obj\vault.obj obj\totp.obj obj\tpm.obj obj\regcfg.obj obj\pwgen.obj obj\bench.obj obj\log.obj obj\selftest.obj obj\redteam.obj obj\theme.obj obj\zipexport.obj obj\zipimport.obj obj\gui.obj obj\vordr.res ^
+     /out:bin\vordr.exe obj\main.obj obj\console.obj obj\hardening.obj obj\random.obj obj\loadcfg.obj obj\sha256.obj obj\sha1.obj obj\aesgcm.obj obj\blake2b.obj obj\argon2.obj obj\fileio.obj obj\secmem.obj obj\vault.obj obj\totp.obj obj\tpm.obj obj\regcfg.obj obj\pwgen.obj obj\bench.obj obj\log.obj obj\selftest.obj obj\redteam.obj obj\theme.obj obj\anim.obj obj\zipexport.obj obj\zipimport.obj obj\gui.obj obj\vordr.res ^
      kernel32.lib bcrypt.lib user32.lib gdi32.lib msimg32.lib dwmapi.lib dxgi.lib comctl32.lib uxtheme.lib advapi32.lib comdlg32.lib ncrypt.lib shell32.lib wtsapi32.lib
 if errorlevel 1 goto :failed
 

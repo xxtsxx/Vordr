@@ -77,7 +77,12 @@ HKEY_CURRENT_USER for its whole process onto `HKCU\Software\VordrGuiTest\<name>`
   `HKCU\SOFTWARE\Vordr\Rollback`;
 - `Start-VordrTest` sets `VORDR_TEST_HKCU=<name>` for a GUI instance, which also
   skips the single-instance hand-off, the global hotkey, the TPM and the secure
-  desktop, and logs to `%TEMP%\vordr_guitest.log`.
+  desktop, and logs to `%TEMP%\vordr_guitest.log`;
+- `Start-VordrTest -Anim on|off` sets `VORDR_TEST_ANIM=1|0`, which overrides
+  Windows' "Animation effects" switch for that instance, so a test sees the same
+  motion on every machine. `guitest.ps1` runs its first instance with animation
+  forced on and its second following Windows, and checks the second matches what
+  Windows reports.
 
 If the remap cannot be set up, the instance exits `0xE0F7` instead of running
 against the real HKCU, and the harness checks that isolation is engaged

@@ -118,7 +118,8 @@ function Stop-Vordr {
 # against the user's own HKCU - Start-VordrTest refuses one (it checks the map).
 function Start-VordrTest {
     param([Parameter(Mandatory)][string]$Exe, [Parameter(Mandatory)][string]$Vault,
-          [Parameter(Mandatory)][string]$Name, [hashtable]$Prefs = @{})
+          [Parameter(Mandatory)][string]$Name, [hashtable]$Prefs = @{},
+          [ValidateSet('', 'on', 'off')][string]$Anim = '')
     $map = [IO.Path]::ChangeExtension($Exe, '.map')
     if (-not (Select-String -LiteralPath $map -Pattern '\sg_testmode\s' -Quiet)) {
         throw "$Exe has no gui_test_hooks (not a probeio/dbg build) - refusing to run it against the real HKCU"
@@ -135,6 +136,9 @@ function Start-VordrTest {
     $psi.UseShellExecute = $false
     $psi.EnvironmentVariables['VORDR_TEST_HKCU'] = $Name
     $psi.EnvironmentVariables['VORDR_TEST_VAULT'] = $Vault
+    # -Anim on|off overrides Windows' "Animation effects" for this instance (test
+    # builds only), so a test sees the same thing on every machine
+    if ($Anim) { $psi.EnvironmentVariables['VORDR_TEST_ANIM'] = $(if ($Anim -eq 'on') { '1' } else { '0' }) }
     return [Diagnostics.Process]::Start($psi)
 }
 

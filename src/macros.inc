@@ -693,3 +693,19 @@ externdef g_sstk_tls:dword              ; TLS index + 1 of the per-thread shadow
 externdef g_cpu_features:dword
 externdef sstk_overflow_fail:near
 externdef ff_trap:near                  ; central fail handler (main.asm)
+
+; ---------------------------------------------------------------------------
+; Animation slots (anim.asm drives them; gui_anim_apply repaints for each)
+; ---------------------------------------------------------------------------
+ANIM_SLOTS          equ 8
+ANIM_TIMER          equ 6               ; WM_TIMER id on the vault window
+ANIM_LBSB           equ 0               ; list thumb alpha 0..255
+ANIM_DSB            equ 1               ; detail-pane thumb alpha 0..255
+ANIM_PILL           equ 2               ; selection pill, content y in px
+ANIM_LHOT           equ 3               ; hovered list row, tint 0..255
+ANIM_LOLD           equ 4               ; row the pointer just left, fading out
+ANIM_XFADE          equ 5               ; detail cross-fade overlay alpha
+ANIM_GHOT           equ 6               ; hovered ghost button's halo 0..255
+ANIM_GOLD           equ 7               ; ghost button just left, fading out
+externdef anim_set:near, anim_get:near, anim_active:near
+externdef g_anim_on:dword, g_anim_tmr:dword

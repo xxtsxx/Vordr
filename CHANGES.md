@@ -88,6 +88,23 @@ in [docs/RELEASES.md](docs/RELEASES.md).
   hidden. No card is ever partly shown, so nothing can overlap the header or the
   command bar. Touchpad scrolling adds up small movements instead of jumping a
   whole card (or three list rows) for each.
+- **A visual uplift.** One animation clock (`src/anim.asm`) eases a few values
+  over time with a single timer that runs only while something moves - at rest
+  it costs nothing. **Settings > Animations** picks *Follow Windows* (the
+  default: Windows' "Animation effects" switch), *Always* or *Never*; without
+  animation every change is instant. On it:
+  - the selection is a Fluent pill with an accent bar that **slides** between
+    entries;
+  - the detail pane **cross-fades** from one entry to the next;
+  - list rows and the frameless header/row buttons **fade** their hover tint in
+    and out, and the scrollbar thumbs fade instead of popping.
+  Hover, selection and the neutral backgrounds are derived from each scheme's
+  own colours the same way for all nine (`col_mix`), with a trace of the accent
+  in the greys. Entry tiles show the title's first letter (a monogram) instead
+  of the same globe or padlock on every row; brand icons and icons you picked
+  stay. The vault window's background is composed off screen and put up in one
+  blit, and the hot paint paths use the DC's own brush instead of creating one
+  per row.
 - **Reproducible release builds.** Two builds of one commit differed (ml64 stamps
   every object, so `/Brepro` hashed different inputs each time).
   `tools\pe_normalise.py` zeroes the build stamps after the link, `build.cmd

@@ -172,7 +172,8 @@ must not be described as Windows CFG.
 | `totp.asm`, `pwgen.asm` | One-time codes, password generation and policy |
 | `tpm.asm`, `regcfg.asm` | TPM wrapping, registry precedence, paths, rollback history |
 | `zipexport.asm`, `zipimport.asm` | AES ZIP and JSON interoperability |
-| `theme.asm` | Color schemes and painting |
+| `theme.asm` | Color schemes and painting; interaction shades derived per scheme (`col_mix`) |
+| `anim.asm` | The animation clock: eased value slots driven by one timer that runs only while something moves, off when Windows' "Animation effects" is |
 | `fileio.asm`, `console.asm`, `log.asm` | File access, diagnostic output, logging |
 | `selftest.asm`, `redteam.asm`, `bench.asm` | Self-tests, fault injection, benchmarks |
 

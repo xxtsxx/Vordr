@@ -33,6 +33,8 @@ extern SetBkMode:proc
 extern GetStockObject:proc
 extern RoundRect:proc
 extern GradientFill:proc
+extern SetDCBrushColor:proc
+extern ghost_halo_color:proc             ; gui.asm: a ghost button's (fading) halo colour
 extern CreateRoundRectRgn:proc
 extern SelectClipRgn:proc
 extern Ellipse:proc
@@ -122,11 +124,14 @@ g_col_dark  dd 1
 g_col_side  dd 00342A26h                  ; sidebar (list + search) panel colour
 g_col_filebadge dd 00544A3Ah              ; attachment/file chip fill (distinct from bg/panel)
 g_col_accent2 dd 00FFC24Ch                ; secondary accent (two-tone gradient end)
-public g_col_hover
+public g_col_hover, g_col_rowhov, g_col_sel
 g_col_hover dd 002C2C2Ch                  ; ghost-button hover halo: bg blended ~10% toward text
                                           ;   (computed per scheme in theme_set_scheme, NOT in the
                                           ;   15-dword schemes table above - keep it out of the copy)
-SCHEME_DW   equ 15                        ; dwords per scheme row
+g_col_rowhov dd 0                         ; entry-list row under the pointer   (derived, ditto)
+g_col_sel   dd 0                          ; entry-list selection pill fill     (derived, ditto)
+SCHEME_DW   equ 15
+TINT_W      equ 6                         ; accent share of the neutrals, /256                        ; dwords per scheme row
 SCHEME_COUNT equ 9
 schemes label dword
     ; bg,panel,frame,btn,btnsel,text,textdim,border,accent,accsel,focus,dark,side,filebadge,accent2
@@ -328,6 +333,36 @@ theme_rebrush proc frame
     ret
 theme_rebrush endp
 
+; col_mix(ecx = a, edx = b, r8d = w 0..256) -> eax = a + (b - a) * w / 256, per
+;   channel (COLORREFs).  The one place interaction shades come from, so every
+;   scheme derives them the same way from its own seeds.
+public col_mix
+col_mix proc frame
+    FRAME_PROLOG 32
+    mov     r9d, ecx
+    xor     r10d, r10d                         ; result
+    xor     ecx, ecx                           ; channel shift 0, 8, 16
+cmx_lp:
+    mov     eax, r9d
+    shr     eax, cl
+    movzx   eax, al                            ; a's channel
+    mov     r11d, edx
+    shr     r11d, cl
+    movzx   r11d, r11b                         ; b's channel
+    sub     r11d, eax                          ; b - a, signed
+    imul    r11d, r8d
+    sar     r11d, 8
+    add     eax, r11d
+    shl     eax, cl
+    or      r10d, eax
+    add     ecx, 8
+    cmp     ecx, 24
+    jb      cmx_lp
+    mov     eax, r10d
+    FRAME_EPILOG
+    ret
+col_mix endp
+
 ; =============================================================================
 ; theme_set_scheme(ecx = index) - select a colour scheme: copy its colours into
 ;   g_col_* and rebuild the brushes/pens.  Clamps out-of-range to 0 (Dark).
@@ -354,29 +389,48 @@ tss_cp:
     inc     eax
     jmp     tss_cp
 tss_done:
-    ; hover halo = g_col_bg blended ~10% toward g_col_text, per channel.  Works for
-    ; both dark (lightens) and light (darkens) schemes = a subtle contrast lift.
-    mov     r8d, dword ptr [g_col_bg]
-    mov     r9d, dword ptr [g_col_text]
-    xor     r10d, r10d                         ; result accumulator
-    xor     ecx, ecx                           ; channel shift (0,8,16)
-tss_hv:
-    mov     eax, r8d                           ; bg channel byte
-    shr     eax, cl
-    movzx   eax, al
-    imul    eax, eax, 230
-    mov     edx, r9d                           ; text channel byte
-    shr     edx, cl
-    movzx   edx, dl
-    imul    edx, edx, 26
-    add     eax, edx
-    shr     eax, 8                             ; /256
-    shl     eax, cl
-    or      r10d, eax
-    add     ecx, 8
-    cmp     ecx, 24
-    jb      tss_hv
-    mov     dword ptr [g_col_hover], r10d
+    ; The table holds each scheme's seeds; everything an interaction needs is
+    ; derived from them here, the same way for every scheme (col_mix):
+    ;   - the big neutral areas carry a trace (~2%) of the accent, so the greys
+    ;     read as belonging to the scheme rather than as default grey;
+    ;   - hover halo = background ~10% toward the text colour (lightens dark
+    ;     schemes, darkens light ones);
+    ;   - list row hover = sidebar ~8% toward text;
+    ;   - selection pill = sidebar ~9% toward text, then ~17% toward the accent.
+    mov     ecx, dword ptr [g_col_bg]
+    mov     edx, dword ptr [g_col_accent]
+    mov     r8d, TINT_W
+    call    col_mix
+    mov     dword ptr [g_col_bg], eax
+    mov     ecx, dword ptr [g_col_panel]
+    mov     edx, dword ptr [g_col_accent]
+    mov     r8d, TINT_W
+    call    col_mix
+    mov     dword ptr [g_col_panel], eax
+    mov     ecx, dword ptr [g_col_side]
+    mov     edx, dword ptr [g_col_accent]
+    mov     r8d, TINT_W
+    call    col_mix
+    mov     dword ptr [g_col_side], eax
+    mov     ecx, dword ptr [g_col_bg]
+    mov     edx, dword ptr [g_col_text]
+    mov     r8d, 26
+    call    col_mix
+    mov     dword ptr [g_col_hover], eax
+    mov     ecx, dword ptr [g_col_side]
+    mov     edx, dword ptr [g_col_text]
+    mov     r8d, 20
+    call    col_mix
+    mov     dword ptr [g_col_rowhov], eax
+    mov     ecx, dword ptr [g_col_side]
+    mov     edx, dword ptr [g_col_text]
+    mov     r8d, 24
+    call    col_mix
+    mov     ecx, eax
+    mov     edx, dword ptr [g_col_accent]
+    mov     r8d, 44
+    call    col_mix
+    mov     dword ptr [g_col_sel], eax
     call    theme_rebrush
     FRAME_EPILOG
     ret
@@ -1138,12 +1192,25 @@ tdi_ghost:
     mov     rax, qword ptr [g_br_panel]
 @@: mov     qword ptr [rbp-116], rax
     WINCALL FillRect, qword ptr [rbp-32], addr rbp-80, qword ptr [rbp-116]
-    mov     eax, dword ptr [rbp-128]
-    test    eax, 0FF00h                        ; hover bit set?
-    jz      tdi_ghost_glyph
+    ; the halo fades in and out (gui.asm ghost_halo_color: -1 = none now)
+    mov     r8d, dword ptr [g_col_bg]
+    mov     r10, qword ptr [rbp-24]
+    cmp     dword ptr [r10+4], IDC_DYN_BASE
+    jb      @F
+    mov     r8d, dword ptr [g_col_panel]
+@@: xor     edx, edx
+    test    dword ptr [rbp-128], 0FF00h        ; hover bit
+    setnz   dl
+    mov     rcx, qword ptr [rbp-40]            ; hwndItem
+    call    ghost_halo_color
+    cmp     eax, -1
+    je      tdi_ghost_glyph
+    mov     dword ptr [rbp-132], eax
     WINCALL GetStockObject, 8                  ; NULL_PEN -> borderless halo
     WINCALL SelectObject, qword ptr [rbp-32], rax
-    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_br_hover]
+    WINCALL GetStockObject, 18                 ; DC_BRUSH
+    WINCALL SelectObject, qword ptr [rbp-32], rax
+    WINCALL SetDCBrushColor, qword ptr [rbp-32], dword ptr [rbp-132]
     WINCALL RoundRect, qword ptr [rbp-32], dword ptr [rbp-80], dword ptr [rbp-76], \
             dword ptr [rbp-72], dword ptr [rbp-68], 8, 8
 tdi_ghost_glyph:

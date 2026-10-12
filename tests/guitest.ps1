@@ -73,7 +73,7 @@ try {
     $rc = Invoke-VordrCli -Exe $Exe -Arguments @('seedtest', $vault)
     if ($rc -ne 0) { throw "seedtest failed ($rc) - is this a probeio/dbg build?" }
 
-    $p = Start-VordrTest -Exe $Exe -Vault $vault -Name $name
+    $p = Start-VordrTest -Exe $Exe -Vault $vault -Name $name -Anim on              # (whatever Windows says)
     Write-Host "instance pid $($p.Id), HKCU -> Software\VordrGuiTest\$name"
 
     # ---- isolation actually engaged -------------------------------------------
@@ -223,6 +223,96 @@ try {
     $gdi1 = [VordrT.Gr]::GetGuiResources($p.Handle, 0); $usr1 = [VordrT.Gr]::GetGuiResources($p.Handle, 1)
     Check (($gdi1 - $gdi0) -le 4 -and ($usr1 - $usr0) -le 4) ("300 scroll+paint cycles leak no GDI/USER objects (GDI {0} -> {1}, USER {2} -> {3})" -f $gdi0, $gdi1, $usr0, $usr1)
 
+    # ---- motion and colour: the selection pill, row hover, the cross-fade --------
+    Check ((& $G 'g_anim_on') -eq 1) 'animation is on for this instance (VORDR_TEST_ANIM=1)'
+    $lo = Get-VordrClientOrigin $lb
+    $lcr = Get-VordrRect $lb -Client
+    $saved = [Windows.Forms.Cursor]::Position
+    try {
+        [void][VordrGui.Native]::SetCursorPos($lo.X + 150, $lo.Y - 40)              # pointer off the list
+        [void](Send-VordrMessage -Hwnd $lb -Msg 0x02A3)                              # WM_MOUSELEAVE
+        [void](Send-VordrMessage -Hwnd $lb -Msg 0x197 -W ([IntPtr]0))                # scrolled to the top
+        [void](Send-VordrMessage -Hwnd $lb -Msg 0x186 -W ([IntPtr]2))                # row 2 selected
+        Send-VordrCommand -Window $v -Id $IDC_V_LIST -Notify 1 -LParam $lb -Sync
+        Start-Sleep -Milliseconds 600
+        $ih = [int](Send-VordrMessage -Hwnd $lb -Msg 0x1A1)                          # LB_GETITEMHEIGHT
+        $sel = & $G 'g_col_sel'; $side = & $G 'g_col_side'
+        # a point inside the pill, clear of the text, the star and the health dot
+        $pp = { param($row) $dc = [VordrGui.Native]::GetDC($lb)
+                try { [VordrGui.Native]::GetPixel($dc, $lcr.R - 40, $row * $ih + $ih - 5) } finally { [void][VordrGui.Native]::ReleaseDC($lb, $dc) } }
+        $p2 = & $pp 2; $p3 = & $pp 3
+        if ($p2 -eq 0xFFFFFFFF) { Write-Host '  (pill pixel checks skipped: the window is not on screen)' }
+        else {
+            Check ($p2 -eq $sel) ("the selected row wears the pill (0x{0:X6}; derived selection colour 0x{1:X6})" -f $p2, $sel)
+            Check ($p3 -eq $side) ("the next row does not (0x{0:X6}; sidebar 0x{1:X6})" -f $p3, $side)
+        }
+        # a key press: the pill slides and the pane cross-fades - watched as it happens
+        [void][VordrGui.Native]::PostMessageW($lb, 0x0100, [IntPtr]0x28, [IntPtr]0)  # WM_KEYDOWN VK_DOWN
+        $sawSlide = $false; $sawFade = $false; $t0 = [DateTime]::UtcNow
+        while (([DateTime]::UtcNow - $t0).TotalMilliseconds -lt 400) {
+            $ab = Read-VordrGlobal -Process $p -Map $map -Symbol 'g_anim' -Size 256
+            if ([BitConverter]::ToInt32($ab, 2 * 32 + 12) -eq 1) { $sawSlide = $true }   # ANIM_PILL moving
+            if ((& $G 'g_xfade_hwnd') -ne 0) { $sawFade = $true }
+            if ($sawSlide -and $sawFade) { break }
+            Start-Sleep -Milliseconds 4
+        }
+        Check $sawSlide 'Down slides the selection pill to the next row (seen moving)'
+        Check $sawFade 'and the detail pane cross-fades to the new entry (overlay seen)'
+        Start-Sleep -Milliseconds 600
+        $q2 = & $pp 2; $q3 = & $pp 3
+        Check ((& $G 'g_pill_idx') -eq 3 -and ($q2 -eq 0xFFFFFFFF -or ($q3 -eq $sel -and $q2 -eq $side))) ("the pill comes to rest on the new row, and only there (0x{0:X6} / 0x{1:X6})" -f $q3, $q2)
+        Check ((& $G 'g_xfade_hwnd') -eq 0) 'the cross-fade overlay is gone once the fade ends'
+        # the row under the pointer is tinted, and the tint goes when the pointer does
+        $hy = 6 * $ih + [int]($ih / 2)
+        [void][VordrGui.Native]::SetCursorPos($lo.X + 150, $lo.Y + $hy)
+        [void](Send-VordrMessage -Hwnd $lb -Msg 0x0200 -L ([IntPtr]($hy * 65536 + 150)))
+        Start-Sleep -Milliseconds 400
+        $hv = & $pp 6
+        Check ((& $G 'g_lhot_idx') -eq 6 -and ($hv -eq 0xFFFFFFFF -or $hv -ne $side)) ("the row under the pointer is tinted (0x{0:X6} vs sidebar 0x{1:X6})" -f $hv, $side)
+        [void][VordrGui.Native]::SetCursorPos($lo.X + 150, $lo.Y - 40)
+        [void](Send-VordrMessage -Hwnd $lb -Msg 0x02A3)
+        Start-Sleep -Milliseconds 500
+        $hv2 = & $pp 6
+        Check ($hv2 -eq 0xFFFFFFFF -or $hv2 -eq $side) ("and the tint fades away when the pointer leaves (0x{0:X6})" -f $hv2)
+    } finally { [Windows.Forms.Cursor]::Position = $saved }
+    # the frameless header buttons' halo fades in and out too (the star)
+    $star = Get-VordrControl -Window $v -Id 237                                     # IDC_V_FAV
+    if ($star -ne [IntPtr]::Zero) {
+        $so = Get-VordrClientOrigin $star; $sr = Get-VordrRect $star -Client
+        $saved = [Windows.Forms.Cursor]::Position
+        try {
+            [void][VordrGui.Native]::SetCursorPos($so.X + [int]($sr.R / 2), $so.Y + [int]($sr.B / 2))
+            [void](Send-VordrMessage -Hwnd $star -Msg 0x0200 -L ([IntPtr](([int]($sr.B / 2)) * 65536 + [int]($sr.R / 2))))
+            Start-Sleep -Milliseconds 300
+            $dc = [VordrGui.Native]::GetDC($star)
+            $halo = [VordrGui.Native]::GetPixel($dc, 2, [int]($sr.B / 2)); [void][VordrGui.Native]::ReleaseDC($star, $dc)
+            $hot = & $G 'g_ghot_hwnd'
+            [void][VordrGui.Native]::SetCursorPos($lo.X + 150, $lo.Y - 40)
+            [void](Send-VordrMessage -Hwnd $star -Msg 0x02A3)                        # WM_MOUSELEAVE
+            Start-Sleep -Milliseconds 450
+            $dc = [VordrGui.Native]::GetDC($star)
+            $bare = [VordrGui.Native]::GetPixel($dc, 2, [int]($sr.B / 2)); [void][VordrGui.Native]::ReleaseDC($star, $dc)
+            Check ($hot -eq [int64]$star -and (& $G 'g_ghot_hwnd') -eq 0 -and (& $G 'g_gold_hwnd') -eq 0 -and ($halo -eq 0xFFFFFFFF -or $halo -ne $bare)) ("a header button's halo fades in under the pointer and out after it (0x{0:X6} -> 0x{1:X6})" -f $halo, $bare)
+        } finally { [Windows.Forms.Cursor]::Position = $saved }
+    }
+    # at rest: no timer, no CPU.  (A focus redraw that re-invalidated the list once
+    # repainted it forever: a core spinning, and every WM_TIMER starved.)
+    Start-Sleep -Milliseconds 300
+    $p.Refresh(); $c0 = $p.TotalProcessorTime.TotalMilliseconds
+    Start-Sleep -Milliseconds 1500
+    $p.Refresh(); $c1 = $p.TotalProcessorTime.TotalMilliseconds
+    Check ((& $G 'g_anim_tmr') -eq 0 -and ($c1 - $c0) -lt 100) ("at rest no animation timer runs and the app is idle ({0:N0} ms CPU in 1.5 s)" -f ($c1 - $c0))
+    # each switch snapshots the pane: 20 of them must leak nothing
+    $gdi0 = [VordrT.Gr]::GetGuiResources($p.Handle, 0); $usr0 = [VordrT.Gr]::GetGuiResources($p.Handle, 1)
+    for ($k = 0; $k -lt 20; $k++) {
+        $vk = if ($k % 2) { 0x26 } else { 0x28 }                                        # up / down
+        [void][VordrGui.Native]::PostMessageW($lb, 0x0100, [IntPtr]$vk, [IntPtr]0)
+        Start-Sleep -Milliseconds 70
+    }
+    Start-Sleep -Milliseconds 700
+    $gdi1 = [VordrT.Gr]::GetGuiResources($p.Handle, 0); $usr1 = [VordrT.Gr]::GetGuiResources($p.Handle, 1)
+    Check (($gdi1 - $gdi0) -le 4 -and ($usr1 - $usr0) -le 4 -and (& $G 'g_xfade_hwnd') -eq 0) ("20 cross-faded switches leak no GDI/USER objects (GDI {0} -> {1}, USER {2} -> {3})" -f $gdi0, $gdi1, $usr0, $usr1)
+
     # ---- the export checklist (a report ListView) has the same drawn bar --------
     Send-VordrCommand -Window $v -Id 245                                                # IDC_V_MEXPORT
     $sel = Wait-VordrOwned -Process $p -Owner $v -TimeoutMs 8000
@@ -290,9 +380,30 @@ try {
     Check ($vb -ne [IntPtr]::Zero) 'the 40-field vault opens'
     if ($vb -ne [IntPtr]::Zero) {
         $G = { param($s) Read-VordrGlobal -Process $p -Map $map -Symbol $s }
+        if (-not ('VordrT.Spi' -as [type])) {
+            Add-Type -Name Spi -Namespace VordrT -MemberDefinition '[DllImport("user32.dll")] public static extern bool SystemParametersInfoW(uint a, uint b, ref int c, uint d);'
+        }
+        $spi = 1; [void][VordrT.Spi]::SystemParametersInfoW(0x1042, 0, [ref]$spi, 0)    # SPI_GETCLIENTAREAANIMATION
+        $won = [int]($spi -ne 0)
+        Check ((& $G 'g_anim_on') -eq $won) ("with no override, animation follows Windows' Animation effects switch (Windows {0}, Vordr {1})" -f $won, (& $G 'g_anim_on'))
+        # Settings > Animations: Follow Windows -> Always -> Never -> Follow Windows.
+        # Each step changes what the clock does, the button's caption and the saved
+        # value (the scratch profile's ui_anim) at once.
+        $setw = [IntPtr](& $G 'g_settings_hwnd')
+        $abtn = if ($setw -ne [IntPtr]::Zero) { Get-VordrControl -Window $setw -Id 281 } else { [IntPtr]::Zero }
+        Check ($abtn -ne [IntPtr]::Zero -and (Get-VordrText $abtn) -eq 'Follow Windows') ("the Animations setting starts at 'Follow Windows' ('{0}')" -f $(if ($abtn -ne [IntPtr]::Zero) { Get-VordrText $abtn }))
+        $akey = Join-Path (Join-Path 'HKCU:\Software\VordrGuiTest' $name) 'SOFTWARE\Vordr'
+        $steps = @(@{ pref = 1; on = 1; cap = 'Always' }, @{ pref = 2; on = 0; cap = 'Never' }, @{ pref = 0; on = $won; cap = 'Follow Windows' })
+        foreach ($st in $steps) {
+            Send-VordrCommand -Window $vb -Id 281 -Sync                                # IDC_V_MANIM
+            $saved = (Get-ItemProperty -Path $akey -Name ui_anim -ErrorAction SilentlyContinue).ui_anim
+            $cap = if ($abtn -ne [IntPtr]::Zero) { Get-VordrText $abtn } else { '' }
+            Check ((& $G 'g_anim_pref') -eq $st.pref -and (& $G 'g_anim_on') -eq $st.on -and $cap -eq $st.cap -and $saved -eq $st.pref) ("Animations -> '{0}': animating {1}, saved {2}" -f $cap, (& $G 'g_anim_on'), $saved)
+        }
         $lbb = Get-VordrControl -Window $vb -Id $IDC_V_LIST
         [void](Send-VordrMessage -Hwnd $lbb -Msg 0x186 -W ([IntPtr]0))
         Send-VordrCommand -Window $vb -Id $IDC_V_LIST -Notify 1 -LParam $lbb -Sync
+        if ($won -eq 0) { Check ((& $G 'g_xfade_hwnd') -eq 0 -and (& $G 'g_anim_tmr') -eq 0) 'with animation off, switching entries is instant: no overlay, no timer' }
         Start-Sleep -Milliseconds 500
         $tops = & $G 'g_page_count'; $last0 = & $G 'g_dsb_lastvis'
         Check ((& $G 'g_cur_page') -eq 0 -and $tops -gt 1 -and $last0 -ge 0 -and $last0 -lt 39) ("40 cards do not fit: rows 0..{0} show, {1} top positions" -f $last0, $tops)

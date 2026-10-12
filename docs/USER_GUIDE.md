@@ -106,6 +106,15 @@ appears when you point at their right edge: drag it, click above or below it to
 move a page, or use the mouse wheel. An entry's fields scroll a whole
 card at a time, and tabbing to a field that is off screen brings it into view.
 
+Vordr animates a little: the selection slides between entries, an entry fades
+into the next one, and rows and buttons fade their highlight in and out.
+**Settings > Animations** chooses: *Follow Windows* (the default - Windows' own
+switch in **Settings > Accessibility > Visual effects > Animation effects**),
+*Always*, or *Never*. Without animation every change is instant; nothing else
+differs. An administrator can fix the choice with the `ui_anim` policy value
+(0 follow Windows, 1 always, 2 never). Each entry's tile shows the first letter of its title, unless the
+title names a known service or you picked an icon for it.
+
 ## Locking and the clipboard
 
 By default, Vordr clears a copied secret after 20 seconds, locks after 10 minutes

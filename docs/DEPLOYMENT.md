@@ -104,6 +104,11 @@ no valid setting exists; the installer does not write defaults automatically.
 | `VORDR_LOGLEVEL` | `LogLevel` | 0–4 | 0 | audit-log verbosity, 0 = off |
 | `VORDR_UISCHEME` | `ui_scheme` | 0–8 | 8 | force a colour scheme (8 is the default) |
 
+`ui_anim` (DWORD under `HKLM\SOFTWARE\Vordr`) fixes Settings > Animations: 0
+follows Windows' "Animation effects" switch (the default), 1 always animates, 2
+never does. It has no installer property; set it by Group Policy or registry like
+any other value here, and the setting shows locked.
+
 `VORDR_NOASSOC` is a fifteenth property, not a policy value. Set it to any
 nonempty value to skip the `.vordr` association; omit it to register the association.
 
@@ -119,6 +124,7 @@ values when reading them:
 | `PwVerifyDays` | 3650 | 0 is valid: no reminder |
 | `LogLevel` | **0** — off, not 4 | 0 is valid: off |
 | `ui_scheme` | **8** — the default | — |
+| `ui_anim` | **0** — follow Windows | 0 is valid: follow Windows |
 | the 0/1 values | any non-zero reads as 1 | — |
 
 The `TpmRequireHello` implementation sets a provider UI policy on a best-effort
@@ -183,7 +189,7 @@ Check the actual path in the unlock dialog after deployment.
 | Location | Data | Owner |
 |---|---|---|
 | `HKLM\SOFTWARE\Vordr` | Enforced settings and optional vault path | Administrator or MSI |
-| `HKCU\SOFTWARE\Vordr` | Preferences, `vault`, `ui_scheme`, `ui_hotkey` | Vordr Settings/path handling |
+| `HKCU\SOFTWARE\Vordr` | Preferences, `vault`, `ui_scheme`, `ui_anim`, `ui_hotkey` | Vordr Settings/path handling |
 | `HKCU\SOFTWARE\Vordr\TPM-Unlock` | Per-vault wrapped key blobs | Vordr TPM enrollment |
 | `HKCU\SOFTWARE\Vordr\Rollback` | Per-vault save counters | Vordr |
 | `HKLM\SOFTWARE\Classes` | `.vordr` and `Vordr.Vault` registrations | MSI |
