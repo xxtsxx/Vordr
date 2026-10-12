@@ -30,9 +30,11 @@ flowchart LR
 
 ## 2. Produce the executable
 
-- [ ] Build with `build.cmd release strict`, with Python and the intended toolchain.
-- [ ] Repeat in a second clean checkout of the same commit with the same toolchain.
-- [ ] Compare executable hashes and investigate differences.
+- [ ] Run `powershell -NoProfile -ExecutionPolicy Bypass -File tools\verify_repro.ps1`.
+  It builds `release strict` twice from clean objects and requires identical
+  hashes, intact mitigations (ASLR, DEP, HEVA, CET), and a matching
+  `bin\SHA256SUMS.txt`. Investigate any difference before going on.
+- [ ] Optionally repeat in a second clean checkout of the same commit.
 - [ ] Record the source commit, toolchain versions, build command, and SHA-256.
 - [ ] Run `selftest` and the Python crypto verifier against the exact executable
   being published.

@@ -95,6 +95,17 @@ new capture; do not assume it removes records already stored. Likewise, deleting
 an entry into Trash is not the same as permanently purging it. Old backups and
 exports can retain data after you purge it from the active vault.
 
+An entry Vordr cannot show completely - more fields than the detail pane holds, a
+value too long to display, or an attachment it cannot list (possible only for
+data imported from elsewhere) - opens read-only with an explanation. Every change
+is saved by rebuilding the entry from what is on screen, so saving one that is
+only partly shown would drop the rest.
+
+Lists, and an entry with more fields than fit on screen, scroll with a thin bar
+at their right edge that widens when you point at it: drag it, click above or
+below it to move a page, or use the mouse wheel. An entry's fields scroll a whole
+card at a time, and tabbing to a field that is off screen brings it into view.
+
 ## Locking and the clipboard
 
 By default, Vordr clears a copied secret after 20 seconds, locks after 10 minutes
@@ -111,6 +122,10 @@ clipboard copy if it still owns it, and attempts preview-file cleanup. Save
 changes and close attachment viewers before exiting. A forced process stop is
 not equivalent to an orderly lock and cleanup.
 
+A lock - from inactivity, Windows locking, the hotkey or Ctrl+L - first closes any
+Vordr dialog or message box that is open, answering it as Cancel, and then locks.
+An unanswered question no longer keeps the vault open.
+
 ## Unlock options
 
 ### Private-desktop password entry
@@ -118,13 +133,15 @@ not equivalent to an orderly lock and cleanup.
 Secure Unlock is enabled by default. It places the password prompt on a separate
 Windows desktop, reducing exposure to ordinary input hooks and screen capture
 on the main desktop. It is not a guarantee against local malware or privileged
-attackers. If the private desktop cannot be created, the application can fall
-back to the normal prompt.
+attackers. If the private desktop cannot be created, Vordr says so and falls back
+to the normal prompt for that unlock.
 
 ### TPM convenience unlock
 
 TPM unlock is enabled by default when a usable TPM is available. It wraps the
 vault key using a machine-local TPM key and stores the wrapped blob in HKCU.
+Like a password unlock, it warns before opening a vault file older than the last
+one saved on this PC.
 It is an alternative to typing the master password, not an additional factor.
 The optional `TpmRequireHello` setting requests provider-mediated confirmation.
 
@@ -147,8 +164,14 @@ erasure, especially on SSDs or backed-up storage.
 
 Enable **Disable attachment preview** to avoid the preview hand-off. Attachments
 then become download-only: downloading still creates a plaintext file at the
-location you choose, and you are responsible for that copy. Executable
-attachments are download-only regardless of this setting.
+location you choose, and you are responsible for that copy. Executable and
+script attachments - programs, installers, shortcuts, disk images, search and
+library connectors and the like - are download-only regardless of this setting.
+
+Every file Vordr writes out of an attachment is marked as downloaded from the
+internet, so Office opens it in Protected View and Windows asks before running
+it. An entry holds up to 24 attached files of up to 256 MB each; Vordr says when
+a file you dropped or chose was not attached.
 
 ## Back up and restore
 
@@ -184,8 +207,11 @@ not sufficient. Choose a strong export password and protect the resulting file.
 Vordr's ZIP importer supports **STORED (uncompressed)** members, not DEFLATE.
 If assembling a compatible archive elsewhere, select STORE/no compression.
 
-Import recognizes file contents rather than trusting the extension. Choose the
-source, enter its password, and select entries to append. Double-clicking a
+Export refuses to write over the vault you have open, however its path is
+spelled. Import recognizes file contents rather than trusting the extension, and
+names an encrypted ZIP it cannot read (AES-128/192, or compressed inside AES) as
+such rather than reporting a wrong password. Choose the source, enter its
+password, and select entries to append. Double-clicking a
 `.vordr` file invokes this import workflow; it does not automatically switch
 the registered vault or import anything without the remaining prompts.
 
@@ -199,7 +225,9 @@ the registered vault or import anything without the remaining prompts.
 | Settings control disabled | An HKLM policy value may be enforcing it |
 | Secret-memory warning | Windows could not pin a static buffer; review memory pressure and machine policy |
 | Exit asks you to close a viewer | A preview file is still open and cleanup could not finish |
-| ZIP import fails | Confirm AES ZIP compatibility and STORED members |
+| ZIP import fails | Confirm AES-256 ZIP and STORED members; Vordr says when the archive uses something else |
+| An entry opens read-only | Part of it cannot be shown in the detail pane; saving it there would drop that part |
+| "The vault file was replaced by an OLDER copy" | Another program or a restore put an older vault in place; check it before saving |
 | Antivirus warning | Follow [Antivirus warnings](ANTIVIRUS.md) before running the file |
 
 For a bug report, use synthetic data and redact screenshots, paths, and logs.

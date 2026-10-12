@@ -54,9 +54,10 @@ KCV = SHA-256(key)[0:16]
 The salt and derived key normally remain unchanged across saves. Native exports
 create their own header salt and key. The save counter is not used as a nonce.
 
-Before derivation, `vk_params_ok` accepts t_cost from 1 through 16 and a nonzero
-memory cost no greater than 4194304 KiB (4 GiB); the reader separately checks
-the supported lane count. These caps bound resource use but still permit
+Before derivation, `vk_params_ok` accepts t_cost from 1 through 16, a
+memory cost from 8 KiB (the RFC 9106 floor) up to 4194304 KiB (4 GiB), and a lane count of exactly 1
+(any other value is refused as unsupported rather than tried and reported as a
+wrong password). These caps bound resource use but still permit
 expensive files. Do not confuse the reader's accepted minimum with the production
 default. Small diagnostic vaults deliberately use cheaper parameters.
 

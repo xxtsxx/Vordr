@@ -27,6 +27,7 @@ FLOORS = {
     "framecheck": {
         # FRAME_PROLOG procs whose frame was actually sized and checked.
         "procs": 450,                    # 496 at time of writing
+        "raw": 20,                       # 29 raw procs (2026-10-11, framecheck v3)
     },
     "idcheck": {
         # control IDs defined in BOTH vordr.rc and gui.asm, i.e. comparable.
@@ -57,8 +58,16 @@ FLOORS = {
     "deadcode": {
         "symbols": 2000,                 # 2305
     },
+    "nvcheck": {
+        "procs": 550,                    # 654 procs (2026-10-11)
+    },
     "aligncheck": {
-        "scalars": 80,                   # 98
+        # 50 measured with aligncheck v2 (2026-10-11).  It was 104 under v1, which
+        # guessed the size of arrays whose dup count is a name or an expression -
+        # every label after one sat at a wrong offset and many were reported as
+        # misaligned when they were not.  v2 resolves those sizes (and stops a
+        # section rather than guess), so the honest count is lower.
+        "scalars": 40,
     },
 }
 

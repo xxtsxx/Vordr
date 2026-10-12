@@ -18,6 +18,10 @@ include macros.inc
 
 extern mem_alloc:proc
 extern mem_free:proc
+extern secmem_alloc:proc                ; the per-entry arena holds every imported value
+extern secmem_free:proc                 ;   as plaintext: locked, like the vault body
+extern VirtualLock:proc                 ; best-effort pin of the raw archive, which the
+extern VirtualUnlock:proc               ;   decrypt runs over IN PLACE
 extern secure_zero:proc
 extern pbkdf2_ae:proc                    ; PBKDF2-HMAC-SHA1 1000 iters -> g_ae_dk
 extern aes_expand_key:proc
@@ -62,11 +66,17 @@ MEMREC      equ 32                        ; {nameptr8, namelen4, _4, dataptr8, u
 align 8
 g_zfz_rng   dq ?                          ; fuzzzip xorshift64 state (dbg/test only)
 g_zi_end    dq ?                          ; raw end
+g_zi_raw    dq ?                          ; the archive being staged (pinned while held)
+g_zi_rawlen dq ?
+g_zi_rawlk  dd ?                          ; 1 = VirtualLock on it succeeded
 g_zi_pwptr  dq ?                          ; UTF-8 pw ptr (= g_zi_u8pw)
 g_zi_pwlen  dd ?
 ZI_PWCAP    equ 1024                      ; 254 wide chars can be 762 UTF-8 bytes; the
+public g_zi_u8pw, g_zi_sbuf, g_zi_nbuf, g_zi_ref ; pinned + crash-wiped by secmem.asm
 g_zi_u8pw   db ZI_PWCAP dup (?)           ;   old 512/500 truncated to an EMPTY password
 g_zi_n      dd ?                          ; member count
+public g_zi_unsup
+g_zi_unsup  dd ?                          ; zi_scan met a member Vordr cannot read
 g_zi_mem    db ZI_MAXMEM * MEMREC dup (?)
 g_zi_rk     db 15*16 dup (?)
 g_zi_ctr    db 16 dup (?)
@@ -132,8 +142,11 @@ zfz_fix label byte
     dd  32                                ; csize = 18 hdr + 4 cipher + 10 hmac
     dd  4                                 ; usize (cipher length)
     dw  10                                ; namelen
-    dw  0                                 ; extralen
+    dw  11                                ; extralen: the AE record zi_scan requires
     db  'v','o','r','d','r','.','j','s','o','n'
+    dw  9901h, 7, 2                       ; AE extra: id, size 7, AE-2
+    db  'A','E', 3                        ;   vendor, strength 3 = AES-256
+    dw  0                                 ;   actual method: stored
     db  32 dup (0AAh)                     ; member data (garbage salt/verify/cipher/hmac)
     dd  06054b50h                         ; EOCD signature -> stops zi_scan
     db  18 dup (0)                        ; EOCD remainder (pad)
@@ -144,6 +157,7 @@ CSTR zfz_m1, "fuzzzip: "
 CSTR zfz_m2, " iters  "
 CSTR zfz_m3, " scanned  "
 CSTR zfz_m4, " rejected  0 crashes",13,10
+CSTR zfz_thin, "fuzzzip: FAIL - almost nothing got past the scan, so the parser was barely exercised: the fixture no longer looks like a member zi_scan accepts",13,10
 
 .code
 
@@ -153,6 +167,7 @@ CSTR zfz_m4, " rejected  0 crashes",13,10
 ; =============================================================================
 zi_scan proc frame
     FRAME_PROLOG 48
+    mov     dword ptr [g_zi_unsup], 0
     mov     qword ptr [rbp-24], rcx             ; p (current header)
     mov     eax, edx
     add     rax, rcx
@@ -188,6 +203,39 @@ zs_lp:
     add     rax, 28                             ; 18-byte header + 10-byte HMAC tag
     cmp     rax, qword ptr [g_zi_end]
     ja      zs_done
+    ; WinZip-AES exactly as Vordr writes it: method 99, an AE extra field saying
+    ; AES-256 (strength 3) over stored data (actual method 0), csize = usize + 28.
+    ; AES-128/192 or deflate inside AES decrypt at the wrong offsets and used to be
+    ; reported as a wrong password - name it for what it is instead.
+    mov     rcx, qword ptr [rbp-24]
+    cmp     word ptr [rcx+8], 99
+    jne     zs_unsup
+    mov     eax, dword ptr [rbp-32]
+    add     rax, 28
+    mov     edx, dword ptr [rbp-28]
+    cmp     rax, rdx
+    jne     zs_unsup
+    lea     rax, [r11+r8]                       ; extra field start
+    lea     rdx, [rax+r9]                       ;   and end (<= dataptr, bounded above)
+zs_ex:
+    lea     rcx, [rax+4]
+    cmp     rcx, rdx
+    ja      zs_unsup                            ; no AE record at all
+    cmp     word ptr [rax], 9901h
+    je      zs_ae
+    movzx   ecx, word ptr [rax+2]
+    lea     rax, [rax+rcx+4]
+    jmp     zs_ex
+zs_ae:
+    lea     rcx, [rax+11]
+    cmp     rcx, rdx
+    ja      zs_unsup
+    cmp     word ptr [rax+2], 7
+    jb      zs_unsup
+    cmp     byte ptr [rax+8], 3                 ; AES-256
+    jne     zs_unsup
+    cmp     word ptr [rax+9], 0                 ; stored inside AES
+    jne     zs_unsup
     ; record
     mov     eax, r10d
     imul    eax, eax, MEMREC
@@ -213,6 +261,9 @@ zs_done:
     mov     eax, r10d
     FRAME_EPILOG
     ret
+zs_unsup:
+    mov     dword ptr [g_zi_unsup], 1
+    jmp     zs_done
 zi_scan endp
 
 ; =============================================================================
@@ -595,6 +646,33 @@ zjs_end:
     ret
 zj_str endp
 
+; zi_type_ok(eax = field type from the JSON) -> eax = a type safe to store.  Leaf.
+;   The archive's "type" went straight into the vault.  A value carrying VF_LABELED
+;   (8000h) produced a field flagged as labelled with no label length, which made
+;   the whole vault fail to unlock after the next save - and with three backup
+;   generations rotating on every save, unrecoverably so.  VFL_RAW (40000000h) made
+;   the importer read a length out of the text itself.  VF_SYSTEM forged a system
+;   item.  Only the kinds the exporter actually writes pass; anything else becomes
+;   plain text, so the value is still imported and still visible.
+zi_type_ok proc
+    cmp     eax, VF_TITLE
+    jb      zto_text
+    cmp     eax, VF_NOTES                       ; 1..5: title/user/secret/url/notes
+    jbe     zto_ok
+    cmp     eax, VF_TOTP
+    jb      zto_text                            ; 6 is unused
+    cmp     eax, VF_ICON                        ; 7..12: totp/text/image/file/fav/icon
+    jbe     zto_ok
+    cmp     eax, VF_GROUP
+    je      zto_ok
+    cmp     eax, VF_SPACER
+    je      zto_ok
+zto_text:                                       ; history, trash marker, system kinds,
+    mov     eax, VF_TEXT                        ;   flag bits, unknown: never as-is
+zto_ok:
+    ret
+zi_type_ok endp
+
 ; zj_skipch(al = char) - if *g_zi_p == char, advance past it.  Leaf.
 zj_skipch proc
     mov     r10, qword ptr [g_zi_p]
@@ -966,6 +1044,7 @@ zij_f0:
     mov     edx, 7
     call    zj_lit
     call    zj_num
+    call    zi_type_ok                          ; untrusted: only plain user kinds pass
     mov     dword ptr [rbp-28], eax             ; type
     lea     rcx, [zl_label]                     ; ,"label":
     mov     edx, 9
@@ -1080,18 +1159,48 @@ zi_walk endp
 
 ; zi_free_wipe() - release the per-entry arena (if held) and wipe the UTF-8 pw.
 zi_free_wipe proc frame
-    FRAME_PROLOG 32
+    FRAME_PROLOG 48
     mov     rcx, qword ptr [g_zi_arena]
     test    rcx, rcx
     jz      zfw_wipe
     mov     rdx, ZI_ARENA
-    call    mem_free
+    call    secmem_free                         ; wipes before release
     mov     qword ptr [g_zi_arena], 0
 zfw_wipe:
     lea     rcx, [g_zi_u8pw]
     mov     edx, ZI_PWCAP
     call    secure_zero
     mov     dword ptr [g_zi_pwlen], 0
+    ; Everything else an import leaves behind: the last decoded value (often a
+    ; password), the decoded attachment name, the expanded AES key schedule, the
+    ; PBKDF2 output (AES key + HMAC key + verifier) and the last staged AttachRef,
+    ; whose embedded key opens that attachment.  None of these were ever wiped.
+    lea     rcx, [g_zi_sbuf]
+    mov     edx, ZI_SBUF
+    call    secure_zero
+    lea     rcx, [g_zi_nbuf]
+    mov     edx, 1024
+    call    secure_zero
+    lea     rcx, [g_zi_rk]
+    mov     edx, 15*16
+    call    secure_zero
+    lea     rcx, [g_ae_dk]
+    mov     edx, 80
+    call    secure_zero
+    lea     rcx, [g_zi_ref]
+    mov     edx, ARF_SIZE
+    call    secure_zero
+    lea     rcx, [g_zi_ctr]
+    mov     edx, 16
+    call    secure_zero
+    lea     rcx, [g_zi_auth]
+    mov     edx, 20
+    call    secure_zero
+    cmp     dword ptr [g_zi_rawlk], 0           ; release the pin on the archive (the
+    je      zfw_done                            ;   caller wipes and frees it)
+    mov     dword ptr [g_zi_rawlk], 0
+    WINCALL VirtualUnlock, qword ptr [g_zi_raw], qword ptr [g_zi_rawlen]
+zfw_done:
     FRAME_EPILOG
     ret
 zi_free_wipe endp
@@ -1102,6 +1211,7 @@ zi_free_wipe endp
 ;        g_zi_stg_n = n.  The arena + decrypted json + password are KEPT so a
 ;        subsequent zi_commit (or zi_abort) can finish the job.
 ;   -3   wrong password        -1   not a readable Vordr zip / error
+;   -4   an encrypted ZIP Vordr cannot read (not AES-256 stored)
 ; On every error path the arena is freed and the password wiped.
 ; =============================================================================
 public zi_stage
@@ -1123,9 +1233,22 @@ zi_stage proc frame
 zs_pwok:
     lea     rax, [g_zi_u8pw]
     mov     qword ptr [g_zi_pwptr], rax
+    ; Members are decrypted IN PLACE in the caller's raw buffer, so vordr.json - every
+    ; secret in the archive - sits there as plaintext until the import ends.  Pin it
+    ; when the quota allows; a refusal costs only the pin, never the import.
+    mov     rax, qword ptr [rbp-24]
+    mov     qword ptr [g_zi_raw], rax
+    mov     eax, dword ptr [rbp-28]
+    mov     qword ptr [g_zi_rawlen], rax
+    mov     dword ptr [g_zi_rawlk], 0
+    WINCALL VirtualLock, qword ptr [g_zi_raw], qword ptr [g_zi_rawlen]
+    test    eax, eax
+    jz      @F
+    mov     dword ptr [g_zi_rawlk], 1
+@@:
     ; allocate the per-entry arena
     mov     rcx, ZI_ARENA
-    call    mem_alloc
+    call    secmem_alloc
     test    rax, rax
     jz      zs_err
     mov     qword ptr [g_zi_arena], rax
@@ -1133,6 +1256,11 @@ zs_pwok:
     mov     rcx, qword ptr [rbp-24]
     mov     edx, dword ptr [rbp-28]
     call    zi_scan
+    cmp     dword ptr [g_zi_unsup], 0
+    je      zs_supported
+    mov     dword ptr [rbp-40], -4              ; a ZIP, but not one Vordr can read
+    jmp     zs_fail
+zs_supported:
     call    attach_reset_pending                ; start a fresh PENDING set only - the
                                                 ;   vault stays open, and dropping its
                                                 ;   on-disk index here left every saved
@@ -1390,6 +1518,18 @@ zfz_report:
     lea     rcx, [zfz_m4]
     mov     edx, zfz_m4_len
     call    print_a
+    ; "0 crashes" over inputs that were all rejected at the first check proves
+    ; nothing.  Mutating 1-4 bytes of a valid fixture leaves most inputs scannable;
+    ; require at least a tenth (it read 0 scanned when the fixture stopped matching).
+    cmp     qword ptr [rbp-40], ZFZ_ITERS / 10
+    jae     zfz_enough
+    lea     rcx, [zfz_thin]
+    mov     edx, zfz_thin_len
+    call    print_a
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+zfz_enough:
     xor     eax, eax
     FRAME_EPILOG
     ret
@@ -1411,6 +1551,23 @@ cmd_zfuzz endp
 ;   Survives every iteration => exit 0 = pass.
 ; =============================================================================
 .data
+CSTR jfz_tbad, "jfuzz: FAIL (an archive field type reached the vault unsanitised)",13,10
+; {type from the archive, what may be stored}: flag bits, the raw-blob marker, the
+; system kinds, history and the trash marker must never pass through as given.
+align 4
+jfz_types label dword
+    dd  VF_SECRET,                  VF_SECRET
+    dd  VF_SPACER,                  VF_SPACER
+    dd  VF_LABELED or VF_USERNAME,  VF_TEXT
+    dd  40000000h or VF_IMAGE,      VF_TEXT
+    dd  VF_SYSTEM,                  VF_TEXT
+    dd  VF_SYS_PWVERIFY,            VF_TEXT
+    dd  VF_PWHIST,                  VF_TEXT
+    dd  VF_DELETED,                 VF_TEXT
+    dd  0,                          VF_TEXT
+    dd  6,                          VF_TEXT
+    dd  0FFFFFFFFh,                 VF_TEXT
+JFZ_TYPES_N equ ($ - jfz_types) / 8
 CSTR jfz_ok,  "jfuzz: PASS ("
 CSTR jfz_ok2, " iters, 0 crashes in the decrypted-json parser)",13,10
 jfz_seed label byte
@@ -1431,10 +1588,29 @@ public cmd_jfuzz
 cmd_jfuzz proc frame
     FRAME_PROLOG 64
     ; [rbp-24]=iters  [rbp-32]=curlen  [rbp-40]=nmut
+    lea     r10, [jfz_types]                         ; the type sanitiser, case by case
+    xor     ecx, ecx
+jfz_tchk:
+    cmp     ecx, JFZ_TYPES_N
+    jae     jfz_tdone
+    mov     eax, dword ptr [r10+rcx*8]
+    call    zi_type_ok
+    cmp     eax, dword ptr [r10+rcx*8+4]
+    jne     jfz_tfail
+    inc     ecx
+    jmp     jfz_tchk
+jfz_tfail:
+    lea     rcx, [jfz_tbad]
+    mov     edx, jfz_tbad_len
+    call    print_a
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+jfz_tdone:
     call    fuzz_seed                                ; G7: random (or --seed) + logged
     mov     qword ptr [g_zfz_rng], rax
     mov     rcx, ZI_ARENA                            ; arena: zi_walk decodes wide here
-    call    mem_alloc
+    call    secmem_alloc                             ;   (zi_free_wipe releases it as secmem)
     test    rax, rax
     jz      jfz_oom
     mov     qword ptr [g_zi_arena], rax

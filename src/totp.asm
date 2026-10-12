@@ -22,6 +22,7 @@ FT_UNIX_EPOCH   equ 116444736000000000     ; 100-ns ticks between 1601 and 1970
 
 .data?
 align 16
+public g_totp_key                         ; pinned + crash-wiped by secmem.asm
 g_totp_key  db 64 dup (?)                  ; decoded TOTP secret (wiped after use)
 
 .code

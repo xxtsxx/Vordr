@@ -15,6 +15,8 @@
 
 include macros.inc
 
+extern secure_zero:proc
+
 
 ; ---------------------------------------------------------------------------
 ; SHA1_ROUND - one round given f in r8d and k in edx.  a..e are the locals at
@@ -354,6 +356,12 @@ hm_pad_done:
     lea     rcx, [rbp-288]
     mov     rdx, qword ptr [rbp-40]          ; out
     call    sha1_final
+    ; k_ipad / k_opad are the key XORed with a public constant - the key itself, in
+    ; effect - and the inner digest and hash state follow from it.  They were left on
+    ; the stack for the next call to find.  [rbp-312, rbp-64) covers all four.
+    lea     rcx, [rbp-312]
+    mov     edx, 312-64
+    call    secure_zero
     FRAME_EPILOG
     ret
 hmac_sha1 endp

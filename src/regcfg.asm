@@ -26,6 +26,8 @@ extern SHGetFolderPathW:proc
 extern GetEnvironmentVariableW:proc
 extern ExpandEnvironmentStringsW:proc   ; REG_EXPAND_SZ means expand it, not accept it
 extern CreateDirectoryW:proc
+extern GetFullPathNameW:proc            ; reg_hash_name: one key per FILE, not per spelling
+extern CharUpperBuffW:proc
 
 REG_SZ          equ 1
 REG_EXPAND_SZ   equ 2
@@ -35,7 +37,7 @@ KEY_READ        equ 20019h
 KEY_WRITE       equ 20006h
 KEY_RW          equ 2001Fh          ; KEY_READ or KEY_WRITE (enumerate + delete values)
 CSIDL_PERSONAL  equ 5
-; "\Vordr" (6) + "ault.vordr" (12) + NUL, and the filename tail on its own.
+; "\Vordr" (6) + "\vault.vordr" (12) + NUL, and the filename tail on its own.
 ; Both appends are bounded against the caller's capacity using these.
 CDV_MIN_CHARS   equ 280        ; MAX_PATH (260) + the tail + slack
 CDV_TAIL_CHARS  equ 19
@@ -70,6 +72,7 @@ od_userfolder label word
     dw 'U','s','e','r','F','o','l','d','e','r', 0
 align 8
 g_hklm  dq 080000002h            ; HKEY_LOCAL_MACHINE (as a clean 64-bit value)
+public g_hkcu                    ; gui_test_hooks (probeio/dbg) points it at a scratch key
 g_hkcu  dq 080000001h            ; HKEY_CURRENT_USER
 
 .data?
@@ -80,6 +83,10 @@ g_cfg_khan  dq ?                 ; open key handle
 g_reg_hdig  db 32 dup (?)        ; C6: SHA-256(vault path), input to the name hash
 align 2
 g_reg_hname dw 33 dup (?)        ; C6: hashed reg value name = 32 hex wide chars + NUL
+align 2
+REG_NORM_CCH equ MAX_PATH_CHARS + 16
+g_reg_tmp   dw REG_NORM_CCH dup (?) ; reg_hash_name: the path with any \\?\ prefix removed
+g_reg_norm  dw REG_NORM_CCH dup (?) ;   and then made absolute and upper-cased
 align 2
 g_prune_name dw 512 dup (?)      ; C6: RegEnumValueW value-name scratch (legacy prune)
 align 2
@@ -105,7 +112,7 @@ od_ufbuf    dw OD_UFBUF_CH dup (?) ; UserFolder value (cfg_od_linked)
 ;   all hash the same path, so they still agree.  (C6. Registry location leak.)
 ;   Clobbers volatiles; reads/writes g_reg_hdig / g_reg_hname.
 ; ===========================================================================
-reg_hash_name proc frame
+reg_hash_legacy proc frame
     FRAME_PROLOG 48
     mov     qword ptr [rbp-24], rcx             ; name ptr
     xor     r11d, r11d                          ; wcslen(name)
@@ -152,7 +159,132 @@ rhn_lp:
     lea     rax, [g_reg_hname]
     FRAME_EPILOG
     ret
+reg_hash_legacy endp
+
+; ===========================================================================
+; reg_hash_name(rcx = vault path) -> rax = hashed value name for that FILE.
+;   The rollback mirror and the TPM blob are looked up by this name, and it used to
+;   hash the path exactly as spelled.  The same vault is spelled many ways - case,
+;   "\\?\" once it passes 248 chars (cfg_in_set adds it), a relative name, a UNC
+;   form - and each spelling had its own counter: the rollback tripwire was
+;   bypassed by opening the file under another name, and a long path lost its TPM
+;   enrolment.  Normalise first: strip the extended-length prefix, make it
+;   absolute, upper-case it.  (Short 8.3 names and junctions still differ; the
+;   mirror is a tripwire, not an access control.)  Readers fall back to the legacy
+;   hash so existing entries keep working.
+; ===========================================================================
+reg_hash_name proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    lea     r11, [g_reg_tmp]
+    xor     r8d, r8d                            ; source offset (chars) to copy from
+    cmp     word ptr [rcx], 5Ch
+    jne     rhn2_copy
+    cmp     word ptr [rcx+2], 5Ch
+    jne     rhn2_copy
+    cmp     word ptr [rcx+4], '?'
+    jne     rhn2_copy
+    cmp     word ptr [rcx+6], 5Ch
+    jne     rhn2_copy
+    mov     r8d, 4                              ; "\\?\X:\..." -> "X:\..."
+    cmp     word ptr [rcx+8], 'U'
+    jne     rhn2_copy
+    cmp     word ptr [rcx+10], 'N'
+    jne     rhn2_copy
+    cmp     word ptr [rcx+12], 'C'
+    jne     rhn2_copy
+    cmp     word ptr [rcx+14], 5Ch
+    jne     rhn2_copy
+    mov     word ptr [r11], 5Ch                 ; "\\?\UNC\srv" -> "\\srv": one
+    add     r11, 2                              ;   backslash here + the one at char 7
+    mov     r8d, 7
+rhn2_copy:
+    xor     r9d, r9d
+rhn2_cl:
+    mov     ax, word ptr [rcx+r8*2]
+    mov     word ptr [r11+r9*2], ax
+    test    ax, ax
+    jz      rhn2_full
+    inc     r8d
+    inc     r9d
+    cmp     r9d, REG_NORM_CCH - 2
+    jb      rhn2_cl
+    mov     word ptr [r11+r9*2], 0
+rhn2_full:
+    WINCALL GetFullPathNameW, addr g_reg_tmp, REG_NORM_CCH, addr g_reg_norm, 0
+    test    eax, eax
+    jz      rhn2_asis
+    cmp     eax, REG_NORM_CCH
+    jb      rhn2_upper
+rhn2_asis:                                      ; could not resolve: hash it as written
+    mov     rcx, qword ptr [rbp-24]
+    call    reg_hash_legacy
+    FRAME_EPILOG
+    ret
+rhn2_upper:
+    mov     dword ptr [rbp-32], eax
+    WINCALL CharUpperBuffW, addr g_reg_norm, dword ptr [rbp-32]
+    lea     rcx, [g_reg_norm]
+    call    reg_hash_legacy
+    FRAME_EPILOG
+    ret
 reg_hash_name endp
+
+; reg_get_bin(rcx = subkey, rdx = value name, r8 = outbuf, r9d = cap) -> eax = bytes
+;   read from HKCU\<subkey>, 0 if absent.
+reg_get_bin proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rdx
+    mov     qword ptr [rbp-32], r8
+    mov     dword ptr [rbp-40], r9d
+    WINCALL RegOpenKeyExW, qword ptr [g_hkcu], rcx, 0, KEY_READ, addr g_cfg_khan
+    test    eax, eax
+    jnz     rgb_no
+    mov     eax, dword ptr [rbp-40]
+    mov     dword ptr [g_cfg_cb], eax
+    WINCALL RegQueryValueExW, qword ptr [g_cfg_khan], qword ptr [rbp-24], 0, 0, \
+            qword ptr [rbp-32], addr g_cfg_cb
+    mov     dword ptr [rbp-48], eax
+    WINCALL RegCloseKey, qword ptr [g_cfg_khan]
+    cmp     dword ptr [rbp-48], 0
+    jne     rgb_no
+    mov     eax, dword ptr [g_cfg_cb]
+    FRAME_EPILOG
+    ret
+rgb_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+reg_get_bin endp
+
+; reg_get_either(rcx = subkey, rdx = vault path, r8 = outbuf, r9d = cap) -> eax =
+;   bytes: under the normalised name, else under the legacy (as-spelled) one.
+reg_get_either proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], rdx
+    mov     qword ptr [rbp-40], r8
+    mov     dword ptr [rbp-48], r9d
+    mov     rcx, rdx
+    call    reg_hash_name
+    mov     rcx, qword ptr [rbp-24]
+    mov     rdx, rax
+    mov     r8, qword ptr [rbp-40]
+    mov     r9d, dword ptr [rbp-48]
+    call    reg_get_bin
+    test    eax, eax
+    jnz     rge_done
+    mov     rcx, qword ptr [rbp-32]
+    call    reg_hash_legacy
+    mov     rcx, qword ptr [rbp-24]
+    mov     rdx, rax
+    mov     r8, qword ptr [rbp-40]
+    mov     r9d, dword ptr [rbp-48]
+    call    reg_get_bin
+rge_done:
+    FRAME_EPILOG
+    ret
+reg_get_either endp
 
 ; ===========================================================================
 ; reg_is_hashed(rcx = wide name) -> eax = 1 iff the name is exactly 32 lowercase
@@ -653,7 +785,7 @@ cfg_od_linked endp
 ; ===========================================================================
 public cfg_default_vault
 ; The capacity used to be implicit: the proc appended "\Vordr" and
-; "ault.vordr" to whatever it had built and trusted the caller to have passed
+; "\vault.vordr" to whatever it had built and trusted the caller to have passed
 ; something big enough.  Both callers do pass 1024 chars, so nothing was wrong -
 ; but the contract lived only in the callers' heads, and a third caller with a
 ; smaller buffer would have overflowed silently.  It is now a parameter, every
@@ -669,7 +801,7 @@ cfg_default_vault proc frame
                                               ;   hold MAX_PATH + the tail is
                                               ;   refused before anything writes
     ; ---- prefer OneDrive if the %OneDrive% folder is configured -------------
-    ; leave room for the longest tail this proc appends: "\Vordr" + "ault.vordr"
+    ; leave room for the longest tail this proc appends: "\Vordr" + "\vault.vordr"
     mov     eax, dword ptr [rbp-32]
     sub     eax, CDV_TAIL_CHARS
     mov     dword ptr [rbp-40], eax           ; the most the env var may occupy
@@ -894,28 +1026,12 @@ reg_tpm_set endp
 
 public reg_tpm_get
 reg_tpm_get proc frame
-    FRAME_PROLOG 96
-    mov     qword ptr [rbp-32], rdx          ; outbuf (saved before reg_hash_name)
-    mov     dword ptr [rbp-40], r8d          ; cap
-    call    reg_hash_name                    ; rcx=path -> rax=hashed value name (C6)
-    mov     qword ptr [rbp-24], rax
-    WINCALL RegOpenKeyExW, qword ptr [g_hkcu], addr tpm_subkey, 0, KEY_READ, \
-            addr g_cfg_khan
-    test    eax, eax
-    jnz     rtg_no
-    mov     eax, dword ptr [rbp-40]
-    mov     dword ptr [g_cfg_cb], eax        ; cb in = cap
-    WINCALL RegQueryValueExW, qword ptr [g_cfg_khan], qword ptr [rbp-24], 0, 0, \
-            qword ptr [rbp-32], addr g_cfg_cb
-    mov     dword ptr [rbp-48], eax
-    WINCALL RegCloseKey, qword ptr [g_cfg_khan]
-    cmp     dword ptr [rbp-48], 0
-    jne     rtg_no
-    mov     eax, dword ptr [g_cfg_cb]        ; bytes actually read
-    FRAME_EPILOG
-    ret
-rtg_no:
-    xor     eax, eax
+    FRAME_PROLOG 32
+    mov     r9d, r8d                         ; cap
+    mov     r8, rdx                          ; outbuf
+    mov     rdx, rcx                         ; vault path
+    lea     rcx, [tpm_subkey]
+    call    reg_get_either
     FRAME_EPILOG
     ret
 reg_tpm_get endp
@@ -923,19 +1039,33 @@ reg_tpm_get endp
 public reg_tpm_del
 reg_tpm_del proc frame
     FRAME_PROLOG 64
-    call    reg_hash_name                    ; rcx=path -> rax=hashed value name (C6)
-    mov     qword ptr [rbp-24], rax
-    WINCALL RegOpenKeyExW, qword ptr [g_hkcu], addr tpm_subkey, 0, KEY_WRITE, \
-            addr g_cfg_khan
-    test    eax, eax
-    jnz     rtd_done
-    WINCALL RegDeleteValueW, qword ptr [g_cfg_khan], qword ptr [rbp-24]
-    WINCALL RegCloseKey, qword ptr [g_cfg_khan]
-rtd_done:
+    mov     qword ptr [rbp-32], rcx          ; vault path
+    call    reg_hash_name                    ; normalised name
+    mov     rdx, rax
+    call    rtd_one
+    mov     rcx, qword ptr [rbp-32]          ; and the legacy (as-spelled) one, so
+    call    reg_hash_legacy                  ;   "forget this device" really forgets
+    mov     rdx, rax
+    call    rtd_one
     mov     eax, 1
     FRAME_EPILOG
     ret
 reg_tpm_del endp
+
+; rtd_one(rdx = hashed value name) - delete it under HKCU\..\TPM-Unlock.
+rtd_one proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rdx
+    WINCALL RegOpenKeyExW, qword ptr [g_hkcu], addr tpm_subkey, 0, KEY_WRITE, \
+            addr g_cfg_khan
+    test    eax, eax
+    jnz     rto_done
+    WINCALL RegDeleteValueW, qword ptr [g_cfg_khan], qword ptr [rbp-24]
+    WINCALL RegCloseKey, qword ptr [g_cfg_khan]
+rto_done:
+    FRAME_EPILOG
+    ret
+rtd_one endp
 
 ; ===========================================================================
 ; Anti-rollback counter mirror: last-seen save_counter per vault path,
@@ -973,28 +1103,12 @@ reg_ctr_set endp
 
 public reg_ctr_get
 reg_ctr_get proc frame
-    FRAME_PROLOG 96
-    mov     qword ptr [rbp-32], rdx             ; outbuf (saved before reg_hash_name)
-    mov     dword ptr [rbp-40], r8d             ; cap
-    call    reg_hash_name                       ; rcx=path -> rax=hashed value name (C6)
-    mov     qword ptr [rbp-24], rax
-    WINCALL RegOpenKeyExW, qword ptr [g_hkcu], addr ctr_subkey, 0, KEY_READ, \
-            addr g_cfg_khan
-    test    eax, eax
-    jnz     rcg_no
-    mov     eax, dword ptr [rbp-40]
-    mov     dword ptr [g_cfg_cb], eax
-    WINCALL RegQueryValueExW, qword ptr [g_cfg_khan], qword ptr [rbp-24], 0, 0, \
-            qword ptr [rbp-32], addr g_cfg_cb
-    mov     dword ptr [rbp-48], eax
-    WINCALL RegCloseKey, qword ptr [g_cfg_khan]
-    cmp     dword ptr [rbp-48], 0
-    jne     rcg_no
-    mov     eax, dword ptr [g_cfg_cb]
-    FRAME_EPILOG
-    ret
-rcg_no:
-    xor     eax, eax
+    FRAME_PROLOG 32
+    mov     r9d, r8d
+    mov     r8, rdx
+    mov     rdx, rcx
+    lea     rcx, [ctr_subkey]
+    call    reg_get_either
     FRAME_EPILOG
     ret
 reg_ctr_get endp

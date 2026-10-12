@@ -13,6 +13,8 @@ include macros.inc
 extern VirtualAlloc:proc
 extern VirtualFree:proc
 extern VirtualProtect:proc
+extern TlsAlloc:proc                    ; the per-thread shadow stack's slot
+extern TlsSetValue:proc
 extern GetModuleHandleW:proc
 extern rng_fill:proc                    ; random.asm: rcx=buf, rdx=len -> eax=1 ok
 extern print_a:proc                     ; console.asm (cttest probe)
@@ -62,12 +64,11 @@ HEAP_TAIL_LEN   equ 8
 
 .data
 public g_stack_canary
-public g_sstk_base
-public g_sstk_index
+public g_sstk_tls
 public g_cpu_features
 g_stack_canary  dq 0
-g_sstk_base     dq 0
-g_sstk_index    dq 0
+g_sstk_tls      dd 0                    ; TLS index + 1 (0 = not allocated yet)
+align 8
 g_cpu_features  dd 0
 g_heap_gen      dd 1                    ; global generation counter
 public g_gui_active
@@ -80,6 +81,9 @@ g_crash_regs    dq 10 dup (0)           ; rax rcx rdx rbx rsp rbp rsi rdi rip r8
 g_crash_h       dq 0                    ; breadcrumb file handle
 g_crash_nw      dd 0                    ; WriteFile bytes-written out
 g_crash_dumped  db 0                    ; reentry guard: dump once
+align 8
+g_img_lo        dq 0                    ; this image's [base, base+SizeOfImage):
+g_img_hi        dq 0                    ;   crash_veh only acts on faults inside it
 align 2
 
 SEM_FAILCRITICALERRORS  equ 1
@@ -104,6 +108,110 @@ CSTR crash_bc, "crash: unhandled exception - wiping secrets, terminating",13,10
 endif
 
 .code
+
+; =============================================================================
+; sstk_thread_init -> eax = 1 ok, 0 failed.  Give the CALLING thread its own
+;   software shadow stack and publish it in the TLS slot.  Every thread that runs
+;   framed code calls this first; one that does not keeps only the canary.
+;
+;   One commit: [guard page][16-byte block {index, -}][SSTK_CAPACITY*8][guard
+;   page], so a runaway push or pop hits a guard, not someone else's memory.
+;
+;   RAW frame: it runs before the thread has a shadow stack.  The caller must
+;   call it with an aligned stack (thread entries align rsp first).
+; =============================================================================
+public sstk_thread_init
+; The block + entries span SSTK_SPAN bytes, which is not a whole number of pages, so
+; the block is placed SSTK_PAD bytes into its first page: the last entry then ends
+; exactly where the upper guard page begins, and a runaway push hits the guard
+; rather than the page's slack.  sstk_thread_free rounds the block down to its page.
+SSTK_SPAN   equ SSTK_HDR + (SSTK_CAPACITY*8)
+SSTK_PAGES  equ (SSTK_SPAN + 0FFFh) / 1000h
+SSTK_PAD    equ SSTK_PAGES*1000h - SSTK_SPAN
+sstk_thread_init proc
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16                        ; whatever the caller did
+    sub     rsp, 64
+    WINCALL VirtualAlloc, 0, <1000h + SSTK_PAGES*1000h + 1000h>, <MEM_RESERVE or MEM_COMMIT>, PAGE_NOACCESS
+    test    rax, rax
+    jz      sti_fail
+    mov     qword ptr [rbp-8], rax          ; region base
+    WINCALL VirtualProtect, addr rax+1000h, <SSTK_PAGES*1000h>, PAGE_READWRITE, addr rbp-16
+    test    eax, eax
+    jz      sti_fail_free
+    mov     rax, qword ptr [rbp-8]
+    lea     rax, [rax+1000h+SSTK_PAD]       ; -> the block, flush against the upper guard
+    mov     qword ptr [rax], 0              ; index = 0
+    mov     qword ptr [rbp-24], rax         ; through memory: WINCALL marshals rax first
+    mov     eax, dword ptr [g_sstk_tls]
+    dec     eax
+    mov     dword ptr [rbp-32], eax
+    WINCALL TlsSetValue, dword ptr [rbp-32], qword ptr [rbp-24]
+    test    eax, eax
+    jz      sti_fail_free
+    mov     eax, 1
+    mov     rsp, rbp
+    pop     rbp
+    ret
+sti_fail_free:
+    WINCALL VirtualFree, qword ptr [rbp-8], 0, MEM_RELEASE
+sti_fail:
+    xor     eax, eax
+    mov     rsp, rbp
+    pop     rbp
+    ret
+sstk_thread_init endp
+
+; =============================================================================
+; sstk_thread_free - give back the calling thread's block.  MUST be the last
+;   thing the thread does: every framed call has returned by then.  The TLS slot
+;   is cleared FIRST, so framed code that somehow runs afterwards degrades to
+;   canary-only instead of writing into released pages.  RAW frame, for the
+;   mirror of sstk_thread_init's reason.
+; =============================================================================
+public sstk_thread_free
+sstk_thread_free proc
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    sub     rsp, 64
+    mov     eax, dword ptr [g_sstk_tls]
+    test    eax, eax
+    jz      stf_ret
+    dec     eax
+    mov     dword ptr [rbp-32], eax
+    mov     r10d, eax
+    mov     r11, gs:[r10*8 + TEB_TLS_SLOTS]
+    test    r11, r11
+    jz      stf_ret
+    and     r11, -1000h                     ; the block's page (it sits SSTK_PAD in) ...
+    sub     r11, 1000h                      ;   ... and the region starts one guard page lower
+    mov     qword ptr [rbp-24], r11
+    WINCALL TlsSetValue, dword ptr [rbp-32], 0
+    WINCALL VirtualFree, qword ptr [rbp-24], 0, MEM_RELEASE
+stf_ret:
+    mov     rsp, rbp
+    pop     rbp
+    ret
+sstk_thread_free endp
+
+; sstk_reset_current - empty the calling thread's shadow stack (ff_trap, which is
+;   terminating and needs secmem_panic_wipe's framed prologue to be able to push
+;   even when the trap was a FULL shadow stack).  Leaf; clobbers rax, r10.
+public sstk_reset_current
+sstk_reset_current proc
+    mov     eax, dword ptr [g_sstk_tls]
+    test    eax, eax
+    jz      srcur_ret
+    dec     eax
+    mov     r10, gs:[rax*8 + TEB_TLS_SLOTS]
+    test    r10, r10
+    jz      srcur_ret
+    mov     qword ptr [r10], 0
+srcur_ret:
+    ret
+sstk_reset_current endp
 
 ; =============================================================================
 ; sstk_overflow_fail - jumped to from FRAME_PROLOG when shadow stack is full
@@ -208,6 +316,17 @@ endif
     and     eax, 0F0000000h                     ; severity nibble
     cmp     eax, 0C0000000h                     ; ERROR severity => fatal
     jne     cv_pass
+    ; ...but only when it was raised in OUR code.  A vectored handler sees every
+    ; first-chance exception in the process, including ones a system or third-party
+    ; DLL raises and handles itself - shell extensions loaded into the file dialogs
+    ; do exactly that - and terminating on those killed Vordr over faults that were
+    ; never going to be fatal.  A fault outside this image that nobody handles still
+    ; reaches crash_filter, which contains it the same way.
+    mov     rax, qword ptr [g_crash_addr]
+    cmp     rax, qword ptr [g_img_lo]
+    jb      cv_pass
+    cmp     rax, qword ptr [g_img_hi]
+    jae     cv_pass
     call    crash_dump                          ; breadcrumb FIRST (survives a
                                                 ;  containment-step failure)
     call    crash_contain                       ; wipe + terminate (no return)
@@ -267,6 +386,12 @@ crash_dump endp
 ;   for environments where a VEH is not reached; same containment action.
 crash_filter proc frame
     FRAME_PROLOG 32
+    mov     rax, qword ptr [rcx]                ; record what crash_veh would have: the
+    mov     r10d, dword ptr [rax]               ;   faults it now passes on end up here
+    mov     dword ptr [g_crash_code], r10d
+    mov     r10, qword ptr [rax+16]
+    mov     qword ptr [g_crash_addr], r10
+    call    crash_dump
     call    crash_contain
     xor     eax, eax                            ; EXCEPTION_CONTINUE_SEARCH (unreached)
     FRAME_EPILOG
@@ -282,6 +407,12 @@ crash_filter endp
 public crash_install
 crash_install proc frame
     FRAME_PROLOG 32
+    WINCALL GetModuleHandleW, 0                 ; our image range, for crash_veh
+    mov     qword ptr [g_img_lo], rax
+    mov     r10d, dword ptr [rax+3Ch]           ; e_lfanew
+    mov     r10d, dword ptr [rax+r10+50h]       ; OptionalHeader.SizeOfImage
+    add     rax, r10
+    mov     qword ptr [g_img_hi], rax
     WINCALL SetErrorMode, <SEM_FAILCRITICALERRORS or SEM_NOGPFAULTERRORBOX>
     WINCALL AddVectoredExceptionHandler, 1, addr crash_veh
     WINCALL SetUnhandledExceptionFilter, addr crash_filter
@@ -306,21 +437,15 @@ hardening_init proc frame
     .allocstack 64
     .endprolog
 
-    ; ---- reserve guard | shadow stack | guard ------------------------------
-    ; size = 4KiB guard + SSTK pages + 4KiB guard
-    WINCALL VirtualAlloc, 0, <1000h + (SSTK_CAPACITY*8) + 1000h>, <MEM_RESERVE or MEM_COMMIT>, PAGE_NOACCESS
-    test    rax, rax
-    jz      hi_fail
-    mov     qword ptr [rbp-8], rax      ; save region base
-
-    ; ---- unprotect only the middle (the usable shadow stack) ---------------
-    WINCALL VirtualProtect, addr rax+1000h, <SSTK_CAPACITY*8>, PAGE_READWRITE, addr rbp-16
+    ; ---- one TLS index, then THIS thread's own shadow stack ----------------
+    call    TlsAlloc                    ; no arguments
+    cmp     eax, 63                     ; must be an inline TEB slot: past 63 the
+    ja      hi_fail                     ;   value lives in TlsExpansionSlots instead
+    inc     eax                         ; stored +1: 0 means "not ready", and TLS
+    mov     dword ptr [g_sstk_tls], eax ;   index 0 is a real slot someone may own
+    call    sstk_thread_init
     test    eax, eax
     jz      hi_fail
-    mov     rax, qword ptr [rbp-8]
-    lea     rax, [rax+1000h]
-    mov     qword ptr [g_sstk_base], rax
-    mov     qword ptr [g_sstk_index], 0
 
     ; ---- seed stack canary: CSPRNG xor rdtsc, never zero --------------------
     ; IMPORTANT: rng_fill is itself canary-protected and reads g_stack_canary

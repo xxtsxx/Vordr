@@ -26,7 +26,7 @@ Run these from the repository root:
 |---|---|
 | `build.cmd` | Normal executable; static checker failures are advisory |
 | `build.cmd strict` | Normal executable; checker nonzero exits fail the build |
-| `build.cmd release strict` | Reproducible-link flags plus strict checks; use for release preparation |
+| `build.cmd release strict` | Reproducible build (normalised by `tools\pe_normalise.py`, hash in `bin\SHA256SUMS.txt`) plus strict checks; use for release preparation |
 | `build.cmd probeio strict` | File-writing diagnostic verbs for synthetic tests |
 | `build.cmd dbg strict` | Debug traces and fault injection; includes probe I/O |
 | `build.cmd nohw strict` | Omits CET compatibility; keeps software checks |
@@ -57,6 +57,42 @@ Use the supplied test driver for the complete suite.
 
 A `.vordr` path passed to the normal GUI is an import source, not a command-line
 unlock or a request to replace the configured vault.
+
+## Tests that live outside the binary
+
+| Command | What it checks | Needs |
+|---|---|---|
+| `python tests\redteam.py bin\vordr.exe` | Each fault-injection case ends with its own fail-fast code; a plain fault is contained and leaves a breadcrumb | `dbg` build |
+| `python tests\verify_vault.py bin\vordr.exe` | An independent reader (own RFC 9106 Argon2id) decrypts real vaults from `docs/formats.md` alone; every region is tamper-checked; nonces differ per save | `probeio` or `dbg` |
+| `python tests\compattest.py bin\vordr.exe` | The frozen v0.2.3 vaults in `tests\fixtures` still open, with the same contents | `probeio` or `dbg` |
+| `tests\guitest.ps1` | A real Vordr window driven from outside (`tests\lib\gui.psm1`): input limits, the drawn scrollbars (entry list, checklist, the detail pane on a `seedbig` vault), lock while a dialog is open, what a lock wipes | `probeio` or `dbg`, an interactive desktop |
+| `tools\verify_repro.ps1` | Two clean `release strict` builds are byte-identical and keep ASLR/DEP/HEVA/CET | Release preparation |
+| `tools\compare.ps1 <test> -Ref <commit>` | The test fails on an older commit and passes on the working tree | git, the toolchain |
+
+Tests keep away from the user's own Vordr. A `probeio`/`dbg` build remaps
+HKEY_CURRENT_USER for its whole process onto `HKCU\Software\VordrGuiTest\<name>`:
+
+- every probe verb (`seedtest`, `bktest`, `vopen` ...) runs under the name `cli`,
+  so their saves' rollback counters no longer land in the real
+  `HKCU\SOFTWARE\Vordr\Rollback`;
+- `Start-VordrTest` sets `VORDR_TEST_HKCU=<name>` for a GUI instance, which also
+  skips the single-instance hand-off, the global hotkey, the TPM and the secure
+  desktop, and logs to `%TEMP%\vordr_guitest.log`.
+
+If the remap cannot be set up, the instance exits `0xE0F7` instead of running
+against the real HKCU, and the harness checks that isolation is engaged
+(`g_testmode = 1`) before it types or presses anything. `Start-VordrTest` refuses
+an executable whose map has no `g_testmode` (a release build has no hooks). The
+scratch keys are deleted after each test and by `tests\run_all.cmd`. Probe files
+under `%TEMP%` and any `<vault>.lock` they leave are test data, not user data.
+
+`python tools\prune_rollback.py` lists rollback-mirror values in the real HKCU
+that are not the registered vault's (left by probe runs before the isolation
+above); `--delete` removes them after writing a .reg backup.
+
+Frozen fixtures are never regenerated. A new release that changes the format
+adds new fixtures beside the old ones; `tests\compattest.py` says how the v0.2.3
+set was made.
 
 ## Full test gate: read before running
 

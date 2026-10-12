@@ -23,10 +23,8 @@ extern CreateThread:proc
 extern WaitForMultipleObjects:proc
 extern CloseHandle:proc
 extern GetSystemInfo:proc
-extern InitializeCriticalSection:proc
-extern EnterCriticalSection:proc
-extern LeaveCriticalSection:proc
-extern DeleteCriticalSection:proc
+extern sstk_thread_init:proc            ; hardening.asm: per-thread shadow stack
+extern sstk_thread_free:proc
 extern gcm_seal:proc
 extern gcm_open:proc
 extern blake2b_hash:proc
@@ -241,7 +239,6 @@ gcm_tag_exp db 0d0h,0d1h,0c8h,0a7h,099h,099h,06bh,0f0h,026h,05bh,098h,0b5h,0d4h,
 
 .data?
 align 8
-g_pkat_cs       db 40 dup (?)        ; CRITICAL_SECTION (x64 = 40 bytes)
 g_pkat_res      dd 8 dup (?)         ; per-thread PASS(0)/FAIL(1) slot
 g_pkat_h        dq 8 dup (?)         ; worker thread handles
 g_pkat_n        dd ?                 ; worker count = min(cores, PKAT_MAX)
@@ -957,28 +954,28 @@ PKAT_ITERS  equ 2000
 ; =============================================================================
 ; pkat_worker(rcx = slot) - worker thread body for the parallel KAT gate.  Runs
 ;   a SHA-256 known-answer test PKAT_ITERS times; on all-pass, clears its result
-;   slot to 0 (PASS).  A RAW frame (no FRAME_PROLOG) - it must not touch the
-;   process-global software shadow stack outside the critical section.  The KAT
-;   itself (sha256_hash uses FRAME_PROLOG) runs under g_pkat_cs, so only one
-;   thread is ever inside shadow-stack-using code at a time: correct LIFO use,
-;   no race.  (True parallel KAT compute awaits a per-thread shadow stack; this
-;   is the fail-closed thread-pool gate machinery, verified end to end.)
+;   slot to 0 (PASS).  Each worker has its OWN shadow stack (sstk_thread_init), so
+;   the workers run framed code truly concurrently - this used to serialise them
+;   under a critical section because the shadow stack was one process global.  A
+;   per-thread stack that leaked between threads fails this gate with 0xF001.
 ; =============================================================================
 pkat_worker proc
     push    rbp
     mov     rbp, rsp
+    and     rsp, -16
     sub     rsp, 96                          ; raw frame: shadow + a 32-byte out buf
     mov     qword ptr [rbp-8], rcx           ; slot
     mov     qword ptr [rbp-16], PKAT_ITERS
+    call    sstk_thread_init
+    test    eax, eax
+    jz      pw_done                          ; no stack of its own: leave the slot FAIL
 pw_loop:
     cmp     qword ptr [rbp-16], 0
     je      pw_pass
-    WINCALL EnterCriticalSection, addr g_pkat_cs
     lea     rcx, [st_abc]                    ; sha256("abc") -> [rbp-56]
     mov     rdx, 3
     lea     r8, [rbp-56]
     call    sha256_hash
-    WINCALL LeaveCriticalSection, addr g_pkat_cs
     lea     r10, [rbp-56]                    ; compare to the known digest
     lea     r11, [sha_abc_exp]
     xor     r9, r9
@@ -996,8 +993,9 @@ pw_pass:
     lea     r10, [g_pkat_res]
     mov     dword ptr [r10+rcx*4], 0
 pw_done:
+    call    sstk_thread_free                 ; last thing the thread does
     xor     eax, eax
-    add     rsp, 96
+    mov     rsp, rbp
     pop     rbp
     ret
 pkat_worker endp
@@ -1022,7 +1020,6 @@ cmd_pkat proc frame
     jbe     @F
     mov     eax, PKAT_MAX
 @@: mov     dword ptr [g_pkat_n], eax
-    WINCALL InitializeCriticalSection, addr g_pkat_cs
     ; every result slot starts FAIL(1) - fail closed
     mov     qword ptr [rbp-24], 0
 pk_init:
@@ -1066,7 +1063,6 @@ pk_eval:
     ; the process exits (ExitProcess) immediately after pkat returns.
     cmp     dword ptr [rbp-32], 0               ; WAIT_OBJECT_0 = all signalled
     jne     pk_fail                             ; timeout / abandoned -> fail closed
-    WINCALL DeleteCriticalSection, addr g_pkat_cs
     mov     qword ptr [rbp-24], 0               ; every slot must be PASS(0)
 pk_sum:
     mov     eax, dword ptr [rbp-24]
@@ -1139,6 +1135,16 @@ CSTR krl_totp,       "totp/rfc6238 "
 CSTR krl_b32h,       "base32/hello "
 CSTR krl_b32o,       "base32/otp16 "
 CSTR krl_a2,         "argon2id/rfc9106 "
+CSTR krl_a2ref,      "argon2id/ref-t2m64 "
+; The RFC 9106 vector (m=32, p=4) has two-block segments, so it never reaches the
+; data-independent address block's regeneration at i = 128 - and every real vault
+; does (the default is ~32K blocks a segment).  The reference implementation's own
+; test.c vector, t=2 m=64 MiB p=1 "password"/"somesalt", does: it is the one that
+; tells "index by block position" (RFC 9106) from "index by a call counter" (the
+; non-conformance Myrkr found in its own copy).  Vordr indexes by position; this
+; is what proves it.
+a2_pwref    db "password"
+a2_saltref  db "somesalt"
 ; ---- fixed inputs ----------------------------------------------------------
 kr_fips2    db "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
 kr_fips2_len equ $ - kr_fips2
@@ -1474,6 +1480,30 @@ kr_a2ad:
     lea     rcx, [a2_req]
     call    argon2id_hash
     KEMIT   krl_a2, a2_out, 32
+
+    ; ---- Argon2id (reference test.c: t=2, m=64 MiB, p=1, no secret/ad) ----
+    lea     r8, [a2_req]
+    mov     dword ptr [r8].ARGON2REQ.t_cost, 2
+    mov     dword ptr [r8].ARGON2REQ.m_cost, 65536
+    mov     dword ptr [r8].ARGON2REQ.lanes, 1
+    mov     dword ptr [r8].ARGON2REQ.outlen, 32
+    mov     dword ptr [r8].ARGON2REQ.version, 13h
+    mov     dword ptr [r8].ARGON2REQ.atype, 2
+    lea     rax, [a2_pwref]
+    mov     qword ptr [r8].ARGON2REQ.pwd, rax
+    mov     dword ptr [r8].ARGON2REQ.pwdlen, 8
+    lea     rax, [a2_saltref]
+    mov     qword ptr [r8].ARGON2REQ.salt, rax
+    mov     dword ptr [r8].ARGON2REQ.saltlen, 8
+    mov     qword ptr [r8].ARGON2REQ.secret, 0
+    mov     dword ptr [r8].ARGON2REQ.secretlen, 0
+    mov     qword ptr [r8].ARGON2REQ.ad, 0
+    mov     dword ptr [r8].ARGON2REQ.adlen, 0
+    lea     rax, [a2_out]
+    mov     qword ptr [r8].ARGON2REQ.outp, rax
+    lea     rcx, [a2_req]
+    call    argon2id_hash
+    KEMIT   krl_a2ref, a2_out, 32
 
     xor     eax, eax
     FRAME_EPILOG

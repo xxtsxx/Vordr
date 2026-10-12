@@ -23,6 +23,8 @@ extern rng_fill:proc
 extern mem_alloc:proc
 extern print_a:proc
 extern mem_free:proc
+extern secmem_alloc:proc                 ; vordr.json is every exported secret in clear
+extern secmem_free:proc
 extern secure_zero:proc
 extern vault_count:proc
 extern vault_is_system:proc             ; never export the system item (SYSITEM_DESIGN.md)
@@ -41,8 +43,9 @@ VF_PWHIST_  equ 13                   ; reserved field history - never exported
 JSON_CAP    equ 16*1024*1024
 CP_UTF8_    equ 65001
 
-ZE_CAP      equ 32*1024*1024
-ZE_MAXFILE  equ 512
+ZE_CAP      equ 32*1024*1024             ; INITIAL archive capacity - it grows (buf_reserve)
+ZE_MAXCAP   equ 0F0000000h               ; ZIP32 offsets/sizes are 32-bit: refuse past this
+ZE_MAXFILE  equ 8192                     ; = zipimport's ZI_MAXMEM member cap
 ZE_NAMEPOOL equ 512*1024             ; persistent copies of every entry's name
 PBKDF2_ITERS equ 1000
 
@@ -50,7 +53,7 @@ PBKDF2_ITERS equ 1000
 g_xl_err    db ?                     ; shared build-error flag (moved from xlexport)
 align 16
 public g_zbuf
-g_zbuf      dq 3 dup (?)             ; {ptr,len,cap}
+g_zbuf      dq 4 dup (?)             ; {ptr,len,cap,grow}: grow=1 -> buf_reserve may enlarge
 g_ze_pw     dq ?                     ; UTF-8 password ptr
 g_ze_pwlen  dd ?
 g_ze_cn     dd ?                     ; central-dir record count
@@ -154,6 +157,18 @@ pb_wr:
     inc     dword ptr [rbp-52]
     jmp     pb_block
 pb_done:
+    lea     rcx, [g_pb_u]                       ; U / U' / T are slices of the derived
+    mov     edx, 20                             ;   key; the message holds the salt only,
+    call    secure_zero                         ;   but goes too for symmetry
+    lea     rcx, [g_pb_un]
+    mov     edx, 20
+    call    secure_zero
+    lea     rcx, [g_pb_t]
+    mov     edx, 20
+    call    secure_zero
+    lea     rcx, [g_pb_msg]
+    mov     edx, 32
+    call    secure_zero
     FRAME_EPILOG
     ret
 pbkdf2_ae endp
@@ -175,6 +190,7 @@ ze_reset proc frame
     mov     qword ptr [r10], rax
     mov     qword ptr [r10+8], 0
     mov     qword ptr [r10+16], ZE_CAP
+    mov     qword ptr [r10+24], 1                ; the archive may grow
     xor     eax, eax
     FRAME_EPILOG
     ret
@@ -211,6 +227,9 @@ zf_done:
     lea     rcx, [g_ze_rk]
     mov     edx, 15*16
     call    secure_zero
+    lea     rcx, [g_ze_ctr]
+    mov     edx, 16
+    call    secure_zero
     FRAME_EPILOG
     ret
 ze_free endp
@@ -233,13 +252,15 @@ ZBB macro v
 endm
 
 ; ze_aextra - emit the 11-byte AE-2 extra field (id 0x9901)
-ze_aextra proc
+ze_aextra proc frame                     ; framed: the buf_* it calls are framed
+    FRAME_PROLOG 32                          ;   procs now and need an aligned stack
     ZB16    09901h
     ZB16    7
     ZB16    2                                    ; AE-2
     ZB16    04541h                               ; vendor 'A','E'
     ZBB     3                                    ; AES-256
     ZB16    0                                    ; stored inside AES
+    FRAME_EPILOG
     ret
 ze_aextra endp
 
@@ -356,6 +377,17 @@ zaf_ncpd:
     mov     rdx, qword ptr [rbp-40]
     mov     r8, qword ptr [rbp-48]
     call    buf_putn
+    ; The encryption below runs IN PLACE over [cipher start, +datalen).  If that
+    ; append did not happen - the archive could not grow - the range is not ours:
+    ; this used to XOR keystream straight past the end of the buffer.  Check it
+    ; landed, byte count and all, before touching it.
+    cmp     byte ptr [g_xl_err], 0
+    jne     zaf_fail
+    lea     r10, [g_zbuf]
+    mov     rax, qword ptr [r10+8]
+    sub     rax, qword ptr [rbp-72]
+    cmp     rax, qword ptr [rbp-48]
+    jne     zaf_fail
     ; expand AES-256 key (dk[0..32])
     lea     rcx, [g_ae_dk]
     mov     rdx, 32
@@ -397,6 +429,11 @@ zaf_ncpd:
     mov     qword ptr [r11+16], rax              ; nameptr
     inc     dword ptr [g_ze_cn]
     xor     eax, eax                             ; ok
+    FRAME_EPILOG
+    ret
+zaf_fail:
+    mov     byte ptr [g_xl_err], 1
+    mov     eax, 1
     FRAME_EPILOG
     ret
 ze_add_file endp
@@ -477,12 +514,13 @@ zj_defname  db "attachment.bin"
 hexdig    db "0123456789abcdef"
 
 .data?
-g_json      dq 3 dup (?)             ; {ptr,len,cap} for the fields JSON
+g_json      dq 4 dup (?)             ; {ptr,len,cap,grow=0} - secmem, fixed capacity
 ; The dialog takes up to 254 wide chars, and a BMP char can be 3 UTF-8 bytes, so
 ; the worst case is 762.  The old 512/500 silently truncated - and because
 ; WideCharToMultiByte reports that by returning 0, the password became EMPTY.
 ZE_PWCAP    equ 1024
 ZE_EXT_MAX  equ 12                   ; max ".ext" kept in a ZIP member name (dot + 11)
+public g_ze_u8pw, g_ze_rk                 ; pinned + crash-wiped by secmem.asm
 g_ze_u8pw   db ZE_PWCAP dup (?)      ; wide->UTF-8 export password scratch
 g_zj_fld    db 40 dup (?)            ; vault_field_get out struct
 g_zj_fn     db 512 dup (?)           ; attachment filename (UTF-8)
@@ -586,17 +624,34 @@ js_close:
     ret
 json_str endp
 
+; ze_json_free() - wipe and release g_json if held (secmem_free wipes first).
+ze_json_free proc frame
+    FRAME_PROLOG 32
+    lea     r10, [g_json]
+    mov     rcx, qword ptr [r10]
+    test    rcx, rcx
+    jz      zjf_done
+    mov     rdx, qword ptr [r10+16]
+    call    secmem_free
+    lea     r10, [g_json]
+    mov     qword ptr [r10], 0
+zjf_done:
+    FRAME_EPILOG
+    ret
+ze_json_free endp
+
 ; ze_build_json() -> eax 0/err.  Builds g_json = [{"title":..,"fields":[..]},..].
 ze_build_json proc frame
     FRAME_PROLOG 96
-    mov     rcx, JSON_CAP
-    call    mem_alloc
+    mov     rcx, JSON_CAP                       ; every exported value in clear: lock it
+    call    secmem_alloc
     test    rax, rax
     jz      zbj_err
     lea     r10, [g_json]
     mov     qword ptr [r10], rax
     mov     qword ptr [r10+8], 0
     mov     qword ptr [r10+16], JSON_CAP
+    mov     qword ptr [r10+24], 0               ; fixed: secmem does not grow
     lea     rcx, [g_json]
     mov     dl, '['
     call    buf_putb
@@ -1090,14 +1145,7 @@ comp_pwok:
     call    ze_add_file
     test    eax, eax                            ; json is file #1; guard is defensive/uniform
     jnz     comp_ziperr
-    lea     r10, [g_json]                       ; wipe the plaintext json (every field value
-    mov     rcx, qword ptr [r10]                ; of every exported entry) before freeing it
-    mov     rdx, qword ptr [r10+16]
-    call    secure_zero
-    lea     r10, [g_json]
-    mov     rcx, qword ptr [r10]
-    mov     rdx, qword ptr [r10+16]
-    call    mem_free
+    call    ze_json_free                        ; wipe + release the plaintext json
     call    ze_add_attachments                  ; every image/file, path recorded in json
     test    eax, eax
     jnz     comp_ziperr
@@ -1109,6 +1157,7 @@ comp_pwok:
     FRAME_EPILOG
     ret
 comp_ziperr:
+    call    ze_json_free                        ; an abort must not leave it either
     lea     rcx, [g_ze_u8pw]
     mov     edx, ZE_PWCAP
     call    secure_zero
@@ -1123,106 +1172,149 @@ ze_compose endp
 
 
 ; ---------------------------------------------------------------------------
-; Byte-buffer append helpers (moved from the removed xlexport.asm; the
-; encrypted-zip builder is now their only user).  Buffer desc = {ptr,len,cap}.
+; Byte-buffer append helpers.  Buffer desc = {ptr,len,cap,grow}.  Every append goes
+; through buf_putn, which goes through buf_reserve: there is ONE capacity check and
+; one place that can enlarge a buffer.  A buffer that cannot take the bytes refuses
+; the WHOLE append (nothing written, length unchanged) and sets g_xl_err; callers
+; check that before trusting the data landed.
 ; ---------------------------------------------------------------------------
-buf_putb proc
+; buf_reserve(rcx=desc, rdx=extra bytes) -> eax = 1 room now exists / 0 refused.
+buf_reserve proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
     mov     rax, qword ptr [rcx+8]
+    add     rax, rdx
+    jc      brs_no
     cmp     rax, qword ptr [rcx+16]
-    jae     bpb_over
-    mov     r10, qword ptr [rcx]
-    mov     byte ptr [r10+rax], dl
-    inc     qword ptr [rcx+8]
+    jbe     brs_ok
+    cmp     qword ptr [rcx+24], 0               ; fixed-capacity buffer
+    je      brs_no
+    cmp     rax, ZE_MAXCAP
+    ja      brs_no
+    mov     r8, qword ptr [rcx+16]              ; new cap = max(2*cap, needed)
+    shl     r8, 1
+    cmp     r8, rax
+    jae     @F
+    mov     r8, rax
+@@: cmp     r8, ZE_MAXCAP
+    jbe     @F
+    mov     r8, ZE_MAXCAP
+@@: mov     qword ptr [rbp-32], r8
+    mov     rcx, r8
+    call    mem_alloc
+    test    rax, rax
+    jz      brs_no
+    mov     qword ptr [rbp-40], rax
+    mov     r10, qword ptr [rbp-24]             ; copy what is there
+    mov     rcx, rax
+    mov     rdx, qword ptr [r10]
+    mov     r8, qword ptr [r10+8]
+    call    buf_copy
+    mov     r10, qword ptr [rbp-24]             ; wipe + release the old block
+    mov     rcx, qword ptr [r10]
+    mov     rdx, qword ptr [r10+16]
+    call    mem_free
+    mov     r10, qword ptr [rbp-24]
+    mov     rax, qword ptr [rbp-40]
+    mov     qword ptr [r10], rax
+    mov     rax, qword ptr [rbp-32]
+    mov     qword ptr [r10+16], rax
+brs_ok:
+    mov     eax, 1
+    FRAME_EPILOG
     ret
-bpb_over:
+brs_no:
     mov     byte ptr [g_xl_err], 1
+    xor     eax, eax
+    FRAME_EPILOG
     ret
-buf_putb endp
+buf_reserve endp
 
-; buf_putn(rcx=desc, rdx=src, r8=len)                                          leaf
-buf_putn proc
+; buf_copy(rcx=dst, rdx=src, r8=len) - byte copy.  Leaf.
+buf_copy proc
+    xor     r9, r9
+bcy_lp:
+    cmp     r9, r8
+    jae     bcy_done
+    mov     al, byte ptr [rdx+r9]
+    mov     byte ptr [rcx+r9], al
+    inc     r9
+    jmp     bcy_lp
+bcy_done:
+    ret
+buf_copy endp
+
+; buf_putn(rcx=desc, rdx=src, r8=len)
+buf_putn proc frame
+    FRAME_PROLOG 64
     test    r8, r8
     jz      bpn_ret
-    mov     rax, qword ptr [rcx+8]
-    mov     r9, rax
-    add     r9, r8
-    cmp     r9, qword ptr [rcx+16]
-    ja      bpn_over
-    mov     r10, qword ptr [rcx]
-    add     r10, rax
-    xor     r11, r11
-bpn_lp:
-    mov     r9b, byte ptr [rdx+r11]
-    mov     byte ptr [r10+r11], r9b
-    inc     r11
-    cmp     r11, r8
-    jb      bpn_lp
-    add     qword ptr [rcx+8], r8
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], rdx
+    mov     qword ptr [rbp-40], r8
+    mov     rdx, r8
+    call    buf_reserve
+    test    eax, eax
+    jz      bpn_ret
+    mov     r10, qword ptr [rbp-24]
+    mov     rcx, qword ptr [r10]
+    add     rcx, qword ptr [r10+8]
+    mov     rdx, qword ptr [rbp-32]
+    mov     r8, qword ptr [rbp-40]
+    call    buf_copy
+    mov     r10, qword ptr [rbp-24]
+    mov     rax, qword ptr [rbp-40]
+    add     qword ptr [r10+8], rax
 bpn_ret:
-    ret
-bpn_over:
-    mov     byte ptr [g_xl_err], 1
+    FRAME_EPILOG
     ret
 buf_putn endp
 
-; buf_pu16(rcx=desc, edx=val)                                                  leaf
-buf_pu16 proc
-    mov     rax, qword ptr [rcx+8]
-    mov     r9, rax
-    add     r9, 2
-    cmp     r9, qword ptr [rcx+16]
-    ja      bp16_over
-    mov     r10, qword ptr [rcx]
-    mov     byte ptr [r10+rax], dl
-    shr     edx, 8
-    mov     byte ptr [r10+rax+1], dl
-    add     qword ptr [rcx+8], 2
+; buf_putb(rcx=desc, dl=byte)
+buf_putb proc frame
+    FRAME_PROLOG 48
+    mov     byte ptr [rbp-24], dl
+    lea     rdx, [rbp-24]
+    mov     r8d, 1
+    call    buf_putn
+    FRAME_EPILOG
     ret
-bp16_over:
-    mov     byte ptr [g_xl_err], 1
+buf_putb endp
+
+; buf_pu16(rcx=desc, edx=val) - little-endian
+buf_pu16 proc frame
+    FRAME_PROLOG 48
+    mov     word ptr [rbp-24], dx
+    lea     rdx, [rbp-24]
+    mov     r8d, 2
+    call    buf_putn
+    FRAME_EPILOG
     ret
 buf_pu16 endp
 
-; buf_pu32(rcx=desc, edx=val)                                                  leaf
-buf_pu32 proc
-    mov     rax, qword ptr [rcx+8]
-    mov     r9, rax
-    add     r9, 4
-    cmp     r9, qword ptr [rcx+16]
-    ja      bp32_over
-    mov     r10, qword ptr [rcx]
-    mov     byte ptr [r10+rax], dl
-    shr     edx, 8
-    mov     byte ptr [r10+rax+1], dl
-    shr     edx, 8
-    mov     byte ptr [r10+rax+2], dl
-    shr     edx, 8
-    mov     byte ptr [r10+rax+3], dl
-    add     qword ptr [rcx+8], 4
-    ret
-bp32_over:
-    mov     byte ptr [g_xl_err], 1
+; buf_pu32(rcx=desc, edx=val) - little-endian
+buf_pu32 proc frame
+    FRAME_PROLOG 48
+    mov     dword ptr [rbp-24], edx
+    lea     rdx, [rbp-24]
+    mov     r8d, 4
+    call    buf_putn
+    FRAME_EPILOG
     ret
 buf_pu32 endp
 
-; buf_putcstr(rcx=desc, rdx=cstr)                                              leaf
-buf_putcstr proc
-bpc_lp:
-    mov     r8b, byte ptr [rdx]
-    test    r8b, r8b
-    jz      bpc_ret
-    mov     rax, qword ptr [rcx+8]
-    cmp     rax, qword ptr [rcx+16]
-    jae     bpc_over
-    mov     r10, qword ptr [rcx]
-    mov     byte ptr [r10+rax], r8b
-    inc     qword ptr [rcx+8]
-    inc     rdx
-    jmp     bpc_lp
-bpc_ret:
-    ret
-bpc_over:
-    mov     byte ptr [g_xl_err], 1
+; buf_putcstr(rcx=desc, rdx=cstr)
+buf_putcstr proc frame
+    FRAME_PROLOG 32
+    xor     r8, r8
+bpc_len:
+    cmp     byte ptr [rdx+r8], 0
+    je      bpc_go
+    inc     r8
+    jmp     bpc_len
+bpc_go:
+    call    buf_putn
+    FRAME_EPILOG
     ret
 buf_putcstr endp
 
@@ -1267,9 +1359,10 @@ buf_pu32dec endp
 ;   would advance to ZE_MAXFILE+1 (a record written out of bounds) and this FAILS.
 ; =============================================================================
 .data
-CSTR zxc_ok,  "zexcap: PASS (central-dir cap enforced; OOB write into key material refused)",13,10
+CSTR zxc_ok,  "zexcap: PASS (central-dir cap enforced; an over-capacity member grows the archive, never overruns it)",13,10
 CSTR zxc_bad, "zexcap: FAIL (ze_add_file wrote a record past g_ze_cd[ZE_MAXFILE])",13,10
 zxc_name db "a"
+zxc_pw   db "test"
 .code
 LANDING_PAD
 public cmd_zexcap
@@ -1291,6 +1384,36 @@ cmd_zexcap proc frame
     jne     zxc_fail
     cmp     dword ptr [g_ze_cn], ZE_MAXFILE     ; count unchanged => no OOB record written
     jne     zxc_fail
+    call    ze_free
+    ; ---- a member larger than the archive's capacity -------------------------
+    ; This is the 32 MiB export case at test scale: shrink the capacity to 64 bytes
+    ; and add a 300-byte member.  It used to encrypt past the end of the buffer; it
+    ; must now grow it, land every byte, and report no error.
+    call    ze_reset
+    test    eax, eax
+    jnz     zxc_fail
+    mov     dword ptr [g_ze_cn], 0
+    mov     byte ptr [g_xl_err], 0
+    lea     rcx, [zxc_pw]
+    mov     edx, 4
+    call    ze_set_pw
+    lea     r10, [g_zbuf]
+    mov     qword ptr [r10+16], 64
+    lea     rcx, [zxc_name]
+    mov     edx, 1
+    lea     r8, [g_ze_cd]                       ; any 300 readable bytes
+    mov     r9, 300
+    call    ze_add_file
+    test    eax, eax
+    jnz     zxc_fail
+    cmp     byte ptr [g_xl_err], 0
+    jne     zxc_fail
+    lea     r10, [g_zbuf]
+    cmp     qword ptr [r10+8], 30+1+11+16+2+300+10   ; header+name+extra+salt+verify+data+mac
+    jne     zxc_fail
+    cmp     qword ptr [r10+16], 30+1+11+16+2+300+10
+    jb      zxc_fail
+    call    ze_free
     lea     rcx, [zxc_ok]
     mov     edx, zxc_ok_len
     call    print_a

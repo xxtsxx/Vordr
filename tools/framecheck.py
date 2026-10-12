@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
-"""framecheck v2 - static stack-frame safety scanner for Vordr's MASM sources.
+"""framecheck v3 - static stack-frame safety scanner for Vordr's MASM sources.
+
+Each rule below was added after a bug of that shape got past both the assembler
+and a careful read.  v3 takes back Myrkr's improvements to the Vordr original:
+raw-proc counting with a coverage floor, a FATAL for a raw epilogue that gives
+back a different size than its prologue took, `sizeof` folded inside larger
+expressions, self-write stack args not counted as overlap, and --strict.
 
 Two proc shapes are scanned:
 
-1. FRAME_PROLOG procs (the v1 check): flag procs where the stack-arg spill of
-   the widest WINCALL (args 5+ go to [rsp+32], [rsp+40], ...) could overlap the
-   proc's deepest [rbp-N] local.  This is a HEURISTIC: per the project's frame
+1. FRAME_PROLOG procs: flag procs where the stack-arg spill of the widest
+   WINCALL (args 5+ go to [rsp+32], [rsp+40], ...) could overlap the proc's
+   deepest [rbp-N] local.  This is a HEURISTIC: per the project's frame
    convention a spill slot may legally share bytes with a local that is DEAD at
    that call, so these are reported as "warn" and a curated allowlist silences
-   the historically verified-safe sites.  The frame size may be a plain number
-   or any constant MASM expression ("FRAME_PROLOG 96 + BLAKE2B_CTX_SIZE");
-   equ names and sizeof STRUCT are evaluated from the sources, and a frame
-   whose size cannot be resolved is reported as warn (never silently skipped).
+   the verified-safe sites.  The frame size may be a plain number or any
+   constant MASM expression ("FRAME_PROLOG 32 + sizeof ARGON2REQ + 32"); equ
+   names and sizeof STRUCT are evaluated from the sources, and a frame whose
+   size cannot be resolved is reported as warn (never silently skipped).
 
-2. Raw procs ("push rbp / mov rbp,rsp / sub rsp,N", no FRAME_PROLOG - i.e. the
-   dialog/window procs): these are the dangerous ones that v1 never saw.
+2. Raw procs ("push rbp / mov rbp,rsp / sub rsp,N", no FRAME_PROLOG - the
+   dialog/window procs and thread entries).  These are the dangerous ones:
    - FATAL: a WINCALL (or explicit [rsp+K] arg store) whose spill area extends
      PAST the N-byte frame, clobbering the saved rbp / return address.  This is
      the exact class that crashed create_proc (14-arg CreateFontW in a
@@ -22,7 +28,7 @@ Two proc shapes are scanned:
    - WARN:  the spill stays inside the frame but reaches into the proc's
      deepest [rbp-N] local region (possible silent corruption).
    Manual "sub rsp,K ... call ... add rsp,K" extensions and push/pop are
-   tracked, so about_proc-style widened call sites are judged with K included.
+   tracked, so widened call sites are judged with K included.
 
 Exit code: number of FATALs (so "build strict" can gate on it); warns are
 informational.  Usage: python tools\\framecheck.py [--src DIR] [--fatal-only]
@@ -33,26 +39,29 @@ import floors                            # coverage floors: see tools/floors.py
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEF_SRC = os.path.normpath(os.path.join(HERE, "..", "src"))
 
-# FRAME_PROLOG heuristic findings verified safe in the 2026-07 audit (proc names).
+# FRAME_PROLOG heuristic findings reviewed and accepted (proc names).  Add a
+# name here only with a comment saying why the overlapped local is dead at that
+# call - an unexplained entry is indistinguishable from a silenced bug.
 # read_file/write_file DELIBERATELY overlap ReadFile/WriteFile's out-param slot
 # with the lpOverlapped=NULL stack-arg slot (exact-sized frames, documented).
 # gui_temp_purge documents the same pattern: its deepest live local is rbp-56
 # and [rbp-64] is a throwaway bytes-written slot that intentionally sits in
 # the CreateFileW(7)/WriteFile(5) spill zone.
 ALLOW_FP = {
-    "gui_draw_sbadge", "read_file", "write_file", "gui_temp_purge",
+    "gui_draw_sbadge", "write_file", "gui_temp_purge",
 }
 
 # Home-space findings that are safe by inspection rather than by frame size.
 # read_file DELIBERATELY aliases ReadFile's lpNumberOfBytesRead with the
 # lpOverlapped=NULL slot; write_file/gui_temp_purge document the same pattern.
 ALLOW_HOME = {
-    "read_file", "write_file", "gui_temp_purge",
+    "write_file", "gui_temp_purge",
 }
+# read_file left both lists (2026-10-12): an allowlisted proc is an unchecked one,
+# and a new local added under the allowlist landed in CreateFileW's arg area.
 
-# Raw-proc warn findings verified safe: url_editproc's 5-arg CallWindowProcW
-# spills [rbp-32] onto [rsp+32] which IS [rbp-32] in its 64-byte frame - the
-# local is overwritten with its own value and is dead after the call.
+# Raw-proc warn findings verified safe (url_editproc's self-write is now
+# recognised by the rule itself; the entry stays until a run proves it unneeded).
 ALLOW_RAW_WARN = {
     "url_editproc",
 }
@@ -122,8 +131,8 @@ RE_ADDRSP = re.compile(r'^\s*add\s+rsp\s*,\s*([0-9*+ ]+?)\s*$', re.I)
 RE_PUSH   = re.compile(r'^\s*push\s+\w+', re.I)
 RE_POP    = re.compile(r'^\s*pop\s+\w+', re.I)
 # A local is referenced either as [rbp-N] or, when its ADDRESS is handed to an
-# API, as "addr rbp-N".  Missing the second form is how the GetClientRect output
-# buffer in gui_draw_field_cards hid inside that call's own home space.
+# API, as "addr rbp-N".  Missing the second form hides an output buffer inside
+# the call's own home space.
 RE_LOCAL  = re.compile(r'(?:\[rbp\s*-\s*(\d+)\]|\baddr\s+rbp\s*-\s*(\d+)\b)', re.I)
 RE_EXTERN = re.compile(r'^\s*extern\s+([\w$]+)\s*:\s*proc', re.I)
 # __WSTKARG stores an absolute constant or a 64-bit register straight to [rsp+K];
@@ -143,11 +152,12 @@ RE_RSPST  = re.compile(
     r'(?:(qword|dword|word|byte|xmmword)\s+ptr\s+)?\[rsp\s*\+\s*(\d+)\]\s*,', re.I)
 ST_SIZE = {'qword': 8, 'dword': 4, 'word': 2, 'byte': 1, 'xmmword': 16}
 RE_MOVRSPBASE = re.compile(r'^\s*mov\s+rsp\s*,\s*rbp', re.I)
+RE_POPRBP     = re.compile(r'^\s*pop\s+rbp\b', re.I)
 
 EQUS = {}
 STRUCTS = {}
 EXTERNS = set()          # `extern X:proc` - a Win32 callee, free to use its home space
-STATS = {'fp': 0, 'sym': 0}
+STATS = {'fp': 0, 'sym': 0, 'raw': 0}
 
 def masm_int(tok):
     """MASM integer literal -> int or None: decimal, 0x.., or trailing-h hex (0FFh)."""
@@ -168,6 +178,21 @@ def eval_size(expr, depth=0):
     if m:
         if m.group(1) not in STRUCTS: raise ValueError(f"unknown struct {m.group(1)}")
         return STRUCTS[m.group(1)]
+    # `sizeof NAME` inside a larger expression ("32 + (sizeof ARGON2REQ) + 32"):
+    # fold each occurrence to a literal before tokenising, or the loop below
+    # meets a bare `sizeof` token and gives up - which silently left derive_key,
+    # on the key-derivation path, reported as NOT CHECKED.
+    if re.search(r'\bsizeof\b', expr, re.I):
+        missing = []
+        def _sz(mm):
+            name = mm.group(1)
+            if name not in STRUCTS:
+                missing.append(name)
+                return '0'
+            return str(STRUCTS[name])
+        expr = re.sub(r'\bsizeof\s+([\w$]+)', _sz, expr, flags=re.I)
+        if missing:
+            raise ValueError(f"unknown struct {missing[0]}")
     out = []
     for t in re.findall(r'[\w$]+|[()+*/-]', expr):
         n = masm_int(t)
@@ -226,7 +251,7 @@ def scan_file(path, results):
                 maxloc = max(maxloc, int(mm.group(1) or mm.group(2)))
 
         if fp:
-            # ---- v1 heuristic on FRAME_PROLOG procs -------------------------
+            # ---- heuristic on FRAME_PROLOG procs ----------------------------
             try:
                 N = eval_size(fp.group(1))
             except ValueError as e:
@@ -251,8 +276,8 @@ def scan_file(path, results):
             # The 32-byte home area belongs to the CALLEE for any arg count, and
             # a Win32 callee really does save nonvolatiles there (GetClientRect
             # homes four on its first instruction).  Internal procs never touch a
-            # caller's home space - an unwritten invariant this whole codebase
-            # relies on - so only extern callees are judged here.
+            # caller's home space - an unwritten invariant this codebase relies
+            # on - so only extern callees are judged here.
             worst = 0; wat = start; wcallee = None
             for ln, s in merged:
                 callee, args = wincall_parts(s)
@@ -263,7 +288,7 @@ def scan_file(path, results):
                 # __WSTKARG emits the stack args BEFORE the register args, and
                 # every form except an absolute constant or a 64-bit register
                 # goes out through rax.  Passing rax itself as arg 1-4 then
-                # loads the wrong value (this silently broke gui_reflow).
+                # loads the wrong value.
                 if len(args) > 4 and any(a.strip().lower() in ('rax', 'eax')
                                          for a in args[:4]) \
                    and any(clobbers_rax(a) for a in args[4:]):
@@ -278,7 +303,7 @@ def scan_file(path, results):
                     f"-{maxloc} lies in {wcallee}'s home/arg area (rsp..rsp+{worst}) "
                     f"- a Win32 callee may save registers over it"))
         else:
-            # ---- v2: raw proc ----------------------------------------------
+            # ---- raw proc ---------------------------------------------------
             # find the raw prologue: sub rsp,N within the first few lines
             N = None; pidx = None
             for idx, (ln, s) in enumerate(merged[:6]):
@@ -286,8 +311,54 @@ def scan_file(path, results):
                 if sm: N = eval(sm.group(1)); pidx = idx; break
             if N is None:
                 i = end + 1; continue   # leaf/trampoline without a frame
+            STATS['raw'] += 1
             extra = 0                    # manual sub/add rsp + push/pop tracking
-            for ln, s in merged[pidx + 1:]:
+            tail = merged[pidx + 1:]
+            # An "add rsp, N" whose next code line is "pop rbp" is an EPILOGUE,
+            # not a frame shrink: control resumes at the following label with the
+            # original frame intact.  gui.asm's raw procs return through several
+            # such exits, and counting each one drove the running total negative,
+            # reporting an impossible frame and a phantom FATAL in
+            # slider_subclass.  Vordr's procs epilogue with "mov rsp, rbp"
+            # instead, which RE_MOVRSPBASE already handled, so its version never
+            # saw this idiom.  Mark both lines of each pair as epilogue.
+            epilogue = set()
+            epilogue_add = {}            # index of the "add rsp,N" -> N
+            for k, (_, s) in enumerate(tail):
+                am0 = RE_ADDRSP.match(s)
+                if not am0:
+                    continue
+                nxt = next(((j, t) for j, (_, t) in enumerate(tail[k + 1:k + 3])
+                            if t.strip()), None)
+                if nxt and RE_POPRBP.match(nxt[1]):
+                    epilogue.add(k)
+                    epilogue.add(k + 1 + nxt[0])
+                    epilogue_add[k] = eval(am0.group(1))
+            for k, (ln, s) in enumerate(tail):
+                # ---- the epilogue must give back exactly what the prologue took.
+                # A raw proc writes its frame size TWICE, by hand, and the two can
+                # be edited apart: raise "sub rsp,160" to 256 for a bigger local,
+                # leave "add rsp,160" alone, and every return pops rbp and then the
+                # return address from 96 bytes below where they were pushed.  The
+                # process jumps to whatever that stack slot held.
+                #
+                # It costs nothing to check and it is invisible otherwise: the
+                # assembler is happy, the linker is happy, and the failure arrives
+                # as an access violation in no module at all (WER buckets it BEX64,
+                # "faulting module: unknown").  That is exactly how it presented in
+                # myrkrshell.dll's QueryContextMenu, where it took explorer.exe
+                # down on every right-drag.
+                if k in epilogue_add:
+                    want = N + extra
+                    if epilogue_add[k] != want:
+                        results.append(("FATAL", fname, start + ln + 1, name,
+                            f"epilogue gives back {epilogue_add[k]} bytes but the frame "
+                            f"is {want} (sub rsp,{N}"
+                            + (f" plus {extra} pushed since" if extra else "")
+                            + ") - pop rbp and ret then read the wrong slots"))
+                    extra = 0; continue
+                if k in epilogue:
+                    extra = 0; continue  # frame restored for the next label
                 if RE_MOVRSPBASE.match(s):
                     extra = 0; continue  # epilogue "mov rsp, rbp"
                 sm = RE_SUBRSP.match(s)
@@ -298,11 +369,29 @@ def scan_file(path, results):
                 if RE_PUSH.match(s): extra += 8; continue
                 if RE_POP.match(s):  extra -= 8; continue
 
-                spill_end = 0; desc = None
+                spill_end = 0; desc = None; live_end = 0
                 n = wincall_args(s)
                 if n > 4:
                     spill_end = 32 + 8 * (n - 4)
                     desc = f"{n}-arg WINCALL"
+                    # A stack arg whose SOURCE is the very slot it is stored to
+                    # is a no-op: __WSTKARG loads [rbp-M] and writes it back to
+                    # [rsp+K], and for this frame those are the same address.
+                    # Such a slot cannot corrupt anything, so it must not count
+                    # toward the "reaches the local region" warning - otherwise
+                    # the idiom that dr_text/draw_logo/list_subclass all use
+                    # produces a permanent warn nobody can act on.
+                    _, cargs = wincall_parts(s)
+                    frame_now = N + extra
+                    live_end = 32
+                    for k in range(4, len(cargs)):
+                        dest = 32 + 8 * (k - 4)
+                        m_self = re.fullmatch(
+                            r'(?:qword|dword|word|byte)\s+ptr\s+\[rbp\s*-\s*(\d+)\]',
+                            cargs[k].strip(), re.I)
+                        if m_self and int(m_self.group(1)) == frame_now - dest:
+                            continue                # self-write: harmless
+                        live_end = max(live_end, dest + 8)
                 else:
                     # explicit write to [rsp+K] (outgoing arg or xmm save)
                     mm = RE_RSPST.match(s)
@@ -313,6 +402,7 @@ def scan_file(path, results):
                         k = int(mm.group(3))
                         if k + sz > spill_end:
                             spill_end = k + sz; desc = f"{sz}-byte store to [rsp+{k}]"
+                            live_end = spill_end
                 if not spill_end: continue
 
                 frame = N + extra
@@ -321,9 +411,9 @@ def scan_file(path, results):
                         f"{desc} spills to rsp+{spill_end - 8} but the raw frame is "
                         f"only {frame} bytes (sub rsp,{N}{f' +{extra} manual' if extra else ''}) "
                         f"- saved rbp/return address clobbered (BEX64 class)"))
-                elif spill_end > frame - maxloc and maxloc and name not in ALLOW_RAW_WARN:
+                elif live_end > frame - maxloc and maxloc and name not in ALLOW_RAW_WARN:
                     results.append(("warn", fname, start + ln + 1, name,
-                        f"{desc} spill (to rsp+{spill_end - 8}) reaches the local region "
+                        f"{desc} spill (to rsp+{live_end - 8}) reaches the local region "
                         f"(frame {frame}, deepest local -{maxloc}) - verify liveness"))
         i = end + 1
 
@@ -331,6 +421,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", default=DEF_SRC)
     ap.add_argument("--fatal-only", action="store_true")
+    ap.add_argument("--strict", action="store_true",
+                    help="count warns toward the exit code.  The tree is at zero "
+                         "warns; gating keeps it there, so a new overlap has to be "
+                         "either fixed or allowlisted with a reason, not just "
+                         "printed into a list nobody reads.")
     args = ap.parse_args()
     files = sorted(glob.glob(os.path.join(args.src, "*.asm")))
     inc = os.path.join(args.src, "macros.inc")
@@ -346,8 +441,11 @@ def main():
     n_warn = sum(1 for r in results if r[0] == 'warn')
     print(f"framecheck: {fatals} fatal, {n_warn} warn "
           f"({'clean' if fatals == 0 else 'FRAME BUGS PRESENT'}); "
-          f"{STATS['fp']} FRAME_PROLOG procs checked ({STATS['sym']} symbolic-size)")
-    fatals += floors.check("framecheck", {"procs": STATS['fp']})
+          f"{STATS['fp']} FRAME_PROLOG + {STATS['raw']} raw procs checked "
+          f"({STATS['sym']} symbolic-size)")
+    fatals += floors.check("framecheck", {"procs": STATS['fp'], "raw": STATS['raw']})
+    if args.strict:
+        fatals += n_warn
     sys.exit(min(fatals, 255))
 
 if __name__ == "__main__":

@@ -27,6 +27,7 @@ extern SetWindowSubclass:proc
 extern DefSubclassProc:proc
 extern TrackMouseEvent:proc
 extern hardening_init:proc
+extern sec_lock_statics:proc            ; secmem.asm: VirtualLock the static secret buffers
 extern crash_install:proc               ; hardening.asm: arm crash containment
 externdef g_gui_active:dword            ; hardening.asm: gate the crash apology box
 extern con_init:proc
@@ -256,6 +257,30 @@ extern FrameRect:proc
 extern MapDialogRect:proc
 extern SendMessageW:proc
 extern PostMessageW:proc
+extern AlphaBlend:proc                   ; the entry list's drawn scrollbar thumb
+extern CreateRoundRectRgn:proc
+extern SelectClipRgn:proc
+extern CreateCompatibleDC:proc
+extern CreateCompatibleBitmap:proc
+extern SetPixel:proc
+extern GetDC:proc
+extern ReleaseDC:proc
+extern SetCapture:proc
+extern ReleaseCapture:proc
+extern ShowScrollBar:proc
+extern SaveDC:proc                       ; the detail pane's thumb, drawn in the erase DC
+extern RestoreDC:proc
+extern ExtSelectClipRgn:proc
+extern sstk_thread_init:proc             ; hardening.asm: per-thread shadow stack
+extern sstk_thread_free:proc
+externdef g_rf_cap:qword
+externdef g_zi_unsup:dword
+extern EnumThreadWindows:proc            ; gui_end_modals: a lock closes our modals first
+extern GetClassNameW:proc
+extern IsWindowEnabled:proc
+extern GetWindow:proc
+extern GetFileInformationByHandle:proc   ; gui_same_file: export onto the open vault
+extern secmem_wipe_statics:proc          ; lock: every static secret buffer, not a list here
 extern SetWindowTextW:proc
 extern GetDlgCtrlID:proc
 extern GetKeyState:proc
@@ -340,6 +365,40 @@ WM_SETFONT          equ 30h
 WM_MOUSEWHEEL       equ 20Ah
 WM_MOUSEMOVE_       equ 200h
 WM_MOUSELEAVE_      equ 2A3h
+WM_LBUTTONDOWN_     equ 201h
+WM_CAPTURECHANGED_  equ 215h
+WM_VSCROLL_         equ 115h
+LB_GETTOPINDEX_     equ 18Eh
+LB_SETTOPINDEX_     equ 197h
+LB_GETITEMHEIGHT_   equ 1A1h
+LB_MSG_FIRST        equ 180h          ; LB_ADDSTRING ..
+LB_MSG_LAST         equ 1B0h          ;   .. the listbox message range
+; ---- the entry list's scrollbar: drawn, not a control (after Myrkr) ----------
+; The native bar was a wide, theme-dependent stripe down the sidebar.  This is a
+; thin translucent thumb drawn over the cards right after the list paints, so
+; nothing can land on top of it; it widens while the pointer is over the strip
+; or while it is dragged.  It is always shown (thin) when there is something to
+; scroll - a bar that appears only on hover hides the fact that the list scrolls.
+; The listbox scrolls in whole cards (LB_SETTOPINDEX); the bar's maths is in
+; cards, not pixels.  (Myrkr's pixel-smooth trick - an oversized control under a
+; window region - does not carry over: a few thousand cards is a window far
+; taller than the 16-bit sizes WM_SIZE reports.)
+LBSB_HOT            equ 16            ; the strip at the right edge that hovers/clicks
+LBSB_W_IDLE         equ 3             ; thumb width at rest
+LBSB_W_HOT          equ 8             ;   and while hovered or dragged
+LBSB_INSET          equ 3             ; held off the right edge
+LBSB_MINH           equ 28            ; shorter than this cannot be grabbed
+LBSB_ALPHA          equ 150           ; ~59% over the card colour
+LBSB_RADIUS         equ 4
+LBSB_WHEEL_CARDS    equ 3             ; cards per wheel notch
+AC_SRC_OVER_        equ 0
+LVM_GETITEMRECT_    equ 100Eh         ; ListView messages the export/import checklist's
+LVM_SCROLL_         equ 1014h         ;   drawn scrollbar uses (same lbsb_* code, kind 1)
+LVM_GETTOPINDEX_    equ 1027h
+LVM_MSG_FIRST       equ 1000h
+LVM_MSG_LAST        equ 10FFh
+WM_NCCALCSIZE_      equ 083h
+SB_BOTH_            equ 3
 WM_CHAR_            equ 102h
 WM_KEYDOWN_         equ 100h
 VK_CONTROL_         equ 11h
@@ -683,10 +742,16 @@ DESCSZ      equ 480            ; 16 + 16 handles*8 + 328 arf blob + 8 reserved (
 ; into one row backed by g_tilefiles (see the tf_* helpers).  Each file entry is
 ; {AttachRef[68], filename wide (NUL-terminated, <=129 wchars)}.
 MAX_TFILES  equ 24             ; <= MAX_FIELDS minus the other fields of an entry
+ATT_FILE_MAX equ 10000000h     ; 256 MiB per attached file: read_file refuses past it
+PW_MAXCH    equ 1023           ; master-password edits: g_pwbuf/g_pw2buf hold 1024 wide
+XLPW_MAXCH  equ 254            ; export/import password edits: g_xlpw holds 256 wide
+LBL_MAXCH   equ 127            ; row-label edits: g_rlabel holds 128 wide
+SRCH_MAXCH  equ 254            ; search boxes: read with a 255 count
+WM_GETTEXTLENGTH_ equ 0Eh
 ; secure temp-file tracking: every attachment decrypted to %TEMP% is
 ; recorded here and, on vault lock/exit, overwritten with zeros then deleted.
 MAX_TEMPFILES equ 16           ; tracked decrypt-to-temp files per session
-TEMP_PATHW    equ 300          ; wide chars reserved per temp path
+TEMP_PATHW    equ 1024         ; wide chars reserved per temp path (a long %TEMP% works)
 TEMP_SIZEOFF  equ TEMP_PATHW*2 ; qword plaintext size lives after the path
 TEMP_DIROFF   equ TEMP_SIZEOFF+8 ; directory terminator offset in WCHARs, 0 = none
 TEMPREC       equ TEMP_SIZEOFF+16
@@ -725,6 +790,12 @@ MAXROWS     equ 64
 ; scale with MAXROWS - at 24 rows a fixed 4096 still fit, at 64 it did not.
 ; gui_gather also range-checks against this, so the two can never drift again.
 LBLBLOB_W   equ MAXROWS*128
+; Commit scratch for field VALUES.  Every row's edit takes up to CONVW_MAX-1 chars
+; (+ NUL), and the title the same, so this is the worst case, not an estimate.  It
+; was 32768 for all rows together: two long Notes fields used it up, the next value
+; was cut short without a word, and once the budget hit 0 the value pointer walked
+; off the end into g_lblblob - storing some LABEL's text as that field's value.
+VALBLOB_W   equ (MAXROWS+1)*CONVW_MAX
 FDF_LABELED equ 1               ; FD_FLAGS bit0 = carries a custom label
 FDF_REVEALED equ 2              ; FD_FLAGS bit1 = value currently unmasked
 FDF_PWLVL_MASK equ 30h          ; FD_FLAGS bits4-5 = secret strength grade 0..3
@@ -880,6 +951,21 @@ WSTR g_unlock_title,   <Vordr - Unlock vault>
 WSTR g_create_title,   <Vordr - Set master password>
 WSTR s_createfail,  <Could not create the vault (I/O or out of memory).>
 WSTR s_notitle,     <An entry needs a title.>
+WSTR s_attfail,     <Some files were not attached. An entry holds at most 24 files of up to 256 MB each, and a file that is locked or cannot be read is skipped.>
+WSTR s_urllong,     <This address is too long to open from Vordr (over 1023 characters). Copy it and paste it into your browser instead.>
+WSTR s_readlong,    <Read aloud handles passwords of up to 255 characters, and this one is longer.>
+WSTR s_sdfall,      <The private desktop for entering your password could not be created, so the password will be typed on the normal desktop this time.>
+WSTR imp_g_unsup,   <This is an encrypted ZIP, but not one Vordr can read: Vordr imports only archives encrypted with AES-256 and stored without compression, as Vordr itself exports them.>
+WSTR s_trunc,       <This entry holds more than Vordr can show (too many fields, a value that is too long, or an attachment that could not be listed). It is read-only, because saving it from this screen would drop the part that is not shown.>
+WSTR s_buildfull,   <This entry does not fit in the vault - it is full, or a field is too long. Nothing was saved.>
+WSTR s_resealbad,   <The change was not saved: the result failed the integrity check that runs before every write. The vault file on disk is unchanged.>
+WSTR s_reloadfail,  <This vault was changed on disk, but the new version could not be read. The vault you have open is unchanged and your change was not saved. Try again once the file is available.>
+WSTR s_rbreload,    <The vault file was replaced on disk by an OLDER copy than the last one saved on this PC, and that copy is now open. Entries saved since may be missing. If you did not restore a backup, lock Vordr and check the file before saving.>
+WSTR exp_self,      <That file is the vault you have open. Choose another name for the export.>
+WSTR motw_ads,      <:Zone.Identifier>
+WSTR dlg_cls_w,     <#32770>
+motw_body   db "[ZoneTransfer]",13,10,"ZoneId=3",13,10
+motw_body_len equ $ - motw_body
 WSTR s_tempbusy,    <Some preview files are still in use. Close their applications and try exiting again. Cleanup will keep retrying while Vordr is running.>
 WSTR s_editnomem,   <Could not allocate secure memory for this edit. Your changes have not been saved. Please retry.>
 WSTR s_nofieldroom, <This record already has the maximum number of fields.>
@@ -1013,8 +1099,8 @@ dbg_static_cls label word                   ; system class for the no-registrati
     dw 'S','t','a','t','i','c', 0
 tray_wt label word
     dw 'V','o','r','d','r', 0
-secdesk_name label word                          ; private desktop for password entry
-    dw 'V','o','r','d','r','-','S','e','c','u','r','e', 0
+secdesk_pfx label word                           ; private desktop for password entry:
+    dw 'V','o','r','d','r','-','S','e','c','u','r','e','-', 0   ; + 16 random hex per use
 desk_default label word                          ; the normal interactive desktop, by name:
     dw 'D','e','f','a','u','l','t', 0            ;   secdesk_restore's last resort
 WSTR cf_hist_name,  <CanIncludeInClipboardHistory>
@@ -1329,6 +1415,14 @@ exec_exts label word
     dw 'm','s','i','x',0,  'a','p','p','x',0
     dw 'a','p','p','x','b','u','n','d','l','e',0,  'm','s','i','x','b','u','n','d','l','e',0
     dw 'p','s','1','x','m','l',0,  'm','s','h',0,  'w','s',0
+    dw 'm','s','h','1',0,  'm','s','h','2',0,  'm','s','h','x','m','l',0,  'm','s','h','1','x','m','l',0,  'm','s','h','2','x','m','l',0
+    dw 'p','s','2',0,  'p','s','2','x','m','l',0,  'p','s','c','2',0,  'p','s','d','1',0,  'p','s','m','1',0
+    dw 'a','p','p','r','e','f','-','m','s',0,  'l','i','b','r','a','r','y','-','m','s',0,  's','e','a','r','c','h','-','m','s',0
+    dw 's','e','a','r','c','h','c','o','n','n','e','c','t','o','r','-','m','s',0,  's','e','t','t','i','n','g','c','o','n','t','e','n','t','-','m','s',0
+    dw 'w','e','b','s','i','t','e',0,  'x','b','a','p',0,  'x','l','l',0,  'w','s','b',0,  'd','i','a','g','c','a','b',0,  'm','s','u',0
+    dw 'v','s','t','o',0,  'j','n','l','p',0,  'a','p','p','i','n','s','t','a','l','l','e','r',0,  't','h','e','m','e',0,  't','h','e','m','e','p','a','c','k',0
+    dw 'd','e','s','k','t','h','e','m','e','p','a','c','k',0,  'i','s','o',0,  'i','m','g',0,  'v','h','d',0,  'v','h','d','x',0
+    dw 'p','y',0,  'p','y','w',0,  'p','y','z',0,  'p','y','z','w',0,  'p','l',0,  'r','b',0
     dw 0                                             ; double-NUL terminator
 badge_weak label word
     dw 'W','e','a','k', 0
@@ -1494,6 +1588,9 @@ g_secdesk_orig  dq ?                  ; HDESK of the original input desktop (res
 g_secdesk_res   dq ?                  ; DialogBox result marshalled back to the caller
 g_secdesk_orphan dd ?                 ; 1 = the watchdog gave up on a wedged worker
 align 2
+g_secdesk_name  dw 32 dup (?)         ; "Vordr-Secure-<16 hex>": a fixed, well-known name let any
+                                      ;   process open the desktop and wait on it by name
+align 2
 g_errbuf    dw 256 dup (?)            ; "<prefix> <number>" built by gui_num_msg
 align 4
 g_home_stats dd 4 dup (?)             ; vault_health: {weak, reused, old, total}
@@ -1509,17 +1606,6 @@ align 8
 g_cds          db 24 dup (?)          ; COPYDATASTRUCT {dwData, cbData, pad, lpData}
 g_exedir    dw MAX_PATH_CHARS dup (?)  ; folder holding vordr.exe
 g_initdir   dw MAX_PATH_CHARS dup (?)  ; explicit start folder for the vault picker
-align 8
-; The software shadow stack (g_sstk_base/g_sstk_index) is a process-global, but
-; the Secure-Unlock dialog runs on a SEPARATE worker thread (secdesk_thread) that
-; executes framed code.  If the worker pushed/popped onto the main thread's shared
-; stack it could corrupt the main thread's parked frames -> intermittent
-; FF_SHADOW_STACK on the next real return.  The worker gets its OWN shadow stack,
-; swapped in for the duration of its run (the main thread is blocked in
-; WaitForSingleObject, so touching these globals is race-free).
-g_sstk_worker   dq SSTK_CAPACITY dup (?)  ; the worker thread's isolated shadow stack
-g_sstk_savebase dq ?                  ; main thread's g_sstk_base, parked during the worker
-g_sstk_saveidx  dq ?                  ; main thread's g_sstk_index, parked during the worker
 g_nid       db 976 dup (?)           ; NOTIFYICONDATAW (x64 full size)
 g_wc        db 80 dup (?)            ; WNDCLASSW (72 used)
 g_msg       db 56 dup (?)            ; MSG
@@ -1583,6 +1669,59 @@ g_edit_backup_len dq ?                ; panic wipe must cover both copies
 g_edit_history dq ?                   ; history rollback copy in the working arena's tail
 g_loading   dd ?                      ; 1 = programmatically loading fields (ignore EN_CHANGE)
 g_editmode  dd ?                      ; 1 = detail fields editable (view/edit toggle)
+g_cur_trunc dd ?                      ; 1 = the shown entry did not fully load: too many fields,
+                                      ;   a value too long to show, an attachment not listed.
+                                      ;   Saves rebuild the entry from the screen, so it is read-only.
+g_setfield_lossy dd ?                 ; gui_setfield: a non-empty value converted to nothing
+g_lock_tries dd ?                     ; vp_lock_req: re-posts while waiting for modals to close
+g_em_count  dd ?                      ; gui_end_modals: dialogs ended this pass
+align 2
+g_em_cls    dw 16 dup (?)             ; gem_cb: window class scratch
+; entry-list scrollbar (lbsb_*).  Transient UI state: zeroed in vp_init.
+align 8
+g_lbsb_sdc   dq ?                     ; 1x1 source DC + bitmap for AlphaBlend (kept for
+g_lbsb_sbmp  dq ?                     ;   the process, like the theme brushes)
+g_lbsb_scol  dd ?                     ; colour the source pixel holds (-1 = none yet)
+g_lbsb_hover dd ?                     ; pointer over the strip
+g_lbsb_track dd ?                     ; thumb drag in progress (mouse captured)
+g_lbsb_top   dd ?                     ; top index last painted - a change means the
+                                      ;   list scrolled and the strip must repaint
+g_lbsb_busy  dd ?                     ; re-entrancy guard for lbsb_scrollcheck
+g_lbsb_kind  dd ?                     ; 0 = listbox (entry list), 1 = report ListView
+                                      ;   (export/import checklist).  Set by the subclass
+                                      ;   on entry; the two are never live at once - the
+                                      ;   checklist is modal over the vault window.
+g_lbsb_grabtop dd ?                   ; drag: top index and screen y at the grab
+g_lbsb_graby dd ?
+g_lbsb_w     dd ?                     ; geometry from lbsb_geom: client width,
+g_lbsb_view  dd ?                     ;   client height,
+g_lbsb_ih    dd ?                     ;   card height,
+g_lbsb_vis   dd ?                     ;   whole cards that fit,
+g_lbsb_topmax dd ?                    ;   highest useful top index,
+g_lbsb_curtop dd ?                    ;   top index now (clamped),
+g_lbsb_thh   dd ?                     ;   thumb height (0 = nothing to scroll),
+g_lbsb_thy   dd ?                     ;   thumb top, client y
+g_lbsb_rc    dd 4 dup (?)
+; detail pane (gui_dsb_*): it scrolls a whole card at a time instead of paging.
+;   g_cur_page is the TOP ROW now and g_page_count the number of valid top rows.
+g_dsb_view    dd ?                    ; field band height (DLU), from gui_rows_layout
+g_dsb_content dd ?                    ; all cards + gaps (DLU)
+g_dsb_ytop    dd ?                    ; virtual y of the top row (DLU)
+g_dsb_ymax    dd ?                    ; virtual y of the highest useful top row (DLU)
+g_dsb_lastvis dd ?                    ; last row on screen (-1 = none)
+g_dsb_hover   dd ?                    ; pointer over the strip   (zeroed in vp_init)
+g_dsb_wheelacc dd ?                   ; wheel delta not yet a whole card
+g_lbsb_wheelacc dd ?                  ; ... and for the lists (3 cards per 120)
+g_dsb_track   dd ?                    ; thumb drag in progress   (zeroed in vp_init)
+g_dsb_graby   dd ?
+g_dsb_grabtop dd ?
+g_dsb_cardr   dd ?                    ; px geometry from gui_dsb_geom: card right edge,
+g_dsb_t       dd ?                    ;   band top,
+g_dsb_b       dd ?                    ;   band bottom,
+g_dsb_thh     dd ?                    ;   thumb height (0 = all rows fit),
+g_dsb_thy     dd ?                    ;   thumb top
+g_lbsb_wr    dd 4 dup (?)
+g_lbsb_pt    dd 2 dup (?)
 g_new_pending dd ?                    ; 1 = current entry is a just-added placeholder (delete on Cancel)
 align 8
 public g_vaulthwnd
@@ -1605,10 +1744,14 @@ g_xlpw      dw 256 dup (?)         ; export password (wide; wiped after use)
 g_xlpw2     dw 256 dup (?)         ; export confirm password (wide; wiped)
 g_xlpwlen   dd ?                   ; export password length in bytes
 public g_pwbuf, g_pw2buf, g_secret_w, g_e_totp, g_totp_b32
+public g_conv_w, g_valblob, g_lblblob, g_tilefiles, g_tileblob, g_imgstageref
+public g_readpw, g_phon_w, g_genout, g_genout_w, g_xlpw, g_xlpw2, g_match_w, g_sub_w
+; ^ every buffer that holds a field value, a password or an AttachRef key: secmem.asm
+;   pins them at startup and wipes them on a crash (sec_regions)
 g_pwbuf     dw 1024 dup (?)        ; password field (wide; wiped after use)
 g_pw2buf    dw 1024 dup (?)        ; confirm-password field (wide; wiped)
 g_conv_w    dw CONVW_MAX dup (?)   ; utf8 -> wide display scratch (see CONVW_MAX)
-g_secret_w  dw EBUF*2 dup (?)      ; current selected secret (wide) for reveal/copy
+g_secret_w  dw CONVW_MAX dup (?)    ; current selected secret (wide) for reveal/copy
 g_e_totp    dw 256 dup (?)            ; entry-form base32 TOTP key (wide)
 g_totp_on   dd ?                      ; 1 if the selected entry has a TOTP key
 g_totp_secs dd ?                      ; seconds left in the current TOTP window
@@ -1741,6 +1884,7 @@ g_settings_hwnd dq ?                       ; the settings child dialog (0 = not 
 g_exp_iszip   dd ?                         ; export format the user chose: 0 = .vordr, 1 = .zip
                                            ;   (from the save dialog's filter index)
 g_tmpfile     dw MAX_PATH_CHARS dup (?)    ; temp path for opening an attachment (wide)
+g_motw_w      dw MAX_PATH_CHARS+32 dup (?) ; gui_motw: <path>:Zone.Identifier
 align 8
 g_tempfiles   db MAX_TEMPFILES*TEMPREC dup (?)  ; tracked decrypt-to-temp paths + sizes
 g_tempfile_n  dd ?                         ; number of live tracked temp files
@@ -1748,7 +1892,7 @@ g_tmpdir_len dd ?                          ; owned directory length for this pre
 g_wipezeros   db WIPE_CHUNK dup (?)        ; source of zeros for overwriting temp files
 align 2
 g_imgpath     dw MAX_PATH_CHARS dup (?)   ; import/export file path (wide)
-g_valblob   dw 32768 dup (?)          ; commit scratch: field values, NUL-joined
+g_valblob   dw VALBLOB_W dup (?)      ; commit scratch: field values, NUL-joined
 g_lblblob   dw LBLBLOB_W dup (?)      ; commit scratch: custom labels, NUL-joined
 g_rlabel    dw 128 dup (?)            ; per-row label read scratch
 g_grouptxt  dw 128 dup (?)            ; group-heading title read scratch (paint)
@@ -1757,7 +1901,7 @@ g_base_cy   dd ?
 g_base_winw dd ?                      ; vault window size recorded at init (min-track size)
 g_base_winh dd ?
 g_anchor_rect dd ANCHOR_N*4 dup (?)   ; per-control initial client {x,y,w,h}
-g_extw      dw 20 dup (?)             ; scratch: an attachment's extension, lowercased
+g_extw      dw 40 dup (?)             ; scratch: an attachment's extension, lowercased
 align 8
 g_ofn       OPENFILENAMEW <>
 
@@ -1797,12 +1941,22 @@ gui_setfield proc frame
     FRAME_PROLOG 64
     mov     qword ptr [rbp-24], rcx         ; hdlg
     mov     dword ptr [rbp-32], edx         ; id
+    mov     qword ptr [rbp-40], r8          ; src
+    mov     dword ptr [rbp-48], r9d         ; len
     ; convert into g_conv_w
     mov     rcx, r8
     mov     edx, r9d
     lea     r8, [g_conv_w]
     mov     r9d, CONVW_MAX-1
     call    gui_towide
+    test    eax, eax                        ; a non-empty value that produced nothing did not
+    jnz     gsf_set                         ;   fit: the edit now shows something other than
+    cmp     qword ptr [rbp-40], 0           ;   what is stored (g_cur_trunc)
+    je      gsf_set
+    cmp     dword ptr [rbp-48], 0
+    je      gsf_set
+    mov     dword ptr [g_setfield_lossy], 1
+gsf_set:
     WINCALL SetDlgItemTextW, qword ptr [rbp-24], dword ptr [rbp-32], addr g_conv_w
     FRAME_EPILOG
     ret
@@ -2027,7 +2181,7 @@ gsof_len:
     cmp     word ptr [r10+r8*2], 0
     je      gsof_have
     inc     r8d
-    cmp     r8d, 1023
+    cmp     r8d, MAX_PATH_CHARS-2               ; gui_stash_openfile's own bound
     jb      gsof_len
 gsof_have:
     inc     r8d
@@ -2068,7 +2222,7 @@ gxd_cut:
     cmp     r9d, 0
     jle     gxd_fail
     movsxd  r11, r9d
-    mov     word ptr [r10+r11*2], 0             ; strip "ordr.exe"
+    mov     word ptr [r10+r11*2], 0             ; strip "\vordr.exe"
     mov     eax, 1
     FRAME_EPILOG
     ret
@@ -2898,6 +3052,14 @@ up_init:
     mov     r9d, 1
     lea     rax, [cue_pw]
     mov     qword ptr [rsp+32], rax
+    call    SendDlgItemMessageW
+    add     rsp, 48
+    sub     rsp, 48                          ; typing stops where the buffer does, rather
+    mov     rcx, qword ptr [rbp-8]           ;   than the tail being dropped on read
+    mov     edx, IDC_U_PW
+    mov     r8d, EM_LIMITTEXT
+    mov     r9d, PW_MAXCH
+    mov     qword ptr [rsp+32], 0
     call    SendDlgItemMessageW
     add     rsp, 48
     sub     rsp, 32
@@ -4823,9 +4985,8 @@ dk_pghavex:
     ; sliver it uncovers - the area it VACATED keeps its old paint, so a stale
     ; digit can sit where a chevron just landed.  Repaint the whole bar row,
     ; children included, whenever the bar is up.
-    cmp     dword ptr [g_page_count], 1
-    jle     dk_done
-    mov     dword ptr [rbp-184], 0             ; strip {0, y-6, cx, y+30}
+    jmp     dk_done                            ; the page bar never shows now (the pane
+    mov     dword ptr [rbp-184], 0             ;   scrolls), so its row needs no repaint
     mov     eax, dword ptr [rbp-152]
     sub     eax, 6
     mov     dword ptr [rbp-180], eax
@@ -5412,6 +5573,8 @@ gsd_noicon:
     call    gui_rows_clear
     call    tf_reset                             ; start the attachments tile empty
     call    pwh_reset                            ; start password history empty
+    mov     dword ptr [g_cur_trunc], 0           ; set below wherever part of the entry
+    mov     dword ptr [g_setfield_lossy], 0      ;   does not make it onto the screen
     ; Title (fixed control)
     mov     ecx, dword ptr [rbp-32]
     mov     edx, VF_TITLE
@@ -5454,7 +5617,7 @@ gsd_floop:
     mov     edx, eax
     call    gui_row_add                          ; eax = row (-1 if full)
     cmp     eax, 0
-    jl      gsd_fdone
+    jl      gsd_trunc
     mov     dword ptr [rbp-44], eax              ; row
     ; custom label (if the field carried one)
     mov     rax, qword ptr [rbp-80]              ; out.labellen
@@ -5530,12 +5693,16 @@ gsd_attach:
     ; append this file to the attachments tile; create the tile row only once
     mov     eax, dword ptr [rbp-64]             ; vallen
     cmp     eax, 68
-    jb      gsd_attach_row                      ; < 68: no valid AttachRef -> skip the file
+    jb      gsd_attach_bad                      ; < 68: no valid AttachRef -> skip the file
     mov     rcx, qword ptr [rbp-72]             ; valptr -> AttachRef
     lea     rdx, [g_empty_w]                    ; default: no filename (vallen == 68)
     jbe     @F
     lea     rdx, [rcx+68]                       ; filename wide (at value+68)
 @@: call    tf_append
+    test    eax, eax                            ; tile full: this file is not listed, and
+    jz      gsd_attach_row                      ;   a save would drop it
+gsd_attach_bad:
+    mov     dword ptr [g_cur_trunc], 1
 gsd_attach_row:
     call    tf_find_row
     cmp     eax, -1
@@ -5599,7 +5766,13 @@ gsd_ph_go:
 gsd_fnext:
     inc     dword ptr [rbp-40]
     jmp     gsd_floop
+gsd_trunc:
+    mov     dword ptr [g_cur_trunc], 1          ; no row left (MAXROWS): the rest is unshown
 gsd_fdone:
+    cmp     dword ptr [g_setfield_lossy], 0     ; a value too long to show
+    je      @F
+    mov     dword ptr [g_cur_trunc], 1
+@@:
     mov     rcx, qword ptr [rbp-24]
     call    gui_rows_layout
     mov     rcx, qword ptr [rbp-24]           ; hand-cursor subclass on URL value edits
@@ -5722,7 +5895,7 @@ gc_len:
     cmp     word ptr [r10+rcx*2], 0
     je      gc_lend
     inc     ecx
-    cmp     ecx, EBUF*2
+    cmp     ecx, CONVW_MAX                  ; a whole value (the edits cap at CONVW_MAX-1)
     jb      gc_len
 gc_lend:
     inc     ecx                             ; include NUL
@@ -5802,7 +5975,7 @@ gui_gather proc frame
     mov     qword ptr [rbp-24], rcx             ; hdlg
     lea     rax, [g_valblob]
     mov     qword ptr [rbp-40], rax             ; vc (value cursor)
-    mov     dword ptr [rbp-48], 32768           ; vcap (wide chars left)
+    mov     dword ptr [rbp-48], VALBLOB_W       ; vcap (wide chars left) - worst case
     lea     rax, [g_lblblob]
     mov     qword ptr [rbp-56], rax             ; lc (label cursor)
     ; field 0 = Title
@@ -6376,6 +6549,22 @@ gpe_done:
     ret
 gui_pwhist_emit endp
 
+; gui_trunc_refuse(rcx = hdlg) -> eax = 1, having said why, if the shown entry did
+;   not fully load.  Every change - edit, favourite, trash, restore, history purge -
+;   is saved by rebuilding the entry from what is on screen, so saving one that is
+;   only partly on screen destroys the rest.
+gui_trunc_refuse proc frame
+    FRAME_PROLOG 32
+    xor     eax, eax
+    cmp     dword ptr [g_cur_trunc], 0
+    je      gtr_done
+    WINCALL gui_msgbox, rcx, addr s_trunc, addr t_err, <MB_OK or MB_ICONWARNING>
+    mov     eax, 1
+gtr_done:
+    FRAME_EPILOG
+    ret
+gui_trunc_refuse endp
+
 ; gui_commit(rcx = hdlg) - gather Title + rows into g_field_list and write the
 ;   record back (remove the old entry, rebuild via vault_build_entry, reseal).
 ;   Reselects the entry.  Refuses to save an empty title (keeps the old entry).
@@ -6383,6 +6572,9 @@ gui_commit proc frame
     FRAME_PROLOG 96
     mov     qword ptr [rbp-24], rcx
     mov     qword ptr [rbp-40], 0             ; original body (transaction not started)
+    call    gui_trunc_refuse                  ; rcx = hdlg
+    test    eax, eax
+    jnz     gco_refused
     mov     dword ptr [g_dirty], 1           ; suppress refresh during nested error dialogs
     cmp     dword ptr [g_cur_idx], 0
     jl      gco_done                          ; nothing selected
@@ -6444,7 +6636,7 @@ gco_nohist:
     call    vault_remove_at
     call    vault_build_entry
     test    eax, eax
-    jnz     gco_done
+    jnz     gco_buildfail
 gco_reseal:
     call    vault_reseal
     mov     dword ptr [rbp-32], eax             ; C5: audit the save outcome
@@ -6480,7 +6672,19 @@ gco_notitle:
 gco_allocerr:
     WINCALL gui_msgbox, qword ptr [rbp-24], addr s_editnomem, addr t_err, <MB_OK or MB_ICONWARNING>
     jmp     gco_done
+gco_buildfail:
+    cmp     eax, EXIT_NOSPACE                   ; (EXIT_USAGE = no title, refused above)
+    jne     gco_done
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr s_buildfull, addr t_err, <MB_OK or MB_ICONWARNING>
+    jmp     gco_done
+gco_corrupt:
+    ; vault_seal_write refused a body that failed validation.  Retrying writes the
+    ; same body, so this is not the "file is locked, retry?" case.
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr s_resealbad, addr t_err, <MB_OK or MB_ICONERROR>
+    jmp     gco_done
 gco_resealerr:
+    cmp     eax, EXIT_CORRUPT
+    je      gco_corrupt
     cmp     eax, EXIT_CHANGED                   ; C8: change caught in the TOCTOU window
     je      gco_reload
     cmp     eax, EXIT_BUSY                       ; C8: another instance holds the write lock
@@ -6509,6 +6713,10 @@ gco_done:
 gco_success:
     mov     dword ptr [g_dirty], 0
     xor     eax, eax
+    FRAME_EPILOG
+    ret
+gco_refused:
+    mov     eax, 1                           ; nothing was started; g_dirty untouched
     FRAME_EPILOG
     ret
 gui_commit endp
@@ -6550,23 +6758,53 @@ gco_rollback endp
 ;   (vault_reload, existing key - no re-KDF), refresh the list, and tell the user
 ;   to re-apply their unsaved change.  Never overwrites the other writer's save.
 gui_reload_safe proc frame
-    FRAME_PROLOG 32
+    FRAME_PROLOG 64
     mov     qword ptr [rbp-24], rcx
+    mov     eax, dword ptr [g_rollback]
+    mov     dword ptr [rbp-32], eax
     call    vault_reload
+    test    eax, eax
+    jnz     grs_fail
     mov     rcx, qword ptr [rbp-24]
     call    gui_poplist
     WINCALL gui_msgbox, qword ptr [rbp-24], addr s_reloaded, addr t_reloaded, \
             <MB_OK or MB_ICONINFORMATION>
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-32]
+    call    gui_rb_warn
+    FRAME_EPILOG
+    ret
+grs_fail:
+    ; vault_reload keeps the open vault when the re-read fails, so nothing is lost -
+    ; but nothing was saved either, and "reloaded" would be untrue.
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr s_reloadfail, addr t_err, \
+            <MB_OK or MB_ICONWARNING>
     FRAME_EPILOG
     ret
 gui_reload_safe endp
+
+; gui_rb_warn(rcx = hdlg, edx = g_rollback before the reload) - a reload has just
+;   read a file OLDER than the last one saved on this PC.  Unlock asks before opening
+;   such a file; a reload swapped it in silently.  Warn on the transition only: a
+;   vault the user already accepted as older at unlock stays flagged.
+gui_rb_warn proc frame
+    FRAME_PROLOG 32
+    test    edx, edx
+    jnz     grw_done
+    cmp     dword ptr [g_rollback], 0
+    je      grw_done
+    WINCALL gui_msgbox, rcx, addr s_rbreload, addr t_rbtitle, <MB_OK or MB_ICONWARNING>
+grw_done:
+    FRAME_EPILOG
+    ret
+gui_rb_warn endp
 
 ; gui_check_refresh(rcx = hdlg) - C8.4: if the vault changed on disk and we have
 ;   no unsaved edit, silently reload it (existing key, no re-KDF) and refresh the
 ;   list.  Called from the idle poll.  Skips while editing/dirty so the reload-safe
 ;   save path (gui_commit) owns the conflict then.
 gui_check_refresh proc frame
-    FRAME_PROLOG 32
+    FRAME_PROLOG 64
     mov     qword ptr [rbp-24], rcx
     call    vault_count                       ; 0 = locked/closed -> nothing to do
     test    eax, eax
@@ -6578,11 +6816,16 @@ gui_check_refresh proc frame
     call    vault_ext_changed
     test    eax, eax
     jz      gcr2_done
+    mov     eax, dword ptr [g_rollback]
+    mov     dword ptr [rbp-32], eax
     call    vault_reload
     test    eax, eax
-    jnz     gcr2_done                          ; reload failed -> leave as is
-    mov     rcx, qword ptr [rbp-24]
+    jnz     gcr2_done                          ; reload failed -> the open vault is kept
+    mov     rcx, qword ptr [rbp-24]            ;   as it was; the next poll tries again
     call    gui_poplist
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-32]
+    call    gui_rb_warn
 gcr2_done:
     FRAME_EPILOG
     ret
@@ -7088,12 +7331,1131 @@ vck_no:
     ret
 vault_ctrl_key endp
 
+; =============================================================================
+; gui_dsb_* - the detail pane's drawn scrollbar.  The pane is not one control (its
+;   rows are the dialog's own children), so it scrolls by re-laying the rows from a
+;   new top row, a whole card at a time, and the vault window draws the thumb in
+;   its erase handler next to the cards and takes the mouse for it.
+; =============================================================================
+; gui_dsb_compute(ecx = band bottom DLU) - after gui_rows_layout's measure pass:
+;   the highest useful top row (from which every remaining row fits), the scroll
+;   range in DLU, and g_cur_page clamped into it.
+gui_dsb_compute proc frame
+    FRAME_PROLOG 64
+    mov     eax, ecx
+    sub     eax, 52
+    jg      gdc_view
+    mov     eax, 1
+gdc_view:
+    mov     dword ptr [g_dsb_view], eax
+    mov     r10d, dword ptr [g_layout]
+    lea     r11, [layout_gaps]
+    mov     eax, dword ptr [r11+r10*4]
+    mov     dword ptr [rbp-24], eax              ; gap
+    mov     dword ptr [g_dsb_content], 0
+    mov     dword ptr [g_dsb_ytop], 0
+    mov     dword ptr [g_dsb_ymax], 0
+    mov     ecx, dword ptr [g_field_count]
+    test    ecx, ecx
+    jz      gdc_none
+    lea     r10, [g_fields]
+    lea     eax, [ecx-1]
+    mov     dword ptr [rbp-28], eax              ; maxtop candidate t = N-1 (always fits)
+    mov     r8d, eax
+    imul    eax, eax, DESCSZ
+    mov     edx, dword ptr [r10+rax+FD_H]
+    mov     dword ptr [rbp-32], edx              ; acc = height of rows t..N-1
+gdc_back:
+    test    r8d, r8d
+    jz      gdc_backdone
+    dec     r8d
+    mov     eax, r8d
+    imul    eax, eax, DESCSZ
+    mov     edx, dword ptr [r10+rax+FD_H]
+    add     edx, dword ptr [rbp-24]
+    add     edx, dword ptr [rbp-32]
+    cmp     edx, dword ptr [g_dsb_view]
+    jg      gdc_backdone                         ; one more row would not fit
+    mov     dword ptr [rbp-32], edx
+    mov     dword ptr [rbp-28], r8d
+    jmp     gdc_back
+gdc_backdone:
+    mov     eax, dword ptr [rbp-28]
+    inc     eax
+    mov     dword ptr [g_page_count], eax        ; number of useful top rows
+    mov     eax, dword ptr [g_cur_page]
+    test    eax, eax
+    jns     gdc_c1
+    xor     eax, eax
+gdc_c1:
+    cmp     eax, dword ptr [rbp-28]
+    jle     gdc_c2
+    mov     eax, dword ptr [rbp-28]
+gdc_c2:
+    mov     dword ptr [g_cur_page], eax
+    xor     r8d, r8d                             ; prefix sums of height + gap
+    xor     edx, edx
+gdc_sum:
+    cmp     r8d, dword ptr [g_field_count]
+    jae     gdc_sumdone
+    cmp     r8d, dword ptr [g_cur_page]
+    jne     gdc_s1
+    mov     dword ptr [g_dsb_ytop], edx
+gdc_s1:
+    cmp     r8d, dword ptr [rbp-28]
+    jne     gdc_s2
+    mov     dword ptr [g_dsb_ymax], edx
+gdc_s2:
+    mov     eax, r8d
+    imul    eax, eax, DESCSZ
+    add     edx, dword ptr [r10+rax+FD_H]
+    add     edx, dword ptr [rbp-24]
+    inc     r8d
+    jmp     gdc_sum
+gdc_sumdone:
+    sub     edx, dword ptr [rbp-24]              ; no gap after the last card
+    mov     dword ptr [g_dsb_content], edx
+    FRAME_EPILOG
+    ret
+gdc_none:
+    mov     dword ptr [g_page_count], 1
+    mov     dword ptr [g_cur_page], 0
+    FRAME_EPILOG
+    ret
+gui_dsb_compute endp
+
+; gui_dsb_geom(rcx = hdlg) -> eax = thumb height in px (0 = nothing to scroll).
+gui_dsb_geom proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [g_dsb_thh], 0
+    cmp     dword ptr [g_cur_idx], 0
+    jl      gdg_none
+    cmp     dword ptr [g_menu_open], 0           ; the settings screen covers the pane
+    jne     gdg_none
+    cmp     dword ptr [g_dsb_ymax], 0
+    jle     gdg_none
+    cmp     dword ptr [g_dsb_content], 0
+    jle     gdg_none
+    mov     dword ptr [rbp-48], 472              ; the band, DLU -> px: x = the cards'
+    mov     dword ptr [rbp-44], 52               ;   right edge (414 + VDX_DLU), y = the
+    mov     dword ptr [rbp-40], 472              ;   rows' band
+    mov     eax, 52
+    add     eax, dword ptr [g_dsb_view]
+    mov     dword ptr [rbp-36], eax
+    WINCALL MapDialogRect, qword ptr [rbp-24], addr rbp-48
+    WINCALL GetClientRect, qword ptr [rbp-24], addr rbp-64
+    mov     eax, dword ptr [rbp-56]              ; widened like the cards (gui_draw_field_cards)
+    sub     eax, dword ptr [g_base_cx]
+    jns     gdg_dw
+    xor     eax, eax
+gdg_dw:
+    add     eax, dword ptr [rbp-48]
+    mov     dword ptr [g_dsb_cardr], eax
+    mov     eax, dword ptr [rbp-44]
+    mov     dword ptr [g_dsb_t], eax
+    mov     eax, dword ptr [rbp-36]
+    mov     dword ptr [g_dsb_b], eax
+    sub     eax, dword ptr [rbp-44]              ; band height px
+    jle     gdg_none
+    mov     dword ptr [rbp-68], eax
+    imul    eax, dword ptr [g_dsb_view]          ; thumb = band * view / content
+    cdq
+    idiv    dword ptr [g_dsb_content]
+    cmp     eax, LBSB_MINH
+    jge     gdg_h1
+    mov     eax, LBSB_MINH
+gdg_h1:
+    cmp     eax, dword ptr [rbp-68]
+    jle     gdg_h2
+    mov     eax, dword ptr [rbp-68]
+gdg_h2:
+    mov     dword ptr [g_dsb_thh], eax
+    mov     ecx, dword ptr [rbp-68]              ; top = band top + travel * ytop / ymax
+    sub     ecx, eax
+    mov     eax, dword ptr [g_dsb_ytop]
+    imul    eax, ecx
+    cdq
+    idiv    dword ptr [g_dsb_ymax]
+    add     eax, dword ptr [g_dsb_t]
+    mov     dword ptr [g_dsb_thy], eax
+    mov     eax, dword ptr [g_dsb_thh]
+    FRAME_EPILOG
+    ret
+gdg_none:
+    mov     dword ptr [g_dsb_thh], 0
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gui_dsb_geom endp
+
+; gui_draw_dthumb(rcx = hdc, rdx = hdlg) - from the vault window's erase handler,
+;   after the cards: the same translucent thumb as the entry list's.  The erase DC
+;   is clipped to the update region; the round clip is ANDed in, then restored.
+gui_draw_dthumb proc frame
+    FRAME_PROLOG 160                             ; AlphaBlend: 11 args
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], rdx
+    mov     rcx, rdx
+    call    gui_dsb_geom
+    test    eax, eax
+    jz      gdt_ret
+    mov     eax, LBSB_W_IDLE
+    cmp     dword ptr [g_dsb_hover], 0
+    jne     gdt_hot
+    cmp     dword ptr [g_dsb_track], 0
+    je      gdt_w
+gdt_hot:
+    mov     eax, LBSB_W_HOT
+gdt_w:
+    mov     dword ptr [rbp-36], eax              ; width
+    mov     ecx, dword ptr [g_dsb_cardr]
+    add     ecx, 6
+    mov     dword ptr [rbp-40], ecx              ; x
+    add     ecx, eax
+    inc     ecx
+    mov     dword ptr [rbp-44], ecx              ; region right
+    mov     eax, dword ptr [g_dsb_thy]
+    add     eax, dword ptr [g_dsb_thh]
+    inc     eax
+    mov     dword ptr [rbp-48], eax              ; region bottom
+    mov     rcx, qword ptr [rbp-24]
+    call    lbsb_source
+    mov     qword ptr [rbp-56], rax
+    test    rax, rax
+    jz      gdt_ret
+    WINCALL SaveDC, qword ptr [rbp-24]
+    mov     dword ptr [rbp-60], eax
+    WINCALL CreateRoundRectRgn, dword ptr [rbp-40], dword ptr [g_dsb_thy], dword ptr [rbp-44], \
+            dword ptr [rbp-48], LBSB_RADIUS*2, LBSB_RADIUS*2
+    mov     qword ptr [rbp-72], rax
+    test    rax, rax
+    jz      gdt_restore
+    WINCALL ExtSelectClipRgn, qword ptr [rbp-24], qword ptr [rbp-72], 1   ; RGN_AND
+    WINCALL AlphaBlend, qword ptr [rbp-24], dword ptr [rbp-40], dword ptr [g_dsb_thy], \
+            dword ptr [rbp-36], dword ptr [g_dsb_thh], qword ptr [rbp-56], 0, 0, 1, 1, \
+            <AC_SRC_OVER_ or (LBSB_ALPHA shl 16)>
+    WINCALL DeleteObject, qword ptr [rbp-72]
+gdt_restore:
+    WINCALL RestoreDC, qword ptr [rbp-24], dword ptr [rbp-60]
+gdt_ret:
+    FRAME_EPILOG
+    ret
+gui_draw_dthumb endp
+
+; gui_dsb_inval(rcx = hdlg) - repaint the strip (erase: the handler draws the thumb).
+gui_dsb_inval proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    call    gui_dsb_geom
+    mov     eax, dword ptr [g_dsb_cardr]
+    inc     eax
+    mov     dword ptr [rbp-48], eax
+    mov     eax, dword ptr [g_dsb_t]
+    mov     dword ptr [rbp-44], eax
+    mov     eax, dword ptr [g_dsb_cardr]
+    add     eax, LBSB_HOT + 4
+    mov     dword ptr [rbp-40], eax
+    mov     eax, dword ptr [g_dsb_b]
+    mov     dword ptr [rbp-36], eax
+    WINCALL InvalidateRect, qword ptr [rbp-24], addr rbp-48, 1
+    FRAME_EPILOG
+    ret
+gui_dsb_inval endp
+
+; gui_dsb_settop(rcx = hdlg, edx = top row) - scroll to it (clamped) and re-lay.
+gui_dsb_settop proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    test    edx, edx
+    jge     gds_lo
+    xor     edx, edx
+gds_lo:
+    mov     eax, dword ptr [g_page_count]
+    dec     eax
+    cmp     edx, eax
+    jle     gds_hi
+    mov     edx, eax
+gds_hi:
+    cmp     edx, dword ptr [g_cur_page]
+    je      gds_ret
+    mov     dword ptr [g_cur_page], edx
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_rows_layout                      ; it invalidates the pane, strip included
+    ; The wheel and the thumb move cards without moving the focus.  A focused field
+    ; that just went off screen would still take typing - edits nobody can see, and
+    ; a dirty entry.  Give the focus to the top card instead.
+    WINCALL GetFocus
+    test    rax, rax
+    jz      gds_ret
+    mov     rcx, rax
+    call    GetDlgCtrlID_frame
+    sub     eax, IDC_DYN_BASE
+    jb      gds_ret                              ; not a row control
+    xor     edx, edx
+    mov     ecx, DYN_SLOTS
+    div     ecx                                  ; its row
+    cmp     eax, dword ptr [g_cur_page]
+    jb      gds_refocus
+    cmp     eax, dword ptr [g_dsb_lastvis]
+    jle     gds_ret                              ; still on screen
+gds_refocus:
+    mov     ecx, dword ptr [g_cur_page]
+    mov     edx, DS_VALUE
+    call    dynid
+    mov     dword ptr [rbp-28], eax
+    WINCALL GetDlgItem, qword ptr [rbp-24], dword ptr [rbp-28]
+    test    rax, rax
+    jz      gds_ret
+    WINCALL SetFocus, rax
+gds_ret:
+    FRAME_EPILOG
+    ret
+gui_dsb_settop endp
+
+; gui_dsb_ensure(rcx = hdlg, edx = row) - a field took the focus (Tab): bring its
+;   card on screen if it is above or below what is showing.
+gui_dsb_ensure proc frame
+    FRAME_PROLOG 48
+    cmp     edx, dword ptr [g_cur_page]
+    jl      gde_go
+    cmp     edx, dword ptr [g_dsb_lastvis]
+    jle     gde_ret
+gde_go:
+    call    gui_dsb_settop
+gde_ret:
+    FRAME_EPILOG
+    ret
+gui_dsb_ensure endp
+
+; gui_dsb_hover(rcx = hdlg, edx = 1 to arm leave tracking) - over the strip?
+gui_dsb_hover proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-28], edx
+    mov     dword ptr [rbp-32], 0                ; want
+    call    gui_dsb_geom
+    test    eax, eax
+    jz      ghv_decide
+    WINCALL GetCursorPos, addr g_lbsb_pt
+    WINCALL ScreenToClient, qword ptr [rbp-24], addr g_lbsb_pt
+    mov     eax, dword ptr [g_lbsb_pt]
+    mov     ecx, dword ptr [g_dsb_cardr]
+    inc     ecx
+    cmp     eax, ecx
+    jl      ghv_decide
+    add     ecx, LBSB_HOT
+    cmp     eax, ecx
+    jge     ghv_decide
+    mov     eax, dword ptr [g_lbsb_pt+4]
+    cmp     eax, dword ptr [g_dsb_t]
+    jl      ghv_decide
+    cmp     eax, dword ptr [g_dsb_b]
+    jge     ghv_decide
+    mov     dword ptr [rbp-32], 1
+ghv_decide:
+    cmp     dword ptr [g_dsb_track], 0
+    je      ghv_arm
+    mov     dword ptr [rbp-32], 1
+ghv_arm:
+    cmp     dword ptr [rbp-28], 0                ; never from the leave handler (it would
+    je      ghv_set                              ;   post WM_MOUSELEAVE straight back)
+    mov     dword ptr [rbp-64], 24
+    mov     dword ptr [rbp-60], 2                ; TME_LEAVE
+    mov     rax, qword ptr [rbp-24]
+    mov     qword ptr [rbp-56], rax
+    mov     dword ptr [rbp-48], 0
+    WINCALL TrackMouseEvent, addr rbp-64
+ghv_set:
+    mov     eax, dword ptr [rbp-32]
+    cmp     eax, dword ptr [g_dsb_hover]
+    je      ghv_ret
+    mov     dword ptr [g_dsb_hover], eax
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_dsb_inval
+ghv_ret:
+    FRAME_EPILOG
+    ret
+gui_dsb_hover endp
+
+; gui_dsb_lbdown(rcx = hdlg, rdx = lParam) -> eax = 1 if the press was the bar's.
+gui_dsb_lbdown proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], rdx
+    call    gui_dsb_geom
+    test    eax, eax
+    jz      gdl_no
+    movsx   eax, word ptr [rbp-32]               ; client x
+    mov     ecx, dword ptr [g_dsb_cardr]
+    inc     ecx
+    cmp     eax, ecx
+    jl      gdl_no
+    add     ecx, LBSB_HOT
+    cmp     eax, ecx
+    jge     gdl_no
+    movsx   eax, word ptr [rbp-30]               ; client y
+    cmp     eax, dword ptr [g_dsb_t]
+    jl      gdl_no
+    cmp     eax, dword ptr [g_dsb_b]
+    jge     gdl_no
+    cmp     eax, dword ptr [g_dsb_thy]
+    jl      gdl_pageup
+    mov     ecx, dword ptr [g_dsb_thy]
+    add     ecx, dword ptr [g_dsb_thh]
+    cmp     eax, ecx
+    jge     gdl_pagedown
+    WINCALL GetCursorPos, addr g_lbsb_pt         ; on the thumb: a drag, grab in SCREEN y
+    mov     eax, dword ptr [g_lbsb_pt+4]
+    mov     dword ptr [g_dsb_graby], eax
+    mov     eax, dword ptr [g_cur_page]
+    mov     dword ptr [g_dsb_grabtop], eax
+    mov     dword ptr [g_dsb_track], 1
+    WINCALL SetCapture, qword ptr [rbp-24]
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_dsb_inval
+    jmp     gdl_yes
+gdl_pageup:                                      ; a page = the cards on screen now
+    mov     edx, dword ptr [g_dsb_lastvis]
+    sub     edx, dword ptr [g_cur_page]
+    inc     edx                                  ; (lastvis - top + 1), as page down
+    jg      gdl_pu
+    mov     edx, 1
+gdl_pu:
+    neg     edx
+    add     edx, dword ptr [g_cur_page]
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_dsb_settop
+    jmp     gdl_yes
+gdl_pagedown:
+    mov     edx, dword ptr [g_dsb_lastvis]
+    inc     edx                                  ; the first card that did not fit
+    cmp     edx, dword ptr [g_cur_page]
+    jg      gdl_pd
+    mov     edx, dword ptr [g_cur_page]
+    inc     edx
+gdl_pd:
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_dsb_settop
+gdl_yes:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gdl_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gui_dsb_lbdown endp
+
+; GetDlgCtrlID_frame(rcx = hwnd) -> eax = its control id (framed wrapper, so the
+;   framed callers keep an aligned stack).
+GetDlgCtrlID_frame proc frame
+    FRAME_PROLOG 32
+    WINCALL GetDlgCtrlID, rcx
+    FRAME_EPILOG
+    ret
+GetDlgCtrlID_frame endp
+
+; gui_dsb_striphit(rcx = hdlg, rdx = lParam screen point) -> eax = 1 if the point
+;   is in the thumb's strip while there is something to scroll.
+gui_dsb_striphit proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    movsx   eax, dx
+    mov     dword ptr [rbp-40], eax
+    sar     rdx, 16
+    movsx   eax, dx
+    mov     dword ptr [rbp-36], eax
+    call    gui_dsb_geom                         ; rcx = hdlg still
+    test    eax, eax
+    jz      gsh_no
+    WINCALL ScreenToClient, qword ptr [rbp-24], addr rbp-40
+    mov     eax, dword ptr [rbp-40]
+    mov     ecx, dword ptr [g_dsb_cardr]
+    inc     ecx
+    cmp     eax, ecx
+    jl      gsh_no
+    add     ecx, LBSB_HOT
+    cmp     eax, ecx
+    jge     gsh_no
+    mov     eax, dword ptr [rbp-36]
+    cmp     eax, dword ptr [g_dsb_t]
+    jl      gsh_no
+    cmp     eax, dword ptr [g_dsb_b]
+    jge     gsh_no
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gsh_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gui_dsb_striphit endp
+
+; gui_dsb_drag(rcx = hdlg) - one move of a thumb drag:
+;   top = grab + (cursor y - grab y) * maxtop / (band - thumb)   (signed)
+gui_dsb_drag proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    call    gui_dsb_geom
+    test    eax, eax
+    jz      gdd_ret
+    mov     ecx, dword ptr [g_dsb_b]
+    sub     ecx, dword ptr [g_dsb_t]
+    sub     ecx, eax
+    jle     gdd_ret
+    mov     dword ptr [rbp-28], ecx              ; travel
+    WINCALL GetCursorPos, addr g_lbsb_pt
+    mov     eax, dword ptr [g_lbsb_pt+4]
+    sub     eax, dword ptr [g_dsb_graby]
+    mov     ecx, dword ptr [g_page_count]
+    dec     ecx                                  ; maxtop
+    imul    eax, ecx
+    cdq
+    idiv    dword ptr [rbp-28]
+    add     eax, dword ptr [g_dsb_grabtop]
+    mov     edx, eax
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_dsb_settop
+gdd_ret:
+    FRAME_EPILOG
+    ret
+gui_dsb_drag endp
+
+; gui_dsb_wheel(rcx = hdlg, rdx = wParam, r8 = lParam screen point) -> eax = 1 if
+;   it scrolled the pane (pointer over the detail pane, a card per notch).
+gui_dsb_wheel proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], rdx
+    cmp     dword ptr [g_cur_idx], 0
+    jl      gdw_no
+    cmp     dword ptr [g_menu_open], 0
+    jne     gdw_no
+    cmp     dword ptr [g_page_count], 1
+    jle     gdw_no                               ; everything fits
+    movsx   eax, r8w                             ; screen point -> client
+    mov     dword ptr [g_lbsb_pt], eax
+    sar     r8, 16
+    movsx   eax, r8w
+    mov     dword ptr [g_lbsb_pt+4], eax
+    WINCALL ScreenToClient, qword ptr [rbp-24], addr g_lbsb_pt
+    mov     dword ptr [rbp-48], 210              ; the detail pane starts at 210 DLU
+    mov     dword ptr [rbp-44], 0
+    mov     dword ptr [rbp-40], 210
+    mov     dword ptr [rbp-36], 0
+    WINCALL MapDialogRect, qword ptr [rbp-24], addr rbp-48
+    mov     eax, dword ptr [g_lbsb_pt]
+    cmp     eax, dword ptr [rbp-48]
+    jl      gdw_no                               ; over the sidebar: not ours
+    movsx   eax, word ptr [rbp-30]               ; delta, +120 per notch away
+    add     eax, dword ptr [g_dsb_wheelacc]      ; precision touchpads send many small
+    cdq                                          ;   deltas: accumulate, a card per 120
+    mov     ecx, 120
+    idiv    ecx
+    mov     dword ptr [g_dsb_wheelacc], edx      ; keep the remainder
+    test    eax, eax
+    jz      gdw_yes
+gdw_have:
+    neg     eax
+    mov     edx, dword ptr [g_cur_page]
+    add     edx, eax
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_dsb_settop
+gdw_yes:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gdw_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gui_dsb_wheel endp
+
+; lbsb_source(rcx = a DC) -> rax = the 1x1 source DC holding the scheme's dim text
+;   colour (0 if it could not be made).  Shared by both drawn scrollbars.
+lbsb_source proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    cmp     qword ptr [g_lbsb_sdc], 0
+    jne     lsrc_have
+    WINCALL CreateCompatibleDC, qword ptr [rbp-24]
+    mov     qword ptr [g_lbsb_sdc], rax
+    test    rax, rax
+    jz      lsrc_no
+    WINCALL CreateCompatibleBitmap, qword ptr [rbp-24], 1, 1
+    mov     qword ptr [g_lbsb_sbmp], rax
+    test    rax, rax
+    jz      lsrc_no
+    WINCALL SelectObject, qword ptr [g_lbsb_sdc], qword ptr [g_lbsb_sbmp]
+    mov     dword ptr [g_lbsb_scol], -1
+lsrc_have:
+    cmp     qword ptr [g_lbsb_sbmp], 0
+    je      lsrc_no
+    mov     eax, dword ptr [g_col_textdim]
+    cmp     eax, dword ptr [g_lbsb_scol]
+    je      lsrc_ok
+    mov     dword ptr [g_lbsb_scol], eax
+    WINCALL SetPixel, qword ptr [g_lbsb_sdc], 0, 0, dword ptr [g_lbsb_scol]
+lsrc_ok:
+    mov     rax, qword ptr [g_lbsb_sdc]
+    FRAME_EPILOG
+    ret
+lsrc_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+lbsb_source endp
+
+; =============================================================================
+; lbsb_* - the entry list's drawn scrollbar.  All UI thread.
+; =============================================================================
+; lbsb_geom(rcx = list) -> eax = thumb height (0 = everything fits).  Fills g_lbsb_*.
+lbsb_geom proc frame
+    FRAME_PROLOG 96                              ; RECT at [rbp-56] for LVM_GETITEMRECT
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [g_lbsb_thh], 0
+    WINCALL GetClientRect, qword ptr [rbp-24], addr g_lbsb_rc
+    mov     eax, dword ptr [g_lbsb_rc+8]
+    mov     dword ptr [g_lbsb_w], eax
+    mov     eax, dword ptr [g_lbsb_rc+12]
+    mov     dword ptr [g_lbsb_view], eax
+    test    eax, eax
+    jle     lg_none
+    cmp     dword ptr [g_lbsb_kind], 0
+    jne     lg_lv
+    WINCALL SendMessageW, qword ptr [rbp-24], LB_GETCOUNT, 0, 0
+    mov     dword ptr [rbp-32], eax              ; count
+    test    eax, eax
+    jle     lg_none
+    WINCALL SendMessageW, qword ptr [rbp-24], LB_GETITEMHEIGHT_, 0, 0
+    jmp     lg_ih
+lg_lv:
+    WINCALL SendMessageW, qword ptr [rbp-24], LVM_GETITEMCOUNT, 0, 0
+    mov     dword ptr [rbp-32], eax
+    test    eax, eax
+    jle     lg_none
+    mov     dword ptr [rbp-56], 0                ; RECT.left = LVIR_BOUNDS
+    WINCALL SendMessageW, qword ptr [rbp-24], LVM_GETITEMRECT_, 0, addr rbp-56
+    test    eax, eax
+    jz      lg_none
+    mov     eax, dword ptr [rbp-44]              ; bottom - top = row height
+    sub     eax, dword ptr [rbp-52]
+lg_ih:
+    test    eax, eax
+    jle     lg_none                              ; LB_ERR / nothing measurable
+    mov     dword ptr [g_lbsb_ih], eax
+    mov     eax, dword ptr [rbp-32]
+    imul    eax, dword ptr [g_lbsb_ih]           ; content height
+    mov     dword ptr [rbp-40], eax
+    cmp     eax, dword ptr [g_lbsb_view]
+    jle     lg_none                              ; it all fits: no bar
+    mov     eax, dword ptr [g_lbsb_view]
+    cdq
+    idiv    dword ptr [g_lbsb_ih]                ; whole cards in view
+    cmp     eax, 1
+    jge     lg_vis
+    mov     eax, 1
+lg_vis:
+    mov     dword ptr [g_lbsb_vis], eax
+    mov     ecx, dword ptr [rbp-32]
+    sub     ecx, eax                             ; usually >= 1 - but not when the view is
+    jle     lg_none                              ;   shorter than ONE row (vis forced to 1):
+    mov     dword ptr [g_lbsb_topmax], ecx       ;   nothing to scroll, and no divide by 0
+    mov     eax, dword ptr [g_lbsb_view]         ; thumb = view * view / content
+    imul    eax, eax
+    cdq
+    idiv    dword ptr [rbp-40]
+    cmp     eax, LBSB_MINH
+    jge     lg_h1
+    mov     eax, LBSB_MINH
+lg_h1:
+    cmp     eax, dword ptr [g_lbsb_view]
+    jle     lg_h2
+    mov     eax, dword ptr [g_lbsb_view]
+lg_h2:
+    mov     dword ptr [g_lbsb_thh], eax
+    mov     edx, LB_GETTOPINDEX_
+    cmp     dword ptr [g_lbsb_kind], 0
+    je      lg_topmsg
+    mov     edx, LVM_GETTOPINDEX_
+lg_topmsg:
+    mov     dword ptr [rbp-60], edx
+    WINCALL SendMessageW, qword ptr [rbp-24], dword ptr [rbp-60], 0, 0
+    test    eax, eax
+    jge     lg_t1
+    xor     eax, eax
+lg_t1:
+    cmp     eax, dword ptr [g_lbsb_topmax]
+    jle     lg_t2
+    mov     eax, dword ptr [g_lbsb_topmax]
+lg_t2:
+    mov     dword ptr [g_lbsb_curtop], eax
+    mov     ecx, dword ptr [g_lbsb_view]         ; position = travel * top / topmax
+    sub     ecx, dword ptr [g_lbsb_thh]
+    imul    eax, ecx
+    cdq
+    idiv    dword ptr [g_lbsb_topmax]
+    mov     dword ptr [g_lbsb_thy], eax
+    mov     eax, dword ptr [g_lbsb_thh]
+    FRAME_EPILOG
+    ret
+lg_none:
+    mov     dword ptr [g_lbsb_thh], 0
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+lbsb_geom endp
+
+; lbsb_paint(rcx = list) - draw the thumb over what the list just painted.
+;   Translucency: a 1x1 source pixel stretched over the thumb with AlphaBlend's
+;   constant alpha; the rounded ends are the clip (AlphaBlend knows no shapes).
+;   A DC from GetDC has its origin at the client's top-left, so the region needs
+;   no viewport offset (Myrkr's double-buffered listview did).
+lbsb_paint proc frame
+    FRAME_PROLOG 160                             ; AlphaBlend: 11 args
+    mov     qword ptr [rbp-24], rcx
+    call    lbsb_geom
+    test    eax, eax
+    jz      lp_ret
+    mov     eax, LBSB_W_IDLE
+    cmp     dword ptr [g_lbsb_hover], 0
+    jne     lp_hot
+    cmp     dword ptr [g_lbsb_track], 0
+    je      lp_width
+lp_hot:
+    mov     eax, LBSB_W_HOT
+lp_width:
+    mov     dword ptr [rbp-32], eax              ; width
+    mov     ecx, dword ptr [g_lbsb_w]
+    sub     ecx, LBSB_INSET
+    sub     ecx, eax
+    mov     dword ptr [rbp-40], ecx              ; x
+    add     ecx, eax
+    inc     ecx
+    mov     dword ptr [rbp-56], ecx              ; region right (exclusive + 1)
+    mov     eax, dword ptr [g_lbsb_thy]
+    add     eax, dword ptr [g_lbsb_thh]
+    inc     eax
+    mov     dword ptr [rbp-60], eax              ; region bottom
+    WINCALL GetDC, qword ptr [rbp-24]
+    mov     qword ptr [rbp-48], rax
+    test    rax, rax
+    jz      lp_ret
+    mov     rcx, qword ptr [rbp-48]              ; the scheme's dim text colour: light
+    call    lbsb_source                          ;   on dark schemes, dark on light ones
+    test    rax, rax
+    jz      lp_rel
+lp_draw:
+    WINCALL CreateRoundRectRgn, dword ptr [rbp-40], dword ptr [g_lbsb_thy], dword ptr [rbp-56], \
+            dword ptr [rbp-60], LBSB_RADIUS*2, LBSB_RADIUS*2
+    mov     qword ptr [rbp-64], rax
+    test    rax, rax
+    jz      lp_rel
+    WINCALL SelectClipRgn, qword ptr [rbp-48], qword ptr [rbp-64]
+    WINCALL AlphaBlend, qword ptr [rbp-48], dword ptr [rbp-40], dword ptr [g_lbsb_thy], \
+            dword ptr [rbp-32], dword ptr [g_lbsb_thh], qword ptr [g_lbsb_sdc], 0, 0, 1, 1, \
+            <AC_SRC_OVER_ or (LBSB_ALPHA shl 16)>
+    WINCALL SelectClipRgn, qword ptr [rbp-48], 0
+    WINCALL DeleteObject, qword ptr [rbp-64]
+lp_rel:
+    WINCALL ReleaseDC, qword ptr [rbp-24], qword ptr [rbp-48]
+lp_ret:
+    FRAME_EPILOG
+    ret
+lbsb_paint endp
+
+; lbsb_strip_inval(rcx = list) - repaint just the strip the thumb lives in.
+lbsb_strip_inval proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    WINCALL GetClientRect, qword ptr [rbp-24], addr rbp-48
+    mov     eax, dword ptr [rbp-40]              ; right
+    sub     eax, LBSB_HOT + 2
+    mov     dword ptr [rbp-48], eax              ; left = right - strip
+    WINCALL InvalidateRect, qword ptr [rbp-24], addr rbp-48, 0
+    FRAME_EPILOG
+    ret
+lbsb_strip_inval endp
+
+; lbsb_settop(rcx = list, edx = top) - scroll to a top card (clamped), then
+;   repaint the strip so the thumb follows.
+lbsb_settop proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    test    edx, edx
+    jge     lst_lo
+    xor     edx, edx
+lst_lo:
+    cmp     edx, dword ptr [g_lbsb_topmax]
+    jle     lst_hi
+    mov     edx, dword ptr [g_lbsb_topmax]
+lst_hi:
+    mov     dword ptr [rbp-28], edx
+    cmp     dword ptr [g_lbsb_kind], 0
+    jne     lst_lv
+    WINCALL SendMessageW, qword ptr [rbp-24], LB_SETTOPINDEX_, dword ptr [rbp-28], 0
+    jmp     lst_done
+lst_lv:
+    mov     eax, edx
+    sub     eax, dword ptr [g_lbsb_curtop]
+    imul    eax, dword ptr [g_lbsb_ih]
+    movsxd  rax, eax
+    mov     qword ptr [rbp-40], rax
+    WINCALL SendMessageW, qword ptr [rbp-24], LVM_SCROLL_, 0, qword ptr [rbp-40]
+lst_done:
+    mov     eax, dword ptr [rbp-28]
+    mov     dword ptr [g_lbsb_top], eax
+    mov     rcx, qword ptr [rbp-24]
+    call    lbsb_strip_inval
+    FRAME_EPILOG
+    ret
+lbsb_settop endp
+
+; lbsb_scrollcheck(rcx = list) - after anything that can scroll the list: a
+;   changed top index means the listbox blitted its old pixels, the old thumb
+;   with them, so the strip has to repaint.  Guarded: LB_GETTOPINDEX comes back
+;   through the same subclass.
+lbsb_scrollcheck proc frame
+    FRAME_PROLOG 48
+    cmp     dword ptr [g_lbsb_busy], 0
+    jne     lsc_ret
+    mov     dword ptr [g_lbsb_busy], 1
+    mov     qword ptr [rbp-24], rcx
+    mov     edx, LB_GETTOPINDEX_
+    cmp     dword ptr [g_lbsb_kind], 0
+    je      lsc_msg
+    mov     edx, LVM_GETTOPINDEX_
+lsc_msg:
+    mov     dword ptr [rbp-28], edx
+    WINCALL SendMessageW, qword ptr [rbp-24], dword ptr [rbp-28], 0, 0
+    cmp     eax, dword ptr [g_lbsb_top]
+    je      lsc_done
+    mov     dword ptr [g_lbsb_top], eax
+    mov     rcx, qword ptr [rbp-24]
+    call    lbsb_strip_inval
+lsc_done:
+    mov     dword ptr [g_lbsb_busy], 0
+lsc_ret:
+    FRAME_EPILOG
+    ret
+lbsb_scrollcheck endp
+
+; lbsb_hover_eval(rcx = list, edx = 1 to arm leave tracking) - is the pointer over
+;   the strip?  Decided from SCREEN coordinates of the cursor and the window, not
+;   from the message's own point.  Never re-arms from the leave handler: arming
+;   TrackMouseEvent after the pointer has left posts WM_MOUSELEAVE straight back,
+;   a loop that starves real input (Myrkr's lesson).
+lbsb_hover_eval proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-28], edx              ; arm
+    mov     dword ptr [rbp-32], 0                ; want
+    mov     dword ptr [rbp-36], 0                ; inside the window at all
+    WINCALL GetWindowRect, qword ptr [rbp-24], addr g_lbsb_wr
+    WINCALL GetCursorPos, addr g_lbsb_pt
+    mov     eax, dword ptr [g_lbsb_pt]
+    cmp     eax, dword ptr [g_lbsb_wr]
+    jl      lhe_decide
+    cmp     eax, dword ptr [g_lbsb_wr+8]
+    jge     lhe_decide
+    mov     ecx, dword ptr [g_lbsb_pt+4]
+    cmp     ecx, dword ptr [g_lbsb_wr+4]
+    jl      lhe_decide
+    cmp     ecx, dword ptr [g_lbsb_wr+12]
+    jge     lhe_decide
+    mov     dword ptr [rbp-36], 1
+    mov     ecx, dword ptr [g_lbsb_wr+8]
+    sub     ecx, LBSB_HOT
+    cmp     eax, ecx
+    jl      lhe_decide
+    mov     dword ptr [rbp-32], 1
+lhe_decide:
+    cmp     dword ptr [g_lbsb_track], 0          ; never shrink under a drag
+    je      lhe_arm
+    mov     dword ptr [rbp-32], 1
+lhe_arm:
+    cmp     dword ptr [rbp-28], 0
+    je      lhe_set
+    cmp     dword ptr [rbp-36], 0
+    je      lhe_set
+    mov     dword ptr [rbp-64], 24               ; TRACKMOUSEEVENT: cbSize must be 24
+    mov     dword ptr [rbp-60], 2                ;   TME_LEAVE
+    mov     rax, qword ptr [rbp-24]
+    mov     qword ptr [rbp-56], rax
+    mov     dword ptr [rbp-48], 0
+    WINCALL TrackMouseEvent, addr rbp-64
+lhe_set:
+    mov     eax, dword ptr [rbp-32]
+    cmp     eax, dword ptr [g_lbsb_hover]
+    je      lhe_ret
+    mov     dword ptr [g_lbsb_hover], eax
+    mov     rcx, qword ptr [rbp-24]
+    call    lbsb_strip_inval
+lhe_ret:
+    FRAME_EPILOG
+    ret
+lbsb_hover_eval endp
+
+; lbsb_lbdown(rcx = list, rdx = lParam) -> eax = 1 if the press belonged to the bar.
+;   On the thumb: start a drag (capture; the grab is remembered in SCREEN y).  Above
+;   or below it: a page up / down.  Anywhere else: a card click, not ours.
+lbsb_lbdown proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], rdx
+    call    lbsb_geom
+    test    eax, eax
+    jz      lld_no
+    movsx   eax, word ptr [rbp-32]               ; client x
+    mov     ecx, dword ptr [g_lbsb_w]
+    sub     ecx, LBSB_HOT
+    cmp     eax, ecx
+    jl      lld_no
+    movsx   eax, word ptr [rbp-30]               ; client y
+    cmp     eax, dword ptr [g_lbsb_thy]
+    jl      lld_pageup
+    mov     ecx, dword ptr [g_lbsb_thy]
+    add     ecx, dword ptr [g_lbsb_thh]
+    cmp     eax, ecx
+    jge     lld_pagedown
+    WINCALL GetCursorPos, addr g_lbsb_pt
+    mov     eax, dword ptr [g_lbsb_pt+4]
+    mov     dword ptr [g_lbsb_graby], eax
+    mov     eax, dword ptr [g_lbsb_curtop]
+    mov     dword ptr [g_lbsb_grabtop], eax
+    mov     dword ptr [g_lbsb_track], 1
+    WINCALL SetCapture, qword ptr [rbp-24]
+    mov     rcx, qword ptr [rbp-24]
+    call    lbsb_strip_inval
+    jmp     lld_yes
+lld_pageup:
+    mov     edx, dword ptr [g_lbsb_curtop]
+    sub     edx, dword ptr [g_lbsb_vis]
+    mov     rcx, qword ptr [rbp-24]
+    call    lbsb_settop
+    jmp     lld_yes
+lld_pagedown:
+    mov     edx, dword ptr [g_lbsb_curtop]
+    add     edx, dword ptr [g_lbsb_vis]
+    mov     rcx, qword ptr [rbp-24]
+    call    lbsb_settop
+lld_yes:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+lld_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+lbsb_lbdown endp
+
+; lbsb_drag(rcx = list) - one mouse move of a thumb drag.  Screen coordinates:
+;   top = grab + (cursor y - grab y) * topmax / (view - thumb)   (SIGNED divide)
+lbsb_drag proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    call    lbsb_geom
+    test    eax, eax
+    jz      ldr_ret
+    mov     ecx, dword ptr [g_lbsb_view]
+    sub     ecx, dword ptr [g_lbsb_thh]
+    jle     ldr_ret                              ; thumb fills the track
+    mov     dword ptr [rbp-28], ecx              ; travel
+    WINCALL GetCursorPos, addr g_lbsb_pt
+    mov     eax, dword ptr [g_lbsb_pt+4]
+    sub     eax, dword ptr [g_lbsb_graby]
+    imul    eax, dword ptr [g_lbsb_topmax]
+    cdq
+    idiv    dword ptr [rbp-28]
+    add     eax, dword ptr [g_lbsb_grabtop]
+    mov     edx, eax
+    mov     rcx, qword ptr [rbp-24]
+    call    lbsb_settop
+ldr_ret:
+    FRAME_EPILOG
+    ret
+lbsb_drag endp
+
+; lbsb_wheel(rcx = list, rdx = WM_MOUSEWHEEL wParam) - LBSB_WHEEL_CARDS per notch.
+lbsb_wheel proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], rdx
+    call    lbsb_geom
+    test    eax, eax
+    jz      lw_ret
+    movsx   eax, word ptr [rbp-30]               ; wheel delta, +120 per notch away
+    imul    eax, eax, LBSB_WHEEL_CARDS
+    add     eax, dword ptr [g_lbsb_wheelacc]     ; accumulate small (touchpad) deltas
+    cdq
+    mov     ecx, 120
+    idiv    ecx
+    mov     dword ptr [g_lbsb_wheelacc], edx
+    test    eax, eax
+    jz      lw_ret
+lw_have:
+    neg     eax                                  ; away from the user = up
+    mov     edx, dword ptr [g_lbsb_curtop]
+    add     edx, eax
+    mov     rcx, qword ptr [rbp-24]
+    call    lbsb_settop
+lw_ret:
+    FRAME_EPILOG
+    ret
+lbsb_wheel endp
+
+; sel_list_subclass - SUBCLASSPROC for the export/import checklist (a report
+;   ListView): the same drawn scrollbar as the entry list.  The native bar is
+;   removed after every non-client calc - the ListView re-adds it whenever its
+;   item count changes - which is Myrkr's own idiom for its list.
+sel_list_subclass proc frame
+    FRAME_PROLOG 112
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], rdx
+    mov     qword ptr [rbp-40], r8
+    mov     qword ptr [rbp-48], r9
+    mov     dword ptr [g_lbsb_kind], 1           ; a report ListView
+    cmp     rdx, WM_NCCALCSIZE_
+    je      sls_nccalc
+    cmp     rdx, WM_PAINT
+    je      sls_paint
+    cmp     rdx, WM_MOUSEWHEEL
+    je      sls_wheel
+    cmp     rdx, WM_LBUTTONDOWN_
+    je      sls_lbdown
+    cmp     rdx, WM_MOUSEMOVE_
+    je      sls_move
+    cmp     rdx, WM_LBUTTONUP
+    je      sls_lbup
+    cmp     rdx, WM_MOUSELEAVE_
+    je      sls_leave
+    cmp     rdx, WM_CAPTURECHANGED_
+    je      sls_capchg
+sls_def:
+    WINCALL DefSubclassProc, qword ptr [rbp-24], qword ptr [rbp-32], qword ptr [rbp-40], \
+            qword ptr [rbp-48]
+    mov     qword ptr [rbp-72], rax
+    mov     rax, qword ptr [rbp-32]
+    cmp     rax, LVM_MSG_FIRST
+    jb      sls_chk2
+    cmp     rax, LVM_MSG_LAST
+    jbe     sls_chk
+sls_chk2:
+    cmp     rax, WM_KEYDOWN_
+    je      sls_chk
+    cmp     rax, WM_VSCROLL_
+    je      sls_chk
+    cmp     rax, WM_TIMER
+    je      sls_chk
+    cmp     rax, WM_SIZE_
+    je      sls_chk
+    cmp     rax, WM_LBUTTONDOWN_
+    jne     sls_ret
+sls_chk:
+    mov     rcx, qword ptr [rbp-24]
+    call    lbsb_scrollcheck
+sls_ret:
+    mov     rax, qword ptr [rbp-72]
+    FRAME_EPILOG
+    ret
+sls_nccalc:
+    WINCALL DefSubclassProc, qword ptr [rbp-24], qword ptr [rbp-32], qword ptr [rbp-40], \
+            qword ptr [rbp-48]
+    mov     qword ptr [rbp-72], rax
+    WINCALL ShowScrollBar, qword ptr [rbp-24], SB_BOTH_, 0     ; both: the column is sized to fit
+    jmp     sls_ret
+sls_paint:
+    WINCALL DefSubclassProc, qword ptr [rbp-24], qword ptr [rbp-32], qword ptr [rbp-40], \
+            qword ptr [rbp-48]
+    mov     qword ptr [rbp-72], rax
+    mov     rcx, qword ptr [rbp-24]
+    call    lbsb_paint
+    mov     eax, dword ptr [g_lbsb_curtop]
+    cmp     eax, dword ptr [g_lbsb_top]
+    je      sls_ret
+    mov     dword ptr [g_lbsb_top], eax
+    mov     rcx, qword ptr [rbp-24]
+    call    lbsb_strip_inval
+    jmp     sls_ret
+sls_wheel:
+    mov     rcx, qword ptr [rbp-24]
+    mov     rdx, qword ptr [rbp-40]
+    call    lbsb_wheel
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+sls_lbdown:
+    mov     rcx, qword ptr [rbp-24]
+    mov     rdx, qword ptr [rbp-48]
+    call    lbsb_lbdown
+    test    eax, eax
+    jz      sls_def
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+sls_move:
+    cmp     dword ptr [g_lbsb_track], 0
+    je      sls_hover
+    mov     rcx, qword ptr [rbp-24]
+    call    lbsb_drag
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+sls_hover:
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, 1
+    call    lbsb_hover_eval
+    jmp     sls_def
+sls_lbup:
+    cmp     dword ptr [g_lbsb_track], 0
+    je      sls_def
+    mov     dword ptr [g_lbsb_track], 0
+    WINCALL ReleaseCapture
+    mov     rcx, qword ptr [rbp-24]
+    xor     edx, edx
+    call    lbsb_hover_eval
+    mov     rcx, qword ptr [rbp-24]
+    call    lbsb_strip_inval
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+sls_leave:
+    mov     rcx, qword ptr [rbp-24]
+    xor     edx, edx
+    call    lbsb_hover_eval
+    jmp     sls_def
+sls_capchg:
+    cmp     dword ptr [g_lbsb_track], 0
+    je      sls_def
+    mov     dword ptr [g_lbsb_track], 0
+    mov     rcx, qword ptr [rbp-24]
+    call    lbsb_strip_inval
+    jmp     sls_def
+sel_list_subclass endp
+
 search_type_subclass proc frame
-    FRAME_PROLOG 80
+    FRAME_PROLOG 112
     mov     qword ptr [rbp-24], rcx            ; hwnd (list)
     mov     qword ptr [rbp-32], rdx            ; msg
     mov     qword ptr [rbp-40], r8             ; wParam (char)
     mov     qword ptr [rbp-48], r9             ; lParam
+    ; ---- the drawn scrollbar (lbsb_*) ------------------------------------------
+    mov     dword ptr [g_lbsb_kind], 0           ; a listbox
+    cmp     rdx, WM_PAINT
+    je      sts_paint
+    cmp     rdx, WM_MOUSEWHEEL
+    je      sts_wheel
+    cmp     rdx, WM_LBUTTONDOWN_
+    je      sts_lbdown
+    cmp     rdx, WM_MOUSEMOVE_
+    je      sts_move
+    cmp     rdx, WM_LBUTTONUP
+    je      sts_lbup
+    cmp     rdx, WM_MOUSELEAVE_
+    je      sts_leave
+    cmp     rdx, WM_CAPTURECHANGED_
+    je      sts_capchg
     cmp     rdx, WM_KEYDOWN_
     jne     sts_notkey
     mov     rcx, qword ptr [rbp-24]
@@ -7124,8 +8486,99 @@ sts_notkey:
 sts_def:
     WINCALL DefSubclassProc, qword ptr [rbp-24], qword ptr [rbp-32], qword ptr [rbp-40], \
             qword ptr [rbp-48]
+    mov     qword ptr [rbp-72], rax
+    ; anything that can scroll the list: keys, the list's own messages (LB_SETCURSEL,
+    ; LB_SETTOPINDEX, a refill), a resize, the drag-select autoscroll timer
+    mov     rax, qword ptr [rbp-32]
+    cmp     rax, LB_MSG_FIRST
+    jb      sts_chk2
+    cmp     rax, LB_MSG_LAST
+    jbe     sts_chk
+sts_chk2:
+    cmp     rax, WM_KEYDOWN_
+    je      sts_chk
+    cmp     rax, WM_VSCROLL_
+    je      sts_chk
+    cmp     rax, WM_TIMER
+    je      sts_chk
+    cmp     rax, WM_SIZE_
+    je      sts_chk
+    cmp     rax, WM_LBUTTONDOWN_
+    jne     sts_ret
+sts_chk:
+    mov     rcx, qword ptr [rbp-24]
+    call    lbsb_scrollcheck
+sts_ret:
+    mov     rax, qword ptr [rbp-72]
     FRAME_EPILOG
     ret
+sts_paint:
+    WINCALL DefSubclassProc, qword ptr [rbp-24], qword ptr [rbp-32], qword ptr [rbp-40], \
+            qword ptr [rbp-48]
+    mov     qword ptr [rbp-72], rax
+    mov     rcx, qword ptr [rbp-24]              ; the rows are on screen: the thumb on top,
+    call    lbsb_paint                           ;   in the same message
+    mov     eax, dword ptr [g_lbsb_curtop]       ; scrolled since the strip last painted?
+    cmp     eax, dword ptr [g_lbsb_top]          ;   the old thumb was blitted along with the
+    je      sts_ret                              ;   rows - repaint the strip once more
+    mov     dword ptr [g_lbsb_top], eax
+    mov     rcx, qword ptr [rbp-24]
+    call    lbsb_strip_inval
+    jmp     sts_ret
+sts_wheel:
+    mov     rcx, qword ptr [rbp-24]
+    mov     rdx, qword ptr [rbp-40]
+    call    lbsb_wheel
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+sts_lbdown:
+    mov     rcx, qword ptr [rbp-24]
+    mov     rdx, qword ptr [rbp-48]
+    call    lbsb_lbdown
+    test    eax, eax
+    jz      sts_def                              ; a card, not the bar
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+sts_move:
+    cmp     dword ptr [g_lbsb_track], 0
+    je      sts_hover
+    mov     rcx, qword ptr [rbp-24]              ; a drag owns every move until release
+    call    lbsb_drag
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+sts_hover:
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, 1                               ; the pointer is inside: arm the leave
+    call    lbsb_hover_eval
+    jmp     sts_def
+sts_lbup:
+    cmp     dword ptr [g_lbsb_track], 0
+    je      sts_def
+    mov     dword ptr [g_lbsb_track], 0
+    WINCALL ReleaseCapture
+    mov     rcx, qword ptr [rbp-24]
+    xor     edx, edx
+    call    lbsb_hover_eval
+    mov     rcx, qword ptr [rbp-24]
+    call    lbsb_strip_inval
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+sts_leave:
+    mov     rcx, qword ptr [rbp-24]
+    xor     edx, edx                             ; do NOT re-arm (see lbsb_hover_eval)
+    call    lbsb_hover_eval
+    jmp     sts_def
+sts_capchg:
+    cmp     dword ptr [g_lbsb_track], 0          ; capture taken away mid-drag (Alt+Tab,
+    je      sts_def                              ;   a modal): the drag is over
+    mov     dword ptr [g_lbsb_track], 0
+    mov     rcx, qword ptr [rbp-24]
+    call    lbsb_strip_inval
+    jmp     sts_def
 search_type_subclass endp
 
 ; kind_label(edx=kind) -> rax = wide default-label ptr.  Leaf.
@@ -7387,6 +8840,15 @@ gra_finish:
     jz      gra_nolimit
     WINCALL SendMessageW, rcx, EM_LIMITTEXT, CONVW_MAX-1, 0
 gra_nolimit:
+    mov     eax, dword ptr [rbp-40]              ; the label edit: read back into the
+    imul    eax, eax, DESCSZ                     ;   128-wide g_rlabel, so stop at 127
+    lea     r10, [g_fields]
+    add     r10, rax
+    mov     rcx, qword ptr [r10+FD_HANDLES+DS_LABEL*8]
+    test    rcx, rcx
+    jz      gra_nolbl
+    WINCALL SendMessageW, rcx, EM_LIMITTEXT, LBL_MAXCH, 0
+gra_nolbl:
     inc     dword ptr [g_field_count]
     mov     eax, dword ptr [rbp-40]
     FRAME_EPILOG
@@ -7904,29 +9366,12 @@ gui_tile_choose proc frame
     call    img_pick
     test    eax, eax
     jz      gtc_done
-    lea     rcx, [g_imgpath]
-    lea     rdx, [g_imgbuf]
-    lea     r8, [g_imgbuflen]
-    call    read_file
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_tile_add_cur                         ; read, stage, append - or 0
     test    eax, eax
-    jnz     gtc_done
-    lea     rcx, [g_imgpath]
-    call    gui_basename                             ; -> g_imgfn_w
-    mov     rcx, qword ptr [g_imgbuf]                 ; encrypt+stage -> g_imgstageref
-    mov     rdx, qword ptr [g_imgbuflen]
-    lea     r8, [g_imgstageref]
-    call    attach_stage
-    test    eax, eax
-    jnz     gtc_free
-    lea     rcx, [g_imgstageref]                     ; append {ref, filename}
-    lea     rdx, [g_imgfn_w]
-    call    tf_append
-    mov     dword ptr [g_dirty], 1
-gtc_free:
-    mov     rcx, qword ptr [g_imgbuf]
-    mov     rdx, qword ptr [g_imgbuflen]
-    call    mem_free
-    mov     qword ptr [g_imgbuf], 0
+    jnz     gtc_added
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr s_attfail, addr t_err, <MB_OK or MB_ICONWARNING>
+gtc_added:
     mov     rcx, qword ptr [rbp-24]
     mov     edx, dword ptr [rbp-32]
     call    gui_tile_relayout
@@ -7985,6 +9430,8 @@ gto_free_written:
     call    gui_temp_purge                            ; remove a partial plaintext file now
     jmp     gto_done
 gto_written:
+    lea     rcx, [g_tmpfile]                         ; before anything can open it
+    call    gui_motw
     WINCALL SetFileAttributesW, addr g_tmpfile, FILE_ATTRIBUTE_TEMPORARY  ; hint: keep in cache
     WINCALL ShellExecuteW, 0, addr verb_open, addr g_tmpfile, 0, 0, 1
     jmp     gto_done
@@ -8315,13 +9762,13 @@ gxe_scandone:
     add     r11, 2                             ; ext start = after the '.'
     cmp     r11, qword ptr [rbp-32]
     jae     gxe_noext                          ; nothing after the '.'
-    ; copy the extension -> g_extw, lowercased, capped at 15 chars
+    ; copy the extension -> g_extw, lowercased, capped at 31 chars (longest listed: 18)
     lea     r8, [g_extw]
     xor     ecx, ecx
 gxe_cpy:
     cmp     r11, qword ptr [rbp-32]
     jae     gxe_cpd
-    cmp     ecx, 15
+    cmp     ecx, 31
     jae     gxe_cpd
     movzx   eax, word ptr [r11]
     cmp     eax, 'A'
@@ -8365,6 +9812,123 @@ gxe_noext:
     FRAME_EPILOG
     ret
 gui_ext_is_exec endp
+
+; gui_same_file(rcx = path A, rdx = path B) -> eax = 1 if both exist and are the
+;   same file (volume serial + file index), else 0.
+gui_same_file proc frame
+    FRAME_PROLOG 240                            ; two 52-byte infos, clear of the spill
+    mov     qword ptr [rbp-24], rdx
+    mov     qword ptr [rbp-32], -1              ; handle B
+    mov     dword ptr [rbp-40], 0               ; result
+    test    rcx, rcx
+    jz      gsf2_done
+    test    rdx, rdx
+    jz      gsf2_done
+    WINCALL CreateFileW, rcx, 80h, 7, 0, OPEN_EXISTING_, 02000000h, 0
+    cmp     rax, -1                             ; 80h = FILE_READ_ATTRIBUTES, share all,
+    je      gsf2_done                           ;   BACKUP_SEMANTICS
+    mov     qword ptr [rbp-48], rax
+    WINCALL CreateFileW, qword ptr [rbp-24], 80h, 7, 0, OPEN_EXISTING_, 02000000h, 0
+    mov     qword ptr [rbp-32], rax
+    cmp     rax, -1
+    je      gsf2_closea
+    WINCALL GetFileInformationByHandle, qword ptr [rbp-48], addr rbp-120
+    test    eax, eax
+    jz      gsf2_closeb
+    WINCALL GetFileInformationByHandle, qword ptr [rbp-32], addr rbp-184
+    test    eax, eax
+    jz      gsf2_closeb
+    mov     eax, dword ptr [rbp-120+28]         ; dwVolumeSerialNumber
+    cmp     eax, dword ptr [rbp-184+28]
+    jne     gsf2_closeb
+    mov     rax, qword ptr [rbp-120+44]         ; nFileIndexHigh:Low
+    cmp     rax, qword ptr [rbp-184+44]
+    jne     gsf2_closeb
+    mov     dword ptr [rbp-40], 1
+gsf2_closeb:
+    WINCALL CloseHandle, qword ptr [rbp-32]
+gsf2_closea:
+    WINCALL CloseHandle, qword ptr [rbp-48]
+gsf2_done:
+    mov     eax, dword ptr [rbp-40]
+    FRAME_EPILOG
+    ret
+gui_same_file endp
+
+; gui_end_modals() -> eax = how many of this thread's modal dialogs were ended.  A
+;   modal is a dialog-class top-level window whose owner is disabled; the vault
+;   window itself (owned by the disabled tray window) is skipped.
+gui_end_modals proc frame
+    FRAME_PROLOG 32
+    mov     dword ptr [g_em_count], 0
+    WINCALL GetCurrentThreadId
+    WINCALL EnumThreadWindows, eax, addr gem_cb, 0
+    mov     eax, dword ptr [g_em_count]
+    FRAME_EPILOG
+    ret
+gui_end_modals endp
+
+; gem_cb(rcx = hwnd, rdx = lparam) -> TRUE (keep enumerating).
+gem_cb proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    cmp     rcx, qword ptr [g_vaulthwnd]
+    je      gem_next
+    WINCALL GetClassNameW, qword ptr [rbp-24], addr g_em_cls, 16
+    lea     rcx, [g_em_cls]
+    lea     rdx, [dlg_cls_w]
+    call    gui_wstr_eq
+    test    eax, eax
+    jz      gem_next
+    WINCALL GetWindow, qword ptr [rbp-24], 4    ; GW_OWNER
+    test    rax, rax
+    jz      gem_next
+    WINCALL IsWindowEnabled, rax
+    test    eax, eax
+    jnz     gem_next                            ; owner usable -> not modal over it
+    WINCALL EndDialog, qword ptr [rbp-24], IDCANCEL
+    inc     dword ptr [g_em_count]
+gem_next:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gem_cb endp
+
+; gui_motw(rcx = wide path) - mark a file Vordr just wrote out as downloaded from the
+;   internet (Zone.Identifier ZoneId=3), so Office opens it in Protected View, Windows
+;   asks before running it, and SmartScreen checks it.  An attachment's bytes are
+;   whatever was imported; the vault vouches for where they are kept, not for what
+;   they do.  Best-effort: FAT/exFAT and some shares have no alternate streams.
+gui_motw proc frame
+    FRAME_PROLOG 96                             ; locals to -40 clear of the 7-arg spill
+    mov     qword ptr [rbp-24], rcx
+    xor     r8d, r8d                            ; a path that does not fit would be cut,
+gmw_len:                                        ;   and the stream would land on a prefix
+    cmp     word ptr [rcx+r8*2], 0              ;   of it - another file entirely
+    je      gmw_fits
+    inc     r8d
+    cmp     r8d, MAX_PATH_CHARS-1
+    jb      gmw_len
+    jmp     gmw_done
+gmw_fits:
+    lea     rcx, [g_motw_w]
+    mov     rdx, qword ptr [rbp-24]
+    lea     r8, [g_motw_w + (MAX_PATH_CHARS-1)*2]
+    call    gui_wstrcpy                         ; -> rax = the NUL
+    mov     rcx, rax
+    lea     rdx, [motw_ads]
+    lea     r8, [g_motw_w + (MAX_PATH_CHARS+31)*2]
+    call    gui_wstrcpy
+    WINCALL CreateFileW, addr g_motw_w, GENERIC_WRITE_, 0, 0, 2, FILE_ATTR_NORMAL_, 0
+    cmp     rax, -1                             ; 2 = CREATE_ALWAYS (the stream, not the file)
+    je      gmw_done
+    mov     qword ptr [rbp-32], rax
+    WINCALL WriteFile, qword ptr [rbp-32], addr motw_body, motw_body_len, addr rbp-40, 0
+    WINCALL CloseHandle, qword ptr [rbp-32]
+gmw_done:
+    FRAME_EPILOG
+    ret
+gui_motw endp
 
 ; gui_tag_saveas(rcx = hdlg, edx = file index) - decrypt the attachment and let the
 ;   user pick where to save it (Save As).  Used for executable/script types instead
@@ -8421,7 +9985,11 @@ gts_scandone:
     mov     rdx, rax
     mov     r8, qword ptr [rbp-48]
     call    write_file
-    mov     rcx, qword ptr [rbp-56]
+    test    eax, eax
+    jnz     @F
+    lea     rcx, [g_imgpath]                  ; an executable type, by definition: mark it
+    call    gui_motw
+@@: mov     rcx, qword ptr [rbp-56]
     mov     rdx, qword ptr [rbp-48]
     call    mem_free
 gts_done:
@@ -8526,29 +10094,12 @@ gui_tile_palette_add proc frame
     call    img_pick
     test    eax, eax
     jz      gtpa_done
-    lea     rcx, [g_imgpath]
-    lea     rdx, [g_imgbuf]
-    lea     r8, [g_imgbuflen]
-    call    read_file
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_tile_add_cur                     ; read, stage, append - or 0
     test    eax, eax
-    jnz     gtpa_done
-    lea     rcx, [g_imgpath]
-    call    gui_basename                         ; -> g_imgfn_w
-    mov     rcx, qword ptr [g_imgbuf]
-    mov     rdx, qword ptr [g_imgbuflen]
-    lea     r8, [g_imgstageref]
-    call    attach_stage
-    test    eax, eax
-    jnz     gtpa_free
-    lea     rcx, [g_imgstageref]
-    lea     rdx, [g_imgfn_w]
-    call    tf_append
-    mov     dword ptr [g_dirty], 1
-gtpa_free:
-    mov     rcx, qword ptr [g_imgbuf]
-    mov     rdx, qword ptr [g_imgbuflen]
-    call    mem_free
-    mov     qword ptr [g_imgbuf], 0
+    jnz     gtpa_added
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr s_attfail, addr t_err, <MB_OK or MB_ICONWARNING>
+gtpa_added:
     call    tf_find_row                          ; already have a tile?
     cmp     eax, -1
     jne     gtpa_relayout
@@ -8570,10 +10121,14 @@ gtpa_done:
 gui_tile_palette_add endp
 
 ; gui_tile_add_cur(rcx = hdlg) -> eax = 1 if the file at g_imgpath was read,
-;   encrypted+staged, and appended to the attachments tile (0 if read failed,
-;   staging failed, or the tile is already full).  Shared by Choose and drop.
+;   encrypted+staged, and appended to the attachments tile (0 if the tile is full,
+;   the file is over ATT_FILE_MAX, or reading or staging failed).  The ONE path
+;   for Choose, the palette and drop; each tells the user when it returns 0.
 gui_tile_add_cur proc frame
     FRAME_PROLOG 48
+    cmp     dword ptr [g_tilefile_n], MAX_TFILES    ; full: refuse BEFORE reading and
+    jae     gtac_no                                 ;   staging a file that cannot be listed
+    mov     qword ptr [g_rf_cap], ATT_FILE_MAX
     lea     rcx, [g_imgpath]
     lea     rdx, [g_imgbuf]
     lea     r8, [g_imgbuflen]
@@ -8590,7 +10145,7 @@ gui_tile_add_cur proc frame
     jnz     gtac_free_no
     lea     rcx, [g_imgstageref]
     lea     rdx, [g_imgfn_w]
-    call    tf_append                               ; 1 = tile full (MAX_TFILES)
+    call    tf_append                               ; cannot be full: checked above
     test    eax, eax
     jnz     gtac_free_no
     mov     dword ptr [g_dirty], 1
@@ -8616,13 +10171,14 @@ gui_tile_add_cur endp
 ;   attachments tile (edit mode), creating the tile row on the first file.  The
 ;   MAX_TFILES cap is enforced by tf_append inside gui_tile_add_cur.
 gui_drop_files proc frame
-    FRAME_PROLOG 64
-    ; [rbp-24]=hdlg [rbp-32]=hdrop [rbp-40]=count [rbp-44]=i
+    FRAME_PROLOG 80
+    ; [rbp-24]=hdlg [rbp-32]=hdrop [rbp-40]=count [rbp-44]=i [rbp-52]=failed
     mov     qword ptr [rbp-24], rcx
     mov     qword ptr [rbp-32], rdx
     WINCALL DragQueryFileW, qword ptr [rbp-32], 0FFFFFFFFh, 0, 0
     mov     dword ptr [rbp-40], eax
     mov     dword ptr [rbp-44], 0
+    mov     dword ptr [rbp-52], 0                   ; files not attached
 gdf_loop:
     mov     eax, dword ptr [rbp-44]
     cmp     eax, dword ptr [rbp-40]
@@ -8631,10 +10187,18 @@ gdf_loop:
             addr g_imgpath, MAX_PATH_CHARS
     mov     rcx, qword ptr [rbp-24]
     call    gui_tile_add_cur
+    test    eax, eax
+    jnz     gdf_added
+    inc     dword ptr [rbp-52]                      ; not attached: say so once, below
+gdf_added:
     inc     dword ptr [rbp-44]
     jmp     gdf_loop
 gdf_finish:
     WINCALL DragFinish, qword ptr [rbp-32]
+    cmp     dword ptr [rbp-52], 0
+    je      gdf_allin
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr s_attfail, addr t_err, <MB_OK or MB_ICONWARNING>
+gdf_allin:
     call    tf_find_row                             ; existing tile?
     cmp     eax, -1
     jne     gdf_relayout
@@ -8736,9 +10300,8 @@ pg_putnum endp
 gui_page_bar proc frame
     FRAME_PROLOG 160
     mov     qword ptr [rbp-24], rcx
-    mov     dword ptr [rbp-28], 0                ; SW_HIDE (single page)
-    cmp     dword ptr [g_page_count], 1
-    jle     gpb_apply
+    mov     dword ptr [rbp-28], 0                ; SW_HIDE: the pane scrolls now (gui_dsb_*),
+    jmp     gpb_apply                            ;   so the "< n / m >" bar stays hidden
     mov     dword ptr [rbp-28], SW_SHOW
     ; --- indicator text "n / m" (1-based current, total) ---
     lea     r8, [g_pgbuf]
@@ -8783,13 +10346,20 @@ grl_havecmd:
     lea     r10, [lay_band]
     mov     eax, dword ptr [r10+rax*4]
     mov     dword ptr [rbp-68], eax
-    mov     rcx, qword ptr [rbp-24]              ; pagination: rows are packed into pages
-    call    gui_vis_bottom                       ;   sized to the live window height
+    mov     rcx, qword ptr [rbp-24]              ; the field band ends above the docked
+    call    gui_vis_bottom                       ;   command bar, at the live window height
     mov     dword ptr [rbp-92], eax              ; visible field-area bottom (DLU)
+    ; The pane scrolls a whole card at a time (it used to page): pass 0 MEASURES every
+    ; row, gui_dsb_compute turns that into the range of useful top rows and clamps
+    ; g_cur_page (the top row) into it, and pass 1 PLACES whole rows from the top row
+    ; down while they fit.  No row is ever partly shown, so nothing has to be clipped
+    ; against the header or the command bar.
+    mov     dword ptr [rbp-96], 0                ; pass: 0 = measure, 1 = place
 grl_pgrestart:
     mov     dword ptr [rbp-36], 0                ; i
-    mov     dword ptr [rbp-84], 52               ; py = per-page virtual cursor (ROW_TOP)
-    mov     dword ptr [rbp-88], 0                ; pg = current row's page index
+    mov     dword ptr [rbp-84], 52               ; py = layout cursor (ROW_TOP)
+    mov     dword ptr [rbp-100], 0               ; 1 = a row did not fit: the rest go too
+    mov     dword ptr [g_dsb_lastvis], -1
 grl_row:
     mov     eax, dword ptr [rbp-36]
     cmp     eax, dword ptr [g_field_count]
@@ -8842,20 +10412,32 @@ grl_setyh:
     mov     eax, dword ptr [rbp-68]              ; adjust height for the layout band
     sub     eax, 14                              ; (base heights assume a 14-DLU band)
     add     dword ptr [rbp-44], eax
-    ; --- pagination: does this row fit on the current page?  If not, open a new
-    ;     one.  Rows on g_cur_page get their real y; all others go off-screen. ---
+    cmp     dword ptr [rbp-96], 0                ; measure pass: record the height only
+    jne     grl_place
+    mov     r10, qword ptr [rbp-32]
+    mov     eax, dword ptr [rbp-44]
+    mov     dword ptr [r10+FD_H], eax
+    inc     dword ptr [rbp-36]
+    jmp     grl_row
+grl_place:
+    ; --- rows above the top row, and every row after the first that does not fit,
+    ;     go off-screen; the rest get their real y, top row first. ---
+    mov     eax, dword ptr [rbp-36]
+    cmp     eax, dword ptr [g_cur_page]
+    jb      grl_pg_hide
+    cmp     dword ptr [rbp-100], 0
+    jne     grl_pg_hide
     mov     eax, dword ptr [rbp-84]              ; py
-    cmp     eax, 52                              ; first row on a page always fits
-    je      grl_pg_disp
+    cmp     eax, 52                              ; the top row always fits
+    je      grl_pg_fit
     add     eax, dword ptr [rbp-44]              ; py + rowH
     cmp     eax, dword ptr [rbp-92]              ; > visible bottom?
-    jle     grl_pg_disp
-    inc     dword ptr [rbp-88]                   ; pg++ : this row opens a new page
-    mov     dword ptr [rbp-84], 52               ; py = top of the new page
-grl_pg_disp:
-    mov     eax, dword ptr [rbp-88]              ; on the current page -> real y; else hide
-    cmp     eax, dword ptr [g_cur_page]
-    jne     grl_pg_hide
+    jle     grl_pg_fit
+    mov     dword ptr [rbp-100], 1
+    jmp     grl_pg_hide
+grl_pg_fit:
+    mov     eax, dword ptr [rbp-36]
+    mov     dword ptr [g_dsb_lastvis], eax
     mov     eax, dword ptr [rbp-84]
     jmp     grl_pg_sety
 grl_pg_hide:
@@ -9116,28 +10698,25 @@ grl_attach:
     mov     edx, dword ptr [rbp-52]
     call    ShowWindow
 grl_advance:
-    ; advance the per-page virtual cursor by card height + inter-card gap
+    ; advance the layout cursor by card height + inter-card gap - for a row that is
+    ; actually on screen; an off-screen one takes no room
+    cmp     dword ptr [rbp-40], 10000
+    je      grl_adv_skip
     mov     eax, dword ptr [rbp-84]
     add     eax, dword ptr [rbp-44]
     mov     r10d, dword ptr [g_layout]
     lea     r11, [layout_gaps]
     add     eax, dword ptr [r11+r10*4]
     mov     dword ptr [rbp-84], eax
+grl_adv_skip:
     inc     dword ptr [rbp-36]
     jmp     grl_row
 grl_done:
-    ; total pages = the last row's page index + 1
-    mov     eax, dword ptr [rbp-88]
-    inc     eax
-    mov     dword ptr [g_page_count], eax
-    ; if the current page fell past the end (window shrank / rows removed), clamp
-    ; it and re-run the layout once with the corrected page
-    mov     eax, dword ptr [g_cur_page]
-    cmp     eax, dword ptr [g_page_count]
-    jl      grl_pgok
-    mov     eax, dword ptr [g_page_count]
-    dec     eax
-    mov     dword ptr [g_cur_page], eax
+    cmp     dword ptr [rbp-96], 0
+    jne     grl_pgok
+    mov     ecx, dword ptr [rbp-92]              ; measured: the scroll range, and the top
+    call    gui_dsb_compute                      ;   row clamped into it (window shrank,
+    mov     dword ptr [rbp-96], 1                ;   rows removed) - then place
     jmp     grl_pgrestart
 grl_pgok:
     ; (created/modified now live in the history browser, not under the last row)
@@ -9173,6 +10752,14 @@ gui_url_open proc frame
     mov     edx, DS_VALUE
     call    dynid
     mov     dword ptr [rbp-40], eax             ; value control id
+    mov     rcx, qword ptr [rbp-24]             ; a URL cut at 1023 characters opens a
+    mov     edx, dword ptr [rbp-40]             ;   DIFFERENT address - refuse it instead
+    call    gui_ctl_len
+    cmp     eax, 1024
+    jb      guo_fits
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr s_urllong, addr t_err, <MB_OK or MB_ICONWARNING>
+    jmp     guo_done
+guo_fits:
     WINCALL GetDlgItemTextW, qword ptr [rbp-24], dword ptr [rbp-40], addr g_urlbuf, 1024
     test    eax, eax
     jz      guo_done                            ; empty field
@@ -9440,7 +11027,7 @@ grc_value:
     mov     edx, DS_VALUE
     call    dynid
     mov     dword ptr [rbp-40], eax
-    WINCALL GetDlgItemTextW, qword ptr [rbp-24], dword ptr [rbp-40], addr g_secret_w, EBUF*2-1
+    WINCALL GetDlgItemTextW, qword ptr [rbp-24], dword ptr [rbp-40], addr g_secret_w, CONVW_MAX
     mov     rcx, qword ptr [rbp-24]
     lea     rdx, [g_secret_w]
     call    gui_copy
@@ -9487,6 +11074,13 @@ gat_loop:
     call    dynid
     mov     dword ptr [rbp-36], eax
     WINCALL GetDlgItemTextW, qword ptr [rbp-24], dword ptr [rbp-36], addr g_e_totp, 256
+    mov     rcx, qword ptr [rbp-24]             ; longer than any key: the first 255
+    mov     edx, dword ptr [rbp-36]             ;   characters are not the key, so show
+    call    gui_ctl_len                         ;   no code rather than a wrong one
+    cmp     eax, 256
+    jb      gat_keyfits
+    mov     word ptr [g_e_totp], 0
+gat_keyfits:
     lea     r10, [g_e_totp]                     ; ascii base32 (wide) -> bytes
     lea     r11, [g_totp_b32]
     xor     r8d, r8d
@@ -9714,6 +11308,10 @@ gui_addfield_one proc frame
     mov     qword ptr [rbp-24], rcx
     mov     dword ptr [rbp-32], edx
     mov     qword ptr [rbp-40], r8
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_trunc_refuse
+    test    eax, eax
+    jnz     gao_done
     ; refuse a 2nd TOTP (the palette greys it; guard regardless)
     cmp     dword ptr [rbp-32], VF_TOTP
     jne     gao_chkroom
@@ -10637,10 +12235,18 @@ pr_ret:
     ret
 pwread_proc endp
 
+; gui_ctl_len(rcx = hdlg, edx = id) -> eax = the control's text length in characters.
+gui_ctl_len proc frame
+    FRAME_PROLOG 32
+    WINCALL SendDlgItemMessageW, rcx, edx, WM_GETTEXTLENGTH_, 0, 0
+    FRAME_EPILOG
+    ret
+gui_ctl_len endp
+
 ; gui_read_password(rcx = hdlg) - read the entry's first secret aloud: copy its
 ;   plaintext into g_readpw, show DLG_PWREAD, then wipe the scratch buffers.
 gui_read_password proc frame
-    FRAME_PROLOG 48
+    FRAME_PROLOG 64
     mov     qword ptr [rbp-24], rcx
     mov     edx, VF_SECRET
     call    gui_row_of_kind
@@ -10649,7 +12255,16 @@ gui_read_password proc frame
     mov     ecx, eax                          ; row -> DS_VALUE id
     mov     edx, DS_VALUE
     call    dynid
-    WINCALL GetDlgItemTextW, qword ptr [rbp-24], eax, addr g_readpw, 256
+    mov     dword ptr [rbp-32], eax
+    mov     rcx, qword ptr [rbp-24]           ; reading out the first 255 characters of a
+    mov     edx, eax                          ;   longer password is reading out the wrong
+    call    gui_ctl_len                       ;   password
+    cmp     eax, 256
+    jb      grp_fits
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr s_readlong, addr t_err, <MB_OK or MB_ICONINFORMATION>
+    jmp     grp_done
+grp_fits:
+    WINCALL GetDlgItemTextW, qword ptr [rbp-24], dword ptr [rbp-32], addr g_readpw, 256
     WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_PWREAD, qword ptr [rbp-24], \
             addr pwread_proc, 0
     lea     r10, [g_readpw]                   ; wipe plaintext + phonetic scratch
@@ -11227,7 +12842,7 @@ gui_restore_entry proc frame
     mov     rcx, qword ptr [rbp-24]
     call    gui_commit
     test    eax, eax
-    jnz     gre_done
+    jnz     gre_fail
     mov     dword ptr [g_cur_idx], -1            ; it left the trash: clear the detail
     mov     rcx, qword ptr [rbp-24]
     call    gui_rows_clear
@@ -11235,6 +12850,9 @@ gui_restore_entry proc frame
     call    gui_poplist                          ; refresh the recover list
     mov     rcx, qword ptr [rbp-24]
     call    gui_detail_clear                     ; empty the detail (no stale entry shown)
+    jmp     gre_done
+gre_fail:
+    mov     dword ptr [g_deleted_state], 1       ; not saved: it is still in the trash
 gre_done:
     FRAME_EPILOG
     ret
@@ -11937,14 +13555,87 @@ vault_proc proc
     je      vp_minmax
     cmp     rdx, WM_NCHITTEST_
     je      vp_nchit
+    cmp     rdx, WM_MOUSEWHEEL                ; the detail pane's scrolling (gui_dsb_*):
+    je      vp_dwheel                         ;   wheel over the pane, or the thumb strip
+    cmp     rdx, WM_LBUTTONDOWN_
+    je      vp_dlbdown
+    cmp     rdx, WM_MOUSEMOVE_
+    je      vp_dmove
+    cmp     rdx, WM_LBUTTONUP
+    je      vp_dlbup
+    cmp     rdx, WM_MOUSELEAVE_
+    je      vp_dleave
+    cmp     rdx, WM_CAPTURECHANGED_
+    je      vp_dcapchg
     xor     eax, eax
     jmp     vp_ret
 vp_tcolor:
     call    gui_ctlcolor                     ; theme + link-blue for view-mode URL values
     jmp     vp_ret
+vp_dwheel:
+    mov     rcx, qword ptr [rbp-8]
+    mov     rdx, r8
+    mov     r8, r9
+    call    gui_dsb_wheel
+    test    eax, eax
+    jz      vp_unhandled
+    jmp     vp_handled
+vp_dlbdown:
+    mov     rcx, qword ptr [rbp-8]
+    mov     rdx, r9
+    call    gui_dsb_lbdown
+    test    eax, eax
+    jz      vp_unhandled
+    jmp     vp_handled
+vp_dmove:
+    cmp     dword ptr [g_dsb_track], 0
+    je      vp_dmove_hover
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_dsb_drag
+    jmp     vp_handled
+vp_dmove_hover:
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, 1
+    call    gui_dsb_hover
+    jmp     vp_unhandled
+vp_dlbup:
+    cmp     dword ptr [g_dsb_track], 0
+    je      vp_unhandled
+    mov     dword ptr [g_dsb_track], 0
+    sub     rsp, 32
+    call    ReleaseCapture
+    add     rsp, 32
+    mov     rcx, qword ptr [rbp-8]
+    xor     edx, edx
+    call    gui_dsb_hover
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_dsb_inval
+    jmp     vp_handled
+vp_dleave:
+    mov     rcx, qword ptr [rbp-8]
+    xor     edx, edx                         ; never re-arm from the leave
+    call    gui_dsb_hover
+    jmp     vp_unhandled
+vp_dcapchg:
+    cmp     dword ptr [g_dsb_track], 0
+    je      vp_unhandled
+    mov     dword ptr [g_dsb_track], 0
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_dsb_inval
+    jmp     vp_unhandled
 vp_nchit:
+    ; The detail pane's thumb strip is empty client area, which frame_hittest would
+    ; call caption - a press there moved the WINDOW and no mouse message ever
+    ; reached the thumb.  Claim it as client first.
+    mov     qword ptr [rbp-40], r9
+    mov     rcx, qword ptr [rbp-8]
+    mov     rdx, r9
+    call    gui_dsb_striphit
+    mov     r9, qword ptr [rbp-40]
+    test    eax, eax
+    jnz     vp_nchit_def                     ; default hit test -> HTCLIENT
     mov     rcx, qword ptr [rbp-8]           ; custom frame: drag the empty title strip
-    call    frame_hittest                    ;   (r9 already = lParam screen point)
+    call    frame_hittest                    ;   (r9 = lParam screen point)
     test    eax, eax
     jz      vp_nchit_def
     mov     eax, 1                           ; handled: DWLP_MSGRESULT = HTCAPTION
@@ -12043,6 +13734,9 @@ vp_terase:
     mov     rcx, qword ptr [rbp-16]           ; ...or the home panel, when the detail
     mov     rdx, qword ptr [rbp-8]            ;   pane has nothing to show
     call    gui_draw_home
+    mov     rcx, qword ptr [rbp-16]           ; the detail pane's thumb, beside the cards
+    mov     rdx, qword ptr [rbp-8]
+    call    gui_draw_dthumb
     mov     eax, 1
     jmp     vp_ret
 vp_tdraw:
@@ -12171,20 +13865,15 @@ vp_wts:
     jne     vp_handled
     cmp     dword ptr [g_winlock], 0          ; setting off -> ignore
     je      vp_handled
-    jmp     vp_lock
+    jmp     vp_lock_req
 vp_t_idle:
     mov     rcx, qword ptr [rbp-8]            ; C8.4: refresh if the vault changed on disk
     call    gui_check_refresh                ;   and we have no unsaved edit (silent)
     cmp     dword ptr [g_idle_min], 0         ; auto-lock: setting turned off since arming
     je      vp_handled
-    sub     rsp, 32                           ; one of OUR modal popups active?
-    call    GetActiveWindow                   ;   (thread-local; NULL if another app
-    add     rsp, 32                           ;    has focus - locking then is fine)
-    test    rax, rax
-    jz      @F
-    cmp     rax, qword ptr [rbp-8]
-    jne     vp_handled                        ; modal child up -> skip this tick
-@@: mov     dword ptr [rbp-32], 8             ; LASTINPUTINFO { cbSize=8, dwTime }
+    ; (This used to skip the tick whenever one of our modals was up - so a message
+    ; box left open kept the vault unlocked for good.  vp_lock_req closes them.)
+    mov     dword ptr [rbp-32], 8             ; LASTINPUTINFO { cbSize=8, dwTime }
     sub     rsp, 32
     lea     rcx, [rbp-32]
     call    GetLastInputInfo
@@ -12199,7 +13888,7 @@ vp_t_idle:
     imul    ecx, ecx, 60000                   ; minutes -> ms
     cmp     eax, ecx
     jb      vp_handled
-    jmp     vp_lock                           ; idle long enough -> lock the vault
+    jmp     vp_lock_req                       ; idle long enough -> lock the vault
 vp_t_clip:
     sub     rsp, 32
     mov     rcx, qword ptr [rbp-8]
@@ -12224,6 +13913,16 @@ vp_t_search:
 vp_init:
     mov     rax, qword ptr [rbp-8]            ; remember the window for the tray toggle
     mov     qword ptr [g_vaulthwnd], rax
+    ; The entry list's drawn scrollbar keeps hover/drag/scroll state across messages;
+    ; a lock destroys this window mid-anything, so it starts clean with each one.
+    mov     dword ptr [g_lbsb_hover], 0
+    mov     dword ptr [g_lbsb_track], 0
+    mov     dword ptr [g_lbsb_top], 0
+    mov     dword ptr [g_lbsb_busy], 0
+    mov     dword ptr [g_dsb_hover], 0
+    mov     dword ptr [g_dsb_track], 0
+    mov     dword ptr [g_dsb_wheelacc], 0
+    mov     dword ptr [g_lbsb_wheelacc], 0
     WINCALL GetFileAttributesW, addr g_vpath  ; C8.5: a read-only vault FILE forces
     cmp     eax, -1                           ; read-only mode (it can't be written anyway)
     je      @F
@@ -12323,6 +14022,7 @@ vp_init:
     WINCALL GetDlgItem, qword ptr [rbp-8], IDC_V_LIST    ; type-to-search: keystrokes on
     WINCALL SetWindowSubclass, rax, addr search_type_subclass, 0, 0   ;  the list -> search box
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_V_SEARCH, EM_SETCUEBANNER, 1, addr cue_search
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_V_SEARCH, EM_LIMITTEXT, SRCH_MAXCH, 0
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_V_TITLE, EM_LIMITTEXT, CONVW_MAX-1, 0
     mov     dword ptr [g_trash_view], 0       ; start in the vault (not the trash) view
     mov     dword ptr [g_deleted_state], 0
@@ -12445,7 +14145,7 @@ vp_cmd_fixed:
     cmp     eax, IDC_V_DONE
     je      vp_done
     cmp     eax, IDC_V_LOCK                   ; no Lock button, but Ctrl+L still posts this
-    je      vp_lock
+    je      vp_lock_req
     cmp     eax, IDC_V_MTHEME
     je      vp_theme
     cmp     eax, IDC_V_MHOTK
@@ -12565,6 +14265,20 @@ vp_search_now:
     call    gui_poplist
     jmp     vp_handled
 vp_focusin:
+    cmp     eax, IDC_DYN_BASE                   ; a row's control took the focus (Tab):
+    jb      vpf_noscroll                        ;   bring its card on screen
+    mov     dword ptr [rbp-16], eax
+    mov     qword ptr [rbp-40], r9
+    sub     eax, IDC_DYN_BASE
+    xor     edx, edx
+    mov     ecx, DYN_SLOTS
+    div     ecx                                 ; row
+    mov     edx, eax
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_dsb_ensure
+    mov     r9, qword ptr [rbp-40]
+    mov     eax, dword ptr [rbp-16]
+vpf_noscroll:
     cmp     dword ptr [g_editmode], 0
     jne     vp_refocus                          ; edit mode: field is being edited
     ; view mode: suppress the blinking caret on the read-only detail edits (the
@@ -12667,6 +14381,10 @@ vp_fav:
     call    gui_restore_entry
     jmp     vp_handled
 vp_fav_toggle:
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_trunc_refuse
+    test    eax, eax
+    jnz     vp_handled
     mov     eax, dword ptr [g_fav_state]         ; toggle favorite
     xor     eax, 1
     mov     dword ptr [g_fav_state], eax
@@ -12858,6 +14576,10 @@ vp_edit:
     cmp     dword ptr [g_cur_idx], 0
     jl      vp_handled                       ; nothing selected -> nothing to edit
     mov     rcx, qword ptr [rbp-8]
+    call    gui_trunc_refuse
+    test    eax, eax
+    jnz     vp_handled
+    mov     rcx, qword ptr [rbp-8]
     mov     edx, 1
     call    gui_set_editmode
     mov     rcx, qword ptr [rbp-8]            ; focus the title for editing
@@ -12950,6 +14672,10 @@ vp_remove:
     jl      vp_handled
     cmp     dword ptr [g_trash_view], 0
     jne     vpr_forever                      ; already in trash -> permanent delete
+    mov     rcx, qword ptr [rbp-8]           ; trashing rebuilds the entry too
+    call    gui_trunc_refuse
+    test    eax, eax
+    jnz     vp_handled
     WINCALL gui_msgbox, qword ptr [rbp-8], addr t_trash, addr t_err, <MB_YESNO or MB_ICONQUESTION>
     cmp     eax, IDYES
     jne     vp_handled
@@ -12990,8 +14716,24 @@ vp_done:
     mov     rcx, qword ptr [rbp-8]           ; "Done" -> leave recover mode
     call    gui_leave_trash
     jmp     vp_handled
+vp_lock_req:
+    ; Idle, workstation lock, the hotkey, Ctrl+L.  When one of our modal dialogs or
+    ; message boxes is up, locking from inside its loop leaves it on screen - showing
+    ; whatever it shows - until someone answers it, and the code that opened it then
+    ; carries on against a vault that is going away.  End them (as Cancel), let their
+    ; loops unwind, and run the lock from the vault window's own loop.  Bounded: a
+    ; dialog that will not close does not hold the lock off.
+    call    gui_end_modals
+    test    eax, eax
+    jz      vp_lock
+    cmp     dword ptr [g_lock_tries], 20
+    jae     vp_lock
+    inc     dword ptr [g_lock_tries]
+    WINCALL PostMessageW, qword ptr [rbp-8], WM_COMMAND, IDC_V_LOCK, 0
+    jmp     vp_handled
 vp_lock:
 vp_close:
+    mov     dword ptr [g_lock_tries], 0
     cmp     dword ptr [g_menu_open], 0       ; closing while settings open -> save
     je      vp_lock_dirty
     mov     rcx, qword ptr [rbp-8]
@@ -13019,7 +14761,7 @@ vp_lock_go:
     call    gui_temp_purge                  ; overwrite + delete any decrypt-to-temp files
     call    gui_clipclear                   ; clear the clipboard if it is still ours
     lea     rcx, [g_secret_w]               ; wipe revealed secret + TOTP material
-    mov     edx, EBUF*4
+    mov     edx, CONVW_MAX*2
     call    secure_zero
     lea     rcx, [g_totp_b32]
     mov     edx, 256
@@ -13856,6 +15598,8 @@ cp_init:
     ; placeholder cue text inside the two password boxes
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_C_PW, EM_SETCUEBANNER, 1, addr cue_pw
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_C_PW2, EM_SETCUEBANNER, 1, addr cue_pw2
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_C_PW, EM_LIMITTEXT, PW_MAXCH, 0
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_C_PW2, EM_LIMITTEXT, PW_MAXCH, 0
     mov     rcx, qword ptr [rbp-8]           ; prime the underlines + Create state
     call    gui_pw_strength
     mov     eax, 1
@@ -14273,6 +16017,11 @@ sel_init:
     mov     dword ptr [r10+0], LVCF_WIDTH
     mov     dword ptr [r10+8], 100
     WINCALL SendMessageW, qword ptr [rbp-16], LVM_INSERTCOLUMNW, 0, addr g_lvi
+    mov     dword ptr [g_lbsb_hover], 0          ; the drawn scrollbar starts clean here too
+    mov     dword ptr [g_lbsb_track], 0
+    mov     dword ptr [g_lbsb_top], 0
+    WINCALL SetWindowSubclass, qword ptr [rbp-16], addr sel_list_subclass, 0, 0
+    WINCALL ShowScrollBar, qword ptr [rbp-16], SB_BOTH_, 0
     cmp     dword ptr [g_sel_src], 0            ; import mode: relabel caption + OK button
     je      sel_init_pop
     WINCALL SetWindowTextW, qword ptr [rbp-8], addr sel_cap_imp
@@ -14281,6 +16030,7 @@ sel_init_pop:
     mov     rcx, qword ptr [rbp-8]
     call    gui_sel_populate
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_SEL_SEARCH, EM_SETCUEBANNER, 1, addr cue_search
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_SEL_SEARCH, EM_LIMITTEXT, SRCH_MAXCH, 0
     mov     eax, 1
     jmp     sel_ret
 sel_cmd:
@@ -14319,9 +16069,16 @@ sel_c_ok:
     mov     rcx, qword ptr [rbp-8]
     call    gui_sel_readback
     WINCALL EndDialog, qword ptr [rbp-8], 1
-    jmp     sel_handled
+    jmp     sel_lbsb_reset
 sel_c_cancel:
     WINCALL EndDialog, qword ptr [rbp-8], 0
+sel_lbsb_reset:
+    ; The checklist and the entry list share the drawn scrollbar's state.  Closed with
+    ; Enter while the pointer was on the checklist's strip, no WM_MOUSELEAVE ever came
+    ; and the entry list drew its thumb hovered-wide until the mouse next crossed it.
+    mov     dword ptr [g_lbsb_hover], 0
+    mov     dword ptr [g_lbsb_track], 0
+    mov     dword ptr [g_lbsb_top], -1           ; and repaint its strip on the next paint
     jmp     sel_handled
 sel_handled:
     mov     eax, 1
@@ -14500,6 +16257,20 @@ gui_export proc frame
     mov     edx, MAX_PATH_CHARS                  ;   name in step, this guarantees the path
     mov     r8d, eax                             ;   actually written matches the format
     call    gui_fix_ext
+    ; The export target must not be the vault itself: the file dialog happily offers
+    ; it, and writing the export over it replaced the vault with a copy encrypted
+    ; under the EXPORT password - or with a ZIP.  Compared by file identity, so no
+    ; spelling, short name or hard link gets round it.
+    lea     rcx, [g_imgpath]
+    lea     rdx, [g_vpath]
+    call    gui_same_file
+    test    eax, eax
+    jnz     gx_self
+    lea     rcx, [g_imgpath]
+    mov     rdx, qword ptr [g_cfg_in]
+    call    gui_same_file
+    test    eax, eax
+    jnz     gx_self
     cmp     dword ptr [rbp-40], 0
     je      gx_askpw
     ; ZIP is the weaker path and must be a deliberate choice, so say plainly what is
@@ -14572,6 +16343,9 @@ gx_composefail:
     call    ze_free
     call    ges_wipepw
     WINCALL MessageBoxW, qword ptr [rbp-24], addr xp_mm_fail, addr xp_mm_title, 010h
+    jmp     gx_done
+gx_self:
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr exp_self, addr exp_title, <MB_OK or MB_ICONWARNING>
     jmp     gx_done
 gx_writefail:
     WINCALL MessageBoxW, qword ptr [rbp-24], addr xp_mm_fail, addr xp_mm_title, 010h
@@ -15329,6 +17103,7 @@ gim_ask:
     test    eax, eax
     jz      gim_done
 gim_havefile:
+    mov     qword ptr [g_rf_cap], 0F0000000h    ; = ZE_MAXCAP: the lengths below are 32-bit
     lea     rcx, [g_imgpath]
     lea     rdx, [rbp-32]                       ; *raw
     lea     r8, [rbp-40]                        ; *rawlen
@@ -15370,11 +17145,16 @@ gim_read_ok:
     mov     dword ptr [g_xlpwlen], 0
     cmp     dword ptr [rbp-64], -3
     je      gim_wrongpw                         ; zi_stage already freed the arena + wiped pw
+    cmp     dword ptr [rbp-64], -4
+    je      gim_unsup
     cmp     dword ptr [rbp-64], 0
     jl      gim_bad
     jg      gim_sel
     call    zi_abort                            ; staged 0 entries
     WINCALL gui_msgbox, qword ptr [rbp-24], addr imp_g_none, addr imp_g_title, 030h
+    jmp     gim_done
+gim_unsup:
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr imp_g_unsup, addr imp_g_title, 030h
     jmp     gim_done
 gim_notvordr:
     WINCALL gui_msgbox, qword ptr [rbp-24], addr imp_g_bad, addr imp_g_title, 030h
@@ -15999,6 +17779,11 @@ xpp_init:
 @@: WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_XP_WARN, rax
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_XP_PW, EM_SETCUEBANNER, 1, addr cue_xppw
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_XP_PW2, EM_SETCUEBANNER, 1, addr cue_xppw2
+    ; g_xlpw holds 254 characters.  Without a limit the box took any length and the
+    ; read kept the first 254 - the archive was sealed with a password that was not
+    ; the one typed, which 7-Zip and Windows then (correctly) refused.
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_XP_PW, EM_LIMITTEXT, XLPW_MAXCH, 0
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_XP_PW2, EM_LIMITTEXT, XLPW_MAXCH, 0
     mov     dword ptr [g_uline_ctl], 0          ; start with default (accent) underlines
     mov     dword ptr [g_uline_ctl2], 0
     mov     qword ptr [g_uline_br], 0
@@ -16160,6 +17945,7 @@ rmp_init:
     mov     rcx, qword ptr [rbp-8]
     call    gui_set_winicon
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_RM_PW, EM_SETCUEBANNER, 1, addr cue_rmpw
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_RM_PW, EM_LIMITTEXT, PW_MAXCH, 0
     mov     eax, 1
     jmp     rmp_ret
 rmp_cmd:
@@ -16171,7 +17957,7 @@ rmp_cmd:
     xor     eax, eax
     jmp     rmp_ret
 rmp_ok:
-    WINCALL GetDlgItemTextW, qword ptr [rbp-8], IDC_RM_PW, addr g_pwbuf, 1023
+    WINCALL GetDlgItemTextW, qword ptr [rbp-8], IDC_RM_PW, addr g_pwbuf, 1024 ; = unlock's count
     test    eax, eax
     jz      rmp_again                            ; empty -> just ask again
     lea     rcx, [g_pwbuf]
@@ -16308,6 +18094,7 @@ ipp_init:
     mov     rcx, qword ptr [rbp-8]
     call    gui_set_winicon
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_XP_PW, EM_SETCUEBANNER, 1, addr cue_ippw
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_XP_PW, EM_LIMITTEXT, XLPW_MAXCH, 0
     mov     eax, 1
     jmp     ipp_ret
 ipp_cmd:
@@ -16625,6 +18412,16 @@ gui_resolve_vault proc frame
     FRAME_PROLOG 32
     mov     dword ptr [g_is_default], 0
     mov     dword ptr [g_vault_lock], 0
+ifdef PROBE_IO
+    cmp     word ptr [g_testvault], 0       ; VORDR_TEST_VAULT: the harness's vault
+    je      grv_notest
+    lea     rcx, [g_vpath]
+    lea     rdx, [g_testvault]
+    lea     r8, [g_vpath + (MAX_PATH_CHARS-1)*2]
+    call    gui_wstrcpy
+    jmp     grv_havepath
+grv_notest:
+endif
     lea     rcx, [g_vpath]
     mov     edx, MAX_PATH_CHARS
     lea     r8, [g_vault_lock]
@@ -16814,32 +18611,22 @@ sdt_done:
     ret
 secdesk_body endp
 
-; secdesk_thread(rcx = unused) - the CreateThread entry.  It swaps in this worker
-;   thread's OWN shadow stack for the duration of the dialog, so the framed code it
-;   runs (secdesk_body -> the create/unlock dialog) can never push or pop the main
-;   thread's shared shadow stack.  The main thread is parked in WaitForSingleObject
-;   throughout, so mutating g_sstk_* here is race-free.  RAW proc by design: it must
-;   NOT frame itself (that would push to the stack it is about to swap out).
+; secdesk_thread(rcx = unused) - the CreateThread entry.  The worker gets its own
+;   per-thread shadow stack (sstk_thread_init), so nothing it does - and nothing an
+;   orphaned worker does after the watchdog has given up on it - touches the main
+;   thread's.  RAW proc by design: it runs before its shadow stack exists, and
+;   sstk_thread_free must be the last thing it does.
 secdesk_thread proc
     push    rbp                                  ; robust raw frame: force 16-byte alignment
     mov     rbp, rsp                             ; regardless of the OS thread-entry rsp
     and     rsp, -16                             ; (a bad assumption here misaligned the crypto
     sub     rsp, 32                              ;  in secdesk_body -> corruption/faults)
+    call    sstk_thread_init                     ; 0 = runs canary-only: still correct
     call    GetCurrentThreadId                   ; publish before the desktop switch: a fault
     mov     dword ptr [g_secdesk_tid], eax       ;   from here on is on the private desktop
-    mov     rax, qword ptr [g_sstk_base]         ; park the main thread's shadow stack
-    mov     qword ptr [g_sstk_savebase], rax
-    mov     rax, qword ptr [g_sstk_index]
-    mov     qword ptr [g_sstk_saveidx], rax
-    lea     rax, [g_sstk_worker]                 ; install this thread's own, empty stack
-    mov     qword ptr [g_sstk_base], rax
-    mov     qword ptr [g_sstk_index], 0
     call    secdesk_body
     mov     dword ptr [g_secdesk_tid], 0         ; back on the caller's desktop from here
-    mov     rax, qword ptr [g_sstk_savebase]     ; restore the main thread's shadow stack
-    mov     qword ptr [g_sstk_base], rax
-    mov     rax, qword ptr [g_sstk_saveidx]
-    mov     qword ptr [g_sstk_index], rax
+    call    sstk_thread_free                     ; every framed call has returned
     mov     rsp, rbp
     pop     rbp
     xor     eax, eax
@@ -16851,7 +18638,7 @@ secdesk_thread endp
 ;   until it closes.  Falls back to a normal modal dialog on any failure.
 public gui_secdesk_show
 gui_secdesk_show proc frame
-    FRAME_PROLOG 64                              ; room for 6-arg WINCALL spill above [rbp-24]
+    FRAME_PROLOG 96                              ; locals to -48 above the 6-arg WINCALL spill
     mov     dword ptr [g_secdesk_dlg], ecx
     mov     qword ptr [g_secdesk_proc], rdx
     mov     qword ptr [g_secdesk_res], 0
@@ -16867,8 +18654,23 @@ gui_secdesk_show proc frame
     mov     qword ptr [g_secdesk_orig], rax
     test    rax, rax
     jz      gss_fallback
-    ; create the private desktop the dialog will live on
-    WINCALL CreateDesktopW, addr secdesk_name, 0, 0, 0, DESKTOP_MAXALLOWED, 0
+    ; create the private desktop the dialog will live on, under a name nobody can
+    ; know in advance.  (Same-user code can still enumerate desktops; this removes
+    ; the trivially pre-arranged hook-up, it is not an access control.)
+    lea     rcx, [g_secdesk_name]
+    lea     rdx, [secdesk_pfx]
+    lea     r8, [g_secdesk_name+30*2]
+    call    gui_wstrcpy                          ; -> rax = the NUL
+    mov     qword ptr [rbp-40], rax
+    lea     rcx, [rbp-48]
+    mov     edx, 8
+    call    rng_fill
+    test    eax, eax
+    jz      gss_fallback                         ; no randomness -> plain dialog
+    mov     rcx, qword ptr [rbp-48]
+    mov     rdx, qword ptr [rbp-40]
+    call    gui_ft_hex16                         ; 16 hex + NUL
+    WINCALL CreateDesktopW, addr g_secdesk_name, 0, 0, 0, DESKTOP_MAXALLOWED, 0
     mov     qword ptr [g_secdesk_hd], rax
     test    rax, rax
     jz      gss_fallback                         ; no desktop -> plain dialog
@@ -16913,19 +18715,14 @@ gss_wait:
     mov     qword ptr [g_secdesk_orig], 0
     jmp     gss_ret
 gss_worker_done:
-    ; secdesk_thread restores these itself on the normal path; repeat it here so a
-    ; worker that died mid-dialog cannot leave the main thread running on the
-    ; worker's shadow stack.  Same saved values, so the normal path is a no-op.
-    mov     rax, qword ptr [g_sstk_savebase]
-    test    rax, rax
-    jz      @F
-    mov     qword ptr [g_sstk_base], rax
-    mov     rax, qword ptr [g_sstk_saveidx]
-    mov     qword ptr [g_sstk_index], rax
-@@: WINCALL CloseHandle, qword ptr [rbp-24]
+    ; (The worker's shadow stack is its own, per thread: there is nothing of the main
+    ; thread's to restore here, and the watchdog path above can return safely.)
+    WINCALL CloseHandle, qword ptr [rbp-24]
     jmp     gss_cleanup
 gss_fallback:
-    ; degrade to a normal on-desktop modal dialog (never lock the user out)
+    ; degrade to a normal on-desktop modal dialog (never lock the user out) - but
+    ; say so: the protection the user turned on is not there this time.
+    WINCALL gui_msgbox, 0, addr s_sdfall, addr t_err, <MB_OK or MB_ICONWARNING>
     WINCALL DialogBoxParamW, qword ptr [g_hinst], dword ptr [g_secdesk_dlg], 0, \
             qword ptr [g_secdesk_proc], 0
     mov     qword ptr [g_secdesk_res], rax
@@ -16994,6 +18791,17 @@ gui_open proc frame
     call    gui_try_tpm_auto                ; silent unlock if this device is enrolled
     test    eax, eax
     jz      go_askpw
+    ; anti-rollback: the password path asks before opening a file older than the last
+    ; one saved here; the TPM path opened it without a word.
+    cmp     dword ptr [g_rollback], 0
+    je      go_tpm_ok
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr s_rollback, addr t_rbtitle, \
+            <MB_YESNO or MB_ICONWARNING>
+    cmp     eax, IDYES
+    je      go_tpm_ok
+    call    vault_lock
+    jmp     go_reset
+go_tpm_ok:
     call    gui_pwremind                    ; C9: the password was NOT typed just now, so
     jmp     go_vault                        ;   remind if it has gone stale
 go_askpw:
@@ -17056,6 +18864,13 @@ go_vault:
     mov     dword ptr [g_base_cy], 0
     WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_VAULT, qword ptr [rbp-24], addr vault_proc, 0
     call    vault_lock                      ; wipe body + key, minimise to tray
+    ; ...and every static buffer that held this vault's plaintext: password history
+    ; and originals, the display/commit scratch, the attachment tile's AttachRefs
+    ; (each carries its file key).  vault_lock wipes only the body and the key.
+    call    secmem_wipe_statics
+    mov     dword ptr [g_tilefile_n], 0
+    mov     dword ptr [g_pwhist_n], 0
+    mov     dword ptr [g_pworig_n], 0
     call    gui_clipclear
     call    gui_resolve_vault               ; refresh create/open state for next time
 go_reset:
@@ -17652,7 +19467,7 @@ twp_copydata:
     mov     eax, dword ptr [r10+8]               ; cbData
     cmp     eax, 4
     jb      twp_cd_no
-    cmp     eax, 2048
+    cmp     eax, MAX_PATH_CHARS*2                ; a long path is a path (it used to be 1023 chars)
     ja      twp_cd_no
     test    eax, 1                               ; wide chars: must be even
     jnz     twp_cd_no
@@ -17668,7 +19483,7 @@ twp_copydata:
     ; LENGTH without requiring termination inside that length checks the wrong
     ; half.  Require the last wide char in the block to be the terminator, so
     ; every NUL scan below is guaranteed to stop inside it.
-    mov     edx, eax                             ; cbData (4..2048, even)
+    mov     edx, eax                             ; cbData (4..64K, even)
     sub     edx, 2
     cmp     word ptr [rcx+rdx], 0
     jne     twp_cd_no
@@ -17805,6 +19620,7 @@ ifdef PROBE_IO
     cmp     dword ptr [g_sp_active], 0
     je      gmb_normal
     inc     dword ptr [g_sp_messages]
+    mov     qword ptr [g_sp_lastmsg], rdx       ; which one: probes assert on it
     mov     eax, IDNO                       ; regression probes never need user interaction
     FRAME_EPILOG
     ret
@@ -18095,6 +19911,14 @@ gui_main proc frame
 ifdef DBG_SHOW
     mov     dword ptr [g_secunlock], 0      ; debug: use the normal desktop so the GUI is inspectable
 endif
+ifdef PROBE_IO
+    cmp     dword ptr [g_testmode], 0       ; test instance: prompts stay reachable by the
+    je      gm_notest                       ;   harness, and the TPM key store is not touched
+    mov     dword ptr [g_secunlock], 0
+    mov     dword ptr [g_tpm_want], 0
+    mov     dword ptr [g_tpm_present], 0
+gm_notest:
+endif
     call    gui_resolve_vault
     ; ---- register + create the hidden tray-owner window --------------------
     lea     rcx, [g_wc]
@@ -18126,8 +19950,13 @@ gm_trayhwnd:
     WINCALL SetTimer, qword ptr [g_trayhwnd], TEMP_RETRY_TIMER, 5000, 0
     mov     rcx, qword ptr [g_trayhwnd]
     call    gui_tray_add
+ifdef PROBE_IO
+    cmp     dword ptr [g_testmode], 0         ; never take the user's hotkey
+    jne     gm_nohotkey
+endif
     mov     rcx, qword ptr [g_trayhwnd]       ; Alt + | summons the vault from anywhere
     call    gui_hotkey_add
+gm_nohotkey:
     ; The shell double-clicked a .vordr while Vordr was not running.  We start
     ; minimised to the tray, so without this the double-click would look like it
     ; did nothing at all: post ourselves an Open so the unlock/create flow runs,
@@ -18197,6 +20026,14 @@ align 8
 g_lp_rc     dd 4 dup (?)             ; scratch RECT for the callback
 g_sp_active dd ?
 g_sp_messages dd ?
+align 8
+g_sp_lastmsg dq ?                    ; text of the last message the intercept swallowed
+g_gp_timer  dq ?                     ; guardkat: the timer that ends the modal
+g_gp_ended  dd ?                     ; guardkat: what gui_end_modals reported
+g_gp_fires  dd ?                     ; guardkat: timer ticks (2nd = watchdog)
+align 2
+g_gp_path   dw MAX_PATH_CHARS+40 dup (?)
+g_gp_rd     db 64 dup (?)
 
 .code
 CSTR lp_tag,   "[LAYOUT] id="
@@ -18333,6 +20170,459 @@ lp_measure endp
 ; gui_layout_probe() -> eax = findings.  The vault must already be unlocked.
 extern vault_lock_acquire:proc
 extern vault_lock_release:proc
+extern MoveFileExW:proc
+extern IsWindow:proc
+extern SetFilePointerEx:proc
+extern SetEndOfFile:proc
+
+.const
+CSTR gp_ok,  "guardkat: PASS (partly-loaded entry read-only; failed reload keeps the vault and says so; same-file by identity; exec list; lock ends modals; MOTW written; attach cap; focus follows the pane's scroll)",13,10
+CSTR gp_bad, "guardkat: FAIL at check "
+WSTR gp_title_w,  <Guard probe>
+WSTR gp_val_w,    <v>
+WSTR gp_suffix,   <.gp>
+WSTR gp_motwname, <vordr_motw_probe.txt>
+WSTR gp_attmiss,  <vordr_attprobe_missing.bin>
+WSTR gp_attbig,   <vordr_attprobe_big.bin>
+WSTR gp_attok,    <vordr_attprobe_ok.bin>
+WSTR gp_x1, <report.SearchConnector-ms>
+WSTR gp_x2, <DISK.ISO>
+WSTR gp_x3, <a.appref-ms>
+WSTR gp_x4, <setup.exe. >
+WSTR gp_x5, <x.settingcontent-ms>
+WSTR gp_x6, <notes.txt>
+WSTR gp_x7, <photo.png>
+WSTR gp_x8, <a.b.c.pdf>
+align 8
+gp_exts label qword                          ; {name, is-executable}
+    dq gp_x1, 1
+    dq gp_x2, 1
+    dq gp_x3, 1
+    dq gp_x4, 1
+    dq gp_x5, 1
+    dq gp_x6, 0
+    dq gp_x7, 0
+    dq gp_x8, 0
+GP_EXTS_N equ ($ - gp_exts) / 16
+.code
+
+; gp_timerproc - fires inside the guard probe's message box.  First tick: what a
+;   lock does, end every modal.  The timer stays armed as a watchdog: a second tick
+;   means the box survived, so close it another way and record the failure - a
+;   regression here must fail the gate, not hang it on a dialog nobody answers.
+gp_timerproc proc frame
+    FRAME_PROLOG 32
+    inc     dword ptr [g_gp_fires]
+    cmp     dword ptr [g_gp_fires], 1
+    jne     gpt_watchdog
+    call    gui_end_modals
+    mov     dword ptr [g_gp_ended], eax
+    jmp     gpt_done
+gpt_watchdog:
+    WINCALL KillTimer, 0, qword ptr [g_gp_timer]
+    mov     dword ptr [g_gp_ended], -1
+    WINCALL GetWindow, qword ptr [g_vaulthwnd], 6   ; GW_ENABLEDPOPUP: the box itself
+    test    rax, rax
+    jz      gpt_done
+    WINCALL EndDialog, rax, 99
+gpt_done:
+    FRAME_EPILOG
+    ret
+gp_timerproc endp
+
+; gui_guard_probe(rcx = hdlg) -> eax = findings (0/1).  The audit's GUI guards,
+;   each against the real window: a partly-loaded entry cannot be saved (save,
+;   favourite, edit), a failed reload keeps the vault and says so, export target
+;   identity, the executable list, a lock ending our modals, Mark of the Web.
+gui_guard_probe proc frame
+    FRAME_PROLOG 160
+    mov     qword ptr [rbp-24], rcx
+    ; The helpers below are called on g_vaulthwnd, which IS this window (vp_init set
+    ; it): dlgtarget attributes a helper's hwnd only when every caller agrees, and a
+    ; probe-local handle would cost those helpers their dialog-item verification.
+    mov     dword ptr [rbp-32], 0
+    cmp     rcx, qword ptr [g_vaulthwnd]
+    jne     gp_fail
+    mov     eax, dword ptr [g_cur_idx]
+    mov     dword ptr [rbp-88], eax              ; the entry to come back to
+    mov     dword ptr [g_sp_active], 1
+    ; ---- 1: an entry with more fields than there are rows ---------------------
+    mov     dword ptr [rbp-32], 1
+    lea     r10, [g_field_list]
+    mov     qword ptr [r10], VF_TITLE
+    mov     qword ptr [r10+8], 0
+    lea     rax, [gp_title_w]
+    mov     qword ptr [r10+16], rax
+    mov     ecx, 1
+gp_fl:
+    imul    eax, ecx, 24
+    mov     qword ptr [r10+rax], VF_TEXT
+    mov     qword ptr [r10+rax+8], 0
+    lea     r11, [gp_val_w]
+    mov     qword ptr [r10+rax+16], r11
+    inc     ecx
+    cmp     ecx, MAXROWS+3
+    jb      gp_fl
+    mov     dword ptr [g_field_n], MAXROWS+3
+    call    vault_build_entry
+    test    eax, eax
+    jnz     gp_fail
+    call    vault_last_user
+    mov     dword ptr [rbp-48], eax
+    cmp     eax, 0
+    jl      gp_fail
+    mov     rax, qword ptr [g_body_len]
+    mov     qword ptr [rbp-40], rax
+    mov     rcx, qword ptr [g_vaulthwnd]
+    mov     edx, dword ptr [rbp-48]
+    call    gui_showdetail
+    mov     dword ptr [rbp-32], 2                ; ... is flagged
+    cmp     dword ptr [g_cur_trunc], 1
+    jne     gp_fail_rm
+    mov     dword ptr [rbp-32], 3                ; ... Save refuses, says so, keeps it whole
+    mov     dword ptr [g_sp_messages], 0
+    mov     rcx, qword ptr [g_vaulthwnd]
+    call    gui_commit
+    cmp     eax, 1
+    jne     gp_fail_rm
+    cmp     dword ptr [g_sp_messages], 1
+    jne     gp_fail_rm
+    lea     rax, [s_trunc]
+    cmp     qword ptr [g_sp_lastmsg], rax
+    jne     gp_fail_rm
+    mov     rax, qword ptr [g_body_len]
+    cmp     rax, qword ptr [rbp-40]
+    jne     gp_fail_rm
+    mov     ecx, dword ptr [rbp-48]
+    call    vault_field_count
+    cmp     eax, MAXROWS+3
+    jne     gp_fail_rm
+    mov     dword ptr [rbp-32], 4                ; ... the star (a rebuild too) refuses
+    mov     eax, dword ptr [g_fav_state]
+    mov     dword ptr [rbp-56], eax
+    WINCALL SendMessageW, qword ptr [rbp-24], WM_COMMAND, IDC_V_FAV, 0
+    cmp     dword ptr [g_sp_messages], 2
+    jne     gp_fail_rm
+    mov     eax, dword ptr [g_fav_state]
+    cmp     eax, dword ptr [rbp-56]
+    jne     gp_fail_rm
+    mov     rax, qword ptr [g_body_len]
+    cmp     rax, qword ptr [rbp-40]
+    jne     gp_fail_rm
+    mov     dword ptr [rbp-32], 5                ; ... and edit mode is not entered
+    WINCALL SendMessageW, qword ptr [rbp-24], WM_COMMAND, IDC_V_EDIT, 0
+    cmp     dword ptr [g_editmode], 0
+    jne     gp_fail_rm
+    cmp     dword ptr [g_sp_messages], 3
+    jne     gp_fail_rm
+    ; ---- 18: the pane scrolls; a focused field scrolled away gives up the focus --
+    mov     dword ptr [rbp-32], 18
+    cmp     dword ptr [g_page_count], 10         ; 67 cards: well past one screen
+    jl      gp_fail_rm
+    xor     ecx, ecx                             ; focus row 0's value
+    mov     edx, DS_VALUE
+    call    dynid
+    mov     dword ptr [rbp-56], eax
+    WINCALL GetDlgItem, qword ptr [rbp-24], dword ptr [rbp-56]
+    test    rax, rax
+    jz      gp_fail_rm
+    WINCALL SetFocus, rax
+    mov     rcx, qword ptr [g_vaulthwnd]
+    mov     edx, 10
+    call    gui_dsb_settop
+    cmp     dword ptr [g_cur_page], 10
+    jne     gp_fail_rm
+    WINCALL GetFocus                             ; it must be ON SCREEN now: row 10's value
+    test    rax, rax
+    jz      gp_fail_rm
+    mov     rcx, rax
+    call    GetDlgCtrlID_frame
+    mov     dword ptr [rbp-56], eax
+    mov     ecx, 10
+    mov     edx, DS_VALUE
+    call    dynid
+    cmp     eax, dword ptr [rbp-56]
+    jne     gp_fail_rm
+    mov     rcx, qword ptr [g_vaulthwnd]         ; and back to the top
+    xor     edx, edx
+    call    gui_dsb_settop
+    mov     ecx, dword ptr [rbp-48]
+    call    vault_remove_at
+    mov     dword ptr [rbp-32], 6                ; an ordinary entry loads complete
+    mov     rcx, qword ptr [g_vaulthwnd]
+    mov     edx, dword ptr [rbp-88]
+    call    gui_showdetail
+    cmp     dword ptr [g_cur_trunc], 0
+    jne     gp_fail
+    ; ---- 7: a reload that cannot read the file keeps the vault and says so ----
+    mov     dword ptr [rbp-32], 7
+    lea     rcx, [g_gp_path]
+    mov     rdx, qword ptr [g_cfg_in]
+    lea     r8, [g_gp_path + (MAX_PATH_CHARS+8)*2]
+    call    gui_wstrcpy
+    mov     rcx, rax
+    lea     rdx, [gp_suffix]
+    lea     r8, [g_gp_path + (MAX_PATH_CHARS+30)*2]
+    call    gui_wstrcpy
+    WINCALL MoveFileExW, qword ptr [g_cfg_in], addr g_gp_path, 0
+    test    eax, eax
+    jz      gp_fail
+    call    vault_count
+    mov     dword ptr [rbp-56], eax
+    mov     dword ptr [g_sp_messages], 0
+    mov     rcx, qword ptr [g_vaulthwnd]
+    call    gui_reload_safe
+    WINCALL MoveFileExW, addr g_gp_path, qword ptr [g_cfg_in], 0   ; put it back first
+    test    eax, eax
+    jz      gp_fail
+    cmp     dword ptr [g_sp_messages], 1
+    jne     gp_fail
+    lea     rax, [s_reloadfail]
+    cmp     qword ptr [g_sp_lastmsg], rax
+    jne     gp_fail
+    cmp     qword ptr [g_body_ptr], 0
+    je      gp_fail
+    call    vault_count
+    cmp     eax, dword ptr [rbp-56]
+    jne     gp_fail
+    ; ---- 8-11: same file, by identity -----------------------------------------
+    mov     dword ptr [rbp-32], 8
+    mov     rcx, qword ptr [g_cfg_in]
+    mov     rdx, rcx
+    call    gui_same_file
+    cmp     eax, 1
+    jne     gp_fail
+    mov     dword ptr [rbp-32], 9                ; <vault>.gp exists no more
+    mov     rcx, qword ptr [g_cfg_in]
+    lea     rdx, [g_gp_path]
+    call    gui_same_file
+    test    eax, eax
+    jnz     gp_fail
+    mov     dword ptr [rbp-32], 10               ; another spelling of the vault
+    mov     r10, qword ptr [g_cfg_in]
+    lea     r11, [g_gp_path]
+    xor     ecx, ecx
+gp_up:
+    movzx   eax, word ptr [r10+rcx*2]
+    cmp     eax, 'a'
+    jb      gp_upput
+    cmp     eax, 'z'
+    ja      gp_upput
+    sub     eax, 20h
+gp_upput:
+    mov     word ptr [r11+rcx*2], ax
+    test    eax, eax
+    jz      gp_updone
+    inc     ecx
+    cmp     ecx, MAX_PATH_CHARS-1
+    jb      gp_up
+    mov     word ptr [r11+rcx*2], 0
+gp_updone:
+    mov     rcx, qword ptr [g_cfg_in]
+    lea     rdx, [g_gp_path]
+    call    gui_same_file
+    cmp     eax, 1
+    jne     gp_fail
+    mov     dword ptr [rbp-32], 11               ; a different file
+    WINCALL GetModuleFileNameW, 0, addr g_gp_path, MAX_PATH_CHARS
+    mov     rcx, qword ptr [g_cfg_in]
+    lea     rdx, [g_gp_path]
+    call    gui_same_file
+    test    eax, eax
+    jnz     gp_fail
+    ; ---- 12: the executable list -------------------------------------------
+    mov     dword ptr [rbp-32], 12
+    mov     dword ptr [rbp-56], 0
+gp_xl:
+    mov     eax, dword ptr [rbp-56]
+    cmp     eax, GP_EXTS_N
+    jae     gp_xdone
+    shl     eax, 4
+    lea     r10, [gp_exts]
+    mov     rcx, qword ptr [r10+rax]
+    call    gui_ext_is_exec
+    mov     ecx, dword ptr [rbp-56]
+    shl     ecx, 4
+    lea     r10, [gp_exts]
+    cmp     eax, dword ptr [r10+rcx+8]
+    jne     gp_fail
+    inc     dword ptr [rbp-56]
+    jmp     gp_xl
+gp_xdone:
+    ; ---- 13: a lock ends our modals, and only those -------------------------
+    mov     dword ptr [rbp-32], 13
+    mov     dword ptr [g_gp_ended], 0
+    mov     dword ptr [g_gp_fires], 0
+    WINCALL SetTimer, 0, 0, 150, addr gp_timerproc
+    mov     qword ptr [g_gp_timer], rax
+    test    rax, rax
+    jz      gp_fail
+    mov     dword ptr [g_sp_active], 0           ; the real message box this time
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr gp_title_w, addr gp_title_w,             <MB_OK or MB_ICONINFORMATION>
+    mov     dword ptr [rbp-56], eax
+    WINCALL KillTimer, 0, qword ptr [g_gp_timer]   ; the watchdog is not needed now
+    mov     eax, dword ptr [rbp-56]
+    mov     dword ptr [g_sp_active], 1
+    cmp     eax, IDCANCEL
+    jne     gp_fail
+    cmp     dword ptr [g_gp_ended], 1
+    jne     gp_fail
+    WINCALL IsWindowVisible, qword ptr [rbp-24]  ; the vault window is left alone
+    test    eax, eax
+    jz      gp_fail
+    ; ---- 15-17: the attach path and read_file's one-shot size cap ------------
+    ; A cap left armed by a failed read refused the NEXT, unrelated read (a vault
+    ; reload) - found in review; and a file over ATT_FILE_MAX must be refused before
+    ; anything is read or staged.
+    mov     dword ptr [rbp-32], 15
+    WINCALL GetTempPathW, MAX_PATH_CHARS, addr g_gp_path
+    test    eax, eax
+    jz      gp_fail
+    mov     dword ptr [rbp-56], eax              ; temp dir length
+    lea     rcx, [g_imgpath]                     ; a file that does not exist
+    lea     rdx, [g_gp_path]
+    lea     r8, [g_imgpath + (MAX_PATH_CHARS-40)*2]
+    call    gui_wstrcpy
+    mov     rcx, rax
+    lea     rdx, [gp_attmiss]
+    lea     r8, [g_imgpath + (MAX_PATH_CHARS-1)*2]
+    call    gui_wstrcpy
+    mov     eax, dword ptr [g_tilefile_n]
+    mov     dword ptr [rbp-60], eax
+    mov     rcx, qword ptr [g_vaulthwnd]
+    call    gui_tile_add_cur
+    test    eax, eax
+    jnz     gp_fail                              ; it cannot have attached
+    cmp     qword ptr [g_rf_cap], 0
+    jne     gp_fail                              ; the cap must not outlive the call
+    mov     dword ptr [rbp-32], 16               ; just over 256 MiB: refused up front
+    lea     rcx, [g_imgpath]
+    lea     rdx, [g_gp_path]
+    lea     r8, [g_imgpath + (MAX_PATH_CHARS-40)*2]
+    call    gui_wstrcpy
+    mov     rcx, rax
+    lea     rdx, [gp_attbig]
+    lea     r8, [g_imgpath + (MAX_PATH_CHARS-1)*2]
+    call    gui_wstrcpy
+    WINCALL CreateFileW, addr g_imgpath, GENERIC_WRITE_, 0, 0, 2, FILE_ATTR_NORMAL, 0
+    cmp     rax, -1
+    je      gp_fail
+    mov     qword ptr [rbp-72], rax
+    mov     rax, ATT_FILE_MAX + 1                ; extend without writing data (the clusters
+    mov     qword ptr [rbp-80], rax              ;   are allocated, not zero-filled: fast,
+    WINCALL SetFilePointerEx, qword ptr [rbp-72], qword ptr [rbp-80], 0, 0   ; but it needs the space)
+    mov     dword ptr [rbp-64], eax
+    WINCALL SetEndOfFile, qword ptr [rbp-72]
+    and     dword ptr [rbp-64], eax
+    WINCALL CloseHandle, qword ptr [rbp-72]
+    cmp     dword ptr [rbp-64], 0                ; no room for a 256 MiB file: this check
+    jne     gp_bigmade                           ;   cannot run - skip it, never fail it on
+    WINCALL DeleteFileW, addr g_imgpath          ;   a full disk (a 0-byte file would attach)
+    jmp     gp_bigdone
+gp_bigmade:
+    mov     rcx, qword ptr [g_vaulthwnd]
+    call    gui_tile_add_cur
+    mov     dword ptr [rbp-64], eax
+    WINCALL DeleteFileW, addr g_imgpath
+    cmp     dword ptr [rbp-64], 0
+    jne     gp_fail
+    cmp     qword ptr [g_rf_cap], 0
+    jne     gp_fail
+    mov     eax, dword ptr [g_tilefile_n]
+    cmp     eax, dword ptr [rbp-60]
+    jne     gp_fail
+gp_bigdone:
+    mov     dword ptr [rbp-32], 17               ; and an ordinary file attaches
+    lea     rcx, [g_imgpath]
+    lea     rdx, [g_gp_path]
+    lea     r8, [g_imgpath + (MAX_PATH_CHARS-40)*2]
+    call    gui_wstrcpy
+    mov     rcx, rax
+    lea     rdx, [gp_attok]
+    lea     r8, [g_imgpath + (MAX_PATH_CHARS-1)*2]
+    call    gui_wstrcpy
+    lea     rcx, [g_imgpath]
+    lea     rdx, [gp_title_w]
+    mov     r8, 8
+    call    write_file
+    test    eax, eax
+    jnz     gp_fail_delimg
+    mov     rcx, qword ptr [g_vaulthwnd]
+    call    gui_tile_add_cur
+    mov     dword ptr [rbp-64], eax
+    WINCALL DeleteFileW, addr g_imgpath
+    cmp     dword ptr [rbp-64], 1
+    jne     gp_fail
+    mov     eax, dword ptr [rbp-60]
+    inc     eax
+    cmp     eax, dword ptr [g_tilefile_n]
+    jne     gp_fail
+    mov     ecx, dword ptr [rbp-60]              ; take it off the tile again
+    call    tf_remove
+    mov     dword ptr [g_dirty], 0
+    ; ---- 14: Mark of the Web ------------------------------------------------
+    mov     dword ptr [rbp-32], 14
+    WINCALL GetTempPathW, MAX_PATH_CHARS, addr g_gp_path
+    test    eax, eax
+    jz      gp_fail
+    lea     rcx, [g_gp_path]
+    lea     rcx, [rcx+rax*2]
+    lea     rdx, [gp_motwname]
+    lea     r8, [g_gp_path + (MAX_PATH_CHARS+30)*2]
+    call    gui_wstrcpy
+    lea     rcx, [g_gp_path]
+    lea     rdx, [gp_title_w]
+    mov     r8, 4
+    call    write_file
+    test    eax, eax
+    jnz     gp_fail_delgp
+    lea     rcx, [g_gp_path]
+    call    gui_motw
+    mov     dword ptr [rbp-80], 0
+    WINCALL CreateFileW, addr g_motw_w, GENERIC_READ, 1, 0, OPEN_EXISTING, FILE_ATTR_NORMAL, 0
+    cmp     rax, -1
+    je      gp_motw_none
+    mov     qword ptr [rbp-72], rax
+    WINCALL ReadFile, qword ptr [rbp-72], addr g_gp_rd, 64, addr rbp-80, 0
+    WINCALL CloseHandle, qword ptr [rbp-72]
+gp_motw_none:
+    WINCALL DeleteFileW, addr g_gp_path
+    cmp     dword ptr [rbp-80], motw_body_len
+    jne     gp_fail
+    lea     r10, [g_gp_rd]
+    lea     r11, [motw_body]
+    xor     ecx, ecx
+gp_mc:
+    mov     al, byte ptr [r10+rcx]
+    cmp     al, byte ptr [r11+rcx]
+    jne     gp_fail
+    inc     ecx
+    cmp     ecx, motw_body_len
+    jb      gp_mc
+    mov     dword ptr [g_sp_active], 0
+    WINCALL print_a, addr gp_ok, gp_ok_len
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gp_fail_rm:
+    mov     ecx, dword ptr [rbp-48]
+    call    vault_remove_at
+    jmp     gp_fail
+gp_fail_delimg:
+    WINCALL DeleteFileW, addr g_imgpath          ; never leave a probe file behind
+    jmp     gp_fail
+gp_fail_delgp:
+    WINCALL DeleteFileW, addr g_gp_path
+gp_fail:
+    mov     dword ptr [g_sp_active], 0
+    WINCALL print_a, addr gp_bad, gp_bad_len
+    WINCALL print_u64, dword ptr [rbp-32]
+    WINCALL print_a, addr lp_nl, lp_nl_len
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gui_guard_probe endp
+
 ; Exercise the actual Save command with a held write lock, twice, then retry.
 gui_save_probe proc frame
     FRAME_PROLOG 144
@@ -18540,6 +20830,9 @@ gui_layout_probe proc frame
     mov     rcx, qword ptr [rbp-32]
     call    gui_save_probe
     add     dword ptr [g_lp_bad], eax
+    mov     rcx, qword ptr [rbp-32]
+    call    gui_guard_probe
+    add     dword ptr [g_lp_bad], eax
     WINCALL DestroyWindow, qword ptr [rbp-32]
     call    lp_pump
     jmp     glp_nowin                       ; do NOT fall into the no-desktop answer
@@ -18578,6 +20871,114 @@ glp_bad:
 gui_layout_probe endp
 endif
 
+ifdef PROBE_IO
+; =============================================================================
+; GUI test hooks - PROBE_IO / dbg builds ONLY; a release binary has none of this.
+;
+; tests\lib\gui.psm1 drives a real Vordr window from outside the process.  It
+; must not be able to touch the user's own Vordr: their settings, registered vault
+; path, rollback counters and TPM blobs (all HKCU), a running instance (the
+; single-instance hand-off), their global hotkey, or the TPM key store.  So:
+;
+;   VORDR_TEST_HKCU=<name>   remap HKEY_CURRENT_USER, for this process, onto
+;                            HKCU\Software\VordrGuiTest\<name> (RegOverridePredefKey):
+;                            every read and write - ours and the shell's on our
+;                            behalf - lands in a scratch key the test deletes.
+;                            Also: no single-instance check, no hotkey, no TPM, no
+;                            secure desktop, and the log goes to %TEMP%.
+;   VORDR_TEST_VAULT=<path>  the vault the unlock flow targets.
+;
+; The probe VERBS (seedtest, bktest, rbtest, vopen ...) always run this way, under
+; the name "cli" unless VORDR_TEST_HKCU says otherwise: their saves write rollback
+; counters, and those used to accumulate in the user's real HKCU\SOFTWARE\Vordr.
+; A GUI launch without VORDR_TEST_HKCU is a normal instance.  If isolation is asked
+; for and fails, the process exits 0xE0F7 rather than run against the real HKCU.
+; =============================================================================
+.data?
+align 8
+g_test_hk    dq ?
+g_testmode   dd ?                      ; 1 = HKCU is remapped; test-instance behaviour on
+align 2
+g_test_name  dw 64 dup (?)
+g_test_key   dw 256 dup (?)
+g_test_log   dw MAX_PATH_CHARS dup (?)
+g_testvault  dw MAX_PATH_CHARS dup (?)
+.const
+WSTR w_test_hkcu,  <VORDR_TEST_HKCU>
+WSTR w_test_vault, <VORDR_TEST_VAULT>
+WSTR w_test_root,  <Software\VordrGuiTest\>
+WSTR w_test_logf,  <vordr_guitest.log>
+WSTR w_test_clidef, <cli>                  ; probe verbs: always a scratch HKCU
+.code
+extern RegCreateKeyExW:proc
+extern RegOverridePredefKey:proc
+extern GetEnvironmentVariableW:proc
+externdef g_cfg_logfile:qword
+externdef g_hkcu:qword
+
+gui_test_hooks proc frame
+    FRAME_PROLOG 96                             ; RegCreateKeyExW: 9 args
+    mov     qword ptr [rbp-24], rcx             ; default scratch name (0 = none)
+    WINCALL GetEnvironmentVariableW, addr w_test_hkcu, addr g_test_name, 60
+    test    eax, eax
+    jz      gth_default
+    cmp     eax, 60
+    jae     gth_refuse                          ; asked for, but unusable: never run as-is
+    jmp     gth_remap
+gth_default:
+    cmp     qword ptr [rbp-24], 0
+    je      gth_done                            ; nothing asked: a normal instance
+    lea     rcx, [g_test_name]
+    mov     rdx, qword ptr [rbp-24]
+    lea     r8, [g_test_name + 62*2]
+    call    gui_wstrcpy
+gth_remap:
+    lea     rcx, [g_test_key]
+    lea     rdx, [w_test_root]
+    lea     r8, [g_test_key + 190*2]
+    call    gui_wstrcpy
+    mov     rcx, rax
+    lea     rdx, [g_test_name]
+    lea     r8, [g_test_key + 255*2]
+    call    gui_wstrcpy
+    WINCALL RegCreateKeyExW, 0FFFFFFFF80000001h, addr g_test_key, 0, 0, 0, 0F003Fh, 0, addr g_test_hk, 0
+    test    eax, eax
+    jnz     gth_refuse
+    WINCALL RegOverridePredefKey, 0FFFFFFFF80000001h, qword ptr [g_test_hk]   ; HKCU, sign-extended as Windows defines it
+    test    eax, eax
+    jnz     gth_refuse
+    ; Every registry access of Vordr's own goes through g_hkcu (regcfg.asm), so this
+    ; is what isolates it for certain; the override above catches the shell and any
+    ; API that reads HKCU on our behalf.
+    mov     rax, qword ptr [g_test_hk]
+    mov     qword ptr [g_hkcu], rax
+    mov     dword ptr [g_testmode], 1
+    WINCALL GetTempPathW, MAX_PATH_CHARS-64, addr g_test_log
+    test    eax, eax
+    jz      gth_vault
+    lea     rcx, [g_test_log]
+    lea     rcx, [rcx+rax*2]
+    lea     rdx, [w_test_logf]
+    lea     r8, [g_test_log + (MAX_PATH_CHARS-1)*2]
+    call    gui_wstrcpy
+    lea     rax, [g_test_log]
+    mov     qword ptr [g_cfg_logfile], rax
+gth_vault:
+    WINCALL GetEnvironmentVariableW, addr w_test_vault, addr g_testvault, MAX_PATH_CHARS
+    cmp     eax, MAX_PATH_CHARS
+    jb      gth_done
+    mov     word ptr [g_testvault], 0           ; did not fit: no override
+gth_done:
+    FRAME_EPILOG
+    ret
+gth_refuse:
+    ; Isolation was asked for and could not be set up.  Running on would put a
+    ; harness - which types a test password and presses buttons - in front of the
+    ; USER's own HKCU and registered vault.  Stop instead (the harness sees the exit).
+    WINCALL ExitProcess, 0E0F7h
+gui_test_hooks endp
+endif
+
 public wstart
 wstart proc
     sub     rsp, 56
@@ -18587,6 +20988,12 @@ wstart proc
     test    eax, eax
     jz      ws_oom
     call    crash_install                   ; arm crash containment before any secrets exist
+    ; Pin the static secret buffers (master password, vault key, field history, value
+    ; scratch...) before any of them can hold anything.  This call lived only in
+    ; main.asm's `start` - which is NOT the entry point (/entry:wstart) - so in every
+    ; shipped build none of them was ever locked, and because the attempt never ran,
+    ; the "secrets not pinned" warning could not fire either.
+    call    sec_lock_statics
     call    parse_cmdline
     call    is_cli_command
     test    eax, eax
@@ -18602,6 +21009,10 @@ wstart proc
     call    run_selftest
     test    eax, eax
     jnz     ws_stfail_cli
+ifdef PROBE_IO
+    lea     rcx, [w_test_clidef]            ; probe verbs never write the user's HKCU
+    call    gui_test_hooks
+endif
     call    dispatch
     mov     dword ptr [rsp+52], eax
     lea     rcx, [g_cfg_pass]
@@ -18632,6 +21043,12 @@ ws_gui:
     ; single-instance guard: two GUIs on one vault would clobber each other's
     ; saves.  If the named mutex already exists, surface the running instance
     ; (focus its open dialog, or ask its tray window to open the flow), then exit.
+ifdef PROBE_IO
+    xor     ecx, ecx                        ; GUI: isolated only when asked
+    call    gui_test_hooks                  ; a test instance never hands off to,
+    cmp     dword ptr [g_testmode], 0       ;   or waits on, the user's own Vordr
+    jne     ws_gui_go
+endif
     call    gui_shell_arg                   ; a .vordr from the shell association?
     WINCALL CreateMutexW, 0, 1, addr g_singleton_name
     call    GetLastError

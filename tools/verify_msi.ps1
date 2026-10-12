@@ -183,6 +183,51 @@ if ($assocRows.Count) {
     if ($fail -eq $before) { Write-Host "  VORDR_NOASSOC=1 drops the association and nothing else - ok" }
 }
 
+# --- 2b. payload structure (ported from Myrkr's verifier) --------------------
+# Each of these produces a package that builds, verifies its policy wiring, and
+# then fails or misbehaves only when somebody installs it.
+Write-Host ""
+$before = $fail
+$pvAll  = Rows "SELECT ``Value`` FROM ``Property`` WHERE ``Property``='ProductVersion'" 1
+$pvNow  = $pvAll[0][0]
+$files  = Rows "SELECT ``File``,``Component_``,``Version``,``Sequence`` FROM ``File``" 4
+$regKeys  = @($reg   | ForEach-Object { $_[0] })
+$fileKeys = @($files | ForEach-Object { $_[0] })
+# KeyPath names the row Windows Installer uses to decide whether the component is
+# installed.  With RegistryKeyPath (0x4) it must be a Registry row, otherwise a
+# File row; a dangling one fails the install with error 2715.  The 0x4 bit alone
+# (checked above) says nothing about whether the row it points at exists.
+foreach ($c in $comp) {
+    if ([string]::IsNullOrEmpty($c[4])) { continue }
+    if ([int]$c[2] -band 4) {
+        if ($regKeys -notcontains $c[4]) { Bad "component $($c[0]) KeyPath '$($c[4])' names no Registry row (error 2715 at install)" }
+    } elseif ($fileKeys -notcontains $c[4]) {
+        Bad "component $($c[0]) KeyPath '$($c[4])' names no File row (error 2715 at install)"
+    }
+}
+# The exe's version resource is the source of truth; the File row must agree with
+# the package or an installed copy cannot be identified from a support call.
+foreach ($f in $files) {
+    if (-not $f[2].StartsWith($pvNow)) { Bad "File $($f[0]) Version $($f[2]) does not match ProductVersion $pvNow" }
+}
+# Media.LastSequence below the highest File.Sequence leaves a payload unextracted.
+$media = Rows "SELECT ``Cabinet``,``LastSequence`` FROM ``Media``" 2
+$maxSeq = ($files | ForEach-Object { [int]$_[3] } | Measure-Object -Maximum).Maximum
+if ($media.Count -ne 1) { Bad "expected one Media row, found $($media.Count)" }
+else {
+    if ([int]$media[0][1] -lt $maxSeq) { Bad "Media.LastSequence $($media[0][1]) does not cover File.Sequence $maxSeq" }
+    # '#name' = the cabinet is a stream INSIDE the package.  Without the stream the
+    # MSI asks for an external vordr.cab that was never shipped.
+    $cabName = $media[0][0]
+    if (-not $cabName.StartsWith("#")) { Bad "Media names an external cabinet '$cabName' - the MSI would need a separate file" }
+    else {
+        $streams = Rows "SELECT ``Name`` FROM ``_Streams``" 1
+        $snames  = @($streams | ForEach-Object { $_[0] })
+        if ($snames -notcontains $cabName.Substring(1)) { Bad "cabinet stream '$($cabName.Substring(1))' is not embedded in the package" }
+    }
+}
+if ($fail -eq $before) { Write-Host ("payload         : {0} file(s), KeyPaths resolve, versions match {1}, cab embedded - ok" -f $files.Count, $pvNow) }
+
 # --- 3. the upgrade row -----------------------------------------------------
 # Attributes is a bitfield whose Inclusive bits are 0x100/0x200, not 0x1/0x2.
 # With VersionMax exclusive every OLDER version is still replaced, so the mistake

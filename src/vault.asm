@@ -168,7 +168,12 @@ ARF_NONCE       equ 48          ;            12-byte GCM nonce
 ARF_PTLEN       equ 60          ;            u64 plaintext length
 ARF_SIZE        equ 68
 ATT_ENThDR      equ 24          ; on-disk entry header = id16 + u64 ctlen
-MAX_ATT         equ 512         ; index / pending-table capacity
+MAX_ATT         equ 512         ; pending (staged, not yet saved) attachments
+; The ON-DISK index is sized separately and far larger.  It was MAX_ATT too, and an
+; attachment past the 512th was simply never indexed - so the next save could not
+; find its ciphertext and wrote an empty blob in its place.  Overflowing this one
+; is now detected (g_att_ovf) and REFUSES the save instead.
+MAX_ATTIDX      equ 16384
 
 .const
 vst_src     db "vault-kat-test!!"      ; 16-byte plaintext for vault_selftest
@@ -229,9 +234,9 @@ CSTR c9_badm, "c9kat: FAIL",13,10
 CSTR vi_okm,  "vimpkat: PASS (foreign vault read, master untouched, selection, idempotent)",13,10
 CSTR vi_badm, "vimpkat: FAIL",13,10
 CSTR mt_leak,"mactest: FAIL (file-MAC did not catch the trailer tamper)",13,10
-CSTR rb_ok,  "rbtest: PASS (older counter flagged, current one not)",13,10
+CSTR rb_ok,  "rbtest: PASS (older counter flagged, current one not, under any spelling of the path)",13,10
 CSTR rb_bad, "rbtest: FAIL",13,10
-CSTR rl_ok,  "reload: PASS (in-memory body refreshed from disk)",13,10
+CSTR rl_ok,  "reload: PASS (refreshed from disk; a failed reload keeps the vault; a malformed body is never sealed)",13,10
 CSTR rl_bad, "reload: FAIL",13,10
 CSTR cw_ok,  "cowrite: PASS (write lock is exclusive + reacquirable)",13,10
 CSTR cw_bad, "cowrite: FAIL",13,10
@@ -295,6 +300,21 @@ g_xs_vkey   db 32 dup (?)                   ; parked live vault key (wiped after
 g_xs_ehash  db 32 dup (?)                   ; parked external-change hash
 g_reuse_key dd ?                            ; C8: vault_reload reuses g_vkey (skip Argon2)
 align 8
+g_ps_body     dq ?                          ; vault_state_park: the open vault, parked
+g_ps_bodylen  dq ?                          ;   across a second vault_unlock
+g_ps_filebuf  dq ?
+g_ps_filesize dq ?
+g_ps_fmac     dq ?
+g_ps_atttotal dq ?
+g_ps_attstart dq ?
+g_ps_counter  dq ?
+g_ps_extsize  dq ?
+g_ps_attidxn  dd ?
+g_ps_attovf   dd ?
+g_ps_rollback dd ?
+g_ps_hdr      db VH_TOTAL dup (?)
+g_ps_ehash    db 32 dup (?)
+align 8
 g_lock_h    dq ?                            ; C8: <vault>.lock handle (0 = not held)
 g_lock_path dw (MAX_PATH_CHARS + 8) dup (?) ; C8: "<vault>.lock" wide path
 align 16
@@ -308,11 +328,18 @@ align 16
 g_att_greq  GCMREQ <>                          ; GCM req for attachment seal/open
 g_newatt    db MAX_ATT * 32 dup (?)            ; pending new: {id16, qword pt, qword ptlen}
 g_newatt_n  dd ?
-g_attidx    db MAX_ATT * 32 dup (?)            ; from file: {id16, qword ct, qword ctlen}
+g_attidx    db MAX_ATTIDX * 32 dup (?)         ; from file: {id16, qword ct, qword ctlen}
 g_attidx_n  dd ?
+g_att_ovf   dd ?                                ; 1 = the file held more attachments than
+                                                ;   g_attidx can index: saving would drop some
+align 8
+g_ps_attidx db MAX_ATTIDX * 32 dup (?)         ; vault_state_park's copy of g_attidx
+g_att_missing dd ?                              ; 1 = a referenced attachment had no
+                                                ;   ciphertext to carry: the save is refused
 g_att_aad   db 32 dup (?)                       ; GCM AAD scratch = id16 | u64 ptlen
 g_att_start dq ?                                ; file offset where attachments begin
 g_att_total dq ?                                ; attachment entries byte length
+public g_conv, g_convlabel                      ; pinned + crash-wiped by secmem.asm
 g_conv      db CONV_CAP dup (?)
 g_convlabel db MAX_LABEL_BYTES dup (?)        ; utf8 label scratch (va_field_labeled)
 align 2
@@ -333,6 +360,8 @@ seed_pass_w  dw 40 dup (?)
 public g_carry_created
 g_carry_created dq ?            ; if !=0, vault_build_entry uses it as `created`
                                ; (one-shot; lets a GUI edit preserve the orig date)
+g_vfe_err   dd ?                ; a va_field_* writer refused (no room / did not fit);
+                               ;   the entry being built is rolled back, never kept half
 vst_ct      db 16 dup (?)
 vst_dec     db 16 dup (?)
 vst_tag     db 16 dup (?)
@@ -402,10 +431,16 @@ vk_params_ok proc
     cmp     eax, ARGON2_MAX_T
     ja      vp_bad
     mov     eax, dword ptr [g_hdr+VH_M]
-    test    eax, eax
-    jz      vp_bad
-    cmp     eax, ARGON2_MAX_M_KIB
+    cmp     eax, ARGON2_MIN_M_KIB               ; RFC 9106 floor: 8 KiB per lane (p=1).
+    jb      vp_bad                              ;   Below it the fill geometry degenerates
+    cmp     eax, ARGON2_MAX_M_KIB               ;   and the result matches no reference.
     ja      vp_bad
+    ; The lane count is written (always 1) but vk_derive never reads it: it derives
+    ; with p = 1 whatever the header says.  A file claiming p != 1 - written by an
+    ; independent implementation, say - would then fail as a WRONG PASSWORD.  It is
+    ; a format this reader does not support, so it is refused as one.
+    cmp     dword ptr [g_hdr+VH_LANES], 1
+    jne     vp_bad
     mov     eax, 1
     ret
 vp_bad:
@@ -823,6 +858,16 @@ vault_rotate_backups endp
 vault_seal_write proc frame
     FRAME_PROLOG 96
     ; [rbp-32] = attachment section bytes (entries + trailer)  [rbp-40] = base len
+    ; Never write a vault that cannot be opened again.  vault_unlock validates the
+    ; body after decrypting and refuses a malformed one outright - so a body that
+    ; fails here would lock the user out, and the backup ring (three saves deep)
+    ; rotates the last good copy away.  Checking costs one linear walk.
+    call    vault_body_validate
+    test    eax, eax
+    jnz     vsw_refuse
+    cmp     dword ptr [g_att_ovf], 0            ; the index could not hold every
+    jne     vsw_refuse                          ;   attachment: saving would drop some
+    mov     dword ptr [g_att_missing], 0
     xor     ecx, ecx                            ; emit=0: size the attachment section
     xor     edx, edx
     call    attach_build
@@ -880,6 +925,10 @@ vsw_hcpy:
     add     rdx, VH_TOTAL + 16
     add     rdx, qword ptr [g_body_len]
     call    attach_build
+    cmp     dword ptr [g_att_missing], 0
+    je      vsw_write
+    mov     dword ptr [rbp-24], EXIT_CORRUPT    ; an attachment had no ciphertext: refuse
+    jmp     vsw_free                            ;   rather than write it away
 vsw_write:
     ; --- full-file MAC + anti-rollback trailer ------------------
     ; layout at offset base: [u64 counter][32 MAC over image+counter][u32 magic]
@@ -1037,6 +1086,10 @@ vsw_free:
     ret
 vsw_oom:
     mov     eax, EXIT_OOM
+    FRAME_EPILOG
+    ret
+vsw_refuse:
+    mov     eax, EXIT_CORRUPT                   ; nothing allocated, nothing written
     FRAME_EPILOG
     ret
 vault_seal_write endp
@@ -1388,28 +1441,134 @@ vault_lock endp
 ; ===========================================================================
 public vault_reload
 vault_reload proc frame
-    FRAME_PROLOG 32
-    mov     rcx, qword ptr [g_body_ptr]         ; free the current secmem body
-    test    rcx, rcx
-    jz      vr_nobody
-    mov     rdx, VAULT_BODY_MAX
-    call    secmem_free
-    mov     qword ptr [g_body_ptr], 0
-vr_nobody:
-    call    attach_reset                        ; free pending attachment plaintext
-    mov     rcx, qword ptr [g_filebuf]          ; free the current resident file image
-    test    rcx, rcx
-    jz      vr_nofile
-    mov     rdx, qword ptr [g_filesize]
-    call    mem_free
+    FRAME_PROLOG 48
+    ; The open vault is parked, not freed, before the re-read.  This used to free the
+    ; body and image FIRST and then try - so any failure (the file momentarily
+    ; unreadable, a network share gone, a different password on the new file) left
+    ; the window open on no vault at all, every caller reporting success or saying
+    ; nothing, and the next Save dereferencing a null body.
+    call    vault_state_park
+    mov     qword ptr [g_body_ptr], 0           ; vault_unlock allocates its own
     mov     qword ptr [g_filebuf], 0
-vr_nofile:
     mov     dword ptr [g_reuse_key], 1          ; re-open reusing g_vkey (skip the KDF)
     call    vault_unlock
     mov     dword ptr [g_reuse_key], 0
+    mov     dword ptr [rbp-24], eax
+    test    eax, eax
+    jnz     vr_fail
+    mov     rcx, qword ptr [g_ps_body]          ; success: release what it replaced
+    mov     rdx, VAULT_BODY_MAX
+    call    secmem_free
+    mov     rcx, qword ptr [g_ps_filebuf]
+    test    rcx, rcx
+    jz      vr_drop
+    mov     rdx, qword ptr [g_ps_filesize]
+    call    mem_free
+vr_drop:
+    call    attach_reset_pending                ; staged attachments belonged to the
+    jmp     vr_ret                              ;   edit the reload just discarded
+vr_fail:
+    call    vault_state_restore                 ; vault_unlock released its own partial
+vr_ret:                                         ;   allocations; the old vault is back
+    mov     eax, dword ptr [rbp-24]
     FRAME_EPILOG
     ret
 vault_reload endp
+
+; ===========================================================================
+; vault_state_park / vault_state_restore - snapshot every global vault_unlock
+;   writes for an OPEN vault, so a second vault_unlock (a reload, or a foreign
+;   vault being read for import) can be undone exactly.  The attachment INDEX is
+;   copied as a table, not just its count: vault_unlock rebuilds it from whatever
+;   file it opened, and restoring only g_attidx_n left the open vault's slots
+;   holding the other file's ids and pointers into an image that was then freed -
+;   so the next save wrote every affected attachment away as empty ciphertext.
+; ===========================================================================
+vault_state_park proc frame
+    FRAME_PROLOG 48
+    mov     rax, qword ptr [g_body_ptr]
+    mov     qword ptr [g_ps_body], rax
+    mov     rax, qword ptr [g_body_len]
+    mov     qword ptr [g_ps_bodylen], rax
+    mov     rax, qword ptr [g_filebuf]
+    mov     qword ptr [g_ps_filebuf], rax
+    mov     rax, qword ptr [g_filesize]
+    mov     qword ptr [g_ps_filesize], rax
+    mov     rax, qword ptr [g_fmac_len]
+    mov     qword ptr [g_ps_fmac], rax
+    mov     rax, qword ptr [g_att_total]
+    mov     qword ptr [g_ps_atttotal], rax
+    mov     rax, qword ptr [g_att_start]
+    mov     qword ptr [g_ps_attstart], rax
+    mov     rax, qword ptr [g_save_counter]
+    mov     qword ptr [g_ps_counter], rax
+    mov     rax, qword ptr [g_ext_size]
+    mov     qword ptr [g_ps_extsize], rax
+    mov     eax, dword ptr [g_attidx_n]
+    mov     dword ptr [g_ps_attidxn], eax
+    mov     eax, dword ptr [g_att_ovf]
+    mov     dword ptr [g_ps_attovf], eax
+    mov     eax, dword ptr [g_rollback]
+    mov     dword ptr [g_ps_rollback], eax
+    lea     rcx, [g_ps_hdr]
+    lea     rdx, [g_hdr]
+    mov     r8d, VH_TOTAL
+    call    copy_bytes
+    lea     rcx, [g_ps_ehash]
+    lea     rdx, [g_ext_hash]
+    mov     r8d, 32
+    call    copy_bytes
+    lea     rcx, [g_ps_attidx]
+    lea     rdx, [g_attidx]
+    mov     r8d, dword ptr [g_attidx_n]
+    shl     r8d, 5                              ; 32 bytes per index row
+    call    copy_bytes
+    FRAME_EPILOG
+    ret
+vault_state_park endp
+
+vault_state_restore proc frame
+    FRAME_PROLOG 48
+    mov     rax, qword ptr [g_ps_body]
+    mov     qword ptr [g_body_ptr], rax
+    mov     rax, qword ptr [g_ps_bodylen]
+    mov     qword ptr [g_body_len], rax
+    mov     rax, qword ptr [g_ps_filebuf]
+    mov     qword ptr [g_filebuf], rax
+    mov     rax, qword ptr [g_ps_filesize]
+    mov     qword ptr [g_filesize], rax
+    mov     rax, qword ptr [g_ps_fmac]
+    mov     qword ptr [g_fmac_len], rax
+    mov     rax, qword ptr [g_ps_atttotal]
+    mov     qword ptr [g_att_total], rax
+    mov     rax, qword ptr [g_ps_attstart]
+    mov     qword ptr [g_att_start], rax
+    mov     rax, qword ptr [g_ps_counter]
+    mov     qword ptr [g_save_counter], rax
+    mov     rax, qword ptr [g_ps_extsize]
+    mov     qword ptr [g_ext_size], rax
+    mov     eax, dword ptr [g_ps_attidxn]
+    mov     dword ptr [g_attidx_n], eax
+    mov     eax, dword ptr [g_ps_attovf]
+    mov     dword ptr [g_att_ovf], eax
+    mov     eax, dword ptr [g_ps_rollback]
+    mov     dword ptr [g_rollback], eax
+    lea     rcx, [g_hdr]
+    lea     rdx, [g_ps_hdr]
+    mov     r8d, VH_TOTAL
+    call    copy_bytes
+    lea     rcx, [g_ext_hash]
+    lea     rdx, [g_ps_ehash]
+    mov     r8d, 32
+    call    copy_bytes
+    lea     rcx, [g_attidx]
+    lea     rdx, [g_ps_attidx]
+    mov     r8d, dword ptr [g_attidx_n]
+    shl     r8d, 5
+    call    copy_bytes
+    FRAME_EPILOG
+    ret
+vault_state_restore endp
 
 ; ===========================================================================
 
@@ -1935,13 +2094,14 @@ vbv_field:
     cmp     rdx, qword ptr [rbp-32]             ; whole field within the body?
     ja      vbv_bad
     test    eax, VF_LABELED                     ; labelled field: {u16 labellen, label, value}
-    jz      vbv_fadv
+    jz      vbv_kind                            ; (unlabelled fields still need the kind check)
     cmp     r8, 2
     jb      vbv_bad                             ; no room for the labellen prefix
     movzx   eax, word ptr [r10+rcx+6]           ; labellen
     add     eax, 2
     cmp     rax, r8                             ; 2 + labellen must fit inside the field
     ja      vbv_bad
+vbv_kind:
     ; attachment fields (VF_IMAGE/VF_FILE) must carry a full AttachRef - downstream
     ; (attach_build/emit/open) dereferences [value + ARF_PTLEN]; reject a crafted body
     ; whose attachment value is shorter than ARF_SIZE (68).
@@ -2229,6 +2389,10 @@ cmd_kdfparam proc frame
     ; --- must REJECT: the DoS / tamper vectors ---
     mov     dword ptr [g_hdr+VH_T], ARGON2_DEF_T        ; m_cost = 0
     mov     dword ptr [g_hdr+VH_M], 0
+    call    vk_params_ok
+    test    eax, eax
+    jnz     kdp_fail
+    mov     dword ptr [g_hdr+VH_M], ARGON2_MIN_M_KIB - 1 ; below the RFC 9106 floor
     call    vk_params_ok
     test    eax, eax
     jnz     kdp_fail
@@ -2828,7 +2992,7 @@ cmd_mactest endp
 LANDING_PAD
 public cmd_rbtest
 cmd_rbtest proc frame
-    FRAME_PROLOG 48
+    FRAME_PROLOG 64                             ; [rbp-32] result of the upper-case unlock
     lea     r10, [g_argv]
     mov     rax, qword ptr [r10+16]
     mov     rcx, rax
@@ -2875,6 +3039,51 @@ rb_pwd:
     call    vault_lock
     cmp     dword ptr [g_rollback], 0
     jne     rb_fail
+    ; ---- the mirror belongs to the FILE, not to one spelling of its path --------
+    ; Push the mirror ahead again, then open the same vault under an upper-cased
+    ; spelling: it must still be flagged.  Each spelling used to get its own mirror,
+    ; so this read as a vault never seen before.
+    mov     qword ptr [g_ctr_io], 5
+    mov     rcx, qword ptr [g_cfg_in]
+    lea     rdx, [g_ctr_io]
+    mov     r8d, 8
+    call    reg_ctr_set
+    mov     r10, qword ptr [g_cfg_in]            ; g_vx_pathb = upper-cased copy
+    lea     r11, [g_vx_pathb]
+    xor     ecx, ecx
+rb_up:
+    movzx   eax, word ptr [r10+rcx*2]
+    cmp     eax, 'a'
+    jb      rb_upput
+    cmp     eax, 'z'
+    ja      rb_upput
+    sub     eax, 20h
+rb_upput:
+    mov     word ptr [r11+rcx*2], ax
+    test    eax, eax
+    jz      rb_updone
+    inc     ecx
+    cmp     ecx, MAX_PATH_CHARS-1
+    jb      rb_up
+    mov     word ptr [r11+rcx*2], 0
+rb_updone:
+    lea     rcx, [g_vx_pathb]
+    call    cfg_in_set
+    call    vault_unlock
+    mov     dword ptr [rbp-32], eax
+    call    vault_lock
+    lea     r10, [g_argv]                        ; the original spelling back
+    mov     rcx, qword ptr [r10+16]
+    call    cfg_in_set
+    cmp     dword ptr [rbp-32], 0
+    jne     rb_fail
+    cmp     dword ptr [g_rollback], 1
+    jne     rb_fail
+    mov     qword ptr [g_ctr_io], 1              ; leave the mirror where the file is
+    mov     rcx, qword ptr [g_cfg_in]
+    lea     rdx, [g_ctr_io]
+    mov     r8d, 8
+    call    reg_ctr_set
     lea     rcx, [rb_ok]
     mov     edx, rb_ok_len
     call    print_a
@@ -2898,7 +3107,7 @@ cmd_rbtest endp
 LANDING_PAD
 public cmd_reload
 cmd_reload proc frame
-    FRAME_PROLOG 48
+    FRAME_PROLOG 80                             ; locals to -48, clear of the home area
     lea     r10, [g_argv]
     mov     rax, qword ptr [r10+16]             ; argv[2] = vault path
     mov     rcx, rax
@@ -2937,6 +3146,49 @@ rl_pwd:
     test    eax, eax
     jnz     rl_faillk
     call    vault_count                         ; memory back to 3
+    cmp     eax, 3
+    jne     rl_faillk
+    ; ---- seal guard: a body the unlock would reject must never be written ------
+    ; Mark field 0 of entry 0 as labelled without giving it a label prefix: exactly
+    ; the shape a crafted import produced, which then locked the vault for good.
+    xor     ecx, ecx
+    call    vault_entry_ptr
+    mov     qword ptr [rbp-40], rax
+    or      word ptr [rax+36], VF_LABELED
+    call    vault_reseal
+    mov     dword ptr [rbp-48], eax
+    mov     rax, qword ptr [rbp-40]
+    and     word ptr [rax+36], 7FFFh            ; put it back
+    cmp     dword ptr [rbp-48], EXIT_CORRUPT    ; refused, and refused as corrupt...
+    jne     rl_faillk
+    call    vault_ext_changed                   ; ...with nothing written
+    test    eax, eax
+    jnz     rl_faillk
+    ; ---- a reload that FAILS must leave the open vault exactly as it was -------
+    mov     rcx, qword ptr [g_cfg_in]           ; break the key check on disk: the
+    lea     rdx, [rbp-24]                       ;   reload reuses g_vkey, so this file
+    lea     r8, [rbp-32]                        ;   now reads as another password's
+    call    read_file
+    test    eax, eax
+    jnz     rl_faillk
+    mov     r10, qword ptr [rbp-24]
+    xor     byte ptr [r10+VH_KCV], 0FFh
+    mov     rcx, qword ptr [g_cfg_in]
+    mov     rdx, qword ptr [rbp-24]
+    mov     r8, qword ptr [rbp-32]
+    call    write_file
+    mov     rcx, qword ptr [rbp-24]
+    mov     rdx, qword ptr [rbp-32]
+    call    mem_free
+    mov     rax, qword ptr [g_body_ptr]
+    mov     qword ptr [rbp-40], rax
+    call    vault_reload
+    test    eax, eax
+    jz      rl_faillk                           ; it must not have "succeeded"
+    mov     rax, qword ptr [g_body_ptr]
+    cmp     rax, qword ptr [rbp-40]             ; same body, not freed or nulled
+    jne     rl_faillk
+    call    vault_count
     cmp     eax, 3
     jne     rl_faillk
     call    vault_lock
@@ -3700,6 +3952,402 @@ vi_fail:
 cmd_vimpkat endp
 
 ; ===========================================================================
+; kat_newvault_att() -> eax 0/err.  Create a vault at g_cfg_in under g_cfg_pass whose
+;   one entry carries two attachments (do_attgen), seal it and close it.  Fast KDF.
+kat_newvault_att proc frame
+    FRAME_PROLOG 48
+    mov     dword ptr [g_cfg_t], 1
+    mov     dword ptr [g_cfg_m], 8
+    mov     dword ptr [g_hdr+0], VAULT_MAGIC
+    mov     dword ptr [g_hdr+4], VAULT_VERSION
+    mov     dword ptr [g_hdr+VH_T], 1
+    mov     dword ptr [g_hdr+VH_M], 8
+    mov     dword ptr [g_hdr+VH_LANES], 1
+    lea     rcx, [g_hdr+VH_SALT]
+    mov     edx, 32
+    call    rng_fill
+    test    eax, eax
+    jz      knv_fail
+    lea     rcx, [g_hdr+VH_NONCE]
+    mov     edx, 12
+    call    rng_fill
+    test    eax, eax
+    jz      knv_fail
+    call    vk_derive
+    test    eax, eax
+    jnz     knv_fail
+    call    vk_kcv
+    lea     r10, [g_sha32]
+    lea     r9, [g_hdr+VH_KCV]
+    xor     r8d, r8d
+knv_kcv:
+    mov     al, byte ptr [r10+r8]
+    mov     byte ptr [r9+r8], al
+    inc     r8d
+    cmp     r8d, KCV_LEN
+    jb      knv_kcv
+    call    do_attgen
+    test    eax, eax
+    jnz     knv_fail
+    mov     qword ptr [g_save_counter], 0
+    call    vault_seal_write
+    mov     dword ptr [rbp-24], eax
+    call    vault_lock
+    mov     eax, dword ptr [rbp-24]
+    FRAME_EPILOG
+    ret
+knv_fail:
+    call    vault_lock
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+kat_newvault_att endp
+
+; kat_setpw(rcx = 9-char ascii password) - g_cfg_pass = it.  Leaf.
+kat_setpw proc
+    lea     r11, [g_cfg_pass]
+    xor     edx, edx
+ksp_lp:
+    mov     al, byte ptr [rcx+rdx]
+    mov     byte ptr [r11+rdx], al
+    inc     edx
+    cmp     edx, 9
+    jb      ksp_lp
+    mov     dword ptr [g_cfg_passlen], 9
+    ret
+kat_setpw endp
+
+; ===========================================================================
+; cmd_vimpattkat <path> - .vordr import and merge where BOTH vaults carry
+;   attachments.  vimpkat cannot see this class: its vaults have none, and every
+;   bug here lives in the attachment index.  Asserts that (1) importing a foreign
+;   vault with attachments leaves the open vault's own attachments decryptable after
+;   the save that follows, and (2) a NEWER copy of an entry merged over it keeps that
+;   entry's attachments instead of replacing it with a stripped copy.
+; ===========================================================================
+CSTR via_ok,  "vimpattkat: PASS (own attachments survive a foreign import and a newer-copy merge)",13,10
+CSTR via_bad, "vimpattkat: FAIL",13,10
+LANDING_PAD
+public cmd_vimpattkat
+cmd_vimpattkat proc frame
+    FRAME_PROLOG 96
+    ; [rbp-24]=src path [rbp-32]=foreign body / snapshot [rbp-40]=merge count
+    lea     r10, [g_argv]
+    mov     rcx, qword ptr [r10+16]
+    call    cfg_in_set
+    mov     r10, rax                            ; g_vx_pathb = <path> + ".src"
+    lea     r11, [g_vx_pathb]
+    xor     r8d, r8d
+via_pcpy:
+    mov     ax, word ptr [r10+r8*2]
+    mov     word ptr [r11+r8*2], ax
+    test    ax, ax
+    jz      via_pdone
+    inc     r8d
+    cmp     r8d, MAX_PATH_CHARS-8
+    jb      via_pcpy
+via_pdone:
+    mov     word ptr [r11+r8*2], '.'
+    mov     word ptr [r11+r8*2+2], 's'
+    mov     word ptr [r11+r8*2+4], 'r'
+    mov     word ptr [r11+r8*2+6], 'c'
+    mov     word ptr [r11+r8*2+8], 0
+    lea     rax, [g_vx_pathb]
+    mov     qword ptr [rbp-24], rax
+    ; ---- the open vault: one entry, two attachments --------------------------
+    lea     rcx, [ffk_seedpw]
+    call    kat_setpw
+    call    kat_newvault_att
+    test    eax, eax
+    jnz     via_fail
+    ; ---- the foreign vault: also two attachments, other ids, other password ---
+    mov     rcx, qword ptr [rbp-24]
+    call    cfg_in_set
+    lea     rcx, [vxk_exppw]
+    call    kat_setpw
+    call    kat_newvault_att
+    test    eax, eax
+    jnz     via_fail
+    ; ---- open the first one and import the second into it --------------------
+    lea     r10, [g_argv]
+    mov     rcx, qword ptr [r10+16]
+    call    cfg_in_set
+    lea     rcx, [ffk_seedpw]
+    call    kat_setpw
+    call    vault_unlock
+    test    eax, eax
+    jnz     via_fail
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [vxk_exppw]
+    mov     r8d, 9
+    lea     r9, [rbp-32]
+    call    vault_open_foreign
+    test    eax, eax
+    jnz     via_faillk
+    mov     rcx, qword ptr [rbp-32]
+    call    fed_merge                           ; g_merge_sel = 0: everything
+    mov     dword ptr [rbp-40], eax
+    mov     rcx, qword ptr [rbp-32]
+    call    vault_free_foreign
+    cmp     dword ptr [rbp-40], 1
+    jne     via_faillk
+    call    vault_reseal                        ; the save that used to zero them
+    test    eax, eax
+    jnz     via_faillk
+    call    vault_lock
+    lea     rcx, [ffk_seedpw]
+    call    kat_setpw
+    call    vault_unlock                        ; back from disk
+    test    eax, eax
+    jnz     via_fail
+    mov     ecx, 2                              ; own entry (2 attachments) + the import
+    call    zi_att_verify
+    cmp     eax, 2
+    jne     via_faillk
+    ; ---- merge a NEWER copy of the own entry over it --------------------------
+    mov     rcx, VAULT_BODY_MAX
+    call    secmem_alloc
+    test    rax, rax
+    jz      via_faillk
+    mov     qword ptr [rbp-32], rax
+    mov     rcx, rax
+    mov     rdx, qword ptr [g_body_ptr]
+    mov     r8d, dword ptr [g_body_len]
+    call    copy_bytes
+    xor     ecx, ecx                            ; entry 0 = the own entry
+    call    vault_entry_ptr
+    sub     rax, qword ptr [g_body_ptr]
+    add     rax, qword ptr [rbp-32]
+    inc     qword ptr [rax+24]                  ; ...but newer
+    mov     rcx, qword ptr [rbp-32]
+    call    fed_merge
+    mov     dword ptr [rbp-40], eax
+    mov     rcx, qword ptr [rbp-32]
+    mov     rdx, VAULT_BODY_MAX
+    call    secmem_free
+    cmp     dword ptr [rbp-40], 1               ; replaced, not added
+    jne     via_faillk
+    call    vault_count
+    cmp     eax, 2
+    jne     via_faillk
+    call    vault_reseal
+    test    eax, eax
+    jnz     via_faillk
+    call    vault_lock
+    lea     rcx, [ffk_seedpw]
+    call    kat_setpw
+    call    vault_unlock
+    test    eax, eax
+    jnz     via_fail
+    mov     ecx, 2
+    call    zi_att_verify                       ; the replacement still has both files
+    cmp     eax, 2
+    jne     via_faillk
+    call    vault_lock
+    lea     rcx, [via_ok]
+    mov     edx, via_ok_len
+    call    print_a
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+via_faillk:
+    call    vault_lock
+via_fail:
+    lea     rcx, [via_bad]
+    mov     edx, via_bad_len
+    call    print_a
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_vimpattkat endp
+
+; ===========================================================================
+; cmd_vattgen <path> - a fixture for tests/verify_vault.py, the independent reader:
+;   a vault (password "vordrtest", t=1 m=8 KiB) whose entry carries two attachments,
+;   sealed once and then saved three more times, so the file has a save counter of
+;   4 (the first write is 1) and .bak1..3 hold the earlier saves - same salt and
+;   key, a fresh nonce each.
+; cmd_vopen <path> - open a vault with Vordr's OWN reader under the same password:
+;   exit 0 = it opened, else the EXIT_* it was refused with.  verify_vault.py
+;   tampers a copy region by region and requires this to refuse every one.
+; ===========================================================================
+CSTR vag_ok,  "vattgen: PASS (2 attachments, saved 4 times)",13,10
+CSTR vag_bad, "vattgen: FAIL",13,10
+CSTR vop_ok,  "vopen: OK, entries "
+CSTR vop_bad, "vopen: refused, exit "
+CSTR vop_nl,  13,10
+LANDING_PAD
+public cmd_vattgen
+cmd_vattgen proc frame
+    FRAME_PROLOG 48
+    lea     r10, [g_argv]
+    mov     rcx, qword ptr [r10+16]
+    call    cfg_in_set
+    lea     rcx, [bk_pw]
+    call    kat_setpw
+    call    kat_newvault_att
+    test    eax, eax
+    jnz     vag_fail
+    mov     dword ptr [rbp-24], 3
+vag_lp:
+    lea     rcx, [bk_pw]                        ; unlock wipes the password it used
+    call    kat_setpw
+    call    vault_unlock
+    test    eax, eax
+    jnz     vag_fail
+    call    vault_reseal
+    mov     dword ptr [rbp-28], eax
+    call    vault_lock
+    cmp     dword ptr [rbp-28], 0
+    jne     vag_fail
+    dec     dword ptr [rbp-24]
+    jnz     vag_lp
+    lea     rcx, [vag_ok]
+    mov     edx, vag_ok_len
+    call    print_a
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+vag_fail:
+    lea     rcx, [vag_bad]
+    mov     edx, vag_bad_len
+    call    print_a
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_vattgen endp
+
+; ===========================================================================
+; cmd_seedbig <path> - a vault (password "vordrtest", t=1 m=8 MiB) whose one entry
+;   has SEEDBIG_N fields - more cards than the detail pane shows at once, for the
+;   GUI tests of its scrolling.  Fields are numbered so a test can tell them apart.
+; ===========================================================================
+SEEDBIG_N   equ 40
+CSTR sbg_ok,  "seedbig: PASS (one entry, 40 fields)",13,10
+CSTR sbg_bad, "seedbig: FAIL",13,10
+WSTR sbg_title, <Many fields>
+WSTR sbg_lbl,   <Field>
+.data?
+align 2
+sbg_vals    dw SEEDBIG_N*8 dup (?)              ; "value NN" per field
+.code
+LANDING_PAD
+public cmd_seedbig
+cmd_seedbig proc frame
+    FRAME_PROLOG 48
+    lea     r10, [g_argv]
+    mov     rcx, qword ptr [r10+16]
+    call    cfg_in_set
+    lea     rcx, [bk_pw]
+    call    kat_setpw
+    mov     dword ptr [g_cfg_t], 1
+    mov     dword ptr [g_cfg_m], 8192
+    call    do_init
+    test    eax, eax
+    jnz     sbg_fail
+    lea     rcx, [bk_pw]
+    call    kat_setpw
+    call    vault_unlock
+    test    eax, eax
+    jnz     sbg_fail
+    lea     r10, [g_field_list]                 ; field 0: the title
+    mov     qword ptr [r10], VF_TITLE
+    mov     qword ptr [r10+8], 0
+    lea     rax, [sbg_title]
+    mov     qword ptr [r10+16], rax
+    xor     ecx, ecx
+sbg_fl:
+    lea     r11, [sbg_vals]                     ; value text "vNN", NUL-terminated
+    mov     eax, ecx
+    shl     eax, 4                              ; 8 wide chars per slot
+    add     r11, rax
+    mov     word ptr [r11], 'v'
+    mov     eax, ecx
+    xor     edx, edx
+    mov     r8d, 10
+    div     r8d
+    add     eax, '0'
+    mov     word ptr [r11+2], ax
+    add     edx, '0'
+    mov     word ptr [r11+4], dx
+    mov     word ptr [r11+6], 0
+    lea     eax, [ecx+1]
+    imul    eax, eax, 24
+    mov     qword ptr [r10+rax], VF_TEXT or VF_LABELED
+    lea     r8, [sbg_lbl]
+    mov     qword ptr [r10+rax+8], r8
+    mov     qword ptr [r10+rax+16], r11
+    inc     ecx
+    cmp     ecx, SEEDBIG_N
+    jb      sbg_fl
+    mov     dword ptr [g_field_n], SEEDBIG_N + 1
+    call    vault_build_entry
+    test    eax, eax
+    jnz     sbg_faillock
+    call    vault_reseal
+    mov     dword ptr [rbp-24], eax
+    call    vault_lock
+    cmp     dword ptr [rbp-24], 0
+    jne     sbg_fail
+    lea     rcx, [sbg_ok]
+    mov     edx, sbg_ok_len
+    call    print_a
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+sbg_faillock:
+    call    vault_lock
+sbg_fail:
+    lea     rcx, [sbg_bad]
+    mov     edx, sbg_bad_len
+    call    print_a
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_seedbig endp
+
+LANDING_PAD
+public cmd_vopen
+cmd_vopen proc frame
+    FRAME_PROLOG 48
+    lea     r10, [g_argv]
+    mov     rcx, qword ptr [r10+16]
+    call    cfg_in_set
+    lea     rcx, [bk_pw]
+    call    kat_setpw
+    call    vault_unlock
+    mov     dword ptr [rbp-24], eax
+    test    eax, eax
+    jnz     vop_refused
+    call    vault_count
+    mov     dword ptr [rbp-28], eax
+    call    vault_lock
+    lea     rcx, [vop_ok]
+    mov     edx, vop_ok_len
+    call    print_a
+    mov     ecx, dword ptr [rbp-28]
+    call    print_u64
+    lea     rcx, [vop_nl]
+    mov     edx, vop_nl_len
+    call    print_a
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+vop_refused:
+    lea     rcx, [vop_bad]
+    mov     edx, vop_bad_len
+    call    print_a
+    mov     ecx, dword ptr [rbp-24]
+    call    print_u64
+    lea     rcx, [vop_nl]
+    mov     edx, vop_nl_len
+    call    print_a
+    mov     eax, dword ptr [rbp-24]
+    FRAME_EPILOG
+    ret
+cmd_vopen endp
+
+; ===========================================================================
 ; cmd_cowrite <path> - C8: prove the <vault>.lock write lock is exclusive and
 ;   reacquirable.  Acquire (must succeed), acquire again while held (must fail),
 ;   release, then re-acquire (must succeed).
@@ -3896,6 +4544,7 @@ va_field_raw proc frame
     mov     r11, qword ptr [g_body_ptr]
     add     r11, qword ptr [g_body_len]
     mov     rax, qword ptr [rbp-24]
+    and     eax, VF_KINDMASK                    ; never a flag bit on a raw field
     mov     word ptr [r11], ax
     mov     rax, qword ptr [rbp-40]
     mov     dword ptr [r11+2], eax
@@ -3918,7 +4567,12 @@ vfr_done:
     FRAME_EPILOG
     ret
 vfr_of:
-    FASTFAIL FF_BOUNDS
+    ; No room.  Refuse rather than fastfail: the caller (vault_build_entry) rolls the
+    ; half-built entry back, and the session - with its unsaved work - survives.
+    mov     dword ptr [g_vfe_err], 1
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
 va_field_raw endp
 
 ; ===========================================================================
@@ -3954,8 +4608,7 @@ vfb_write:
     mov     rcx, qword ptr [rbp-24]
     mov     rdx, qword ptr [rbp-32]
     mov     r8,  qword ptr [rbp-40]
-    call    va_field_raw
-    mov     eax, 1
+    call    va_field_raw                        ; eax = 1 written / 0 refused
     FRAME_EPILOG
     ret
 vfb_labeled:
@@ -3971,6 +4624,7 @@ vfb_labeled:
     mov     r11, qword ptr [g_body_ptr]
     add     r11, qword ptr [g_body_len]
     mov     rax, qword ptr [rbp-24]
+    and     eax, VF_KINDMASK
     or      eax, VF_LABELED
     mov     word ptr [r11], ax
     mov     eax, r9d
@@ -4011,7 +4665,10 @@ vfb_vcdone:
     FRAME_EPILOG
     ret
 vfb_of:
-    FASTFAIL FF_BOUNDS
+    mov     dword ptr [g_vfe_err], 1            ; see vfr_of
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
 va_field_bin_labeled endp
 
 
@@ -4588,6 +5245,7 @@ fx_kcv:
     mov     qword ptr [g_att_total], 0        ; no-carry: emit an empty attachment section
     mov     dword ptr [g_newatt_n], 0
     mov     dword ptr [g_attidx_n], 0
+    mov     dword ptr [g_att_ovf], 0
 fx_seal:
     mov     qword ptr [g_save_counter], 0     ; fresh vault: first save = counter 1
     call    vault_seal_write
@@ -4900,6 +5558,7 @@ vault_open_foreign proc frame
     lea     rdx, [g_ext_hash]
     mov     r8d, 32
     call    copy_bytes
+    call    vault_state_park                    ; incl. the attachment index TABLE (see there)
     ; ---- open the foreign file in place of the live one ----------------------
     mov     rax, qword ptr [rbp-24]
     mov     rcx, rax
@@ -4944,6 +5603,7 @@ vof_f2:
     call    mem_free
 vof_restore:
     ; ---- put the master back, byte for byte ---------------------------------
+    call    vault_state_restore
     mov     rax, qword ptr [rbp-56]
     mov     qword ptr [g_body_ptr], rax
     mov     rax, qword ptr [rbp-64]
@@ -5012,7 +5672,7 @@ vault_free_foreign endp
 ;   skipped.  Attachments filtered (v1).  The caller reseals.  Idempotent.
 public fed_merge
 fed_merge proc frame
-    FRAME_PROLOG 64
+    FRAME_PROLOG 96                             ; locals to -72, clear of the home area
     mov     qword ptr [rbp-24], rcx           ; source body
     mov     dword ptr [rbp-28], 0             ; changed count
     mov     r10, rcx
@@ -5061,8 +5721,40 @@ fm_nosel:
     mov     r8, qword ptr [r10+24]           ; src modified
     cmp     r8, qword ptr [rax+24]           ; vs dest modified
     jbe     fm_next                           ; src not newer -> keep dest, skip
-    mov     ecx, dword ptr [rbp-48]           ; src newer -> remove dest then append
-    call    vault_remove_at
+    ; Src is newer: replace dest.  Two things this used to get wrong.  It removed dest
+    ; BEFORE checking there was room for the replacement, so a full body simply lost
+    ; the entry.  And the replacement is attachment-stripped (the source's blobs are
+    ; not carried), so dest's own attachments vanished with it - re-importing an
+    ; exported copy that had been edited deleted every file on that entry.  Now: room
+    ; for src + all of dest is checked first, the replacement is appended, dest's
+    ; attachment fields are carried onto it, and only then is dest removed.
+    mov     qword ptr [rbp-56], rax           ; dest ptr (stays valid: appends go after it)
+    mov     rcx, rax
+    call    vault_entry_len
+    mov     qword ptr [rbp-64], rax           ; dest len
+    mov     rcx, qword ptr [rbp-40]
+    call    vault_entry_len
+    mov     r8, qword ptr [g_body_len]
+    add     r8, rax
+    add     r8, qword ptr [rbp-64]
+    cmp     r8, VAULT_BODY_MAX
+    ja      fm_next                           ; no room -> keep dest untouched
+    mov     rcx, qword ptr [rbp-40]
+    mov     rdx, qword ptr [g_body_ptr]
+    add     rdx, qword ptr [g_body_len]
+    mov     qword ptr [rbp-72], rdx           ; the replacement entry
+    call    entry_copy_filtered
+    mov     r8d, eax
+    add     qword ptr [g_body_len], r8
+    mov     r10, qword ptr [g_body_ptr]
+    inc     dword ptr [r10]
+    mov     rcx, qword ptr [rbp-56]
+    mov     rdx, qword ptr [rbp-72]
+    call    entry_carry_att                   ; dest's attachments -> the replacement
+    mov     ecx, dword ptr [rbp-48]           ; now drop dest (it precedes the new one,
+    call    vault_remove_at                   ;   so its index is unchanged)
+    inc     dword ptr [rbp-28]                ; changed++
+    jmp     fm_next
 fm_append:
     mov     rcx, qword ptr [rbp-40]           ; bounds: room for the full src entry
     call    vault_entry_len
@@ -5090,6 +5782,48 @@ fm_done:
     FRAME_EPILOG
     ret
 fed_merge endp
+
+; entry_carry_att(rcx = from entry, rdx = to entry) - append every VF_IMAGE/VF_FILE
+;   field of `from` to the end of the body, as fields of `to`, which must be the LAST
+;   entry.  Raw field copies: the AttachRef (id/key/nonce) travels unchanged, so the
+;   ciphertext already in the file still resolves.  The caller has checked the room.
+;   Leaf.
+entry_carry_att proc
+    mov     r9d, dword ptr [rcx+32]             ; from: field count
+    lea     r10, [rcx+36]                       ; from: field cursor
+    mov     r11, qword ptr [g_body_ptr]
+    add     r11, qword ptr [g_body_len]         ; write cursor = body end
+eca_lp:
+    test    r9d, r9d
+    jz      eca_done
+    movzx   eax, word ptr [r10]
+    and     eax, VF_KINDMASK
+    mov     r8d, dword ptr [r10+2]
+    add     r8d, 6                              ; whole field
+    cmp     eax, VF_IMAGE
+    je      eca_copy
+    cmp     eax, VF_FILE
+    jne     eca_next
+eca_copy:
+    xor     ecx, ecx
+eca_cb:
+    cmp     ecx, r8d
+    jae     eca_cbd
+    mov     al, byte ptr [r10+rcx]
+    mov     byte ptr [r11+rcx], al
+    inc     ecx
+    jmp     eca_cb
+eca_cbd:
+    add     r11, r8
+    add     qword ptr [g_body_len], r8
+    inc     dword ptr [rdx+32]                  ; to: one more field
+eca_next:
+    add     r10, r8
+    dec     r9d
+    jmp     eca_lp
+eca_done:
+    ret
+entry_carry_att endp
 
 ; vault_count() -> eax = number of entries (0 if locked).  Leaf.
 public vault_count
@@ -5659,7 +6393,10 @@ vfl_write:
     mov     r11, qword ptr [g_body_ptr]
     add     r11, qword ptr [g_body_len]
     mov     rax, qword ptr [rbp-24]
-    mov     word ptr [r11], ax
+    and     eax, VF_KINDMASK                    ; a PLAIN field carries no flag bits: a
+    mov     word ptr [r11], ax                  ;   stray VF_LABELED here would make the
+                                                ;   value's first bytes read as a label
+                                                ;   length and the vault fail to reopen
     mov     eax, dword ptr [rbp-40]
     mov     dword ptr [r11+2], eax
     add     r11, 6
@@ -5693,6 +6430,7 @@ vfl_labeled:
     mov     r11, qword ptr [g_body_ptr]
     add     r11, qword ptr [g_body_len]
     mov     rax, qword ptr [rbp-24]
+    and     eax, VF_KINDMASK
     or      eax, VF_LABELED
     mov     word ptr [r11], ax
     mov     eax, r9d
@@ -5733,7 +6471,10 @@ vfl_vcdone:
     FRAME_EPILOG
     ret
 vfl_of:
-    FASTFAIL FF_BOUNDS
+    mov     dword ptr [g_vfe_err], 1            ; see vfr_of - a value that does not fit is
+    xor     eax, eax                            ;   refused with the WHOLE entry, never stored
+    FRAME_EPILOG                                ;   empty and never a process kill
+    ret
 va_field_labeled endp
 
 ; ===========================================================================
@@ -6011,6 +6752,9 @@ vault_add_system_item proc frame
     add     rax, 36
     cmp     rax, VAULT_BODY_MAX
     ja      vasi_fail
+    mov     dword ptr [g_vfe_err], 0
+    mov     rax, qword ptr [g_body_len]         ; rollback point (see vault_build_entry)
+    mov     qword ptr [rbp-40], rax
     mov     r11, qword ptr [g_body_ptr]
     add     r11, qword ptr [g_body_len]
     mov     qword ptr [rbp-24], r11
@@ -6043,6 +6787,13 @@ vault_add_system_item proc frame
     mov     r9, 8
     call    va_field_bin_labeled
     add     dword ptr [rbp-32], eax
+    cmp     dword ptr [g_vfe_err], 0
+    je      vasi_patch
+    mov     rax, qword ptr [rbp-40]             ; no room for both fields -> no item at all
+    mov     qword ptr [g_body_len], rax
+    mov     dword ptr [g_vfe_err], 0
+    jmp     vasi_fail
+vasi_patch:
     mov     r11, qword ptr [rbp-24]
     mov     eax, dword ptr [rbp-32]
     mov     dword ptr [r11+32], eax             ; patch field_count
@@ -6352,6 +7103,9 @@ vault_build_entry proc frame
     mov     rax, qword ptr [g_carry_created]    ; consume the one-shot carry immediately
     mov     qword ptr [rbp-56], rax
     mov     qword ptr [g_carry_created], 0
+    mov     dword ptr [g_vfe_err], 0
+    mov     rax, qword ptr [g_body_len]         ; rollback point: if any field is refused
+    mov     qword ptr [rbp-64], rax             ;   the whole entry goes, body untouched
     cmp     dword ptr [g_field_n], 0
     je      vbe_fail
     mov     r10, qword ptr [g_field_list+16]    ; field 0 value wide
@@ -6415,6 +7169,8 @@ vbe_acc:
     inc     dword ptr [rbp-48]
     jmp     vbe_loop
 vbe_patch:
+    cmp     dword ptr [g_vfe_err], 0
+    jne     vbe_rollback
     mov     r11, qword ptr [rbp-32]
     mov     eax, dword ptr [rbp-40]
     mov     dword ptr [r11+32], eax             ; patch field_count
@@ -6423,6 +7179,13 @@ vbe_patch:
     xor     eax, eax
     FRAME_EPILOG
     ret
+vbe_rollback:
+    ; A field did not fit.  entry_count was never bumped, so dropping g_body_len back
+    ; to where this entry began removes every trace of it; the bytes past the new
+    ; end are dead and get overwritten by the next append.
+    mov     rax, qword ptr [rbp-64]
+    mov     qword ptr [g_body_len], rax
+    mov     dword ptr [g_vfe_err], 0
 vbe_full:
     mov     eax, EXIT_NOSPACE
     FRAME_EPILOG
@@ -6574,6 +7337,7 @@ attach_reset proc frame
     FRAME_PROLOG 32
     call    attach_reset_pending
     mov     dword ptr [g_attidx_n], 0
+    mov     dword ptr [g_att_ovf], 0            ; the index it described is gone too
     FRAME_EPILOG
     ret
 attach_reset endp
@@ -6604,19 +7368,19 @@ attach_stage proc frame
     mov     edx, 16
     call    rng_fill
     test    eax, eax
-    jz      as_err
+    jz      as_errbuf
     mov     rcx, qword ptr [rbp-40]
     add     rcx, ARF_KEY
     mov     edx, 32
     call    rng_fill
     test    eax, eax
-    jz      as_err
+    jz      as_errbuf
     mov     rcx, qword ptr [rbp-40]
     add     rcx, ARF_NONCE
     mov     edx, 12
     call    rng_fill
     test    eax, eax
-    jz      as_err
+    jz      as_errbuf
     mov     r10, qword ptr [rbp-40]
     mov     rax, qword ptr [rbp-32]
     mov     qword ptr [r10+ARF_PTLEN], rax
@@ -6639,6 +7403,10 @@ attach_stage proc frame
     xor     eax, eax
     FRAME_EPILOG
     ret
+as_errbuf:
+    mov     rcx, qword ptr [rbp-48]             ; the plaintext copy must not outlive
+    mov     rdx, qword ptr [rbp-32]             ;   the failure (mem_free wipes it)
+    call    mem_free
 as_err:
     mov     eax, 1
     FRAME_EPILOG
@@ -6650,6 +7418,7 @@ attach_stage endp
 attach_index_build proc frame
     FRAME_PROLOG 48
     mov     dword ptr [g_attidx_n], 0
+    mov     dword ptr [g_att_ovf], 0
     mov     rax, qword ptr [g_att_total]
     test    rax, rax
     jz      aib_done
@@ -6678,8 +7447,8 @@ aib_loop:
     cmp     rax, rdx
     ja      aib_done                            ; ct+tag overruns the section -> stop
     mov     eax, dword ptr [g_attidx_n]
-    cmp     eax, MAX_ATT
-    jae     aib_done
+    cmp     eax, MAX_ATTIDX
+    jae     aib_full
     imul    eax, eax, 32
     lea     r8, [g_attidx]
     add     r8, rax
@@ -6699,6 +7468,8 @@ aib_idcp:
     add     r10, rax
     add     r10, 16
     jmp     aib_loop
+aib_full:
+    mov     dword ptr [g_att_ovf], 1            ; a well-formed entry that does not fit
 aib_done:
     FRAME_EPILOG
     ret
@@ -6877,7 +7648,7 @@ attach_emit_one proc frame
     mov     r8d, dword ptr [g_attidx_n]
     call    attach_find
     cmp     eax, -1
-    je      aeo_done
+    je      aeo_missing
     imul    eax, eax, 32
     lea     r10, [g_attidx]
     add     r10, rax
@@ -6891,8 +7662,13 @@ attach_emit_one proc frame
     add     r8, 16                              ; ct + tag
     call    att_cpy
     jmp     aeo_done
-aeo_badlen:
-    FASTFAIL FF_BOUNDS                          ; crafted body: ctlen/ptlen mismatch, refuse
+aeo_badlen:                                     ; crafted body: ctlen/ptlen mismatch
+aeo_missing:
+    ; Nothing to carry.  Writing the header and leaving the ciphertext as whatever the
+    ; buffer held (zeros) produced a well-formed, MAC'd file whose attachment could
+    ; never decrypt again - silently.  Flag it; vault_seal_write refuses the save.
+    mov     dword ptr [g_att_missing], 1
+    jmp     aeo_done
 aeo_new:
     imul    eax, eax, 32
     lea     r10, [g_newatt]

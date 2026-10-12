@@ -95,13 +95,24 @@ rem ---------------------------------------------------------------------------
 where python >nul 2>nul
 if errorlevel 1 goto :nofc
 echo === framecheck ===
-python tools\framecheck.py
+rem strict gates WARNINGS too: the tree is at zero, and a new frame overlap must be
+rem fixed or allowlisted with a reason, not printed into a list nobody reads.
+if "%STRICT%"=="1" (python tools\framecheck.py --strict) else (python tools\framecheck.py)
 if errorlevel 1 (
     if "%STRICT%"=="1" (
         echo framecheck: FATAL frame bug - failing strict build
         goto :failed
     )
     echo framecheck: WARNING - fatal findings above; build continues. Use "build strict" to gate.
+)
+echo === nvcheck ===
+python tools\nvcheck.py
+if errorlevel 1 (
+    if "%STRICT%"=="1" (
+        echo nvcheck: a callee-saved register is not preserved - failing strict build
+        goto :failed
+    )
+    echo nvcheck: WARNING - unsaved non-volatile registers above; build continues. Use "build strict" to gate.
 )
 echo === idcheck ===
 python tools\idcheck.py
@@ -215,8 +226,22 @@ echo === mitigation check (optional, needs dumpbin) ===
 dumpbin /headers bin\vordr.exe | findstr /i "Dynamic NX Guard CET High" 2>nul
 
 if "%REPRO%"=="1" (
-    echo === release SHA-256 ^(publish + verify against a fresh rebuild^) ===
-    certutil -hashfile bin\vordr.exe SHA256 | findstr /r "^[0-9a-f]"
+    rem Normalise BEFORE hashing.  /Brepro replaces timestamps with a hash of the
+    rem linker's inputs, but ml64 stamps every .obj and this script reassembles
+    rem them all, so those inputs differ on every run and so did the exe.
+    rem pe_normalise zeroes the build stamps and the debug payloads (keeping the
+    rem CET record) so one commit gives one hash.  The comparison itself is
+    rem tools\verify_repro.ps1, which builds twice.
+    echo === release normalisation + SHA-256 ^(bin\SHA256SUMS.txt^) ===
+    python tools\pe_normalise.py bin\vordr.exe
+    if errorlevel 1 goto :failed
+    rem findstr /v ":" drops certutil's "SHA256 hash of ..." and "CertUtil: ..."
+    rem lines.  The obvious /r "^[0-9a-f]" does NOT: findstr's bracket ranges match
+    rem case-insensitively, so "CertUtil:" got through it.
+    echo vordr.exe> bin\SHA256SUMS.txt
+    certutil -hashfile bin\vordr.exe SHA256 | findstr /v ":" | findstr /r /v "^$" >> bin\SHA256SUMS.txt
+    type bin\SHA256SUMS.txt
+    echo     ^(recorded in bin\SHA256SUMS.txt; tools\verify_repro.ps1 proves it reproduces^)
 )
 
 echo.

@@ -9,9 +9,12 @@ when modifying an allocation or context switch.
 
 ## What locking does
 
-`sec_lock_statics` attempts to lock selected fixed buffers at startup.
-`sec_ws_grow` adjusts the working-set reservation. A static lock failure is
-recorded and shown as a warning; startup does not universally fail closed.
+`sec_lock_statics` locks every fixed buffer listed in the `sec_regions` table
+(`secmem.asm`) at startup, from the GUI entry point `wstart`. `sec_ws_grow`
+adjusts the working-set reservation first. A static lock failure is recorded and
+shown as a warning; startup does not universally fail closed. The `lktest` probe
+checks that every listed buffer is actually resident-locked
+(`QueryWorkingSetEx`), not just that the call was made.
 
 `secmem_alloc` allocates, locks, and registers a dynamic arena. It returns failure
 rather than handing an unlocked arena to the caller. `secmem_free` wipes a
@@ -21,11 +24,19 @@ Successful [VirtualLock](https://learn.microsoft.com/en-us/windows/win32/api/mem
 keeps the specified pages resident and out of ordinary paging while locked.
 Do not extend that into a claim that all secrets are excluded from hibernation,
 system dumps, kernel access, or every scratch allocation. The application does
-not control all of those paths.
+not control all of those paths. In particular, hibernation writes all of RAM -
+locked pages included - to `hiberfil.sys`; lock Vordr before hibernating, and
+rely on full-disk encryption for the hibernation file.
 
 ## Selected locked buffers
 
-Names are in `src/`; the lock list is in `secmem.asm:sec_lock_statics`.
+Names are in `src/`; the authoritative list is the `sec_regions` table in
+`secmem.asm`. The same table drives the lock at startup, the wipe when the vault
+window closes (`secmem_wipe_statics`, called after `vault_lock`), and the panic
+wipe. The rows below are the main ones; the table also covers the UTF-8 and wide
+conversion scratch, the commit blobs, the attachment tile (whose AttachRefs carry
+per-file keys), the generator output, export/import password copies and ZIP key
+material, and the TOTP key.
 
 | Buffer | Module | Contents | Normal cleanup |
 |---|---|---|---|
@@ -33,12 +44,15 @@ Names are in `src/`; the lock list is in `secmem.asm:sec_lock_statics`.
 | `g_vkey` (32 B) | vault | Active vault key | `vault_lock` |
 | `g_xs_vkey` (32 B) | vault | Parked key during temporary context operations | Export/password-check context cleanup |
 | `g_pwbuf`, `g_pw2buf` (2048 B each) | gui | Wide password and confirmation | Password conversion and create/unlock cleanup |
-| `g_secret_w` (16384 B) | gui | Revealed/copied secret | Vault close/lock |
+| `g_secret_w` (`CONVW_MAX`*2 B) | gui | Revealed/copied secret | Vault close/lock |
 | `g_rowpw_w` (1024 B) | gui | Reveal overlay | `gui_colorpw_hide` and close/lock |
 | `g_e_totp` (512 B), `g_totp_b32` (256 B) | gui | TOTP edit/selected key | Vault close/lock |
-| `g_pwhist` | gui | Field-history records | History/entry teardown and lock |
-| `g_pworig` | gui | Original values for history comparison | Entry/history teardown and lock |
-| `g_pwhblob` | gui | Serialized history staging | History teardown and lock |
+| `g_pwhist` | gui | Field-history records | Entry teardown and vault-window close |
+| `g_pworig` | gui | Original values for history comparison | Entry teardown and vault-window close |
+| `g_pwhblob` | gui | Serialized history staging | Entry teardown and vault-window close |
+| `g_tilefiles`, `g_tileblob`, `g_imgstageref` | gui | Attachment references, each with its file key | Vault-window close |
+| `g_conv_w`, `g_valblob`, `g_lblblob` | gui | Display and commit scratch: field values and labels | Vault-window close |
+| `g_conv`, `g_convlabel` | vault | UTF-8 field/label scratch | Vault lock and vault-window close |
 | Active vault body | vault via secmem | Decrypted records, including history and attachment references | `secmem_free` |
 | Edit transaction bodies | gui via secmem | Original body and working copy | Success releases original; failure restores original and releases working copy |
 
@@ -56,12 +70,12 @@ Not every secret-bearing allocation is managed by `secmem_alloc`.
 
 | Area | Exposure and cleanup to review |
 |---|---|
-| Argon2 arena (`g_arena`) | Large ordinary VirtualAlloc arena; not pinned; mixing state is wiped before release |
+| Argon2 arena (`g_arena`) | Large ordinary VirtualAlloc arena, too large to pin; wiped before release. The one block that is key-equivalent by itself - the last column's final block, input to the final hash - is `VirtualLock`ed (best-effort) while the KDF runs |
 | Argon2 H0 staging (`g_hbuf`) | Sensitive pre-hash state, not in the fixed lock list; wiped on hash exit |
-| `g_conv`, `g_convlabel` in vault | UTF-8 field/label scratch; wiped on vault lock, not locked by the named static list |
-| `g_conv_w` in GUI | Wide display-conversion scratch; transient does not mean non-sensitive |
 | `g_urlbuf`, `g_urlbuf2` | URLs may contain private hosts or tokens; wiped after the launch path |
-| ZIP export buffers | Plaintext JSON, password copies, keys, and archive staging; normal cleanup in `ze_compose`/`ze_free` |
+| ZIP export buffers | Plaintext JSON (in a `secmem` arena), password copies, keys, and archive staging; normal cleanup in `ze_compose`/`ze_free` |
+| ZIP import | The decrypted JSON is in a `secmem` arena; the raw archive is `VirtualLock`ed best-effort while it is parsed |
+| Crypto stack frames | HMAC-SHA1 pads, the BLAKE2b long-hash state and the last AES-CTR keystream block are wiped on return |
 | Attachment staging/open buffers | Plaintext copies can use ordinary heap allocation; follow `attach_stage`, `attach_open`, and caller ownership |
 | Windows controls and API buffers | Edit controls, clipboard, and provider buffers can hold copies beyond the named application arrays |
 
@@ -102,6 +116,13 @@ directories. `gui_temp_purge` attempts overwrite, flush, deletion, and directory
 removal. Failed cleanup stays tracked; the locked tray retries every five seconds.
 Normal Exit asks the user to close blocked viewers. Forced termination or shutdown
 can leave files behind, and overwrite/delete is not guaranteed physical erasure.
+
+Every file Vordr writes out of an attachment - a preview temp file, or a
+download of an executable type - gets a Mark of the Web (`Zone.Identifier`,
+`ZoneId=3`), so Office opens it in Protected View and Windows asks before running
+it. Executable and script types (`exec_exts` in `gui.asm`: programs, scripts,
+installers, shortcuts, disk images, search/library connectors and the like) are
+never handed to the shell at all; they can only be saved.
 
 `NoPreview` disables the automatic preview hand-off. Downloads still write
 plaintext wherever the user explicitly chooses. The viewer's own caches and

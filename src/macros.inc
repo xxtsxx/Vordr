@@ -27,6 +27,7 @@ EXIT_NOSPACE        equ 8          ; insufficient free disk space (pre-flight)
 EXIT_LOCKED         equ 9          ; vault is locked / wrong master password
 EXIT_CHANGED        equ 10         ; C8: vault changed on disk since load (reload-safe)
 EXIT_BUSY           equ 11         ; C8: another instance holds the write lock
+EXIT_TOOBIG         equ 12         ; read_file: the file exceeds the caller's g_rf_cap
 
 
 ; ---------------------------------------------------------------------------
@@ -40,6 +41,7 @@ FF_HEAP_TAG         equ 0F002h     ; temporal heap tag / canary violation
 FF_TYPE_MAGIC       equ 0F003h     ; struct type-magic mismatch
 FF_BOUNDS           equ 0F004h     ; bounds check failed
 FF_OVERFLOW         equ 0F005h     ; integer overflow in size arithmetic
+FF_IAT_RO           equ 01A70h     ; redteam iat: the IAT write was refused (exit only)
 
 ; ---------------------------------------------------------------------------
 ; CPU feature flag bits kept in g_cpu_features (set once in cpu_gate)
@@ -63,6 +65,7 @@ ARGON2_MIN_T        equ 1
 ARGON2_MAX_T        equ 16
 ARGON2_DEF_T        equ 3
 ARGON2_DEF_M_KIB    equ 524288     ; 512 MiB (tuned for ~600-700ms with AVX2)
+ARGON2_MIN_M_KIB    equ 8          ; RFC 9106: m >= 8*p KiB (Vordr always uses p = 1)
 ARGON2_MAX_M_KIB    equ 4194304    ; 4 GiB - the max the config/CLI accepts (4096 MiB);
                                    ; a header m_cost above this is corrupt/tamper and is
                                    ; rejected BEFORE the KDF runs (pre-auth DoS guard)
@@ -190,7 +193,13 @@ TM_HEAPBLK          equ 48504C42h  ; "BLPH" heap block header
 ; ---------------------------------------------------------------------------
 ; Software shadow stack
 ; ---------------------------------------------------------------------------
-SSTK_CAPACITY       equ 4096       ; max simultaneous frames (entries)
+SSTK_CAPACITY       equ 4096       ; max simultaneous frames (entries), PER THREAD
+; The shadow stack is per thread, reached through a TLS slot rather than a global.
+; TEB_TLS_SLOTS is the offset of the TEB's 64 inline TlsSlots on x64, so the lookup
+; is two instructions and no call.  A thread's block is {index, unused} followed
+; directly by its SSTK_CAPACITY entries, so entry i is at [block + 16 + i*8].
+TEB_TLS_SLOTS       equ 1480h
+SSTK_HDR            equ 16
 
 ; landing-pad magic for DLPV - emitted in front of every indirect-call target
 LP_MAGIC            equ 0D1B7C0DEFACEB00Ch
@@ -212,6 +221,7 @@ LP_MAGIC            equ 0D1B7C0DEFACEB00Ch
 ; Clobbers rax, r10, r11 (all volatile, never argument registers).
 ; =============================================================================
 FRAME_PROLOG macro localbytes
+    local no_sstk
     push    rbp
     .pushreg rbp
     mov     rbp, rsp
@@ -222,15 +232,30 @@ FRAME_PROLOG macro localbytes
     ; ---- plant stack canary ------------------------------------------------
     mov     rax, qword ptr [g_stack_canary]
     mov     qword ptr [rbp-8], rax
-    ; ---- push return address onto software shadow stack --------------------
-    mov     r10, qword ptr [g_sstk_index]
+    ; ---- push return address onto THIS THREAD's software shadow stack -------
+    ; Per thread, through a TLS slot.  It used to be one pair of globals for the
+    ; whole process: the secure-desktop worker had to swap in a stack of its own
+    ; while the main thread waited, any OS thread that ran framed code (the
+    ; vectored handler sees every thread's exceptions) raced the main thread's
+    ; pushes, and a watchdog that gave up on the worker left the main thread
+    ; verifying against the worker's stack.  (Ported from Myrkr.)
+    ;
+    ; A thread with no block - one Windows created, or any code before
+    ; hardening_init - keeps the canary and skips this, rather than trapping.
+    mov     r10d, dword ptr [g_sstk_tls]
+    test    r10d, r10d
+    jz      no_sstk                         ; 0 = no TLS index yet
+    dec     r10d
+    mov     r11, gs:[r10*8 + TEB_TLS_SLOTS]
+    test    r11, r11
+    jz      no_sstk                         ; this thread has no block
+    mov     r10, qword ptr [r11]            ; this thread's index
     cmp     r10, SSTK_CAPACITY
     jae     sstk_overflow_fail              ; shared fail stub (hardening.asm)
-    mov     r11, qword ptr [g_sstk_base]
     mov     rax, qword ptr [rbp+8]          ; our return address
-    mov     qword ptr [r11+r10*8], rax
-    inc     r10
-    mov     qword ptr [g_sstk_index], r10
+    mov     qword ptr [r11+r10*8+SSTK_HDR], rax
+    inc     qword ptr [r11]
+no_sstk:
 endm
 
 ; =============================================================================
@@ -256,16 +281,23 @@ ok1:
     ; THIS frame's return address: found -> resync (drop the stale entries above
     ; it); absent from the whole stack -> a genuine return-address (ROP)
     ; violation.  rax holds the return value here, so scratch is r8/r10/r11 only.
+    ; Same per-thread block the prologue used; no block -> nothing was pushed.
+    mov     r10d, dword ptr [g_sstk_tls]
+    test    r10d, r10d
+    jz      ok2
+    dec     r10d
+    mov     r8, gs:[r10*8 + TEB_TLS_SLOTS]
+    test    r8, r8
+    jz      ok2
     mov     r11, qword ptr [rbp+8]              ; the return address to match
-    mov     r10, qword ptr [g_sstk_index]
-    mov     r8, qword ptr [g_sstk_base]
+    mov     r10, qword ptr [r8]                 ; this thread's index
 sse_scan:
     test    r10, r10
     jz      sse_fail                            ; hit the bottom -> not ours -> ROP
     dec     r10
-    cmp     r11, qword ptr [r8+r10*8]
+    cmp     r11, qword ptr [r8+r10*8+SSTK_HDR]
     jne     sse_scan
-    mov     qword ptr [g_sstk_index], r10       ; resync to just below the match
+    mov     qword ptr [r8], r10                 ; resync to just below the match
     jmp     ok2
 sse_fail:
     mov     ecx, FF_SHADOW_STACK
@@ -316,24 +348,8 @@ CHECK_ADD_OVF macro dst, src        ; dst = dst + src, fastfail on carry
 ok:
 endm
 
-CHECK_SUB_OVF macro dst, src        ; dst = dst - src, fastfail on borrow
-    local ok
-    sub     dst, src
-    jnc     ok
-    mov     ecx, FF_OVERFLOW
-    jmp     ff_trap
-ok:
-endm
-
-; rax = rax * src, fastfail if result exceeds 64 bits.  Clobbers rdx.
-CHECK_MUL_OVF macro src
-    local ok
-    mul     src
-    jnc     ok
-    mov     ecx, FF_OVERFLOW
-    jmp     ff_trap
-ok:
-endm
+; (CHECK_SUB_OVF / CHECK_MUL_OVF were removed: nothing used them, and a control
+;  that nothing uses only makes the binary look better defended than it is.)
 
 ; =============================================================================
 ; BOUND_CHECK index, limit - fastfail unless index < limit (unsigned)
@@ -673,8 +689,7 @@ endm
 ; Globals owned by hardening.asm, referenced by the frame macros everywhere
 ; ---------------------------------------------------------------------------
 externdef g_stack_canary:qword
-externdef g_sstk_base:qword
-externdef g_sstk_index:qword
+externdef g_sstk_tls:dword              ; TLS index + 1 of the per-thread shadow stack
 externdef g_cpu_features:dword
 externdef sstk_overflow_fail:near
 externdef ff_trap:near                  ; central fail handler (main.asm)

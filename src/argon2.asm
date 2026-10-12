@@ -17,6 +17,8 @@ extern blake2b_long:proc
 extern secure_zero:proc
 extern VirtualAlloc:proc
 extern VirtualFree:proc
+extern VirtualLock:proc                 ; best-effort pin of the final block (see below)
+extern VirtualUnlock:proc
 
 MEM_COMMIT      equ 1000h
 MEM_RESERVE     equ 2000h
@@ -706,6 +708,9 @@ g_refidx  dq 0
 align 16
 g_b2bctx  db 256 dup (?)
 g_hbuf    db 80 dup (?)   ; H0(64) || LE32(blk) || LE32(lane)
+align 8
+g_lastblk dq ?            ; B[0][q-1]: pinned while the KDF runs
+g_lastlk  dd ?            ; 1 = that VirtualLock succeeded
 g_le4     db 8 dup (?)
 align 16
 g_inp     db 1024 dup (?)
@@ -873,6 +878,18 @@ endif
     test    rax, rax
     jz      a2_fail
     mov     qword ptr [g_arena], rax
+    ; The arena is far too large to lock, and it is pageable.  But one block in it is
+    ; key-equivalent on its own: B[0][q-1] after the last pass IS the input to the
+    ; final H', so recovering it from the pagefile recovers the vault key.  Pin that
+    ; block's page - 1 KiB, always within quota.  Best-effort: a refusal changes
+    ; nothing about the result.
+    xor     ecx, ecx
+    mov     rdx, qword ptr [g_q]
+    dec     rdx
+    call    a2_blkptr
+    mov     qword ptr [g_lastblk], rax
+    WINCALL VirtualLock, rax, 1024
+    mov     dword ptr [g_lastlk], eax
 
     ; ---- initial blocks B[i][0], B[i][1] ----------------------------------
     mov     qword ptr [g_lane], 0
@@ -1273,6 +1290,10 @@ endif
     mov     rdx, qword ptr [g_mb]
     shl     rdx, 10
     call    secure_zero
+    cmp     dword ptr [g_lastlk], 0
+    je      @F
+    WINCALL VirtualUnlock, qword ptr [g_lastblk], 1024
+@@:
     mov     rcx, qword ptr [g_arena]
     xor     edx, edx
     mov     r8d, MEM_RELEASE

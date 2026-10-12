@@ -12,7 +12,7 @@
 
 OPTION CASEMAP:NONE
 
-extern start:proc                       ; the only OS-indirect-called target
+extern wstart:proc                      ; the PE entry point (/entry:wstart)
 
 ; GuardFlags: CF_INSTRUMENTED (100h) | CF_FUNCTION_TABLE_PRESENT (400h),
 ; table stride bits (F0000000h) = 0 -> 4 bytes per entry (plain RVA list).
@@ -38,13 +38,16 @@ __guard_dispatch_icall_fptr dq guard_dispatch_icall_nop
 ; ---------------------------------------------------------------------------
 ; Our guard CF function table: every address the OS may call indirectly.
 ; RtlUserThreadStart dispatches to the image entry point through a CFG-
-; checked call, so "start" MUST be here or the process dies with 0xC0000409
-; before any of our code runs.  Our own indirect calls (command handlers)
-; use plain CALL + DLPV and are not CFG-instrumented, so they are not listed.
+; checked call, so the ENTRY POINT must be here if CFG is ever enabled.  That is
+; wstart (/entry:wstart) - this listed main.asm's `start`, which is not the entry
+; point and kept a dead proc alive.  CFG is not enabled (see build.cmd), so this
+; table is not consulted today; it is kept correct so that turning CFG on does
+; not fail at load.  Our own indirect calls (command handlers) use plain CALL +
+; DLPV and are not CFG-instrumented, so they are not listed.
 ; Entries are RVAs, ascending; with a single entry sorting is trivial.
 ; ---------------------------------------------------------------------------
 gfids_table label dword
-    dd imagerel start
+    dd imagerel wstart
 GFIDS_COUNT equ 1
 
 public _load_config_used

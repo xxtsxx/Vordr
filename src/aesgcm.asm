@@ -568,24 +568,28 @@ gcm_open proc frame
     mov     rcx, qword ptr [rbp-32]
     lea     rdx, [rsp+32+GCM_CTX_SIZE]
     call    gcm_final
-    mov     rcx, qword ptr [rbp-32]              ; wipe the round-key schedule + GHASH subkey
-    mov     rdx, GCM_CTX_SIZE                    ;   now (the computed tag sits just past the
-    call    secure_zero                          ;   ctx, so it survives for the compare below)
     lea     rcx, [rsp+32+GCM_CTX_SIZE]
     mov     r10, qword ptr [rbp-24]
     mov     rdx, qword ptr [r10].GCMREQ.tag
     mov     r8, 16
     call    ct_memcmp
-    test    eax, eax
-    jz      go_ok                               ; tag verified -> plaintext is valid
+    ; Wipe the round keys, the GHASH subkey AND the computed tag behind them - they
+    ; are contiguous - keeping the compare result.  The tag used to stay on the stack:
+    ; after a forgery attempt it is a valid tag for the attacker's ciphertext.
+    mov     dword ptr [rbp-40], eax
+    mov     rcx, qword ptr [rbp-32]
+    mov     rdx, GCM_CTX_SIZE + 16
+    call    secure_zero
+    cmp     dword ptr [rbp-40], 0
+    je      go_ok                               ; tag verified -> plaintext is valid
     ; tag mismatch: scrub the unauthenticated plaintext we already wrote to outp,
     ; so a caller that neglects to check the return value cannot process forged data.
     mov     r10, qword ptr [rbp-24]
     mov     rcx, qword ptr [r10].GCMREQ.outp
     mov     rdx, qword ptr [r10].GCMREQ.inlen
     call    secure_zero
-    mov     eax, 1                              ; restore the mismatch return value
 go_ok:
+    mov     eax, dword ptr [rbp-40]             ; 0 = authentic, 1 = mismatch
     FRAME_EPILOG
     ret
 gcm_open endp
@@ -813,6 +817,8 @@ acx_pb:
     inc     r11
     jmp     acx_pb
 acx_done:
+    pxor    xmm0, xmm0                       ; the last keystream block stays on the
+    movdqu  xmmword ptr [rbp-80], xmm0       ;   stack otherwise
     FRAME_EPILOG
     ret
 aes_ctr_xor endp

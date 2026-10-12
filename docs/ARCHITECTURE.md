@@ -146,6 +146,13 @@ allocations carry canaries and tags. The import table is made read-only after
 startup. Link flags enable ASLR, DEP/NX, high-entropy address space, and CET
 compatibility where supported.
 
+The software shadow stack is per thread: `FRAME_PROLOG` and `FRAME_EPILOG` find
+the calling thread's block through a TLS slot (`sstk_thread_init` gives each
+thread one, between guard pages). Threads Windows creates on Vordr's behalf, and
+any code before `hardening_init`, run with the canary only. Worker threads
+(`secdesk_thread`, the parallel KAT workers) initialise their own block first and
+free it last.
+
 These checks detect particular misuse patterns; they do not make assembly
 memory-safe. Windows CFG (`/guard:cf`) is deliberately not enabled because the
 build lacks the required MASM callback metadata. The software landing-pad guard

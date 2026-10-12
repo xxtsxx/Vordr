@@ -247,6 +247,7 @@ EXPECT = {
     "base32/otp16":        lambda: base64.b32decode("JBSWY3DPEHPK3PXP").hex(),
     # argon2id has no stdlib reference; checked against the published vector below.
     "argon2id/rfc9106":    None,
+    "argon2id/ref-t2m64":  None,
 }
 
 
@@ -272,6 +273,10 @@ PUBLISHED = {
     "gcm256/zero/tag": "d0d1c8a799996bf0265b98b5d48ab919",
     # RFC 9106, Section 5.3 (Argon2id, t=3, m=32, p=4, secret, ad)
     "argon2id/rfc9106": "0d640df58d78766c08c037a34a8b53c9d01ef0452d75b65eb52520e96b01e659",
+    # Argon2 reference implementation, src/test.c: Argon2id v1.3, t=2, m=2^16 KiB,
+    # p=1, "password" / "somesalt".  Unlike the RFC vector (two-block segments) this
+    # one regenerates the address block past i = 128, as every real vault does.
+    "argon2id/ref-t2m64": "09316115d5cf24ed5a15a31a3ba326e5cf32edc24702987c02b6566f61913cf7",
 }
 # RFC 4226, Appendix D truncated 6-digit HOTP values, counters 0..9
 PUBLISHED_HOTP = ["755224", "287082", "359152", "969429", "338314",
@@ -367,6 +372,7 @@ def main():
         "gcm256/zero/ct": "NIST SP800-38D TC14",
         "gcm256/zero/tag": "NIST SP800-38D TC14",
         "argon2id/rfc9106": "RFC 9106 sec.5.3",
+        "argon2id/ref-t2m64": "Argon2 reference test.c",
     }
     for label, expected in PUBLISHED.items():
         pcheck(label, expected, cites[label])

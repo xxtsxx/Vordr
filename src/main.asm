@@ -1,12 +1,9 @@
 ; =============================================================================
 ; main.asm - entry point, CPU gate, command-line parsing, dispatch
 ; =============================================================================
-; Startup order (deliberate):
-;   1. cpu_gate        - raw frame; sets g_cpu_features (rng_fill reads RDSEED)
-;   2. hardening_init  - raw frame; canary + shadow stack become live
-;   3. con_init        - first FRAME_PROLOG-protected call
-;   4. iat_lockdown    - IAT pages -> read-only BEFORE any user input is parsed
-;   5. parse_cmdline / validate / dispatch (DLPV-guarded indirect call)
+; The process entry point is gui.asm's wstart (/entry:wstart), which owns the
+; startup order: cpu_gate, hardening_init, crash_install, sec_lock_statics,
+; parse_cmdline, then either this module's dispatch (CLI) or the GUI.
 ; =============================================================================
 
 include macros.inc
@@ -19,24 +16,10 @@ extern WriteFile:proc
 
 STD_OUTPUT_HANDLE_   equ -11
 
-; ---------------------------------------------------------------------------
-; DBG ch - startup breadcrumb (only assembled with /DDBG_TRACE).  Prints one
-; character to stdout, preserving no volatile registers (caller must not rely
-; on them across a DBG point).  Used to localize early-startup faults.
-; ---------------------------------------------------------------------------
-DBG macro ch
-ifdef DBG_TRACE
-    mov     al, ch
-    call    dbg_putc
-endif
-endm
 
-extern hardening_init:proc
-extern sec_lock_statics:proc
-extern iat_lockdown:proc
 extern secure_zero:proc
 extern secmem_panic_wipe:proc           ; secmem.asm: zero every live secret buffer
-externdef g_sstk_index:qword            ; hardening.asm: software shadow-stack depth
+extern sstk_reset_current:proc          ; hardening.asm: empty this thread's shadow stack
 extern run_selftest:proc
 extern log_result:proc
 externdef g_readonly:dword              ; E9: read-only launch flag (owned by gui.asm)
@@ -65,6 +48,10 @@ extern cmd_sysitemkat:proc              ; system-item hide/round-trip KAT (vault
 extern cmd_vexselkat:proc               ; .vordr export: selection + master untouched (vault.asm)
 extern cmd_c9kat:proc                   ; C9 re-verify policy KAT (vault.asm)
 extern cmd_vimpkat:proc                 ; .vordr import: foreign read + selection (vault.asm)
+extern cmd_vimpattkat:proc              ; .vordr import/merge with attachments on both sides
+extern cmd_vattgen:proc                 ; fixture for tests/verify_vault.py (independent reader)
+extern cmd_vopen:proc                   ; open a vault with Vordr's own reader (tamper tests)
+extern cmd_seedbig:proc                 ; a 40-field entry for the detail-pane scroll tests
 extern cmd_cowrite:proc                 ; C8: write-lock exclusivity probe (vault.asm)
 extern cmd_attfuzz:proc                 ; G8: attachment-index fuzzer (vault.asm)
 extern cmd_healthkat:proc               ; E6: vault-health analysis KAT (vault.asm)
@@ -84,7 +71,6 @@ extern cmd_tpmtest:proc                 ; TPM seal/unseal round-trip (tpm.asm)
 extern cmd_cttest:proc                  ; ct_memcmp timing probe (hardening.asm)
 endif
 
-extern con_init:proc
 extern print_a:proc
 extern cfg_in_set:proc                  ; the ONLY way to set g_cfg_in
 extern print_u64:proc                   ; console.asm: rcx = u64 -> decimal stdout
@@ -175,7 +161,6 @@ msg_usage label byte
     db 13,10
     db "  Every launch runs the self-test gate first and fails closed on mismatch.",13,10
 msg_usage_len equ $ - msg_usage
-CSTR msg_nocpu,    "error: CPU lacks required features (AES-NI, PCLMULQDQ, SSE4.1)",13,10
 CSTR fs_seedlabel, "fuzz seed: "       ; G7: precedes the decimal seed on stdout
 fs_nl db 13,10
 CSTR msg_badnum,   "error: numeric argument out of range",13,10
@@ -232,6 +217,10 @@ WSTR w_sysitemkat, <sysitemkat>          ; system-item hide/round-trip KAT
 WSTR w_vexselkat, <vexselkat>            ; .vordr export selection KAT
 WSTR w_c9kat,     <c9kat>                ; C9 re-verify policy KAT
 WSTR w_vimpkat,   <vimpkat>              ; .vordr import KAT
+WSTR w_vimpattkat, <vimpattkat>          ; .vordr import/merge KAT, attachments both sides
+WSTR w_vattgen,  <vattgen>
+WSTR w_vopen,    <vopen>
+WSTR w_seedbig,  <seedbig>
 WSTR w_cowrite,  <cowrite>               ; C8: write-lock exclusivity probe
 WSTR w_attfuzz,  <attfuzz>               ; G8: attachment-index fuzzer
 WSTR w_healthkat,<healthkat>             ; E6: vault-health analysis KAT
@@ -309,6 +298,10 @@ cmd_table label CMDENT
     CMDENT { w_vexselkat, cmd_vexselkat, 1, 0 }   ; .vordr export selection KAT
     CMDENT { w_c9kat, cmd_c9kat, 1, 0 }           ; C9 re-verify policy KAT
     CMDENT { w_vimpkat, cmd_vimpkat, 1, 0 }       ; .vordr import KAT
+    CMDENT { w_vimpattkat, cmd_vimpattkat, 1, 0 } ; ...where both vaults carry attachments
+    CMDENT { w_vattgen,  cmd_vattgen,  1, 0 }   ; independent-reader fixture (<path>)
+    CMDENT { w_vopen,    cmd_vopen,    1, 0 }   ; open with Vordr's reader (<path>)
+    CMDENT { w_seedbig,  cmd_seedbig,  1, 0 }   ; one 40-field entry (<path>)
     CMDENT { w_cowrite,   cmd_cowrite,   1, 0 }   ; C8: write-lock exclusivity probe
     CMDENT { w_attfuzz,   cmd_attfuzz,   0, 0 }   ; G8: attachment-index fuzzer
     CMDENT { w_healthkat, cmd_healthkat, 0, 0 }   ; E6: vault-health analysis KAT
@@ -403,7 +396,7 @@ endif
     ; exactly when secrets are most worth exfiltrating via a crash/hibernation dump.
     ; Reset the shadow-stack depth first so secmem_panic_wipe's framed prolog can push
     ; even when THIS trap is FF_SHADOW_STACK (a full shadow stack); we are terminating.
-    mov     qword ptr [g_sstk_index], 0
+    call    sstk_reset_current          ; this thread's - another thread's is not ours
     call    secmem_panic_wipe
     int     29h                         ; release: real fast-fail
 ff_trap endp
@@ -904,6 +897,11 @@ co_take_log:
     mov     dword ptr [g_cfg_loglevel], eax
     jmp     co_loop
 co_take_logfile:
+ifndef PROBE_IO
+    ; A path-taking option, and a release CLI takes no paths: --log-file appended a
+    ; line to any file the user could write.  The default log location is unaffected.
+    jmp     co_usage
+endif
     call    co_next_arg
     test    rax, rax
     jz      co_usage
@@ -1736,53 +1734,9 @@ dp_done:
     ret
 dispatch endp
 
-; =============================================================================
-; start - process entry point
-; =============================================================================
-public start
-start proc frame
-    sub     rsp, 56                     ; 32 shadow + 2 locals + align
-    .allocstack 56
-    .endprolog
-    ; locals: [rsp+32] = cpu-ok flag, [rsp+40] = exit code
-
-    DBG     'A'
-    call    cpu_gate                    ; 1. feature detect (raw frame)
-    mov     dword ptr [rsp+32], eax
-    DBG     'B'
-    call    hardening_init              ; 2. canary + shadow stack live
-    test    eax, eax
-    jz      st_oom_raw
-    call    sec_lock_statics           ; VirtualLock the static secret buffers
-    DBG     'C'
-    call    con_init                    ; 3. console up (protected calls ok now)
-    DBG     'D'
-    cmp     dword ptr [rsp+32], 0
-    je      st_nocpu
-    call    iat_lockdown                ; 4. imports now read-only
-    DBG     'E'
-    call    parse_cmdline               ; 5. tokenize + dispatch
-    DBG     'F'
-    call    dispatch
-    mov     dword ptr [rsp+40], eax
-    DBG     'G'
-
-st_exit:
-    ; wipe password material before leaving, belt and braces
-    lea     rcx, [g_cfg_pass]
-    mov     edx, MAX_PASSWORD_BYTES+1
-    call    secure_zero
-    WINCALL ExitProcess, dword ptr [rsp+40]     ; never returns
-
-st_nocpu:
-    lea     rcx, [msg_nocpu]
-    mov     edx, msg_nocpu_len
-    call    print_err
-    mov     dword ptr [rsp+40], EXIT_NOCPU
-    jmp     st_exit
-st_oom_raw:
-    ; hardened runtime unavailable: exit without touching protected helpers
-    WINCALL ExitProcess, EXIT_OOM
-start endp
+; (There is no `start` here any more.  The PE entry point is gui.asm's wstart -
+;  /entry:wstart - and this proc, which nothing reached, still carried startup
+;  steps the real entry did not: it is where sec_lock_statics lived while no shipped
+;  build ever called it.  An entry point that only looks alive is worse than none.)
 
 end

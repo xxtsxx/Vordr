@@ -72,14 +72,26 @@ build.cmd release
 certutil -hashfile bin\vordr.exe SHA256
 ```
 
-The tag is an example; choose the version being verified. For two-build
-verification, repeat in a second fresh directory instead of deleting an
-existing working tree's `bin` and `obj` folders.
+The tag is an example; choose the version being verified. `build.cmd release`
+also writes the hash to `bin\SHA256SUMS.txt`. To check that one machine builds
+the same bytes twice, run `tools\verify_repro.ps1`.
 
-| Linker option | Purpose |
+| Step | Purpose |
 |---|---|
 | `/Brepro` | Uses deterministic content-derived build metadata |
 | `/pdbaltpath:vordr.pdb` | Avoids embedding a machine-specific absolute PDB path |
+| `tools\pe_normalise.py` | Zeroes the build timestamps and the debug-directory payloads the linker still varies (ml64 stamps every object, so `/Brepro` alone did not make two builds identical). The record that carries the CET flag is kept. |
+
+Releases built before normalisation was added (v0.2.3 and earlier) carry those
+stamps, so their published hash cannot be matched by a rebuild directly. Compare
+them by normalising both files first; `pe_normalise.py` changes nothing else:
+
+```bat
+copy vordr.exe published.exe
+python tools\pe_normalise.py published.exe bin\vordr.exe
+certutil -hashfile published.exe SHA256
+certutil -hashfile bin\vordr.exe SHA256
+```
 
 The ASLR, DEP/NX, high-entropy VA, and CET compatibility flags remain enabled.
 Record tool versions alongside hashes when preparing a release.

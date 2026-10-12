@@ -51,22 +51,14 @@ if errorlevel 1 (
     goto :s_build
 )
 set R_REDTEAM=PASS
-for %%c in (canary shadow dlpv overflow bounds typemagic heaptag iat) do (
-    bin\vordr.exe redteam %%c > "%WORK%\rt_%%c.log" 2>&1
-    set /a RC=!errorlevel!
-    set /a HI="(!RC! >> 16) & 0xFFFF"
-    set OK=0
-    if !HI! equ 64222 set OK=1
-    rem iat corrupts the (locked) IAT -> the call faults with a raw AV, which the
-    rem crash-containment VEH now catches, wipes secrets, and terminates with
-    rem 0xC0000409 (-1073740791).  The control still fired; the fault is contained.
-    if "%%c"=="iat" if !RC! equ -1073740791 set OK=1
-    if !OK!==1 (
-        echo   redteam %%c: fired ^(exit !RC!^) - ok
-    ) else (
-        echo   redteam %%c: control did NOT fire ^(exit !RC!^) - FAIL
-        set R_REDTEAM=FAIL
-    )
+rem Each case must end with ITS OWN fail-fast code (not just any 0xFADExxxx), and
+rem `crash` must be contained: 0xC0000409 plus a breadcrumb naming the fault.
+python tests\redteam.py bin\vordr.exe > "%WORK%\redteam.log" 2>&1
+if errorlevel 1 (
+    findstr /c:"FAIL" "%WORK%\redteam.log"
+    set R_REDTEAM=FAIL
+) else (
+    for /f "tokens=*" %%l in ('findstr /c:"redteam:" "%WORK%\redteam.log"') do echo   %%l
 )
 call :now T1
 set /a T_REDTEAM=!T1!-!T0!
@@ -102,7 +94,7 @@ set /a T_SELFTEST=!T1!-!T0!
 
 rem -------------------------------------------------------------- roundtrip --
 call :now T0
-echo === stage: roundtrip (seedtest / atgen / zitest / phtest / secscan / secfreedup / tmptest / fztest / trtest / vfuzz / fuzzzip / jfuzz / bktest / mactest / rbtest / sysitemkat / vexselkat / c9kat / vimpkat / xctest / reload / attfuzz / zexcap / zexname / convcap / healthkat / pkat / kdfparam / vaultexportkat / vaultexpattkat) ===
+echo === stage: roundtrip (seedtest / atgen / zitest / phtest / secscan / secfreedup / tmptest / fztest / trtest / vfuzz / fuzzzip / jfuzz / bktest / mactest / rbtest / sysitemkat / vexselkat / c9kat / vimpkat / vimpattkat / xctest / reload / attfuzz / zexcap / zexname / convcap / healthkat / pkat / kdfparam / vaultexportkat / vaultexpattkat) ===
 set RT=PASS
 
 rem --- data-loss guard: the RELEASE binary (still in bin\ from the build stage)
@@ -124,19 +116,33 @@ if errorlevel 1 ( echo   seedtest: FAIL ^(exit !errorlevel!^) & set RT=FAIL )
 bin\vordr.exe atgen "%WORK%\rt.zip" > "%WORK%\atgen.log" 2>&1
 if errorlevel 1 ( echo   atgen: FAIL ^(exit !errorlevel!^) & set RT=FAIL )
 
-rem layoutkat builds the real vault window and checks its geometry at four sizes.
+rem layoutkat builds the real vault window and checks its geometry at four sizes,
+rem then runs savefail and guardkat in it (save/reload/lock/export guards).
 rem 0xE0F2 (57586) means no interactive desktop - a build server, not a bug.
 bin\vordr.exe layoutkat "%WORK%\rt.vault" > "%WORK%\layoutkat.log" 2>&1
 set /a LKC=!errorlevel!
 if !LKC! equ 0 (
     for /f "tokens=*" %%l in ('findstr /c:"measured" "%WORK%\layoutkat.log"') do echo   %%l
     echo   layoutkat: dialog geometry clean - ok
+    for /f "tokens=*" %%l in ('findstr /c:"guardkat:" "%WORK%\layoutkat.log"') do echo   %%l
 ) else if !LKC! equ 57586 (
     echo   layoutkat: SKIP ^(no interactive desktop^)
 ) else (
     echo   layoutkat: FAIL ^(exit !LKC!^) - see %WORK%\layoutkat.log
-    findstr /c:"[LAYOUT]" "%WORK%\layoutkat.log"
+    findstr /c:"[LAYOUT]" /c:"FAIL" "%WORK%\layoutkat.log"
     set RT=FAIL
+)
+
+rem guitest drives a real, ISOLATED instance from outside (tests\lib\gui.psm1):
+rem HKCU remapped to a scratch key, a seeded vault, no hotkey/TPM/secure desktop.
+rem Input limits, lock-while-a-modal-is-open, what a lock wipes, the scrollbar.
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\guitest.ps1 > "%WORK%\guitest.log" 2>&1
+if errorlevel 1 (
+    echo   guitest: FAIL - see %WORK%\guitest.log
+    findstr /c:"FAIL" "%WORK%\guitest.log"
+    set RT=FAIL
+) else (
+    for /f "tokens=*" %%l in ('findstr /c:"guitest:" /c:"SKIP" "%WORK%\guitest.log"') do echo   %%l
 )
 
 if "!RT!"=="PASS" (
@@ -200,6 +206,8 @@ if not "!errorlevel!"=="0" ( echo   c9kat: FAIL ^(exit !errorlevel!, C9 re-verif
 
 bin\vordr.exe vimpkat "%WORK%\vi.vault" > "%WORK%\vimpkat.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   vimpkat: FAIL ^(exit !errorlevel!, .vordr import foreign-read/selection^) & set RT=FAIL )
+bin\vordr.exe vimpattkat "%WORK%\via.vault" > "%WORK%\vimpattkat.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   vimpattkat: FAIL ^(exit !errorlevel!, own attachments lost on import/merge^) & set RT=FAIL )
 
 bin\vordr.exe xctest "%WORK%\xc.vault" > "%WORK%\xctest.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   xctest: FAIL ^(exit !errorlevel!, external-change detection^) & set RT=FAIL )
@@ -262,6 +270,25 @@ if not errorlevel 1 (
         set RT=FAIL
     ) else (
         echo   persistence regressions: PASS
+    )
+    rem the vault format read by a reader that shares no code with Vordr: its own
+    rem RFC 9106 Argon2id, every region tamper-checked, a fresh nonce per save
+    python tests\verify_vault.py bin\vordr.exe > "%WORK%\verify_vault.log" 2>&1
+    if errorlevel 1 (
+        echo   verify_vault: FAIL - see %WORK%\verify_vault.log
+        findstr /c:"FAIL" "%WORK%\verify_vault.log"
+        set RT=FAIL
+    ) else (
+        for /f "tokens=*" %%l in ('findstr /c:"verify_vault:" "%WORK%\verify_vault.log"') do echo   %%l
+    )
+    rem vaults written by the released v0.2.3, frozen: they must keep opening
+    python tests\compattest.py bin\vordr.exe > "%WORK%\compattest.log" 2>&1
+    if errorlevel 1 (
+        echo   compattest: FAIL - see %WORK%\compattest.log
+        findstr /c:"FAIL" "%WORK%\compattest.log"
+        set RT=FAIL
+    ) else (
+        for /f "tokens=*" %%l in ('findstr /c:"compattest:" "%WORK%\compattest.log"') do echo   %%l
     )
 )
 set R_ROUNDTRIP=!RT!
@@ -357,6 +384,12 @@ set /a T_INSTALLER=!T1!-!T0!
 rem ---------------------------------------------------------------- summary --
 :summary
 echo.
+rem Every probe-build run (the probe verbs, the GUI harness, cryptodiff's katreport)
+rem remaps HKCU under HKCU\Software\VordrGuiTest (see gui_test_hooks).  Drop that
+rem scratch tree LAST, after the final probe-build run, and keep the test instances'
+rem log with the other logs.
+reg delete "HKCU\Software\VordrGuiTest" /f >nul 2>&1
+if exist "%TEMP%\vordr_guitest.log" move /y "%TEMP%\vordr_guitest.log" "%WORK%\vordr_guitest.log" >nul
 echo ============ run_all summary ============
 echo   stage        result   seconds
 echo   redteam      %R_REDTEAM%     %T_REDTEAM%

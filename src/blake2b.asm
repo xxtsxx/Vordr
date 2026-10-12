@@ -407,6 +407,9 @@ bl_tail:
     call    blake2b_hash
 
 bl_done:
+    lea     rcx, [rsp+32]                    ; ctx + V: Argon2 runs H' over the
+    mov     edx, BLAKE2B_CTX_SIZE + 64       ;   password-derived blocks
+    call    secure_zero
     FRAME_EPILOG
     ret
 blake2b_long endp

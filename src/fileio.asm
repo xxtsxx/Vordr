@@ -52,6 +52,9 @@ g_io_err    dd ?                 ; Win32 error from the last failed write/rename
                                  ;   (a sync client holding the file) from a real
                                  ;   failure, instead of seeing a flat EXIT_IO.
 align 4
+public g_rf_cap
+g_rf_cap    dq ?                       ; one-shot read_file size cap (0 = none): a file
+                                       ;   past it is refused before anything is allocated
 public g_wf_disp
 g_wf_disp   dd ?                       ; C7: one-shot write_file disposition override
 public g_wf_created
@@ -116,12 +119,18 @@ public read_file
 ; are, and doing it at the two chokepoints means an import, an export, an
 ; attachment and anything added later all get it without being told.
 read_file proc frame
-    FRAME_PROLOG 96
+    FRAME_PROLOG 144                          ; [rbp-88] = the size cap; 144 puts the
+                                              ;   CreateFileW/ReadFile stack args BELOW every
+                                              ;   local (at 112 the 6th arg landed on the cap)
     ; [rbp-24]=outbuf* [rbp-32]=outsize* [rbp-40]=handle
     ; [rbp-48]=filesize [rbp-56]=buf [rbp-64]=cursor [rbp-72]=remaining
     mov     qword ptr [rbp-24], rdx           ; stash the OUT-PARAMS first: they live
     mov     qword ptr [rbp-32], r8            ;   in the two registers path_longify
                                               ;   needs for its own arguments
+    mov     rax, qword ptr [g_rf_cap]         ; the one-shot cap is consumed HERE, on
+    mov     qword ptr [rbp-88], rax           ;   every call: taken only after a successful
+    mov     qword ptr [g_rf_cap], 0           ;   open, a failed open left it armed for the
+                                              ;   next, unrelated read (a vault reload)
     lea     rdx, [rf_path]                    ; -> the form Win32 accepts
     mov     r8d, MAX_PATH_CHARS + 16
     call    path_longify
@@ -135,6 +144,12 @@ read_file proc frame
     WINCALL GetFileSizeEx, rax, addr rbp-48
     test    eax, eax
     jz      rf_io_close
+    mov     rax, qword ptr [rbp-88]          ; the cap taken at entry
+    test    rax, rax
+    jz      rf_nocap
+    cmp     qword ptr [rbp-48], rax
+    ja      rf_toobig
+rf_nocap:
 
     ; allocate buffer
     mov     rcx, qword ptr [rbp-48]
@@ -174,12 +189,17 @@ rf_ok:
     jmp     rf_done                              ;   MAC still rejects such a truncated image)
 
 rf_io_freebuf:
-    mov     rcx, qword ptr [rbp-56]
-    mov     rdx, qword ptr [rbp-48]
+    mov     rcx, qword ptr [rbp-56]             ; wipe what was READ, not the whole
+    mov     rdx, qword ptr [rbp-64]             ;   allocation: zeroing never-touched
+    sub     rdx, rcx                            ;   pages only commits them
     call    mem_free
 rf_io_close:
     WINCALL CloseHandle, qword ptr [rbp-40]
     mov     eax, EXIT_IO
+    jmp     rf_done
+rf_toobig:
+    WINCALL CloseHandle, qword ptr [rbp-40]
+    mov     eax, EXIT_TOOBIG
     jmp     rf_done
 rf_oom_close:
     WINCALL CloseHandle, qword ptr [rbp-40]
@@ -251,10 +271,22 @@ wf_ok:
 wf_flush_close:
     ; A failed flush means durability was not established.  Never let an
     ; upstream atomic-replace path publish this image as a successful save.
+    ; EXCEPT where the file system does not implement flushing at all (some network
+    ; redirectors and virtual drives answer ERROR_INVALID_FUNCTION or
+    ; ERROR_NOT_SUPPORTED): there was never any durability to establish, and failing
+    ; would make every save on that volume fail forever while the data is written.
     call    GetLastError
+    cmp     eax, 1                              ; ERROR_INVALID_FUNCTION
+    je      wf_flush_nosupp
+    cmp     eax, 50                             ; ERROR_NOT_SUPPORTED
+    je      wf_flush_nosupp
     mov     dword ptr [g_io_err], eax
     WINCALL CloseHandle, qword ptr [rbp-40]
     mov     eax, EXIT_IO
+    jmp     wf_done
+wf_flush_nosupp:
+    WINCALL CloseHandle, qword ptr [rbp-40]
+    xor     eax, eax
     jmp     wf_done
 wf_io_close:
     call    GetLastError                         ; capture BEFORE CloseHandle overwrites it
