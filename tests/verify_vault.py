@@ -5,7 +5,8 @@ Every other vault test reads a file back with Vordr's own reader, and a writer
 and a reader that make the same mistake agree perfectly - a round trip cannot see
 it.  This one cannot share a mistake: Argon2id is written here from RFC 9106 (and
 checked against the RFC's own vector before it is trusted), AES-GCM is
-pycryptodomex, BLAKE2b is hashlib, and the layout is taken from docs/formats.md
+verify_crypto.py's pure-Python one (checked against NIST's vector the same way),
+BLAKE2b is hashlib, and the layout is taken from docs/formats.md
 and nothing else.  If Vordr and its published format part company - the AAD, the
 KCV, the body/attachment split, the attachment AAD, the file MAC's inputs - this
 fails, whichever side moved.  It is also the proof that a user can get their data
@@ -29,13 +30,16 @@ Needs a probeio or dbg build (`vattgen`, `bktest` and `vopen` are test verbs).
 
     python tests/verify_vault.py <vordr.exe>        exit 0 = every check passed
 """
-import hashlib, os, shutil, struct, subprocess, sys, tempfile
+import hashlib, hmac, os, shutil, struct, subprocess, sys, tempfile
 
-try:
-    from Cryptodome.Cipher import AES
-except ImportError:                                     # pragma: no cover
-    print('verify_vault: needs pycryptodomex (pip install pycryptodomex)')
-    sys.exit(2)
+# AES-256-GCM from tests/verify_crypto.py: pure Python, standard library only, and
+# validated against the published NIST vector before it judges anything.  This
+# reader used to need pycryptodomex - installed on the developer's machine, absent
+# on the CI runner, where the test exited "needs pycryptodomex" and failed every
+# run while passing locally.  The gate's tests take no third-party package.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import verify_crypto as _vc
+_vc.gcm_selftest()
 
 # ============================================================== Argon2id ====
 M64 = (1 << 64) - 1
@@ -136,12 +140,25 @@ class Refused(Exception):
     pass
 
 def gcm_open(key, nonce, aad, ct, tag):
-    c = AES.new(key, AES.MODE_GCM, nonce=nonce, mac_len=16)
-    c.update(aad)
-    try:
-        return c.decrypt_and_verify(ct, tag)
-    except ValueError:
+    """AES-256-GCM decrypt-and-verify (96-bit nonce, 16-byte tag): the tag is
+    checked over aad || ct BEFORE anything is decrypted.  Raises Refused."""
+    if len(key) != 32 or len(nonce) != 12 or len(tag) != 16:
+        raise Refused('GCM parameters')
+    rk = _vc._key_expansion_256(key)
+    h_int = int.from_bytes(_vc._aes256_encrypt_block(b'\x00' * 16, rk), 'big')
+    j0 = nonce + b'\x00\x00\x00\x01'
+    pad16 = lambda b: b + b'\x00' * ((16 - len(b) % 16) % 16)
+    s = _vc._ghash(h_int, pad16(aad) + pad16(ct) + struct.pack('>QQ', len(aad) * 8, len(ct) * 8))
+    want = (s ^ int.from_bytes(_vc._aes256_encrypt_block(j0, rk), 'big')).to_bytes(16, 'big')
+    if not hmac.compare_digest(want, tag):
         raise Refused('GCM tag')
+    pt = bytearray()
+    ctr = int.from_bytes(j0, 'big')
+    for i in range(0, len(ct), 16):
+        ctr = (ctr & ~0xFFFFFFFF) | ((ctr + 1) & 0xFFFFFFFF)
+        ks = _vc._aes256_encrypt_block(ctr.to_bytes(16, 'big'), rk)
+        pt += bytes(a ^ b for a, b in zip(ct[i:i + 16], ks))
+    return bytes(pt)
 
 def parse(data, password, key=None):
     """-> dict.  Raises Refused for anything the format says must be refused."""
@@ -310,6 +327,27 @@ def main():
                 mine = str(e)
             check(rc != 0 and mine != 'ACCEPTED',
                   'flip in %-22s -> Vordr exit %d, independent: %s' % (name, rc, mine))
+        # 5. ...but every flip above is caught by the file MAC first, so none of them
+        #    ever reached a GCM tag check.  Re-sign the file after the flip (the MAC
+        #    needs the key, which this test has): now only the GCM tags stand in the
+        #    way.  The body must be refused by both readers; an attachment by this
+        #    one (Vordr verifies an attachment when it is opened, not at unlock).
+        for name, off, both in (('body ciphertext', HDR + 5, True),
+                                ('attachment ciphertext', vstart + 26, False)):
+            b = bytearray(data); b[off] ^= 0x01
+            b[L - 36:L - 4] = hashlib.blake2b(b'vordr-file-mac-v1' + v['key'] + bytes(b[:L - TRAILER + 8]),
+                                              digest_size=32).digest()
+            open(t_path, 'wb').write(b)
+            for ext in ('.bak1', '.bak2', '.bak3', '.lock'):
+                if os.path.exists(t_path + ext):
+                    os.remove(t_path + ext)
+            rc, out = vordr('vopen', t_path)
+            try:
+                parse(bytes(b), pw, key=v['key']); mine = 'ACCEPTED'
+            except Refused as e:
+                mine = str(e)
+            check(mine.startswith('GCM') and (rc != 0 or not both),
+                  'flip in %-22s under a valid file MAC -> Vordr exit %d, independent: %s' % (name, rc, mine))
         rc, out = vordr('vopen', a)
         check(rc == 0, 'the untouched file still opens with Vordr (control)')
 

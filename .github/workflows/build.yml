@@ -82,10 +82,18 @@ jobs:
           name: vordr-exe
           path: bin/vordr.exe
 
+      # run_all writes its logs to %TEMP%\vordr_runall - on the runner that is
+      # C:\Users\runneradmin\AppData\Local\Temp, not runner.temp (D:\a\_temp), so the
+      # upload used to find nothing.  Copy them into the workspace first.
+      - name: collect stage logs on failure
+        if: failure()
+        shell: cmd
+        run: xcopy /e /i /y "%TEMP%\vordr_runall" runall-logs >nul 2>nul & exit /b 0
+
       - name: upload stage logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: runall-logs
-          path: ${{ runner.temp }}\vordr_runall\
+          path: runall-logs/
           if-no-files-found: ignore

@@ -79,7 +79,8 @@ reference that first checks itself against a fixed GCM vector.
 `tests/verify_vault.py` carries a second, independent Argon2id, written from
 RFC 9106 and checked against the RFC's vector before it is trusted. It decrypts
 real vault files - header, KCV, body, every attachment, the file MAC - using only
-`docs/formats.md`, pycryptodomex and hashlib, including a vault whose KDF
+`docs/formats.md`, the Python standard library and the self-checked pure-Python
+AES-GCM of `verify_crypto.py` (no third-party package), including a vault whose KDF
 segments are 2048 blocks long. A writer and reader that share a mistake agree
 with each other; this reader shares nothing, so a drift between Vordr and its
 published format fails here whichever side moved. The same test flips a byte in

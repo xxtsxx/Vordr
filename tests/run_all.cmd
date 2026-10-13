@@ -276,7 +276,9 @@ if not errorlevel 1 (
     python tests\verify_vault.py bin\vordr.exe > "%WORK%\verify_vault.log" 2>&1
     if errorlevel 1 (
         echo   verify_vault: FAIL - see %WORK%\verify_vault.log
-        findstr /c:"FAIL" "%WORK%\verify_vault.log"
+        rem the tail, not only lines saying FAIL: a crash or a missing module says
+        rem neither, and the CI log then showed nothing at all
+        powershell -NoProfile -Command "Get-Content -LiteralPath '%WORK%\verify_vault.log' -Tail 15"
         set RT=FAIL
     ) else (
         for /f "tokens=*" %%l in ('findstr /c:"verify_vault:" "%WORK%\verify_vault.log"') do echo   %%l
@@ -285,7 +287,9 @@ if not errorlevel 1 (
     python tests\compattest.py bin\vordr.exe > "%WORK%\compattest.log" 2>&1
     if errorlevel 1 (
         echo   compattest: FAIL - see %WORK%\compattest.log
-        findstr /c:"FAIL" "%WORK%\compattest.log"
+        rem the tail, not only lines saying FAIL: a crash or a missing module says
+        rem neither, and the CI log then showed nothing at all
+        powershell -NoProfile -Command "Get-Content -LiteralPath '%WORK%\compattest.log' -Tail 15"
         set RT=FAIL
     ) else (
         for /f "tokens=*" %%l in ('findstr /c:"compattest:" "%WORK%\compattest.log"') do echo   %%l
