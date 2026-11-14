@@ -9,44 +9,14 @@ in [docs/RELEASES.md](docs/RELEASES.md).
 
 ### Security
 
-- **Static secret buffers were never locked into RAM.** `sec_lock_statics` ran
-  only from an entry point the executable no longer uses (`start`; the real one
-  is `wstart`), so the master password, the vault key, password history and the
-  display scratch could be paged out, and the "secrets not pinned" warning could
-  never fire for them. The lock list is now one table (`sec_regions`) driving the
-  startup lock, the wipe on lock and the panic wipe; `lktest` checks every listed
-  buffer is actually resident-locked.
-- **Importing a `.vordr` file could destroy the open vault's attachments.** The
-  foreign vault's attachment index overwrote the open vault's; the next save wrote
-  those attachments away as empty ciphertext. Merging a newer copy of an entry
-  also dropped its attachments. Both fixed; `vimpattkat` covers them.
-- **A ZIP import took field types verbatim**, so a crafted archive could make the
-  vault unreadable at its next unlock or drive an out-of-bounds read. Types are
-  sanitised; `jfuzz` checks every case.
-- **ZIP export could write past its buffer** when an attachment did not fit.
-  Buffers now grow; `zexcap` covers it.
-- **The rollback warning could be bypassed by opening the vault under another
-  spelling of its path**, and a long path lost its TPM enrolment: both were keyed
-  by the path as typed. They are keyed by the normalised path now, with the old
-  keys still read.
-- **The computed GCM tag was left on the stack** after every authenticated
-  decrypt - after a forgery attempt, a valid tag for the attacker's ciphertext.
-- **A lock left decrypted data in static buffers** (history, originals, display
-  and commit scratch, attachment keys). The whole secret table is wiped on lock.
-- **Every first-chance exception in any DLL killed Vordr**, including ones shell
-  extensions in the file dialogs raise and handle themselves. The vectored
-  handler acts only on faults inside Vordr's own image; others still reach the
-  unhandled-exception filter.
-- **The software shadow stack was one process-wide global**, raced by any thread
-  running framed code, and the secure-desktop watchdog left the main thread
-  verifying against the worker's stack - a fastfail instead of a cancelled
-  prompt. It is per thread now (TLS), from Myrkr; `pkat` runs its workers truly
-  in parallel to prove it.
-- Mark of the Web on every file written out of an attachment; more executable
-  types (disk images, search/library connectors, appref-ms, theme files, Python)
-  are download-only; the secure-desktop name is random per use; the Argon2 final
-  block is pinned while the KDF runs; HMAC-SHA1, BLAKE2b and AES-CTR wipe their
-  stack state; the header's lane count is checked (the format said it was).
+- **Comprehensive security hardening (`VDR-01`–`VDR-28`).**
+  - **Container, ZIP, and JSON parsers:** Bounded `zj_str` destination capacity (enforced statically in `wstrcheck.py`) with strict `\uXXXX`, surrogate-pair, and `\u0000` validation; enforced `256 MiB` per-attachment (`ATT_FILE_MAX`) and `3,840 MiB` section (`ATT_TOTAL_MAX`) caps with checked 64-bit arithmetic (`attovfkat`); honored per-entry selection masks (`g_sel[]`) on AES-ZIP attachment export (`zexselkat`); validated UTF-16LE tails on `VF_PWHIST`; added automatic nonce retry on `VATT` footer tag collisions (`vattcolkat`); switched `zi_scan` to EOCD Central Directory parsing and made `zi_decrypt` non-destructive across duplicate attachment references.
+  - **Attachment preview, IPC, clipboard, and private desktop:** Replaced preview blocklisting with a strict eight-extension safe-preview allowlist (`.txt`, `.png`, `.jpg`, `.jpeg`, `.gif`, `.bmp`, `.webp`, `.pdf`), filename sanitization (`gui_sanitize_attname`), owner-only temp directory DACLs, and fail-closed `Zone.Identifier` (`ZoneId=3`) writes (`tmptest`); wiped `g_vkey`, arenas, and static buffers immediately inside `vp_lock` when locking over open modals (`guitest.ps1`); rejected UNC/device paths and modal-active hand-offs in `WM_COPYDATA`; bound `CLIP_TIMER` to `g_trayhwnd` so clipboard auto-clear survives dialog closure; made `HKLM`-locked `SecureUnlock=1` fail closed and added explicit user confirmation before normal-desktop fallback (`secdeskkat`); filtered whitespace/quotes/control bytes in URL launches.
+  - **Loader, crash containment, policy, file I/O, and TPM:** Enabled PE `LOAD_CONFIG.DependentLoadFlags = 0x0800` (`System32`-only static import loading, verified by `pe_normalise.py` and `dllhijack`) plus early `SetDefaultDllDirectories` and process mitigation policies; replaced `HKLM` environment expansion with a fail-closed `SHGetFolderPathW` prefix allowlist (`%USERPROFILE%\`, `%LOCALAPPDATA%\`, `%APPDATA%\`) that locks invalid `HKLM` values without `HKCU` fallback (`polkat`); bound TPM RSA-2048 OAEP blobs via a 64-byte `key32 || SHA-256(key32 || label32)` payload verified in constant time (`tpmkat`); made crash handling atomic/reentrant-safe (`crash_reent`) with `{base, size}` secret-region wipes; hardened atomic saves via `ReplaceFileW` and reparse-point/disk-type checks; canonicalized rollback counters via `GetFinalPathNameByHandleW` with monotonic high-water enforcement (`rbtest`); backed `mem_alloc`/`mem_free` with canary-tagged heap blocks (`heaptag`, `heapmagic`) and enforced raw frames on OS callbacks (`framecheck.py`).
+  - **Cryptography, CPU gate, and supply chain:** Replaced table S-boxes in `aes_expand_key` with hardware `aeskeygenassist`; scrubbed Argon2/SHA-1/BLAKE2b/TOTP stack frames and volatile `xmm`/`ymm` registers; enforced the SP 800-38D GCM plaintext length bound ($2^{36}-32$ bytes); verified `OSXSAVE` and `XGETBV(0)` before enabling AVX2; mixed `RDSEED` into `1..7`-byte RNG tails; pinned GitHub Actions by commit SHA, required Python fail-closed in `build.cmd strict`, and added MSI downgrade blocking (`NEWERVERSIONDETECTED`) and SDDL `LockPermissions` (`verify_msi.ps1`).
+- **Static secret buffers pinned from `wstart`.** `sec_lock_statics` now runs at GUI startup via the unified `sec_regions` table driving startup `VirtualLock`, lock-time zeroing, and panic wipes; `lktest` verifies physical working-set residency (`QueryWorkingSetEx`).
+- **Native `.vordr` import preserves active vault attachments.** Foreign imports park and restore the full attachment index table (`vimpattkat`).
+- **Per-thread TLS software shadow stack.** Each thread initializes its own guard-paged shadow-stack arena via TLS (`pkat`), eliminating cross-thread races during parallel KATs and private-desktop prompts; `FRAME_EPILOG` verifies top-of-stack and ancestor integrity (`shadow_anc`).
 
 ### Fixed
 

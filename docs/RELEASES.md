@@ -80,7 +80,7 @@ the same bytes twice, run `tools\verify_repro.ps1`.
 |---|---|
 | `/Brepro` | Uses deterministic content-derived build metadata |
 | `/pdbaltpath:vordr.pdb` | Avoids embedding a machine-specific absolute PDB path |
-| `tools\pe_normalise.py` | Zeroes the build timestamps and the debug-directory payloads the linker still varies (ml64 stamps every object, so `/Brepro` alone did not make two builds identical). The record that carries the CET flag is kept. |
+| `tools\pe_normalise.py` | Verifies `LOAD_CONFIG.DependentLoadFlags == 0x0800` (`LOAD_LIBRARY_SEARCH_SYSTEM32`), zeroes COFF/export/load-config/debug timestamps, and clears variable debug payloads while preserving `IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS` (CET). |
 
 Releases built before normalisation was added (v0.2.3 and earlier) carry those
 stamps, so their published hash cannot be matched by a rebuild directly. Compare

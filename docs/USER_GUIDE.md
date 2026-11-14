@@ -139,11 +139,13 @@ An unanswered question no longer keeps the vault open.
 
 ### Private-desktop password entry
 
-Secure Unlock is enabled by default. It places the password prompt on a separate
-Windows desktop, reducing exposure to ordinary input hooks and screen capture
-on the main desktop. It is not a guarantee against local malware or privileged
-attackers. If the private desktop cannot be created, Vordr says so and falls back
-to the normal prompt for that unlock.
+Secure Unlock is enabled by default. It runs the password prompt on an isolated Windows
+desktop (`CreateDesktopW` + `SwitchDesktop`), shielding keystrokes and dialog rendering
+from ordinary user-mode hooks and screen capture on the main desktop. If Windows refuses
+to create the private desktop, Vordr explains why and asks for explicit confirmation
+before showing a normal-desktop prompt—unless `SecureUnlock=1` is locked by administrator
+policy (`HKLM`), in which case Vordr refuses fallback altogether. It does not protect
+against kernel-level or `SYSTEM`/admin attackers.
 
 ### TPM convenience unlock
 
@@ -171,16 +173,16 @@ Crashes, forced termination, shutdown, filesystem snapshots, and the viewer's ow
 copies can leave plaintext behind. Overwriting is not a guarantee of physical
 erasure, especially on SSDs or backed-up storage.
 
-Enable **Disable attachment preview** to avoid the preview hand-off. Attachments
-then become download-only: downloading still creates a plaintext file at the
-location you choose, and you are responsible for that copy. Executable and
-script attachments - programs, installers, shortcuts, disk images, search and
-library connectors and the like - are download-only regardless of this setting.
-
-Every file Vordr writes out of an attachment is marked as downloaded from the
-internet, so Office opens it in Protected View and Windows asks before running
-it. An entry holds up to 24 attached files of up to 256 MB each; Vordr says when
-a file you dropped or chose was not attached.
+Enable **Disable attachment preview** (`NoPreview`) to turn off preview hand-off
+completely. Even when preview is enabled, Vordr restricts automatic preview to a strict
+**safe-preview allowlist** of eight extensions—`.txt`, `.png`, `.jpg`, `.jpeg`, `.gif`,
+`.bmp`, `.webp`, and `.pdf`—written with sanitized filenames inside an owner-only
+temporary directory (`DACL`) and stamped fail-closed with Mark of the Web
+(`Zone.Identifier`, `ZoneId=3`) so viewers apply untrusted-file protections (such as
+Protected View). Every other file type routes exclusively to **Save As** (download-only)
+and is never launched via Windows Shell. Each entry supports up to 24 attachments of up
+to `256 MiB` each, and Vordr reports explicitly if a dropped or selected file exceeds
+that cap.
 
 ## Back up and restore
 

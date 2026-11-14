@@ -128,9 +128,10 @@ u64 FILETIME | UTF-16 label + NUL | UTF-16 old value + NUL | u32 action
 ```
 
 Action 0 means CHANGED; action 1 means ADDED and has an empty old value.
-The reader also accepts older shapes without the action (CHANGED), and
-without a label (attributed to the default Password field). History is excluded
-from native and ZIP exports.
+`vault_body_validate` enforces even byte alignment and valid UTF-16LE NUL termination on
+every `VF_PWHIST` payload before exposing the unlocked body. The reader also accepts
+older shapes without the action (CHANGED) and without a label (attributed to the default
+Password field). History is excluded from native and ZIP exports.
 
 ### System items
 
@@ -149,8 +150,11 @@ A `VF_IMAGE` or `VF_FILE` value contains a 68-byte reference:
 byte[16] id | byte[32] key | byte[12] nonce | u64 plaintext_length
 ```
 
-Each attachment has its own AES-256-GCM key and nonce. The reference is inside
-the encrypted body. Its ciphertext lives in the optional trailing section:
+Each attachment has its own AES-256-GCM key and nonce, with a per-attachment cap of
+`ATT_FILE_MAX` (`256 MiB`, `0x10000000`) and a total attachment-section cap of
+`ATT_TOTAL_MAX` (`3,840 MiB`, `0xF0000000`), enforced with overflow-checked 64-bit
+arithmetic in both `vault_body_validate` and `attach_build` (`attovfkat`). The reference
+lives inside the encrypted body; its ciphertext lives in the optional trailing section:
 
 ```text
 repeat for attachment records:
@@ -159,8 +163,12 @@ u32 "VATT" | u64 total_attachment_record_bytes
 ```
 
 Attachment GCM AAD is the 24-byte record prefix (ID and length).
-GCM ciphertext length equals plaintext length. The VATT footer is omitted
-when there are no attachments; the mandatory version-2 VMAC trailer remains.
+GCM ciphertext length equals plaintext length. The `VATT` footer is omitted
+when there are no attachments; if a zero-attachment vault's body GCM `tag[4..7]`
+coincidentally equals `"VATT"`, `vault_seal_write` draws a fresh 12-byte body nonce and
+reseals (`vattcolkat`), while `vault_unlock` falls back cleanly to `g_att_total = 0` if
+an unparsed legacy collision occurs. The mandatory version-2 `VMAC` trailer always
+remains.
 
 New content is staged with fresh random key/nonce metadata. Unchanged
 attachments can be copied as ciphertext during a save or native export.
@@ -193,10 +201,14 @@ A version-2 image must have a valid file MAC. Version 1, which could omit the
 trailer, is not accepted. The KCV and GCM tag use constant-time comparisons;
 the full-file MAC is also verified before record data is exposed.
 
-The counter is mirrored per vault path under
-`HKCU\SOFTWARE\Vordr\Rollback`. An older counter sets a rollback warning.
-The mirror is user-writable local evidence, not a hardware monotonic counter.
-It cannot detect rollback of both copies or establish history on a fresh machine.
+The counter is mirrored per vault under `HKCU\SOFTWARE\Vordr\Rollback`, keyed by the
+canonicalized handle path (`GetFinalPathNameByHandleW`) so alternate path spellings,
+junctions, and casing share one high-water mark (`rbtest`). `reg_ctr_set` enforces
+monotonicity—never overwriting a stored 8-byte counter with a smaller value—and
+`vault_seal_write` refuses to wrap `u64` `-1`. An older file counter raises a rollback
+warning on both password and TPM unlock. Because the mirror resides in user-writable
+local registry state rather than hardware monotonic storage, restoring both the vault
+and `HKCU` (or opening an older copy on a fresh machine) cannot be detected locally.
 
 ## Writes and concurrency
 

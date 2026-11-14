@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
-<title>Vordr — how verification fits together</title>
+<title>Vordr — how verification earns trust</title>
 <style>
 :root {
   color-scheme: light dark;
@@ -78,84 +78,100 @@ footer { border-top: 1px solid var(--line); padding-top: 24px; margin-top: 48px;
 </nav>
 <header>
   <div class="eyebrow">Vordr / verification map</div>
-  <h1>Evidence, with its limits in view.</h1>
-  <p class="lede">A guide to how the checks fit together—not a live test result
-    or a security certification.</p>
-  <p class="notice">No independent external security review is recorded in the
-    repository. Passing tests does not establish the absence of vulnerabilities.</p>
+  <h1>Earned trust, with its limits in view.</h1>
+  <p class="lede">How Vordr's architecture, independent reference readers, and six-stage
+    verification gate fit together—an offline engineering reference, not a live dashboard
+    or external certification.</p>
+  <p class="notice">Every claim is backed by runnable checks in this repository, while
+    no external third-party audit is recorded here. Passing deterministic tests bounds
+    known failure classes without proving the absence of all defects.</p>
 </header>
 <section aria-labelledby="gate">
   <h2 id="gate">One gate, six stages</h2>
-  <p class="summary">The driver runs these stages in order. It switches build variants
-    for diagnostic probes and restores a normal executable before packaging.</p>
+  <p class="summary"><code>tests\run_all.cmd</code> executes these stages in sequence,
+    using isolated <code>HKCU</code> test hives for diagnostic probes and restoring a
+    clean release executable before packaging.</p>
   <ol class="stages">
-    <li><span class="step">01 / FAULT INJECTION</span><h3>Exercise runtime checks</h3>
-      <p>Trigger stack, heap, bounds, indirect-call, and import-table violations.
-      Check that the test process terminates.</p></li>
-    <li><span class="step">02 / STRICT BUILD</span><h3>Check source patterns</h3>
-      <p>Run eight Python checkers, then assemble, compile resources, and link.
-      Python must be present for the source checks.</p></li>
-    <li><span class="step">03 / SELF-TESTS</span><h3>Check known answers</h3>
-      <p>Exercise fixed cryptographic and policy inputs. Startup also runs a
-      fail-closed self-test gate.</p></li>
-    <li><span class="step">04 / ROUND-TRIPS</span><h3>Exercise data lifetimes</h3>
-      <p>Test records, attachments, imports, saves, cleanup, and bounded malformed
-      inputs in a diagnostic build.</p></li>
-    <li><span class="step">05 / CRYPTO CROSS-CHECK</span><h3>Compare outputs</h3>
-      <p>Compare with Python calculations and published vectors. Argon2 uses a
-      published vector, not a second full implementation.</p></li>
-    <li><span class="step">06 / INSTALLER</span><h3>Inspect package behavior</h3>
-      <p>Build and cost the MSI after restoring a normal build. Real installation,
-      upgrade, and uninstall still need separate tests.</p></li>
+    <li><span class="step">01 / FAULT INJECTION</span><h3>Verify fail-fast &amp; containment</h3>
+      <p>Trigger stack canary, TLS shadow-stack (top and ancestor-skip), landing-pad,
+      heap-tag, bounds, arithmetic, crash-reentrancy, <code>System32</code> DLL load,
+      and read-only IAT guards via <code>tests\redteam.py</code>.</p></li>
+    <li><span class="step">02 / STRICT BUILD</span><h3>Enforce static &amp; PE invariants</h3>
+      <p>Run ten Python assembly, Win64 ABI, resource, and doc analyzers gated by
+      coverage floors (<code>floors.py</code>), link with ASLR/DEP/HEVA/CET, and verify
+      <code>DependentLoadFlags = 0x0800</code> (<code>pe_normalise.py</code>). Fails closed
+      if Python is missing.</p></li>
+    <li><span class="step">03 / SELF-TESTS</span><h3>Run 23 startup KAT suites</h3>
+      <p>Verify FIPS-197, SP 800-38A/D, RFC 9106 Argon2id, RFC 7693 BLAKE2b, RFC 6238
+      TOTP, register/XMM scrubbing, CPU/XCR0 gates, and URL/filename/JSON sanitizers.
+      Every normal launch runs this gate fail-closed.</p></li>
+    <li><span class="step">04 / ROUND-TRIPS &amp; GUI</span><h3>Exercise formats, fuzzers &amp; UI</h3>
+      <p>Run 35+ container, parser-fuzz, policy, TPM, and persistence probes, a
+      zero-shared-code Python vault reader (<code>verify_vault.py</code>), frozen
+      <code>v0.2.3</code> fixtures, and an 86-check isolated Win32 GUI suite
+      (<code>guitest.ps1</code>).</p></li>
+    <li><span class="step">05 / CRYPTO DIFFERENTIAL</span><h3>Cross-check 83 vectors</h3>
+      <p>Compare 58 primitive outputs from <code>katreport</code> against independent
+      Python calculations and 25 published FIPS/NIST/RFC test vectors via
+      <code>tests\verify_crypto.py</code>.</p></li>
+    <li><span class="step">06 / INSTALLER</span><h3>Cost &amp; verify the MSI</h3>
+      <p>Build the MSI around the restored release binary and cost its tables via
+      Windows Installer COM: 14 policy rows, SDDL permissions, and downgrade prevention
+      (<code>NEWERVERSIONDETECTED</code>).</p></li>
   </ol>
-  <p class="notice">A successful summary can include skipped checks. Review the
-    logs for missing Python, installer tooling, or an interactive desktop.</p>
+  <p class="notice">Strict builds require Python and fail closed without it. Inspect the
+    stage log if <code>makecab.exe</code> or an interactive desktop is unavailable on a
+    headless runner.</p>
 </section>
 <section aria-labelledby="boundaries">
-  <h2 id="boundaries">Encryption is one boundary, not the whole lifecycle</h2>
-  <p class="summary">Unlocking makes data usable. Copying or previewing it then
-    crosses into systems that Vordr does not fully control.</p>
+  <h2 id="boundaries">Three lifecycle zones, three explicit boundaries</h2>
+  <p class="summary">Vault encryption protects data at rest; unlocking moves records into
+    pinned user-mode arenas; copying or previewing deliberately crosses into external
+    OS components.</p>
   <div class="boundary" role="group" aria-label="Encrypted file to unlocked process to other applications">
-    <div class="zone"><h3>Encrypted file</h3><small>Body and attachment authentication.
-      Backups and sync retain encrypted copies.</small></div>
+    <div class="zone"><h3>1. Encrypted container</h3><small>Argon2id key derivation,
+      AES-256-GCM per body and attachment, and full-file BLAKE2b-256 MAC over the
+      64-bit save counter.</small></div>
     <span class="arrow" aria-hidden="true">→</span>
-    <div class="zone"><h3>Unlocked process</h3><small>Selected locked buffers,
-      explicit wipes, and runtime hardening. Other sensitive scratch exists.</small></div>
+    <div class="zone"><h3>2. Unlocked process</h3><small><code>VirtualLock</code> static
+      table and <code>secmem</code> arenas, XMM/stack wipes, private-desktop prompt, and
+      modal-closing auto-lock.</small></div>
     <span class="arrow" aria-hidden="true">→</span>
-    <div class="zone"><h3>Other applications</h3><small>Clipboard, downloads, and preview
-      files contain plaintext. Cleanup cannot erase every outside copy.</small></div>
+    <div class="zone"><h3>3. External OS boundary</h3><small>Tray-timed clipboard clear,
+      strict safe-preview allowlist, owner-only temp DACL, and fail-closed Mark of the
+      Web.</small></div>
   </div>
-  <p><a href="SECRETS.md">Review buffer ownership and cleanup limits →</a></p>
+  <p><a href="SECRETS.md">Review secret buffer ownership and cleanup boundaries →</a></p>
 </section>
 <section aria-labelledby="interpret">
-  <h2 id="interpret">Read a passing result precisely</h2>
+  <h2 id="interpret">Read passing evidence with scientific precision</h2>
   <div class="columns">
-    <article><h3>What it can demonstrate</h3><ul>
-      <li>A fixed input produced the expected output.</li>
-      <li>A selected fault triggered a runtime check.</li>
-      <li>A synthetic save or import preserved the tested data.</li>
-      <li>A particular executable matches a recorded hash.</li>
+    <article><h3>What the suite demonstrates</h3><ul>
+      <li>Independent Python readers agree byte-for-byte with Vordr's wire format and cryptographic outputs.</li>
+      <li>Every deliberate memory, ABI, frame, or loader fault triggers its dedicated fail-fast or containment path.</li>
+      <li>Two clean <code>release strict</code> builds produce identical SHA-256 binaries with ASLR, DEP, HEVA, and CET intact.</li>
+      <li>Policy locks, modal auto-lock, attachment caps, and rollback counters hold under automated CLI and GUI probes.</li>
     </ul></article>
-    <article><h3>What it does not establish</h3><ul>
-      <li>All inputs and failure paths are safe.</li>
-      <li>All sensitive memory is locked or wiped after every crash.</li>
-      <li>Cryptographic output checks prove side-channel resistance.</li>
-      <li>A matching source build contains no vulnerabilities.</li>
+    <article><h3>What remains outside automated proof</h3><ul>
+      <li>Bounded fuzzing and fixed KATs do not prove safety over all possible inputs.</li>
+      <li>User-mode <code>VirtualLock</code> and zeroing cannot block a hostile kernel, admin debugger, or unencrypted hibernation file.</li>
+      <li>Functional output vectors do not prove microarchitectural side-channel immunity across all CPUs.</li>
+      <li>COM table costing does not replace live VM upgrade and uninstall testing.</li>
     </ul></article>
   </div>
 </section>
 <section aria-labelledby="reproduce">
-  <h2 id="reproduce">Reproduce on a safe test machine</h2>
-  <p class="summary">The full driver stops running Vordr processes and replaces build
-    outputs. Use synthetic data in a dedicated checkout or VM.</p>
+  <h2 id="reproduce">Reproduce on an isolated test machine</h2>
+  <p class="summary"><code>tests\run_all.cmd</code> terminates running <code>vordr.exe</code>
+    processes and overwrites <code>bin\</code>. Run it in a clean checkout or VM with
+    synthetic data.</p>
   <pre><code>tests\run_all.cmd
-
-python tests\verify_crypto.py --exe bin\vordr.exe</code></pre>
-  <p>Record the commit, toolchain, commands, logs, and any skips.
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\verify_repro.ps1</code></pre>
+  <p>Record the commit hash, MSVC/SDK versions, full stage logs, and any environment skips.
     <a href="DEVELOPMENT.md">Read the development guide before running the gate.</a></p>
 </section>
-<footer>This page is self-contained and makes no network requests.
-  The <a href="ASSURANCE.md">Markdown assurance guide</a> is the detailed reference.</footer>
+<footer>Self-contained offline document (zero network requests).
+  See the <a href="ASSURANCE.md">Markdown assurance reference</a> for the complete probe and analyzer tables.</footer>
 </main>
 </body>
 </html>

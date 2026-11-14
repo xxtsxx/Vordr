@@ -4,10 +4,17 @@
 
 ## System overview
 
-Vordr is a native Win64 application with one active vault context. Most user
-interaction lives in `gui.asm`; `vault.asm` owns the encrypted container and
-record operations. Import and export temporarily use additional contexts and
-must restore the active vault's key, body, and path on every exit.
+Vordr is structured as a single-binary native Win64 application with zero external
+runtime dependencies (`System32` imports only, no CRT, no network client, no auto-updater).
+Keeping the entire runtime inside 26 auditable assembly modules eliminates third-party
+library supply-chain risk, garbage-collected plaintext copies, and unexpected outbound
+connections.
+
+One active vault context exists in memory at a time: `gui.asm` drives user interaction
+and desktop/clipboard boundaries, while `vault.asm` owns container authentication,
+encryption, and record serialization. Temporary import and export operations park the
+active vault snapshot (`vault_state_park` / `vault_state_restore`) and restore the live
+key, body, attachment index, and canonical path on every exit path.
 
 ```mermaid
 flowchart LR
@@ -96,20 +103,25 @@ conflict. Nearby rotating backups are not an independent backup.
 | TOTP | HMAC-SHA-1, base32 keys, HOTP/TOTP |
 | ZIP interoperability | WinZip AE-2: PBKDF2-HMAC-SHA1, AES-256-CTR, truncated HMAC-SHA1 |
 | Randomness | `BCryptGenRandom`, supplemented by RDSEED across 8-byte lanes and `1..7`-byte tails when available |
-| TPM convenience | RSA-OAEP with SHA-256 (bound to `SHA-256("Vordr-TPM-v2" \|\| vault_salt \|\| LE32(reqhello))`) through Microsoft Platform Crypto Provider; RSA-2048 minimum enforced |
+| TPM convenience | RSA-2048 OAEP (SHA-256) wrapping a 64-byte context-bound payload `key32 \|\| SHA-256(key32 \|\| label32)` where `label32 = SHA-256("Vordr-TPM-v2" \|\| vault_salt \|\| LE32(reqhello))` via Microsoft Platform Crypto Provider |
 
-These are in-repository implementations of published primitives. That does not
-make their composition or implementation automatically secure. In particular,
-the file MAC uses an explicit prefix construction, not BLAKE2's native keyed mode;
-see [the exact format](formats.md#file-authentication-trailer).
+These are in-repository implementations of published primitives, verified at startup by
+23 known-answer suites and cross-checked against Python stdlib and published NIST/RFC
+vectors (`tests/verify_crypto.py`, `tests/verify_vault.py`). The file MAC uses an
+explicit domain-prefixed `BLAKE2b-256` construction rather than BLAKE2's parameter-block
+keyed mode; see [the exact format](formats.md#file-authentication-trailer).
 
-TPM key creation requests RSA-2048, and existing persistent keys are verified via
-`NCryptGetProperty("Length")` so keys shorter than 2048 bits are rejected and
-recreated. RSA-OAEP wrapping and unwrapping pass a 32-byte domain-separated
-digest over the vault header's salt and the active `TpmRequireHello` bit as the
-OAEP label (`pbLabel`), binding a sealed blob to that vault and policy state.
-Provider UI policy (`NCRYPT_UI_POLICY_PROPERTY`) remains best-effort and should
-not be treated as a guaranteed enforcement control.
+TPM key creation requests RSA-2048 (`NCRYPT_OVERWRITE_KEY_FLAG`), and existing persistent
+keys are checked via `NCryptGetProperty("Length")` so keys shorter than 2048 bits are
+rejected. Because Windows `PCPKSP.dll` silently ignores `BCRYPT_OAEP_PADDING_INFO.pbLabel`
+on hardware TPM keys, Vordr enforces cryptographic vault-and-policy binding inside the
+sealed plaintext itself: `tpm_seal` encrypts `key32 || SHA-256(key32 || label32)` (64
+bytes) and `tpm_unseal` verifies the 32-byte binding digest in constant time (`ct_memcmp`)
+before releasing `key32`, preventing cross-vault or downgraded-policy blob transplants
+(`tpmkat`). Legacy 32-byte blobs are accepted only when `TpmRequireHello == 0`. When
+`TpmRequireHello` is active, Vordr propagates the owner `HWND` and omits
+`NCRYPT_SILENT_FLAG` so Windows Hello UI can prompt cleanly; provider UI enforcement
+itself depends on the local platform provider.
 
 Random generation fails closed if the OS RNG fails or the output pointer is NULL.
 RDSEED is optional, can run out of retries, and mixes into both eight-byte lanes

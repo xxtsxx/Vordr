@@ -2,9 +2,11 @@
 
 [Documentation](README.md) · [Visual guide](assurance.html) · [Secret memory](SECRETS.md)
 
-This guide maps claims to tests and explains their limits. It is not a
-certification, a live CI dashboard, or a claim that every possible input is safe.
-No independent external security review is recorded in the repository.
+This reference maps Vordr's security and reliability claims directly to automated
+verifiers, static analyzers, and runtime probes—and states the exact boundary of what
+each check proves. Every tool below runs offline with the Windows x64 toolchain and the
+Python 3 standard library. No independent external third-party audit is recorded in this
+repository.
 
 ## Reproduce the checks
 
@@ -50,8 +52,8 @@ flowchart LR
 | Stage | Evidence produced | Important limit |
 |---|---|---|
 | Fault injection | Deliberate canary, shadow-stack (top and ancestor-skip), indirect-call, arithmetic, bounds, type, production heap-tag (`mem_alloc`/`mem_free`), crash-reentrancy, DLL System32 load-config, and IAT violations each end or pass with that control's expected result (`tests/redteam.py`); an ordinary access violation is contained (0xC0000409, no crash dialog) with a breadcrumb naming the fault | Checks termination behavior, not all paths; the IAT case shows the slot is read-only at the write, not that `iat_lockdown` alone made it so |
-| Strict build | Ten Python source/doc checkers plus assembly/resource/link success and PE `LOAD_CONFIG` `DependentLoadFlags == 0x0800` verification (`pe_normalise.py`); `build.cmd release strict` fails closed if Python is absent | Pattern-based checkers have blind spots |
-| Self-tests | Known-answer checks pass; normal release rejects diagnostic file-writing verbs in the following stage | Fixed vectors exercise selected cases |
+| Strict build | Ten Python assembly/ABI/resource/doc analyzers (each guarded against silent coverage loss by `tools/floors.py`) plus assembly/link success and PE `LOAD_CONFIG` `DependentLoadFlags == 0x0800` verification (`pe_normalise.py`); `build.cmd strict` fails closed if Python is absent | Pattern-based static analyzers inspect source idioms rather than proving full program semantics |
+| Self-tests | 23 startup known-answer suites pass (also run fail-closed on every normal launch); release binary refuses diagnostic file-writing verbs in the next stage | Fixed vectors verify selected inputs and boundary cases |
 | Round-trip | Serialization, imports/exports, attachments, policy, TPM label binding, SecureUnlock fail-closed policy, locking, parsers, preview cleanup, and persistence probes; an independent reader of the vault format; frozen v0.2.3 vaults; a real, isolated GUI instance driven from outside | Synthetic and bounded input space; geometry and GUI tests skip without a desktop |
 | Crypto differential | Output compared with independent Python calculations and published vectors | Functional output checks, not a side-channel proof |
 | Installer | MSI tables, policy `LaunchCondition` guards, downgrade prevention (`NEWERVERSIONDETECTED`), and component costing checked | Does not install, upgrade, or uninstall the program |

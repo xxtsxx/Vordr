@@ -22,9 +22,12 @@ msiexec /i vordr-0.2.3.msi /qn VORDR_SECUREUNLOCK=1 VORDR_PWMINLEN=16
 msiexec /x vordr-0.2.3.msi /qn
 ```
 
-The package replaces related versions from 0.0.0 through its own version,
-inclusive. A rebuilt package of the same version should replace, not install
-alongside, the previous package. The UpgradeCode must stay stable.
+The package replaces related versions from `0.0.0` through its own version, inclusive,
+so a rebuilt package of the same version replaces rather than installs alongside the
+previous package. Downgrades are blocked at install time (`NEWERVERSIONDETECTED`
+`Upgrade` row and `LaunchCondition`), and installer-owned directories/files carry
+explicit `LockPermissions` SDDL rules (`verify_msi.ps1`). Keep `UpgradeCode` stable
+across releases.
 
 **Repeat policy properties on upgrades.** MSI properties are not remembered as
 deployment configuration. Removing the previous package can remove its policy
@@ -60,24 +63,27 @@ For user instructions, see [Updates](USER_GUIDE.md#updates).
 
 ## How policy is resolved
 
-For supported configuration values, Vordr checks the 64-bit registry view in
-this order:
+For supported configuration values, Vordr checks the native 64-bit registry view in
+fail-closed order:
 
 ```mermaid
 flowchart LR
-    A["Valid HKLM value?"] -->|Yes| B["Use administrator policy"]
-    A -->|No| C["Valid HKCU value?"]
+    A["HKLM value present?"] -->|Yes, valid| B["Enforce HKLM policy (locked)"]
+    A -->|Yes, wrong type/invalid| F["Enforce safe default / refuse path (locked; no HKCU fallback)"]
+    A -->|Absent| C["Valid HKCU value?"]
     C -->|Yes| D["Use user preference"]
     C -->|No| E["Use compiled default"]
 ```
 
-Policy is under `HKLM\SOFTWARE\Vordr`, not `SOFTWARE\Policies`.
-Preferences are under `HKCU\SOFTWARE\Vordr`.
+Policy resides under `HKLM\SOFTWARE\Vordr` (not `SOFTWARE\Policies`); user preferences
+reside under `HKCU\SOFTWARE\Vordr`.
 
-A valid HKLM value's **presence** enforces the supported setting and disables
-its matching Settings control. Writing the default is therefore different from
-leaving the value absent. The save path skips locked settings. To restore user
-choice, remove the policy value instead of writing its default.
+Any `HKLM\SOFTWARE\Vordr` value **locks** its corresponding setting (`*locked = 1`),
+disables its Settings UI control, and prevents fallback to `HKCU`. If an `HKLM` value has
+an unexpected registry type (for example `REG_SZ` where `REG_DWORD` is required), Vordr
+keeps the setting locked and applies the safe compiled default rather than consulting
+user-writable `HKCU` (`polkat`). To return choice to the user, delete the `HKLM` value
+rather than setting it to the default number.
 
 The vault path and hotkey have special handling described below; do not assume
 every registry value has an MSI property or a visible policy-lock indicator.
@@ -127,10 +133,14 @@ values when reading them:
 | `ui_anim` | **0** — follow Windows | 0 is valid: follow Windows |
 | the 0/1 values | any non-zero reads as 1 | — |
 
-The `TpmRequireHello` implementation sets a provider UI policy on a best-effort
-basis. Do not describe it as a guaranteed independent second factor.
-Likewise, `SecureUnlock=1` enables the private-desktop path but does not remove
-its normal-prompt fallback if desktop creation fails.
+`TpmRequireHello` sets provider UI policy (`NCRYPT_UI_POLICY_PROPERTY`), propagates the
+owner window handle for Windows Hello prompts, and binds the `TpmRequireHello` bit into
+the 64-byte TPM-sealed payload digest (`tpmkat`); treat it as local hardware-assisted
+convenience hardening rather than an independent second factor. When `SecureUnlock=1` is
+enforced via `HKLM`, Vordr **fails closed** if private-desktop creation fails and refuses
+normal-desktop fallback (`secdeskkat`); when `SecureUnlock=1` comes from `HKCU` or the
+default, Vordr warns and requires explicit user confirmation before opening a prompt on
+the normal desktop.
 
 ### Example policy
 
@@ -158,9 +168,10 @@ reg add "HKLM\SOFTWARE\Vordr" /v ClipSeconds /t REG_DWORD /d 10 /f /reg:64
 reg query "HKLM\SOFTWARE\Vordr" /reg:64
 ```
 
-Use `REG_DWORD` and the native 64-bit view. A 32-bit management process can
-otherwise write to `WOW6432Node`, which Vordr does not read. A wrong value type
-is rejected and resolution falls through to HKCU/default; it is not enforcement.
+Use `REG_DWORD` and the native 64-bit view (`/reg:64`). A 32-bit management process
+without `/reg:64` writes to `WOW6432Node`, which Vordr ignores. Writing a wrong registry
+type under `HKLM\SOFTWARE\Vordr` locks the setting to its safe compiled default and never
+falls back to `HKCU`.
 
 To remove one policy and return control to the user:
 
@@ -173,16 +184,20 @@ reg delete "HKLM\SOFTWARE\Vordr" /v NoPreview /f /reg:64
 The `vault` value follows HKLM-over-HKCU precedence. It is intentionally not an
 MSI property: one literal path rarely suits every user.
 
-Use `REG_SZ` for a literal path, including UNC paths. Use `REG_EXPAND_SZ` when
-each user's environment should be expanded at runtime. This elevated
-**PowerShell** example uses single quotes to preserve the literal percent signs:
+Use `REG_SZ` for a literal local path, or `REG_EXPAND_SZ` with one of the three trusted
+per-user folder prefixes resolved directly via `SHGetFolderPathW`:
+`%USERPROFILE%\`, `%LOCALAPPDATA%\`, or `%APPDATA%\`. Vordr intentionally never runs
+`ExpandEnvironmentStringsW` on `HKLM` policy values, preventing unprivileged
+`HKCU\Environment` edits from redirecting an administrator-pinned vault path (`polkat`).
+Any unrecognized `%...%` variable or overlong path under `HKLM` fails closed (`*locked = 1`)
+without falling back to `HKCU`. This elevated **PowerShell** example uses single quotes
+to preserve the literal percent signs:
 
 ```powershell
 reg.exe add 'HKLM\SOFTWARE\Vordr' /v vault /t REG_EXPAND_SZ /d '%USERPROFILE%\Documents\Vordr\vault.vordr' /f /reg:64
 ```
 
-An expansion that exceeds Vordr's buffer is rejected rather than truncated.
-Check the actual path in the unlock dialog after deployment.
+Verify the resolved path in the unlock dialog after deployment.
 
 ## Registry inventory
 

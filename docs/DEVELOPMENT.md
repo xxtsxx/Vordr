@@ -37,8 +37,9 @@ intermediates under `obj\`. `release` selects deterministic linker flags;
 it is not a prohibition on adding diagnostic flags. Never combine shipping
 builds with `dbg`, `probeio`, or `guishow`.
 
-Python is required for meaningful strict verification: the current build skips
-its Python checkers if Python is missing, even with `strict`.
+Python 3 on `PATH` is mandatory for `strict` builds: `build.cmd strict` fails closed
+immediately if Python is absent rather than silently skipping its ten static source, ABI,
+resource, and documentation analyzers.
 
 ## Run diagnostics
 
@@ -112,9 +113,10 @@ tests\run_all.cmd
 
 The six stages are fault injection, strict build, self-tests, round-trip probes,
 crypto differential checks, and MSI build/verification. `--quick` skips fault
-injection. A successful summary can still include skips: Python-dependent
-checks, installer checks, and desktop-dependent geometry checks have documented
-skip paths. Check the actual log, not just the final banner.
+injection. Because stage 2 runs `build.cmd strict`, Python 3 is required; `makecab`-less
+machines can skip stage 6, and headless build servers without an interactive desktop
+skip `layoutkat` (`0xE0F2`) and cursor-movement checks in `guitest.ps1`. Always inspect
+the stage output alongside the summary table.
 
 Logs are under `%TEMP%\vordr_runall`. The script rebuilds a normal executable
 after the probe stage; release preparation must separately build the exact

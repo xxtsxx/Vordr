@@ -107,11 +107,13 @@ new allocation must not be treated as safe through an old alias.
 
 ## Clipboard and previews
 
-Clipboard exclusion formats request that cooperating Windows features avoid
-history/cloud handling. They are not access control for the current clipboard.
-The clear timer checks sequence ownership before clearing and falls back to a
-windowless `SetTimer(NULL, ...)` callback when the main window is closed to the
-system tray.
+Clipboard exclusion formats (`ExcludeClipboardContentFromMonitorProcessing`,
+`CanIncludeInClipboardHistory`, `CanUploadToCloudClipboard`) instruct cooperating
+Windows components not to index or sync copied secrets; they do not block other local
+processes from reading the active clipboard. The auto-clear timer verifies
+`GetClipboardSequenceNumber` ownership before clearing so a later user copy is untouched,
+and binds `CLIP_TIMER` to the persistent hidden tray window (`g_trayhwnd`) whenever a
+standalone dialog closes or the vault window minimizes/closes to the tray (`guitest.ps1`).
 
 Preview files are created exclusively inside separate random temporary
 directories protected by an explicit owner-only DACL (`S:(ML;;NW;;;ME)` and the

@@ -2,41 +2,33 @@
 
 [Project overview](../README.md)
 
-Start with the guide for your task. User instructions describe the current
-source tree; an older release may behave differently. Release hashes are
-historical records and must be matched to the exact tag.
+Technical and operational references for the current source tree. Published release
+hashes in [RELEASES.md](RELEASES.md) are immutable historical records matched to their
+exact git tags.
 
-## Use and deployment
+## Trust, architecture, and assurance
 
-- [User guide](USER_GUIDE.md): create a vault, manage secrets, back up, and move data.
-- [Deployment and policy](DEPLOYMENT.md): MSI installation, registry settings,
-  policy precedence, upgrades, and uninstall behavior.
-- [Antivirus warnings](ANTIVIRUS.md): verify a download and report a suspected false positive.
-- [Release hashes](RELEASES.md): identify and reproduce a published executable.
+- [Architecture](ARCHITECTURE.md): module design, why each trust boundary is structured this way, unlock/save state machines, cryptography, and runtime hardening.
+- [Assurance and verification](ASSURANCE.md): the six-stage automated gate, independent vault and crypto verifiers, 10 static analyzers, fuzz/regression probes, and explicit test limits.
+- [Visual verification map](assurance.html): self-contained offline HTML overview of how the six verification stages and trust boundaries fit together.
+- [Secret memory](SECRETS.md): `VirtualLock` static/dynamic buffer inventory, zeroing lifecycles, clipboard/preview containment, and constant-time comparison paths.
+- [Vault file format](formats.md): complete version-2 wire specification—header AAD, Argon2id/AES-256-GCM parameters, record encoding, per-attachment AEAD, and BLAKE2b-256 trailer.
+- [Security policy](../SECURITY.md): threat model, in-scope vs OS/hardware boundaries, private vulnerability reporting, and 90-day disclosure policy.
 
-## Development and review
+## Operation and enterprise deployment
 
-- [Development](DEVELOPMENT.md): toolchain, build variants, tests, and contribution workflow.
-- [Architecture](ARCHITECTURE.md): modules, trust boundaries, unlock, and save flows.
-- [File format](formats.md): header offsets, fields, attachments, and authentication.
-- [Assurance](ASSURANCE.md): what the automated checks cover and what they do not.
-- [Visual assurance guide](assurance.html): an offline browser companion, not a live test dashboard.
-- [Secret memory](SECRETS.md): buffer inventory, locking, wiping, and exposure limits.
+- [User guide](USER_GUIDE.md): installation, vault creation, entries, TOTP, safe attachment previews, backups, and native/ZIP import-export.
+- [Deployment and policy](DEPLOYMENT.md): per-machine MSI properties, fail-closed `HKLM\SOFTWARE\Vordr` policy precedence, folder-template path pinning, upgrades, and downgrade protection.
+- [Antivirus warnings](ANTIVIRUS.md): cryptographic hash verification, SmartScreen vs malware verdicts, and vendor false-positive submission.
+- [Release hashes](RELEASES.md): published SHA-256 records, WinGet provenance, and byte-for-byte reproducible rebuild instructions.
 
-## Design decisions
+## Engineering and release maintenance
 
-These describe implemented designs, not a backlog of proposed features.
+- [Development](DEVELOPMENT.md): x64 toolchain, build modes, isolated test harnesses (`HKCU` remapping), and change discipline.
+- [Settings screen design](SETTINGS_DESIGN.md): `DLG_SETTINGS` window ownership and table-driven policy/preference persistence.
+- [System items](SYSITEM_DESIGN.md): encrypted in-body vault metadata and physical-vs-visible index invariants.
+- [Release checklist](RELEASE_CHECKLIST.md): gate execution, `verify_repro.ps1`, MSI costing/VM checks, WinGet manifests, and vendor submissions.
 
-- [Settings screen](SETTINGS_DESIGN.md): child-dialog ownership and table-driven settings.
-- [System items](SYSITEM_DESIGN.md): encrypted per-vault metadata and index discipline.
-
-## Maintenance
-
-- [Release checklist](RELEASE_CHECKLIST.md): verification, packaging, publication,
-  WinGet submission, and security notifications.
-- [Security policy](../SECURITY.md): private reporting, scope, support, and disclosure.
-
-When updating a feature, update its guide and reference in the same change.
-Keep defaults in the deployment table, format details in the format reference,
-and test results in dated logs rather than undated “PASS” badges. Preserve the
-existing document paths where possible so external links keep working.
+Keep configuration defaults canonical in [DEPLOYMENT.md](DEPLOYMENT.md#properties) and
+wire-level constants canonical in [formats.md](formats.md); update code, tests, and
+documentation together in the same change.
