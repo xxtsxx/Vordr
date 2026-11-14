@@ -228,30 +228,61 @@ else {
 }
 if ($fail -eq $before) { Write-Host ("payload         : {0} file(s), KeyPaths resolve, versions match {1}, cab embedded - ok" -f $files.Count, $pvNow) }
 
-# --- 3. the upgrade row -----------------------------------------------------
+# --- 3. the upgrade rows + downgrade block ----------------------------------
 # Attributes is a bitfield whose Inclusive bits are 0x100/0x200, not 0x1/0x2.
-# With VersionMax exclusive every OLDER version is still replaced, so the mistake
-# hides until someone installs a rebuild of the SAME version - and then quietly
-# registers a second product with the same files.
+# Two Upgrade rows are required:
+#   1. OLDERVERSIONBEINGUPGRADED: 0.0.0 .. $pv inclusive (0x300) for replacement.
+#   2. NEWERVERSIONDETECTED: > $pv exclusive (0x002 = OnlyDetect, NO 0x100) + a
+#      LaunchCondition `NOT NEWERVERSIONDETECTED` sequenced AFTER FindRelatedProducts
+#      so an older MSI cannot downgrade a newer installed version.
 Write-Host ""
 $upg   = Rows "SELECT ``VersionMin``,``VersionMax``,``Attributes``,``ActionProperty`` FROM ``Upgrade``" 4
+$lcRows= Rows "SELECT ``Condition``,``Description`` FROM ``LaunchCondition``" 2
 $pvRow = Rows "SELECT ``Value`` FROM ``Property`` WHERE ``Property``='ProductVersion'" 1
 $pv    = $pvRow[0][0]
-# Assign first, THEN pipe.  Rows returns ,$out to stop the array unrolling; that
-# wrapper is removed by assignment but NOT by piping, so "Rows ... | ForEach"
-# hands the loop the whole table as one object and quietly yields a single row.
-$seqRows = Rows "SELECT ``Action`` FROM ``InstallExecuteSequence``" 1
+$seqRows = Rows "SELECT ``Action``,``Sequence`` FROM ``InstallExecuteSequence``" 2
 $names   = @($seqRows | ForEach-Object { $_[0] })
-if (-not $upg.Count) { Bad "no Upgrade row - every install would sit beside the last one" }
-foreach ($u in $upg) {
-    $attr = [int]$u[2]
+$seqMap  = @{}; foreach ($sr in $seqRows) { $seqMap[$sr[0]] = [int]$sr[1] }
+
+$upgOld   = @($upg | Where-Object { $_[3] -eq "OLDERVERSIONBEINGUPGRADED" })
+$upgNew   = @($upg | Where-Object { $_[3] -eq "NEWERVERSIONDETECTED" })
+$upgOther = @($upg | Where-Object { $_[3] -ne "OLDERVERSIONBEINGUPGRADED" -and $_[3] -ne "NEWERVERSIONDETECTED" })
+foreach ($uo in $upgOther) { Bad "unexpected Upgrade row targeting $($uo[3])" }
+
+if ($upgOld.Count -ne 1) { Bad "expected 1 OLDERVERSIONBEINGUPGRADED Upgrade row, found $($upgOld.Count)" }
+else {
+    $u = $upgOld[0]; $attr = [int]$u[2]
     Write-Host ("upgrade         : {0} .. {1}  attr=0x{2:X}  -> {3}" -f $u[0], $u[1], $attr, $u[3])
     if (-not ($attr -band 512)) { Bad "VersionMaxInclusive (0x200) is not set - a rebuild of $pv would install ALONGSIDE the existing one" }
     if ($u[1] -ne $pv)          { Bad "VersionMax is $($u[1]) but ProductVersion is $pv - the range does not reach this build" }
-    if ($attr -band 2)          { Bad "OnlyDetect (0x2) is set - related products are found and then left installed" }
+    if ($attr -band 2)          { Bad "OnlyDetect (0x2) is set on OLDERVERSIONBEINGUPGRADED - related products are found and then left installed" }
     if (($attr -band 1) -and ($names -notcontains "MigrateFeatureStates")) {
         Bad "MigrateFeatures (0x1) is set but MigrateFeatureStates is not sequenced"
     }
+}
+
+if ($upgNew.Count -ne 1) { Bad "expected 1 NEWERVERSIONDETECTED Upgrade row (downgrade block), found $($upgNew.Count)" }
+else {
+    $u = $upgNew[0]; $attr = [int]$u[2]
+    Write-Host ("downgrade guard : > {0}       attr=0x{1:X}  -> {2}" -f $u[0], $attr, $u[3])
+    if ($u[0] -ne $pv)          { Bad "NEWERVERSIONDETECTED VersionMin is $($u[0]), expected $pv" }
+    if (-not [string]::IsNullOrEmpty($u[1])) { Bad "NEWERVERSIONDETECTED VersionMax is '$($u[1])', expected unbounded" }
+    if (-not ($attr -band 2))   { Bad "NEWERVERSIONDETECTED lacks OnlyDetect (0x2) - a downgrade attempt would remove the newer version!" }
+    if ($attr -band 256)        { Bad "NEWERVERSIONDETECTED sets VersionMinInclusive (0x100) - same-version rebuilds of $pv would block themselves as a downgrade" }
+}
+if ($secure -notcontains "NEWERVERSIONDETECTED") {
+    Bad "NEWERVERSIONDETECTED is missing from SecureCustomProperties"
+}
+$lcConds = @($lcRows | ForEach-Object { $_[0] })
+if ($lcConds -notcontains "NOT NEWERVERSIONDETECTED") {
+    Bad "LaunchCondition lacks 'NOT NEWERVERSIONDETECTED' - NEWERVERSIONDETECTED is detected and then ignored"
+}
+if (($seqMap.ContainsKey("FindRelatedProducts")) -and ($seqMap.ContainsKey("LaunchConditions"))) {
+    if ($seqMap["FindRelatedProducts"] -ge $seqMap["LaunchConditions"]) {
+        Bad "InstallExecuteSequence runs LaunchConditions ($($seqMap['LaunchConditions'])) before FindRelatedProducts ($($seqMap['FindRelatedProducts'])) - NEWERVERSIONDETECTED is not set yet when checked"
+    }
+} else {
+    Bad "InstallExecuteSequence must contain both FindRelatedProducts and LaunchConditions"
 }
 if ($names -notcontains "RemoveExistingProducts") { Bad "RemoveExistingProducts is not sequenced - detection would happen and nothing would be removed" }
 
@@ -262,11 +293,17 @@ if ($names -notcontains "RemoveExistingProducts") { Bad "RemoveExistingProducts 
 # install succeeds, the property is empty, and whatever depended on it silently
 # does nothing.  That is exactly how RemoveExistingProducts came to run against
 # an empty OLDERVERSIONBEINGUPGRADED and report success.
-$uiRows   = Rows "SELECT ``Action`` FROM ``InstallUISequence``" 1
+$uiRows   = Rows "SELECT ``Action``,``Sequence`` FROM ``InstallUISequence``" 2
 $uiNames  = @($uiRows | ForEach-Object { $_[0] })
+$uiMap    = @{}; foreach ($ur in $uiRows) { $uiMap[$ur[0]] = [int]$ur[1] }
 foreach ($a in @("FindRelatedProducts","AppSearch","LaunchConditions","CCPSearch","RMCCPSearch")) {
     if (($names -contains $a) -and ($uiNames -notcontains $a)) {
         Bad "$a is in InstallExecuteSequence but not InstallUISequence - the server skips it as 'already done on client side', so it never runs on a UI install"
+    }
+}
+if (($uiMap.ContainsKey("FindRelatedProducts")) -and ($uiMap.ContainsKey("LaunchConditions"))) {
+    if ($uiMap["FindRelatedProducts"] -ge $uiMap["LaunchConditions"]) {
+        Bad "InstallUISequence runs LaunchConditions ($($uiMap['LaunchConditions'])) before FindRelatedProducts ($($uiMap['FindRelatedProducts']))"
     }
 }
 

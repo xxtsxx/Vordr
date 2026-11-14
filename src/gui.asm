@@ -115,6 +115,7 @@ extern vault_field_get:proc
 extern vault_build_entry:proc
 extern attach_stage:proc
 extern attach_open:proc
+extern attach_free:proc
 extern mem_alloc:proc
 extern mem_free:proc
 extern read_file:proc
@@ -197,6 +198,7 @@ extern CloseDesktop:proc
 extern CreateThread:proc
 extern GetCurrentThreadId:proc
 extern WaitForSingleObject:proc
+extern MsgWaitForMultipleObjects:proc
 extern CloseHandle:proc
 extern ReadFile:proc                    ; magic check on an associated .vordr
 extern EndDialog:proc
@@ -210,6 +212,7 @@ extern EmptyClipboard:proc
 extern SetClipboardData:proc
 extern CloseClipboard:proc
 extern GlobalAlloc:proc
+extern GlobalFree:proc
 extern RegisterClipboardFormatW:proc
 extern GlobalLock:proc
 extern GlobalUnlock:proc
@@ -238,6 +241,14 @@ extern CreateFileW:proc                   ; secure temp-file wipe
 extern WriteFile:proc
 extern FlushFileBuffers:proc
 extern CreateDirectoryW:proc
+extern GetCurrentProcess:proc
+extern OpenProcessToken:proc
+extern GetTokenInformation:proc
+extern InitializeSecurityDescriptor:proc
+extern SetSecurityDescriptorDacl:proc
+extern InitializeAcl:proc
+extern AddAccessAllowedAce:proc
+extern GetLengthSid:proc
 extern ShowWindow:proc
 extern IsWindowVisible:proc             ; layout probe: hidden controls are exempt
 extern PeekMessageW:proc                ; layout probe: drain the queue after a resize
@@ -358,6 +369,7 @@ extern CreatePopupMenu:proc
 extern AppendMenuW:proc
 extern TrackPopupMenu:proc
 extern DestroyMenu:proc
+extern EndMenu:proc
 extern SetMenuInfo:proc
 extern GetCursorPos:proc
 extern SetForegroundWindow:proc
@@ -382,7 +394,15 @@ IDOK                equ 1
 IDCANCEL            equ 2
 
 WM_CLOSE            equ 10h
+WM_CANCELMODE_      equ 1Fh
 WM_TIMER            equ 113h
+EM_EMPTYUNDOBUFFER_ equ 0CDh
+QS_ALLINPUT_        equ 04FFh
+GW_ENABLEDPOPUP_    equ 6
+TOKEN_QUERY_        equ 8
+ACL_REVISION_       equ 2
+GENERIC_ALL_        equ 10000000h
+FILE_ATTRIBUTE_REPARSE_POINT_ equ 400h
 WM_INITDIALOG       equ 110h
 WM_SETFONT          equ 30h
 WM_MOUSEWHEEL       equ 20Ah
@@ -1006,7 +1026,8 @@ WSTR s_notitle,     <An entry needs a title.>
 WSTR s_attfail,     <Some files were not attached. An entry holds at most 24 files of up to 256 MB each, and a file that is locked or cannot be read is skipped.>
 WSTR s_urllong,     <This address is too long to open from Vordr (over 1023 characters). Copy it and paste it into your browser instead.>
 WSTR s_readlong,    <Read aloud handles passwords of up to 255 characters, and this one is longer.>
-WSTR s_sdfall,      <The private desktop for entering your password could not be created, so the password will be typed on the normal desktop this time.>
+WSTR s_sdfall,      <The private desktop for entering your password could not be created. Choose OK to type the password on the normal desktop this time, or Cancel to abort.>
+WSTR s_sdlocked,    <Secure password entry is required by policy, and a private desktop could not be created.>
 WSTR imp_g_unsup,   <This is an encrypted ZIP, but not one Vordr can read: Vordr imports only archives encrypted with AES-256 and stored without compression, as Vordr itself exports them.>
 WSTR s_trunc,       <This entry holds more than Vordr can show (too many fields, a value that is too long, or an attachment that could not be listed). It is read-only, because saving it from this screen would drop the part that is not shown.>
 WSTR s_buildfull,   <This entry does not fit in the vault - it is full, or a field is too long. Nothing was saved.>
@@ -1038,7 +1059,7 @@ WSTR sel_ok_imp,    <Import>
 WSTR t_tpminfo,     <TPM Unlock>
 WSTR m_tpminfo,     <The TPM chip in this computer can unlock the vault automatically on this device. You will not need to type the master password at startup. The password still works everywhere and is never stored.>
 WSTR t_msecinfo,    <Secure Unlock>
-WSTR m_msecinfo,    <The master password is typed on a private, isolated Windows desktop, like the one used for UAC prompts. Keyloggers and screen-scrapers in your normal session cannot see it. If a private desktop is unavailable, a normal prompt is used.>
+WSTR m_msecinfo,    <Password entry uses a private desktop to block opportunistic normal-desktop keystroke hooks. Same-user processes are not isolated (unlike UAC). If unavailable, Vordr asks before falling back (unless locked by policy).>
 WSTR cue_pw,        <Master password>
 WSTR cue_pw2,       <Confirm password>
 WSTR t_req,         <Password requirements>
@@ -1082,6 +1103,7 @@ WSTR wv_nohist,     <NoHistory>
 WSTR wv_nophon,     <NoPhonetic>
 WSTR wv_secunlock,  <SecureUnlock>
 WSTR wv_tpm,        <TpmUnlock>
+WSTR wv_allowunc,   <AllowUncVault>
 ; --- system tray strings ------------------------------------------------------
 WSTR t_about,       <About Vordr>
 m_welcome label word
@@ -1160,7 +1182,7 @@ WSTR cf_cloud_name, <CanUploadToCloudClipboard>
 WSTR cf_excl_name,  <ExcludeClipboardContentFromMonitorProcessing>
 ifdef DBG_TRACE
 WSTR sd_spike_ttl, <Secure desktop>
-WSTR sd_spike_txt, <This dialog is running on a private, isolated Vordr desktop. Same-session keyloggers and screen-scrapers cannot see it. Click OK to return to your normal desktop.>
+WSTR sd_spike_txt, <This dialog is running on a private Vordr desktop outside the normal interactive desktop. Click OK to return to your normal desktop.>
 endif
 WSTR xp_mm_title,    <Export all secrets>
 WSTR imp_xls_wrongpw,<Could not open the workbook - the password was incorrect.>
@@ -1453,34 +1475,27 @@ g_glyphpal_col label dword
     dd 0003030D0h, 0002EA02Eh, 000208CE6h, 000909090h  ; red green amber grey
 name_default_att label word
     dw 'v','o','r','d','r','_','a','t','t','a','c','h','.','b','i','n', 0
-; Executable / script extensions Vordr will never auto-open.  Opening one of these
-; attachments prompts a Save As instead, so the USER (not Vordr) decides to run it.
-; Lowercase, NUL-separated, double-NUL terminated (see gui_ext_is_exec).
-exec_exts label word
-    dw 'e','x','e',0,  'c','o','m',0,  's','c','r',0,  'p','i','f',0
-    dw 'b','a','t',0,  'c','m','d',0,  'h','t','a',0,  'c','p','l',0
-    dw 'm','s','i',0,  'm','s','p',0,  'm','s','c',0,  'j','a','r',0
-    dw 'j','s',0,      'j','s','e',0,  'v','b','s',0,  'v','b','e',0
-    dw 'w','s','f',0,  'w','s','h',0,  'w','s','c',0,  'p','s','1',0
-    dw 'p','s','m','1',0,  'p','s','c','1',0,  'r','e','g',0,  'l','n','k',0
-    dw 'u','r','l',0,  'i','n','f',0,  's','c','f',0,  's','c','t',0
-    dw 's','h','b',0,  's','h','s',0,  'c','h','m',0,  'h','l','p',0
-    dw 'a','d','e',0,  'a','d','p',0,  'm','d','e',0,  'm','d','b',0
-    dw 'd','l','l',0,  'o','c','x',0,  's','y','s',0,  'd','r','v',0
-    dw 'v','b',0,      'g','a','d','g','e','t',0
-    dw 'a','p','p','l','i','c','a','t','i','o','n',0
-    dw 'm','s','i','x',0,  'a','p','p','x',0
-    dw 'a','p','p','x','b','u','n','d','l','e',0,  'm','s','i','x','b','u','n','d','l','e',0
-    dw 'p','s','1','x','m','l',0,  'm','s','h',0,  'w','s',0
-    dw 'm','s','h','1',0,  'm','s','h','2',0,  'm','s','h','x','m','l',0,  'm','s','h','1','x','m','l',0,  'm','s','h','2','x','m','l',0
-    dw 'p','s','2',0,  'p','s','2','x','m','l',0,  'p','s','c','2',0,  'p','s','d','1',0,  'p','s','m','1',0
-    dw 'a','p','p','r','e','f','-','m','s',0,  'l','i','b','r','a','r','y','-','m','s',0,  's','e','a','r','c','h','-','m','s',0
-    dw 's','e','a','r','c','h','c','o','n','n','e','c','t','o','r','-','m','s',0,  's','e','t','t','i','n','g','c','o','n','t','e','n','t','-','m','s',0
-    dw 'w','e','b','s','i','t','e',0,  'x','b','a','p',0,  'x','l','l',0,  'w','s','b',0,  'd','i','a','g','c','a','b',0,  'm','s','u',0
-    dw 'v','s','t','o',0,  'j','n','l','p',0,  'a','p','p','i','n','s','t','a','l','l','e','r',0,  't','h','e','m','e',0,  't','h','e','m','e','p','a','c','k',0
-    dw 'd','e','s','k','t','h','e','m','e','p','a','c','k',0,  'i','s','o',0,  'i','m','g',0,  'v','h','d',0,  'v','h','d','x',0
-    dw 'p','y',0,  'p','y','w',0,  'p','y','z',0,  'p','y','z','w',0,  'p','l',0,  'r','b',0
+; Safe-preview allowlist (VDR-03).  ONLY static document/image formats with no
+; script/macro/shell-execution surface may be decrypted to %TEMP% and opened via
+; ShellExecuteW; every other attachment type routes through gui_tag_saveas.
+; Lowercase, NUL-separated, double-NUL terminated (see gui_ext_can_preview).
+preview_exts label word
+    dw 't','x','t',0
+    dw 'p','n','g',0,  'j','p','g',0,  'j','p','e','g',0
+    dw 'g','i','f',0,  'b','m','p',0,  'w','e','b','p',0
+    dw 'p','d','f',0
     dw 0                                             ; double-NUL terminator
+; DOS reserved device stems (lowercase, NUL-separated, double-NUL terminated)
+dos_devs label word
+    dw 'c','o','n',0,  'p','r','n',0,  'a','u','x',0,  'n','u','l',0
+    dw 'c','l','o','c','k','$',0
+    dw 'c','o','m','1',0,  'c','o','m','2',0,  'c','o','m','3',0
+    dw 'c','o','m','4',0,  'c','o','m','5',0,  'c','o','m','6',0
+    dw 'c','o','m','7',0,  'c','o','m','8',0,  'c','o','m','9',0
+    dw 'l','p','t','1',0,  'l','p','t','2',0,  'l','p','t','3',0
+    dw 'l','p','t','4',0,  'l','p','t','5',0,  'l','p','t','6',0
+    dw 'l','p','t','7',0,  'l','p','t','8',0,  'l','p','t','9',0
+    dw 0
 badge_weak label word
     dw 'W','e','a','k', 0
 badge_fair label word
@@ -1646,6 +1661,8 @@ g_secdesk_proc  dq ?                  ; dialog proc addr for the worker thread
 g_secdesk_hd    dq ?                  ; HDESK of the private desktop
 public g_secdesk_orig
 g_secdesk_orig  dq ?                  ; HDESK of the original input desktop (restore on exit)
+public g_secdesk_hwnd
+g_secdesk_hwnd  dq ?                  ; live password-dialog HWND on the private desktop (0 = none)
 g_secdesk_res   dq ?                  ; DialogBox result marshalled back to the caller
 g_secdesk_orphan dd ?                 ; 1 = the watchdog gave up on a wedged worker
 align 2
@@ -1661,6 +1678,7 @@ g_home_numw  dw 16 dup (?)            ; one stat rendered as digits
 g_katline    dw 96 dup (?)            ; "<n> known-answer tests verified at launch"
 align 8
 g_openfile     dw MAX_PATH_CHARS dup (?)  ; .vordr handed to us by the shell, to IMPORT
+public g_openfile_set
 g_openfile_set dd ?                   ; 1 = an import is pending for the open vault
 g_imp_preset   dd ?                   ; 1 = gui_import must use g_imgpath as-is
 align 8
@@ -1702,7 +1720,9 @@ g_numtmp    db 16 dup (?)             ; scratch for uint-to-decimal
 g_vault_lock dd ?                     ; 1 = vault path set by HKLM (locked)
 g_menu_open  dd ?                     ; 1 = settings overlay is showing
 g_revealed  dd ?
+public g_clip_seq
 g_clip_seq  dd ?                      ; clipboard sequence number at last copy
+g_clip_retries dd ?                   ; retry count when OpenClipboard is contended
 g_clip_secs dd ?                      ; auto-clear timeout in seconds (0 = off); HKLM>HKCU>20
 g_clip_lock dd ?                      ; 1 = clipboard timeout forced by HKLM policy
 public g_pwdays
@@ -1988,6 +2008,19 @@ g_base_winw dd ?                      ; vault window size recorded at init (min-
 g_base_winh dd ?
 g_anchor_rect dd ANCHOR_N*4 dup (?)   ; per-control initial client {x,y,w,h}
 g_extw      dw 40 dup (?)             ; scratch: an attachment's extension, lowercased
+align 2
+public g_exppath
+g_exppath   dw MAX_PATH_CHARS dup (?) ; private export target path (isolated from g_imgpath)
+g_gsf_a     dw (MAX_PATH_CHARS + 16) dup (?) ; gui_same_file longified path A
+g_gsf_b     dw (MAX_PATH_CHARS + 16) dup (?) ; gui_same_file longified path B
+g_motw_io   dw (MAX_PATH_CHARS + 48) dup (?) ; gui_motw longified ADS path
+g_scrub_w   dw 1028 dup (?)           ; gui_edit_scrub 'X' overwrite scratch
+g_san_tmp   dw 260 dup (?)            ; gui_sanitize_attname working scratch
+g_san_stem  dw 40 dup (?)             ; gui_sanitize_attname stem lowercase scratch
+align 8
+g_tmp_tokbuf db 128 dup (?)           ; gui_tile_make_temp TokenUser buffer
+g_tmp_acl    db 256 dup (?)           ; gui_tile_make_temp owner-only ACL buffer
+g_tmp_sd     db 64 dup (?)            ; gui_tile_make_temp SECURITY_DESCRIPTOR buffer
 align 8
 g_ofn       OPENFILENAMEW <>
 
@@ -2058,6 +2091,34 @@ gui_status proc frame
     ret
 gui_status endp
 
+; gui_edit_scrub(rcx = hdlg, edx = ctl_id) - overwrite a Win32 EDIT control's
+;   internal heap buffer with 1024 'X' characters, flush its undo buffer, clear it
+;   back to empty, and zero g_scrub_w (VDR-13).
+gui_edit_scrub proc frame
+    FRAME_PROLOG 64
+    test    rcx, rcx
+    jz      ges2_done
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-32], edx
+    lea     r10, [g_scrub_w]
+    xor     eax, eax
+ges2_fill:
+    mov     word ptr [r10+rax*2], 'X'
+    inc     eax
+    cmp     eax, 1024
+    jb      ges2_fill
+    mov     word ptr [r10+rax*2], 0
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], dword ptr [rbp-32], addr g_scrub_w
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], dword ptr [rbp-32], EM_EMPTYUNDOBUFFER_, 0, 0
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], dword ptr [rbp-32], addr g_empty_w
+    lea     rcx, [g_scrub_w]
+    mov     edx, 1028*2
+    call    secure_zero
+ges2_done:
+    FRAME_EPILOG
+    ret
+gui_edit_scrub endp
+
 ; =============================================================================
 ; gui_unlock(rcx = hdlg) - validate inputs, (create then) unlock the vault.
 ;   On success EndDialog(hdlg, 1).  On failure show a status message.
@@ -2065,6 +2126,8 @@ gui_status endp
 gui_unlock proc frame
     FRAME_PROLOG 48
     mov     qword ptr [rbp-24], rcx
+    cmp     dword ptr [g_secdesk_orphan], 0
+    jne     gu_orphan
     mov     dword ptr [g_use_tpm], 0        ; password path (not the TPM shortcut)
     ; R7.3: g_readonly is maintained live by the read-only pill toggle (up_ronly) and
     ; the --ro launch flag, so there is no checkbox to read back here.
@@ -2093,6 +2156,8 @@ gu_havepw:
     call    gui_status
     jmp     gu_done
 gu_pwok:
+    cmp     dword ptr [g_secdesk_orphan], 0
+    jne     gu_orphan_wipe
     lea     rcx, [g_vpath]
     call    cfg_in_set
 gu_open:
@@ -2124,8 +2189,21 @@ gu_norb:
     call    reg_save_vault
     mov     dword ptr [g_is_default], 0
 gu_success:
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_U_PW
+    call    gui_edit_scrub
     WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_U_PW, 0
+    mov     qword ptr [g_secdesk_hwnd], 0
     WINCALL EndDialog, qword ptr [rbp-24], 1
+    jmp     gu_done
+gu_orphan_wipe:
+    call    gui_wipepw
+gu_orphan:
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, IDC_U_PW
+    call    gui_edit_scrub
+    mov     qword ptr [g_secdesk_hwnd], 0
+    WINCALL EndDialog, qword ptr [rbp-24], 0
     jmp     gu_done
 gu_fail:
     mov     eax, dword ptr [rbp-32]
@@ -2154,11 +2232,70 @@ gui_unlock endp
 ;   The extension decides nothing: a shell association can hand us any path, and a
 ;   ".vordr" that is not a vault must never reach the importer.  Opened read-only
 ;   with full sharing, four bytes read, closed - it is a gate, not a load.
+; gui_path_is_local(rcx = wide path) -> eax = 1 if local path (or AllowUncVault=1),
+;   0 if UNC / device namespace path (\\server\share, //server/share, \\?\UNC\..., \\.\...).
+public gui_path_is_local
+gui_path_is_local proc frame
+    FRAME_PROLOG 48
+    test    rcx, rcx
+    jz      gpil_no
+    movzx   eax, word ptr [rcx]
+    test    eax, eax
+    jz      gpil_no
+    cmp     eax, '\'
+    je      gpil_s1
+    cmp     eax, '/'
+    jne     gpil_yes
+gpil_s1:
+    movzx   eax, word ptr [rcx+2]
+    cmp     eax, '\'
+    je      gpil_s2
+    cmp     eax, '/'
+    jne     gpil_yes
+gpil_s2:
+    ; Starts with two slashes.  Permit \\?\<Drive>:\... (extended-length local drive).
+    cmp     word ptr [rcx+4], '?'
+    jne     gpil_unc
+    movzx   eax, word ptr [rcx+6]
+    cmp     eax, '\'
+    je      gpil_qsep
+    cmp     eax, '/'
+    jne     gpil_unc
+gpil_qsep:
+    movzx   eax, word ptr [rcx+8]
+    or      eax, 20h
+    sub     eax, 'a'
+    cmp     eax, 25
+    ja      gpil_unc
+    cmp     word ptr [rcx+10], ':'
+    jne     gpil_unc
+    movzx   eax, word ptr [rcx+12]
+    cmp     eax, '\'
+    je      gpil_yes
+    cmp     eax, '/'
+    je      gpil_yes
+gpil_unc:
+    WINCALL cfg_get_dword, addr wv_allowunc, 0, 0
+    test    eax, eax
+    jz      gpil_no
+gpil_yes:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gpil_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gui_path_is_local endp
+
 gui_vault_file_ok proc frame
     FRAME_PROLOG 96
     mov     qword ptr [rbp-24], rcx
     mov     dword ptr [rbp-32], 0                ; magic lands here
     mov     qword ptr [rbp-40], 0                ; bytes read
+    call    gui_path_is_local                    ; VDR-07: block UNC / SMB NTLM coercion
+    test    eax, eax
+    jz      gvfo_no
     ; the shell can hand us a path longer than Win32 accepts unprefixed
     mov     rcx, qword ptr [rbp-24]
     lea     rdx, [g_vfok_io]                    ; its own scratch: validating a file
@@ -2292,6 +2429,8 @@ gui_exe_dir proc frame
     WINCALL GetModuleFileNameW, 0, qword ptr [rbp-24], dword ptr [rbp-32]
     test    eax, eax
     jz      gxd_fail
+    cmp     eax, dword ptr [rbp-32]
+    jae     gxd_fail
     mov     r10, qword ptr [rbp-24]
     xor     r8d, r8d
     mov     r9d, -1
@@ -3065,6 +3204,8 @@ unlock_proc proc
     mov     qword ptr [rbp-8], rcx
     cmp     rdx, WM_INITDIALOG
     je      up_init
+    cmp     rdx, WM_DESTROY
+    je      up_destroy
     cmp     rdx, WM_COMMAND
     je      up_cmd
     cmp     rdx, WM_PAINT
@@ -3124,6 +3265,7 @@ up_tunh:
     jmp     up_ret
 up_init:
     mov     rcx, qword ptr [rbp-8]
+    mov     qword ptr [g_secdesk_hwnd], rcx
     mov     edx, IDC_U_UNLOCK
     call    theme_attach
     mov     rcx, qword ptr [rbp-8]
@@ -3211,7 +3353,15 @@ up_unlock:
     call    gui_unlock
     mov     eax, 1
     jmp     up_ret
+up_destroy:
+    mov     qword ptr [g_secdesk_hwnd], 0
+    xor     eax, eax
+    jmp     up_ret
 up_cancel:
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_U_PW
+    call    gui_edit_scrub
+    mov     qword ptr [g_secdesk_hwnd], 0
     sub     rsp, 32
     mov     rcx, qword ptr [rbp-8]
     xor     edx, edx
@@ -6072,8 +6222,12 @@ gsd_attach:
     jb      gsd_attach_bad                      ; < 68: no valid AttachRef -> skip the file
     mov     rcx, qword ptr [rbp-72]             ; valptr -> AttachRef
     lea     rdx, [g_empty_w]                    ; default: no filename (vallen == 68)
+    xor     r8d, r8d                            ; src_max_wchars = 0
     jbe     @F
     lea     rdx, [rcx+68]                       ; filename wide (at value+68)
+    mov     r8d, eax
+    sub     r8d, 68
+    shr     r8d, 1                              ; complete wide chars inside vallen
 @@: call    tf_append
     test    eax, eax                            ; tile full: this file is not listed, and
     jz      gsd_attach_row                      ;   a save would drop it
@@ -6088,56 +6242,9 @@ gsd_attach_row:
     call    gui_row_add
     jmp     gsd_fnext
 gsd_pwhist:
-    ; reserved archive {u64 filetime, label wide\0, value wide\0, u32 action} ->
-    ; g_pwhist (not a row).  Two older shapes still load: no action word (reads as
-    ; PWHA_CHANGED), and no label either - just {u64 filetime, pw wide\0}.
-    mov     eax, dword ptr [rbp-64]             ; vallen
-    cmp     eax, 10
-    jb      gsd_fnext                           ; need the filetime + a NUL
-    mov     r10, qword ptr [rbp-72]             ; valptr
-    mov     r11, r10                            ; value end = valptr + vallen
-    add     r11, rax
-    mov     rcx, qword ptr [r10]                ; filetime qword
-    lea     r8, [r10+8]                         ; scan string1 to its NUL
-    xor     eax, eax
-gsd_ph_scan:
-    cmp     r8, r11                             ; never scan past the value
-    jae     gsd_ph_s1end
-    cmp     word ptr [r8], 0
-    je      gsd_ph_s1end
-    add     r8, 2
-    inc     eax
-    cmp     eax, 255
-    jb      gsd_ph_scan
-gsd_ph_s1end:
-    add     r8, 2                               ; past string1's NUL
-    xor     r9d, r9d                            ; action defaults to PWHA_CHANGED
-    cmp     r8, r11
-    jb      gsd_ph_new                          ; a second string follows -> labelled format
-    lea     rdx, [kl_secret]                    ; oldest format: label = "Password",
-    lea     r8, [r10+8]                         ;                pw = value+8
-    call    pwh_append
-    jmp     gsd_fnext
-gsd_ph_new:
-    lea     rdx, [r10+8]                        ; label = value+8, value = past its NUL
-    mov     rax, r8                             ; scan the value; a u32 action may follow it
-gsd_ph_scan2:
-    cmp     rax, r11
-    jae     gsd_ph_go
-    cmp     word ptr [rax], 0
-    je      gsd_ph_s2end
-    add     rax, 2
-    jmp     gsd_ph_scan2
-gsd_ph_s2end:
-    add     rax, 6                              ; past the NUL + the u32 action
-    cmp     rax, r11
-    ja      gsd_ph_go                           ; no room -> pre-action record, keep CHANGED
-    mov     r9d, dword ptr [rax-4]
-    cmp     r9d, PWHA_ADDED                     ; unknown action -> treat as CHANGED
-    jbe     gsd_ph_go
-    xor     r9d, r9d
-gsd_ph_go:
-    call    pwh_append
+    mov     rcx, qword ptr [rbp-72]             ; valptr
+    mov     edx, dword ptr [rbp-64]             ; vallen
+    call    gsd_parse_pwhist
     jmp     gsd_fnext
 gsd_fnext:
     inc     dword ptr [rbp-40]
@@ -6297,7 +6404,7 @@ gui_totp_refresh endp
 ;   tently registers the formats on first use.  Best-effort - failures are
 ;   silently ignored (the copy + auto-clear still work).
 gui_clip_markers proc frame
-    FRAME_PROLOG 32
+    FRAME_PROLOG 48
     cmp     dword ptr [g_cf_hist], 0            ; register the formats once
     jne     cm_have
     WINCALL RegisterClipboardFormatW, addr cf_hist_name
@@ -6312,21 +6419,33 @@ cm_have:
     WINCALL GlobalAlloc, <GMEM_MOVEABLE or GMEM_ZEROINIT>, 4
     test    rax, rax
     jz      cm_cloud
+    mov     qword ptr [rbp-24], rax
     WINCALL SetClipboardData, dword ptr [g_cf_hist], rax
+    test    rax, rax
+    jnz     cm_cloud
+    WINCALL GlobalFree, qword ptr [rbp-24]
 cm_cloud:
     cmp     dword ptr [g_cf_cloud], 0          ; CanUploadToCloudClipboard = 0
     je      cm_excl
     WINCALL GlobalAlloc, <GMEM_MOVEABLE or GMEM_ZEROINIT>, 4
     test    rax, rax
     jz      cm_excl
+    mov     qword ptr [rbp-24], rax
     WINCALL SetClipboardData, dword ptr [g_cf_cloud], rax
+    test    rax, rax
+    jnz     cm_excl
+    WINCALL GlobalFree, qword ptr [rbp-24]
 cm_excl:
     cmp     dword ptr [g_cf_excl], 0           ; ExcludeClipboardContentFromMonitorProcessing
     je      cm_done
     WINCALL GlobalAlloc, <GMEM_MOVEABLE or GMEM_ZEROINIT>, 4
     test    rax, rax
     jz      cm_done
+    mov     qword ptr [rbp-24], rax
     WINCALL SetClipboardData, dword ptr [g_cf_excl], rax
+    test    rax, rax
+    jnz     cm_done
+    WINCALL GlobalFree, qword ptr [rbp-24]
 cm_done:
     FRAME_EPILOG
     ret
@@ -6334,7 +6453,7 @@ gui_clip_markers endp
 
 gui_copy proc frame
     FRAME_PROLOG 64
-    mov     qword ptr [rbp-40], rcx         ; hdlg (for SetTimer)
+    mov     qword ptr [rbp-40], rcx         ; fallback hdlg (if tray hwnd absent)
     mov     qword ptr [rbp-48], rdx         ; source wide ptr
     ; wide length (chars) incl NUL
     mov     r10, rdx
@@ -6357,7 +6476,7 @@ gc_lend:
     mov     qword ptr [rbp-24], rax         ; hMem
     WINCALL GlobalLock, rax
     test    rax, rax
-    jz      gc_done
+    jz      gc_free_raw
     ; copy the source (chars) into the locked block
     mov     r11, rax                        ; dst
     mov     r10, qword ptr [rbp-48]         ; src
@@ -6373,14 +6492,23 @@ gc_cpd:
     WINCALL GlobalUnlock, qword ptr [rbp-24]
     WINCALL OpenClipboard, 0
     test    eax, eax
-    jz      gc_done
+    jz      gc_wipe_free
     WINCALL EmptyClipboard
     WINCALL SetClipboardData, CF_UNICODETEXT, qword ptr [rbp-24]
+    test    rax, rax
+    jz      gc_close_wipe_free
     call    gui_clip_markers                ; exclude from history / cloud / monitors
     WINCALL CloseClipboard
-    ; remember the clipboard state and arm the auto-clear timer
+    ; remember the clipboard state and arm the auto-clear timer on the persistent
+    ; tray window (falling back to hdlg only in headless/no-tray contexts)
     WINCALL GetClipboardSequenceNumber
     mov     dword ptr [g_clip_seq], eax
+    mov     dword ptr [g_clip_retries], 0
+    mov     rcx, qword ptr [g_trayhwnd]
+    test    rcx, rcx
+    jnz     @F
+    mov     rcx, qword ptr [rbp-40]
+@@: mov     qword ptr [rbp-40], rcx
     WINCALL KillTimer, qword ptr [rbp-40], CLIP_TIMER     ; cancel any prior
     mov     eax, dword ptr [g_clip_secs]        ; 0 = never auto-clear
     test    eax, eax
@@ -6388,6 +6516,20 @@ gc_cpd:
     imul    eax, eax, 1000                      ; seconds -> ms
     mov     r10d, eax                           ; stage off the arg regs (r9 is arg4)
     WINCALL SetTimer, qword ptr [rbp-40], CLIP_TIMER, r10d, 0
+    jmp     gc_done
+gc_close_wipe_free:
+    WINCALL CloseClipboard
+gc_wipe_free:
+    WINCALL GlobalLock, qword ptr [rbp-24]
+    test    rax, rax
+    jz      gc_free_raw
+    mov     rcx, rax
+    mov     edx, dword ptr [rbp-32]
+    shl     edx, 1
+    call    secure_zero
+    WINCALL GlobalUnlock, qword ptr [rbp-24]
+gc_free_raw:
+    WINCALL GlobalFree, qword ptr [rbp-24]
 gc_done:
     FRAME_EPILOG
     ret
@@ -6395,8 +6537,11 @@ gui_copy endp
 
 ; gui_clipclear() - if the clipboard still holds the secret we copied (unchanged
 ;   sequence number), empty it; otherwise leave the user's newer content alone.
+;   When another process transiently holds OpenClipboard, preserve g_clip_seq and
+;   schedule bounded retries on g_trayhwnd so a clipboard listener cannot pin our
+;   copied secret indefinitely.
 gui_clipclear proc frame
-    FRAME_PROLOG 32
+    FRAME_PROLOG 48
     cmp     dword ptr [g_clip_seq], 0
     je      gcc_done
     WINCALL GetClipboardSequenceNumber
@@ -6404,11 +6549,22 @@ gui_clipclear proc frame
     jne     gcc_keep                        ; changed since our copy -> don't touch
     WINCALL OpenClipboard, 0
     test    eax, eax
-    jz      gcc_keep
+    jz      gcc_busy
     WINCALL EmptyClipboard
     WINCALL CloseClipboard
+    jmp     gcc_keep
+gcc_busy:
+    inc     dword ptr [g_clip_retries]
+    cmp     dword ptr [g_clip_retries], 8
+    ja      gcc_keep
+    cmp     qword ptr [g_trayhwnd], 0
+    je      gcc_keep
+    WINCALL SetTimer, qword ptr [g_trayhwnd], CLIP_TIMER, 250, 0
+    test    rax, rax
+    jnz     gcc_done                        ; retry armed; keep g_clip_seq
 gcc_keep:
     mov     dword ptr [g_clip_seq], 0
+    mov     dword ptr [g_clip_retries], 0
 gcc_done:
     FRAME_EPILOG
     ret
@@ -7606,8 +7762,10 @@ ghost_make endp
 
 ; ghost_subclass - SUBCLASSPROC: track hover for the halo.  WM_MOUSEMOVE sets the
 ;   hover bit + arms WM_MOUSELEAVE; WM_MOUSELEAVE clears it; both repaint.
-ghost_subclass proc frame
-    FRAME_PROLOG 112
+ghost_subclass proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 128
     mov     qword ptr [rbp-24], rcx             ; hwnd
     mov     qword ptr [rbp-32], rdx             ; msg
     mov     qword ptr [rbp-40], r8              ; wParam
@@ -7623,7 +7781,8 @@ ghost_subclass proc frame
 gsc_def:
     WINCALL DefSubclassProc, qword ptr [rbp-24], qword ptr [rbp-32], qword ptr [rbp-40], \
             qword ptr [rbp-48]
-    FRAME_EPILOG
+    mov     rsp, rbp
+    pop     rbp
     ret
 gsc_key:
     mov     rcx, qword ptr [rbp-24]            ; Ctrl+shortcuts from a focused ghost button
@@ -7632,7 +7791,8 @@ gsc_key:
     test    eax, eax
     jz      gsc_def
     xor     eax, eax
-    FRAME_EPILOG
+    mov     rsp, rbp
+    pop     rbp
     ret
 gsc_char:
     ; type-to-search: a printable key while a ghost button has focus jumps to the
@@ -7649,7 +7809,8 @@ gsc_char:
     WINCALL SendMessageW, qword ptr [rbp-64], WM_CHAR_, qword ptr [rbp-40], \
             qword ptr [rbp-48]
     xor     eax, eax
-    FRAME_EPILOG
+    mov     rsp, rbp
+    pop     rbp
     ret
 gsc_move:
     WINCALL GetWindowLongPtrW, qword ptr [rbp-24], GWL_USERDATA
@@ -9418,8 +9579,10 @@ gui_inval_underlines proc frame
 gui_inval_underlines endp
 
 ; uline_cb(rcx = hwnd, rdx = 0) -> 1 - EnumChildWindows callback for the above.
-uline_cb proc frame
-    FRAME_PROLOG 128
+uline_cb proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 128
     mov     qword ptr [rbp-24], rcx
     WINCALL GetParent, rcx
     cmp     rax, qword ptr [g_excl_par]
@@ -9441,14 +9604,17 @@ uline_cb proc frame
     WINCALL InvalidateRect, qword ptr [g_excl_par], addr rbp-88, 1
 ulc_ret:
     mov     eax, 1
-    FRAME_EPILOG
+    mov     rsp, rbp
+    pop     rbp
     ret
 uline_cb endp
 
 ; erase_excl_cb(rcx = hwnd, rdx = 0) -> 1 - leave a visible edit (a direct child of
 ;   g_excl_par) out of the background paint going on in g_excl_hdc.
-erase_excl_cb proc frame
-    FRAME_PROLOG 128
+erase_excl_cb proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 144
     mov     qword ptr [rbp-24], rcx
     WINCALL GetParent, rcx
     cmp     rax, qword ptr [g_excl_par]
@@ -9467,7 +9633,8 @@ erase_excl_cb proc frame
             dword ptr [rbp-80], dword ptr [rbp-76]
 eec_ret:
     mov     eax, 1
-    FRAME_EPILOG
+    mov     rsp, rbp
+    pop     rbp
     ret
 erase_excl_cb endp
 
@@ -9630,8 +9797,10 @@ gui_entry_monogram endp
 ;   ListView): the same drawn scrollbar as the entry list.  The native bar is
 ;   removed after every non-client calc - the ListView re-adds it whenever its
 ;   item count changes - which is Myrkr's own idiom for its list.
-sel_list_subclass proc frame
-    FRAME_PROLOG 112
+sel_list_subclass proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 128
     mov     qword ptr [rbp-24], rcx
     mov     qword ptr [rbp-32], rdx
     mov     qword ptr [rbp-40], r8
@@ -9680,7 +9849,8 @@ sls_chk:
     call    lbsb_scrollcheck
 sls_ret:
     mov     rax, qword ptr [rbp-72]
-    FRAME_EPILOG
+    mov     rsp, rbp
+    pop     rbp
     ret
 sls_nccalc:
     ; Strip both scrollbar styles BEFORE the frame is computed, so it never makes
@@ -9701,7 +9871,8 @@ sls_nc_def:
     jmp     sls_ret
 sls_erase:                                       ; lbsb_wmpaint paints every pixel
     mov     eax, 1
-    FRAME_EPILOG
+    mov     rsp, rbp
+    pop     rbp
     ret
 sls_paint:
     mov     rcx, qword ptr [rbp-24]
@@ -9719,7 +9890,8 @@ sls_wheel:
     mov     rdx, qword ptr [rbp-40]
     call    lbsb_wheel
     xor     eax, eax
-    FRAME_EPILOG
+    mov     rsp, rbp
+    pop     rbp
     ret
 sls_lbdown:
     mov     rcx, qword ptr [rbp-24]
@@ -9728,7 +9900,8 @@ sls_lbdown:
     test    eax, eax
     jz      sls_def
     xor     eax, eax
-    FRAME_EPILOG
+    mov     rsp, rbp
+    pop     rbp
     ret
 sls_move:
     cmp     dword ptr [g_lbsb_track], 0
@@ -9736,7 +9909,8 @@ sls_move:
     mov     rcx, qword ptr [rbp-24]
     call    lbsb_drag
     xor     eax, eax
-    FRAME_EPILOG
+    mov     rsp, rbp
+    pop     rbp
     ret
 sls_hover:
     mov     rcx, qword ptr [rbp-24]
@@ -9754,7 +9928,8 @@ sls_lbup:
     mov     rcx, qword ptr [rbp-24]
     call    lbsb_strip_inval
     xor     eax, eax
-    FRAME_EPILOG
+    mov     rsp, rbp
+    pop     rbp
     ret
 sls_leave:
     mov     rcx, qword ptr [rbp-24]
@@ -9770,8 +9945,10 @@ sls_capchg:
     jmp     sls_def
 sel_list_subclass endp
 
-search_type_subclass proc frame
-    FRAME_PROLOG 112
+search_type_subclass proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 128
     mov     qword ptr [rbp-24], rcx            ; hwnd (list)
     mov     qword ptr [rbp-32], rdx            ; msg
     mov     qword ptr [rbp-40], r8             ; wParam (char)
@@ -9802,7 +9979,8 @@ search_type_subclass proc frame
     test    eax, eax
     jz      sts_def
     xor     eax, eax
-    FRAME_EPILOG
+    mov     rsp, rbp
+    pop     rbp
     ret
 sts_notkey:
     cmp     rdx, WM_CHAR_
@@ -9819,7 +9997,8 @@ sts_notkey:
     WINCALL SendMessageW, qword ptr [rbp-64], WM_CHAR_, qword ptr [rbp-40], \
             qword ptr [rbp-48]                  ;   then forward the keystroke into it
     xor     eax, eax                           ; consumed
-    FRAME_EPILOG
+    mov     rsp, rbp
+    pop     rbp
     ret
 sts_def:
     WINCALL DefSubclassProc, qword ptr [rbp-24], qword ptr [rbp-32], qword ptr [rbp-40], \
@@ -9882,11 +10061,13 @@ sts_sel_call:
     call    lbsb_selcheck
 sts_ret:
     mov     rax, qword ptr [rbp-72]
-    FRAME_EPILOG
+    mov     rsp, rbp
+    pop     rbp
     ret
 sts_erase:                                       ; lbsb_wmpaint paints every pixel
     mov     eax, 1
-    FRAME_EPILOG
+    mov     rsp, rbp
+    pop     rbp
     ret
 sts_paint:
     mov     rcx, qword ptr [rbp-24]              ; rows + thumb, composed off screen
@@ -9904,7 +10085,8 @@ sts_wheel:
     mov     rdx, qword ptr [rbp-40]
     call    lbsb_wheel
     xor     eax, eax
-    FRAME_EPILOG
+    mov     rsp, rbp
+    pop     rbp
     ret
 sts_lbdown:
     mov     rcx, qword ptr [rbp-24]
@@ -9913,7 +10095,8 @@ sts_lbdown:
     test    eax, eax
     jz      sts_def                              ; a card, not the bar
     xor     eax, eax
-    FRAME_EPILOG
+    mov     rsp, rbp
+    pop     rbp
     ret
 sts_move:
     cmp     dword ptr [g_lbsb_track], 0
@@ -9921,7 +10104,8 @@ sts_move:
     mov     rcx, qword ptr [rbp-24]              ; a drag owns every move until release
     call    lbsb_drag
     xor     eax, eax
-    FRAME_EPILOG
+    mov     rsp, rbp
+    pop     rbp
     ret
 sts_hover:
     mov     rcx, qword ptr [rbp-24]
@@ -9949,7 +10133,8 @@ sts_lbup:
     mov     rcx, qword ptr [rbp-24]
     call    lbsb_strip_inval
     xor     eax, eax
-    FRAME_EPILOG
+    mov     rsp, rbp
+    pop     rbp
     ret
 sts_leave:
     mov     rcx, qword ptr [rbp-24]
@@ -10291,11 +10476,14 @@ tf_entry proc
     ret
 tf_entry endp
 
-; tf_append(rcx = AttachRef[68], rdx = filename wide) -> eax = 0 ok / 1 full.
+; tf_append(rcx = AttachRef[68], rdx = filename wide, r8d = src_max_wchars)
+;   -> eax = 0 ok / 1 full.  Bounds the source read to r8d wide chars and
+;   canonicalizes any non-empty filename via gui_sanitize_attname.
 tf_append proc frame
-    FRAME_PROLOG 48
+    FRAME_PROLOG 64
     mov     qword ptr [rbp-24], rcx
     mov     qword ptr [rbp-32], rdx
+    mov     dword ptr [rbp-48], r8d
     mov     eax, dword ptr [g_tilefile_n]
     cmp     eax, MAX_TFILES
     jae     tfa_full
@@ -10306,10 +10494,24 @@ tf_append proc frame
     mov     rdx, qword ptr [rbp-24]
     mov     r8, 68
     call    gui_bcpy
-    mov     rcx, qword ptr [rbp-40]             ; copy the filename (capped, NUL-term)
-    add     rcx, TFILE_NAME
     mov     rdx, qword ptr [rbp-32]
-    call    gui_wcpy_capped
+    mov     r8d, dword ptr [rbp-48]
+    test    r8d, r8d
+    jz      tfa_empty
+    cmp     word ptr [rdx], 0
+    je      tfa_empty
+    lea     rcx, [g_san_tmp]                    ; bounded copy -> NUL-terminated scratch
+    mov     r9d, 255
+    call    gui_wcpy_bounded
+    lea     rcx, [g_san_tmp]
+    mov     rdx, qword ptr [rbp-40]
+    add     rdx, TFILE_NAME
+    call    gui_sanitize_attname
+    jmp     tfa_inc
+tfa_empty:
+    mov     rax, qword ptr [rbp-40]
+    mov     word ptr [rax+TFILE_NAME], 0
+tfa_inc:
     inc     dword ptr [g_tilefile_n]
     xor     eax, eax
     FRAME_EPILOG
@@ -10415,6 +10617,132 @@ pwh_entry proc
     add     rax, rdx
     ret
 pwh_entry endp
+
+; gui_wcpy_bounded(rcx = dst, rdx = src, r8d = src_max_wchars, r9d = dst_cap_wchars)
+;   -> eax = wchars copied (excluding NUL).  Reads at most r8d wide chars from src
+;   (stopping earlier on NUL), writes at most r9d wide chars to dst, and always
+;   NUL-terminates dst (requires dst room >= r9d + 1 wide chars).  Leaf.
+gui_wcpy_bounded proc
+    xor     eax, eax
+    mov     r10d, r8d
+    cmp     r10d, r9d
+    jbe     gwcb_lp
+    mov     r10d, r9d
+gwcb_lp:
+    cmp     eax, r10d
+    jae     gwcb_term
+    mov     r11w, word ptr [rdx+rax*2]
+    test    r11w, r11w
+    jz      gwcb_term
+    mov     word ptr [rcx+rax*2], r11w
+    inc     eax
+    jmp     gwcb_lp
+gwcb_term:
+    mov     word ptr [rcx+rax*2], 0
+    ret
+gui_wcpy_bounded endp
+
+; gsd_parse_pwhist(rcx = valptr, edx = vallen) - bounded parser for VF_PWHIST
+;   {u64 filetime, label wide\0, value wide\0, u32 action} (plus pre-action and
+;   unlabelled legacy shapes).  Never reads past valptr + vallen even if a
+;   corrupt/forged field omits NUL terminators; stages strings in pinned g_pwhblob.
+gsd_parse_pwhist proc frame
+    FRAME_PROLOG 64
+    cmp     edx, 10                             ; need 8B filetime + >=1 wchar
+    jb      gpph_done
+    mov     r10, rcx                            ; valptr
+    mov     eax, edx
+    sub     eax, 8
+    shr     eax, 1                              ; complete wchars after filetime
+    test    eax, eax
+    jz      gpph_done
+    lea     r11, [r10+8+rax*2]                  ; aligned end <= valptr + vallen
+    mov     rax, qword ptr [r10]
+    mov     qword ptr [rbp-24], rax             ; filetime
+    lea     r8, [r10+8]
+gpph_s1:
+    cmp     r8, r11
+    jae     gpph_old                            ; no NUL at all -> bounded oldest shape
+    cmp     word ptr [r8], 0
+    je      gpph_s1nul
+    add     r8, 2
+    jmp     gpph_s1
+gpph_s1nul:
+    add     r8, 2                               ; past string1's NUL
+    cmp     r8, r11
+    jb      gpph_new                            ; second string follows -> labelled shape
+gpph_old:
+    lea     rcx, [g_pwhblob+256]
+    lea     rdx, [r10+8]
+    mov     r8, r11
+    sub     r8, rdx
+    shr     r8, 1                               ; max wchars in value
+    mov     r9d, 120
+    call    gui_wcpy_bounded
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [kl_secret]
+    lea     r8, [g_pwhblob+256]
+    xor     r9d, r9d                            ; PWHA_CHANGED
+    call    pwh_append
+    jmp     gpph_wipe
+gpph_new:
+    mov     qword ptr [rbp-32], r8              ; pw start (past label's NUL)
+    mov     qword ptr [rbp-40], r10             ; valptr
+    mov     qword ptr [rbp-48], r11             ; aligned end
+    mov     dword ptr [rbp-52], 0               ; action = PWHA_CHANGED
+    mov     rax, r8
+gpph_s2:
+    cmp     rax, r11
+    jae     gpph_s2_nonul
+    cmp     word ptr [rax], 0
+    je      gpph_s2nul
+    add     rax, 2
+    jmp     gpph_s2
+gpph_s2nul:
+    mov     rcx, rax
+    sub     rcx, r8
+    shr     rcx, 1
+    mov     dword ptr [rbp-56], ecx             ; pw wchar len
+    add     rax, 6                              ; past NUL (2B) + u32 action (4B)
+    cmp     rax, r11
+    ja      gpph_emit
+    mov     ecx, dword ptr [rax-4]
+    cmp     ecx, PWHA_ADDED
+    ja      gpph_emit
+    mov     dword ptr [rbp-52], ecx
+    jmp     gpph_emit
+gpph_s2_nonul:
+    mov     rcx, r11
+    sub     rcx, r8
+    shr     rcx, 1
+    mov     dword ptr [rbp-56], ecx
+gpph_emit:
+    lea     rcx, [g_pwhblob]                    ; bounded label -> g_pwhblob+0
+    mov     r10, qword ptr [rbp-40]
+    lea     rdx, [r10+8]
+    mov     r8, qword ptr [rbp-32]
+    sub     r8, rdx
+    shr     r8, 1
+    mov     r9d, 120
+    call    gui_wcpy_bounded
+    lea     rcx, [g_pwhblob+256]                ; bounded pw -> g_pwhblob+256
+    mov     rdx, qword ptr [rbp-32]
+    mov     r8d, dword ptr [rbp-56]
+    mov     r9d, 120
+    call    gui_wcpy_bounded
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [g_pwhblob]
+    lea     r8, [g_pwhblob+256]
+    mov     r9d, dword ptr [rbp-52]
+    call    pwh_append
+gpph_wipe:
+    lea     rcx, [g_pwhblob]
+    mov     edx, 512
+    call    secure_zero
+gpph_done:
+    FRAME_EPILOG
+    ret
+gsd_parse_pwhist endp
 
 ; pwh_append(rcx = FILETIME qword, rdx = wide label, r8 = wide old value,
 ;            r9d = PWHA_* action) - add a history entry; when full, drop the
@@ -10604,37 +10932,245 @@ ip_save:
     ret
 img_pick endp
 
-; gui_basename(rcx=wide path) - copy the file-name part (after the last \ or /)
-;   into g_imgfn_w (wide, NUL-terminated, capped).  Leaf.
-gui_basename proc
+; gui_sanitize_attname(rcx = raw_wide, rdx = out_wide120)
+;   Canonicalizes an untrusted attachment filename into out_wide120 (capped at
+;   119 wide chars + NUL):
+;     1. Strips directory prefixes (everything up to the last '\' or '/').
+;     2. Truncates at ':' (blocking NTFS alternate data streams such as :$DATA
+;        and :Zone.Identifier) and replaces Win32 reserved characters (< > " | ? *)
+;        and control characters (<= 0x1F) with '_'.
+;     3. Trims leading spaces and trailing dots/spaces (which Win32 strips).
+;     4. Substitutes name_default_att ("vordr_attach.bin") if empty, "." or "..".
+;     5. Prefixes '_' if the stem matches a legacy DOS device name (CON, PRN, AUX,
+;        NUL, CLOCK$, COM1..COM9, LPT1..LPT9).
+;     6. Caps at 119 chars while preserving an extension of <= 32 chars.
+public gui_sanitize_attname
+gui_sanitize_attname proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx             ; raw_wide
+    mov     qword ptr [rbp-32], rdx             ; out_wide120
+    test    rcx, rcx
+    jz      gsa_default
     mov     r10, rcx
-    mov     r11, rcx                            ; start of basename
-gb_scan:
+    mov     r11, rcx                            ; basename start
+gsa_base:
     mov     ax, word ptr [r10]
     test    ax, ax
-    jz      gb_copy
+    jz      gsa_clean
     cmp     ax, '\'
-    je      gb_sep
+    je      gsa_sep
     cmp     ax, '/'
-    jne     gb_next
-gb_sep:
+    jne     gsa_bnext
+gsa_sep:
     lea     r11, [r10+2]
-gb_next:
+gsa_bnext:
     add     r10, 2
-    jmp     gb_scan
-gb_copy:
-    lea     r10, [g_imgfn_w]
+    jmp     gsa_base
+gsa_clean:
+    lea     r10, [g_san_tmp]
+    xor     ecx, ecx                            ; length in g_san_tmp (max 254)
+gsa_clp:
+    movzx   eax, word ptr [r11]
+    test    eax, eax
+    jz      gsa_cdone
+    cmp     eax, ':'                            ; truncate before any NTFS ADS stream
+    je      gsa_cdone
+    cmp     eax, 1Fh
+    jbe     gsa_repl
+    cmp     eax, '<'
+    je      gsa_repl
+    cmp     eax, '>'
+    je      gsa_repl
+    cmp     eax, '"'
+    je      gsa_repl
+    cmp     eax, '|'
+    je      gsa_repl
+    cmp     eax, '?'
+    je      gsa_repl
+    cmp     eax, '*'
+    jne     gsa_cput
+gsa_repl:
+    mov     eax, '_'
+gsa_cput:
+    mov     word ptr [r10+rcx*2], ax
+    inc     ecx
+    add     r11, 2
+    cmp     ecx, 254
+    jb      gsa_clp
+gsa_cdone:
+    mov     word ptr [r10+rcx*2], 0
+    ; trim trailing '.' and ' '
+gsa_trimr:
+    test    ecx, ecx
+    jz      gsa_default
+    movzx   eax, word ptr [r10+rcx*2-2]
+    cmp     eax, '.'
+    je      gsa_trimrc
+    cmp     eax, ' '
+    jne     gsa_triml
+gsa_trimrc:
+    dec     ecx
+    mov     word ptr [r10+rcx*2], 0
+    jmp     gsa_trimr
+gsa_triml:
+    ; skip leading ' '
+    test    ecx, ecx
+    jz      gsa_default
+    cmp     word ptr [r10], ' '
+    jne     gsa_have
+    add     r10, 2
+    dec     ecx
+    jmp     gsa_triml
+gsa_have:
+    ; after trimming trailing '.'/' ' and leading ' ', "." and ".." are already empty;
+    ; check DOS device stem (before the first '.', trimming trailing stem spaces)
+    mov     qword ptr [rbp-40], r10             ; start ptr
+    mov     dword ptr [rbp-48], ecx             ; len
     xor     r8d, r8d
-gb_cp:
-    mov     ax, word ptr [r11+r8*2]
-    mov     word ptr [r10+r8*2], ax
-    test    ax, ax
-    jz      gb_done
+gsa_stem_end:
+    cmp     r8d, ecx
+    jae     gsa_stem_trim
+    cmp     word ptr [r10+r8*2], '.'
+    je      gsa_stem_trim
     inc     r8d
-    cmp     r8d, 120
-    jb      gb_cp
-    mov     word ptr [r10+r8*2], 0
-gb_done:
+    jmp     gsa_stem_end
+gsa_stem_trim:
+    test    r8d, r8d
+    jz      gsa_emit
+    cmp     word ptr [r10+r8*2-2], ' '
+    jne     gsa_stem_chk
+    dec     r8d
+    jmp     gsa_stem_trim
+gsa_stem_chk:
+    cmp     r8d, 16
+    ja      gsa_emit
+    lea     r11, [g_san_stem]
+    xor     edx, edx
+gsa_stem_lc:
+    cmp     edx, r8d
+    jae     gsa_stem_lcd
+    movzx   eax, word ptr [r10+rdx*2]
+    cmp     eax, 'A'
+    jb      @F
+    cmp     eax, 'Z'
+    ja      @F
+    add     eax, 20h
+@@: mov     word ptr [r11+rdx*2], ax
+    inc     edx
+    jmp     gsa_stem_lc
+gsa_stem_lcd:
+    mov     word ptr [r11+rdx*2], 0
+    lea     rax, [dos_devs]
+    mov     qword ptr [rbp-56], rax
+gsa_dev_lp:
+    mov     rdx, qword ptr [rbp-56]
+    cmp     word ptr [rdx], 0
+    je      gsa_emit
+    lea     rcx, [g_san_stem]
+    call    gui_wstr_eq
+    test    eax, eax
+    jnz     gsa_dev_hit
+    mov     r10, qword ptr [rbp-56]
+@@: cmp     word ptr [r10], 0
+    je      @F
+    add     r10, 2
+    jmp     @B
+@@: add     r10, 2
+    mov     qword ptr [rbp-56], r10
+    jmp     gsa_dev_lp
+gsa_dev_hit:
+    ; prepend '_' in g_san_tmp
+    mov     r10, qword ptr [rbp-40]
+    mov     ecx, dword ptr [rbp-48]
+    cmp     ecx, 254
+    jbe     @F
+    mov     ecx, 254
+@@: lea     r11, [g_san_tmp]
+    mov     edx, ecx
+gsa_shift:
+    mov     ax, word ptr [r10+rdx*2]
+    mov     word ptr [r11+rdx*2+2], ax
+    dec     edx
+    jns     gsa_shift
+    mov     word ptr [r11], '_'
+    inc     ecx
+    mov     qword ptr [rbp-40], r11
+    mov     dword ptr [rbp-48], ecx
+gsa_emit:
+    mov     r10, qword ptr [rbp-40]             ; src
+    mov     ecx, dword ptr [rbp-48]             ; len
+    mov     r11, qword ptr [rbp-32]             ; dst
+    cmp     ecx, 119
+    jbe     gsa_copy_all
+    ; find last '.' in r10[1..ecx-1] so extension <= 32 wchars is preserved
+    mov     r8d, ecx
+    dec     r8d
+gsa_ext_scan:
+    cmp     r8d, 1
+    jb      gsa_copy_trunc
+    cmp     word ptr [r10+r8*2], '.'
+    je      gsa_ext_found
+    dec     r8d
+    jmp     gsa_ext_scan
+gsa_ext_found:
+    mov     r9d, ecx
+    sub     r9d, r8d                            ; ext_len (incl '.')
+    cmp     r9d, 32
+    ja      gsa_copy_trunc
+    mov     edx, 119
+    sub     edx, r9d                            ; stem prefix len to keep
+    xor     eax, eax
+gsa_cp_pre:
+    cmp     eax, edx
+    jae     gsa_cp_ext_init
+    mov     cx, word ptr [r10+rax*2]
+    mov     word ptr [r11+rax*2], cx
+    inc     eax
+    jmp     gsa_cp_pre
+gsa_cp_ext_init:
+    xor     ecx, ecx
+gsa_cp_ext:
+    cmp     ecx, r9d
+    jae     gsa_cp_ext_done
+    mov     edx, r8d
+    add     edx, ecx
+    mov     dx, word ptr [r10+rdx*2]
+    mov     word ptr [r11+rax*2], dx
+    inc     eax
+    inc     ecx
+    jmp     gsa_cp_ext
+gsa_cp_ext_done:
+    mov     word ptr [r11+rax*2], 0
+    jmp     gsa_done
+gsa_copy_trunc:
+    mov     ecx, 119
+gsa_copy_all:
+    xor     eax, eax
+gsa_cp_all:
+    cmp     eax, ecx
+    jae     gsa_cp_all_done
+    mov     dx, word ptr [r10+rax*2]
+    mov     word ptr [r11+rax*2], dx
+    inc     eax
+    jmp     gsa_cp_all
+gsa_cp_all_done:
+    mov     word ptr [r11+rax*2], 0
+    jmp     gsa_done
+gsa_default:
+    mov     rcx, qword ptr [rbp-32]
+    lea     rdx, [name_default_att]
+    call    gui_wcpy_capped
+gsa_done:
+    FRAME_EPILOG
+    ret
+gui_sanitize_attname endp
+
+; gui_basename(rcx=wide path) - sanitize and copy the file-name part into g_imgfn_w.
+gui_basename proc frame
+    FRAME_PROLOG 32
+    lea     rdx, [g_imgfn_w]
+    call    gui_sanitize_attname
+    FRAME_EPILOG
     ret
 gui_basename endp
 
@@ -10642,13 +11178,11 @@ gui_basename endp
 ; Generic file attachments (VF_FILE)
 ; =============================================================================
 
-; gui_tile_make_temp(ecx = file index) -> eax=1 with an exclusively created
-;   random directory and g_tmpfile beneath it, or eax=0 on failure.
-;   The stored filename can be attacker-controlled (imported from a zip), so any
-;   directory part is stripped (basename after the last '\' or '/') to keep the
-;   written+opened file confined to %TEMP% - no "..\" path traversal out of it.
+; gui_tile_make_temp(ecx = file index) -> eax=1 with an exclusively created,
+;   owner-only ACL'd random directory (verified non-reparse) and sanitized
+;   g_tmpfile beneath it, or eax=0 on failure.
 gui_tile_make_temp proc frame
-    FRAME_PROLOG 96
+    FRAME_PROLOG 176
     mov     dword ptr [rbp-24], ecx
     mov     dword ptr [g_tmpdir_len], 0
     ; Reserve space for a 32-hex random directory, slash and 120-char basename.
@@ -10673,9 +11207,46 @@ gui_tile_make_temp proc frame
     lea     rdx, [rdx+rax*2]
     mov     rcx, qword ptr [rbp-56]
     call    gui_ft_hex16
-    WINCALL CreateDirectoryW, addr g_tmpfile, 0
+    ; Build an owner-only DACL from our process token's user SID so other local
+    ; users on shared systems cannot traverse or read the decrypt-to-temp subdir.
+    WINCALL GetCurrentProcess
+    mov     qword ptr [rbp-72], rax
+    WINCALL OpenProcessToken, qword ptr [rbp-72], TOKEN_QUERY_, addr rbp-80
     test    eax, eax
-    jz      gtmt_fail                         ; never reuse or remove a pre-existing name
+    jz      gtmt_fail
+    WINCALL GetTokenInformation, qword ptr [rbp-80], 1, addr g_tmp_tokbuf, 128, addr rbp-84
+    mov     dword ptr [rbp-88], eax
+    WINCALL CloseHandle, qword ptr [rbp-80]
+    cmp     dword ptr [rbp-88], 0
+    je      gtmt_fail
+    mov     rax, qword ptr [g_tmp_tokbuf]            ; TOKEN_USER.User.Sid
+    test    rax, rax
+    jz      gtmt_fail
+    mov     qword ptr [rbp-72], rax
+    WINCALL InitializeAcl, addr g_tmp_acl, 256, ACL_REVISION_
+    test    eax, eax
+    jz      gtmt_fail
+    WINCALL AddAccessAllowedAce, addr g_tmp_acl, ACL_REVISION_, GENERIC_ALL_, qword ptr [rbp-72]
+    test    eax, eax
+    jz      gtmt_fail
+    WINCALL InitializeSecurityDescriptor, addr g_tmp_sd, 1
+    test    eax, eax
+    jz      gtmt_fail
+    WINCALL SetSecurityDescriptorDacl, addr g_tmp_sd, 1, addr g_tmp_acl, 0
+    test    eax, eax
+    jz      gtmt_fail
+    mov     qword ptr [rbp-112], 24                  ; SECURITY_ATTRIBUTES.nLength = 24
+    lea     rax, [g_tmp_sd]
+    mov     qword ptr [rbp-104], rax                 ; lpSecurityDescriptor
+    mov     qword ptr [rbp-96], 0                    ; bInheritHandle = FALSE
+    WINCALL CreateDirectoryW, addr g_tmpfile, addr rbp-112
+    test    eax, eax
+    jz      gtmt_fail                                ; never reuse or remove a pre-existing name
+    WINCALL GetFileAttributesW, addr g_tmpfile
+    cmp     eax, -1
+    je      gtmt_rmdir_fail
+    test    eax, FILE_ATTRIBUTE_REPARSE_POINT_
+    jnz     gtmt_rmdir_fail
     mov     eax, dword ptr [rbp-32]
     add     eax, 32
     mov     dword ptr [g_tmpdir_len], eax
@@ -10685,36 +11256,16 @@ gui_tile_make_temp proc frame
     mov     dword ptr [rbp-32], eax
     mov     ecx, dword ptr [rbp-24]
     call    tf_entry
-    add     rax, TFILE_NAME
-    mov     r10, rax                                 ; scan cursor
-    mov     r11, rax                                 ; basename start
-gtmt_scan:
-    mov     dx, word ptr [r10]
-    test    dx, dx
-    jz      gtmt_scandone
-    cmp     dx, '\'
-    je      gtmt_sep
-    cmp     dx, '/'
-    jne     gtmt_next
-gtmt_sep:
-    lea     r11, [r10+2]                             ; name restarts after the separator
-gtmt_next:
-    add     r10, 2
-    jmp     gtmt_scan
-gtmt_scandone:
-    mov     qword ptr [rbp-40], r11                  ; sanitized filename ptr (basename)
+    lea     rcx, [rax+TFILE_NAME]
     mov     eax, dword ptr [rbp-32]
-    lea     rcx, [g_tmpfile]
-    lea     rcx, [rcx+rax*2]                         ; dst = g_tmpfile + baselen
-    mov     rdx, qword ptr [rbp-40]
-    movzx   eax, word ptr [rdx]                      ; empty name -> default
-    test    eax, eax
-    jnz     @F
-    lea     rdx, [name_default_att]
-@@: call    gui_wcpy_capped
+    lea     rdx, [g_tmpfile]
+    lea     rdx, [rdx+rax*2]                         ; dst = g_tmpfile + baselen
+    call    gui_sanitize_attname
     mov     eax, 1
     FRAME_EPILOG
     ret
+gtmt_rmdir_fail:
+    WINCALL RemoveDirectoryW, addr g_tmpfile
 gtmt_fail:
     xor     eax, eax
     FRAME_EPILOG
@@ -10752,11 +11303,15 @@ gui_tile_choose proc frame
     call    img_pick
     test    eax, eax
     jz      gtc_done
+    cmp     qword ptr [g_body_ptr], 0                ; vault locked while picker was open?
+    je      gtc_done
     mov     rcx, qword ptr [rbp-24]
     call    gui_tile_add_cur                         ; read, stage, append - or 0
     test    eax, eax
     jnz     gtc_added
     WINCALL gui_msgbox, qword ptr [rbp-24], addr s_attfail, addr t_err, <MB_OK or MB_ICONWARNING>
+    cmp     qword ptr [g_body_ptr], 0
+    je      gtc_done
 gtc_added:
     mov     rcx, qword ptr [rbp-24]
     mov     edx, dword ptr [rbp-32]
@@ -10786,7 +11341,7 @@ gui_tag_open proc frame
     call    gui_tile_make_temp                       ; -> g_tmpfile
     test    eax, eax
     jz      gto_free
-    ; Register the path BEFORE CREATE_ALWAYS can put plaintext on disk.  Thus a
+    ; Register the path BEFORE CREATE_NEW can put plaintext on disk.  Thus a
     ; partial write, an early error, or a crash after file creation still leaves
     ; a path known to the normal purge path (and the error path purges now).
     lea     rcx, [g_tmpfile]
@@ -10810,14 +11365,26 @@ gui_tag_open proc frame
 gto_free_written:
     mov     rcx, qword ptr [rbp-56]
     mov     rdx, qword ptr [rbp-48]
-    call    mem_free
+    call    attach_free
     cmp     dword ptr [rbp-60], 0                     ; only open if the temp was written
     je      gto_written
     call    gui_temp_purge                            ; remove a partial plaintext file now
     jmp     gto_done
 gto_written:
-    lea     rcx, [g_tmpfile]                         ; before anything can open it
+    lea     rcx, [g_tmpfile]                         ; mandatory Mark-of-the-Web before launch
     call    gui_motw
+    test    eax, eax
+    jnz     gto_launch
+    ; Non-NTFS / ADS-refusing %TEMP%: purge the unmarked temp file immediately and
+    ; fall back to Save As rather than launching without Zone.Identifier.
+    call    gui_temp_purge
+    mov     rcx, qword ptr [g_vaulthwnd]
+    test    rcx, rcx
+    jz      gto_done
+    mov     edx, dword ptr [rbp-32]
+    call    gui_tag_saveas
+    jmp     gto_done
+gto_launch:
     WINCALL SetFileAttributesW, addr g_tmpfile, FILE_ATTRIBUTE_TEMPORARY  ; hint: keep in cache
     WINCALL ShellExecuteW, 0, addr verb_open, addr g_tmpfile, 0, 0, 1
     jmp     gto_done
@@ -10829,7 +11396,7 @@ gto_rmdir:
 gto_free:
     mov     rcx, qword ptr [rbp-56]
     mov     rdx, qword ptr [rbp-48]
-    call    mem_free
+    call    attach_free
 gto_done:
     FRAME_EPILOG
     ret
@@ -11093,69 +11660,80 @@ gtt2_cleanup:
     ret
 gui_tmptest endp
 
-; gui_ext_is_exec(rcx = wide filename) -> eax = 1 if the extension is a known
-;   executable/script type (exec_exts denylist).  Extracts the extension of the
-;   basename (last '.' after the last '\' or '/'), ignoring trailing dots/spaces
-;   that Windows strips, and compares case-insensitively.
-gui_ext_is_exec proc frame
+; gui_ext_can_preview(rcx = wide filename) -> eax = 1 if the basename carries a
+;   safe-preview allowlisted extension (preview_exts: txt, png, jpg, jpeg, gif,
+;   bmp, webp, pdf), else 0 (route to Save As).  Rejects any string containing ':'
+;   (alternate data stream syntax), trims trailing dots/spaces, requires a non-empty
+;   stem before the extension, and compares case-insensitively.
+public gui_ext_can_preview
+gui_ext_can_preview proc frame
     FRAME_PROLOG 48
+    test    rcx, rcx
+    jz      gxp_no
     mov     qword ptr [rbp-24], rcx            ; name
-    mov     r10, rcx                           ; find the NUL terminator
-gxe_end:
-    cmp     word ptr [r10], 0
-    je      gxe_haveend
+    mov     r10, rcx                           ; find the NUL terminator (reject ':')
+gxp_end:
+    movzx   eax, word ptr [r10]
+    test    eax, eax
+    jz      gxp_haveend
+    cmp     eax, ':'
+    je      gxp_no
     add     r10, 2
-    jmp     gxe_end
-gxe_haveend:
-    ; trim trailing '.' and ' ' (Windows ignores them when resolving a name)
-gxe_trim:
+    jmp     gxp_end
+gxp_haveend:
+    ; trim trailing '.' and ' '
+gxp_trim:
     cmp     r10, qword ptr [rbp-24]
-    jbe     gxe_noext
+    jbe     gxp_no
     movzx   eax, word ptr [r10-2]
     cmp     eax, '.'
-    je      gxe_trimc
+    je      gxp_trimc
     cmp     eax, ' '
-    jne     gxe_trimdone
-gxe_trimc:
+    jne     gxp_trimdone
+gxp_trimc:
     sub     r10, 2
-    jmp     gxe_trim
-gxe_trimdone:
+    jmp     gxp_trim
+gxp_trimdone:
     mov     qword ptr [rbp-32], r10            ; end (after trim)
-    ; last '.' within the basename (a separator resets it -> new component)
+    ; find basename start + last '.' within the basename
     mov     r11, qword ptr [rbp-24]
-    mov     qword ptr [rbp-40], 0             ; dot ptr = none
-gxe_scan:
+    mov     r9, r11                            ; basename start
+    mov     qword ptr [rbp-40], 0              ; dot ptr = none
+gxp_scan:
     cmp     r11, qword ptr [rbp-32]
-    jae     gxe_scandone
+    jae     gxp_scandone
     movzx   eax, word ptr [r11]
     cmp     eax, '\'
-    je      gxe_ssep
+    je      gxp_ssep
     cmp     eax, '/'
-    je      gxe_ssep
+    je      gxp_ssep
     cmp     eax, '.'
-    jne     gxe_snext
+    jne     gxp_snext
     mov     qword ptr [rbp-40], r11
-    jmp     gxe_snext
-gxe_ssep:
+    jmp     gxp_snext
+gxp_ssep:
+    lea     r9, [r11+2]
     mov     qword ptr [rbp-40], 0
-gxe_snext:
+gxp_snext:
     add     r11, 2
-    jmp     gxe_scan
-gxe_scandone:
+    jmp     gxp_scan
+gxp_scandone:
     mov     r11, qword ptr [rbp-40]
     test    r11, r11
-    jz      gxe_noext                          ; no '.' in the basename
+    jz      gxp_no                             ; no '.' in the basename
+    cmp     r11, r9
+    jbe     gxp_no                             ; dotfile with empty stem -> Save As
     add     r11, 2                             ; ext start = after the '.'
     cmp     r11, qword ptr [rbp-32]
-    jae     gxe_noext                          ; nothing after the '.'
-    ; copy the extension -> g_extw, lowercased, capped at 31 chars (longest listed: 18)
+    jae     gxp_no                             ; nothing after the '.'
+    ; copy extension -> g_extw, lowercased; reject if > 15 chars
     lea     r8, [g_extw]
     xor     ecx, ecx
-gxe_cpy:
+gxp_cpy:
     cmp     r11, qword ptr [rbp-32]
-    jae     gxe_cpd
-    cmp     ecx, 31
-    jae     gxe_cpd
+    jae     gxp_cpd
+    cmp     ecx, 15
+    jae     gxp_no
     movzx   eax, word ptr [r11]
     cmp     eax, 'A'
     jb      @F
@@ -11165,70 +11743,81 @@ gxe_cpy:
 @@: mov     word ptr [r8+rcx*2], ax
     inc     ecx
     add     r11, 2
-    jmp     gxe_cpy
-gxe_cpd:
-    mov     word ptr [r8+rcx*2], 0             ; NUL-terminate
-    lea     r10, [exec_exts]
-    mov     qword ptr [rbp-40], r10            ; denylist cursor (survives the call)
-gxe_next:
+    jmp     gxp_cpy
+gxp_cpd:
+    mov     word ptr [r8+rcx*2], 0
+    lea     r10, [preview_exts]
+    mov     qword ptr [rbp-40], r10
+gxp_next:
     mov     r10, qword ptr [rbp-40]
     cmp     word ptr [r10], 0
-    je      gxe_noext                          ; double-NUL -> not found
+    je      gxp_no
     lea     rcx, [g_extw]
     mov     rdx, r10
     call    gui_wstr_eq
     test    eax, eax
-    jnz     gxe_yes
-    mov     r10, qword ptr [rbp-40]            ; advance past this entry's NUL
-gxe_adv:
+    jnz     gxp_yes
+    mov     r10, qword ptr [rbp-40]
+gxp_adv:
     cmp     word ptr [r10], 0
-    je      gxe_advd
+    je      gxp_advd
     add     r10, 2
-    jmp     gxe_adv
-gxe_advd:
+    jmp     gxp_adv
+gxp_advd:
     add     r10, 2
     mov     qword ptr [rbp-40], r10
-    jmp     gxe_next
-gxe_yes:
+    jmp     gxp_next
+gxp_yes:
     mov     eax, 1
     FRAME_EPILOG
     ret
-gxe_noext:
+gxp_no:
     xor     eax, eax
     FRAME_EPILOG
     ret
-gui_ext_is_exec endp
+gui_ext_can_preview endp
 
 ; gui_same_file(rcx = path A, rdx = path B) -> eax = 1 if both exist and are the
-;   same file (volume serial + file index), else 0.
+;   same file (volume serial + file index), else 0.  Passes both paths through
+;   path_longify so paths > 260 chars are still opened and compared reliably.
 gui_same_file proc frame
-    FRAME_PROLOG 240                            ; two 52-byte infos, clear of the spill
-    mov     qword ptr [rbp-24], rdx
+    FRAME_PROLOG 256                            ; two 52-byte infos, clear of the spill
+    mov     qword ptr [rbp-56], rcx             ; path A
+    mov     qword ptr [rbp-24], rdx             ; path B
     mov     qword ptr [rbp-32], -1              ; handle B
     mov     dword ptr [rbp-40], 0               ; result
     test    rcx, rcx
     jz      gsf2_done
     test    rdx, rdx
     jz      gsf2_done
-    WINCALL CreateFileW, rcx, 80h, 7, 0, OPEN_EXISTING_, 02000000h, 0
+    lea     rdx, [g_gsf_a]
+    mov     r8d, MAX_PATH_CHARS + 16
+    call    path_longify
+    mov     qword ptr [rbp-64], rax
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [g_gsf_b]
+    mov     r8d, MAX_PATH_CHARS + 16
+    call    path_longify
+    mov     qword ptr [rbp-72], rax
+    WINCALL CreateFileW, qword ptr [rbp-64], 80h, 7, 0, OPEN_EXISTING_, 02000000h, 0
     cmp     rax, -1                             ; 80h = FILE_READ_ATTRIBUTES, share all,
     je      gsf2_done                           ;   BACKUP_SEMANTICS
     mov     qword ptr [rbp-48], rax
-    WINCALL CreateFileW, qword ptr [rbp-24], 80h, 7, 0, OPEN_EXISTING_, 02000000h, 0
+    WINCALL CreateFileW, qword ptr [rbp-72], 80h, 7, 0, OPEN_EXISTING_, 02000000h, 0
     mov     qword ptr [rbp-32], rax
     cmp     rax, -1
     je      gsf2_closea
-    WINCALL GetFileInformationByHandle, qword ptr [rbp-48], addr rbp-120
+    WINCALL GetFileInformationByHandle, qword ptr [rbp-48], addr rbp-136
     test    eax, eax
     jz      gsf2_closeb
-    WINCALL GetFileInformationByHandle, qword ptr [rbp-32], addr rbp-184
+    WINCALL GetFileInformationByHandle, qword ptr [rbp-32], addr rbp-200
     test    eax, eax
     jz      gsf2_closeb
-    mov     eax, dword ptr [rbp-120+28]         ; dwVolumeSerialNumber
-    cmp     eax, dword ptr [rbp-184+28]
+    mov     eax, dword ptr [rbp-136+28]         ; dwVolumeSerialNumber
+    cmp     eax, dword ptr [rbp-200+28]
     jne     gsf2_closeb
-    mov     rax, qword ptr [rbp-120+44]         ; nFileIndexHigh:Low
-    cmp     rax, qword ptr [rbp-184+44]
+    mov     rax, qword ptr [rbp-136+44]         ; nFileIndexHigh:Low
+    cmp     rax, qword ptr [rbp-200+44]
     jne     gsf2_closeb
     mov     dword ptr [rbp-40], 1
 gsf2_closeb:
@@ -11241,22 +11830,29 @@ gsf2_done:
     ret
 gui_same_file endp
 
-; gui_end_modals() -> eax = how many of this thread's modal dialogs were ended.  A
-;   modal is a dialog-class top-level window whose owner is disabled; the vault
-;   window itself (owned by the disabled tray window) is skipped.
+; gui_end_modals() -> eax = how many of this thread's modal dialogs were ended.
+;   Also cancels any active popup menu (EndMenu + WM_CANCELMODE) and posts WM_CLOSE
+;   alongside EndDialog so common file dialogs (GetOpenFileNameW / GetSaveFileNameW)
+;   unwind promptly when auto-lock or session lock fires.
 gui_end_modals proc frame
-    FRAME_PROLOG 32
+    FRAME_PROLOG 48
     mov     dword ptr [g_em_count], 0
-    WINCALL GetCurrentThreadId
+    WINCALL EndMenu
+    cmp     qword ptr [g_vaulthwnd], 0
+    je      @F
+    WINCALL SendMessageW, qword ptr [g_vaulthwnd], WM_CANCELMODE_, 0, 0
+@@: WINCALL GetCurrentThreadId
     WINCALL EnumThreadWindows, eax, addr gem_cb, 0
     mov     eax, dword ptr [g_em_count]
     FRAME_EPILOG
     ret
 gui_end_modals endp
 
-; gem_cb(rcx = hwnd, rdx = lparam) -> TRUE (keep enumerating).
-gem_cb proc frame
-    FRAME_PROLOG 64
+; gem_cb(rcx = hwnd, rdx = lparam) -> TRUE (keep enumerating).  Raw frame (OS callback).
+gem_cb proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 64
     mov     qword ptr [rbp-24], rcx
     cmp     rcx, qword ptr [g_vaulthwnd]
     je      gem_next
@@ -11273,21 +11869,25 @@ gem_cb proc frame
     test    eax, eax
     jnz     gem_next                            ; owner usable -> not modal over it
     WINCALL EndDialog, qword ptr [rbp-24], IDCANCEL
+    WINCALL PostMessageW, qword ptr [rbp-24], WM_CLOSE, 0, 0
     inc     dword ptr [g_em_count]
 gem_next:
     mov     eax, 1
-    FRAME_EPILOG
+    mov     rsp, rbp
+    pop     rbp
     ret
 gem_cb endp
 
-; gui_motw(rcx = wide path) - mark a file Vordr just wrote out as downloaded from the
-;   internet (Zone.Identifier ZoneId=3), so Office opens it in Protected View, Windows
-;   asks before running it, and SmartScreen checks it.  An attachment's bytes are
-;   whatever was imported; the vault vouches for where they are kept, not for what
-;   they do.  Best-effort: FAT/exFAT and some shares have no alternate streams.
+; gui_motw(rcx = wide path) -> eax = 1 if Zone.Identifier (ZoneId=3) was written
+;   completely, else 0.  Passes <path>:Zone.Identifier through path_longify and
+;   opens with FILE_FLAG_OPEN_REPARSE_POINT so long paths and symlinks cannot
+;   silently skip or redirect Mark-of-the-Web.
 gui_motw proc frame
-    FRAME_PROLOG 96                             ; locals to -40 clear of the 7-arg spill
+    FRAME_PROLOG 112                            ; locals to -48 clear of the 7-arg spill
     mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-44], 0               ; result = 0 (fail-closed)
+    test    rcx, rcx
+    jz      gmw_done
     xor     r8d, r8d                            ; a path that does not fit would be cut,
 gmw_len:                                        ;   and the stream would land on a prefix
     cmp     word ptr [rcx+r8*2], 0              ;   of it - another file entirely
@@ -11305,53 +11905,45 @@ gmw_fits:
     lea     rdx, [motw_ads]
     lea     r8, [g_motw_w + (MAX_PATH_CHARS+31)*2]
     call    gui_wstrcpy
-    WINCALL CreateFileW, addr g_motw_w, GENERIC_WRITE_, 0, 0, 2, FILE_ATTR_NORMAL_, 0
+    lea     rcx, [g_motw_w]
+    lea     rdx, [g_motw_io]
+    mov     r8d, MAX_PATH_CHARS + 48
+    call    path_longify
+    mov     qword ptr [rbp-48], rax
+    mov     dword ptr [rbp-40], 0
+    WINCALL CreateFileW, qword ptr [rbp-48], GENERIC_WRITE_, 0, 0, 2, <FILE_ATTR_NORMAL_ or 00200000h>, 0
     cmp     rax, -1                             ; 2 = CREATE_ALWAYS (the stream, not the file)
     je      gmw_done
     mov     qword ptr [rbp-32], rax
     WINCALL WriteFile, qword ptr [rbp-32], addr motw_body, motw_body_len, addr rbp-40, 0
+    test    eax, eax
+    jz      gmw_close
+    cmp     dword ptr [rbp-40], motw_body_len
+    jne     gmw_close
+    mov     dword ptr [rbp-44], 1
+gmw_close:
     WINCALL CloseHandle, qword ptr [rbp-32]
 gmw_done:
+    mov     eax, dword ptr [rbp-44]
     FRAME_EPILOG
     ret
 gui_motw endp
 
 ; gui_tag_saveas(rcx = hdlg, edx = file index) - decrypt the attachment and let the
-;   user pick where to save it (Save As).  Used for executable/script types instead
-;   of opening them: Vordr writes the file but never runs it on the user's behalf.
+;   user pick where to save it (Save As).  Used for all non-previewable types so
+;   Vordr writes the file (marked with MOTW where supported) without executing it.
 gui_tag_saveas proc frame
     FRAME_PROLOG 64
     mov     qword ptr [rbp-24], rcx           ; hdlg
     mov     dword ptr [rbp-32], edx           ; index
-    ; prefill the Save As name with the basename of the stored filename
+    cmp     edx, dword ptr [g_tilefile_n]
+    jae     gts_done
+    ; prefill the Save As name with the canonicalized stored filename
     mov     ecx, edx
     call    tf_entry
-    add     rax, TFILE_NAME
-    mov     r10, rax
-    mov     r11, rax
-gts_scan:
-    mov     dx, word ptr [r10]
-    test    dx, dx
-    jz      gts_scandone
-    cmp     dx, '\'
-    je      gts_sep
-    cmp     dx, '/'
-    jne     gts_snext
-gts_sep:
-    lea     r11, [r10+2]
-gts_snext:
-    add     r10, 2
-    jmp     gts_scan
-gts_scandone:
-    mov     qword ptr [rbp-40], r11
-    movzx   eax, word ptr [r11]               ; empty name -> default
-    test    eax, eax
-    jnz     @F
-    lea     r11, [name_default_att]
-    mov     qword ptr [rbp-40], r11
-@@: lea     rcx, [g_imgpath]
-    mov     rdx, qword ptr [rbp-40]
-    call    gui_wcpy_capped
+    lea     rcx, [rax+TFILE_NAME]
+    lea     rdx, [g_imgpath]
+    call    gui_sanitize_attname
     lea     rax, [g_allfilter]
     mov     qword ptr [g_pickfilter], rax
     mov     rcx, qword ptr [rbp-24]
@@ -11359,10 +11951,14 @@ gts_scandone:
     call    img_pick
     test    eax, eax
     jz      gts_done                          ; cancelled
+    cmp     qword ptr [g_body_ptr], 0         ; vault locked while Save As was open?
+    je      gts_done
     mov     ecx, dword ptr [rbp-32]
+    cmp     ecx, dword ptr [g_tilefile_n]
+    jae     gts_done
     call    tf_entry                          ; AttachRef @ +0
     mov     rcx, rax
-    lea     rdx, [rbp-48]                      ; &len
+    lea     rdx, [rbp-48]                     ; &len
     call    attach_open
     test    rax, rax
     jz      gts_done
@@ -11373,11 +11969,11 @@ gts_scandone:
     call    write_file
     test    eax, eax
     jnz     @F
-    lea     rcx, [g_imgpath]                  ; an executable type, by definition: mark it
+    lea     rcx, [g_imgpath]                  ; best-effort MOTW on user-selected volume
     call    gui_motw
 @@: mov     rcx, qword ptr [rbp-56]
     mov     rdx, qword ptr [rbp-48]
-    call    mem_free
+    call    attach_free
 gts_done:
     FRAME_EPILOG
     ret
@@ -11449,13 +12045,13 @@ gtk_relayout:
 gtk_open:
     cmp     dword ptr [g_nopreview], 0               ; preview disabled -> download only,
     jne     gtk_saveas                               ;   never decrypt to a temp file
-    mov     ecx, dword ptr [rbp-76]                  ; executable/script type?
+    mov     ecx, dword ptr [rbp-76]                  ; safe-preview allowlist check
     call    tf_entry
     lea     rcx, [rax+TFILE_NAME]
-    call    gui_ext_is_exec
+    call    gui_ext_can_preview
     test    eax, eax
-    jnz     gtk_saveas                               ; yes -> Save As, never run it
-    mov     ecx, dword ptr [rbp-76]                  ; otherwise open in the default app
+    jz      gtk_saveas                               ; not allowlisted -> Save As, never launch
+    mov     ecx, dword ptr [rbp-76]                  ; allowlisted -> open in default viewer
     call    gui_tag_open
     jmp     gtk_done
 gtk_saveas:
@@ -11480,11 +12076,15 @@ gui_tile_palette_add proc frame
     call    img_pick
     test    eax, eax
     jz      gtpa_done
+    cmp     qword ptr [g_body_ptr], 0            ; vault locked while picker was open?
+    je      gtpa_done
     mov     rcx, qword ptr [rbp-24]
     call    gui_tile_add_cur                     ; read, stage, append - or 0
     test    eax, eax
     jnz     gtpa_added
     WINCALL gui_msgbox, qword ptr [rbp-24], addr s_attfail, addr t_err, <MB_OK or MB_ICONWARNING>
+    cmp     qword ptr [g_body_ptr], 0
+    je      gtpa_done
 gtpa_added:
     call    tf_find_row                          ; already have a tile?
     cmp     eax, -1
@@ -11531,6 +12131,7 @@ gui_tile_add_cur proc frame
     jnz     gtac_free_no
     lea     rcx, [g_imgstageref]
     lea     rdx, [g_imgfn_w]
+    mov     r8d, 120
     call    tf_append                               ; cannot be full: checked above
     test    eax, eax
     jnz     gtac_free_no
@@ -12127,9 +12728,253 @@ dynid proc
     ret
 dynid endp
 
-; gui_url_open(rcx=hdlg, edx=row) - read the URL from the row's value field and
-;   open it in the default browser, prepending https:// when the value carries no
-;   "://" scheme.  Invoked when a URL field is clicked in view mode.
+; gui_url_prepare(rcx = src_w, rdx = dst_w, r8d = cap_cch) -> eax = 1 ok / 0 reject.
+;   Trims leading/trailing ASCII whitespace, rejects empty inputs, control characters
+;   (<= 0x20, 0x7F), quotes ('"'), angle brackets ('<', '>'), backslashes ('\'),
+;   protocol-relative "//...", non-http(s) schemes (file:, javascript:, ms-msdt:,
+;   search-ms:, drive paths C:/...), and empty/slash-prefixed hosts ("https:///...").
+;   Normalizes scheme to lowercase http:// or https:// (prepending https:// when
+;   absent) and writes the NUL-terminated URL to dst_w when it fits in cap_cch.
+public gui_url_prepare
+gui_url_prepare proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx             ; src_w
+    mov     qword ptr [rbp-32], rdx             ; dst_w
+    mov     dword ptr [rbp-36], r8d             ; cap_cch
+    test    rcx, rcx
+    jz      gup_no
+    test    rdx, rdx
+    jz      gup_no
+    cmp     r8d, 10
+    jb      gup_no
+    mov     r10, rcx
+    xor     ecx, ecx
+gup_slen:
+    cmp     word ptr [r10+rcx*2], 0
+    je      gup_triml
+    inc     ecx
+    cmp     ecx, 4096
+    jb      gup_slen
+    jmp     gup_no                              ; unterminated / absurdly long
+gup_triml:
+    test    ecx, ecx
+    jz      gup_no
+    movzx   eax, word ptr [r10]
+    cmp     eax, ' '
+    je      gup_trimlc
+    cmp     eax, 09h
+    jb      gup_trimr
+    cmp     eax, 0Dh
+    ja      gup_trimr
+gup_trimlc:
+    add     r10, 2
+    dec     ecx
+    jmp     gup_triml
+gup_trimr:
+    test    ecx, ecx
+    jz      gup_no
+    movzx   eax, word ptr [r10+rcx*2-2]
+    cmp     eax, ' '
+    je      gup_trimrc
+    cmp     eax, 09h
+    jb      gup_charscan
+    cmp     eax, 0Dh
+    ja      gup_charscan
+gup_trimrc:
+    dec     ecx
+    jmp     gup_trimr
+gup_charscan:
+    ; reject controls/embedded whitespace (<= 0x20), DEL (0x7F), '"', '<', '>', '\'
+    xor     edx, edx
+gup_chlp:
+    cmp     edx, ecx
+    jae     gup_find_scheme
+    movzx   eax, word ptr [r10+rdx*2]
+    cmp     eax, 20h
+    jbe     gup_no
+    cmp     eax, 7Fh
+    je      gup_no
+    cmp     eax, '"'
+    je      gup_no
+    cmp     eax, '<'
+    je      gup_no
+    cmp     eax, '>'
+    je      gup_no
+    cmp     eax, '\'
+    je      gup_no
+    inc     edx
+    jmp     gup_chlp
+gup_find_scheme:
+    ; look for "://" in r10[0..ecx-1]
+    xor     r8d, r8d
+gup_sclp:
+    lea     eax, [r8d+3]
+    cmp     eax, ecx
+    ja      gup_bare
+    cmp     word ptr [r10+r8*2], ':'
+    jne     gup_scnext
+    cmp     word ptr [r10+r8*2+2], '/'
+    jne     gup_scnext
+    cmp     word ptr [r10+r8*2+4], '/'
+    je      gup_scheme
+gup_scnext:
+    inc     r8d
+    jmp     gup_sclp
+gup_bare:
+    ; no "://": reject leading '/' ("//host/share") or ':'
+    movzx   eax, word ptr [r10]
+    cmp     eax, '/'
+    je      gup_no
+    cmp     eax, ':'
+    je      gup_no
+    cmp     eax, '['
+    je      gup_bare_ipv6
+    ; scan authority up to '/', '?', '#', or end: if ':' appears, require >=1 ASCII
+    ; digits for a port (blocks javascript:, ms-msdt:, search-ms:, file:/, C:/...)
+    xor     edx, edx
+gup_auth_lp:
+    cmp     edx, ecx
+    jae     gup_bare_ok
+    movzx   eax, word ptr [r10+rdx*2]
+    cmp     eax, '/'
+    je      gup_bare_ok
+    cmp     eax, '?'
+    je      gup_bare_ok
+    cmp     eax, '#'
+    je      gup_bare_ok
+    cmp     eax, ':'
+    je      gup_bare_port
+    inc     edx
+    jmp     gup_auth_lp
+gup_bare_port:
+    inc     edx                                 ; past ':'
+    xor     r9d, r9d                            ; port digit count
+gup_port_lp:
+    cmp     edx, ecx
+    jae     gup_port_end
+    movzx   eax, word ptr [r10+rdx*2]
+    cmp     eax, '/'
+    je      gup_port_end
+    cmp     eax, '?'
+    je      gup_port_end
+    cmp     eax, '#'
+    je      gup_port_end
+    cmp     eax, '0'
+    jb      gup_no
+    cmp     eax, '9'
+    ja      gup_no
+    inc     r9d
+    inc     edx
+    jmp     gup_port_lp
+gup_port_end:
+    test    r9d, r9d
+    jz      gup_no                              ; empty port (e.g. "C:/..." or "foo:")
+    jmp     gup_bare_ok
+gup_bare_ipv6:
+    mov     edx, 1
+gup_v6_lp:
+    cmp     edx, ecx
+    jae     gup_no                              ; unclosed '['
+    movzx   eax, word ptr [r10+rdx*2]
+    cmp     eax, ']'
+    je      gup_bare_ok
+    cmp     eax, '/'
+    je      gup_no
+    inc     edx
+    jmp     gup_v6_lp
+gup_bare_ok:
+    mov     eax, ecx
+    add     eax, 8                              ; "https://" (8 chars) + ecx + NUL
+    cmp     eax, dword ptr [rbp-36]
+    jae     gup_no
+    mov     r11, qword ptr [rbp-32]             ; dst_w
+    lea     r9, [url_https]
+    xor     edx, edx
+gup_pfx:
+    mov     ax, word ptr [r9+rdx*2]
+    mov     word ptr [r11+rdx*2], ax
+    inc     edx
+    cmp     edx, 8
+    jb      gup_pfx
+    xor     r8d, r8d
+gup_bcp:
+    cmp     r8d, ecx
+    jae     gup_bcpd
+    mov     ax, word ptr [r10+r8*2]
+    mov     word ptr [r11+rdx*2], ax
+    inc     r8d
+    inc     edx
+    jmp     gup_bcp
+gup_bcpd:
+    mov     word ptr [r11+rdx*2], 0
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gup_scheme:
+    ; allowlist: http:// (len 4) or https:// (len 5) only
+    cmp     r8d, 4
+    jb      gup_no
+    cmp     r8d, 5
+    ja      gup_no
+    lea     r11, [url_https]                    ; [0..r8d) is "http" or "https"
+    xor     r9d, r9d
+gup_sc_ci:
+    movzx   eax, word ptr [r10+r9*2]
+    or      eax, 20h
+    movzx   edx, word ptr [r11+r9*2]
+    cmp     eax, edx
+    jne     gup_no
+    inc     r9d
+    cmp     r9d, r8d
+    jb      gup_sc_ci
+    lea     r9d, [r8d+3]                        ; first char of host after "://"
+    cmp     r9d, ecx
+    jae     gup_no                              ; empty host ("https://")
+    movzx   eax, word ptr [r10+r9*2]
+    cmp     eax, '/'
+    je      gup_no                              ; "https:///..."
+    cmp     eax, '?'
+    je      gup_no
+    cmp     eax, '#'
+    je      gup_no
+    cmp     ecx, dword ptr [rbp-36]
+    jae     gup_no
+    mov     r11, qword ptr [rbp-32]
+    xor     edx, edx
+gup_scp_sc:
+    cmp     edx, r8d
+    jae     gup_scp_rest
+    movzx   eax, word ptr [r10+rdx*2]
+    or      eax, 20h                            ; normalize scheme to lowercase
+    mov     word ptr [r11+rdx*2], ax
+    inc     edx
+    jmp     gup_scp_sc
+gup_scp_rest:
+    cmp     edx, ecx
+    jae     gup_scp_done
+    mov     ax, word ptr [r10+rdx*2]
+    mov     word ptr [r11+rdx*2], ax
+    inc     edx
+    jmp     gup_scp_rest
+gup_scp_done:
+    mov     word ptr [r11+rdx*2], 0
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gup_no:
+    mov     rdx, qword ptr [rbp-32]
+    test    rdx, rdx
+    jz      @F
+    cmp     dword ptr [rbp-36], 0
+    je      @F
+    mov     word ptr [rdx], 0
+@@: xor     eax, eax
+    FRAME_EPILOG
+    ret
+gui_url_prepare endp
+
+; gui_url_open(rcx=hdlg, edx=row) - read the URL from the row's value field,
+;   validate/canonicalize via gui_url_prepare, and open in the default browser.
 gui_url_open proc frame
     FRAME_PROLOG 96
     mov     qword ptr [rbp-24], rcx
@@ -12149,60 +12994,13 @@ guo_fits:
     WINCALL GetDlgItemTextW, qword ptr [rbp-24], dword ptr [rbp-40], addr g_urlbuf, 1024
     test    eax, eax
     jz      guo_done                            ; empty field
-    lea     r10, [g_urlbuf]                     ; scheme present ("://")?
-    xor     ecx, ecx
-guo_scan:
-    movzx   eax, word ptr [r10+rcx*2]
+    lea     rcx, [g_urlbuf]
+    lea     rdx, [g_urlbuf2]
+    mov     r8d, 1040
+    call    gui_url_prepare
     test    eax, eax
-    jz      guo_bare
-    cmp     eax, ':'
-    jne     guo_next
-    movzx   eax, word ptr [r10+rcx*2+2]
-    cmp     eax, '/'
-    jne     guo_next
-    movzx   eax, word ptr [r10+rcx*2+4]
-    cmp     eax, '/'
-    je      guo_hasscheme
-guo_next:
-    inc     ecx
-    cmp     ecx, 1022
-    jb      guo_scan
-guo_bare:
-    lea     rcx, [g_urlbuf2]                    ; target = "https://" + url
-    lea     rdx, [url_https]
-    lea     r8, [g_urlbuf2 + (1040-1)*2]        ; last slot the NUL may occupy
-    call    gui_wstrcpy
-    mov     rcx, rax
-    lea     rdx, [g_urlbuf]
-    lea     r8, [g_urlbuf2 + (1040-1)*2]        ; last slot the NUL may occupy
-    call    gui_wstrcpy
-    lea     rax, [g_urlbuf2]
-    mov     qword ptr [rbp-48], rax
-    jmp     guo_exec
-guo_hasscheme:
-    ; allowlist: only open http:// and https://.  A stored or imported URL field
-    ; could carry file://, a UNC path, javascript:, etc., which ShellExecute would
-    ; launch as click-to-execute in the user's context.  ecx = scheme length.
-    cmp     ecx, 4
-    jb      guo_done
-    cmp     ecx, 5
-    ja      guo_done
-    lea     r10, [g_urlbuf]
-    lea     r11, [url_https]                    ; L"https://": [0..ecx) is "http"/"https"
-    xor     r9d, r9d
-guo_ci_lp:
-    movzx   eax, word ptr [r10+r9*2]
-    or      eax, 20h                            ; ASCII tolower
-    movzx   edx, word ptr [r11+r9*2]
-    cmp     eax, edx
-    jne     guo_done                            ; scheme not http/https -> do not open
-    inc     r9d
-    cmp     r9d, ecx
-    jb      guo_ci_lp
-    lea     rax, [g_urlbuf]
-    mov     qword ptr [rbp-48], rax
-guo_exec:
-    WINCALL ShellExecuteW, 0, addr verb_open, qword ptr [rbp-48], 0, 0, 1
+    jz      guo_done
+    WINCALL ShellExecuteW, 0, addr verb_open, addr g_urlbuf2, 0, 0, 1
 guo_done:
     lea     rcx, [g_urlbuf]                     ; URLs may carry internal hosts / tokens
     mov     edx, 1024*2
@@ -13013,6 +13811,8 @@ gom_track:
     mov     dword ptr [rbp-44], eax              ; chosen id
     WINCALL DestroyMenu, qword ptr [rbp-32]
     WINCALL DeleteObject, qword ptr [rbp-64]
+    cmp     qword ptr [g_body_ptr], 0            ; vault locked while menu was open?
+    je      gom_done
     cmp     dword ptr [rbp-44], 7               ; "Recover items" -> enter trash view
     jne     gom_notrecover
     call    gui_first_deleted
@@ -14289,6 +15089,8 @@ gui_pick_template proc frame
     mov     dword ptr [rbp-44], eax
     WINCALL DestroyMenu, qword ptr [rbp-32]
     WINCALL DeleteObject, qword ptr [rbp-64]
+    cmp     qword ptr [g_body_ptr], 0            ; vault locked while menu was open?
+    je      gpt_cancel
     mov     eax, dword ptr [rbp-44]
     test    eax, eax
     jz      gpt_cancel
@@ -14374,6 +15176,8 @@ gam_totp:
     mov     dword ptr [rbp-44], eax              ; chosen id
     WINCALL DestroyMenu, qword ptr [rbp-32]
     WINCALL DeleteObject, qword ptr [rbp-64]
+    cmp     qword ptr [g_body_ptr], 0            ; vault locked while menu was open?
+    je      gam_done
     cmp     dword ptr [rbp-44], 0
     je      gam_done
     mov     rcx, qword ptr [rbp-24]
@@ -14465,8 +15269,10 @@ settings_proc endp
 ;   with the label to its left by ~4 DLU, and the label sits above it in z-order, so a
 ;   clipped edit loses its own left edge ("20" renders as "!0").  Those controls have no
 ;   overlay to defend against - only the vault's do.
-gui_clip_cb proc frame
-    FRAME_PROLOG 72                            ; locals clear of the callees' home areas
+gui_clip_cb proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 80                            ; locals clear of the callees' home areas
     mov     qword ptr [rbp-24], rcx
     mov     qword ptr [rbp-32], rdx            ; the vault hwnd
     WINCALL GetParent, qword ptr [rbp-24]
@@ -14478,7 +15284,8 @@ gui_clip_cb proc frame
     WINCALL SetWindowLongPtrW, qword ptr [rbp-24], GWL_STYLE_, qword ptr [rbp-40]
 gcc_next:
     mov     eax, 1
-    FRAME_EPILOG
+    mov     rsp, rbp
+    pop     rbp
     ret
 gui_clip_cb endp
 
@@ -14771,8 +15578,10 @@ frame_hittest endp
 
 ; frame_shift_cb(rcx=child, rdx=parent) - EnumChildWindows callback: move one
 ;   child down by TBAR_H so the reclaimed caption space becomes the title strip.
-frame_shift_cb proc frame
-    FRAME_PROLOG 128                            ; spill area must clear the locals (down to -76)
+frame_shift_cb proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 144                            ; spill area must clear the locals (down to -76)
     mov     qword ptr [rbp-24], rcx
     mov     qword ptr [rbp-32], rdx
     ; DIRECT children only.  EnumChildWindows recurses, so this used to shift the settings
@@ -14797,7 +15606,8 @@ frame_shift_cb proc frame
             dword ptr [rbp-68], dword ptr [rbp-72], 1
 fsc_skip:
     mov     eax, 1                             ; continue enumeration
-    FRAME_EPILOG
+    mov     rsp, rbp
+    pop     rbp
     ret
 frame_shift_cb endp
 
@@ -15738,9 +16548,12 @@ vpf_caretdone:
     call    gui_desc                             ; ecx=row -> rax=descriptor
     cmp     dword ptr [rax+FD_KIND], VF_URL
     jne     vp_refocus
-    WINCALL GetKeyState, 1                        ; VK_LBUTTON: focus from a click, not a tab?
+    WINCALL GetKeyState, 1                        ; VK_LBUTTON: Ctrl+Click required to open URL
     test    ax, ax
     jns     vp_refocus                          ; high bit clear -> keyboard focus, ignore
+    WINCALL GetKeyState, VK_CONTROL_
+    test    ax, ax
+    jns     vp_refocus                          ; plain click selects/focuses without launching
     mov     rcx, qword ptr [rbp-8]
     mov     edx, dword ptr [rbp-16]
     call    gui_url_open
@@ -15800,6 +16613,8 @@ vp_iconpick:
     cmp     dword ptr [g_cur_idx], 0             ; only with an entry shown (edit mode only)
     jl      vp_handled
     WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_ICON, qword ptr [rbp-8], addr icon_proc, 0
+    cmp     qword ptr [g_body_ptr], 0            ; vault locked while dialog was open?
+    je      vp_handled
     cmp     eax, 1
     jne     vp_handled
     mov     rcx, qword ptr [rbp-8]               ; repaint the icon button with the new glyph
@@ -15986,6 +16801,8 @@ vp_add:
     mov     dword ptr [g_dirty], 0
     mov     rcx, qword ptr [rbp-8]            ; choose a template (Login/Card/Identity/Note)
     call    gui_pick_template
+    cmp     qword ptr [g_body_ptr], 0
+    je      vp_handled
     cmp     eax, -1
     je      vp_handled                       ; menu cancelled -> no new entry
     mov     edx, eax                         ; build the field list from the template
@@ -16129,6 +16946,8 @@ vp_remove:
     test    eax, eax
     jnz     vp_handled
     WINCALL gui_msgbox, qword ptr [rbp-8], addr t_trash, addr t_err, <MB_YESNO or MB_ICONQUESTION>
+    cmp     qword ptr [g_body_ptr], 0
+    je      vp_handled
     cmp     eax, IDYES
     jne     vp_handled
     mov     dword ptr [g_deleted_state], 1   ; soft-delete: mark VF_DELETED + reseal
@@ -16140,6 +16959,8 @@ vp_remove:
     jmp     vpr_teardown
 vpr_forever:
     WINCALL gui_msgbox, qword ptr [rbp-8], addr t_delforever, addr t_err, <MB_YESNO or MB_ICONWARNING>
+    cmp     qword ptr [g_body_ptr], 0
+    je      vp_handled
     cmp     eax, IDYES
     jne     vp_handled
     mov     ecx, dword ptr [g_cur_idx]
@@ -16188,15 +17009,14 @@ vp_close:
     mov     dword ptr [g_lock_tries], 0
     cmp     dword ptr [g_menu_open], 0       ; closing while settings open -> save
     je      vp_lock_dirty
+    cmp     qword ptr [g_body_ptr], 0
+    je      vp_lock_dirty
     mov     rcx, qword ptr [rbp-8]
     call    gui_menu_save
 vp_lock_dirty:
     mov     dword ptr [g_dirty], 0           ; locking discards unsaved inline edits
 vp_lock_go:
     sub     rsp, 32
-    mov     rcx, qword ptr [rbp-8]
-    mov     edx, CLIP_TIMER
-    call    KillTimer
     mov     rcx, qword ptr [rbp-8]
     mov     edx, TOTP_TIMER
     call    KillTimer
@@ -16211,7 +17031,7 @@ vp_lock_go:
     add     rsp, 32
     mov     dword ptr [g_totp_on], 0
     call    gui_temp_purge                  ; overwrite + delete any decrypt-to-temp files
-    call    gui_clipclear                   ; clear the clipboard if it is still ours
+    call    gui_clipclear                   ; clear the clipboard (or arm tray retry timer)
     lea     rcx, [g_secret_w]               ; wipe revealed secret + TOTP material
     mov     edx, CONVW_MAX*2
     call    secure_zero
@@ -16221,10 +17041,18 @@ vp_lock_go:
     lea     rcx, [g_e_totp]
     mov     edx, 512
     call    secure_zero
-    lea     rcx, [g_rowpw_w]                 ; revealed-row secret (if overlay was up)
+    lea     rcx, [g_rowpw_w]                ; revealed-row secret (if overlay was up)
     mov     edx, 512*2
     call    secure_zero
-    mov     qword ptr [g_vaulthwnd], 0       ; window going away -> tray reopens it
+    ; Cryptographic lock happens IMMEDIATELY here - even if a stubborn OS/shell modal
+    ; (e.g. GetOpenFileNameW) keeps DialogBoxParamW on the call stack briefly.
+    call    vault_lock
+    call    tile_cache_flush
+    call    secmem_wipe_statics
+    mov     dword ptr [g_tilefile_n], 0
+    mov     dword ptr [g_pwhist_n], 0
+    mov     dword ptr [g_pworig_n], 0
+    mov     qword ptr [g_vaulthwnd], 0      ; window going away -> tray reopens it
     WINCALL EndDialog, qword ptr [rbp-8], 0
 vp_handled:
     mov     eax, 1
@@ -16516,6 +17344,7 @@ cd_polok:
     FRAME_EPILOG
     ret
 cd_status:
+    call    gui_wipepw
     call    gui_wipepw_create
     WINCALL gui_msgbox, qword ptr [rbp-24], qword ptr [rbp-56], addr t_err, \
             <MB_OK or MB_ICONWARNING>
@@ -16991,6 +17820,8 @@ create_proc proc
     mov     qword ptr [rbp-8], rcx
     cmp     rdx, WM_INITDIALOG
     je      cp_init
+    cmp     rdx, WM_DESTROY
+    je      cp_destroy
     cmp     rdx, WM_COMMAND
     je      cp_cmd
     cmp     rdx, WM_CTLCOLORSTATIC
@@ -17030,7 +17861,13 @@ cp_tdraw:
 cp_tunh:
     xor     eax, eax
     jmp     cp_ret
+cp_destroy:
+    mov     qword ptr [g_secdesk_hwnd], 0
+    xor     eax, eax
+    jmp     cp_ret
 cp_init:
+    mov     rax, qword ptr [rbp-8]
+    mov     qword ptr [g_secdesk_hwnd], rax
     mov     rcx, qword ptr [rbp-8]
     mov     edx, IDOK
     call    theme_attach
@@ -17099,10 +17936,23 @@ cp_info:
     mov     eax, 1
     jmp     cp_ret
 cp_ok:
+    cmp     dword ptr [g_secdesk_orphan], 0
+    jne     cp_cancel
     mov     rcx, qword ptr [rbp-8]
     call    gui_create_do
     test    eax, eax
     jz      cp_handled                      ; error shown, stay open
+    cmp     dword ptr [g_secdesk_orphan], 0
+    je      @F
+    call    gui_wipepw
+    jmp     cp_cancel
+@@: mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_C_PW
+    call    gui_edit_scrub
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_C_PW2
+    call    gui_edit_scrub
+    mov     qword ptr [g_secdesk_hwnd], 0
     sub     rsp, 32
     mov     rcx, qword ptr [rbp-8]
     mov     edx, 1
@@ -17112,6 +17962,14 @@ cp_handled:
     mov     eax, 1
     jmp     cp_ret
 cp_cancel:
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_C_PW
+    call    gui_edit_scrub
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_C_PW2
+    call    gui_edit_scrub
+    call    gui_wipepw_create
+    mov     qword ptr [g_secdesk_hwnd], 0
     sub     rsp, 32
     mov     rcx, qword ptr [rbp-8]
     xor     edx, edx
@@ -17677,13 +18535,15 @@ gui_fix_ext endp
 ; box, and the extension is settled from the filter index on return (gui_fix_ext).
 
 gui_export proc frame
-    FRAME_PROLOG 64
+    FRAME_PROLOG 80
     mov     qword ptr [rbp-24], rcx
     mov     dword ptr [g_sel_src], 0             ; checklist draws from the open vault
     call    vault_count                          ; open the checklist with all entries ticked
     mov     ecx, eax
     call    gui_sel_all
     WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_SELECT, qword ptr [rbp-24], addr select_proc, 0
+    cmp     qword ptr [g_body_ptr], 0            ; VDR-06: locked while checklist was open?
+    je      gx_done
     cmp     eax, 1
     jne     gx_done
     ; ---- destination FIRST: the chosen file type is the chosen format ------
@@ -17698,6 +18558,8 @@ gui_export proc frame
     call    img_pick
     test    eax, eax
     jz      gx_done
+    cmp     qword ptr [g_body_ptr], 0            ; VDR-06: locked while Save dialog was open?
+    je      gx_done
     lea     r10, [g_ofn]                         ; the TYPE box is the authority, not the
     xor     eax, eax                             ;   text the user was left with: filter 2
     cmp     dword ptr [r10].OPENFILENAMEW.nFilterIndex, 2   ;   = ZIP, anything else = vordr
@@ -17709,16 +18571,22 @@ gui_export proc frame
     mov     edx, MAX_PATH_CHARS                  ;   name in step, this guarantees the path
     mov     r8d, eax                             ;   actually written matches the format
     call    gui_fix_ext
+    ; VDR-07: snapshot the destination into private g_exppath so an external
+    ; WM_COPYDATA hand-off into g_imgpath can never redirect an in-flight export.
+    lea     rcx, [g_exppath]
+    lea     rdx, [g_imgpath]
+    lea     r8, [g_exppath + (MAX_PATH_CHARS-1)*2]
+    call    gui_wstrcpy
     ; The export target must not be the vault itself: the file dialog happily offers
     ; it, and writing the export over it replaced the vault with a copy encrypted
     ; under the EXPORT password - or with a ZIP.  Compared by file identity, so no
     ; spelling, short name or hard link gets round it.
-    lea     rcx, [g_imgpath]
+    lea     rcx, [g_exppath]
     lea     rdx, [g_vpath]
     call    gui_same_file
     test    eax, eax
     jnz     gx_self
-    lea     rcx, [g_imgpath]
+    lea     rcx, [g_exppath]
     mov     rdx, qword ptr [g_cfg_in]
     call    gui_same_file
     test    eax, eax
@@ -17729,6 +18597,8 @@ gui_export proc frame
     ; given up - including the extensions kept in member names - and let them back out.
     WINCALL gui_msgbox, qword ptr [rbp-24], addr exp_zipwarn, addr exp_title, \
             <MB_OKCANCEL or MB_ICONWARNING>
+    cmp     qword ptr [g_body_ptr], 0
+    je      gx_done
     cmp     eax, IDOK
     jne     gx_done
 gx_askpw:
@@ -17744,8 +18614,25 @@ gx_askpw:
 gx_pw_normal:
     WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_XLPW, qword ptr [rbp-24], addr xlpw_proc, 0
 gx_pw_res:
+    cmp     qword ptr [g_body_ptr], 0            ; VDR-06: locked while password dialog was open?
+    jne     gx_pw_alive
+    call    ges_wipepw
+    jmp     gx_done
+gx_pw_alive:
     cmp     rax, 1
     jne     gx_done
+    ; VDR-07: re-verify file identity right before write (catches symlink/hardlink swap
+    ; during the modal password prompt).
+    lea     rcx, [g_exppath]
+    lea     rdx, [g_vpath]
+    call    gui_same_file
+    test    eax, eax
+    jnz     gx_self_wipe
+    lea     rcx, [g_exppath]
+    mov     rdx, qword ptr [g_cfg_in]
+    call    gui_same_file
+    test    eax, eax
+    jnz     gx_self_wipe
     cmp     dword ptr [rbp-40], 0
     jne     gx_zip
     ; ---- .vordr: seal a child vault; the master stays open throughout -------
@@ -17753,7 +18640,7 @@ gx_pw_res:
     call    password_to_utf8
     test    eax, eax
     jz      gx_composefail
-    lea     rcx, [g_imgpath]
+    lea     rcx, [g_exppath]
     call    vault_export_sel
     mov     dword ptr [rbp-32], eax
     lea     rcx, [ev_export]                     ; C5: audit the export
@@ -17779,7 +18666,7 @@ gx_zip:
     mov     eax, dword ptr [rbp-32]
     test    eax, eax
     jnz     gx_composefail
-    lea     rcx, [g_imgpath]
+    lea     rcx, [g_exppath]
     lea     r11, [g_zbuf]
     mov     rdx, qword ptr [r11]
     mov     r8, qword ptr [r11+8]
@@ -17796,6 +18683,8 @@ gx_composefail:
     call    ges_wipepw
     WINCALL MessageBoxW, qword ptr [rbp-24], addr xp_mm_fail, addr xp_mm_title, 010h
     jmp     gx_done
+gx_self_wipe:
+    call    ges_wipepw
 gx_self:
     WINCALL gui_msgbox, qword ptr [rbp-24], addr exp_self, addr exp_title, <MB_OK or MB_ICONWARNING>
     jmp     gx_done
@@ -18340,6 +19229,8 @@ gui_open_pwhist proc frame
     mov     dword ptr [g_pwh_dirty], 0
     WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_PWHIST, qword ptr [rbp-24], \
             addr pwhist_proc, 0
+    cmp     qword ptr [g_body_ptr], 0         ; VDR-06: locked while history dialog was open?
+    je      gop_done
     cmp     dword ptr [g_pwh_dirty], 0        ; a purge -> re-save the entry so it sticks
     je      gop_done
     mov     rcx, qword ptr [rbp-24]
@@ -18554,6 +19445,8 @@ gim_ask:
     call    img_pick
     test    eax, eax
     jz      gim_done
+    cmp     qword ptr [g_body_ptr], 0           ; VDR-06: locked while picker was open?
+    je      gim_done
 gim_havefile:
     mov     qword ptr [g_rf_cap], 0F0000000h    ; = ZE_MAXCAP: the lengths below are 32-bit
     lea     rcx, [g_imgpath]
@@ -18581,8 +19474,21 @@ gim_read_ok:
     jne     gim_notvordr
     cmp     word ptr [r10+8], 99                ; method 99 = WinZip AES
     jne     gim_notvordr
+    cmp     dword ptr [g_secunlock], 0          ; VDR-13: honour Secure Unlock for import pw
+    je      gim_zpw_norm
+    mov     ecx, DLG_IMPPW
+    lea     rdx, [imppw_proc]
+    call    gui_secdesk_show
+    jmp     gim_zpw_res
+gim_zpw_norm:
     WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_IMPPW, qword ptr [rbp-24], addr imppw_proc, 0
-    cmp     eax, 1
+gim_zpw_res:
+    cmp     qword ptr [g_body_ptr], 0           ; VDR-06: locked while password dialog was open?
+    jne     gim_zpw_alive
+    call    ges_wipepw
+    jmp     gim_done
+gim_zpw_alive:
+    cmp     rax, 1
     jne     gim_done
     ; ---- stage: decrypt vordr.json + collect entry titles (raw stays mapped) ----
     mov     rcx, qword ptr [rbp-32]             ; raw zip
@@ -18613,8 +19519,21 @@ gim_notvordr:
     jmp     gim_done
     ; ---- .vordr: decrypt the foreign vault, then reuse the same checklist ------
 gim_vault:
+    cmp     dword ptr [g_secunlock], 0          ; VDR-13: honour Secure Unlock for import pw
+    je      gim_vpw_norm
+    mov     ecx, DLG_IMPPW
+    lea     rdx, [imppw_proc]
+    call    gui_secdesk_show
+    jmp     gim_vpw_res
+gim_vpw_norm:
     WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_IMPPW, qword ptr [rbp-24], addr imppw_proc, 0
-    cmp     eax, 1
+gim_vpw_res:
+    cmp     qword ptr [g_body_ptr], 0           ; VDR-06: locked while password dialog was open?
+    jne     gim_vpw_alive
+    call    ges_wipepw
+    jmp     gim_done
+gim_vpw_alive:
+    cmp     rax, 1
     jne     gim_done
     lea     rcx, [g_xlpw]                       ; -> g_cfg_pass, wiping g_xlpw at the source
     call    password_to_utf8
@@ -18639,10 +19558,14 @@ gim_vault:
     cmp     dword ptr [g_zi_trunc], 0           ; say so BEFORE the checklist: importing a
     je      @F                                  ;   silent subset of someone's vault is
     WINCALL gui_msgbox, qword ptr [rbp-24], addr imp_v_trunc, addr t_imp_trunc,             <MB_OK or MB_ICONWARNING>           ;   exactly the surprise to avoid
+    cmp     qword ptr [g_body_ptr], 0
+    je      gim_vfree
 @@: mov     dword ptr [g_sel_src], 1
     mov     ecx, dword ptr [rbp-64]
     call    gui_sel_all
     WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_SELECT, qword ptr [rbp-24], addr select_proc, 0
+    cmp     qword ptr [g_body_ptr], 0           ; VDR-06: locked while checklist was open?
+    je      gim_vfree
     cmp     eax, 1
     jne     gim_vfree                           ; cancelled -> nothing merged
     mov     dword ptr [g_merge_sel], 1          ; honour the ticks
@@ -18678,8 +19601,11 @@ gim_sel:
     mov     ecx, dword ptr [rbp-64]             ; staged count
     call    gui_sel_all
     WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_SELECT, qword ptr [rbp-24], addr select_proc, 0
+    cmp     qword ptr [g_body_ptr], 0           ; VDR-06: locked while checklist was open?
+    je      gim_sel_abort
     cmp     eax, 1
     je      gim_commit
+gim_sel_abort:
     call    zi_abort                            ; user cancelled the selection
     jmp     gim_done
 gim_commit:
@@ -18691,12 +19617,23 @@ gim_commit:
     jmp     gim_done
 gim_ok:
     mov     dword ptr [rbp-64], eax             ; both paths arrive with the count in eax
-    call    vault_reseal
-    lea     rcx, [ev_import]                    ; C5: audit the import
-    mov     edx, dword ptr [rbp-64]
-    call    log_result
     mov     rcx, qword ptr [rbp-24]
     call    gui_poplist
+gim_reseal:
+    call    vault_reseal
+    mov     dword ptr [rbp-72], eax
+    lea     rcx, [ev_import]                    ; VDR-20 / C5: audit reseal outcome (0 = OK)
+    mov     edx, eax
+    call    log_result
+    cmp     dword ptr [rbp-72], 0
+    je      gim_show_ok
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr s_resealfail, addr t_err, <MB_YESNO or MB_ICONWARNING>
+    cmp     qword ptr [g_body_ptr], 0
+    je      gim_done
+    cmp     eax, IDYES
+    je      gim_reseal
+    jmp     gim_done
+gim_show_ok:
     lea     rcx, [g_imp_msgw]                   ; "Imported N entries."
     lea     rdx, [imp_g_pre]
     lea     r8, [g_imp_msgw + (160-1)*2]        ; last slot the NUL may occupy
@@ -19055,6 +19992,9 @@ pp_use_copy:
     lea     rdx, [g_genout_w]                    ; the generated password (wide)
     call    gui_copy
 pp_use_wipe:
+    mov     rcx, qword ptr [rbp-8]               ; VDR-27: scrub IDC_PG_OUT edit buffer
+    mov     edx, IDC_PG_OUT
+    call    gui_edit_scrub
     lea     rcx, [g_genout]                      ; wipe plaintext scratch
     mov     edx, 260
     call    secure_zero
@@ -19065,6 +20005,9 @@ pp_use_wipe:
     mov     eax, 1
     jmp     pp_ret
 pp_cancel:
+    mov     rcx, qword ptr [rbp-8]               ; VDR-27: scrub IDC_PG_OUT edit buffer
+    mov     edx, IDC_PG_OUT
+    call    gui_edit_scrub
     lea     rcx, [g_genout]
     mov     edx, 260
     call    secure_zero
@@ -19183,6 +20126,8 @@ xlpw_proc proc
     je      xpp_init
     cmp     rdx, WM_COMMAND
     je      xpp_cmd
+    cmp     rdx, WM_DESTROY
+    je      xpp_destroy
     cmp     rdx, WM_CTLCOLORSTATIC
     je      xpp_col
     cmp     rdx, WM_CTLCOLOREDIT
@@ -19198,6 +20143,13 @@ xlpw_proc proc
     cmp     rdx, WM_DRAWITEM
     je      xpp_draw
     xor     eax, eax
+    jmp     xpp_ret
+xpp_destroy:
+    mov     rax, qword ptr [rbp-8]
+    cmp     qword ptr [g_secdesk_hwnd], rax
+    jne     @F
+    mov     qword ptr [g_secdesk_hwnd], 0
+@@: xor     eax, eax
     jmp     xpp_ret
 xpp_col:
     call    theme_ctlcolor
@@ -19219,7 +20171,11 @@ xpp_unh:
     xor     eax, eax
     jmp     xpp_ret
 xpp_init:
-    mov     rcx, qword ptr [rbp-8]
+    cmp     qword ptr [g_secdesk_hd], 0
+    je      @F
+    mov     rax, qword ptr [rbp-8]
+    mov     qword ptr [g_secdesk_hwnd], rax
+@@: mov     rcx, qword ptr [rbp-8]
     mov     edx, IDOK
     call    theme_attach
     mov     rcx, qword ptr [rbp-8]
@@ -19272,6 +20228,8 @@ xpp_pwchg:
     mov     eax, 1
     jmp     xpp_ret
 xpp_ok:
+    cmp     dword ptr [g_secdesk_orphan], 0     ; VDR-13: orphaned worker must not write globals
+    jne     xpp_cancel
     WINCALL GetDlgItemTextW, qword ptr [rbp-8], IDC_XP_PW, addr g_xlpw, 255
     mov     dword ptr [rbp-16], eax             ; length in chars
     WINCALL GetDlgItemTextW, qword ptr [rbp-8], IDC_XP_PW2, addr g_xlpw2, 255
@@ -19298,6 +20256,12 @@ xpp_polok:
     mov     eax, dword ptr [rbp-16]
     shl     eax, 1                               ; bytes = chars * 2
     mov     dword ptr [g_xlpwlen], eax
+    mov     rcx, qword ptr [rbp-8]               ; VDR-27: scrub both edit controls
+    mov     edx, IDC_XP_PW
+    call    gui_edit_scrub
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_XP_PW2
+    call    gui_edit_scrub
     lea     rcx, [g_xlpw2]                       ; wipe the confirm copy
     mov     edx, 512
     call    secure_zero
@@ -19305,6 +20269,7 @@ xpp_polok:
     mov     dword ptr [g_uline_ctl2], 0
     mov     qword ptr [g_uline_br], 0
     mov     qword ptr [g_uline_br2], 0
+    mov     qword ptr [g_secdesk_hwnd], 0
     WINCALL EndDialog, qword ptr [rbp-8], 1
     mov     eax, 1
     jmp     xpp_ret
@@ -19317,6 +20282,12 @@ xpp_mismatch:
     mov     eax, 1
     jmp     xpp_ret
 xpp_cancel:
+    mov     rcx, qword ptr [rbp-8]               ; VDR-27: scrub both edit controls
+    mov     edx, IDC_XP_PW
+    call    gui_edit_scrub
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_XP_PW2
+    call    gui_edit_scrub
     lea     rcx, [g_xlpw]
     mov     edx, 512
     call    secure_zero
@@ -19327,6 +20298,7 @@ xpp_cancel:
     mov     dword ptr [g_uline_ctl2], 0
     mov     qword ptr [g_uline_br], 0
     mov     qword ptr [g_uline_br2], 0
+    mov     qword ptr [g_secdesk_hwnd], 0
     WINCALL EndDialog, qword ptr [rbp-8], 0
     mov     eax, 1
 xpp_ret:
@@ -19358,6 +20330,8 @@ pwremind_proc proc
     je      rmp_init
     cmp     rdx, WM_COMMAND
     je      rmp_cmd
+    cmp     rdx, WM_DESTROY
+    je      rmp_destroy
     cmp     rdx, WM_CTLCOLORSTATIC
     je      rmp_col
     cmp     rdx, WM_CTLCOLOREDIT
@@ -19373,6 +20347,13 @@ pwremind_proc proc
     cmp     rdx, WM_DRAWITEM
     je      rmp_draw
     xor     eax, eax
+    jmp     rmp_ret
+rmp_destroy:
+    mov     rax, qword ptr [rbp-8]
+    cmp     qword ptr [g_secdesk_hwnd], rax
+    jne     @F
+    mov     qword ptr [g_secdesk_hwnd], 0
+@@: xor     eax, eax
     jmp     rmp_ret
 rmp_col:
     call    theme_ctlcolor
@@ -19391,7 +20372,11 @@ rmp_draw:
     call    theme_drawitem
     jmp     rmp_ret
 rmp_init:
-    mov     rcx, qword ptr [rbp-8]
+    cmp     qword ptr [g_secdesk_hd], 0
+    je      @F
+    mov     rax, qword ptr [rbp-8]
+    mov     qword ptr [g_secdesk_hwnd], rax
+@@: mov     rcx, qword ptr [rbp-8]
     mov     edx, IDOK
     call    theme_attach
     mov     rcx, qword ptr [rbp-8]
@@ -19409,6 +20394,8 @@ rmp_cmd:
     xor     eax, eax
     jmp     rmp_ret
 rmp_ok:
+    cmp     dword ptr [g_secdesk_orphan], 0      ; VDR-13: orphaned worker must not touch vault
+    jne     rmp_cancel
     WINCALL GetDlgItemTextW, qword ptr [rbp-8], IDC_RM_PW, addr g_pwbuf, 1024 ; = unlock's count
     test    eax, eax
     jz      rmp_again                            ; empty -> just ask again
@@ -19416,11 +20403,17 @@ rmp_ok:
     call    password_to_utf8                     ; -> g_cfg_pass; wipes g_pwbuf
     test    eax, eax
     jz      rmp_again
+    cmp     dword ptr [g_secdesk_orphan], 0
+    jne     rmp_cancel_wipe
     lea     rcx, [g_cfg_pass]                    ; vault_pw_check wipes g_cfg_pass itself,
     mov     edx, dword ptr [g_cfg_passlen]       ;   whichever way the comparison goes
     call    vault_pw_check
     test    eax, eax
     jz      rmp_bad
+    mov     rcx, qword ptr [rbp-8]               ; VDR-27: scrub edit control
+    mov     edx, IDC_RM_PW
+    call    gui_edit_scrub
+    mov     qword ptr [g_secdesk_hwnd], 0
     WINCALL EndDialog, qword ptr [rbp-8], 1
     mov     eax, 1
     jmp     rmp_ret
@@ -19428,10 +20421,19 @@ rmp_bad:
     WINCALL gui_msgbox, qword ptr [rbp-8], addr rm_wrong, addr rm_title, \
             <MB_OK or MB_ICONWARNING>
 rmp_again:
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_RM_PW
+    call    gui_edit_scrub
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_RM_PW, 0
     mov     eax, 1
     jmp     rmp_ret
+rmp_cancel_wipe:
+    call    gui_wipepw
 rmp_cancel:
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_RM_PW
+    call    gui_edit_scrub
+    mov     qword ptr [g_secdesk_hwnd], 0
     WINCALL EndDialog, qword ptr [rbp-8], 0      ; "Not now" is always available
     mov     eax, 1
 rmp_ret:
@@ -19481,6 +20483,8 @@ gpr_normal:
     WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_PWREMIND, qword ptr [g_vaulthwnd], \
             addr pwremind_proc, 0
 gpr_res:
+    cmp     qword ptr [g_body_ptr], 0            ; VDR-06: locked while reminder was up?
+    je      gpr_done
     cmp     rax, 1
     jne     gpr_done                             ; dismissed - ask again next unlock
     mov     rcx, qword ptr [rbp-24]              ; confirmed: restart the clock
@@ -19504,6 +20508,8 @@ imppw_proc proc
     je      ipp_init
     cmp     rdx, WM_COMMAND
     je      ipp_cmd
+    cmp     rdx, WM_DESTROY
+    je      ipp_destroy
     cmp     rdx, WM_CTLCOLORSTATIC
     je      ipp_col
     cmp     rdx, WM_CTLCOLOREDIT
@@ -19519,6 +20525,13 @@ imppw_proc proc
     cmp     rdx, WM_DRAWITEM
     je      ipp_draw
     xor     eax, eax
+    jmp     ipp_ret
+ipp_destroy:
+    mov     rax, qword ptr [rbp-8]
+    cmp     qword ptr [g_secdesk_hwnd], rax
+    jne     @F
+    mov     qword ptr [g_secdesk_hwnd], 0
+@@: xor     eax, eax
     jmp     ipp_ret
 ipp_col:
     call    theme_ctlcolor
@@ -19540,7 +20553,11 @@ ipp_unh:
     xor     eax, eax
     jmp     ipp_ret
 ipp_init:
-    mov     rcx, qword ptr [rbp-8]
+    cmp     qword ptr [g_secdesk_hd], 0
+    je      @F
+    mov     rax, qword ptr [rbp-8]
+    mov     qword ptr [g_secdesk_hwnd], rax
+@@: mov     rcx, qword ptr [rbp-8]
     mov     edx, IDOK
     call    theme_attach
     mov     rcx, qword ptr [rbp-8]
@@ -19558,11 +20575,17 @@ ipp_cmd:
     xor     eax, eax
     jmp     ipp_ret
 ipp_ok:
+    cmp     dword ptr [g_secdesk_orphan], 0      ; VDR-13: orphaned worker must not write globals
+    jne     ipp_cancel
     WINCALL GetDlgItemTextW, qword ptr [rbp-8], IDC_XP_PW, addr g_xlpw, 255
     test    eax, eax
     jz      ipp_empty
     shl     eax, 1                               ; bytes = chars * 2
     mov     dword ptr [g_xlpwlen], eax
+    mov     rcx, qword ptr [rbp-8]               ; VDR-27: scrub edit control
+    mov     edx, IDC_XP_PW
+    call    gui_edit_scrub
+    mov     qword ptr [g_secdesk_hwnd], 0
     WINCALL EndDialog, qword ptr [rbp-8], 1
     mov     eax, 1
     jmp     ipp_ret
@@ -19571,9 +20594,13 @@ ipp_empty:
     mov     eax, 1
     jmp     ipp_ret
 ipp_cancel:
+    mov     rcx, qword ptr [rbp-8]               ; VDR-27: scrub edit control
+    mov     edx, IDC_XP_PW
+    call    gui_edit_scrub
     lea     rcx, [g_xlpw]                        ; wipe on cancel
     mov     edx, 512
     call    secure_zero
+    mov     qword ptr [g_secdesk_hwnd], 0
     WINCALL EndDialog, qword ptr [rbp-8], 0
     mov     eax, 1
 ipp_ret:
@@ -20041,15 +21068,17 @@ secdesk_body proc frame
     FRAME_PROLOG 48
     WINCALL SetThreadDesktop, qword ptr [g_secdesk_hd]
     test    eax, eax
-    jz      sdt_run                              ; couldn't bind -> show on current desktop
+    jz      sdt_fail                             ; VDR-13: never silently run on current desktop
     mov     rcx, qword ptr [g_secdesk_hd]
     call    secdesk_switch
     test    eax, eax
     jnz     sdt_run
     ; It could not be made the input desktop.  Unbind (safe: this thread owns no
-    ; windows yet) and show the dialog on the desktop the user is actually looking
-    ; at, rather than on an invisible one.
+    ; windows yet) and report -2 so gui_secdesk_show enforces HKLM policy / user consent.
     WINCALL SetThreadDesktop, qword ptr [g_secdesk_orig]
+sdt_fail:
+    mov     qword ptr [g_secdesk_res], -2
+    jmp     sdt_done
 sdt_run:
     WINCALL DialogBoxParamW, qword ptr [g_hinst], dword ptr [g_secdesk_dlg], 0, \
             qword ptr [g_secdesk_proc], 0
@@ -20085,23 +21114,39 @@ secdesk_thread proc
     ret
 secdesk_thread endp
 
+ifdef PROBE_IO
+.data?
+public g_secdesk_force_fail
+g_secdesk_force_fail dd ?
+.code
+endif
+
 ; gui_secdesk_show(ecx = dialog template id, rdx = dialog proc) -> rax = result.
 ;   Runs the given dialog on a private desktop via secdesk_thread and blocks
-;   until it closes.  Falls back to a normal modal dialog on any failure.
+;   until it closes.  Enforces HKLM SecureUnlock fail-closed or explicit Yes/No consent.
 public gui_secdesk_show
 gui_secdesk_show proc frame
-    FRAME_PROLOG 96                              ; locals to -48 above the 6-arg WINCALL spill
+    FRAME_PROLOG 112                             ; locals -24..-48 clear of 6-arg WINCALL spill
     mov     dword ptr [g_secdesk_dlg], ecx
     mov     qword ptr [g_secdesk_proc], rdx
     mov     qword ptr [g_secdesk_res], 0
     mov     qword ptr [g_secdesk_hd], 0
+    mov     qword ptr [g_secdesk_orig], 0
+    mov     qword ptr [g_secdesk_hwnd], 0
     mov     dword ptr [g_secdesk_orphan], 0
+    xor     eax, eax
+    cmp     qword ptr [g_body_ptr], 0
+    setne   al
+    mov     dword ptr [rbp-36], eax              ; 1 if vault was unlocked on entry
+ifdef PROBE_IO
+    cmp     dword ptr [g_secdesk_force_fail], 0
+    jne     gss_fallback
+endif
     ; Remember the desktop currently receiving input, to restore afterwards.  If this
     ; fails there is NO handle to switch back to, and both restore paths (secdesk_body
     ; and gss_cleanup) are guarded on it being non-null - so switching away anyway would
     ; leave the user on a shell-less desktop with no code able to return them, silently
-    ; and without a crash.  Never switch away from a desktop you cannot get back to:
-    ; degrade to the plain modal instead.
+    ; and without a crash.  Never switch away from a desktop you cannot get back to.
     WINCALL OpenInputDesktop, 0, 0, DESKTOP_MAXALLOWED
     mov     qword ptr [g_secdesk_orig], rax
     test    rax, rax
@@ -20118,66 +21163,115 @@ gui_secdesk_show proc frame
     mov     edx, 8
     call    rng_fill
     test    eax, eax
-    jz      gss_fallback                         ; no randomness -> plain dialog
+    jz      gss_fallback                         ; no randomness -> fallback gate
     mov     rcx, qword ptr [rbp-48]
     mov     rdx, qword ptr [rbp-40]
     call    gui_ft_hex16                         ; 16 hex + NUL
     WINCALL CreateDesktopW, addr g_secdesk_name, 0, 0, 0, DESKTOP_MAXALLOWED, 0
     mov     qword ptr [g_secdesk_hd], rax
     test    rax, rax
-    jz      gss_fallback                         ; no desktop -> plain dialog
+    jz      gss_fallback                         ; no desktop -> fallback gate
     WINCALL CreateThread, 0, 0, addr secdesk_thread, 0, 0, 0
     mov     qword ptr [rbp-24], rax              ; worker thread handle
     test    rax, rax
-    jz      gss_fallback                         ; no thread -> plain dialog
-    ; Bounded wait, not INFINITE.  The desktop restore lives at the END of the
-    ; worker's dialog, so ANYTHING that blocks inside that dialog leaves the user on
-    ; a shell-less desktop with no way back but Ctrl+Alt+Del - which is exactly what
-    ; a blocking write into a OneDrive-synced folder did.  The password entry itself
-    ; is unbounded by nature, so the ceiling is generous; it exists only to break a
-    ; genuine wedge, never to interrupt someone typing.
-    mov     dword ptr [rbp-32], 0                ; elapsed ms
+    jz      gss_fallback                         ; no thread -> fallback gate
+    ; Bounded wait using GetTickCount wall-clock delta + MsgWaitForMultipleObjects so
+    ; WM_WTSSESSION_CHANGE (Win+L) and WM_TIMER (idle lock / clipboard scrub) continue
+    ; to fire while the worker owns the secure desktop.
+    WINCALL GetTickCount
+    mov     dword ptr [rbp-32], eax              ; start tick (32-bit modular)
 gss_wait:
-    WINCALL WaitForSingleObject, qword ptr [rbp-24], SECDESK_SLICE_MS
+    WINCALL MsgWaitForMultipleObjects, 1, addr rbp-24, 0, SECDESK_SLICE_MS, QS_ALLINPUT_
     test    eax, eax                             ; WAIT_OBJECT_0 -> the worker finished
     jz      gss_worker_done
-    add     dword ptr [rbp-32], SECDESK_SLICE_MS
-    cmp     dword ptr [rbp-32], SECDESK_MAX_MS
+    cmp     eax, 1                               ; WAIT_OBJECT_0 + 1 -> queue input arrived
+    jne     gss_chk_timeout
+gss_pump_wts:
+    WINCALL PeekMessageW, addr g_msg, 0, WM_WTSSESSION_CHANGE, WM_WTSSESSION_CHANGE, 1
+    test    eax, eax
+    jz      gss_pump_tmr
+    WINCALL DispatchMessageW, addr g_msg
+    jmp     gss_pump_wts
+gss_pump_tmr:
+    WINCALL PeekMessageW, addr g_msg, 0, WM_TIMER, WM_TIMER, 1
+    test    eax, eax
+    jz      gss_pump_mark
+    WINCALL DispatchMessageW, addr g_msg
+    jmp     gss_pump_tmr
+gss_pump_mark:
+    ; Dispatch any pending inter-thread SendMessage and mark remaining input seen
+    ; so MsgWaitForMultipleObjects sleeps for its slice instead of busy-spinning.
+    WINCALL PeekMessageW, addr g_msg, 0, 0, 0, 0
+    cmp     dword ptr [rbp-36], 0
+    je      gss_chk_timeout
+    cmp     qword ptr [g_body_ptr], 0            ; vault locked while dialog was up?
+    jne     gss_chk_timeout
+    mov     rcx, qword ptr [g_secdesk_hwnd]
+    test    rcx, rcx
+    jz      gss_chk_timeout
+    WINCALL PostMessageW, rcx, WM_COMMAND, IDCANCEL, 0
+gss_chk_timeout:
+    WINCALL GetTickCount
+    sub     eax, dword ptr [rbp-32]
+    cmp     eax, SECDESK_MAX_MS
     jb      gss_wait
-    ; Wedged.  Hand the user their desktop back and abandon the worker.  Deliberately
-    ; leak the desktop and thread handles: the worker is still inside the dialog and
-    ; would use them, and two leaked handles cost far less than a stranded user.
-    ;
-    ; THIS IS THE ONE WINDOW IN WHICH TWO THREADS RUN APPLICATION CODE AT ONCE.
-    ; Everywhere else the main thread is parked in the wait above, and that is what
-    ; lets everything process-wide be shared without a lock: the shadow-stack swap in
-    ; secdesk_thread, g_cfg_in, g_cfg_pass, g_hdr, g_body_ptr, and fileio.asm's
-    ; single-slot path buffers.  Past this line an orphaned worker can still finish
-    ; its dialog and reach vault_unlock, and it shares all of that with the main
-    ; thread - so none of those are safe here, not merely some of them.
-    ;
-    ; Locking one of them would make the code look safer than it is.  The question to
-    ; answer, if this is ever closed, is whether a worker the watchdog has given up on
-    ; should be allowed to touch vault state at all - it already knows, via
-    ; g_secdesk_orphan, that nobody is waiting for its answer.
+    ; Wedged.  Flag orphan BEFORE restoring desktop, post IDCANCEL to dismiss the
+    ; dialog if it created one, and abandon the worker handles safely.
     mov     dword ptr [g_secdesk_orphan], 1
-    call    secdesk_restore
+    mov     rcx, qword ptr [g_secdesk_hwnd]
+    test    rcx, rcx
+    jz      @F
+    WINCALL PostMessageW, rcx, WM_COMMAND, IDCANCEL, 0
+@@: call    secdesk_restore
     mov     qword ptr [g_secdesk_res], 0         ; treat as cancelled
     mov     qword ptr [g_secdesk_hd], 0          ; skip the closes in gss_cleanup
     mov     qword ptr [g_secdesk_orig], 0
+    mov     qword ptr [g_secdesk_hwnd], 0
     jmp     gss_ret
 gss_worker_done:
-    ; (The worker's shadow stack is its own, per thread: there is nothing of the main
-    ; thread's to restore here, and the watchdog path above can return safely.)
     WINCALL CloseHandle, qword ptr [rbp-24]
+    cmp     qword ptr [g_secdesk_res], -2        ; worker could not bind/switch desktop?
+    je      gss_fallback
     jmp     gss_cleanup
 gss_fallback:
-    ; degrade to a normal on-desktop modal dialog (never lock the user out) - but
-    ; say so: the protection the user turned on is not there this time.
-    WINCALL gui_msgbox, 0, addr s_sdfall, addr t_err, <MB_OK or MB_ICONWARNING>
+    ; Release any handles opened before the failure first.
+    cmp     qword ptr [g_secdesk_orig], 0
+    je      gss_fb_closehd
+    call    secdesk_restore
+gss_fb_closehd:
+    cmp     qword ptr [g_secdesk_hd], 0
+    je      gss_fb_closeorig
+    WINCALL CloseDesktop, qword ptr [g_secdesk_hd]
+    mov     qword ptr [g_secdesk_hd], 0
+gss_fb_closeorig:
+    cmp     qword ptr [g_secdesk_orig], 0
+    je      gss_fb_policy
+    WINCALL CloseDesktop, qword ptr [g_secdesk_orig]
+    mov     qword ptr [g_secdesk_orig], 0
+gss_fb_policy:
+    ; VDR-13: when HKLM policy locks SecureUnlock=1, NEVER degrade to the normal desktop.
+    cmp     dword ptr [g_secunlock_lock], 0
+    je      gss_fb_ask
+    WINCALL gui_msgbox, 0, addr s_sdlocked, addr t_err, <MB_OK or MB_ICONERROR>
+    mov     qword ptr [g_secdesk_res], 0
+    jmp     gss_ret
+gss_fb_ask:
+    ; User-configured Secure Unlock: require explicit Yes consent before falling back.
+    WINCALL gui_msgbox, 0, addr s_sdfall, addr t_err, <MB_YESNO or MB_ICONWARNING>
+    cmp     eax, IDYES
+    jne     gss_fb_deny
+    cmp     dword ptr [rbp-36], 0
+    je      gss_fb_run
+    cmp     qword ptr [g_body_ptr], 0
+    je      gss_fb_deny
+gss_fb_run:
     WINCALL DialogBoxParamW, qword ptr [g_hinst], dword ptr [g_secdesk_dlg], 0, \
             qword ptr [g_secdesk_proc], 0
     mov     qword ptr [g_secdesk_res], rax
+    jmp     gss_ret
+gss_fb_deny:
+    mov     qword ptr [g_secdesk_res], 0
+    jmp     gss_ret
 gss_cleanup:
     ; belt-and-braces: secdesk_body restores itself on the normal path, but a worker that
     ; died mid-dialog never reached that line.  Switching to the desktop that is already
@@ -20197,6 +21291,7 @@ gss_orig:
     WINCALL CloseDesktop, qword ptr [g_secdesk_orig]
     mov     qword ptr [g_secdesk_orig], 0
 gss_ret:
+    mov     qword ptr [g_secdesk_hwnd], 0
     mov     rax, qword ptr [g_secdesk_res]
     FRAME_EPILOG
     ret
@@ -20591,8 +21686,10 @@ gui_hotkey_apply endp
 ;   WM_KEYDOWN and WM_SYSKEYDOWN - Alt combinations only ever arrive as the latter,
 ;   which is the usual reason a hand-rolled capture misses exactly the combo the
 ;   user is trying to set.
-hk_cap_subclass proc frame
-    FRAME_PROLOG 96
+hk_cap_subclass proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 96
     mov     qword ptr [rbp-24], rcx             ; hwnd
     mov     qword ptr [rbp-32], rdx             ; msg
     mov     qword ptr [rbp-40], r8              ; wParam = vk
@@ -20606,7 +21703,8 @@ hk_cap_subclass proc frame
     jmp     hkc_def
 hkc_wantall:
     mov     eax, DLGC_WANTALLKEYS
-    FRAME_EPILOG
+    mov     rsp, rbp
+    pop     rbp
     ret
 hkc_key:
     mov     eax, dword ptr [rbp-40]             ; a bare modifier is not a hotkey by itself
@@ -20667,12 +21765,14 @@ hkc_take:
     WINCALL InvalidateRect, qword ptr [rbp-24], 0, 1
 hkc_eat:
     xor     eax, eax                            ; consumed
-    FRAME_EPILOG
+    mov     rsp, rbp
+    pop     rbp
     ret
 hkc_def:
     WINCALL DefSubclassProc, qword ptr [rbp-24], qword ptr [rbp-32], qword ptr [rbp-40], \
             qword ptr [rbp-48]
-    FRAME_EPILOG
+    mov     rsp, rbp
+    pop     rbp
     ret
 hk_cap_subclass endp
 
@@ -20897,6 +21997,12 @@ tray_wndproc proc
     WINCALL DefWindowProcW, qword ptr [rbp-8], qword ptr [rbp-16], qword ptr [rbp-24], qword ptr [rbp-32]
     jmp     twp_ret
 twp_temp_retry:
+    cmp     qword ptr [rbp-24], CLIP_TIMER       ; VDR-11: tray owns clipboard auto-clear
+    jne     twp_chk_temp
+    WINCALL KillTimer, qword ptr [rbp-8], CLIP_TIMER
+    call    gui_clipclear
+    jmp     twp_ret_zero
+twp_chk_temp:
     cmp     qword ptr [rbp-24], TEMP_RETRY_TIMER
     jne     twp_ret_zero
     cmp     qword ptr [g_vaulthwnd], 0         ; active previews stay live until lock
@@ -20912,6 +22018,19 @@ twp_copydata:
     ; magic).  Even then all it can do is put us in front of the import prompt -
     ; the source password still has to be typed and the entries ticked, and the
     ; path can never become the registered vault.
+    ; VDR-07: refuse hand-offs whenever a modal dialog (Export, Import, Attach,
+    ; Unlock, Create, ...) is already active, so g_imgpath / g_openfile cannot be
+    ; mutated mid-flow.
+    cmp     qword ptr [g_vaulthwnd], 0
+    je      twp_cd_chkshow
+    WINCALL GetWindow, qword ptr [g_vaulthwnd], GW_ENABLEDPOPUP_
+    test    rax, rax
+    jnz     twp_cd_no
+    jmp     twp_cd_parse
+twp_cd_chkshow:
+    cmp     dword ptr [g_showing], 0
+    jne     twp_cd_no
+twp_cd_parse:
     mov     r10, qword ptr [rbp-32]              ; COPYDATASTRUCT*
     test    r10, r10
     jz      twp_cd_no
@@ -21507,9 +22626,11 @@ CSTR lp_meas,  "layoutkat: visible controls measured: "
 CSTR lp_thin,  "layoutkat: measured almost nothing - the window or its children never became visible, so this run proves nothing",13,10
 
 ; lp_child(rcx = child hwnd, rdx = lparam) -> 1 to keep enumerating.
-;   Called by Windows, so it carries its own frame.
-lp_child proc frame
-    FRAME_PROLOG 96
+;   Called by Windows (EnumChildWindows), so it uses a raw frame (no shadow stack).
+lp_child proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 96
     mov     qword ptr [rbp-24], rcx
     WINCALL IsWindowVisible, qword ptr [rbp-24]
     test    eax, eax
@@ -21542,7 +22663,8 @@ lp_child proc frame
     jg      lpc_escapes
 lpc_next:
     mov     eax, 1
-    FRAME_EPILOG
+    mov     rsp, rbp
+    pop     rbp
     ret
 lpc_collapsed:
     ; This is what found the gui_reflow slot overlap: IDC_V_HEADER, IDC_V_TITLE
@@ -21558,7 +22680,8 @@ lpc_collapsed:
     WINCALL print_u64, dword ptr [rbp-40]
     WINCALL print_a, addr lp_nl, lp_nl_len
     mov     eax, 1
-    FRAME_EPILOG
+    mov     rsp, rbp
+    pop     rbp
     ret
 lpc_escapes:
     inc     dword ptr [g_lp_bad]
@@ -21574,7 +22697,8 @@ lpc_escapes:
     WINCALL print_u64, dword ptr [g_lp_cy]
     WINCALL print_a, addr lp_nl, lp_nl_len
     mov     eax, 1
-    FRAME_EPILOG
+    mov     rsp, rbp
+    pop     rbp
     ret
 lp_child endp
 
@@ -21646,16 +22770,20 @@ WSTR gp_x5, <x.settingcontent-ms>
 WSTR gp_x6, <notes.txt>
 WSTR gp_x7, <photo.png>
 WSTR gp_x8, <a.b.c.pdf>
+WSTR gp_x9, <macro.docm>
+WSTR gp_x10, <page.html>
 align 8
-gp_exts label qword                          ; {name, is-executable}
-    dq gp_x1, 1
-    dq gp_x2, 1
-    dq gp_x3, 1
-    dq gp_x4, 1
-    dq gp_x5, 1
-    dq gp_x6, 0
-    dq gp_x7, 0
-    dq gp_x8, 0
+gp_exts label qword                          ; {name, can-preview} (VDR-03 allowlist)
+    dq gp_x1, 0
+    dq gp_x2, 0
+    dq gp_x3, 0
+    dq gp_x4, 0
+    dq gp_x5, 0
+    dq gp_x6, 1
+    dq gp_x7, 1
+    dq gp_x8, 1
+    dq gp_x9, 0
+    dq gp_x10, 0
 GP_EXTS_N equ ($ - gp_exts) / 16
 .code
 
@@ -21663,8 +22791,11 @@ GP_EXTS_N equ ($ - gp_exts) / 16
 ;   lock does, end every modal.  The timer stays armed as a watchdog: a second tick
 ;   means the box survived, so close it another way and record the failure - a
 ;   regression here must fail the gate, not hang it on a dialog nobody answers.
-gp_timerproc proc frame
-    FRAME_PROLOG 32
+;   OS TIMERPROC callback -> raw frame (no shadow stack).
+gp_timerproc proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 32
     inc     dword ptr [g_gp_fires]
     cmp     dword ptr [g_gp_fires], 1
     jne     gpt_watchdog
@@ -21679,7 +22810,8 @@ gpt_watchdog:
     jz      gpt_done
     WINCALL EndDialog, rax, 99
 gpt_done:
-    FRAME_EPILOG
+    mov     rsp, rbp
+    pop     rbp
     ret
 gp_timerproc endp
 
@@ -21929,7 +23061,7 @@ gp_updone:
     call    gui_same_file
     test    eax, eax
     jnz     gp_fail
-    ; ---- 12: the executable list -------------------------------------------
+    ; ---- 12: the safe-preview allowlist (VDR-03) ------------------------------
     mov     dword ptr [rbp-32], 12
     mov     dword ptr [rbp-56], 0
 gp_xl:
@@ -21939,7 +23071,7 @@ gp_xl:
     shl     eax, 4
     lea     r10, [gp_exts]
     mov     rcx, qword ptr [r10+rax]
-    call    gui_ext_is_exec
+    call    gui_ext_can_preview
     mov     ecx, dword ptr [rbp-56]
     shl     ecx, 4
     lea     r10, [gp_exts]
@@ -22077,6 +23209,8 @@ gp_bigdone:
     jnz     gp_fail_delgp
     lea     rcx, [g_gp_path]
     call    gui_motw
+    cmp     eax, 1
+    jne     gp_fail_delgp
     mov     dword ptr [rbp-80], 0
     WINCALL CreateFileW, addr g_motw_w, GENERIC_READ, 1, 0, OPEN_EXISTING, FILE_ATTR_NORMAL, 0
     cmp     rax, -1
@@ -22368,6 +23502,88 @@ glp_bad:
     FRAME_EPILOG
     ret
 gui_layout_probe endp
+
+; =============================================================================
+; cmd_secdeskkat - VDR-13 headless secure-desktop fallback policy & orphan probe.
+;   1) g_secunlock_lock=1 (HKLM policy) + forced secure-desktop failure ->
+;      displays s_sdlocked and refuses fallback (returns 0).
+;   2) g_secunlock_lock=0 (user pref) + forced failure -> prompts Yes/No via
+;      s_sdfall and refuses fallback when declined (IDNO -> returns 0).
+;   3) g_secdesk_orphan=1 -> create_proc(WM_COMMAND, IDOK) wipes g_pwbuf and
+;      cancels instead of running gui_create_do.
+; =============================================================================
+.const
+CSTR sdk_ok,  "secdeskkat: PASS (HKLM SecureUnlock fail-closed, user consent gate, and orphan IDOK block)",13,10
+CSTR sdk_bad, "secdeskkat: FAIL (secure-desktop fallback gate regressed)",13,10
+.code
+LANDING_PAD
+public cmd_secdeskkat
+cmd_secdeskkat proc frame
+    FRAME_PROLOG 48
+    mov     dword ptr [g_sp_active], 1
+    mov     dword ptr [g_sp_messages], 0
+    mov     qword ptr [g_sp_lastmsg], 0
+    mov     dword ptr [g_secdesk_force_fail], 1
+
+    ; 1) HKLM policy lock: fail closed with s_sdlocked, no Yes/No prompt
+    mov     dword ptr [g_secunlock_lock], 1
+    mov     ecx, DLG_UNLOCK
+    lea     rdx, [unlock_proc]
+    call    gui_secdesk_show
+    test    rax, rax
+    jnz     sdk_fail
+    cmp     dword ptr [g_sp_messages], 1
+    jne     sdk_fail
+    lea     rax, [s_sdlocked]
+    cmp     qword ptr [g_sp_lastmsg], rax
+    jne     sdk_fail
+
+    ; 2) User SecureUnlock (unlocked): prompts s_sdfall; IDNO refuses normal desktop
+    mov     dword ptr [g_secunlock_lock], 0
+    mov     dword ptr [g_sp_messages], 0
+    mov     qword ptr [g_sp_lastmsg], 0
+    mov     ecx, DLG_UNLOCK
+    lea     rdx, [unlock_proc]
+    call    gui_secdesk_show
+    test    rax, rax
+    jnz     sdk_fail
+    cmp     dword ptr [g_sp_messages], 1
+    jne     sdk_fail
+    lea     rax, [s_sdfall]
+    cmp     qword ptr [g_sp_lastmsg], rax
+    jne     sdk_fail
+
+    ; 3) Orphaned dialog: IDOK cancels and wipes password scratch without gui_create_do
+    mov     dword ptr [g_sp_messages], 0
+    mov     word ptr [g_pwbuf], 'X'
+    mov     dword ptr [g_secdesk_orphan], 1
+    xor     ecx, ecx
+    mov     edx, WM_COMMAND
+    mov     r8d, IDOK
+    xor     r9d, r9d
+    call    create_proc
+    mov     dword ptr [g_secdesk_orphan], 0
+    cmp     word ptr [g_pwbuf], 0
+    jne     sdk_fail
+    cmp     dword ptr [g_sp_messages], 0
+    jne     sdk_fail
+
+    mov     dword ptr [g_secdesk_force_fail], 0
+    mov     dword ptr [g_sp_active], 0
+    WINCALL print_a, addr sdk_ok, sdk_ok_len
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+sdk_fail:
+    mov     dword ptr [g_secdesk_orphan], 0
+    mov     dword ptr [g_secdesk_force_fail], 0
+    mov     dword ptr [g_secunlock_lock], 0
+    mov     dword ptr [g_sp_active], 0
+    WINCALL print_a, addr sdk_bad, sdk_bad_len
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_secdeskkat endp
 endif
 
 ifdef PROBE_IO
@@ -22519,6 +23735,8 @@ wstart proc
     cmp     dword ptr [rsp+48], 0
     je      ws_nocpu_cli
     call    iat_lockdown
+    test    eax, eax
+    jz      ws_stfail_cli
     xor     ecx, ecx
     call    run_selftest
     test    eax, eax
@@ -22550,6 +23768,8 @@ ws_gui:
     cmp     dword ptr [rsp+48], 0
     je      ws_nocpu
     call    iat_lockdown
+    test    eax, eax
+    jz      ws_stfail_gui
     xor     ecx, ecx
     call    run_selftest
     test    eax, eax
@@ -22576,12 +23796,15 @@ endif
     je      ws_gui_focuschain
     WINCALL FindWindowW, addr tray_cls, 0
     test    rax, rax
-    jz      ws_gui_exit
+    jz      ws_gui_go                       ; squatted/stale mutex with no tray -> start up
     mov     rcx, rax
     call    gui_send_openfile
     jmp     ws_gui_exit
 ws_gui_focuschain:
     WINCALL FindWindowW, 0, addr g_vault_title
+    test    rax, rax
+    jnz     ws_gui_focus
+    WINCALL FindWindowW, 0, addr g_vault_title_ro
     test    rax, rax
     jnz     ws_gui_focus
     WINCALL FindWindowW, 0, addr g_unlock_title
@@ -22594,7 +23817,7 @@ ws_gui_focuschain:
     ; Open command so IT shows the unlock/create flow, instead of dying silently
     WINCALL FindWindowW, addr tray_cls, 0
     test    rax, rax
-    jz      ws_gui_exit
+    jz      ws_gui_go                       ; squatted/stale mutex with no tray -> start up
     WINCALL PostMessageW, rax, WM_COMMAND, IDM_OPEN, 0
     jmp     ws_gui_exit
 ws_gui_focus:

@@ -246,6 +246,21 @@ ac_store:
     cmp     rax, 1024
     jb      ac_fin
 
+    ; wipe Rbuf + Qbuf + Tbuf (1024 + 1024 + 128 = 2176 bytes) + volatile XMMs
+    pxor    xmm0, xmm0
+    pxor    xmm1, xmm1
+    pxor    xmm2, xmm2
+    pxor    xmm3, xmm3
+    pxor    xmm4, xmm4
+    pxor    xmm5, xmm5
+    lea     r10, [rsp+RB]
+    xor     eax, eax
+ac_wipe:
+    movdqu  xmmword ptr [r10+rax], xmm0
+    add     eax, 16
+    cmp     eax, 2176
+    jb      ac_wipe
+
     mov     r12, qword ptr [rsp+S12]
     mov     r13, qword ptr [rsp+S13]
     mov     r14, qword ptr [rsp+S14]
@@ -476,6 +491,21 @@ cs_store:
     cmp     rax, 1024
     jb      cs_fin
 
+    ; wipe SR + WSS (2048 bytes) + volatile XMMs
+    pxor    xmm0, xmm0
+    pxor    xmm1, xmm1
+    pxor    xmm2, xmm2
+    pxor    xmm3, xmm3
+    pxor    xmm4, xmm4
+    pxor    xmm5, xmm5
+    lea     r10, [rsp+SR]
+    xor     eax, eax
+cs_wipe:
+    movdqu  xmmword ptr [r10+rax], xmm0
+    add     eax, 16
+    cmp     eax, 2048
+    jb      cs_wipe
+
     lea     r11, [rsp+SX6]
     movdqu  xmm6,  xmmword ptr [r11+0]
     movdqu  xmm7,  xmmword ptr [r11+16]
@@ -670,6 +700,21 @@ av_store:
     cmp     rax, 1024
     jb      av_fin
 
+    ; wipe AR + AW (2048 bytes) + volatile YMMs
+    vpxor   ymm0, ymm0, ymm0
+    vpxor   ymm1, ymm1, ymm1
+    vpxor   ymm2, ymm2, ymm2
+    vpxor   ymm3, ymm3, ymm3
+    vpxor   ymm4, ymm4, ymm4
+    vpxor   ymm5, ymm5, ymm5
+    lea     r10, [rsp+AR]
+    xor     eax, eax
+av_wipe:
+    vmovdqu ymmword ptr [r10+rax], ymm0
+    add     eax, 32
+    cmp     eax, 2048
+    jb      av_wipe
+
     vzeroupper
     lea     r11, [rsp+AX6]
     movdqu  xmm6,  xmmword ptr [r11+0]
@@ -768,8 +813,27 @@ argon2id_hash proc frame
     mov     qword ptr [rbp-40], r13
     mov     qword ptr [rbp-48], r15
 
-    ; ---- read params -------------------------------------------------------
+    ; ---- RFC 9106 parameter validation (prevents #DE on lanes=0 / q=0) -----
+    test    rcx, rcx
+    jz      a2_badparam
+    cmp     qword ptr [rcx].ARGON2REQ.outp, 0
+    je      a2_badparam
     mov     eax, dword ptr [rcx].ARGON2REQ.lanes
+    test    eax, eax
+    jz      a2_badparam
+    cmp     eax, 0FFFFFFh
+    ja      a2_badparam
+    cmp     dword ptr [rcx].ARGON2REQ.t_cost, 1
+    jb      a2_badparam
+    cmp     dword ptr [rcx].ARGON2REQ.outlen, 4
+    jb      a2_badparam
+    mov     rdx, rax
+    shl     rdx, 3                           ; 8 * lanes (64-bit)
+    mov     r8d, dword ptr [rcx].ARGON2REQ.m_cost
+    cmp     r8, rdx
+    jb      a2_badparam
+
+    ; ---- read params -------------------------------------------------------
     mov     qword ptr [g_p], rax
     mov     eax, dword ptr [rcx].ARGON2REQ.t_cost
     mov     qword ptr [g_t], rax
@@ -1279,12 +1343,17 @@ endif
     mov     r9, 1024
     call    blake2b_long
 
-    ; wipe the key-equivalent pre-hash H0 (g_hbuf, 80 bytes) - together with the
-    ; public salt it is sufficient to reproduce the derived key, so it must not
-    ; linger in .data? after the KDF completes.
+    ; wipe the key-equivalent pre-hash H0 (g_hbuf, 80 bytes) + auxiliary KDF state
     lea     rcx, [g_hbuf]
     mov     edx, 80
     call    secure_zero
+    lea     rcx, [g_inp]
+    mov     edx, 1024
+    call    secure_zero
+    lea     rcx, [g_addr]
+    mov     edx, 1024
+    call    secure_zero
+    mov     qword ptr [g_le4], 0
     ; wipe + free arena
     mov     rcx, qword ptr [g_arena]
     mov     rdx, qword ptr [g_mb]
@@ -1298,7 +1367,14 @@ endif
     xor     edx, edx
     mov     r8d, MEM_RELEASE
     call    VirtualFree
+    mov     qword ptr [g_arena], 0
 
+    pxor    xmm0, xmm0
+    pxor    xmm1, xmm1
+    pxor    xmm2, xmm2
+    pxor    xmm3, xmm3
+    pxor    xmm4, xmm4
+    pxor    xmm5, xmm5
     xor     eax, eax
     mov     r12, qword ptr [rbp-32]     ; restore callee-saved registers
     mov     r13, qword ptr [rbp-40]
@@ -1310,6 +1386,20 @@ a2_fail:
     lea     rcx, [g_hbuf]
     mov     edx, 80
     call    secure_zero
+    lea     rcx, [g_inp]
+    mov     edx, 1024
+    call    secure_zero
+    lea     rcx, [g_addr]
+    mov     edx, 1024
+    call    secure_zero
+    mov     qword ptr [g_le4], 0
+a2_badparam:
+    pxor    xmm0, xmm0
+    pxor    xmm1, xmm1
+    pxor    xmm2, xmm2
+    pxor    xmm3, xmm3
+    pxor    xmm4, xmm4
+    pxor    xmm5, xmm5
     mov     eax, 1
     mov     r12, qword ptr [rbp-32]     ; restore callee-saved registers
     mov     r13, qword ptr [rbp-40]

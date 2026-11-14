@@ -93,7 +93,13 @@ rem the IDC_V_HEADER "dip" class) gate the same way: any finding fails a strict
 rem build.
 rem ---------------------------------------------------------------------------
 where python >nul 2>nul
-if errorlevel 1 goto :nofc
+if errorlevel 1 (
+    if "%STRICT%"=="1" (
+        echo build: python not found on PATH - failing strict build
+        goto :failed
+    )
+    goto :nofc
+)
 echo === framecheck ===
 rem strict gates WARNINGS too: the tree is at zero, and a new frame overlap must be
 rem fixed or allowlisted with a reason, not printed into a list nobody reads.
@@ -176,6 +182,15 @@ if errorlevel 1 (
         goto :failed
     )
     echo aligncheck: WARNING - misaligned labels above; build continues. Use "build strict" to gate.
+)
+echo === check_docs ===
+python tools\check_docs.py
+if errorlevel 1 (
+    if "%STRICT%"=="1" (
+        echo check_docs: documentation link/anchor error - failing strict build
+        goto :failed
+    )
+    echo check_docs: WARNING - documentation errors above; build continues. Use "build strict" to gate.
 )
 :nofc
 

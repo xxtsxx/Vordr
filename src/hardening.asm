@@ -23,14 +23,14 @@ extern secmem_panic_wipe:proc           ; secmem.asm: zero every live secret buf
 extern SetUnhandledExceptionFilter:proc
 extern AddVectoredExceptionHandler:proc
 extern SetErrorMode:proc
+extern SetDefaultDllDirectories:proc
+extern SetProcessMitigationPolicy:proc
 extern TerminateProcess:proc
 extern GetCurrentProcess:proc
-extern GetCurrentThreadId:proc
 extern SwitchDesktop:proc               ; restore the user's desktop before we die
-extern MessageBoxW:proc
 externdef g_secdesk_orig:qword          ; gui.asm: HDESK of the user's own input desktop
-externdef g_secdesk_tid:dword           ; gui.asm: secure-desktop worker tid (0 = none)
 extern CreateFileW:proc
+extern GetFileType:proc
 extern WriteFile:proc
 extern CloseHandle:proc
 extern GetTempPathW:proc
@@ -72,7 +72,9 @@ align 8
 g_cpu_features  dd 0
 g_heap_gen      dd 1                    ; global generation counter
 public g_gui_active
-g_gui_active    dd 0                    ; 1 once the GUI is up (crash apology box)
+g_gui_active    dd 0                    ; 1 once the GUI is up
+public g_in_crash
+g_in_crash      dd 0                    ; atomic re-entrancy latch (lock bts)
 g_crash_code    dq 0                    ; last exception code (crash breadcrumb)
 g_crash_addr    dq 0                    ; last exception address
 g_crash_base    dq 0                    ; image base at crash time (RVA math)
@@ -88,19 +90,17 @@ align 2
 
 SEM_FAILCRITICALERRORS  equ 1
 SEM_NOGPFAULTERRORBOX   equ 2
-MB_OK_          equ 0
-MB_ICONERROR_   equ 10h
-GENERIC_WRITE_  equ 40000000h
-CREATE_ALWAYS_  equ 2
+GENERIC_WRITE_          equ 40000000h
+CREATE_ALWAYS_          equ 2
+FILE_FLAG_OPEN_RP       equ 00200000h   ; FILE_FLAG_OPEN_REPARSE_POINT
+FILE_TYPE_DISK_         equ 1
+STATUS_STACK_OVF        equ 0C00000FDh
+LOAD_LIB_SYS32          equ 0800h       ; LOAD_LIBRARY_SEARCH_SYSTEM32
+MITIG_EXT_DISABLE       equ 7           ; ProcessExtensionPointDisablePolicy
+MITIG_IMG_LOAD          equ 10          ; ProcessImageLoadPolicy
+IMG_POL_FLAGS           equ 5           ; NoRemoteImages (1) | PreferSystem32Images (4)
 
 .const
-crash_apology label word
-    dw 'V','o','r','d','r',' ','h','i','t',' ','a',' ','f','a','t','a','l',' ','e'
-    dw 'r','r','o','r',' ','a','n','d',' ','m','u','s','t',' ','c','l','o','s','e'
-    dw '.',' ','Y','o','u','r',' ','s','e','c','r','e','t','s',' ','w','e','r','e'
-    dw ' ','w','i','p','e','d',' ','f','r','o','m',' ','m','e','m','o','r','y','.', 0
-crash_title label word
-    dw 'V','o','r','d','r', 0
 crash_fname label word
     dw 'v','o','r','d','r','_','c','r','a','s','h','.','b','i','n', 0
 ifdef DBG_TRACE
@@ -222,73 +222,70 @@ sstk_overflow_fail proc
 sstk_overflow_fail endp
 
 ; =============================================================================
-; crash_contain() - the shared crash-containment action: wipe every live secret
-;   buffer, print a dbg breadcrumb, show a one-line apology (GUI only), then
-;   terminate the process hard.  No secret can reach a WER minidump or
-;   hibernation image, and the OS never runs its dump writer for this fault.
-;   Never returns.
+; crash_contain() - the shared crash-containment action: reset shadow stack,
+;   wipe every live secret buffer, print a dbg breadcrumb, restore desktop if on
+;   the Secure-Unlock private desktop, and terminate immediately without pumping
+;   messages or raising UI.  RAW frame so crash containment never depends on the
+;   software shadow stack or stack canary being intact.
 ; =============================================================================
-crash_contain proc frame
-    FRAME_PROLOG 64
+crash_contain proc
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    sub     rsp, 64
+    call    sstk_reset_current
     call    secmem_panic_wipe                   ; secrets gone before anything else
 ifdef DBG_TRACE
     lea     rcx, [crash_bc]
     mov     edx, crash_bc_len
     call    print_a
 endif
-    ; A fault raised while the Secure-Unlock desktop holds input would otherwise
-    ; strand the user there: we are about to TerminateProcess, and the only other
-    ; SwitchDesktop back lives in secdesk_body, which a faulting worker never
-    ; reaches.  Hand the session back BEFORE any UI or termination.
     cmp     qword ptr [g_secdesk_orig], 0
-    je      cc_gui
+    je      cc_kill
     WINCALL SwitchDesktop, qword ptr [g_secdesk_orig]
-    WINCALL GetCurrentThreadId                   ; is the faulting thread the worker?
-    cmp     eax, dword ptr [g_secdesk_tid]
-    je      cc_kill                             ; yes: its windows are on the desktop we
-                                                ;  just left, so a modal raised here would
-                                                ;  be invisible AND block termination for
-                                                ;  ever - die quietly instead
-cc_gui:
-    cmp     dword ptr [g_gui_active], 0          ; apology box only when a GUI is up
-    je      cc_kill                             ; (headless CLI never blocks on a modal)
-    WINCALL MessageBoxW, 0, addr crash_apology, addr crash_title, \
-            <MB_OK_ or MB_ICONERROR_>
 cc_kill:
     WINCALL GetCurrentProcess
     WINCALL TerminateProcess, rax, 0C0000409h
-    FRAME_EPILOG                                ; unreached
+    mov     ecx, 2
+    int     29h
+    mov     rsp, rbp
+    pop     rbp
     ret
 crash_contain endp
 
 ; =============================================================================
 ; crash_veh(rcx = PEXCEPTION_POINTERS) -> LONG.  Vectored exception handler,
-;   the PRIMARY containment path: it runs first-chance, so it fires before any
-;   OS dump writer and even when a monitor/debugger owns the last-chance filter.
-;   It only acts on error-severity (0xCxxxxxxx) codes - access violations,
-;   stack-buffer-overrun fastfails, illegal instructions, etc. - and passes
-;   benign first-chance events (guard-page stack growth 0x80000001, single-step)
-;   straight through with EXCEPTION_CONTINUE_SEARCH so normal execution is
-;   untouched.  On a fatal code it never returns (crash_contain terminates).
+;   the PRIMARY containment path: raw frame + atomic re-entrancy latch (g_in_crash).
 ; =============================================================================
-crash_veh proc frame
-    FRAME_PROLOG 32
+crash_veh proc
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    sub     rsp, 64
     mov     rax, qword ptr [rcx]                ; -> EXCEPTION_RECORD
-    mov     r10d, dword ptr [rax]
-    mov     dword ptr [g_crash_code], r10d      ; ExceptionCode
-    mov     r10, qword ptr [rax+16]
-    mov     qword ptr [g_crash_addr], r10       ; ExceptionAddress
+    mov     edx, dword ptr [rax]                ; ExceptionCode
+    mov     r8d, edx
+    and     r8d, 0F0000000h                     ; severity nibble
+    cmp     r8d, 0C0000000h                     ; ERROR severity => fatal
+    jne     cv_pass
+    mov     r10, qword ptr [rax+16]             ; ExceptionAddress
+    cmp     r10, qword ptr [g_img_lo]
+    jb      cv_pass
+    cmp     r10, qword ptr [g_img_hi]
+    jae     cv_pass
+    ; Re-entrancy guard: if we fault INSIDE crash_dump / crash_contain, kill immediately
+    lock bts dword ptr [g_in_crash], 0
+    jc      cv_reent
+    mov     dword ptr [g_crash_code], edx
+    mov     qword ptr [g_crash_addr], r10
     cmp     dword ptr [rax+24], 2               ; NumberParameters >= 2?
     jb      cv_noinfo
     mov     r10, qword ptr [rax+32]
-    mov     qword ptr [g_crash_info], r10       ; ExceptionInformation[0]
+    mov     qword ptr [g_crash_info], r10
     mov     r10, qword ptr [rax+40]
-    mov     qword ptr [g_crash_info+8], r10     ; ExceptionInformation[1] (data addr)
+    mov     qword ptr [g_crash_info+8], r10
 cv_noinfo:
 ifdef DBG_TRACE
-    ; dbg builds only: capture GP registers for post-mortem analysis.  Never in
-    ; release - at a crash during crypto these can hold key or password bytes,
-    ; and the breadcrumb file is world-readable within the user profile.
     mov     rax, qword ptr [rcx+8]              ; -> CONTEXT
     mov     r10, qword ptr [rax+78h]
     mov     qword ptr [g_crash_regs+0], r10     ; rax
@@ -311,45 +308,38 @@ ifdef DBG_TRACE
     mov     r10, qword ptr [rax+0B8h]
     mov     qword ptr [g_crash_regs+72], r10    ; r8
 endif
-    mov     rax, qword ptr [rcx]                ; -> EXCEPTION_RECORD
-    mov     eax, dword ptr [rax]                ; ExceptionCode
-    and     eax, 0F0000000h                     ; severity nibble
-    cmp     eax, 0C0000000h                     ; ERROR severity => fatal
-    jne     cv_pass
-    ; ...but only when it was raised in OUR code.  A vectored handler sees every
-    ; first-chance exception in the process, including ones a system or third-party
-    ; DLL raises and handles itself - shell extensions loaded into the file dialogs
-    ; do exactly that - and terminating on those killed Vordr over faults that were
-    ; never going to be fatal.  A fault outside this image that nobody handles still
-    ; reaches crash_filter, which contains it the same way.
-    mov     rax, qword ptr [g_crash_addr]
-    cmp     rax, qword ptr [g_img_lo]
-    jb      cv_pass
-    cmp     rax, qword ptr [g_img_hi]
-    jae     cv_pass
-    call    crash_dump                          ; breadcrumb FIRST (survives a
-                                                ;  containment-step failure)
+    cmp     dword ptr [g_crash_code], STATUS_STACK_OVF
+    je      cv_nodump                           ; stack exhausted: skip Win32 file I/O
+    call    crash_dump
+cv_nodump:
     call    crash_contain                       ; wipe + terminate (no return)
+cv_reent:
+    WINCALL GetCurrentProcess
+    WINCALL TerminateProcess, rax, 0C0000409h
+    mov     ecx, 2
+    int     29h
 cv_pass:
     xor     eax, eax                            ; EXCEPTION_CONTINUE_SEARCH
-    FRAME_EPILOG
+    mov     rsp, rbp
+    pop     rbp
     ret
 crash_veh endp
 
-; crash_dump() - best-effort crash breadcrumb: %TEMP%\vordr_crash.bin.  Runs
-;   BEFORE the wipe/apology so the record survives even if a later containment
-;   step fails.  Release writes {code, addr, base} (24 bytes - no secret content;
-;   the ExceptionInformation words are not recorded); dbg builds append 10 GP registers for
-;   post-mortem analysis (registers may hold key/password bytes at a crash, so
-;   they never ship in a release breadcrumb).
-crash_dump proc frame
-    FRAME_PROLOG 64
+; crash_dump() - best-effort crash breadcrumb: %TEMP%\vordr_crash.bin.
+;   RAW frame; refuses symlinks/reparse points and non-disk handles.
+crash_dump proc
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    sub     rsp, 64
     cmp     byte ptr [g_crash_dumped], 0
     jne     cd_ret
     mov     byte ptr [g_crash_dumped], 1
     WINCALL GetTempPathW, MAX_PATH_CHARS-32, addr g_crashpath
-    test    rax, rax
+    test    eax, eax
     jz      cd_ret
+    cmp     eax, MAX_PATH_CHARS-32
+    jae     cd_ret
     lea     r10, [g_crashpath]
 cd_scan:
     cmp     word ptr [r10], 0
@@ -365,10 +355,13 @@ cd_cp:
     add     r11, 2
     test    ax, ax
     jnz     cd_cp
-    WINCALL CreateFileW, addr g_crashpath, GENERIC_WRITE_, 0, 0, CREATE_ALWAYS_, 0, 0
+    WINCALL CreateFileW, addr g_crashpath, GENERIC_WRITE_, 0, 0, CREATE_ALWAYS_, FILE_FLAG_OPEN_RP, 0
     cmp     rax, -1
     je      cd_ret
     mov     qword ptr [g_crash_h], rax
+    WINCALL GetFileType, qword ptr [g_crash_h]
+    cmp     eax, FILE_TYPE_DISK_
+    jne     cd_close
     WINCALL GetModuleHandleW, 0
     mov     qword ptr [g_crash_base], rax
 ifdef DBG_TRACE
@@ -376,25 +369,40 @@ ifdef DBG_TRACE
 else
     WINCALL WriteFile, qword ptr [g_crash_h], addr g_crash_code, 24, addr g_crash_nw, 0
 endif
+cd_close:
     WINCALL CloseHandle, qword ptr [g_crash_h]
 cd_ret:
-    FRAME_EPILOG
+    mov     rsp, rbp
+    pop     rbp
     ret
 crash_dump endp
 
-; crash_filter(rcx = PEXCEPTION_POINTERS) -> LONG.  Backup last-chance filter
-;   for environments where a VEH is not reached; same containment action.
-crash_filter proc frame
-    FRAME_PROLOG 32
-    mov     rax, qword ptr [rcx]                ; record what crash_veh would have: the
-    mov     r10d, dword ptr [rax]               ;   faults it now passes on end up here
+; crash_filter(rcx = PEXCEPTION_POINTERS) -> LONG.  Backup last-chance filter.
+crash_filter proc
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    sub     rsp, 64
+    lock bts dword ptr [g_in_crash], 0
+    jc      cf_reent
+    mov     rax, qword ptr [rcx]
+    mov     r10d, dword ptr [rax]
     mov     dword ptr [g_crash_code], r10d
     mov     r10, qword ptr [rax+16]
     mov     qword ptr [g_crash_addr], r10
+    cmp     r10d, STATUS_STACK_OVF
+    je      cf_nodump
     call    crash_dump
+cf_nodump:
     call    crash_contain
-    xor     eax, eax                            ; EXCEPTION_CONTINUE_SEARCH (unreached)
-    FRAME_EPILOG
+cf_reent:
+    WINCALL GetCurrentProcess
+    WINCALL TerminateProcess, rax, 0C0000409h
+    mov     ecx, 2
+    int     29h
+    xor     eax, eax
+    mov     rsp, rbp
+    pop     rbp
     ret
 crash_filter endp
 
@@ -436,6 +444,13 @@ hardening_init proc frame
     sub     rsp, 64                     ; 32 shadow + locals (base, oldprot, seed)
     .allocstack 64
     .endprolog
+
+    ; ---- lock dynamic DLL search path + process mitigation policies ---------
+    WINCALL SetDefaultDllDirectories, LOAD_LIB_SYS32
+    mov     dword ptr [rbp-24], 1
+    WINCALL SetProcessMitigationPolicy, MITIG_EXT_DISABLE, addr rbp-24, 4
+    mov     dword ptr [rbp-24], IMG_POL_FLAGS
+    WINCALL SetProcessMitigationPolicy, MITIG_IMG_LOAD, addr rbp-24, 4
 
     ; ---- one TLS index, then THIS thread's own shadow stack ----------------
     call    TlsAlloc                    ; no arguments
@@ -648,6 +663,33 @@ tagged_check proc
 tc_fail:
     FASTFAIL FF_HEAP_TAG
 tagged_check endp
+
+; =============================================================================
+; tagged_free(rcx = user ptr) - verify header/rear canaries, wipe user + header
+;   bytes, bump g_heap_gen, and release via VirtualFree.  NULL is a safe no-op.
+; =============================================================================
+public tagged_free
+tagged_free proc frame
+    FRAME_PROLOG 48
+    test    rcx, rcx
+    jz      tf_done
+    mov     qword ptr [rbp-24], rcx
+    call    tagged_check                        ; traps on overflow/corrupt/double-free
+    mov     rcx, qword ptr [rbp-24]
+    lea     rax, [rcx - sizeof HEAPBLK]
+    mov     qword ptr [rbp-32], rax
+    mov     rdx, qword ptr [rax].HEAPBLK.blksize
+    add     rdx, HEAP_TAIL_LEN
+    call    secure_zero                         ; wipe user bytes + rear canary
+    mov     rcx, qword ptr [rbp-32]
+    mov     edx, sizeof HEAPBLK
+    call    secure_zero                         ; clear TM_HEAPBLK + tags
+    inc     dword ptr [g_heap_gen]
+    WINCALL VirtualFree, qword ptr [rbp-32], 0, MEM_RELEASE
+tf_done:
+    FRAME_EPILOG
+    ret
+tagged_free endp
 
 ; =============================================================================
 ; cmd_cttest (dbg probe) - coarse constant-time check for ct_memcmp: time 10k

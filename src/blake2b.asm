@@ -88,10 +88,23 @@ ROUND macro s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15
 endm
 
 ; =============================================================================
-; blake2b_init(rcx = ctx, edx = outlen)
+; blake2b_init(rcx = ctx, edx = outlen 1..64) -> eax = 0 ok, 1 out-of-range
+;   Clamps ctx.outlen into [1..64] even when returning eax = 1 so a caller that
+;   ignores the status cannot overflow out[] past ctx.h[0..63] in blake2b_final.
 ; =============================================================================
 public blake2b_init
 blake2b_init proc
+    xor     r8d, r8d
+    test    edx, edx
+    jnz     @F
+    mov     edx, 1
+    mov     r8d, 1
+    jmp     b2i_go
+@@: cmp     edx, 64
+    jbe     b2i_go
+    mov     edx, 64
+    mov     r8d, 1
+b2i_go:
     ; h = IV
     movdqu  xmm0, xmmword ptr [b2b_iv+0]
     movdqu  xmmword ptr [rcx].BLAKE2B_CTX.h+0, xmm0
@@ -101,6 +114,7 @@ blake2b_init proc
     movdqu  xmmword ptr [rcx].BLAKE2B_CTX.h+32, xmm0
     movdqu  xmm0, xmmword ptr [b2b_iv+48]
     movdqu  xmmword ptr [rcx].BLAKE2B_CTX.h+48, xmm0
+    pxor    xmm0, xmm0
     ; h[0] ^= 0x01010000 | outlen   (fanout=1, depth=1, no key)
     mov     eax, edx
     and     eax, 0FFh
@@ -112,6 +126,7 @@ blake2b_init proc
     mov     qword ptr [rcx].BLAKE2B_CTX.t+8, 0
     mov     dword ptr [rcx].BLAKE2B_CTX.buflen, 0
     mov     dword ptr [rcx].BLAKE2B_CTX.outlen, edx
+    mov     eax, r8d
     ret
 blake2b_init endp
 
@@ -179,6 +194,17 @@ blake2b_compress proc frame
     FF 5
     FF 6
     FF 7
+
+    ; wipe working state v[0..15] (128 bytes)
+    pxor    xmm0, xmm0
+    movdqu  xmmword ptr [r13+0],   xmm0
+    movdqu  xmmword ptr [r13+16],  xmm0
+    movdqu  xmmword ptr [r13+32],  xmm0
+    movdqu  xmmword ptr [r13+48],  xmm0
+    movdqu  xmmword ptr [r13+64],  xmm0
+    movdqu  xmmword ptr [r13+80],  xmm0
+    movdqu  xmmword ptr [r13+96],  xmm0
+    movdqu  xmmword ptr [r13+112], xmm0
 
     mov     r13, qword ptr [rbp-16]
     mov     r14, qword ptr [rbp-24]
@@ -314,6 +340,7 @@ blake2b_long proc frame
     ;  [rbp-24] out  [rbp-32] outlen  [rbp-40] in  [rbp-48] inlen
     ;  [rbp-56] ctx ptr  [rbp-64] pos  [rbp-72] remaining
     ;  ctx at [rsp+32], Vbuf (64) at [rsp+32+CTX]
+    mov     edx, edx                     ; zero-extend 32-bit outlen into rdx
     mov     qword ptr [rbp-24], rcx
     mov     qword ptr [rbp-32], rdx
     mov     qword ptr [rbp-40], r8
@@ -322,6 +349,8 @@ blake2b_long proc frame
     mov     qword ptr [rbp-56], rax
     lea     rax, [rsp+32+BLAKE2B_CTX_SIZE]
     mov     qword ptr [rbp-80], rax      ; Vbuf
+    test    edx, edx
+    jz      bl_done
 
     ; store LE32(outlen) into the high 4 bytes of a scratch (use [rbp-88])
     mov     eax, dword ptr [rbp-32]
@@ -407,6 +436,8 @@ bl_tail:
     call    blake2b_hash
 
 bl_done:
+    pxor    xmm0, xmm0
+    mov     dword ptr [rbp-88], 0
     lea     rcx, [rsp+32]                    ; ctx + V: Argon2 runs H' over the
     mov     edx, BLAKE2B_CTX_SIZE + 64       ;   password-derived blocks
     call    secure_zero

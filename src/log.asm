@@ -25,12 +25,14 @@
 include macros.inc
 
 extern CreateFileW:proc
+extern GetFileType:proc
 extern WriteFile:proc
 extern CloseHandle:proc
 extern GetEnvironmentVariableW:proc
 extern CreateDirectoryW:proc
 extern GetLocalTime:proc
 extern WideCharToMultiByte:proc
+extern reg_hash_name:proc
 
 externdef g_cfg_loglevel:dword
 externdef g_cfg_logfile:qword
@@ -47,6 +49,8 @@ FILE_APPEND_DATA     equ 4
 FILE_SHARE_RW        equ 3            ; FILE_SHARE_READ | FILE_SHARE_WRITE
 OPEN_ALWAYS          equ 4
 FILE_ATTR_NORMAL     equ 80h
+FILE_FLAG_OPEN_RP    equ 00200000h    ; FILE_FLAG_OPEN_REPARSE_POINT
+FILE_TYPE_DISK_      equ 1
 INVALID              equ -1
 LINELEN              equ 16384        ; one log line, UTF-8 bytes
 
@@ -170,6 +174,21 @@ log_putw proc frame
     jz      pw_none
     dec     eax                         ; drop the NUL from the byte count
     mov     rcx, qword ptr [rbp-24]
+    xor     r8d, r8d
+pw_scrub:
+    cmp     r8d, eax
+    jae     pw_done
+    movzx   edx, byte ptr [rcx+r8]
+    cmp     edx, 20h                    ; scrub CR/LF and C0 controls (log-injection guard)
+    jb      pw_qmark
+    cmp     edx, 7Fh
+    jne     pw_next
+pw_qmark:
+    mov     byte ptr [rcx+r8], '?'
+pw_next:
+    inc     r8d
+    jmp     pw_scrub
+pw_done:
     add     rcx, rax
     mov     rax, rcx
     FRAME_EPILOG
@@ -183,11 +202,11 @@ log_putw endp
 ; -----------------------------------------------------------------------------
 ; log_open() -> rax = file handle (append mode) or INVALID.
 ; Uses g_cfg_logfile if set, else %LOCALAPPDATA%\Vordr\vordr.log (creating the
-; Vordr directory if needed).
+; Vordr directory if needed).  Refuses reparse points and non-disk handles.
 ; -----------------------------------------------------------------------------
 log_open proc frame
     FRAME_PROLOG 128
-    ; [rbp-24]=saved cursor  [rbp-32]=path ptr
+    ; [rbp-24]=saved cursor  [rbp-32]=path ptr  [rbp-40]=handle
     mov     rax, qword ptr [g_cfg_logfile]
     test    rax, rax
     jz      lo_default
@@ -197,7 +216,7 @@ lo_default:
     WINCALL GetEnvironmentVariableW, addr w_localappdata, addr g_logpath, MAX_PATH_CHARS-64
     test    eax, eax
     jz      lo_fail
-    cmp     eax, 1000                   ; value didn't fit (returns required size), or
+    cmp     eax, MAX_PATH_CHARS-64      ; value didn't fit (returns required size), or
     jae     lo_fail                     ; leaves no room for "\Vordr\vordr.log" -> skip
     mov     ecx, eax                    ; dir length (chars)
     lea     rdx, [g_logpath]
@@ -216,9 +235,18 @@ lo_default:
     mov     qword ptr [rbp-32], rax
 lo_open:
     WINCALL CreateFileW, qword ptr [rbp-32], FILE_APPEND_DATA, FILE_SHARE_RW, 0, \
-            OPEN_ALWAYS, FILE_ATTR_NORMAL, 0
+            OPEN_ALWAYS, <FILE_ATTR_NORMAL or FILE_FLAG_OPEN_RP>, 0
+    cmp     rax, INVALID
+    je      lo_fail
+    mov     qword ptr [rbp-40], rax
+    WINCALL GetFileType, rax
+    cmp     eax, FILE_TYPE_DISK_
+    jne     lo_badtype
+    mov     rax, qword ptr [rbp-40]
     FRAME_EPILOG
     ret
+lo_badtype:
+    WINCALL CloseHandle, qword ptr [rbp-40]
 lo_fail:
     mov     rax, INVALID
     FRAME_EPILOG
@@ -355,7 +383,7 @@ lr_have:
     mov     rdx, qword ptr [rbp-64]         ; result text
     mov     r8d, dword ptr [rbp-72]
     call    log_puta
-    ; ---- debug: " [in=<path> out=<path>]" ----------------------------------
+    ; ---- debug: " [in=<hash> out=<hash>]" (redacted path hashes, VDR-27) ---
     cmp     dword ptr [g_cfg_loglevel], LOG_DEBUG
     jne     lr_crlf
     mov     rdx, qword ptr [g_cfg_in]
@@ -365,8 +393,11 @@ lr_have:
     lea     rdx, [sep_in]
     mov     r8d, sep_in_len
     call    log_puta
-    mov     rcx, rax
-    mov     rdx, qword ptr [g_cfg_in]
+    mov     qword ptr [rbp-80], rax
+    mov     rcx, qword ptr [g_cfg_in]
+    call    reg_hash_name
+    mov     rcx, qword ptr [rbp-80]
+    mov     rdx, rax
     call    log_putw
     mov     rdx, qword ptr [g_cfg_out]
     test    rdx, rdx
@@ -375,8 +406,11 @@ lr_have:
     lea     rdx, [sep_out]
     mov     r8d, sep_out_len
     call    log_puta
-    mov     rcx, rax
-    mov     rdx, qword ptr [g_cfg_out]
+    mov     qword ptr [rbp-80], rax
+    mov     rcx, qword ptr [g_cfg_out]
+    call    reg_hash_name
+    mov     rcx, qword ptr [rbp-80]
+    mov     rdx, rax
     call    log_putw
 lr_closebr:
     mov     rcx, rax

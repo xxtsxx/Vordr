@@ -103,6 +103,30 @@ def normalise(path):
                 struct.pack_into("<I", b, eo + 4, 0)
                 changed += 1
 
+    # --- the LOAD_CONFIG directory: verify DependentLoadFlags = 0x0800 ------
+    # Without LOAD_LIBRARY_SEARCH_SYSTEM32 (0x0800) in _load_config_used, the PE
+    # loader resolves static import DLLs (wtsapi32.dll, bcrypt.dll, dwmapi.dll,
+    # ...) from the application directory before wstart runs.
+    if nddir <= 10:
+        raise ValueError("PE optional header lacks IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG")
+    lcfg_rva, lcfg_size = _u32(b, ddir + 10 * 8), _u32(b, ddir + 10 * 8 + 4)
+    if lcfg_rva == 0 or lcfg_size < 0x50:
+        raise ValueError("missing or truncated LOAD_CONFIG directory (rva=0x%X, size=0x%X)"
+                         % (lcfg_rva, lcfg_size))
+    lcfg_off = rva_to_off(lcfg_rva)
+    if lcfg_off is None or lcfg_off + 0x50 > len(b):
+        raise ValueError("LOAD_CONFIG RVA 0x%X is outside mapped sections" % lcfg_rva)
+    if _u32(b, lcfg_off) < 0x50:
+        raise ValueError("LOAD_CONFIG.Size 0x%X does not cover DependentLoadFlags"
+                         % _u32(b, lcfg_off))
+    dep_flags = _u16(b, lcfg_off + 0x4E)
+    if dep_flags != 0x0800:
+        raise ValueError("LOAD_CONFIG.DependentLoadFlags is 0x%04X, expected 0x0800 "
+                         "(LOAD_LIBRARY_SEARCH_SYSTEM32)" % dep_flags)
+    if _u32(b, lcfg_off + 4) != 0:
+        struct.pack_into("<I", b, lcfg_off + 4, 0)
+        changed += 1
+
     if nddir <= 6:
         return _save(path, b, changed)
     dbg_rva = _u32(b, ddir + 6 * 8)

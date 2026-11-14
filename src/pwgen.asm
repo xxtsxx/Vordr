@@ -19,6 +19,7 @@
 include macros.inc
 
 extern rng_fill:proc
+extern secure_zero:proc
 
 externdef g_cfg_pass:byte
 externdef g_cfg_passlen:dword
@@ -164,10 +165,20 @@ pg_draw:
     inc     qword ptr [rbp-48]
     jmp     pg_outer
 pg_ok:
+    mov     byte ptr [rbp-56], 0
+    mov     dword ptr [pw_alpha_n], 0
+    lea     rcx, [pw_alpha]
+    mov     edx, 128
+    call    secure_zero
     mov     eax, 1
     FRAME_EPILOG
     ret
 pg_fail:
+    mov     byte ptr [rbp-56], 0
+    mov     dword ptr [pw_alpha_n], 0
+    lea     rcx, [pw_alpha]
+    mov     edx, 128
+    call    secure_zero
     xor     eax, eax
     FRAME_EPILOG
     ret
@@ -193,6 +204,7 @@ ri_draw:
     test    eax, eax
     jz      ri_fail
     movzx   eax, byte ptr [rbp-32]
+    mov     byte ptr [rbp-32], 0
     cmp     eax, dword ptr [rbp-28]
     jae     ri_draw
     xor     edx, edx
@@ -201,6 +213,7 @@ ri_draw:
     FRAME_EPILOG
     ret
 ri_fail:
+    mov     byte ptr [rbp-32], 0
     mov     eax, -1
     FRAME_EPILOG
     ret
@@ -526,9 +539,21 @@ pex_finish:
     xor     edx, edx
     mov     ecx, 1000
     div     ecx                                 ; -> whole bits
+    mov     dword ptr [rbp-84], eax
+    mov     dword ptr [pw_entropy], 0
+    mov     dword ptr [pw_alpha_n], 0
+    lea     rcx, [pw_alpha]
+    mov     edx, 128
+    call    secure_zero
+    mov     eax, dword ptr [rbp-84]
     FRAME_EPILOG
     ret
 pex_fail:
+    mov     dword ptr [pw_entropy], 0
+    mov     dword ptr [pw_alpha_n], 0
+    lea     rcx, [pw_alpha]
+    mov     edx, 128
+    call    secure_zero
     xor     eax, eax
     FRAME_EPILOG
     ret

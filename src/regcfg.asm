@@ -26,8 +26,12 @@ extern SHGetFolderPathW:proc
 extern GetEnvironmentVariableW:proc
 extern ExpandEnvironmentStringsW:proc   ; REG_EXPAND_SZ means expand it, not accept it
 extern CreateDirectoryW:proc
+extern CreateFileW:proc
+extern CloseHandle:proc
+extern GetFinalPathNameByHandleW:proc
 extern GetFullPathNameW:proc            ; reg_hash_name: one key per FILE, not per spelling
 extern CharUpperBuffW:proc
+extern path_longify:proc
 
 REG_SZ          equ 1
 REG_EXPAND_SZ   equ 2
@@ -36,7 +40,13 @@ REG_DWORD       equ 4
 KEY_READ        equ 20019h
 KEY_WRITE       equ 20006h
 KEY_RW          equ 2001Fh          ; KEY_READ or KEY_WRITE (enumerate + delete values)
-CSIDL_PERSONAL  equ 5
+CSIDL_PERSONAL      equ 5
+CSIDL_APPDATA       equ 1Ah
+CSIDL_LOCAL_APPDATA equ 1Ch
+CSIDL_PROFILE       equ 28h
+OPEN_EXISTING       equ 3
+FILE_SHARE_RWD      equ 7
+FILE_FLAG_BACKUP_SEM equ 02000000h
 ; "\Vordr" (6) + "\vault.vordr" (12) + NUL, and the filename tail on its own.
 ; Both appends are bounded against the caller's capacity using these.
 CDV_MIN_CHARS   equ 280        ; MAX_PATH (260) + the tail + slack
@@ -70,7 +80,14 @@ od_accounts label word
     dw 5Ch, 'O','n','e','D','r','i','v','e', 5Ch, 'A','c','c','o','u','n','t','s', 0
 od_userfolder label word
     dw 'U','s','e','r','F','o','l','d','e','r', 0
+pfx_hklm_up label word
+    dw '%','U','S','E','R','P','R','O','F','I','L','E','%', 5Ch, 0
+pfx_hklm_la label word
+    dw '%','L','O','C','A','L','A','P','P','D','A','T','A','%', 5Ch, 0
+pfx_hklm_ad label word
+    dw '%','A','P','P','D','A','T','A','%', 5Ch, 0
 align 8
+public g_hklm
 g_hklm  dq 080000002h            ; HKEY_LOCAL_MACHINE (as a clean 64-bit value)
 public g_hkcu                    ; gui_test_hooks (probeio/dbg) points it at a scratch key
 g_hkcu  dq 080000001h            ; HKEY_CURRENT_USER
@@ -82,9 +99,10 @@ g_cfg_dw    dd ?                 ; REG_DWORD value scratch
 g_cfg_khan  dq ?                 ; open key handle
 g_reg_hdig  db 32 dup (?)        ; C6: SHA-256(vault path), input to the name hash
 align 2
-g_reg_hname dw 33 dup (?)        ; C6: hashed reg value name = 32 hex wide chars + NUL
+g_reg_hname dw 33 dup (?)        ; C6: hashed reg value name = 32 hex chars + NUL
 align 2
 REG_NORM_CCH equ MAX_PATH_CHARS + 16
+g_reg_lpath dw REG_NORM_CCH dup (?) ; path_longify scratch for reg_hash_name
 g_reg_tmp   dw REG_NORM_CCH dup (?) ; reg_hash_name: the path with any \\?\ prefix removed
 g_reg_norm  dw REG_NORM_CCH dup (?) ;   and then made absolute and upper-cased
 align 2
@@ -173,44 +191,94 @@ reg_hash_legacy endp
 ;   mirror is a tripwire, not an access control.)  Readers fall back to the legacy
 ;   hash so existing entries keep working.
 ; ===========================================================================
-reg_hash_name proc frame
-    FRAME_PROLOG 64
-    mov     qword ptr [rbp-24], rcx
-    lea     r11, [g_reg_tmp]
-    xor     r8d, r8d                            ; source offset (chars) to copy from
+; rhn_strip_prefix(rcx = wide src, rdx = wide dst) -> eax = chars written.
+;   Strips leading "\\?\" or "\\.\" (and case-insensitive "\\?\UNC\" / "\\.\UNC\" -> "\\")
+;   into dst, bounded by REG_NORM_CCH - 2.  Leaf.
+rhn_strip_prefix proc
+    mov     r11, rdx
+    xor     r8d, r8d
     cmp     word ptr [rcx], 5Ch
-    jne     rhn2_copy
+    jne     rsp_copy
     cmp     word ptr [rcx+2], 5Ch
-    jne     rhn2_copy
-    cmp     word ptr [rcx+4], '?'
-    jne     rhn2_copy
+    jne     rsp_copy
+    movzx   eax, word ptr [rcx+4]
+    cmp     eax, '?'
+    je      rsp_pfx4
+    cmp     eax, '.'
+    jne     rsp_copy
+rsp_pfx4:
     cmp     word ptr [rcx+6], 5Ch
-    jne     rhn2_copy
-    mov     r8d, 4                              ; "\\?\X:\..." -> "X:\..."
-    cmp     word ptr [rcx+8], 'U'
-    jne     rhn2_copy
-    cmp     word ptr [rcx+10], 'N'
-    jne     rhn2_copy
-    cmp     word ptr [rcx+12], 'C'
-    jne     rhn2_copy
+    jne     rsp_copy
+    mov     r8d, 4                              ; "\\?\X:\..." or "\\.\X:\..." -> "X:\..."
+    movzx   eax, word ptr [rcx+8]
+    or      eax, 20h
+    cmp     eax, 'u'
+    jne     rsp_copy
+    movzx   eax, word ptr [rcx+10]
+    or      eax, 20h
+    cmp     eax, 'n'
+    jne     rsp_copy
+    movzx   eax, word ptr [rcx+12]
+    or      eax, 20h
+    cmp     eax, 'c'
+    jne     rsp_copy
     cmp     word ptr [rcx+14], 5Ch
-    jne     rhn2_copy
-    mov     word ptr [r11], 5Ch                 ; "\\?\UNC\srv" -> "\\srv": one
-    add     r11, 2                              ;   backslash here + the one at char 7
+    jne     rsp_copy
+    mov     word ptr [r11], 5Ch                 ; "\\?\UNC\srv" -> "\\srv"
+    add     r11, 2
     mov     r8d, 7
-rhn2_copy:
+rsp_copy:
     xor     r9d, r9d
-rhn2_cl:
+rsp_cl:
     mov     ax, word ptr [rcx+r8*2]
     mov     word ptr [r11+r9*2], ax
     test    ax, ax
-    jz      rhn2_full
+    jz      rsp_done
     inc     r8d
     inc     r9d
     cmp     r9d, REG_NORM_CCH - 2
-    jb      rhn2_cl
+    jb      rsp_cl
     mov     word ptr [r11+r9*2], 0
-rhn2_full:
+rsp_done:
+    lea     rax, [r11+r9*2]
+    sub     rax, rdx
+    shr     rax, 1
+    ret
+rhn_strip_prefix endp
+
+public reg_hash_name
+reg_hash_name proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx
+    ; 1) Try handle-based canonicalisation (GetFinalPathNameByHandleW) so 8.3 short
+    ;    names, directory junctions, symlinks, "\\.\", and case variants all map to
+    ;    the exact same registry hash when the file exists.
+    lea     rdx, [g_reg_lpath]
+    mov     r8d, REG_NORM_CCH
+    call    path_longify
+    WINCALL CreateFileW, rax, 0, FILE_SHARE_RWD, 0, OPEN_EXISTING, FILE_FLAG_BACKUP_SEM, 0
+    cmp     rax, -1
+    je      rhn2_lex
+    mov     qword ptr [rbp-40], rax
+    WINCALL GetFinalPathNameByHandleW, rax, addr g_reg_tmp, REG_NORM_CCH, 0
+    mov     dword ptr [rbp-48], eax
+    WINCALL CloseHandle, qword ptr [rbp-40]
+    mov     eax, dword ptr [rbp-48]
+    test    eax, eax
+    jz      rhn2_lex
+    cmp     eax, REG_NORM_CCH
+    jae     rhn2_lex
+    lea     rcx, [g_reg_tmp]
+    lea     rdx, [g_reg_norm]
+    call    rhn_strip_prefix
+    test    eax, eax
+    jz      rhn2_lex
+    jmp     rhn2_upper
+rhn2_lex:
+    ; 2) File does not exist yet: strip "\\?\" / "\\.\" / "UNC\" and normalise lexically.
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [g_reg_tmp]
+    call    rhn_strip_prefix
     WINCALL GetFullPathNameW, addr g_reg_tmp, REG_NORM_CCH, addr g_reg_norm, 0
     test    eax, eax
     jz      rhn2_asis
@@ -373,83 +441,216 @@ reg_prune_all proc frame
     ret
 reg_prune_all endp
 
+; cfg_expand_hklm(rcx = wide in/out dst, edx = cap chars) -> eax = 1 ok / 0 invalid.
+;   Expands HKLM REG_EXPAND_SZ templates WITHOUT calling ExpandEnvironmentStringsW
+;   (which evaluates untrusted process/HKCU environment variables).  Only a single
+;   leading "%USERPROFILE%\", "%LOCALAPPDATA%\", or "%APPDATA%\" token is permitted
+;   and is resolved strictly through SHGetFolderPathW; any other '%' fails closed.
+cfg_expand_hklm proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx             ; dst
+    mov     dword ptr [rbp-32], edx             ; cap chars
+    ; Check if any '%' exists at all; if none, accept literal path unchanged.
+    xor     r8d, r8d
+ceh_scan:
+    movzx   eax, word ptr [rcx+r8*2]
+    test    eax, eax
+    jz      ceh_nopct
+    cmp     eax, '%'
+    je      ceh_match
+    inc     r8d
+    jmp     ceh_scan
+ceh_nopct:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+ceh_match:
+    ; '%' appeared: must be at index 0 and match one of the 3 known folder prefixes
+    test    r8d, r8d
+    jnz     ceh_bad
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [pfx_hklm_up]
+    call    cfg_path_prefix
+    test    eax, eax
+    jz      ceh_try_la
+    mov     dword ptr [rbp-40], CSIDL_PROFILE
+    mov     dword ptr [rbp-44], 13              ; offset of trailing '\' in "%USERPROFILE%\"
+    jmp     ceh_have_pfx
+ceh_try_la:
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [pfx_hklm_la]
+    call    cfg_path_prefix
+    test    eax, eax
+    jz      ceh_try_ad
+    mov     dword ptr [rbp-40], CSIDL_LOCAL_APPDATA
+    mov     dword ptr [rbp-44], 14              ; offset of trailing '\' in "%LOCALAPPDATA%\"
+    jmp     ceh_have_pfx
+ceh_try_ad:
+    mov     rcx, qword ptr [rbp-24]
+    lea     rdx, [pfx_hklm_ad]
+    call    cfg_path_prefix
+    test    eax, eax
+    jz      ceh_bad
+    mov     dword ptr [rbp-40], CSIDL_APPDATA
+    mov     dword ptr [rbp-44], 9               ; offset of trailing '\' in "%APPDATA%\"
+ceh_have_pfx:
+    ; Verify no remaining '%' exists in the tail after the prefix
+    mov     rcx, qword ptr [rbp-24]
+    mov     r8d, dword ptr [rbp-44]
+    xor     r9d, r9d                            ; tail length (incl leading '\')
+ceh_tail_chk:
+    movzx   eax, word ptr [rcx+r8*2]
+    test    eax, eax
+    jz      ceh_resolve
+    cmp     eax, '%'
+    je      ceh_bad
+    inc     r8d
+    inc     r9d
+    jmp     ceh_tail_chk
+ceh_resolve:
+    mov     dword ptr [rbp-48], r9d             ; tail chars (excl NUL)
+    WINCALL SHGetFolderPathW, 0, dword ptr [rbp-40], 0, 0, addr g_cfg_expand
+    test    eax, eax
+    jnz     ceh_bad
+    ; Measure resolved folder length in g_cfg_expand (strip any trailing '\')
+    lea     r10, [g_cfg_expand]
+    xor     r8d, r8d
+ceh_flen:
+    cmp     word ptr [r10+r8*2], 0
+    je      ceh_fend
+    inc     r8d
+    cmp     r8d, CFG_EXPAND_CCH
+    jb      ceh_flen
+    jmp     ceh_bad
+ceh_fend:
+    test    r8d, r8d
+    jz      ceh_bad
+    cmp     word ptr [r10+r8*2-2], 5Ch
+    jne     @F
+    dec     r8d
+@@: mov     eax, r8d
+    add     eax, dword ptr [rbp-48]             ; folder + "\..." tail
+    inc     eax                                 ; + NUL
+    cmp     eax, CFG_EXPAND_CCH
+    ja      ceh_bad
+    cmp     eax, dword ptr [rbp-32]             ; <= caller cap chars?
+    ja      ceh_bad
+    ; Append tail (from '\') onto g_cfg_expand[r8d..]
+    mov     r11, qword ptr [rbp-24]
+    mov     ecx, dword ptr [rbp-44]
+    lea     r11, [r11+rcx*2]
+    lea     r10, [r10+r8*2]
+ceh_app:
+    mov     ax, word ptr [r11]
+    mov     word ptr [r10], ax
+    add     r11, 2
+    add     r10, 2
+    test    ax, ax
+    jnz     ceh_app
+    ; Copy g_cfg_expand -> dst
+    mov     r10, qword ptr [rbp-24]
+    lea     r11, [g_cfg_expand]
+    xor     r8d, r8d
+ceh_out:
+    mov     ax, word ptr [r11+r8*2]
+    mov     word ptr [r10+r8*2], ax
+    test    ax, ax
+    jz      ceh_ok
+    inc     r8d
+    jmp     ceh_out
+ceh_ok:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+ceh_bad:
+    mov     r10, qword ptr [rbp-24]
+    mov     word ptr [r10], 0
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+cfg_expand_hklm endp
+
 ; ===========================================================================
-; reg_query_sz(rcx=hkey, rdx=value name, r8=dst, r9d=cap bytes) -> eax = 1 if
-;   the SOFTWARE\Vordr value was read into dst, else 0.  Opens + queries +
-;   closes the key (RegOpenKeyExW fails cleanly when the key is absent).
+; reg_query_sz(rcx=hkey, rdx=value name, r8=dst, r9d=cap bytes) -> eax:
+;   1  = valid non-empty string read into dst
+;   0  = key or value absent (ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND)
+;  -1  = value exists (or open failed abnormally) with invalid type/size/template
 ; ===========================================================================
 reg_query_sz proc frame
-    ; 112, not 80: the expansion path below adds a local at rbp-56, which at the
-    ; smaller size lands in RegQueryValueExW's 6th-argument slot.  It happens to
-    ; be dead at that call, but framecheck cannot know that and neither can the
-    ; next person - give it room instead of an argument.
     FRAME_PROLOG 112
     mov     qword ptr [rbp-16], rcx          ; hkey
     mov     qword ptr [rbp-24], rdx          ; value name
     mov     qword ptr [rbp-32], r8           ; dst
     mov     dword ptr [rbp-40], r9d          ; cap bytes
+    cmp     r9d, 4                           ; need at least 1 wchar + NUL
+    jb      qsz_bad
     WINCALL RegOpenKeyExW, qword ptr [rbp-16], addr cfg_subkey, 0, KEY_READ, addr g_cfg_khan
     test    eax, eax
-    jnz     qsz_no
+    jz      qsz_opened
+    cmp     eax, 2                           ; ERROR_FILE_NOT_FOUND
+    je      qsz_absent
+    cmp     eax, 3                           ; ERROR_PATH_NOT_FOUND
+    je      qsz_absent
+    jmp     qsz_bad
+qsz_opened:
     mov     eax, dword ptr [rbp-40]
     mov     dword ptr [g_cfg_cb], eax
     WINCALL RegQueryValueExW, qword ptr [g_cfg_khan], qword ptr [rbp-24], 0, addr g_cfg_type, \
             qword ptr [rbp-32], addr g_cfg_cb
     mov     dword ptr [rbp-48], eax
     WINCALL RegCloseKey, qword ptr [g_cfg_khan]
-    cmp     dword ptr [rbp-48], 0
-    jne     qsz_no
-    ; the value must be a string type; other types may carry non-NUL-terminated
-    ; bytes that the wide-Z consumers (vault_mkbak, path scans) would over-read.
+    mov     eax, dword ptr [rbp-48]
+    test    eax, eax
+    jz      qsz_chktype
+    cmp     eax, 2                           ; ERROR_FILE_NOT_FOUND -> value absent
+    je      qsz_absent
+    jmp     qsz_bad                          ; ERROR_MORE_DATA (234) etc. -> fail closed
+qsz_chktype:
     cmp     dword ptr [g_cfg_type], REG_SZ
     je      qsz_term
     cmp     dword ptr [g_cfg_type], REG_EXPAND_SZ
-    jne     qsz_no
+    jne     qsz_bad
 qsz_term:
-    ; RegQueryValueExW does not guarantee a terminating NUL (and none fits when the
-    ; value exactly fills the buffer).  Force a wide NUL inside [0, cap).
     mov     ecx, dword ptr [rbp-40]             ; cap bytes
-    cmp     ecx, 2
-    jb      qsz_no                              ; can't even hold L"" -> reject
     mov     eax, dword ptr [g_cfg_cb]           ; bytes returned
+    test    eax, 1                              ; odd byte count in UTF-16 -> reject
+    jnz     qsz_bad
     cmp     eax, ecx
-    jbe     @F
-    mov     eax, ecx
-@@: mov     edx, ecx
-    sub     edx, 2                              ; last in-bounds wide-NUL offset
-    cmp     eax, edx
-    jbe     @F
-    mov     eax, edx
-@@: and     eax, 0FFFFFFFEh                     ; align to a wchar boundary
+    ja      qsz_bad
     mov     r10, qword ptr [rbp-32]             ; dst
-    mov     word ptr [r10+rax], 0
-    ; A REG_EXPAND_SZ value is a TEMPLATE, not a string: the type exists to say
-    ; "%VARS% in here are meant to be expanded".  This used to accept the type
-    ; and then use the bytes verbatim, so an administrator setting the vault
-    ; path to "%USERPROFILE%\Documents\vault.vordr" - the obvious way to give
-    ; every account its own vault from one policy - got a literal path with a
-    ; percent sign in it, which simply failed to open.  Accepting a type while
-    ; ignoring what it means is worse than rejecting it: it looks like it worked.
-    ;
-    ; Expanded via a scratch buffer because the source and destination of
-    ; ExpandEnvironmentStringsW must not overlap.  The termination above runs
-    ; FIRST, so what is handed to it is guaranteed NUL-terminated.
+    je      qsz_exact_cap                       ; filled entire buffer: must already end in NUL
+    mov     word ptr [r10+rax], 0               ; room for NUL at [rax] -> terminate cleanly
+    jmp     qsz_chk_nonempty
+qsz_exact_cap:
+    cmp     word ptr [r10+rcx-2], 0             ; no room to append NUL: require trailing NUL
+    jne     qsz_bad                             ;   (otherwise value would truncate!)
+qsz_chk_nonempty:
+    cmp     word ptr [r10], 0                   ; empty "" string -> invalid path
+    je      qsz_bad
     cmp     dword ptr [g_cfg_type], REG_EXPAND_SZ
     jne     qsz_ok
-    mov     ecx, dword ptr [rbp-40]             ; cap bytes
-    shr     ecx, 1                              ;   -> chars
+    mov     ecx, dword ptr [rbp-40]
+    shr     ecx, 1
     mov     dword ptr [rbp-56], ecx             ; dst capacity, chars
+    ; HKLM policy strings MUST NOT expand user-controlled environment variables!
+    mov     rax, qword ptr [rbp-16]
+    cmp     rax, qword ptr [g_hklm]
+    jne     qsz_exp_hkcu
+    mov     rcx, qword ptr [rbp-32]
+    mov     edx, dword ptr [rbp-56]
+    call    cfg_expand_hklm
+    test    eax, eax
+    jz      qsz_bad
+    jmp     qsz_ok
+qsz_exp_hkcu:
     WINCALL ExpandEnvironmentStringsW, qword ptr [rbp-32], addr g_cfg_expand, CFG_EXPAND_CCH
     test    eax, eax
-    jz      qsz_no                              ; expansion failed outright
-    ; Every "does not fit" case is a REJECT, never a truncation.  A path cut
-    ; short does not fail - it names a different file, and for a vault that is
-    ; the difference between "no vault found" and opening the wrong one.
-    cmp     eax, CFG_EXPAND_CCH                 ; needed > scratch?
-    ja      qsz_no
-    cmp     eax, dword ptr [rbp-56]             ; needed > caller's buffer?
-    ja      qsz_no
-    mov     r10, qword ptr [rbp-32]             ; dst
+    jz      qsz_bad
+    cmp     eax, CFG_EXPAND_CCH
+    ja      qsz_bad
+    cmp     eax, dword ptr [rbp-56]
+    ja      qsz_bad
+    mov     r10, qword ptr [rbp-32]
     lea     r11, [g_cfg_expand]
     xor     r8d, r8d
 qsz_cpy:
@@ -460,20 +661,28 @@ qsz_cpy:
     inc     r8d
     cmp     r8d, dword ptr [rbp-56]
     jb      qsz_cpy
-    mov     word ptr [r10], 0                   ; unreachable given the checks above,
-    jmp     qsz_no                              ;   but never leave a half-copied path
+    jmp     qsz_bad
 qsz_ok:
     mov     eax, 1
     FRAME_EPILOG
     ret
-qsz_no:
+qsz_bad:
+    cmp     dword ptr [rbp-40], 2
+    jb      @F
+    mov     r10, qword ptr [rbp-32]
+    mov     word ptr [r10], 0
+@@: mov     eax, -1
+    FRAME_EPILOG
+    ret
+qsz_absent:
     xor     eax, eax
     FRAME_EPILOG
     ret
 reg_query_sz endp
 
 ; ===========================================================================
-; reg_query_dw(rcx=hkey, rdx=value name, r8=*out dword) -> eax = 1 if read.
+; reg_query_dw(rcx=hkey, rdx=value name, r8=*out dword) -> eax:
+;   1 = valid REG_DWORD, 0 = absent, -1 = present with invalid type/size.
 ; ===========================================================================
 reg_query_dw proc frame
     FRAME_PROLOG 80
@@ -482,35 +691,41 @@ reg_query_dw proc frame
     mov     qword ptr [rbp-32], r8           ; *out
     WINCALL RegOpenKeyExW, qword ptr [rbp-16], addr cfg_subkey, 0, KEY_READ, addr g_cfg_khan
     test    eax, eax
-    jnz     qdw_no
+    jz      qdw_opened
+    cmp     eax, 2                           ; ERROR_FILE_NOT_FOUND
+    je      qdw_absent
+    cmp     eax, 3                           ; ERROR_PATH_NOT_FOUND
+    je      qdw_absent
+    jmp     qdw_bad
+qdw_opened:
     mov     dword ptr [g_cfg_cb], 4
     mov     dword ptr [g_cfg_type], 0
     WINCALL RegQueryValueExW, qword ptr [g_cfg_khan], qword ptr [rbp-24], 0, addr g_cfg_type, \
             addr g_cfg_dw, addr g_cfg_cb
     mov     dword ptr [rbp-40], eax
     WINCALL RegCloseKey, qword ptr [g_cfg_khan]
-    cmp     dword ptr [rbp-40], 0
-    jne     qdw_no
-    ; The type used to be discarded (lpType = 0) and whatever landed in the four
-    ; bytes was returned.  A REG_SZ "1" is exactly four bytes - L'1' then the NUL
-    ; - so it read back as 0x00000031 = 49, and PwMinLen set that way silently
-    ; became a 49-character minimum.  Nothing warned; the value was simply wrong.
-    ; An administrator writing a policy from a .reg file or a management tool has
-    ; every opportunity to make that mistake, so the type is now checked.  A
-    ; wrong type is rejected rather than coerced, which sends cfg_get_dword on to
-    ; HKCU and then to the compiled-in default: a misconfigured policy leaves the
-    ; setting where it was instead of somewhere arbitrary.
+    mov     eax, dword ptr [rbp-40]
+    test    eax, eax
+    jz      qdw_chk
+    cmp     eax, 2                           ; ERROR_FILE_NOT_FOUND
+    je      qdw_absent
+    jmp     qdw_bad
+qdw_chk:
     cmp     dword ptr [g_cfg_type], REG_DWORD
-    jne     qdw_no
-    cmp     dword ptr [g_cfg_cb], 4             ; REG_DWORD is 4 bytes, always
-    jne     qdw_no
+    jne     qdw_bad
+    cmp     dword ptr [g_cfg_cb], 4
+    jne     qdw_bad
     mov     rax, qword ptr [rbp-32]
     mov     ecx, dword ptr [g_cfg_dw]
     mov     dword ptr [rax], ecx
     mov     eax, 1
     FRAME_EPILOG
     ret
-qdw_no:
+qdw_bad:
+    mov     eax, -1
+    FRAME_EPILOG
+    ret
+qdw_absent:
     xor     eax, eax
     FRAME_EPILOG
     ret
@@ -518,8 +733,8 @@ reg_query_dw endp
 
 ; ===========================================================================
 ; cfg_get_dword(rcx=value name, edx=default, r8=*locked) -> eax = value.
-;   HKLM wins (and sets *locked=1, since it is admin policy); else HKCU
-;   (*locked=0); else the supplied default (*locked=0).  *locked may be 0/NULL.
+;   HKLM wins (*locked=1); if HKLM has an invalid/corrupt policy value (-1),
+;   fail closed (*locked=1, return safe default, NEVER consult HKCU).
 ; ===========================================================================
 public cfg_get_dword
 cfg_get_dword proc frame
@@ -534,6 +749,8 @@ cfg_get_dword proc frame
     call    reg_query_dw
     test    eax, eax
     jz      cgd_hkcu
+    cmp     eax, -1
+    je      cgd_hklm_bad
     mov     rax, qword ptr [rbp-40]
     test    rax, rax
     jz      cgd_hklm_val
@@ -542,6 +759,12 @@ cgd_hklm_val:
     mov     eax, dword ptr [g_cfg_dw]
     FRAME_EPILOG
     ret
+cgd_hklm_bad:
+    mov     rax, qword ptr [rbp-40]
+    test    rax, rax
+    jz      cgd_def
+    mov     dword ptr [rax], 1               ; locked = 1 (do NOT fall back to HKCU)
+    jmp     cgd_def
 cgd_hkcu:
     mov     rax, qword ptr [rbp-40]
     test    rax, rax
@@ -552,8 +775,8 @@ cgd_hkcu_q:
     mov     rdx, qword ptr [rbp-24]
     lea     r8, [g_cfg_dw]
     call    reg_query_dw
-    test    eax, eax
-    jz      cgd_def
+    cmp     eax, 1
+    jne     cgd_def
     mov     eax, dword ptr [g_cfg_dw]
     FRAME_EPILOG
     ret
@@ -611,6 +834,8 @@ reg_load_vault proc frame
     call    reg_query_sz
     test    eax, eax
     jz      rlv_hkcu
+    cmp     eax, -1
+    je      rlv_hklm_bad                     ; invalid HKLM policy: lock & refuse HKCU
     mov     rax, qword ptr [rbp-40]
     test    rax, rax
     jz      rlv_yes
@@ -619,6 +844,12 @@ rlv_yes:
     mov     eax, 1
     FRAME_EPILOG
     ret
+rlv_hklm_bad:
+    mov     rax, qword ptr [rbp-40]
+    test    rax, rax
+    jz      rlv_no
+    mov     dword ptr [rax], 1               ; HKLM policy present -> locked
+    jmp     rlv_no
 rlv_hkcu:
     mov     rax, qword ptr [rbp-40]
     test    rax, rax
@@ -631,6 +862,14 @@ rlv_hkcu_q:
     mov     r9d, dword ptr [rbp-32]
     shl     r9d, 1
     call    reg_query_sz
+    cmp     eax, 1
+    je      rlv_yes
+rlv_no:
+    cmp     dword ptr [rbp-32], 1
+    jb      @F
+    mov     r10, qword ptr [rbp-24]
+    mov     word ptr [r10], 0
+@@: xor     eax, eax
     FRAME_EPILOG
     ret
 reg_load_vault endp
@@ -1077,9 +1316,27 @@ rtd_one endp
 ; ===========================================================================
 public reg_ctr_set
 reg_ctr_set proc frame
-    FRAME_PROLOG 128
+    FRAME_PROLOG 144
+    mov     qword ptr [rbp-56], rcx             ; raw path
     mov     qword ptr [rbp-32], rdx             ; data (saved before reg_hash_name)
     mov     dword ptr [rbp-40], r8d             ; len
+    ; Enforce monotonicity: never overwrite an existing 8-byte counter with a smaller one
+    cmp     r8d, 8
+    jne     rcs_write
+    mov     qword ptr [rbp-64], 0
+    lea     rcx, [ctr_subkey]
+    mov     rdx, qword ptr [rbp-56]
+    lea     r8, [rbp-64]
+    mov     r9d, 8
+    call    reg_get_either
+    cmp     eax, 8
+    jne     rcs_write
+    mov     rax, qword ptr [rbp-32]
+    mov     rcx, qword ptr [rax]                ; new counter
+    cmp     rcx, qword ptr [rbp-64]             ; < existing stored counter?
+    jb      rcs_keep                            ; keep the higher high-water mark
+rcs_write:
+    mov     rcx, qword ptr [rbp-56]
     call    reg_hash_name                       ; rcx=path -> rax=hashed value name (C6)
     mov     qword ptr [rbp-24], rax
     WINCALL RegCreateKeyExW, qword ptr [g_hkcu], addr ctr_subkey, 0, 0, 0, \
@@ -1092,6 +1349,7 @@ reg_ctr_set proc frame
     WINCALL RegCloseKey, qword ptr [g_cfg_khan]
     cmp     dword ptr [rbp-48], 0
     jne     rcs_fail
+rcs_keep:
     mov     eax, 1
     FRAME_EPILOG
     ret
@@ -1112,5 +1370,211 @@ reg_ctr_get proc frame
     FRAME_EPILOG
     ret
 reg_ctr_get endp
+
+public reg_ctr_del
+reg_ctr_del proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-32], rcx
+    call    reg_hash_name
+    mov     rdx, rax
+    call    rcd_one
+    mov     rcx, qword ptr [rbp-32]
+    call    reg_hash_legacy
+    mov     rdx, rax
+    call    rcd_one
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+reg_ctr_del endp
+
+rcd_one proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rdx
+    WINCALL RegOpenKeyExW, qword ptr [g_hkcu], addr ctr_subkey, 0, KEY_WRITE, \
+            addr g_cfg_khan
+    test    eax, eax
+    jnz     rco_done
+    WINCALL RegDeleteValueW, qword ptr [g_cfg_khan], qword ptr [rbp-24]
+    WINCALL RegCloseKey, qword ptr [g_cfg_khan]
+rco_done:
+    FRAME_EPILOG
+    ret
+rcd_one endp
+
+; ===========================================================================
+; cmd_polkat - VDR-09 + VDR-23 registry policy & cfg_in_set ABI KAT.
+;   Runs entirely inside the isolated scratch HKCU hive installed by
+;   gui_test_hooks (g_hkcu), mounting a subkey "PolHklm" as g_hklm so zero
+;   machine or user registry state is touched.  Verifies:
+;     1) HKLM REG_EXPAND_SZ "%APPDATA%\Vordr\corp.vordr" resolves via
+;        SHGetFolderPathW with *locked == 1.
+;     2) HKLM REG_EXPAND_SZ "%ATTACKER_ENV%\evil.vordr" fails closed
+;        (eax == 0, *locked == 1, dst[0] == 0) and NEVER falls back to HKCU!
+;     3) HKLM wrong-type REG_SZ on DWORD policy "ClipSeconds" returns safe
+;        default (15) with *locked == 1 and NEVER consults HKCU (99)!
+;     4) cfg_in_set preserves caller's r8 across path normalisation (VDR-23).
+; ===========================================================================
+extern cfg_in_set:proc
+extern print_a:proc
+
+.data
+CSTR plk_ok,  "polkat: PASS (HKLM folder-template allowlist, fail-closed lock, cfg_in_set r8)",13,10
+CSTR plk_bad, "polkat: FAIL",13,10
+WSTR plk_subm, <PolHklm>
+align 2
+plk_good label word
+    dw '%','A','P','P','D','A','T','A','%',5Ch,'V','o','r','d','r',5Ch,'c','o','r','p','.','v','o','r','d','r',0
+PLK_GOOD_CB equ ($ - plk_good)
+plk_evil label word
+    dw '%','A','T','T','A','C','K','E','R','_','E','N','V','%',5Ch,'e','v','i','l','.','v','o','r','d','r',0
+PLK_EVIL_CB equ ($ - plk_evil)
+WSTR plk_usrv, <C:\UserVault\user.vordr>
+PLK_USRV_CB equ (23 + 1) * 2
+WSTR plk_clip, <ClipSeconds>
+WSTR plk_zero, <0>
+PLK_ZERO_CB equ 4
+align 4
+plk_dw99    dd 99
+.data?
+align 2
+plk_out     dw 512 dup (?)
+align 4
+plk_locked  dd ?
+.code
+LANDING_PAD
+public cmd_polkat
+cmd_polkat proc frame
+    FRAME_PROLOG 128
+    ; [rbp-16]=saved g_hklm, [rbp-24]=hFakeHklm, [rbp-32]=hPolKey, [rbp-40]=hUsrKey,
+    ; [rbp-48]=saved g_cfg_in
+    mov     rax, qword ptr [g_hklm]
+    mov     qword ptr [rbp-16], rax
+    mov     qword ptr [rbp-24], 0
+    mov     qword ptr [rbp-32], 0
+    mov     qword ptr [rbp-40], 0
+    WINCALL RegCreateKeyExW, qword ptr [g_hkcu], addr plk_subm, 0, 0, 0, \
+            KEY_RW, 0, addr rbp-24, 0
+    test    eax, eax
+    jnz     plk_fail
+    mov     rax, qword ptr [rbp-24]
+    mov     qword ptr [g_hklm], rax
+    WINCALL RegCreateKeyExW, qword ptr [g_hklm], addr cfg_subkey, 0, 0, 0, \
+            KEY_RW, 0, addr rbp-32, 0
+    test    eax, eax
+    jnz     plk_clean
+    WINCALL RegCreateKeyExW, qword ptr [g_hkcu], addr cfg_subkey, 0, 0, 0, \
+            KEY_RW, 0, addr rbp-40, 0
+    test    eax, eax
+    jnz     plk_clean
+    ; Seed HKCU fallback values that MUST NOT be reached when HKLM policy is set/corrupt
+    WINCALL RegSetValueExW, qword ptr [rbp-40], addr cfg_value, 0, REG_SZ, \
+            addr plk_usrv, PLK_USRV_CB
+    test    eax, eax
+    jnz     plk_clean
+    WINCALL RegSetValueExW, qword ptr [rbp-40], addr plk_clip, 0, REG_DWORD, \
+            addr plk_dw99, 4
+    test    eax, eax
+    jnz     plk_clean
+
+    ; 1) Valid HKLM REG_EXPAND_SZ "%APPDATA%\Vordr\corp.vordr" -> expands, *locked = 1
+    WINCALL RegSetValueExW, qword ptr [rbp-32], addr cfg_value, 0, REG_EXPAND_SZ, \
+            addr plk_good, PLK_GOOD_CB
+    test    eax, eax
+    jnz     plk_clean
+    mov     dword ptr [plk_locked], 0
+    lea     rcx, [plk_out]
+    mov     edx, 512
+    lea     r8, [plk_locked]
+    call    reg_load_vault
+    cmp     eax, 1
+    jne     plk_clean
+    cmp     dword ptr [plk_locked], 1
+    jne     plk_clean
+    cmp     word ptr [plk_out], 0
+    je      plk_clean
+    cmp     word ptr [plk_out], '%'
+    je      plk_clean
+
+    ; 2) Disallowed HKLM "%ATTACKER_ENV%\evil.vordr" -> fail closed, *locked = 1, NO HKCU fallback
+    WINCALL RegSetValueExW, qword ptr [rbp-32], addr cfg_value, 0, REG_EXPAND_SZ, \
+            addr plk_evil, PLK_EVIL_CB
+    test    eax, eax
+    jnz     plk_clean
+    mov     dword ptr [plk_locked], 0
+    lea     rcx, [plk_out]
+    mov     edx, 512
+    lea     r8, [plk_locked]
+    call    reg_load_vault
+    test    eax, eax
+    jnz     plk_clean
+    cmp     dword ptr [plk_locked], 1
+    jne     plk_clean
+    cmp     word ptr [plk_out], 0
+    jne     plk_clean
+
+    ; 3) Wrong-type REG_SZ on HKLM DWORD policy -> default (15), *locked = 1, NO HKCU (99)
+    WINCALL RegSetValueExW, qword ptr [rbp-32], addr plk_clip, 0, REG_SZ, \
+            addr plk_zero, PLK_ZERO_CB
+    test    eax, eax
+    jnz     plk_clean
+    mov     dword ptr [plk_locked], 0
+    lea     rcx, [plk_clip]
+    mov     edx, 15
+    lea     r8, [plk_locked]
+    call    cfg_get_dword
+    cmp     eax, 15
+    jne     plk_clean
+    cmp     dword ptr [plk_locked], 1
+    jne     plk_clean
+
+    ; 4) cfg_in_set preserves r8 (VDR-23 raw frame ABI check)
+    lea     rcx, [plk_usrv]
+    mov     r8, 0CAFEBABE12345678h
+    call    cfg_in_set
+    mov     rcx, 0CAFEBABE12345678h
+    cmp     r8, rcx
+    jne     plk_clean
+
+    ; Clean up values + handles and restore g_hklm
+    WINCALL RegDeleteValueW, qword ptr [rbp-32], addr cfg_value
+    WINCALL RegDeleteValueW, qword ptr [rbp-32], addr plk_clip
+    WINCALL RegDeleteValueW, qword ptr [rbp-40], addr cfg_value
+    WINCALL RegDeleteValueW, qword ptr [rbp-40], addr plk_clip
+    WINCALL RegCloseKey, qword ptr [rbp-40]
+    WINCALL RegCloseKey, qword ptr [rbp-32]
+    WINCALL RegCloseKey, qword ptr [rbp-24]
+    mov     rax, qword ptr [rbp-16]
+    mov     qword ptr [g_hklm], rax
+    lea     rcx, [plk_ok]
+    mov     edx, plk_ok_len
+    call    print_a
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+
+plk_clean:
+    cmp     qword ptr [rbp-40], 0
+    je      @F
+    WINCALL RegDeleteValueW, qword ptr [rbp-40], addr cfg_value
+    WINCALL RegDeleteValueW, qword ptr [rbp-40], addr plk_clip
+    WINCALL RegCloseKey, qword ptr [rbp-40]
+@@: cmp     qword ptr [rbp-32], 0
+    je      @F
+    WINCALL RegDeleteValueW, qword ptr [rbp-32], addr cfg_value
+    WINCALL RegDeleteValueW, qword ptr [rbp-32], addr plk_clip
+    WINCALL RegCloseKey, qword ptr [rbp-32]
+@@: cmp     qword ptr [rbp-24], 0
+    je      @F
+    WINCALL RegCloseKey, qword ptr [rbp-24]
+@@: mov     rax, qword ptr [rbp-16]
+    mov     qword ptr [g_hklm], rax
+plk_fail:
+    lea     rcx, [plk_bad]
+    mov     edx, plk_bad_len
+    call    print_a
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_polkat endp
 
 end

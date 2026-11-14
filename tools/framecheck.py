@@ -157,7 +157,33 @@ RE_POPRBP     = re.compile(r'^\s*pop\s+rbp\b', re.I)
 EQUS = {}
 STRUCTS = {}
 EXTERNS = set()          # `extern X:proc` - a Win32 callee, free to use its home space
+OS_CALLBACKS = {}        # proc_name -> registration site ("gui.asm:123 SetWindowSubclass")
 STATS = {'fp': 0, 'sym': 0, 'raw': 0}
+
+# Win32 APIs that register an OS-dispatched callback (which Win32 may unwind
+# across via SEH, so using FRAME_PROLOG would desynchronize the per-thread
+# software shadow stack).  Maps callee -> 0-based argument index of the callback.
+CB_ARG_INDEX = {
+    'SetWindowSubclass': 2,
+    'EnumThreadWindows': 1,
+    'EnumChildWindows': 1,
+    'DialogBoxParamW': 3,
+    'CreateDialogParamW': 3,
+    'DialogBoxIndirectParamW': 3,
+    'CreateDialogIndirectParamW': 3,
+    'AddVectoredExceptionHandler': 1,
+    'SetUnhandledExceptionFilter': 0,
+}
+
+def _extract_proc_sym(arg):
+    a = arg.strip()
+    if a.lower().startswith('addr '):
+        a = a[5:].strip()
+    elif a.lower().startswith('offset '):
+        a = a[7:].strip()
+    if re.fullmatch(r'[A-Za-z_$][\w$]*', a) and a.lower() not in REG64:
+        return a
+    return None
 
 def masm_int(tok):
     """MASM integer literal -> int or None: decimal, 0x.., or trailing-h hex (0FFh)."""
@@ -211,9 +237,12 @@ def eval_size(expr, depth=0):
     return int(eval(pyexpr, {'__builtins__': {}}))
 
 def build_tables(files):
-    """Collect `NAME equ EXPR` and `NAME struct .. ends` sizes from every source."""
+    """Collect `NAME equ EXPR`, `NAME struct .. ends` sizes, and OS callback procs."""
+    re_lea_sym = re.compile(r'^\s*lea\s+(r[a-z0-9]+)\s*,\s*\[([A-Za-z_$][\w$]*)\]\s*$', re.I)
+    re_wndproc_st = re.compile(r'\.lpfnWndProc\b|\+\s*8\s*\]\s*,\s*(r[a-z0-9]+)\b', re.I)
     for path in files:
         raw = [strip_comment(l.rstrip('\n')) for l in open(path, encoding='latin-1')]
+        fname = os.path.basename(path)
         cur = None; size = 0
         for s in raw:
             xm = RE_EXTERN.match(s)
@@ -230,6 +259,33 @@ def build_tables(files):
                     dm = re.match(r'(\d+)\s+dup\b', fm.group(2))
                     if dm: cnt = int(dm.group(1))
                     size += cnt * FSIZE[fm.group(1).lower()]
+        merged = join_continuations(raw)
+        reg_sym = {}
+        for ln, s in merged:
+            lm = re_lea_sym.match(s)
+            if lm:
+                reg_sym[lm.group(1).lower()] = (lm.group(2), f"{fname}:{ln + 1}")
+                continue
+            if 'lpfnwndproc' in s.lower():
+                for rname, (sym, site) in list(reg_sym.items()):
+                    if re.search(rf',\s*{rname}\b', s, re.I):
+                        OS_CALLBACKS.setdefault(sym, f"{site} lpfnWndProc")
+            callee, args = wincall_parts(s)
+            if not callee:
+                continue
+            sym = None
+            if callee in CB_ARG_INDEX and len(args) > CB_ARG_INDEX[callee]:
+                sym = _extract_proc_sym(args[CB_ARG_INDEX[callee]])
+            elif callee == 'SetTimer' and len(args) >= 4:
+                a3 = args[3].strip()
+                if a3 not in ('0', 'NULL'):
+                    sym = _extract_proc_sym(a3)
+            elif callee == 'SetWindowLongPtrW' and len(args) >= 3:
+                a1 = args[1].strip()
+                if a1 in ('GWLP_WNDPROC', 'GWLP_WNDPROC_', '-4'):
+                    sym = _extract_proc_sym(args[2])
+            if sym:
+                OS_CALLBACKS.setdefault(sym, f"{fname}:{ln + 1} {callee}")
 
 def scan_file(path, results):
     raw = [strip_comment(l.rstrip('\n')) for l in open(path, encoding='latin-1')]
@@ -251,6 +307,11 @@ def scan_file(path, results):
                 maxloc = max(maxloc, int(mm.group(1) or mm.group(2)))
 
         if fp:
+            if name in OS_CALLBACKS:
+                results.append(("FATAL", fname, start + 1, name,
+                    f"OS-dispatched callback (registered at {OS_CALLBACKS[name]}) uses "
+                    f"FRAME_PROLOG - Win32 callback SEH unwinds desynchronize the "
+                    f"software shadow stack; use a raw frame (push rbp / mov rbp,rsp / sub rsp,N)"))
             # ---- heuristic on FRAME_PROLOG procs ----------------------------
             try:
                 N = eval_size(fp.group(1))

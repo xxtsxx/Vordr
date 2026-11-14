@@ -261,10 +261,10 @@ endm
 ; =============================================================================
 ; FRAME_EPILOG - place immediately before "ret".
 ; Verifies canary + shadow stack, restores rsp/rbp.
-; Preserves rax/rdx/xmm0 (return values).  Clobbers r10, r11.
+; Preserves rax/rdx/xmm0 (return values).  Clobbers r8, r10, r11 (and rcx on trap).
 ; =============================================================================
 FRAME_EPILOG macro
-    local ok1, ok2, sse_scan, sse_fail
+    local ok1, ok2, sse_fail
     ; ---- verify stack canary ------------------------------------------------
     mov     r10, qword ptr [g_stack_canary]
     cmp     r10, qword ptr [rbp-8]
@@ -272,16 +272,13 @@ FRAME_EPILOG macro
     mov     ecx, FF_STACK_COOKIE
     jmp     ff_trap
 ok1:
-    ; ---- pop + verify the software shadow stack (SEH-unwind tolerant) -------
-    ; The OS SEH unwinder restores rsp/rbp but does NOT pop this software shadow
-    ; stack, so an exception unwinding through framed procs (e.g. the Windows
-    ; GUI / CoreMessaging exceptions raised while the create/unlock dialog runs
-    ; on the Secure-Unlock private desktop) leaves stale entries above the live
-    ; frame's.  So instead of fastfailing on the first mismatch, scan DOWN for
-    ; THIS frame's return address: found -> resync (drop the stale entries above
-    ; it); absent from the whole stack -> a genuine return-address (ROP)
-    ; violation.  rax holds the return value here, so scratch is r8/r10/r11 only.
-    ; Same per-thread block the prologue used; no block -> nothing was pushed.
+    ; ---- pop + verify top of the software shadow stack ----------------------
+    ; Every OS callback (WndProc, DlgProc, SetWindowSubclass, EnumThreadWindows,
+    ; VEH/UEF) uses a raw frame rather than FRAME_PROLOG, so legitimate OS SEH
+    ; unwinds never leave stale entries on the per-thread shadow stack.  Enforce
+    ; strict top-of-stack equality so returning to an ancestor frame (skipping
+    ; intermediate frames via stack pivot or return-address overwrite) traps
+    ; immediately with FF_SHADOW_STACK.
     mov     r10d, dword ptr [g_sstk_tls]
     test    r10d, r10d
     jz      ok2
@@ -290,14 +287,13 @@ ok1:
     test    r8, r8
     jz      ok2
     mov     r11, qword ptr [rbp+8]              ; the return address to match
-    mov     r10, qword ptr [r8]                 ; this thread's index
-sse_scan:
+    mov     r10, qword ptr [r8]                 ; this thread's depth
     test    r10, r10
-    jz      sse_fail                            ; hit the bottom -> not ours -> ROP
+    jz      sse_fail                            ; empty shadow stack -> ROP
     dec     r10
     cmp     r11, qword ptr [r8+r10*8+SSTK_HDR]
-    jne     sse_scan
-    mov     qword ptr [r8], r10                 ; resync to just below the match
+    jne     sse_fail
+    mov     qword ptr [r8], r10                 ; pop top-of-stack
     jmp     ok2
 sse_fail:
     mov     ecx, FF_SHADOW_STACK

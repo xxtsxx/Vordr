@@ -94,7 +94,7 @@ set /a T_SELFTEST=!T1!-!T0!
 
 rem -------------------------------------------------------------- roundtrip --
 call :now T0
-echo === stage: roundtrip (seedtest / atgen / zitest / phtest / secscan / secfreedup / tmptest / fztest / trtest / vfuzz / fuzzzip / jfuzz / bktest / mactest / rbtest / sysitemkat / vexselkat / c9kat / vimpkat / vimpattkat / xctest / reload / attfuzz / zexcap / zexname / convcap / healthkat / pkat / kdfparam / vaultexportkat / vaultexpattkat) ===
+echo === stage: roundtrip (seedtest / atgen / zitest / phtest / secscan / secfreedup / tmptest / fztest / trtest / vfuzz / fuzzzip / jfuzz / bktest / mactest / rbtest / sysitemkat / vexselkat / c9kat / vimpkat / vimpattkat / xctest / reload / attfuzz / zexcap / zexname / convcap / healthkat / pkat / kdfparam / vaultexportkat / vaultexpattkat / zexselkat / attovfkat / vattcolkat / polkat / tpmkat / secdeskkat) ===
 set RT=PASS
 
 rem --- data-loss guard: the RELEASE binary (still in bin\ from the build stage)
@@ -260,6 +260,24 @@ if not "!errorlevel!"=="0" ( echo   vaultexportkat: FAIL ^(exit !errorlevel!, M6
 
 bin\vordr.exe vaultexpattkat "%WORK%\vea.vault" > "%WORK%\vaultexpattkat.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   vaultexpattkat: FAIL ^(exit !errorlevel!, M6 attachment carry^) & set RT=FAIL )
+
+bin\vordr.exe zexselkat > "%WORK%\zexselkat.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   zexselkat: FAIL ^(exit !errorlevel!, VDR-04 selective ZIP attachment filter^) & set RT=FAIL )
+
+bin\vordr.exe attovfkat > "%WORK%\attovfkat.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   attovfkat: FAIL ^(exit !errorlevel!, VDR-02 attachment overflow/cap guard^) & set RT=FAIL )
+
+bin\vordr.exe vattcolkat "%WORK%\vattcol.vault" > "%WORK%\vattcolkat.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   vattcolkat: FAIL ^(exit !errorlevel!, VDR-19 VATT tag-collision retry^) & set RT=FAIL )
+
+bin\vordr.exe polkat > "%WORK%\polkat.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   polkat: FAIL ^(exit !errorlevel!, VDR-09/VDR-23 registry policy + cfg_in_set^) & set RT=FAIL )
+
+bin\vordr.exe tpmkat > "%WORK%\tpmkat.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   tpmkat: FAIL ^(exit !errorlevel!, VDR-10 TPM OAEP v2 label + cleanup^) & set RT=FAIL )
+
+bin\vordr.exe secdeskkat > "%WORK%\secdeskkat.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   secdeskkat: FAIL ^(exit !errorlevel!, VDR-13 secure-desktop fallback/orphan^) & set RT=FAIL )
 
 :roundtrip_publish
 where python >nul 2>&1

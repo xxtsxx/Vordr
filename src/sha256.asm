@@ -87,6 +87,7 @@ sha256_init proc
     movdqu  xmmword ptr [rcx].SHA256_CTX.state, xmm0
     movdqu  xmm0, xmmword ptr [init_h+16]
     movdqu  xmmword ptr [rcx].SHA256_CTX.state+16, xmm0
+    pxor    xmm0, xmm0
     mov     dword ptr [rcx].SHA256_CTX.buflen, 0
     mov     qword ptr [rcx].SHA256_CTX.total, 0
     ret
@@ -169,6 +170,12 @@ sc_block:
     movdqu  xmmword ptr [rcx+16], xmm2
 
 sc_done:
+    pxor    xmm0, xmm0
+    pxor    xmm1, xmm1
+    pxor    xmm2, xmm2
+    pxor    xmm3, xmm3
+    pxor    xmm4, xmm4
+    pxor    xmm5, xmm5
     movdqu  xmm6,  xmmword ptr [rsp+0]
     movdqu  xmm7,  xmmword ptr [rsp+16]
     movdqu  xmm8,  xmmword ptr [rsp+32]
@@ -330,6 +337,8 @@ sf_putlen:
     movdqu  xmm0, xmmword ptr [rcx].SHA256_CTX.state+16
     pshufb  xmm0, xmm1
     movdqu  xmmword ptr [rdx+16], xmm0
+    pxor    xmm0, xmm0
+    pxor    xmm1, xmm1
 
     ; wipe context (contains message-derived state)
     lea     rcx, [rcx].SHA256_CTX.state
@@ -363,5 +372,4 @@ sha256_hash proc frame
     ret
 sha256_hash endp
 
-extern secure_zero:proc
 end

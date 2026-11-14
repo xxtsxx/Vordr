@@ -100,10 +100,11 @@ $Policies = @(
     @{ Prop="VORDR_LOGLEVEL";        Value="LogLevel";        Comp="PolLogLevel";     Guid="{A3BD3F2C-326F-4749-A57E-A78D1EC4AC0E}"; Range="0-4";     Default="0";   Doc="audit-log verbosity, 0 = off" }
     @{ Prop="VORDR_UISCHEME";        Value="ui_scheme";       Comp="PolUiScheme";     Guid="{9B70EE1D-7B67-44A0-8C02-06B7BD8F982F}"; Range="0-8";     Default="8";   Doc="force a colour scheme (8 = the default)" }
 )
-# NOT exposed: HKLM "vault".  It would pin every user on the machine to one
-# literal path - reg_query_sz accepts REG_EXPAND_SZ but never expands it, so
-# "%USERPROFILE%\..." would be taken verbatim and fail.  A shared machine would
-# end up with every account fighting over one vault file.
+# NOT exposed via MSI property: HKLM "vault".  Administrators who configure a
+# per-machine vault path via Group Policy can use safe per-user prefixes
+# (%APPDATA%\, %LOCALAPPDATA%\, %USERPROFILE%\) resolved via SHGetFolderPathW in
+# regcfg.asm, whereas an unparameterized MSI property could easily point every
+# user on a shared machine at one literal path by mistake.
 
 # --- .vordr file association -------------------------------------------------
 # Registered per-machine under HKLM\SOFTWARE\Classes (which is what HKCR resolves
@@ -216,6 +217,7 @@ try {
     Exec "CREATE TABLE ``AdminExecuteSequence`` (``Action`` CHAR(72) NOT NULL, ``Condition`` CHAR(255), ``Sequence`` SHORT PRIMARY KEY ``Action``)"
     Exec "CREATE TABLE ``AdvtExecuteSequence`` (``Action`` CHAR(72) NOT NULL, ``Condition`` CHAR(255), ``Sequence`` SHORT PRIMARY KEY ``Action``)"
     Exec "CREATE TABLE ``Upgrade`` (``UpgradeCode`` CHAR(38) NOT NULL, ``VersionMin`` CHAR(20), ``VersionMax`` CHAR(20), ``Language`` CHAR(255), ``Attributes`` LONG NOT NULL, ``Remove`` CHAR(255), ``ActionProperty`` CHAR(72) NOT NULL PRIMARY KEY ``UpgradeCode``, ``VersionMin``, ``VersionMax``, ``Language``, ``Attributes``)"
+    Exec "CREATE TABLE ``LaunchCondition`` (``Condition`` CHAR(255) NOT NULL, ``Description`` CHAR(255) NOT NULL PRIMARY KEY ``Condition``)"
     Exec "CREATE TABLE ``Shortcut`` (``Shortcut`` CHAR(72) NOT NULL, ``Directory_`` CHAR(72) NOT NULL, ``Name`` CHAR(128) NOT NULL, ``Component_`` CHAR(72) NOT NULL, ``Target`` CHAR(72) NOT NULL, ``Arguments`` CHAR(255), ``Description`` CHAR(255), ``Hotkey`` SHORT, ``Icon_`` CHAR(72), ``IconIndex`` SHORT, ``ShowCmd`` SHORT, ``WkDir`` CHAR(72) PRIMARY KEY ``Shortcut``)"
     Exec "CREATE TABLE ``Registry`` (``Registry`` CHAR(72) NOT NULL, ``Root`` SHORT NOT NULL, ``Key`` CHAR(255) NOT NULL, ``Name`` CHAR(255), ``Value`` CHAR(0), ``Component_`` CHAR(72) NOT NULL PRIMARY KEY ``Registry``)"
     # NO RemoveFile table.  MSI removes a component's own files on uninstall
@@ -246,7 +248,7 @@ try {
         # Public properties reach the elevated half of a per-machine install only
         # if they are listed here.  Miss one and it silently has no effect - the
         # property is set, the component condition still evaluates false.
-        "SecureCustomProperties" = (@("OLDERVERSIONBEINGUPGRADED", $AssocProp) + ($Policies | ForEach-Object { $_.Prop })) -join ";"
+        "SecureCustomProperties" = (@("OLDERVERSIONBEINGUPGRADED", "NEWERVERSIONDETECTED", $AssocProp) + ($Policies | ForEach-Object { $_.Prop })) -join ";"
     }
     foreach ($k in $props.Keys) {
         $v = $props[$k] -replace "'", "''"
@@ -272,6 +274,29 @@ try {
     # Condition is the bare property name: true when it is set to anything,
     # false when the admin left it out.
     foreach ($p in $Policies) {
+        $defVal = 0
+        if (-not [int]::TryParse($p.Default, [ref]$defVal)) {
+            throw ("policy {0} Default '{1}' is not an integer" -f $p.Prop, $p.Default)
+        }
+        if ($p.Range -eq "0/1") {
+            if ($defVal -lt 0 -or $defVal -gt 1) { throw ("policy {0} Default {1} outside 0/1" -f $p.Prop, $defVal) }
+            $cond = "(NOT {0}) OR ({0} = `"0`") OR ({0} = `"1`")" -f $p.Prop
+        } elseif ($p.Range -match '^(\d+)-(\d+)$') {
+            $lo = [int]$Matches[1]; $hi = [int]$Matches[2]
+            if ($defVal -lt $lo -or $defVal -gt $hi) { throw ("policy {0} Default {1} outside {2}" -f $p.Prop, $defVal, $p.Range) }
+            if (($hi - $lo) -le 8) {
+                $terms = @("NOT $($p.Prop)") + ($lo..$hi | ForEach-Object { "($($p.Prop) = `"$_`")" })
+                $cond = $terms -join " OR "
+            } else {
+                $cond = "(NOT {0}) OR ((NOT ({0} >< `"-`")) AND (NOT ({0} >< `"+`")) AND (NOT ({0} >< `" `")) AND (NOT ({0} >< `"#`")))" -f $p.Prop
+            }
+        } else {
+            throw ("policy {0} has unrecognised Range '{1}'" -f $p.Prop, $p.Range)
+        }
+        $desc = ("{0} must be a valid integer in {1}." -f $p.Prop, $p.Range) -replace "'", "''"
+        $condSql = $cond -replace "'", "''"
+        Exec ("INSERT INTO ``LaunchCondition`` (``Condition``,``Description``) VALUES ('{0}','{1}')" -f $condSql, $desc)
+
         $reg = "Reg" + $p.Comp
         Exec ("INSERT INTO ``Component`` (``Component``,``ComponentId``,``Directory_``,``Attributes``,``Condition``,``KeyPath``) VALUES ('{0}','{1}','INSTALLDIR',260,'{2}','{3}')" -f $p.Comp, $p.Guid, $p.Prop, $reg)
         Exec ("INSERT INTO ``FeatureComponents`` (``Feature_``,``Component_``) VALUES ('Main','{0}')" -f $p.Comp)
@@ -314,7 +339,8 @@ try {
 
     Exec "INSERT INTO ``Shortcut`` (``Shortcut``,``Directory_``,``Name``,``Component_``,``Target``,``Arguments``,``Description``,``ShowCmd``,``WkDir``) VALUES ('VordrSC','ProgramMenuFolder','Vordr','VordrExe','[INSTALLDIR]vordr.exe','','Vordr password manager',1,'INSTALLDIR')"
 
-    # Upgrade: replace an existing install rather than sitting beside it.
+    # Upgrade: replace an existing install rather than sitting beside it, and
+    # refuse to downgrade when a strictly newer version is already installed.
     #
     # Attributes is a bitfield and the two Inclusive bits are easy to get wrong,
     # because they are NOT 1 and 2:
@@ -333,11 +359,14 @@ try {
     # our own ProductCode, so "including this version" can only ever match a
     # DIFFERENT build of it - exactly the case that was broken.
     #
-    # MigrateFeatures is deliberately not set: it needs the MigrateFeatureStates
-    # action, which is not in the sequence, and there is one always-installed
-    # feature so there is nothing to migrate.
+    # 2 = OnlyDetect (WITHOUT VersionMinInclusive): detect any installed version
+    # strictly greater than $productVersion into NEWERVERSIONDETECTED, then halt
+    # in LaunchConditions before modifying the machine.
     $UPG_ATTR = 768
+    $DOWNGRADE_ATTR = 2
     Exec "INSERT INTO ``Upgrade`` (``UpgradeCode``,``VersionMin``,``VersionMax``,``Language``,``Attributes``,``Remove``,``ActionProperty``) VALUES ('$UpgradeCode','0.0.0','$productVersion','',$UPG_ATTR,'','OLDERVERSIONBEINGUPGRADED')"
+    Exec "INSERT INTO ``Upgrade`` (``UpgradeCode``,``VersionMin``,``VersionMax``,``Language``,``Attributes``,``Remove``,``ActionProperty``) VALUES ('$UpgradeCode','$productVersion','','',$DOWNGRADE_ATTR,'','NEWERVERSIONDETECTED')"
+    Exec "INSERT INTO ``LaunchCondition`` (``Condition``,``Description``) VALUES ('NOT NEWERVERSIONDETECTED','A newer version of Vordr is already installed.')"
 
     # Standard sequence.  RemoveExistingProducts runs after InstallFiles so an
     # upgrade never leaves the user without the exe if it fails mid-way.
@@ -346,10 +375,11 @@ try {
     # done - so if one is missing from InstallUISequence, the server-side pass
     # logs "Skipping <action>: already done on client side" and returns 0 without
     # running it.  It never ran anywhere, and nothing says so above verbose level.
-    # $clientSide below is the shared list; both sequences get all of it.
+    # FindRelatedProducts MUST precede LaunchConditions so NEWERVERSIONDETECTED
+    # is populated before the downgrade guard evaluates.
     $clientSide = @(
-        @("LaunchConditions",      "",  100),
-        @("FindRelatedProducts",   "",  200)
+        @("FindRelatedProducts",   "",  100),
+        @("LaunchConditions",      "",  200)
     )
     $seq = $clientSide + @(
         @("CostInitialize",        "",  800),

@@ -80,6 +80,7 @@ extern reg_prune_all:proc               ; C6: drop legacy path-named reg values
 externdef g_readonly:dword              ; E9: read-only mode flag (owned by gui.asm)
 extern reg_ctr_set:proc
 extern reg_ctr_get:proc
+extern reg_ctr_del:proc
 
 externdef g_cfg_in:qword
 externdef g_argv:qword
@@ -174,6 +175,8 @@ MAX_ATT         equ 512         ; pending (staged, not yet saved) attachments
 ; find its ciphertext and wrote an empty blob in its place.  Overflowing this one
 ; is now detected (g_att_ovf) and REFUSES the save instead.
 MAX_ATTIDX      equ 16384
+ATT_FILE_MAX    equ 10000000h   ; 256 MiB per-attachment cap (mirrors gui.asm)
+ATT_TOTAL_MAX   equ 0F0000000h  ; 3.75 GiB cumulative attachment section cap
 
 .const
 vst_src     db "vault-kat-test!!"      ; 16-byte plaintext for vault_selftest
@@ -268,7 +271,7 @@ g_vx_ids    db 16*16 dup (?)           ; vaultexportkat: snapshot of source entr
 align 8
 g_vfz_rng   dq ?                       ; vfuzz xorshift64 state (dbg/test only)
 g_kat_body  db 512 dup (?)             ; scratch body for the field-serialization KAT
-public g_vkey
+public g_vkey, g_sha32, g_hdr
 g_vkey      db 32 dup (?)
 g_sha32     db 32 dup (?)
 g_hdr       db VH_TOTAL dup (?)
@@ -325,6 +328,7 @@ align 8
 g_lock_h    dq ?                            ; C8: <vault>.lock handle (0 = not held)
 g_lock_path dw (MAX_PATH_CHARS + 8) dup (?) ; C8: "<vault>.lock" wide path
 align 16
+public g_fmac_ctx
 g_fmac_ctx  db 256 dup (?)                  ; BLAKE2B_CTX scratch (216 used)
 g_fmac_out  db 32 dup (?)                   ; computed file MAC
 g_filebuf   dq ?
@@ -824,14 +828,52 @@ vault_ext_changed endp
 ;   is fine); on the very first save g_cfg_in does not exist yet so the copy is
 ;   a harmless no-op.  Frame proc; no failure is fatal to the save.
 ; ===========================================================================
+; bak_not_reparse(rcx = wpath) -> eax = 1 safe (absent or regular file) / 0 reparse point.
+bak_not_reparse proc frame
+    FRAME_PROLOG 32
+    WINCALL GetFileAttributesW, rcx
+    cmp     eax, -1
+    je      bnr_ok                              ; absent -> safe
+    test    eax, 0400h                          ; FILE_ATTRIBUTE_REPARSE_POINT
+    jnz     bnr_bad
+bnr_ok:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+bnr_bad:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+bak_not_reparse endp
+
 vault_rotate_backups proc frame
     FRAME_PROLOG 80                        ; 80, not 48: the staged CopyFileW source
                                           ;   at rbp-48 sits in the callee home
                                           ;   area at the smaller size
-    lea     rcx, [g_bak_a]                      ; delete the oldest (bak3)
+    ; Refuse to rotate if any .bak1..3 slot is a planted reparse point / symlink.
+    lea     rcx, [g_bak_a]
     mov     dl, '0' + BAK_GENS
     call    vault_mkbak
-    WINCALL DeleteFileW, addr g_bak_a
+    lea     rcx, [g_bak_a]
+    call    bak_not_reparse
+    test    eax, eax
+    jz      vrb_done
+    lea     rcx, [g_bak_b]
+    mov     dl, '0' + BAK_GENS - 1
+    call    vault_mkbak
+    lea     rcx, [g_bak_b]
+    call    bak_not_reparse
+    test    eax, eax
+    jz      vrb_done
+    lea     rcx, [g_bak_b]
+    mov     dl, '1'
+    call    vault_mkbak
+    lea     rcx, [g_bak_b]
+    call    bak_not_reparse
+    test    eax, eax
+    jz      vrb_done
+
+    WINCALL DeleteFileW, addr g_bak_a           ; delete the oldest (bak3)
     lea     rcx, [g_bak_a]                      ; bak2 -> bak3
     mov     dl, '0' + BAK_GENS - 1
     call    vault_mkbak
@@ -846,13 +888,15 @@ vault_rotate_backups proc frame
     mov     dl, '2'
     call    vault_mkbak
     WINCALL MoveFileExW, addr g_bak_a, addr g_bak_b, MOVEFILE_REPLACE_EXISTING
-    lea     rcx, [g_bak_a]                      ; live vault -> bak1 (overwrite)
+    lea     rcx, [g_bak_a]                      ; live vault -> bak1 (create-new after delete)
     mov     dl, '1'
     call    vault_mkbak
+    WINCALL DeleteFileW, addr g_bak_a
     mov     rcx, qword ptr [g_cfg_in]           ; the source needs the Win32 form too;
     call    path_io                             ;   g_bak_a already has it
     mov     qword ptr [rbp-48], rax
-    WINCALL CopyFileW, qword ptr [rbp-48], addr g_bak_a, 0
+    WINCALL CopyFileW, qword ptr [rbp-48], addr g_bak_a, 1
+vrb_done:
     FRAME_EPILOG
     ret
 vault_rotate_backups endp
@@ -874,26 +918,41 @@ vault_seal_write proc frame
     jnz     vsw_refuse
     cmp     dword ptr [g_att_ovf], 0            ; the index could not hold every
     jne     vsw_refuse                          ;   attachment: saving would drop some
+    cmp     qword ptr [g_save_counter], -1      ; refuse u64 counter wrap to 0
+    je      vsw_refuse
     mov     dword ptr [g_att_missing], 0
     xor     ecx, ecx                            ; emit=0: size the attachment section
     xor     edx, edx
+    xor     r8d, r8d
     call    attach_build
+    cmp     dword ptr [g_att_missing], 0
+    jne     vsw_refuse
     mov     qword ptr [rbp-32], rax
-    ; base image = VH_TOTAL + body_len + 16 + attachment section
+    ; base image = VH_TOTAL + body_len + 16 + attachment section (checked u64 adds)
     mov     rax, qword ptr [g_body_len]
+    cmp     rax, VAULT_BODY_MAX
+    ja      vsw_refuse
     add     rax, VH_TOTAL + 16
+    jc      vsw_refuse
     add     rax, qword ptr [rbp-32]
+    jc      vsw_refuse
     mov     qword ptr [rbp-40], rax             ; base length (before the MAC trailer)
     add     rax, FMAC_TRAILER                   ; + [u64 counter][32 MAC][u32 magic]
+    jc      vsw_refuse
+    mov     ecx, ATT_TOTAL_MAX + VAULT_BODY_MAX + 4096
+    cmp     rax, rcx
+    ja      vsw_refuse
     mov     qword ptr [g_outlen], rax
     mov     rcx, rax
     call    mem_alloc
     test    rax, rax
     jz      vsw_oom
     mov     qword ptr [g_outbuf], rax
+    mov     dword ptr [rbp-56], 0               ; nonce retry count (VATT tag collision guard)
+vsw_seal_try:
     ; copy header (80 bytes)
     lea     r10, [g_hdr]
-    mov     r11, rax
+    mov     r11, qword ptr [g_outbuf]
     xor     r8, r8
 vsw_hcpy:
     mov     cl, byte ptr [r10+r8]
@@ -926,11 +985,30 @@ vsw_hcpy:
     ; emit the attachment section right after the body tag (seals new blobs,
     ; copies existing ones from the old image)
     cmp     qword ptr [rbp-32], 0
-    je      vsw_write
+    jne     vsw_emit_att
+    ; No attachments: the last 12 bytes of the base image are tag[4..15].  Ensure
+    ; tag[4..7] never accidentally equals ATT_MAGIC ("VATT"), re-noncing if so.
+    mov     r10, qword ptr [g_outbuf]
+    add     r10, VH_TOTAL
+    add     r10, qword ptr [g_body_len]
+    cmp     dword ptr [r10+4], ATT_MAGIC
+    jne     vsw_write
+    inc     dword ptr [rbp-56]
+    cmp     dword ptr [rbp-56], 8
+    jae     vsw_io
+    lea     rcx, [g_hdr+VH_NONCE]
+    mov     edx, 12
+    call    rng_fill
+    test    eax, eax
+    jz      vsw_io
+    jmp     vsw_seal_try
+vsw_emit_att:
     mov     ecx, 1                              ; emit=1
     mov     rdx, qword ptr [g_outbuf]
     add     rdx, VH_TOTAL + 16
     add     rdx, qword ptr [g_body_len]
+    mov     r8, qword ptr [g_outbuf]
+    add     r8, qword ptr [rbp-40]              ; dst_end = base offset (before FMAC_TRAILER)
     call    attach_build
     cmp     dword ptr [g_att_missing], 0
     je      vsw_write
@@ -1284,7 +1362,34 @@ vu_ctset:
     lea     rcx, [g_greq]
     call    gcm_open
     test    eax, eax
+    jz      vu_gcm_ok
+    ; VATT tag-collision fallback: an attachment-free vault whose 16-byte GCM tag
+    ; happened to carry ATT_MAGIC at tag[4..7] and a small u64 at tag[8..15] would
+    ; otherwise subtract a phantom attachment section from ctlen.  Retry once with
+    ; g_att_total = 0 before reporting EXIT_AUTH.
+    cmp     qword ptr [g_att_total], 0
+    je      vu_auth
+    mov     qword ptr [g_att_total], 0
+    mov     rax, qword ptr [g_filesize]
+    sub     rax, qword ptr [g_fmac_len]
+    sub     rax, VH_TOTAL + 16
+    cmp     rax, VAULT_BODY_MAX
+    ja      vu_auth
+    mov     qword ptr [rbp-24], rax
+    mov     r10, rax
+    add     r10, VH_TOTAL + 16
+    mov     qword ptr [g_att_start], r10
+    lea     r10, [g_greq]
+    mov     qword ptr [r10].GCMREQ.inlen, rax
+    mov     r11, qword ptr [g_filebuf]
+    lea     rcx, [r11+VH_TOTAL]
+    add     rcx, rax
+    mov     qword ptr [r10].GCMREQ.tag, rcx
+    lea     rcx, [g_greq]
+    call    gcm_open
+    test    eax, eax
     jnz     vu_auth
+vu_gcm_ok:
     mov     rax, qword ptr [rbp-24]
     mov     qword ptr [g_body_len], rax
     ; fail closed if the (now authenticated) record stream is structurally
@@ -1328,7 +1433,15 @@ vu_cleanfile2:
     mov     eax, dword ptr [rbp-24]
 vu_cleanfile:
     mov     qword ptr [rbp-24], rax
-    cmp     dword ptr [g_preloaded], 0          ; a preloaded image belongs to the caller:
+    lea     rcx, [g_sha32]
+    mov     edx, 32
+    call    secure_zero
+    cmp     dword ptr [g_reuse_key], 0          ; vault_reload reuses the live master key:
+    jne     @F                                  ;   only wipe newly-derived candidate keys
+    lea     rcx, [g_vkey]
+    mov     edx, 32
+    call    secure_zero
+@@: cmp     dword ptr [g_preloaded], 0          ; a preloaded image belongs to the caller:
     jne     vu_ret                              ;   freeing it here would send the next
                                                 ;   wrong-password retry back to the file,
                                                 ;   which is the I/O we moved off the
@@ -1437,6 +1550,15 @@ vl_key:
 vl_wipe:
     lea     rcx, [g_vkey]
     mov     rdx, 32
+    call    secure_zero
+    lea     rcx, [g_sha32]
+    mov     edx, 32
+    call    secure_zero
+    lea     rcx, [g_fmac_ctx]
+    mov     edx, 256
+    call    secure_zero
+    lea     rcx, [g_fmac_out]
+    mov     edx, 32
     call    secure_zero
     lea     rcx, [g_conv]                       ; wipe plaintext field-value scratch
     mov     edx, CONV_CAP
@@ -2066,9 +2188,9 @@ find_field_in endp
 ; ===========================================================================
 public vault_body_validate
 vault_body_validate proc frame
-    FRAME_PROLOG 64
+    FRAME_PROLOG 80
     ; [rbp-24]=body ptr  [rbp-32]=body_len  [rbp-40]=offset
-    ; [rbp-48]=entries remaining  [rbp-56]=fields remaining
+    ; [rbp-48]=entries remaining  [rbp-56]=fields remaining  [rbp-64]=att section total
     mov     r10, qword ptr [g_body_ptr]
     test    r10, r10
     jz      vbv_bad
@@ -2080,6 +2202,7 @@ vault_body_validate proc frame
     mov     eax, dword ptr [r10]                ; entry_count
     mov     dword ptr [rbp-48], eax
     mov     qword ptr [rbp-40], 4               ; first entry begins after the count
+    mov     qword ptr [rbp-64], 0               ; cumulative attachment section bytes
 vbv_entry:
     mov     eax, dword ptr [rbp-48]
     test    eax, eax
@@ -2102,43 +2225,89 @@ vbv_field:
     cmp     rdx, qword ptr [rbp-32]
     ja      vbv_bad
     mov     r10, qword ptr [rbp-24]
-    movzx   eax, word ptr [r10+rcx]             ; raw type (kind | flags)
+    movzx   r9d, word ptr [r10+rcx]             ; raw type (kind | flags)
     mov     r8d, dword ptr [r10+rcx+2]          ; field len (zero-extended into r8)
     lea     rdx, [rcx+6]
     add     rdx, r8                             ; field end offset
+    jc      vbv_bad
     cmp     rdx, qword ptr [rbp-32]             ; whole field within the body?
     ja      vbv_bad
-    test    eax, VF_LABELED                     ; labelled field: {u16 labellen, label, value}
-    jz      vbv_kind                            ; (unlabelled fields still need the kind check)
+    lea     rdx, [r10+rcx+6]                    ; default val_ptr = field+6
+    mov     r11, r8                             ; default val_len = field len
+    test    r9d, VF_LABELED                     ; labelled field: {u16 labellen, label, value}
+    jz      vbv_kind
     cmp     r8, 2
     jb      vbv_bad                             ; no room for the labellen prefix
     movzx   eax, word ptr [r10+rcx+6]           ; labellen
     add     eax, 2
     cmp     rax, r8                             ; 2 + labellen must fit inside the field
     ja      vbv_bad
+    add     rdx, rax                            ; val_ptr past {u16 labellen, label}
+    sub     r11, rax                            ; val_len = field len - (2 + labellen)
 vbv_kind:
-    ; attachment fields (VF_IMAGE/VF_FILE) must carry a full AttachRef - downstream
-    ; (attach_build/emit/open) dereferences [value + ARF_PTLEN]; reject a crafted body
-    ; whose attachment value is shorter than ARF_SIZE (68).
-    mov     r10, qword ptr [rbp-24]
-    mov     rcx, qword ptr [rbp-40]
-    movzx   r9d, word ptr [r10+rcx]             ; raw type
+    ; Validate typed binary fields so downstream readers can never OOB-read or wrap u64:
+    ;   1) VF_IMAGE / VF_FILE: >= ARF_SIZE, ARF_PTLEN <= ATT_FILE_MAX, cumulative section
+    ;      <= ATT_TOTAL_MAX, and any trailing wide filename even-length + NUL-terminated.
+    ;   2) VF_PWHIST (13): unlabelled, even length >= 10, wide NUL-terminated string(s)
+    ;      after the 8-byte FILETIME, with 0 or 4 trailing action bytes after the 2nd NUL.
     mov     eax, r9d
     and     eax, VF_KINDMASK                    ; base kind
     cmp     eax, VF_IMAGE
     je      vbv_atref
     cmp     eax, VF_FILE
-    jne     vbv_fadv
+    je      vbv_atref
+    cmp     eax, VF_PWHIST
+    je      vbv_pwhist
+    jmp     vbv_fadv
 vbv_atref:
-    mov     r11, r8                             ; value length = field len minus the
-    test    r9d, VF_LABELED                     ;   {u16 labellen, label} prefix if labelled
-    jz      vbv_atlen
-    movzx   eax, word ptr [r10+rcx+6]
-    add     eax, 2
-    sub     r11, rax
-vbv_atlen:
     cmp     r11, ARF_SIZE
     jb      vbv_bad
+    mov     rax, qword ptr [rdx+ARF_PTLEN]      ; untrusted u64 plaintext length
+    cmp     rax, ATT_FILE_MAX
+    ja      vbv_bad
+    add     rax, ATT_ENThDR + 16
+    add     qword ptr [rbp-64], rax
+    jc      vbv_bad
+    mov     eax, ATT_TOTAL_MAX
+    cmp     qword ptr [rbp-64], rax
+    ja      vbv_bad
+    cmp     r11, ARF_SIZE                       ; bare 68-byte AttachRef (no filename) is ok
+    je      vbv_fadv
+    mov     rax, r11
+    sub     rax, ARF_SIZE
+    test    rax, 1                              ; trailing wide filename must be even bytes
+    jnz     vbv_bad
+    cmp     word ptr [rdx+r11-2], 0             ; ...and end with a wide NUL
+    jne     vbv_bad
+    jmp     vbv_fadv
+vbv_pwhist:
+    test    r9d, VF_LABELED                     ; VF_PWHIST is never labelled
+    jnz     vbv_bad
+    cmp     r11, 10                             ; at least {u64 ft, wide NUL}
+    jb      vbv_bad
+    test    r11, 1                              ; 8 + wide*2 (+ optional u32 action) -> even
+    jnz     vbv_bad
+    mov     rax, 8
+vbv_ph1:
+    cmp     rax, r11
+    jae     vbv_bad                             ; missing 1st wide NUL
+    cmp     word ptr [rdx+rax], 0
+    lea     rax, [rax+2]
+    jne     vbv_ph1
+    cmp     rax, r11
+    je      vbv_fadv                            ; legacy v1 shape: {u64 ft, pw\0}
+vbv_ph2:
+    cmp     rax, r11
+    jae     vbv_bad                             ; missing 2nd wide NUL
+    cmp     word ptr [rdx+rax], 0
+    lea     rax, [rax+2]
+    jne     vbv_ph2
+    mov     rcx, r11
+    sub     rcx, rax
+    test    rcx, rcx
+    jz      vbv_fadv                            ; v2 shape: {u64 ft, label\0, pw\0}
+    cmp     rcx, 4
+    jne     vbv_bad                             ; v3 shape: {u64 ft, label\0, pw\0, u32 act}
 vbv_fadv:
     mov     rcx, qword ptr [rbp-40]
     add     rcx, 6
@@ -2781,6 +2950,9 @@ vea_cmp1:
     inc     ecx
     cmp     ecx, AG_PLAIN_LEN
     jb      vea_cmp1
+    mov     rcx, rax
+    mov     rdx, qword ptr [rbp-32]
+    call    attach_free
     mov     rcx, qword ptr [rbp-40]           ; VF_FILE attachment
     mov     edx, VF_FILE
     call    find_field_in
@@ -2803,6 +2975,9 @@ vea_cmp2:
     inc     ecx
     cmp     ecx, AG_PLAI2_LEN
     jb      vea_cmp2
+    mov     rcx, rax
+    mov     rdx, qword ptr [rbp-32]
+    call    attach_free
     lea     rcx, [vea_ok]
     mov     edx, vea_ok_len
     call    print_a
@@ -2999,19 +3174,23 @@ mt_fail:
 cmd_mactest endp
 
 ; ===========================================================================
-; cmd_rbtest <path> - prove anti-rollback detection.  Create a vault
-;   (counter 1, mirror 1), force the HKCU mirror ahead to 5, and confirm the
-;   next unlock flags g_rollback; then set the mirror back to 1 and confirm a
-;   fresh unlock does NOT flag it.  exit 0 = pass.
+; cmd_rbtest <path> - prove anti-rollback detection and monotonic high-water
+;   counter enforcement.  Create a vault (counter 1, mirror 1), force the HKCU
+;   mirror ahead to 5, confirm unlock flags g_rollback == 1, confirm attempting
+;   to lower the mirror back to 1 is refused by reg_ctr_set (still flags 1),
+;   advance the vault on disk to counter 5 and confirm unlock clears g_rollback,
+;   then push mirror to 9 and confirm upper-cased path spelling still flags 1.
 ; ===========================================================================
 LANDING_PAD
 public cmd_rbtest
 cmd_rbtest proc frame
-    FRAME_PROLOG 64                             ; [rbp-32] result of the upper-case unlock
+    FRAME_PROLOG 64                             ; [rbp-32] result scratch
     lea     r10, [g_argv]
     mov     rax, qword ptr [r10+16]
     mov     rcx, rax
     call    cfg_in_set
+    mov     rcx, qword ptr [g_cfg_in]
+    call    reg_ctr_del
     lea     r10, [bk_pw]
     lea     r11, [g_cfg_pass]
     xor     ecx, ecx
@@ -3030,6 +3209,14 @@ rb_pwd:
     call    do_init
     test    eax, eax
     jnz     rb_fail
+    ; clear any recycled NTFS file-id counter from a prior run, then seed mirror = 1
+    mov     rcx, qword ptr [g_cfg_in]
+    call    reg_ctr_del
+    mov     qword ptr [g_ctr_io], 1
+    mov     rcx, qword ptr [g_cfg_in]
+    lea     rdx, [g_ctr_io]
+    mov     r8d, 8
+    call    reg_ctr_set
     ; force the mirror ahead of the file's counter (simulate a later save)
     mov     qword ptr [g_ctr_io], 5
     mov     rcx, qword ptr [g_cfg_in]
@@ -3042,7 +3229,7 @@ rb_pwd:
     call    vault_lock
     cmp     dword ptr [g_rollback], 1
     jne     rb_fail
-    ; restore the mirror to the file's counter -> no rollback
+    ; monotonic guard: attempting to lower the mirror from 5 -> 1 must be refused
     mov     qword ptr [g_ctr_io], 1
     mov     rcx, qword ptr [g_cfg_in]
     lea     rdx, [g_ctr_io]
@@ -3052,13 +3239,28 @@ rb_pwd:
     test    eax, eax
     jnz     rb_fail
     call    vault_lock
+    cmp     dword ptr [g_rollback], 1
+    jne     rb_fail
+    ; advance the vault's sealed counter to 5 -> catches up with mirror -> no rollback
+    call    vault_unlock
+    test    eax, eax
+    jnz     rb_fail
+    mov     qword ptr [g_save_counter], 4       ; vault_seal_write increments to 5
+    call    vault_seal_write
+    mov     dword ptr [rbp-32], eax
+    call    vault_lock
+    cmp     dword ptr [rbp-32], 0
+    jne     rb_fail
+    call    vault_unlock
+    test    eax, eax
+    jnz     rb_fail
+    call    vault_lock
     cmp     dword ptr [g_rollback], 0
     jne     rb_fail
     ; ---- the mirror belongs to the FILE, not to one spelling of its path --------
-    ; Push the mirror ahead again, then open the same vault under an upper-cased
-    ; spelling: it must still be flagged.  Each spelling used to get its own mirror,
-    ; so this read as a vault never seen before.
-    mov     qword ptr [g_ctr_io], 5
+    ; Push the mirror ahead again (9 > 5), then open the same vault under an
+    ; upper-cased spelling: it must still be flagged.
+    mov     qword ptr [g_ctr_io], 9
     mov     rcx, qword ptr [g_cfg_in]
     lea     rdx, [g_ctr_io]
     mov     r8d, 8
@@ -3094,11 +3296,8 @@ rb_updone:
     jne     rb_fail
     cmp     dword ptr [g_rollback], 1
     jne     rb_fail
-    mov     qword ptr [g_ctr_io], 1              ; leave the mirror where the file is
-    mov     rcx, qword ptr [g_cfg_in]
-    lea     rdx, [g_ctr_io]
-    mov     r8d, 8
-    call    reg_ctr_set
+    mov     rcx, qword ptr [g_cfg_in]            ; scrub the scratch vault's mirror
+    call    reg_ctr_del
     lea     rcx, [rb_ok]
     mov     edx, rb_ok_len
     call    print_a
@@ -3106,7 +3305,11 @@ rb_updone:
     FRAME_EPILOG
     ret
 rb_fail:
-    lea     rcx, [rb_bad]
+    cmp     qword ptr [g_cfg_in], 0
+    je      @F
+    mov     rcx, qword ptr [g_cfg_in]
+    call    reg_ctr_del
+@@: lea     rcx, [rb_bad]
     mov     edx, rb_bad_len
     call    print_a
     mov     eax, 1
@@ -4945,11 +5148,13 @@ lka_cpd:
     mov     word ptr [r11+6], 'c'
     mov     word ptr [r11+8], 'k'
     mov     word ptr [r11+10], 0
-    WINCALL CreateFileW, addr g_lock_path, LK_GENERIC_WRITE, 0, 0, LK_CREATE_NEW, LK_DELONCLOSE, 0
+    ; Share read (1 = FILE_SHARE_READ) so cloud sync/backup indexers do not fail
+    ; mid-scan while write exclusion (no FILE_SHARE_WRITE/DELETE) still holds.
+    WINCALL CreateFileW, addr g_lock_path, LK_GENERIC_WRITE, 1, 0, LK_CREATE_NEW, LK_DELONCLOSE, 0
     cmp     rax, -1
     jne     lka_got
     WINCALL DeleteFileW, addr g_lock_path       ; reclaim an orphan (fails if live-held)
-    WINCALL CreateFileW, addr g_lock_path, LK_GENERIC_WRITE, 0, 0, LK_CREATE_NEW, LK_DELONCLOSE, 0
+    WINCALL CreateFileW, addr g_lock_path, LK_GENERIC_WRITE, 1, 0, LK_CREATE_NEW, LK_DELONCLOSE, 0
     cmp     rax, -1
     je      lka_busy
 lka_got:
@@ -5067,6 +5272,15 @@ ecf_loop:
     je      ecf_adv                           ; attachment field -> drop (don't copy)
     cmp     ecx, VF_FILE
     je      ecf_adv
+    cmp     ecx, VF_PWHIST
+    jne     ecf_do_cp
+    test    eax, VF_LABELED                   ; defensive: drop malformed history blobs
+    jnz     ecf_adv
+    cmp     r8d, 16                           ; 6-byte header + >=10-byte payload
+    jb      ecf_adv
+    test    r8d, 1
+    jnz     ecf_adv
+ecf_do_cp:
     xor     ecx, ecx                          ; copy r8d bytes r10 -> r11
 ecf_cp:
     cmp     ecx, r8d
@@ -7413,6 +7627,23 @@ af_none:
     ret
 attach_find endp
 
+; attach_free(rcx = secmem plaintext ptr, rdx = ptlen) - wipe + release an
+;   attachment plaintext buffer allocated by attach_open / attach_stage.
+;   0-byte attachments allocate a 1-byte locked page, so clamp rdx >= 1.
+public attach_free
+attach_free proc frame
+    FRAME_PROLOG 32
+    test    rcx, rcx
+    jz      atf_done
+    test    rdx, rdx
+    jnz     @F
+    mov     edx, 1
+@@: call    secmem_free
+atf_done:
+    FRAME_EPILOG
+    ret
+attach_free endp
+
 ; attach_reset_pending() - free the pending new-attachment plaintext buffers and
 ;   clear the pending table, leaving the ON-DISK index (g_attidx) intact.  Use
 ;   this whenever a vault stays open: g_attidx is what attach_open resolves a
@@ -7432,7 +7663,13 @@ ar_loop:
     test    rcx, rcx
     jz      ar_next
     mov     rdx, qword ptr [r10+24]
-    call    mem_free
+    call    attach_free
+    mov     eax, dword ptr [rbp-24]
+    imul    eax, eax, 32
+    lea     r10, [g_newatt]
+    add     r10, rax
+    mov     qword ptr [r10+16], 0
+    mov     qword ptr [r10+24], 0
 ar_next:
     inc     dword ptr [rbp-24]
     jmp     ar_loop
@@ -7470,7 +7707,12 @@ attach_stage proc frame
     cmp     eax, MAX_ATT
     jae     as_err
     mov     rcx, qword ptr [rbp-32]
-    call    mem_alloc
+    cmp     rcx, ATT_FILE_MAX
+    ja      as_err
+    test    rcx, rcx
+    jnz     @F
+    mov     ecx, 1                              ; 0-byte attachment -> 1-byte locked page
+@@: call    secmem_alloc
     test    rax, rax
     jz      as_err
     mov     qword ptr [rbp-48], rax             ; buf
@@ -7519,9 +7761,12 @@ attach_stage proc frame
     FRAME_EPILOG
     ret
 as_errbuf:
-    mov     rcx, qword ptr [rbp-48]             ; the plaintext copy must not outlive
-    mov     rdx, qword ptr [rbp-32]             ;   the failure (mem_free wipes it)
-    call    mem_free
+    mov     rcx, qword ptr [rbp-40]             ; wipe partially-generated AttachRef (key/id)
+    mov     edx, ARF_SIZE
+    call    secure_zero
+    mov     rcx, qword ptr [rbp-48]             ; wipe + release locked plaintext copy
+    mov     rdx, qword ptr [rbp-32]
+    call    attach_free
 as_err:
     mov     eax, 1
     FRAME_EPILOG
@@ -7640,9 +7885,14 @@ attach_open proc frame
     call    attach_find
     cmp     eax, -1
     je      ao_disk
-    ; pending: return a copy of the plaintext
+    ; pending: return a locked secmem copy of the plaintext
     mov     rcx, qword ptr [rbp-40]
-    call    mem_alloc
+    cmp     rcx, ATT_FILE_MAX
+    ja      ao_fail
+    test    rcx, rcx
+    jnz     @F
+    mov     ecx, 1
+@@: call    secmem_alloc
     test    rax, rax
     jz      ao_fail
     mov     qword ptr [rbp-48], rax
@@ -7673,13 +7923,17 @@ ao_disk:
     mov     rcx, qword ptr [r10+24]
     mov     qword ptr [rbp-64], rcx             ; ctlen
     ; defence in depth: the on-disk ctlen must equal the body's ptlen (GCM is
-    ; length-preserving).  Refuse a mismatch BEFORE allocating, so gcm_open can
-    ; never be asked to write ctlen plaintext bytes into a ptlen-sized buffer.
+    ; length-preserving) and stay within ATT_FILE_MAX.
     mov     rax, qword ptr [rbp-64]
     cmp     rax, qword ptr [rbp-40]
     jne     ao_fail
-    mov     rcx, qword ptr [rbp-40]
-    call    mem_alloc
+    cmp     rax, ATT_FILE_MAX
+    ja      ao_fail
+    mov     rcx, rax
+    test    rcx, rcx
+    jnz     @F
+    mov     ecx, 1
+@@: call    secmem_alloc
     test    rax, rax
     jz      ao_fail
     mov     qword ptr [rbp-48], rax
@@ -7722,7 +7976,7 @@ ao_ret:
 ao_authfail:
     mov     rcx, qword ptr [rbp-48]
     mov     rdx, qword ptr [rbp-40]
-    call    mem_free
+    call    attach_free
 ao_fail:
     xor     eax, eax
     FRAME_EPILOG
@@ -7816,13 +8070,15 @@ aeo_done:
     ret
 attach_emit_one endp
 
-; attach_build(ecx=emit, rdx=out ptr) -> rax = total section bytes (entries + the
-;   12-byte trailer), or 0 when the vault has no image fields.  emit=0 sizes only;
-;   emit=1 also writes the section at [rdx].  Walks every VF_IMAGE AttachRef.
+; attach_build(ecx=emit, rdx=out ptr, r8=out_end) -> rax = total section bytes
+;   (entries + the 12-byte trailer), or 0 when the vault has no attachment fields.
+;   emit=0 sizes only; emit=1 writes the section at [rdx..r8) with strict bounds.
+;   Any u64 wrap, oversized ptlen, or buffer overrun sets g_att_missing = 1.
 attach_build proc frame
     FRAME_PROLOG 192
     mov     dword ptr [rbp-24], ecx             ; emit
     mov     qword ptr [rbp-32], rdx             ; cur
+    mov     qword ptr [rbp-152], r8             ; out_end (valid when emit != 0)
     mov     qword ptr [rbp-40], 0               ; total
     mov     dword ptr [rbp-48], 0               ; count
     call    vault_count
@@ -7845,16 +8101,34 @@ ab_frow:
     lea     r8, [rbp-128]                       ; out struct
     call    vault_field_get
     cmp     qword ptr [rbp-128], VF_IMAGE       ; image + generic-file fields carry
-    je      ab_isatt                           ;   an AttachRef value
+    je      ab_isatt                            ;   an AttachRef value
     cmp     qword ptr [rbp-128], VF_FILE
     jne     ab_fadv
 ab_isatt:
     mov     rax, qword ptr [rbp-104]            ; out.valptr (= [rbp-128+24])
     mov     qword ptr [rbp-136], rax            ; ref
     mov     rcx, qword ptr [rax+ARF_PTLEN]
+    cmp     rcx, ATT_FILE_MAX
+    ja      ab_ovf
     mov     qword ptr [rbp-144], rcx            ; ptlen
+    mov     r9, rcx
+    add     r9, ATT_ENThDR + 16                 ; entry_bytes = 24 + ptlen + 16
+    jc      ab_ovf
+    mov     rax, qword ptr [rbp-40]
+    add     rax, r9
+    jc      ab_ovf
+    mov     ecx, ATT_TOTAL_MAX
+    cmp     rax, rcx
+    ja      ab_ovf
     cmp     dword ptr [rbp-24], 0
     je      ab_acc
+    mov     r10, qword ptr [rbp-32]             ; cur
+    mov     r11, qword ptr [rbp-152]            ; out_end
+    cmp     r10, r11
+    ja      ab_ovf
+    sub     r11, r10
+    cmp     r9, r11
+    ja      ab_ovf
     mov     rcx, qword ptr [rbp-136]
     mov     rdx, qword ptr [rbp-32]
     mov     r8, qword ptr [rbp-144]
@@ -7863,10 +8137,12 @@ ab_acc:
     mov     rax, qword ptr [rbp-144]
     add     rax, ATT_ENThDR + 16                ; 24 + ptlen + 16
     add     qword ptr [rbp-40], rax
+    jc      ab_ovf
     cmp     dword ptr [rbp-24], 0
     je      ab_cnt
     mov     rcx, qword ptr [rbp-32]
     add     rcx, rax
+    jc      ab_ovf
     mov     qword ptr [rbp-32], rcx
 ab_cnt:
     inc     dword ptr [rbp-48]
@@ -7879,16 +8155,31 @@ ab_fnext:
 ab_edone:
     cmp     dword ptr [rbp-48], 0
     je      ab_ret
+    mov     rax, qword ptr [rbp-40]
+    add     rax, ATT_TRAILER
+    jc      ab_ovf
     cmp     dword ptr [rbp-24], 0
     je      ab_trail
     mov     rcx, qword ptr [rbp-32]
+    mov     r11, qword ptr [rbp-152]
+    cmp     rcx, r11
+    ja      ab_ovf
+    sub     r11, rcx
+    cmp     r11, ATT_TRAILER
+    jb      ab_ovf
     mov     dword ptr [rcx], ATT_MAGIC
     mov     rax, qword ptr [rbp-40]
     mov     qword ptr [rcx+4], rax
 ab_trail:
     add     qword ptr [rbp-40], ATT_TRAILER
+    jc      ab_ovf
 ab_ret:
     mov     rax, qword ptr [rbp-40]
+    FRAME_EPILOG
+    ret
+ab_ovf:
+    mov     dword ptr [g_att_missing], 1
+    xor     eax, eax
     FRAME_EPILOG
     ret
 attach_build endp
@@ -7970,7 +8261,7 @@ ast_idcp:
     ; free the opened buffer
     mov     rcx, qword ptr [rbp-24]
     mov     rdx, 40
-    call    mem_free
+    call    attach_free
     call    attach_reset
     xor     eax, eax
     FRAME_EPILOG
@@ -7978,7 +8269,7 @@ ast_idcp:
 ast_freefail:
     mov     rcx, qword ptr [rbp-24]
     mov     rdx, 40
-    call    mem_free
+    call    attach_free
 ast_fail:
     call    attach_reset
     mov     eax, 1
@@ -8071,7 +8362,7 @@ zav_hit:
 zav_free:
     mov     rcx, qword ptr [rbp-56]
     mov     rdx, qword ptr [rbp-48]
-    call    mem_free
+    call    attach_free
 zav_kindnext:
     mov     eax, dword ptr [rbp-36]
     cmp     eax, VF_IMAGE
@@ -8148,5 +8439,504 @@ cvc_fail:
     FRAME_EPILOG
     ret
 cmd_convcap endp
+
+; ===========================================================================
+; cmd_attovfkat - VDR-02 attachment u64 wrap / per-file cap / cumulative section
+;   cap / emit=1 destination bounds regression probe.
+; ===========================================================================
+.data
+CSTR avk_ok,  "attovfkat: PASS (attachment u64 wrap, file/section caps, and emit bounds enforced)",13,10
+CSTR avk_bad, "attovfkat: FAIL (hostile ARF_PTLEN slipped past validator or attach_build)",13,10
+.data?
+avk_tiny db 32 dup (?)
+.code
+LANDING_PAD
+public cmd_attovfkat
+cmd_attovfkat proc frame
+    FRAME_PROLOG 48
+    mov     rcx, VAULT_BODY_MAX
+    call    secmem_alloc
+    test    rax, rax
+    jz      avk_fail
+    mov     qword ptr [g_body_ptr], rax
+    mov     r10, rax
+    xor     ecx, ecx
+avk_zlp:
+    mov     byte ptr [r10+rcx], 0
+    inc     ecx
+    cmp     ecx, 1280
+    jb      avk_zlp
+    ; 1-entry, 1-field VF_FILE body (40 + 6 + ARF_SIZE = 114 bytes)
+    mov     dword ptr [r10+0], 1                ; entry_count = 1
+    mov     dword ptr [r10+36], 1               ; field_count = 1
+    mov     word ptr [r10+40], VF_FILE
+    mov     dword ptr [r10+42], ARF_SIZE
+    mov     qword ptr [g_body_len], 40 + 6 + ARF_SIZE
+
+    ; 1) Inclusive upper bound: ARF_PTLEN = ATT_FILE_MAX is structurally valid
+    mov     r10, qword ptr [g_body_ptr]
+    mov     rax, ATT_FILE_MAX
+    mov     qword ptr [r10 + 46 + ARF_PTLEN], rax
+    call    vault_body_validate
+    test    eax, eax
+    jnz     avk_faillk
+
+    ; 2) Near-2^64 ARF_PTLEN (-32) used to wrap ptlen+40 to 8 -> must reject in BOTH
+    mov     r10, qword ptr [g_body_ptr]
+    mov     rax, 0FFFFFFFFFFFFFFE0h
+    mov     qword ptr [r10 + 46 + ARF_PTLEN], rax
+    call    vault_body_validate
+    test    eax, eax
+    jz      avk_faillk
+    mov     dword ptr [g_att_missing], 0
+    xor     ecx, ecx
+    xor     edx, edx
+    xor     r8d, r8d
+    call    attach_build
+    test    rax, rax
+    jnz     avk_faillk
+    cmp     dword ptr [g_att_missing], 1
+    jne     avk_faillk
+
+    ; 3) ARF_PTLEN = ATT_FILE_MAX + 1 -> must reject in BOTH
+    mov     r10, qword ptr [g_body_ptr]
+    mov     rax, ATT_FILE_MAX + 1
+    mov     qword ptr [r10 + 46 + ARF_PTLEN], rax
+    call    vault_body_validate
+    test    eax, eax
+    jz      avk_faillk
+    mov     dword ptr [g_att_missing], 0
+    xor     ecx, ecx
+    xor     edx, edx
+    xor     r8d, r8d
+    call    attach_build
+    test    rax, rax
+    jnz     avk_faillk
+    cmp     dword ptr [g_att_missing], 1
+    jne     avk_faillk
+
+    ; 4) emit=1 destination bounds check: 64-byte payload into a 32-byte out window
+    mov     r10, qword ptr [g_body_ptr]
+    mov     qword ptr [r10 + 46 + ARF_PTLEN], 64
+    call    vault_body_validate
+    test    eax, eax
+    jnz     avk_faillk
+    mov     dword ptr [g_att_missing], 0
+    mov     ecx, 1
+    lea     rdx, [avk_tiny]
+    lea     r8, [avk_tiny + 32]
+    call    attach_build
+    test    rax, rax
+    jnz     avk_faillk
+    cmp     dword ptr [g_att_missing], 1
+    jne     avk_faillk
+
+    ; 5) Cumulative ATT_TOTAL_MAX cap: 16 fields * ATT_FILE_MAX = 4 GiB > ATT_TOTAL_MAX
+    mov     r10, qword ptr [g_body_ptr]
+    mov     dword ptr [r10+36], 16              ; field_count = 16
+    lea     r11, [r10+40]
+    mov     rax, ATT_FILE_MAX
+    xor     ecx, ecx
+avk_mk16:
+    mov     word ptr [r11+0], VF_FILE
+    mov     dword ptr [r11+2], ARF_SIZE
+    mov     qword ptr [r11 + 6 + ARF_PTLEN], rax
+    add     r11, 6 + ARF_SIZE
+    inc     ecx
+    cmp     ecx, 16
+    jb      avk_mk16
+    mov     qword ptr [g_body_len], 40 + 16 * (6 + ARF_SIZE)
+    call    vault_body_validate
+    test    eax, eax
+    jz      avk_faillk
+    mov     dword ptr [g_att_missing], 0
+    xor     ecx, ecx
+    xor     edx, edx
+    xor     r8d, r8d
+    call    attach_build
+    test    rax, rax
+    jnz     avk_faillk
+    cmp     dword ptr [g_att_missing], 1
+    jne     avk_faillk
+
+    call    vault_lock
+    lea     rcx, [avk_ok]
+    mov     edx, avk_ok_len
+    call    print_a
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+avk_faillk:
+    call    vault_lock
+avk_fail:
+    lea     rcx, [avk_bad]
+    mov     edx, avk_bad_len
+    call    print_a
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_attovfkat endp
+
+; ===========================================================================
+; cmd_vattcolkat <path> - VDR-19 deterministic real-AES-GCM VATT tag-collision KAT.
+;   Solves a 128x128 GF(2) affine system over an 80-byte plaintext body's final
+;   16-byte VF_NOTES block so the genuine AES-256-GCM tag has tag[4..7] == "VATT"
+;   (ATT_MAGIC) and tag[8..15] == 8.  Asserts vault_unlock recovers cleanly via
+;   the retry path (g_att_total == 0, vault_count == 1), while a 1-bit ciphertext
+;   tamper with re-signed outer MAC still fails closed with EXIT_AUTH.
+; ===========================================================================
+VCK_FILE_LEN equ 220                            ; 80 hdr + 80 ct + 16 tag + 44 fmac
+
+.data
+CSTR vck_ok,  "vattcolkat: PASS (authentic VATT-colliding GCM tag unlocked; tampered ct rejected)",13,10
+CSTR vck_bad, "vattcolkat: FAIL (VATT tag-collision fallback regressed)",13,10
+.data?
+align 8
+vck_mat  db 4096 dup (?)                        ; 128 rows * 32B: [lhs16 | rhs16]
+vck_file db 224 dup (?)                         ; 220B vault image (padded to 8B)
+vck_body db 80 dup (?)                          ; 80B plaintext body
+vck_t0   db 16 dup (?)
+vck_dt   db 16 dup (?)
+vck_x    db 16 dup (?)
+.code
+vck_seal_once proc frame
+    FRAME_PROLOG 32
+    lea     r10, [g_greq]
+    lea     rax, [g_vkey]
+    mov     qword ptr [r10].GCMREQ.key, rax
+    lea     rax, [g_hdr + VH_NONCE]
+    mov     qword ptr [r10].GCMREQ.iv, rax
+    lea     rax, [g_hdr]
+    mov     qword ptr [r10].GCMREQ.aad, rax
+    mov     qword ptr [r10].GCMREQ.aadlen, VH_TOTAL
+    lea     rax, [vck_body]
+    mov     qword ptr [r10].GCMREQ.inp, rax
+    mov     qword ptr [r10].GCMREQ.inlen, 80
+    lea     rax, [vck_file + VH_TOTAL]
+    mov     qword ptr [r10].GCMREQ.outp, rax
+    lea     rax, [vck_file + VH_TOTAL + 80]
+    mov     qword ptr [r10].GCMREQ.tag, rax
+    lea     rcx, [g_greq]
+    call    gcm_seal
+    FRAME_EPILOG
+    ret
+vck_seal_once endp
+
+LANDING_PAD
+public cmd_vattcolkat
+cmd_vattcolkat proc frame
+    FRAME_PROLOG 64
+    ; [rbp-24]=i/c  [rbp-28]=p  [rbp-32]=r
+    lea     r10, [g_argv]
+    mov     rcx, qword ptr [r10+16]
+    call    cfg_in_set
+    lea     rcx, [g_cfg_pass]
+    lea     rdx, [bk_pw]
+    mov     r8d, 10
+    call    copy_bytes
+    mov     dword ptr [g_cfg_passlen], 9
+    mov     dword ptr [g_cfg_t], 1
+    mov     dword ptr [g_cfg_m], 8
+
+    ; Build 80-byte vault header + derive real AES-256 vault key
+    mov     dword ptr [g_hdr+0], VAULT_MAGIC
+    mov     dword ptr [g_hdr+4], VAULT_VERSION
+    mov     dword ptr [g_hdr+VH_T], 1
+    mov     dword ptr [g_hdr+VH_M], 8
+    mov     dword ptr [g_hdr+VH_LANES], 1
+    lea     rcx, [g_hdr+VH_SALT]
+    mov     edx, 32
+    call    rng_fill
+    test    eax, eax
+    jz      vck_fail
+    lea     rcx, [g_hdr+VH_NONCE]
+    mov     edx, 12
+    call    rng_fill
+    test    eax, eax
+    jz      vck_fail
+    call    vk_derive
+    test    eax, eax
+    jnz     vck_fail
+    call    vk_kcv
+    lea     rcx, [g_hdr+VH_KCV]
+    lea     rdx, [g_sha32]
+    mov     r8d, KCV_LEN
+    call    copy_bytes
+    lea     rcx, [vck_file]
+    lea     rdx, [g_hdr]
+    mov     r8d, VH_TOTAL
+    call    copy_bytes
+
+    ; Construct 80-byte body: 1 entry, VF_TITLE(12)="VattCollTest", VF_NOTES(16)@[64..79]
+    lea     r10, [vck_body]
+    xor     ecx, ecx
+vck_zb:
+    mov     qword ptr [r10+rcx], 0
+    add     ecx, 8
+    cmp     ecx, 80
+    jb      vck_zb
+    mov     dword ptr [r10+0], 1
+    mov     byte ptr [r10+4], 77h
+    mov     qword ptr [r10+20], 1
+    mov     qword ptr [r10+28], 1
+    mov     dword ptr [r10+36], 2
+    mov     word ptr [r10+40], VF_TITLE
+    mov     dword ptr [r10+42], 12
+    mov     rax, 6C6C6F4374746156h              ; "VattColl"
+    mov     qword ptr [r10+46], rax
+    mov     dword ptr [r10+54], 74736554h       ; "Test"
+    mov     word ptr [r10+58], VF_NOTES
+    mov     dword ptr [r10+60], 16
+
+    ; T0 = tag(0^128)
+    call    vck_seal_once
+    lea     rcx, [vck_t0]
+    lea     rdx, [vck_file + 160]
+    mov     r8d, 16
+    call    copy_bytes
+
+    ; Sample L(e_i) = tag(e_i) XOR T0 for i = 0..127 -> vck_mat[i] = [L(e_i) | e_i]
+    mov     dword ptr [rbp-24], 0
+vck_basis:
+    lea     r10, [vck_body + 64]
+    mov     qword ptr [r10+0], 0
+    mov     qword ptr [r10+8], 0
+    mov     eax, dword ptr [rbp-24]
+    mov     edx, eax
+    shr     edx, 3
+    mov     ecx, eax
+    and     ecx, 7
+    mov     r8d, 1
+    shl     r8d, cl
+    mov     byte ptr [r10+rdx], r8b
+    call    vck_seal_once
+    mov     eax, dword ptr [rbp-24]
+    shl     eax, 5                              ; i * 32
+    lea     r11, [vck_mat]
+    add     r11, rax
+    lea     r9, [vck_file + 160]
+    lea     r8, [vck_t0]
+    mov     rax, qword ptr [r9+0]
+    xor     rax, qword ptr [r8+0]
+    mov     qword ptr [r11+0], rax
+    mov     rax, qword ptr [r9+8]
+    xor     rax, qword ptr [r8+8]
+    mov     qword ptr [r11+8], rax
+    lea     r10, [vck_body + 64]
+    mov     rax, qword ptr [r10+0]
+    mov     qword ptr [r11+16], rax
+    mov     rax, qword ptr [r10+8]
+    mov     qword ptr [r11+24], rax
+    inc     dword ptr [rbp-24]
+    cmp     dword ptr [rbp-24], 128
+    jb      vck_basis
+
+    ; Gauss-Jordan elimination over GF(2) on columns c = 0..127
+    mov     dword ptr [rbp-24], 0
+vck_col:
+    mov     eax, dword ptr [rbp-24]
+    mov     dword ptr [rbp-28], eax             ; p = c
+vck_piv:
+    mov     eax, dword ptr [rbp-28]
+    cmp     eax, 128
+    jae     vck_faillk                          ; singular (H == 0, prob 2^-128)
+    shl     eax, 5
+    lea     r10, [vck_mat]
+    add     r10, rax
+    mov     ecx, dword ptr [rbp-24]
+    mov     edx, ecx
+    shr     edx, 3
+    and     ecx, 7
+    movzx   eax, byte ptr [r10+rdx]
+    shr     eax, cl
+    test    al, 1
+    jnz     vck_swap
+    inc     dword ptr [rbp-28]
+    jmp     vck_piv
+vck_swap:
+    mov     eax, dword ptr [rbp-24]
+    cmp     eax, dword ptr [rbp-28]
+    je      vck_elim
+    shl     eax, 5
+    lea     r10, [vck_mat]
+    add     r10, rax                            ; row c
+    mov     edx, dword ptr [rbp-28]
+    shl     edx, 5
+    lea     r11, [vck_mat]
+    add     r11, rdx                            ; row p
+    xor     ecx, ecx
+vck_swlp:
+    mov     rax, qword ptr [r10+rcx]
+    mov     r8, qword ptr [r11+rcx]
+    mov     qword ptr [r10+rcx], r8
+    mov     qword ptr [r11+rcx], rax
+    add     ecx, 8
+    cmp     ecx, 32
+    jb      vck_swlp
+vck_elim:
+    mov     dword ptr [rbp-32], 0               ; r = 0
+vck_row:
+    mov     eax, dword ptr [rbp-32]
+    cmp     eax, 128
+    jae     vck_colnext
+    cmp     eax, dword ptr [rbp-24]
+    je      vck_rownext
+    shl     eax, 5
+    lea     r11, [vck_mat]
+    add     r11, rax                            ; row r
+    mov     ecx, dword ptr [rbp-24]
+    mov     edx, ecx
+    shr     edx, 3
+    and     ecx, 7
+    movzx   eax, byte ptr [r11+rdx]
+    shr     eax, cl
+    test    al, 1
+    jz      vck_rownext
+    mov     eax, dword ptr [rbp-24]
+    shl     eax, 5
+    lea     r10, [vck_mat]
+    add     r10, rax                            ; row c
+    xor     ecx, ecx
+vck_xrow:
+    mov     rax, qword ptr [r10+rcx]
+    xor     qword ptr [r11+rcx], rax
+    add     ecx, 8
+    cmp     ecx, 32
+    jb      vck_xrow
+vck_rownext:
+    inc     dword ptr [rbp-32]
+    jmp     vck_row
+vck_colnext:
+    inc     dword ptr [rbp-24]
+    cmp     dword ptr [rbp-24], 128
+    jb      vck_col
+
+    ; Target delta: dt = T_target XOR T0, where T_target = [T0[0..3], ATT_MAGIC, u64(8)]
+    lea     r8, [vck_t0]
+    lea     r9, [vck_dt]
+    mov     dword ptr [r9+0], 0
+    mov     eax, ATT_MAGIC
+    xor     eax, dword ptr [r8+4]
+    mov     dword ptr [r9+4], eax
+    mov     rax, 8
+    xor     rax, qword ptr [r8+8]
+    mov     qword ptr [r9+8], rax
+
+    ; Reconstruct x = XOR_{c : dt_c == 1} rhs_c
+    lea     r10, [vck_x]
+    mov     qword ptr [r10+0], 0
+    mov     qword ptr [r10+8], 0
+    xor     r8d, r8d                            ; c = 0..127
+vck_rec:
+    mov     edx, r8d
+    shr     edx, 3
+    mov     ecx, r8d
+    and     ecx, 7
+    lea     r9, [vck_dt]
+    movzx   eax, byte ptr [r9+rdx]
+    shr     eax, cl
+    test    al, 1
+    jz      vck_recnext
+    mov     eax, r8d
+    shl     eax, 5
+    lea     r11, [vck_mat]
+    add     r11, rax
+    mov     rax, qword ptr [r11+16]
+    xor     qword ptr [r10+0], rax
+    mov     rax, qword ptr [r11+24]
+    xor     qword ptr [r10+8], rax
+vck_recnext:
+    inc     r8d
+    cmp     r8d, 128
+    jb      vck_rec
+
+    ; Seal solved body and verify genuine tag collides with ATT_MAGIC + entries_len=8
+    lea     rcx, [vck_body + 64]
+    lea     rdx, [vck_x]
+    mov     r8d, 16
+    call    copy_bytes
+    call    vck_seal_once
+    cmp     dword ptr [vck_file + 164], ATT_MAGIC
+    jne     vck_faillk
+    cmp     qword ptr [vck_file + 168], 8
+    jne     vck_faillk
+
+    ; Append counter=1 + full-file MAC + FMAC_MAGIC, write, and unlock via retry path
+    mov     qword ptr [vck_file + 176], 1
+    lea     rcx, [vck_file]
+    mov     edx, 184
+    lea     r8, [g_fmac_out]
+    call    vault_file_mac
+    lea     rcx, [vck_file + 184]
+    lea     rdx, [g_fmac_out]
+    mov     r8d, FMAC_MACLEN
+    call    copy_bytes
+    mov     dword ptr [vck_file + 216], FMAC_MAGIC
+    call    vault_lock
+
+    mov     rcx, qword ptr [g_cfg_in]
+    lea     rdx, [vck_file]
+    mov     r8d, VCK_FILE_LEN
+    call    write_file
+    test    eax, eax
+    jnz     vck_fail
+    lea     rcx, [g_cfg_pass]
+    lea     rdx, [bk_pw]
+    mov     r8d, 10
+    call    copy_bytes
+    mov     dword ptr [g_cfg_passlen], 9
+    call    vault_unlock
+    test    eax, eax
+    jnz     vck_faillk
+    cmp     qword ptr [g_att_total], 0
+    jne     vck_faillk
+    call    vault_count
+    cmp     eax, 1
+    jne     vck_faillk
+
+    ; Negative control: flip 1 ct bit, re-sign outer MAC (using still-live g_vkey),
+    ; lock, write, and verify the VATT retry path still rejects unauthentic ct!
+    xor     byte ptr [vck_file + VH_TOTAL], 1
+    lea     rcx, [vck_file]
+    mov     edx, 184
+    lea     r8, [g_fmac_out]
+    call    vault_file_mac
+    lea     rcx, [vck_file + 184]
+    lea     rdx, [g_fmac_out]
+    mov     r8d, FMAC_MACLEN
+    call    copy_bytes
+    call    vault_lock
+    mov     rcx, qword ptr [g_cfg_in]
+    lea     rdx, [vck_file]
+    mov     r8d, VCK_FILE_LEN
+    call    write_file
+    test    eax, eax
+    jnz     vck_fail
+    lea     rcx, [g_cfg_pass]
+    lea     rdx, [bk_pw]
+    mov     r8d, 10
+    call    copy_bytes
+    mov     dword ptr [g_cfg_passlen], 9
+    call    vault_unlock
+    cmp     eax, EXIT_AUTH
+    jne     vck_faillk
+    call    vault_lock
+
+    lea     rcx, [vck_ok]
+    mov     edx, vck_ok_len
+    call    print_a
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+vck_faillk:
+    call    vault_lock
+vck_fail:
+    lea     rcx, [vck_bad]
+    mov     edx, vck_bad_len
+    call    print_a
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_vattcolkat endp
 
 end

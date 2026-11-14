@@ -10,6 +10,8 @@ include macros.inc
 
 extern GetCommandLineW:proc
 extern ExitProcess:proc
+extern TerminateProcess:proc
+extern GetCurrentProcess:proc
 extern WideCharToMultiByte:proc
 extern GetStdHandle:proc
 extern WriteFile:proc
@@ -20,6 +22,7 @@ STD_OUTPUT_HANDLE_   equ -11
 extern secure_zero:proc
 extern secmem_panic_wipe:proc           ; secmem.asm: zero every live secret buffer
 extern sstk_reset_current:proc          ; hardening.asm: empty this thread's shadow stack
+externdef g_in_crash:dword              ; hardening.asm: atomic crash re-entrancy latch
 extern run_selftest:proc
 extern log_result:proc
 externdef g_readonly:dword              ; E9: read-only launch flag (owned by gui.asm)
@@ -57,11 +60,17 @@ extern cmd_attfuzz:proc                 ; G8: attachment-index fuzzer (vault.asm
 extern cmd_healthkat:proc               ; E6: vault-health analysis KAT (vault.asm)
 ifdef PROBE_IO
 extern gui_layout_probe:proc            ; runtime dialog-geometry probe (gui.asm)
+extern cmd_secdeskkat:proc              ; VDR-13 secure-desktop fallback/orphan KAT (gui.asm)
 endif
 extern cmd_xctest:proc                  ; external-change detection probe (vault.asm)
 extern cmd_vaultexportkat:proc          ; M6 vault export/merge KAT (vault.asm)
 extern cmd_vaultexpattkat:proc          ; M6 attachment-carry KAT (vault.asm)
 extern cmd_kdfparam:proc                ; pre-auth KDF-param DoS-guard probe (vault.asm)
+extern cmd_zexselkat:proc               ; VDR-04 selective ZIP attachment filter KAT (zipexport.asm)
+extern cmd_attovfkat:proc               ; VDR-02 attachment u64/cap overflow KAT (vault.asm)
+extern cmd_vattcolkat:proc              ; VDR-19 real-GCM VATT tag-collision KAT (vault.asm)
+extern cmd_polkat:proc                  ; VDR-09/VDR-23 registry policy + cfg_in_set KAT (regcfg.asm)
+extern cmd_tpmkat:proc                  ; VDR-10 TPM OAEP v2 label + cleanup KAT (tpm.asm)
 extern cmd_pkat:proc                    ; parallel fail-closed KAT gate (selftest.asm)
 extern cmd_katreport:proc               ; external-audit crypto proof battery (selftest.asm)
 extern read_file:proc
@@ -191,6 +200,7 @@ WSTR w_seedtest, <seedtest>
 WSTR w_seedn,    <seedn>                 ; seedtest with a caller-chosen count
 ifdef PROBE_IO
 WSTR w_layoutkat, <layoutkat>            ; runtime dialog-geometry probe; the verb, the
+WSTR w_secdeskkat, <secdeskkat>          ; VDR-13 secure-desktop fallback/orphan KAT
 endif                                    ;   proc and the row all live or die together,
                                          ;   or release fails on a dead string
 WSTR w_atgen,    <atgen>
@@ -230,6 +240,11 @@ WSTR w_trtest,   <trtest>
 WSTR w_vaultexportkat, <vaultexportkat>
 WSTR w_vaultexpattkat, <vaultexpattkat>
 WSTR w_kdfparam, <kdfparam>
+WSTR w_zexselkat, <zexselkat>
+WSTR w_attovfkat, <attovfkat>
+WSTR w_vattcolkat, <vattcolkat>
+WSTR w_polkat,   <polkat>
+WSTR w_tpmkat,   <tpmkat>
 ifdef DBG_TRACE
 WSTR w_securedesk, <securedesk>
 endif
@@ -307,10 +322,16 @@ cmd_table label CMDENT
     CMDENT { w_healthkat, cmd_healthkat, 0, 0 }   ; E6: vault-health analysis KAT
 ifdef PROBE_IO
     CMDENT { w_layoutkat, cmd_layoutkat, 1, 0 }   ; runtime dialog-geometry probe
+    CMDENT { w_secdeskkat, cmd_secdeskkat, 0, 0 } ; VDR-13 secure-desktop fallback/orphan KAT
 endif
     CMDENT { w_vaultexportkat, cmd_vaultexportkat, 1, 0 } ; M6 vault export/merge KAT (<path>)
     CMDENT { w_vaultexpattkat, cmd_vaultexpattkat, 1, 0 } ; M6 attachment-carry KAT (<path>)
     CMDENT { w_kdfparam,  cmd_kdfparam,  0, 0 }   ; pre-auth KDF-param DoS-guard probe
+    CMDENT { w_zexselkat, cmd_zexselkat, 0, 0 }   ; VDR-04 selective ZIP attachment filter KAT
+    CMDENT { w_attovfkat, cmd_attovfkat, 0, 0 }   ; VDR-02 attachment overflow/cap KAT
+    CMDENT { w_vattcolkat, cmd_vattcolkat, 1, 0 } ; VDR-19 real-GCM VATT tag-collision KAT
+    CMDENT { w_polkat,    cmd_polkat,    0, 0 }   ; VDR-09/VDR-23 registry policy + cfg_in_set KAT
+    CMDENT { w_tpmkat,    cmd_tpmkat,    0, 0 }   ; VDR-10 TPM OAEP v2 label + cleanup KAT
     CMDENT { w_pkat,      cmd_pkat,      0, 0 }   ; parallel fail-closed KAT gate
     CMDENT { w_trtest,    cmd_trtest,    0, 0 }   ; trash timestamp/threshold KAT
 ifdef DBG_TRACE
@@ -358,6 +379,13 @@ ff_trap proc
 ifdef DBG_TRACE
     mov     r15d, ecx                   ; preserve code (r15 nonvolatile, unused)
     and     rsp, -16                    ; realign (we never return from here)
+    sub     rsp, 32                     ; shadow space for calls
+    ; Prevent re-entrant traps inside secmem_panic_wipe / dbg_putc / ExitProcess
+    ; from looping forever, and wipe secrets BEFORE printing or calling ExitProcess.
+    lock bts dword ptr [g_in_crash], 0
+    jc      ff_dbg_reent
+    call    sstk_reset_current
+    call    secmem_panic_wipe
     mov     al, 'F'
     call    dbg_putc
     mov     al, 'F'
@@ -376,7 +404,9 @@ ff_dec:
     add     al, '0'
 ff_emit:
     push    rcx
+    sub     rsp, 8                      ; keep 16-byte stack alignment
     call    dbg_putc
+    add     rsp, 8
     pop     rcx
     test    ecx, ecx
     jnz     ff_hexloop
@@ -389,6 +419,10 @@ ff_emit:
     mov     eax, r15d
     or      eax, 0FADE0000h
     WINCALL ExitProcess, eax
+ff_dbg_reent:
+    WINCALL GetCurrentProcess
+    WINCALL TerminateProcess, rax, 0C0000409h
+    int     29h
 endif
     ; Wipe key material before the non-catchable __fastfail.  int 29h bypasses the
     ; vectored handler, so crash_veh -> crash_contain (which wipes on an ordinary AV)
@@ -402,15 +436,55 @@ endif
 ff_trap endp
 
 ; =============================================================================
+; cpu_eval_features(ecx = leaf1_ecx, edx = leaf7_ebx, r8d = xcr0_eax) -> eax
+;   Pure helper (also exercised by selftest) that derives CPUF_* flags.
+;   CPUF_AVX2 is set ONLY when CPUID(7,0).EBX.AVX2[5], CPUID(1).ECX.OSXSAVE[27],
+;   CPUID(1).ECX.AVX[28], and XCR0[2:1] (XMM + YMM state OS-enabled) are ALL 1.
+; =============================================================================
+public cpu_eval_features
+cpu_eval_features proc
+    xor     eax, eax
+    test    ecx, 1 SHL 25               ; AES-NI
+    jz      @F
+    or      eax, CPUF_AESNI
+@@: test    ecx, 1 SHL 1                ; PCLMULQDQ
+    jz      @F
+    or      eax, CPUF_PCLMUL
+@@: test    ecx, 1 SHL 19               ; SSE4.1
+    jz      @F
+    or      eax, CPUF_SSE41
+@@: test    edx, 1 SHL 29               ; SHA-NI
+    jz      @F
+    or      eax, CPUF_SHANI
+@@: test    edx, 1 SHL 18               ; RDSEED
+    jz      @F
+    or      eax, CPUF_RDSEED
+@@: test    edx, 1 SHL 5                ; AVX2 (hardware bit)
+    jz      cef_done
+    mov     r9d, ecx
+    and     r9d, (1 SHL 27) or (1 SHL 28) ; OSXSAVE + AVX
+    cmp     r9d, (1 SHL 27) or (1 SHL 28)
+    jne     cef_done
+    mov     r9d, r8d
+    and     r9d, 06h                    ; XCR0.SSE (bit 1) + XCR0.AVX (bit 2)
+    cmp     r9d, 06h
+    jne     cef_done
+    or      eax, CPUF_AVX2
+cef_done:
+    ret
+cpu_eval_features endp
+
+; =============================================================================
 ; cpu_gate - detect required/optional CPU features into g_cpu_features.
 ; Raw frame (runs before hardening_init).  Returns eax=1 if required set ok.
-; Required: AES-NI, PCLMULQDQ, SSE4.1.  Optional: SHA-NI, AVX2, RDSEED.
+; Required: AES-NI, PCLMULQDQ, SSE4.1, SHA-NI.  Optional: AVX2, RDSEED.
 ; =============================================================================
 cpu_gate proc frame
     push    rbx                         ; cpuid clobbers rbx (non-volatile)
     .pushreg rbx
+    sub     rsp, 32
+    .allocstack 32
     .endprolog
-    xor     r10d, r10d                  ; feature accumulator
 
     xor     eax, eax                    ; leaf 0: highest supported leaf
     xor     ecx, ecx
@@ -420,40 +494,34 @@ cpu_gate proc frame
     mov     eax, 1
     xor     ecx, ecx
     cpuid
-    test    ecx, 1 SHL 25               ; AES-NI
-    jz      @F
-    or      r10d, CPUF_AESNI
-@@: test    ecx, 1 SHL 1                ; PCLMULQDQ
-    jz      @F
-    or      r10d, CPUF_PCLMUL
-@@: test    ecx, 1 SHL 19               ; SSE4.1
-    jz      @F
-    or      r10d, CPUF_SSE41
-@@:
+    mov     r10d, ecx                   ; r10d = leaf1_ecx
+
+    xor     r8d, r8d                    ; r8d = xcr0_eax (0 unless OSXSAVE=1)
+    test    r10d, 1 SHL 27              ; OSXSAVE?
+    jz      cg_no_xgetbv
+    xor     ecx, ecx                    ; XCR0
+    xgetbv                              ; eax:edx = XCR0
+    mov     r8d, eax
+cg_no_xgetbv:
+    xor     r11d, r11d                  ; r11d = leaf7_ebx
     cmp     r9d, 7                      ; leaf 7 may not exist on old CPUs
-    jb      cg_store
+    jb      cg_eval
     mov     eax, 7
     xor     ecx, ecx
     cpuid
-    test    ebx, 1 SHL 29               ; SHA-NI
-    jz      @F
-    or      r10d, CPUF_SHANI
-@@: test    ebx, 1 SHL 5                ; AVX2
-    jz      @F
-    or      r10d, CPUF_AVX2
-@@: test    ebx, 1 SHL 18               ; RDSEED
-    jz      @F
-    or      r10d, CPUF_RDSEED
-@@:
-cg_store:
-    mov     dword ptr [g_cpu_features], r10d
-    mov     eax, r10d
+    mov     r11d, ebx
+cg_eval:
+    mov     ecx, r10d
+    mov     edx, r11d
+    call    cpu_eval_features
+    mov     dword ptr [g_cpu_features], eax
     ; sha256.asm uses the SHA-NI instructions unconditionally, so a CPU with
     ; AES-NI but no SHA-NI (Skylake-class) must be refused here, not #UD later
     and     eax, CPUF_AESNI or CPUF_PCLMUL or CPUF_SSE41 or CPUF_SHANI
     cmp     eax, CPUF_AESNI or CPUF_PCLMUL or CPUF_SSE41 or CPUF_SHANI
     sete    al
     movzx   eax, al
+    add     rsp, 32
     pop     rbx
     ret
 cpu_gate endp

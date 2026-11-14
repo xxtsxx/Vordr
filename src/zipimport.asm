@@ -72,7 +72,12 @@ g_zi_rawlk  dd ?                          ; 1 = VirtualLock on it succeeded
 g_zi_pwptr  dq ?                          ; UTF-8 pw ptr (= g_zi_u8pw)
 g_zi_pwlen  dd ?
 ZI_PWCAP    equ 1024                      ; 254 wide chars can be 762 UTF-8 bytes; the
+ZI_NBUF     equ 1024                      ; decoded attachment "name" capacity
 public g_zi_u8pw, g_zi_sbuf, g_zi_nbuf, g_zi_ref ; pinned + crash-wiped by secmem.asm
+public g_zi_rk, g_zi_tbuf, g_zi_err, g_zi_p, g_zi_jend
+g_zi_jcap   dq ?                          ; secmem byte capacity of g_zi_jptr (0 = none)
+g_zi_err    dd ?                          ; sticky JSON/UTF-8 decode error flag
+            dd ?                          ; keep natural alignment of subsequent globals
 g_zi_u8pw   db ZI_PWCAP dup (?)           ;   old 512/500 truncated to an EMPTY password
 g_zi_n      dd ?                          ; member count
 public g_zi_unsup
@@ -93,7 +98,7 @@ g_zi_slot   dd ?                          ; zi_addattach: field slot
 g_zi_atype  dd ?                          ; zi_addattach: base type (9/10)
 g_zi_alabel dq ?                          ; zi_addattach: label wide (0/none)
 g_zi_anamen dd ?                          ; decoded "name" length; 0 = predates the key
-g_zi_nbuf   db 1024 dup (?)               ; decoded "name" (kept apart from g_zi_sbuf,
+g_zi_nbuf   db ZI_NBUF dup (?)            ; decoded "name" (kept apart from g_zi_sbuf,
                                           ;   which still holds the value/path)
 g_zi_mode   dd ?                          ; zi_walk: 0 = stage (titles), 1 = commit (build)
 g_zi_e      dd ?                          ; zi_walk: running entry index
@@ -128,9 +133,8 @@ zl_label    db ',"label":'
 zl_value    db ',"value":'
 zl_name     db ',"name":'                  ; optional, attachments only (see zi_addattach)
 
-; --- fuzzzip fixture: a minimal WinZip-AES STORED local header for vordr.json
-; (usize=4 so the whole member region {salt16, verify2, cipher4, hmac10} = 32B
-; of data sits inside the buffer), then an EOCD signature to end the scan. -----
+; --- fuzzzip fixture: a minimal WinZip-AES STORED archive for vordr.json with
+; LFH (usize=256, csize=284), Central Directory (67B at +335), and EOCD (22B).
 align 4
 zfz_fix label byte
     dd  04034b50h                         ; local file header signature
@@ -139,19 +143,40 @@ zfz_fix label byte
     dw  99                                ; method = AE-x
     dw  0, 0                              ; mod time, mod date
     dd  0                                 ; crc32
-    dd  32                                ; csize = 18 hdr + 4 cipher + 10 hmac
-    dd  4                                 ; usize (cipher length)
+    dd  284                               ; csize = 18 hdr + 256 cipher + 10 hmac
+    dd  256                               ; usize (cipher length)
     dw  10                                ; namelen
     dw  11                                ; extralen: the AE record zi_scan requires
     db  'v','o','r','d','r','.','j','s','o','n'
     dw  9901h, 7, 2                       ; AE extra: id, size 7, AE-2
     db  'A','E', 3                        ;   vendor, strength 3 = AES-256
     dw  0                                 ;   actual method: stored
-    db  32 dup (0AAh)                     ; member data (garbage salt/verify/cipher/hmac)
-    dd  06054b50h                         ; EOCD signature -> stops zi_scan
-    db  18 dup (0)                        ; EOCD remainder (pad)
-zfz_fix_end label byte
-ZFZ_FIX_LEN equ zfz_fix_end - zfz_fix
+    db  284 dup (0AAh)                    ; member data (garbage salt/verify/cipher/hmac)
+    dd  02014b50h                         ; central directory header signature (@ +335)
+    dw  20, 20                            ; version made by, version needed
+    dw  1                                 ; flags
+    dw  99                                ; method = AE-x
+    dw  0, 0                              ; mod time, mod date
+    dd  0                                 ; crc32
+    dd  284                               ; csize
+    dd  256                               ; usize
+    dw  10                                ; namelen
+    dw  11                                ; extralen
+    dw  0, 0, 0                           ; commentlen, disk, internal attrs
+    dd  0                                 ; external attrs
+    dd  0                                 ; local header offset
+    db  'v','o','r','d','r','.','j','s','o','n'
+    dw  9901h, 7, 2
+    db  'A','E', 3
+    dw  0
+    dd  06054b50h                         ; EOCD signature (@ +402)
+    dw  0, 0                              ; disk numbers
+    dw  1, 1                              ; entries on disk, total entries
+    dd  67                                ; central directory size
+    dd  335                               ; central directory offset
+    dw  0                                 ; comment length
+ZFZ_FIX_LEN equ 424
+.errnz ($ - zfz_fix) - ZFZ_FIX_LEN
 ZFZ_ITERS   equ 100000
 CSTR zfz_m1, "fuzzzip: "
 CSTR zfz_m2, " iters  "
@@ -162,73 +187,185 @@ CSTR zfz_thin, "fuzzzip: FAIL - almost nothing got past the scan, so the parser 
 .code
 
 ; =============================================================================
-; zi_scan(rcx = raw, edx = rawlen) -> eax = member count.  Walk the local file
-;   headers into g_zi_mem; stop at the central directory / EOCD.
+; zi_scan(rcx = raw, edx = rawlen) -> eax = member count.
+;   Locates the End of Central Directory (PK\x05\x06), walks Central Directory
+;   records (PK\x01\x02) for authoritative member metadata, and cross-checks
+;   each Local File Header (PK\x03\x04) before recording into g_zi_mem.
 ; =============================================================================
 zi_scan proc frame
-    FRAME_PROLOG 48
+    FRAME_PROLOG 96
     mov     dword ptr [g_zi_unsup], 0
-    mov     qword ptr [rbp-24], rcx             ; p (current header)
-    mov     eax, edx
-    add     rax, rcx
-    mov     qword ptr [g_zi_end], rax           ; raw end
-    xor     r10d, r10d                          ; n
-zs_lp:
-    mov     rcx, qword ptr [rbp-24]
-    lea     rax, [rcx+30]
-    cmp     rax, qword ptr [g_zi_end]
-    ja      zs_done
-    cmp     dword ptr [rcx], 04034b50h          ; local file header sig?
-    jne     zs_done
-    movzx   r8d, word ptr [rcx+26]              ; namelen
-    movzx   r9d, word ptr [rcx+28]              ; extralen
-    mov     eax, dword ptr [rcx+18]             ; csize
-    mov     dword ptr [rbp-28], eax
-    mov     eax, dword ptr [rcx+22]             ; usize
-    mov     dword ptr [rbp-32], eax
-    lea     r11, [rcx+30]                       ; nameptr
-    ; dataptr = p + 30 + namelen + extralen
-    lea     rax, [rcx+30]
+    mov     dword ptr [g_zi_n], 0
+    mov     edx, edx
+    cmp     rdx, 22
+    jb      zs_empty
+    mov     qword ptr [rbp-16], rcx             ; raw_base
+    lea     rax, [rcx+rdx]
+    mov     qword ptr [rbp-24], rax             ; raw_end
+    mov     qword ptr [g_zi_end], rax
+    ; Search backwards from raw_end - 22 (up to 65535 comment bytes) for EOCD
+    mov     r9, rcx                             ; min_eocd = raw_base
+    cmp     rdx, 22 + 65535
+    jbe     @F
+    mov     r9, rax
+    sub     r9, 22 + 65535
+@@: lea     r10, [rax-22]                       ; p = raw_end - 22
+zs_eocd_lp:
+    cmp     r10, r9
+    jb      zs_empty
+    cmp     dword ptr [r10], 06054b50h
+    jne     zs_eocd_prev
+    movzx   eax, word ptr [r10+20]              ; comment length
+    lea     r8, [r10+rax+22]
+    cmp     r8, qword ptr [rbp-24]
+    je      zs_eocd_ok
+zs_eocd_prev:
+    dec     r10
+    jmp     zs_eocd_lp
+zs_eocd_ok:
+    cmp     word ptr [r10+4], 0                 ; multi-disk archives unsupported
+    jne     zs_unsup
+    cmp     word ptr [r10+6], 0
+    jne     zs_unsup
+    movzx   eax, word ptr [r10+10]              ; total entries
+    cmp     ax, 0FFFFh                          ; Zip64 sentinel
+    je      zs_unsup
+    movzx   ecx, word ptr [r10+8]               ; entries on this disk
+    cmp     eax, ecx
+    jne     zs_empty
+    mov     dword ptr [rbp-60], eax             ; total_entries
+    mov     eax, dword ptr [r10+16]             ; cd_off (zero-extended)
+    mov     ecx, dword ptr [r10+12]             ; cd_size (zero-extended)
+    cmp     eax, 0FFFFFFFFh
+    je      zs_unsup
+    cmp     ecx, 0FFFFFFFFh
+    je      zs_unsup
+    mov     r8, r10
+    sub     r8, qword ptr [rbp-16]              ; eocd_off
+    cmp     rax, r8
+    ja      zs_empty
+    mov     r9, r8
+    sub     r9, rax                             ; eocd_off - cd_off
+    cmp     rcx, r9
+    ja      zs_empty
+    mov     r8, qword ptr [rbp-16]
+    add     r8, rax
+    mov     qword ptr [rbp-32], r8              ; cd_base
+    mov     qword ptr [rbp-48], r8              ; cd_cur
+    add     r8, rcx
+    mov     qword ptr [rbp-40], r8              ; cd_end
+    mov     dword ptr [rbp-64], 0               ; count = 0
+zs_cd_lp:
+    mov     eax, dword ptr [rbp-64]
+    cmp     eax, dword ptr [rbp-60]
+    jae     zs_cd_end
+    cmp     eax, ZI_MAXMEM
+    jae     zs_done_ok
+    mov     rcx, qword ptr [rbp-48]             ; cd_cur
+    lea     rax, [rcx+46]
+    cmp     rax, qword ptr [rbp-40]
+    ja      zs_empty
+    cmp     dword ptr [rcx], 02014b50h          ; CD signature
+    jne     zs_empty
+    movzx   r8d, word ptr [rcx+28]              ; cd_namelen
+    mov     dword ptr [rbp-76], r8d
+    movzx   r9d, word ptr [rcx+30]              ; cd_extralen
+    movzx   edx, word ptr [rcx+32]              ; cd_commlen
+    lea     rax, [rcx+46]
     add     rax, r8
     add     rax, r9
-    mov     qword ptr [rbp-40], rax             ; dataptr
-    ; Bounds: the whole member region {salt16, verify2, cipher[usize], hmac10}
-    ; must lie inside the raw buffer.  usize/dataptr come straight from the
-    ; attacker's header - without this a hostile usize would drive zi_decrypt's
-    ; HMAC read (pre-auth) and in-place CTR write past the end (OOB read/write).
-    ; A malformed member ends the scan (like an unrecognised signature does).
-    mov     rax, qword ptr [rbp-40]             ; dataptr
-    mov     ecx, dword ptr [rbp-32]             ; usize (zero-extended into rcx)
-    add     rax, rcx
-    add     rax, 28                             ; 18-byte header + 10-byte HMAC tag
-    cmp     rax, qword ptr [g_zi_end]
-    ja      zs_done
-    ; WinZip-AES exactly as Vordr writes it: method 99, an AE extra field saying
-    ; AES-256 (strength 3) over stored data (actual method 0), csize = usize + 28.
-    ; AES-128/192 or deflate inside AES decrypt at the wrong offsets and used to be
-    ; reported as a wrong password - name it for what it is instead.
-    mov     rcx, qword ptr [rbp-24]
-    cmp     word ptr [rcx+8], 99
+    add     rax, rdx
+    cmp     rax, qword ptr [rbp-40]
+    ja      zs_empty
+    mov     qword ptr [rbp-56], rax             ; cd_next
+    cmp     word ptr [rcx+10], 99               ; method == WinZip AE
     jne     zs_unsup
-    mov     eax, dword ptr [rbp-32]
-    add     rax, 28
-    mov     edx, dword ptr [rbp-28]
-    cmp     rax, rdx
+    mov     eax, dword ptr [rcx+20]             ; csize
+    mov     dword ptr [rbp-68], eax
+    mov     edx, dword ptr [rcx+24]             ; usize
+    mov     dword ptr [rbp-72], edx
+    add     rdx, 28
+    cmp     rdx, rax                            ; csize == usize + 28
     jne     zs_unsup
-    lea     rax, [r11+r8]                       ; extra field start
-    lea     rdx, [rax+r9]                       ;   and end (<= dataptr, bounded above)
-zs_ex:
-    lea     rcx, [rax+4]
-    cmp     rcx, rdx
-    ja      zs_unsup                            ; no AE record at all
+    ; Verify matching Local File Header at raw_base + lfh_off
+    mov     eax, dword ptr [rcx+42]             ; lfh_off (zero-extended)
+    mov     r11, qword ptr [rbp-16]
+    add     r11, rax                            ; lfh
+    lea     rdx, [r11+30]
+    cmp     rdx, qword ptr [rbp-32]             ; lfh + 30 <= cd_base
+    ja      zs_empty
+    cmp     dword ptr [r11], 04034b50h
+    jne     zs_empty
+    cmp     word ptr [r11+8], 99
+    jne     zs_unsup
+    movzx   eax, word ptr [r11+26]              ; lfh_namelen
+    cmp     eax, dword ptr [rbp-76]             ; must match CD namelen
+    jne     zs_empty
+    movzx   edx, word ptr [r11+6]               ; lfh_flags
+    test    edx, 8                              ; bit 3 streaming data descriptor?
+    jnz     zs_lfh_name
+    mov     eax, dword ptr [r11+18]             ; non-streaming: LFH sizes must match CD
+    cmp     eax, dword ptr [rbp-68]
+    jne     zs_empty
+    mov     eax, dword ptr [r11+22]
+    cmp     eax, dword ptr [rbp-72]
+    jne     zs_empty
+zs_lfh_name:
+    xor     r8d, r8d
+zs_ncmp:
+    cmp     r8d, dword ptr [rbp-76]
+    jae     zs_ncmp_ok
+    mov     al, byte ptr [rcx+r8+46]
+    cmp     al, byte ptr [r11+r8+30]
+    jne     zs_empty
+    inc     r8d
+    jmp     zs_ncmp
+zs_ncmp_ok:
+    movzx   r8d, word ptr [r11+26]
+    movzx   r9d, word ptr [r11+28]              ; lfh_extralen
+    lea     rax, [r11+30]
+    add     rax, r8
+    add     rax, r9                             ; dataptr
+    cmp     rax, qword ptr [rbp-32]
+    ja      zs_empty
+    mov     qword ptr [rbp-88], rax             ; dataptr (keep disjoint from [rbp-76])
+    mov     edx, dword ptr [rbp-68]             ; csize (zero-extended)
+    mov     r10, qword ptr [rbp-32]
+    sub     r10, rax                            ; cd_base - dataptr
+    cmp     rdx, r10
+    ja      zs_empty
+    ; Validate AE-2 extra (0x9901: AES-256 strength 3, stored inner method 0)
+    ; Check CD extra first; if omitted there, fall back to LFH extra.
+    movzx   r8d, word ptr [rcx+28]              ; cd_namelen
+    movzx   r9d, word ptr [rcx+30]              ; cd_extralen
+    lea     rax, [rcx+r8+46]                    ; cd extra start
+    lea     rdx, [rax+r9]                       ; cd extra end
+zs_cd_ex:
+    lea     r10, [rax+4]
+    cmp     r10, rdx
+    ja      zs_try_lfh_ex
     cmp     word ptr [rax], 9901h
-    je      zs_ae
-    movzx   ecx, word ptr [rax+2]
-    lea     rax, [rax+rcx+4]
-    jmp     zs_ex
-zs_ae:
-    lea     rcx, [rax+11]
-    cmp     rcx, rdx
+    je      zs_ae_chk
+    movzx   r10d, word ptr [rax+2]
+    lea     rax, [rax+r10+4]
+    jmp     zs_cd_ex
+zs_try_lfh_ex:
+    movzx   r8d, word ptr [r11+26]              ; lfh_namelen
+    movzx   r9d, word ptr [r11+28]              ; lfh_extralen
+    lea     rax, [r11+r8+30]                    ; lfh extra start
+    lea     rdx, [rax+r9]                       ; lfh extra end
+zs_lfh_ex:
+    lea     r10, [rax+4]
+    cmp     r10, rdx
+    ja      zs_unsup
+    cmp     word ptr [rax], 9901h
+    je      zs_ae_chk
+    movzx   r10d, word ptr [rax+2]
+    lea     rax, [rax+r10+4]
+    jmp     zs_lfh_ex
+zs_ae_chk:
+    lea     r10, [rax+11]
+    cmp     r10, rdx
     ja      zs_unsup
     cmp     word ptr [rax+2], 7
     jb      zs_unsup
@@ -236,34 +373,39 @@ zs_ae:
     jne     zs_unsup
     cmp     word ptr [rax+9], 0                 ; stored inside AES
     jne     zs_unsup
-    ; record
-    mov     eax, r10d
+    ; Record validated member into g_zi_mem[count]
+    mov     eax, dword ptr [rbp-64]
     imul    eax, eax, MEMREC
-    lea     rcx, [g_zi_mem]
-    add     rcx, rax
-    mov     qword ptr [rcx+0], r11              ; nameptr
-    mov     dword ptr [rcx+8], r8d              ; namelen
-    mov     rax, qword ptr [rbp-40]
-    mov     qword ptr [rcx+16], rax             ; dataptr
-    mov     eax, dword ptr [rbp-32]
-    mov     dword ptr [rcx+24], eax             ; usize
-    inc     r10d
-    ; advance p = dataptr + csize
-    mov     rcx, qword ptr [rbp-40]             ; dataptr
-    mov     eax, dword ptr [rbp-28]             ; csize (zero-extended)
-    add     rcx, rax
-    mov     qword ptr [rbp-24], rcx
-    cmp     r10d, ZI_MAXMEM
-    jae     zs_done
-    jmp     zs_lp
-zs_done:
-    mov     dword ptr [g_zi_n], r10d
-    mov     eax, r10d
+    lea     r10, [g_zi_mem]
+    add     r10, rax
+    lea     rax, [rcx+46]                       ; authoritative CD nameptr
+    mov     qword ptr [r10+0], rax
+    mov     eax, dword ptr [rbp-76]
+    mov     dword ptr [r10+8], eax              ; namelen
+    mov     rax, qword ptr [rbp-88]
+    mov     qword ptr [r10+16], rax             ; dataptr
+    mov     eax, dword ptr [rbp-72]
+    mov     dword ptr [r10+24], eax             ; usize
+    inc     dword ptr [rbp-64]
+    mov     rax, qword ptr [rbp-56]
+    mov     qword ptr [rbp-48], rax             ; cd_cur = cd_next
+    jmp     zs_cd_lp
+zs_cd_end:
+    mov     rax, qword ptr [rbp-48]
+    cmp     rax, qword ptr [rbp-40]
+    jne     zs_empty
+zs_done_ok:
+    mov     eax, dword ptr [rbp-64]
+    mov     dword ptr [g_zi_n], eax
     FRAME_EPILOG
     ret
 zs_unsup:
     mov     dword ptr [g_zi_unsup], 1
-    jmp     zs_done
+zs_empty:
+    mov     dword ptr [g_zi_n], 0
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
 zi_scan endp
 
 ; =============================================================================
@@ -310,12 +452,17 @@ zf_none:
 zi_find endp
 
 ; =============================================================================
-; zi_decrypt(ecx = member index) -> eax = 0 ok / -3 wrong pw / -1 corrupt.
-;   Verifies the 2-byte password check + the HMAC, then AES-256-CTR decrypts the
-;   ciphertext IN PLACE.  Plaintext = member.dataptr+18, length member.usize.
+; zi_decrypt(ecx = member index, rdx = *out_ptr, r8 = *out_len, r9 = *out_cap)
+;   -> eax = 0 ok / -3 wrong pw / -1 corrupt.
+;   Verifies the 2-byte password check + the HMAC over immutable g_zi_raw, then
+;   allocates a fresh locked secmem buffer and AES-256-CTR decrypts into it so
+;   multiple records referencing the same member all succeed.
 ; =============================================================================
 zi_decrypt proc frame
-    FRAME_PROLOG 96                             ; room for 5-arg WINCALL arg spill
+    FRAME_PROLOG 128                            ; room for 5-arg WINCALL spill + locals
+    mov     qword ptr [rbp-64], rdx             ; *out_ptr
+    mov     qword ptr [rbp-72], r8              ; *out_len
+    mov     qword ptr [rbp-80], r9              ; *out_cap
     mov     eax, ecx
     imul    eax, eax, MEMREC
     lea     r10, [g_zi_mem]
@@ -335,7 +482,6 @@ zi_decrypt proc frame
     mov     r9d, 16
     call    pbkdf2_ae
     ; ---- 2-byte password verifier: g_ae_dk[64..66] vs salt[16..18] ----
-    ; constant-time: the verifier bytes are derived from the password
     lea     rcx, [g_ae_dk+64]
     mov     rdx, qword ptr [rbp-24]
     add     rdx, 16
@@ -355,7 +501,29 @@ zi_decrypt proc frame
     call    ct_memcmp
     test    eax, eax
     jnz     zd_corrupt
-    ; ---- AES-256-CTR decrypt in place ----
+    ; ---- Allocate locked secmem buffer & copy ciphertext ----
+    mov     ecx, dword ptr [rbp-32]             ; usize (zero-extended)
+    test    rcx, rcx
+    jnz     @F
+    mov     ecx, 1
+@@: mov     qword ptr [rbp-88], rcx             ; alloc cap = max(usize, 1)
+    call    secmem_alloc
+    test    rax, rax
+    jz      zd_corrupt
+    mov     qword ptr [rbp-48], rax             ; plaintext buffer
+    mov     r10, qword ptr [rbp-40]             ; src ciphertext in g_zi_raw
+    mov     r11, rax                            ; dst secmem buffer
+    mov     r8d, dword ptr [rbp-32]
+    xor     ecx, ecx
+zd_cp:
+    cmp     ecx, r8d
+    jae     zd_cpd
+    mov     al, byte ptr [r10+rcx]
+    mov     byte ptr [r11+rcx], al
+    inc     ecx
+    jmp     zd_cp
+zd_cpd:
+    ; ---- AES-256-CTR decrypt in secmem buffer ----
     lea     rcx, [g_ae_dk]
     mov     rdx, 32
     lea     r8, [g_zi_rk]
@@ -365,8 +533,17 @@ zi_decrypt proc frame
     xor     eax, eax
     mov     qword ptr [rcx], rax
     mov     qword ptr [rcx+8], rax
-    WINCALL aes_ctr_xor, addr g_zi_rk, qword ptr [rbp-40], dword ptr [rbp-32], \
+    WINCALL aes_ctr_xor, addr g_zi_rk, qword ptr [rbp-48], dword ptr [rbp-32], \
             addr g_zi_ctr, dword ptr [g_zi_nr]
+    mov     r10, qword ptr [rbp-64]
+    mov     rax, qword ptr [rbp-48]
+    mov     qword ptr [r10], rax
+    mov     r10, qword ptr [rbp-72]
+    mov     eax, dword ptr [rbp-32]
+    mov     dword ptr [r10], eax
+    mov     r10, qword ptr [rbp-80]
+    mov     rax, qword ptr [rbp-88]
+    mov     qword ptr [r10], rax
     xor     eax, eax
     FRAME_EPILOG
     ret
@@ -380,22 +557,10 @@ zd_corrupt:
     ret
 zi_decrypt endp
 
-; zi_plain(ecx = member index) -> rax = plaintext ptr, edx = length.  (After a
-;   successful zi_decrypt: the ciphertext region now holds plaintext.)
-zi_plain proc
-    mov     eax, ecx
-    imul    eax, eax, MEMREC
-    lea     r10, [g_zi_mem]
-    add     r10, rax
-    mov     rax, qword ptr [r10+16]
-    add     rax, 18
-    mov     edx, dword ptr [r10+24]
-    ret
-zi_plain endp
-
 ; =============================================================================
 ; zi_u2w(rcx = src UTF-8, edx = srclen) -> rax = NUL-terminated wide ptr in the
-;   arena (advances g_zi_ap).  Empty input yields an empty wide string.
+;   arena (advances g_zi_ap).  Empty input yields an empty wide string; overflow
+;   or invalid UTF-8 sets g_zi_err = 1 and returns zi_empty_w safely.
 ; =============================================================================
 zi_u2w proc frame
     FRAME_PROLOG 96                             ; room for 6-arg MBtoWC arg spill
@@ -405,25 +570,23 @@ zi_u2w proc frame
     mov     eax, dword ptr [g_zi_ap]
     add     r10, rax
     mov     qword ptr [rbp-40], r10             ; dst
-    ; cap (wchars) = (ZI_ARENA - ap - 2) / 2, guarded against unsigned underflow.
-    ; A SIGNED check on the remaining bytes catches both an exhausted arena and any
-    ; prior overrun (ap >= ZI_ARENA); the old unsigned subtract wrapped to ~2GB.
     mov     ecx, ZI_ARENA
     sub     ecx, dword ptr [g_zi_ap]           ; remaining bytes
     cmp     ecx, 2
-    jle     zw_full                            ; no room for even a NUL -> empty string
+    jle     zw_full                            ; no room for even a NUL
     sub     ecx, 2
     shr     ecx, 1
     mov     dword ptr [rbp-44], ecx             ; wide cap (bounds MBtoWC's writes)
     cmp     dword ptr [rbp-28], 0
     je      zw_empty
-    WINCALL MultiByteToWideChar, CP_UTF8_, 0, qword ptr [rbp-24], dword ptr [rbp-28], \
+    WINCALL MultiByteToWideChar, CP_UTF8_, 8, qword ptr [rbp-24], dword ptr [rbp-28], \
             qword ptr [rbp-40], dword ptr [rbp-44]
+    test    eax, eax
+    jz      zw_full                             ; conversion/capacity failure -> flag error
     jmp     zw_term
 zw_empty:
     xor     eax, eax
 zw_term:
-    ; NUL-terminate + advance ap by (wchars+1)*2 (<= remaining, so ap stays <= ZI_ARENA)
     mov     r10, qword ptr [rbp-40]
     mov     word ptr [r10+rax*2], 0
     inc     eax
@@ -433,7 +596,8 @@ zw_term:
     FRAME_EPILOG
     ret
 zw_full:
-    lea     rax, [zi_empty_w]                  ; arena exhausted -> static empty wide str
+    mov     dword ptr [g_zi_err], 1
+    lea     rax, [zi_empty_w]
     FRAME_EPILOG
     ret
 zi_u2w endp
@@ -488,30 +652,40 @@ zjn_done:
 zj_num endp
 
 ; =============================================================================
-; zj_str(rcx = dst UTF-8) -> eax = decoded byte length.  g_zi_p must point at the
-;   opening quote; decodes JSON escapes and advances past the closing quote.
+; zj_str(rcx = dst UTF-8, edx = dst byte capacity) -> eax = decoded byte length.
+;   g_zi_p must point at the opening quote; decodes JSON escapes (strict \uXXXX
+;   hex + UTF-16 surrogate pairs, rejecting \u0000 and raw control chars) and
+;   advances past the closing quote.  Sets g_zi_err = 1 and returns 0 on error
+;   or capacity overflow.
 ; =============================================================================
+public zj_str
 zj_str proc frame
     FRAME_PROLOG 48
     mov     qword ptr [rbp-24], rcx             ; dst
     xor     r11d, r11d                          ; out len
+    mov     edx, edx
+    cmp     edx, 5
+    jb      zjs_bad_nostream
+    sub     edx, 4
+    mov     dword ptr [rbp-28], edx             ; cap_limit = cap - 4 (room for 4B UTF-8)
     mov     r10, qword ptr [g_zi_p]
     cmp     r10, qword ptr [g_zi_jend]
-    jae     zjs_end
+    jae     zjs_bad
     cmp     byte ptr [r10], '"'
-    jne     zjs_end
+    jne     zjs_bad
     inc     r10                                 ; past opening quote
 zjs_lp:
     cmp     r10, qword ptr [g_zi_jend]
-    jae     zjs_end
-    cmp     r11d, ZI_SBUF - 4                   ; output full (<=3 bytes/iter + NUL
-    jae     zjs_full                            ; headroom)? stop emitting, drain input
+    jae     zjs_bad
     movzx   eax, byte ptr [r10]
     cmp     eax, '"'
     je      zjs_close
+    cmp     eax, 20h                            ; RFC 8259: raw control chars (< 0x20) invalid
+    jb      zjs_bad
+    cmp     r11d, dword ptr [rbp-28]            ; output full? fail closed + drain input
+    jae     zjs_over
     cmp     eax, '\'
     je      zjs_esc
-    ; literal byte
     mov     rcx, qword ptr [rbp-24]
     mov     byte ptr [rcx+r11], al
     inc     r11d
@@ -520,7 +694,7 @@ zjs_lp:
 zjs_esc:
     inc     r10                                 ; past backslash
     cmp     r10, qword ptr [g_zi_jend]
-    jae     zjs_end
+    jae     zjs_bad
     movzx   eax, byte ptr [r10]
     inc     r10
     cmp     eax, 'n'
@@ -535,8 +709,13 @@ zjs_esc:
     je      zjs_e_f
     cmp     eax, 'u'
     je      zjs_e_u
-    ; \" \\ \/ and any other -> the literal char in eax
-    jmp     zjs_put
+    cmp     eax, '"'
+    je      zjs_put
+    cmp     eax, '\'
+    je      zjs_put
+    cmp     eax, '/'
+    je      zjs_put
+    jmp     zjs_bad                             ; invalid escape sequence
 zjs_e_n:
     mov     eax, 0Ah
     jmp     zjs_put
@@ -551,35 +730,113 @@ zjs_e_b:
     jmp     zjs_put
 zjs_e_f:
     mov     eax, 0Ch
-    jmp     zjs_put
 zjs_put:
     mov     rcx, qword ptr [rbp-24]
     mov     byte ptr [rcx+r11], al
     inc     r11d
     jmp     zjs_lp
 zjs_e_u:
-    ; read 4 hex digits -> codepoint in edx, UTF-8 encode
+    ; Parse 4 strict hex digits -> edx
+    lea     rax, [r10+4]
+    cmp     rax, qword ptr [g_zi_jend]
+    ja      zjs_bad
     xor     edx, edx
     mov     r9d, 4
-zjs_uhex:
-    cmp     r10, qword ptr [g_zi_jend]
-    jae     zjs_end
+zjs_uhex1:
     movzx   eax, byte ptr [r10]
     inc     r10
-    shl     edx, 4
+    cmp     eax, '0'
+    jb      zjs_bad
     cmp     eax, '9'
-    jbe     zjs_udig
-    or      eax, 20h                            ; lower-case
-    sub     eax, 'a'-10
-    jmp     zjs_uadd
-zjs_udig:
+    jbe     zjs_uh1_d
+    or      eax, 20h
+    cmp     eax, 'a'
+    jb      zjs_bad
+    cmp     eax, 'f'
+    ja      zjs_bad
+    sub     eax, 'a' - 10
+    jmp     zjs_uh1_ok
+zjs_uh1_d:
     sub     eax, '0'
-zjs_uadd:
-    and     eax, 0Fh
+zjs_uh1_ok:
+    shl     edx, 4
     or      edx, eax
     dec     r9d
-    jnz     zjs_uhex
-    ; UTF-8 encode edx (BMP) into dst
+    jnz     zjs_uhex1
+    test    edx, edx                            ; reject embedded \u0000
+    jz      zjs_bad
+    ; Check UTF-16 surrogate range 0xD800..0xDFFF
+    mov     eax, edx
+    sub     eax, 0D800h
+    cmp     eax, 800h
+    jae     zjs_bmp                             ; BMP scalar (non-surrogate)
+    cmp     eax, 400h
+    jae     zjs_bad                             ; lone low surrogate (0xDC00..0xDFFF)
+    ; High surrogate (0xD800..0xDBFF): require trailing \uDC00..\uDFFF
+    mov     r8d, eax                            ; high - 0xD800 (10 bits)
+    lea     rcx, [r10+6]
+    cmp     rcx, qword ptr [g_zi_jend]
+    ja      zjs_bad
+    cmp     byte ptr [r10], '\'
+    jne     zjs_bad
+    cmp     byte ptr [r10+1], 'u'
+    jne     zjs_bad
+    add     r10, 2
+    xor     edx, edx
+    mov     r9d, 4
+zjs_uhex2:
+    movzx   eax, byte ptr [r10]
+    inc     r10
+    cmp     eax, '0'
+    jb      zjs_bad
+    cmp     eax, '9'
+    jbe     zjs_uh2_d
+    or      eax, 20h
+    cmp     eax, 'a'
+    jb      zjs_bad
+    cmp     eax, 'f'
+    ja      zjs_bad
+    sub     eax, 'a' - 10
+    jmp     zjs_uh2_ok
+zjs_uh2_d:
+    sub     eax, '0'
+zjs_uh2_ok:
+    shl     edx, 4
+    or      edx, eax
+    dec     r9d
+    jnz     zjs_uhex2
+    mov     eax, edx
+    sub     eax, 0DC00h
+    cmp     eax, 400h
+    jae     zjs_bad                             ; second unit not a low surrogate
+    shl     r8d, 10
+    lea     edx, [r8+rax+10000h]                ; 21-bit scalar U+10000..U+10FFFF
+    ; 4-byte UTF-8: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+    mov     rcx, qword ptr [rbp-24]
+    mov     eax, edx
+    shr     eax, 18
+    or      eax, 0F0h
+    mov     byte ptr [rcx+r11], al
+    inc     r11d
+    mov     eax, edx
+    shr     eax, 12
+    and     eax, 3Fh
+    or      eax, 80h
+    mov     byte ptr [rcx+r11], al
+    inc     r11d
+    mov     eax, edx
+    shr     eax, 6
+    and     eax, 3Fh
+    or      eax, 80h
+    mov     byte ptr [rcx+r11], al
+    inc     r11d
+    mov     eax, edx
+    and     eax, 3Fh
+    or      eax, 80h
+    mov     byte ptr [rcx+r11], al
+    inc     r11d
+    jmp     zjs_lp
+zjs_bmp:
     mov     rcx, qword ptr [rbp-24]
     cmp     edx, 80h
     jae     zjs_u2
@@ -618,28 +875,30 @@ zjs_u3:
     mov     byte ptr [rcx+r11], al
     inc     r11d
     jmp     zjs_lp
-zjs_full:
-    ; output cap reached: a single string >= ZI_SBUF only occurs in a crafted
-    ; archive.  Drain the rest of the string (honoring escapes so an escaped quote
-    ; cannot end it early) WITHOUT writing, keeping g_zi_p in sync, then stop.
-    ; Memory-safe truncation; the oversized value is discarded.
+zjs_over:
+    ; Capacity exceeded: drain to closing quote (if present), flag g_zi_err, return 0.
     cmp     r10, qword ptr [g_zi_jend]
-    jae     zjs_end
+    jae     zjs_bad
     movzx   eax, byte ptr [r10]
     inc     r10
     cmp     eax, '\'
-    jne     zjs_full_q
-    cmp     r10, qword ptr [g_zi_jend]          ; skip the escaped char
-    jae     zjs_end
+    jne     zjs_over_q
+    cmp     r10, qword ptr [g_zi_jend]
+    jae     zjs_bad
     inc     r10
-    jmp     zjs_full
-zjs_full_q:
+    jmp     zjs_over
+zjs_over_q:
     cmp     eax, '"'
-    jne     zjs_full
-    jmp     zjs_end                             ; consumed the closing quote
+    jne     zjs_over
+zjs_bad:
+    mov     qword ptr [g_zi_p], r10
+zjs_bad_nostream:
+    mov     dword ptr [g_zi_err], 1
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
 zjs_close:
     inc     r10                                 ; past closing quote
-zjs_end:
     mov     qword ptr [g_zi_p], r10
     mov     eax, r11d
     FRAME_EPILOG
@@ -687,6 +946,29 @@ zjc_done:
 zj_skipch endp
 
 ; =============================================================================
+; zi_utf8_ok(rcx = UTF-8 ptr, edx = byte len) -> eax = 1 valid / 0 invalid.
+;   Validates UTF-8 strictly with MB_ERR_INVALID_CHARS (8); sets g_zi_err on
+;   malformed sequences so STAGE rejects invalid UTF-8 before commit.
+; =============================================================================
+zi_utf8_ok proc frame
+    FRAME_PROLOG 64                             ; room for 6-arg MBtoWC spill
+    test    edx, edx
+    jz      zu8_ok
+    WINCALL MultiByteToWideChar, CP_UTF8_, 8, rcx, edx, 0, 0
+    test    eax, eax
+    jz      zu8_bad
+zu8_ok:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+zu8_bad:
+    mov     dword ptr [g_zi_err], 1
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+zi_utf8_ok endp
+
+; =============================================================================
 ; zi_addattach(ecx = base type 9/10, rdx = label wide (0/none), r8 = path UTF-8,
 ;   r9d = pathlen, [rbp+? via mem] n) - decrypt the referenced member, stage it,
 ;   and write g_field_list[n] as a VFL_RAW {AttachRef, filename} field.
@@ -694,11 +976,14 @@ zj_skipch endp
 ;   n (field slot) passed in g_zi_slot.
 ; =============================================================================
 zi_addattach proc frame
-    FRAME_PROLOG 128                            ; room for 6-arg MBtoWC arg spill
+    FRAME_PROLOG 144                            ; room for locals (-88) + 6-arg MBtoWC spill
     mov     dword ptr [g_zi_atype], ecx
     mov     qword ptr [g_zi_alabel], rdx
     mov     qword ptr [rbp-24], r8              ; path
     mov     dword ptr [rbp-28], r9d             ; pathlen
+    mov     qword ptr [rbp-40], 0               ; pt_ptr
+    mov     dword ptr [rbp-44], 0               ; pt_len
+    mov     qword ptr [rbp-56], 0               ; pt_cap
     ; find the member
     mov     rcx, r8
     mov     edx, r9d
@@ -707,20 +992,24 @@ zi_addattach proc frame
     je      za_skip
     mov     dword ptr [rbp-32], eax             ; member idx
     mov     ecx, eax
+    lea     rdx, [rbp-40]                       ; &pt_ptr
+    lea     r8, [rbp-44]                        ; &pt_len
+    lea     r9, [rbp-56]                        ; &pt_cap
     call    zi_decrypt
     test    eax, eax
     jnz     za_skip
-    mov     ecx, dword ptr [rbp-32]
-    call    zi_plain                            ; rax=ptr edx=len
-    mov     qword ptr [rbp-40], rax
-    mov     dword ptr [rbp-44], edx
-    ; stage the plaintext -> g_zi_ref
-    mov     rcx, rax
+    ; stage the plaintext -> g_zi_ref, then wipe + release the decrypt buffer immediately
+    mov     rcx, qword ptr [rbp-40]
     mov     edx, dword ptr [rbp-44]
     lea     r8, [g_zi_ref]
     call    attach_stage
-    test    eax, eax
-    jnz     za_skip
+    mov     dword ptr [rbp-88], eax             ; save attach_stage rc
+    mov     rcx, qword ptr [rbp-40]
+    mov     rdx, qword ptr [rbp-56]
+    call    secmem_free
+    mov     qword ptr [rbp-40], 0
+    cmp     dword ptr [rbp-88], 0
+    jne     za_skip
     ; filename: prefer the json's "name".  Member names are opaque (16 hex of the
     ; attachment id), so the path's last component is no longer the real name.
     ; An archive written before that change carries no "name" - and there the
@@ -728,9 +1017,9 @@ zi_addattach proc frame
     cmp     dword ptr [g_zi_anamen], 0
     je      zaf_frompath
     mov     eax, dword ptr [g_zi_anamen]
-    mov     dword ptr [rbp-48], eax             ; fnlen
+    mov     dword ptr [rbp-68], eax             ; fnlen
     lea     r10, [g_zi_nbuf]
-    mov     qword ptr [rbp-56], r10             ; fnptr
+    mov     qword ptr [rbp-64], r10             ; fnptr
     jmp     zaf_have
 zaf_frompath:
     mov     r10, qword ptr [rbp-24]             ; path
@@ -747,26 +1036,46 @@ zaf_scan:
 zaf_done:
     mov     eax, r8d
     sub     eax, r9d                            ; fnlen = pathlen - base
-    mov     dword ptr [rbp-48], eax             ; fnlen
+    mov     dword ptr [rbp-68], eax             ; fnlen
     mov     r10, qword ptr [rbp-24]
     add     r10, r9                             ; fnptr
-    mov     qword ptr [rbp-56], r10
+    mov     qword ptr [rbp-64], r10
 zaf_have:
-    cmp     dword ptr [rbp-48], 255             ; clamp to the MultiByteToWideChar cap
-    jbe     zaf_fnok                            ;   below: over it the call returns 0 and
-    mov     dword ptr [rbp-48], 255             ;   the name would land EMPTY instead of
-zaf_fnok:                                       ;   merely truncated
+    ; Validate the full UTF-8 filename strictly BEFORE clamping length.
+    mov     rcx, qword ptr [rbp-64]
+    mov     edx, dword ptr [rbp-68]
+    call    zi_utf8_ok
+    test    eax, eax
+    jz      za_skip
+    ; Clamp to <= 255 UTF-8 bytes on a clean codepoint boundary.
+    mov     ecx, dword ptr [rbp-68]
+    cmp     ecx, 255
+    jbe     zaf_fnok
+    mov     ecx, 255
+    mov     r10, qword ptr [rbp-64]
+zaf_u8trim:
+    test    ecx, ecx
+    jz      zaf_trimmed
+    movzx   edx, byte ptr [r10+rcx]
+    and     edx, 0C0h
+    cmp     edx, 80h                            ; UTF-8 continuation byte?
+    jne     zaf_trimmed
+    dec     ecx
+    jmp     zaf_u8trim
+zaf_trimmed:
+    mov     dword ptr [rbp-68], ecx
+zaf_fnok:
     ; ensure the arena has room for the worst-case blob before any write:
     ;   4 (rawlen) + ARF_SIZE + (255+1)*2 (max wide filename incl NUL, MBtoWC-capped)
     mov     eax, dword ptr [g_zi_ap]
     add     eax, 4 + ARF_SIZE + 512
     cmp     eax, ZI_ARENA
-    ja      za_skip
+    ja      za_arena_err
     ; build blob in arena: {u32 rawlen, AttachRef[68], filename wide (NUL-term)}
     mov     r11, qword ptr [g_zi_arena]
     mov     eax, dword ptr [g_zi_ap]
     add     r11, rax
-    mov     qword ptr [rbp-64], r11             ; blob base
+    mov     qword ptr [rbp-80], r11             ; blob base
     ; copy AttachRef into blob+4
     lea     rax, [r11+4]
     lea     r8, [g_zi_ref]
@@ -779,11 +1088,19 @@ za_cpref:
     jb      za_cpref
     ; append the filename as wide (convert), directly after AttachRef
     ; wide dst = blob + 4 + 68
-    mov     r10, qword ptr [rbp-64]
+    mov     r10, qword ptr [rbp-80]
     lea     r10, [r10+4+ARF_SIZE]
-    mov     qword ptr [rbp-40], r10             ; wide dst (reuse -40)
-    WINCALL MultiByteToWideChar, CP_UTF8_, 0, qword ptr [rbp-56], dword ptr [rbp-48], \
+    mov     qword ptr [rbp-40], r10             ; wide dst
+    cmp     dword ptr [rbp-68], 0
+    je      za_fnempty
+    WINCALL MultiByteToWideChar, CP_UTF8_, 8, qword ptr [rbp-64], dword ptr [rbp-68], \
             qword ptr [rbp-40], 255
+    test    eax, eax
+    jz      za_arena_err
+    jmp     za_fnterm
+za_fnempty:
+    xor     eax, eax
+za_fnterm:
     ; NUL-terminate the wide filename
     mov     r10, qword ptr [rbp-40]
     mov     word ptr [r10+rax*2], 0
@@ -791,7 +1108,7 @@ za_cpref:
     lea     eax, [eax*2]                        ; filename bytes
     ; rawlen = ARF_SIZE + filename bytes
     add     eax, ARF_SIZE
-    mov     r11, qword ptr [rbp-64]
+    mov     r11, qword ptr [rbp-80]
     mov     dword ptr [r11], eax                ; u32 rawlen
     ; advance ap by 4 + rawlen
     add     eax, 4
@@ -806,11 +1123,13 @@ za_cpref:
     mov     qword ptr [r10+0], rcx
     mov     rax, qword ptr [g_zi_alabel]
     mov     qword ptr [r10+8], rax
-    mov     rax, qword ptr [rbp-64]
+    mov     rax, qword ptr [rbp-80]
     mov     qword ptr [r10+16], rax
     mov     eax, 1
     FRAME_EPILOG
     ret
+za_arena_err:
+    mov     dword ptr [g_zi_err], 1
 za_skip:
     xor     eax, eax
     FRAME_EPILOG
@@ -919,8 +1238,15 @@ zi_stage_title proc frame
     mov     dword ptr [rbp-52], ecx             ; cap
     cmp     dword ptr [rbp-36], 0
     je      st_empty
-    WINCALL MultiByteToWideChar, CP_UTF8_, 0, qword ptr [rbp-32], dword ptr [rbp-36], \
+    mov     rcx, qword ptr [rbp-32]
+    mov     edx, dword ptr [rbp-36]
+    call    zi_utf8_ok
+    test    eax, eax
+    jz      st_full
+    WINCALL MultiByteToWideChar, CP_UTF8_, 8, qword ptr [rbp-32], dword ptr [rbp-36], \
             qword ptr [rbp-48], dword ptr [rbp-52]
+    test    eax, eax
+    jz      st_full
     jmp     st_term
 st_empty:
     xor     eax, eax
@@ -971,28 +1297,35 @@ zi_walk proc frame
     mov     dword ptr [g_zi_count], 0
     mov     dword ptr [g_zi_e], 0
     mov     qword ptr [rbp-72], 0              ; entry-loop progress marker (0 = none yet)
-    mov     al, '['
-    call    zj_skipch
+    mov     r10, qword ptr [g_zi_p]
+    cmp     r10, qword ptr [g_zi_jend]
+    jae     zij_bad
+    cmp     byte ptr [r10], '['
+    jne     zij_bad
+    inc     r10
+    mov     qword ptr [g_zi_p], r10
 zij_entry:
     mov     r10, qword ptr [g_zi_p]
-    cmp     r10, qword ptr [rbp-72]             ; FORWARD-PROGRESS guard: if this entry
-    je      zij_done                            ;   iteration begins where the last one did,
-    mov     qword ptr [rbp-72], r10             ;   the cursor is stuck on malformed json ->
-                                                ;   stop.  Without it a crafted vordr.json
-                                                ;   spins zij_entry forever (a DoS; found by
-                                                ;   the jfuzz structural fuzzer).
+    cmp     r10, qword ptr [rbp-72]             ; FORWARD-PROGRESS guard: stuck cursor -> malformed
+    je      zij_bad
+    mov     qword ptr [rbp-72], r10
     cmp     r10, qword ptr [g_zi_jend]
-    jae     zij_done
+    jae     zij_bad                             ; truncated before closing ']' -> malformed
     movzx   eax, byte ptr [r10]
     cmp     eax, ']'
-    je      zij_done
+    je      zij_close
     cmp     eax, ','
     jne     zij_e0
     inc     r10
     mov     qword ptr [g_zi_p], r10
 zij_e0:
-    mov     al, '{'
-    call    zj_skipch
+    mov     r10, qword ptr [g_zi_p]
+    cmp     r10, qword ptr [g_zi_jend]
+    jae     zij_bad
+    cmp     byte ptr [r10], '{'
+    jne     zij_bad
+    inc     r10
+    mov     qword ptr [g_zi_p], r10
     ; per-entry build flag: commit mode builds only g_sel[e]-selected entries
     mov     dword ptr [g_zi_build], 0
     cmp     dword ptr [g_zi_mode], 1
@@ -1007,8 +1340,13 @@ zij_titr:
     lea     rcx, [zl_title]                     ; "title":
     mov     edx, 8
     call    zj_lit
+    test    eax, eax
+    jz      zij_bad
     lea     rcx, [g_zi_sbuf]                    ; decode title -> sbuf
+    mov     edx, ZI_SBUF
     call    zj_str
+    cmp     dword ptr [g_zi_err], 0
+    jne     zij_done
     mov     dword ptr [rbp-52], eax             ; title UTF-8 len
     cmp     dword ptr [g_zi_mode], 1
     je      zij_titdone                         ; commit: title already staged
@@ -1020,16 +1358,18 @@ zij_titdone:
     lea     rcx, [zl_fields]                    ; ,"fields":[
     mov     edx, 11
     call    zj_lit
+    test    eax, eax
+    jz      zij_bad
     mov     dword ptr [g_zi_ap], 0              ; fresh arena for this entry
     mov     dword ptr [rbp-24], 0               ; n (field slot)
     mov     qword ptr [rbp-80], 0              ; field-loop progress marker (reset per entry)
 zij_field:
     mov     r10, qword ptr [g_zi_p]
-    cmp     r10, qword ptr [rbp-80]             ; FORWARD-PROGRESS guard (see zij_entry): a
-    je      zij_fend                            ;   stuck cursor in the fields array would
-    mov     qword ptr [rbp-80], r10             ;   otherwise spin zij_field forever
+    cmp     r10, qword ptr [rbp-80]             ; FORWARD-PROGRESS guard (see zij_entry)
+    je      zij_bad
+    mov     qword ptr [rbp-80], r10
     cmp     r10, qword ptr [g_zi_jend]
-    jae     zij_fend
+    jae     zij_bad
     movzx   eax, byte ptr [r10]
     cmp     eax, ']'
     je      zij_fend
@@ -1038,19 +1378,31 @@ zij_field:
     inc     r10
     mov     qword ptr [g_zi_p], r10
 zij_f0:
-    mov     al, '{'
-    call    zj_skipch
+    mov     r10, qword ptr [g_zi_p]
+    cmp     r10, qword ptr [g_zi_jend]
+    jae     zij_bad
+    cmp     byte ptr [r10], '{'
+    jne     zij_bad
+    inc     r10
+    mov     qword ptr [g_zi_p], r10
     lea     rcx, [zl_type]                      ; "type":
     mov     edx, 7
     call    zj_lit
+    test    eax, eax
+    jz      zij_bad
     call    zj_num
     call    zi_type_ok                          ; untrusted: only plain user kinds pass
     mov     dword ptr [rbp-28], eax             ; type
     lea     rcx, [zl_label]                     ; ,"label":
     mov     edx, 9
     call    zj_lit
+    test    eax, eax
+    jz      zij_bad
     lea     rcx, [g_zi_sbuf]                    ; decode label -> sbuf
+    mov     edx, ZI_SBUF
     call    zj_str
+    cmp     dword ptr [g_zi_err], 0
+    jne     zij_done
     mov     dword ptr [rbp-32], eax             ; labellen
     mov     qword ptr [rbp-40], 0               ; label wide (0 = none)
     test    eax, eax
@@ -1063,9 +1415,19 @@ zij_lbldone:
     lea     rcx, [zl_value]                     ; ,"value":
     mov     edx, 9
     call    zj_lit
+    test    eax, eax
+    jz      zij_bad
     lea     rcx, [g_zi_sbuf]                    ; decode value -> sbuf
+    mov     edx, ZI_SBUF
     call    zj_str
+    cmp     dword ptr [g_zi_err], 0
+    jne     zij_done
     mov     dword ptr [rbp-48], eax             ; vallen
+    lea     rcx, [g_zi_sbuf]
+    mov     edx, eax
+    call    zi_utf8_ok
+    test    eax, eax
+    jz      zij_done
     ; optional ,"name":"<real filename>" - attachments only, and only in archives
     ; written after member names were made opaque.  Its absence is normal: an
     ; older archive carries the real name as the last path component instead.
@@ -1079,9 +1441,19 @@ zij_lbldone:
     lea     rcx, [zl_name]                      ; ,"name":
     mov     edx, 8
     call    zj_lit
+    test    eax, eax
+    jz      zij_noname
     lea     rcx, [g_zi_nbuf]                    ; decode name -> its own buffer
+    mov     edx, ZI_NBUF
     call    zj_str
+    cmp     dword ptr [g_zi_err], 0
+    jne     zij_done
     mov     dword ptr [g_zi_anamen], eax
+    lea     rcx, [g_zi_nbuf]
+    mov     edx, eax
+    call    zi_utf8_ok
+    test    eax, eax
+    jz      zij_done
 zij_noname:
     mov     al, '}'
     call    zj_skipch
@@ -1142,6 +1514,12 @@ zij_fend:
 zij_eadv:
     inc     dword ptr [g_zi_e]
     jmp     zij_entry
+zij_close:
+    inc     r10
+    mov     qword ptr [g_zi_p], r10
+    jmp     zij_done
+zij_bad:
+    mov     dword ptr [g_zi_err], 1
 zij_done:
     cmp     dword ptr [g_zi_mode], 1
     je      zij_dret
@@ -1157,30 +1535,44 @@ zij_dret:
     ret
 zi_walk endp
 
-; zi_free_wipe() - release the per-entry arena (if held) and wipe the UTF-8 pw.
+; zi_free_wipe() - release the per-entry arena + decrypted json (if held) and wipe secrets.
 zi_free_wipe proc frame
     FRAME_PROLOG 48
     mov     rcx, qword ptr [g_zi_arena]
     test    rcx, rcx
-    jz      zfw_wipe
+    jz      zfw_jbuf
     mov     rdx, ZI_ARENA
     call    secmem_free                         ; wipes before release
     mov     qword ptr [g_zi_arena], 0
-zfw_wipe:
+zfw_jbuf:
+    mov     rcx, qword ptr [g_zi_jptr]
+    test    rcx, rcx
+    jz      zfw_jclr
+    mov     rdx, qword ptr [g_zi_jcap]
+    test    rdx, rdx
+    jz      zfw_jclr                            ; static buffer (jfuzz) -> do not VirtualFree
+    call    secmem_free                         ; wipes before release
+zfw_jclr:
+    mov     qword ptr [g_zi_jptr], 0
+    mov     dword ptr [g_zi_jlen], 0
+    mov     qword ptr [g_zi_jcap], 0
     lea     rcx, [g_zi_u8pw]
     mov     edx, ZI_PWCAP
     call    secure_zero
     mov     dword ptr [g_zi_pwlen], 0
-    ; Everything else an import leaves behind: the last decoded value (often a
-    ; password), the decoded attachment name, the expanded AES key schedule, the
-    ; PBKDF2 output (AES key + HMAC key + verifier) and the last staged AttachRef,
-    ; whose embedded key opens that attachment.  None of these were ever wiped.
+    ; Wipe every transient secret buffer used during staging and commit:
+    ; sbuf (values/labels/titles), nbuf (filenames), tbuf (staged wide titles),
+    ; expanded AES key schedule, PBKDF2 output, staged AttachRef, CTR, and HMAC.
     lea     rcx, [g_zi_sbuf]
     mov     edx, ZI_SBUF
     call    secure_zero
     lea     rcx, [g_zi_nbuf]
-    mov     edx, 1024
+    mov     edx, ZI_NBUF
     call    secure_zero
+    lea     rcx, [g_zi_tbuf]
+    mov     edx, ZI_TBUF
+    call    secure_zero
+    mov     dword ptr [g_zi_tap], 0
     lea     rcx, [g_zi_rk]
     mov     edx, 15*16
     call    secure_zero
@@ -1219,6 +1611,10 @@ zi_stage proc frame
     FRAME_PROLOG 160                            ; room for the 8-arg WCtoMB arg spill
     mov     qword ptr [rbp-24], rcx             ; raw
     mov     dword ptr [rbp-28], edx             ; rawlen
+    mov     dword ptr [g_zi_err], 0
+    mov     qword ptr [g_zi_jptr], 0
+    mov     dword ptr [g_zi_jlen], 0
+    mov     qword ptr [g_zi_jcap], 0
     ; wide pw -> UTF-8 g_zi_u8pw (stage count in r9d: WINCALL rax-clobber footgun)
     shr     r9d, 1                              ; wide chars
     mov     dword ptr [rbp-32], r9d
@@ -1233,9 +1629,6 @@ zi_stage proc frame
 zs_pwok:
     lea     rax, [g_zi_u8pw]
     mov     qword ptr [g_zi_pwptr], rax
-    ; Members are decrypted IN PLACE in the caller's raw buffer, so vordr.json - every
-    ; secret in the archive - sits there as plaintext until the import ends.  Pin it
-    ; when the quota allows; a refusal costs only the pin, never the import.
     mov     rax, qword ptr [rbp-24]
     mov     qword ptr [g_zi_raw], rax
     mov     eax, dword ptr [rbp-28]
@@ -1261,12 +1654,8 @@ zs_pwok:
     mov     dword ptr [rbp-40], -4              ; a ZIP, but not one Vordr can read
     jmp     zs_fail
 zs_supported:
-    call    attach_reset_pending                ; start a fresh PENDING set only - the
-                                                ;   vault stays open, and dropping its
-                                                ;   on-disk index here left every saved
-                                                ;   attachment unopenable, then let the
-                                                ;   post-import save write them away
-    ; find + decrypt the data file
+    call    attach_reset_pending                ; start a fresh PENDING set only
+    ; find + decrypt the data file into a fresh secmem buffer
     lea     rcx, [zi_jsonname]
     mov     edx, 10
     call    zi_find
@@ -1277,24 +1666,27 @@ zs_supported:
 zs_json:
     mov     dword ptr [rbp-36], eax             ; member idx
     mov     ecx, eax
+    lea     rdx, [g_zi_jptr]
+    lea     r8, [g_zi_jlen]
+    lea     r9, [g_zi_jcap]
     call    zi_decrypt
     test    eax, eax
     jz      zs_json_ok
     mov     dword ptr [rbp-40], eax             ; -3 wrong pw / -1 corrupt
     jmp     zs_fail
 zs_json_ok:
-    mov     ecx, dword ptr [rbp-36]
-    call    zi_plain                            ; rax=ptr edx=len
-    mov     qword ptr [g_zi_jptr], rax          ; persist json for the commit pass
-    mov     dword ptr [g_zi_jlen], edx
+    mov     rax, qword ptr [g_zi_jptr]
+    mov     edx, dword ptr [g_zi_jlen]
     mov     qword ptr [g_zi_p], rax
     add     rax, rdx
     mov     qword ptr [g_zi_jend], rax
     mov     dword ptr [g_zi_tap], 0
     mov     dword ptr [g_zi_stg_n], 0
-    mov     dword ptr [g_zi_mode], 0            ; STAGE: collect titles
+    mov     dword ptr [g_zi_mode], 0            ; STAGE: collect titles + validate json
     call    zi_walk
-    mov     eax, dword ptr [g_zi_stg_n]         ; keep arena + pw for zi_commit
+    cmp     dword ptr [g_zi_err], 0
+    jne     zs_err                              ; malformed JSON or UTF-8 -> reject closed
+    mov     eax, dword ptr [g_zi_stg_n]         ; keep arena + json + pw for zi_commit
     FRAME_EPILOG
     ret
 zs_fail:
@@ -1310,12 +1702,14 @@ zs_err:
 zi_stage endp
 
 ; =============================================================================
-; zi_commit() -> eax = entries imported.  Re-walk the staged json, building only
-;   the entries whose g_sel[e] is set, then free the arena + wipe the password.
+; zi_commit() -> eax = entries imported (<0 on error).  Re-walk the staged json,
+;   building only the entries whose g_sel[e] is set, then free the arena + wipe
+;   the password.
 ; =============================================================================
 public zi_commit
 zi_commit proc frame
     FRAME_PROLOG 48
+    mov     dword ptr [g_zi_err], 0
     mov     rax, qword ptr [g_zi_jptr]
     mov     qword ptr [g_zi_p], rax
     mov     edx, dword ptr [g_zi_jlen]
@@ -1325,8 +1719,16 @@ zi_commit proc frame
     mov     dword ptr [g_zi_mode], 1            ; COMMIT: build selected entries
     call    zi_walk
     mov     dword ptr [rbp-24], eax
+    mov     ecx, dword ptr [g_zi_err]
+    mov     dword ptr [rbp-28], ecx
     call    zi_free_wipe
+    cmp     dword ptr [rbp-28], 0
+    jne     zic_err
     mov     eax, dword ptr [rbp-24]
+    FRAME_EPILOG
+    ret
+zic_err:
+    mov     eax, -1
     FRAME_EPILOG
     ret
 zi_commit endp
@@ -1670,6 +2072,7 @@ jfz_mutnext:
 jfz_run:
     lea     rax, [jfz_buf]
     mov     qword ptr [g_zi_jptr], rax
+    mov     qword ptr [g_zi_jcap], 0
     mov     qword ptr [g_zi_p], rax
     mov     r10, qword ptr [rbp-32]
     mov     dword ptr [g_zi_jlen], r10d
@@ -1677,6 +2080,7 @@ jfz_run:
     mov     qword ptr [g_zi_jend], rax
     mov     dword ptr [g_zi_tap], 0
     mov     dword ptr [g_zi_stg_n], 0
+    mov     dword ptr [g_zi_err], 0
     mov     dword ptr [g_zi_mode], 0                 ; STAGE: decode titles/labels
     call    zi_walk
     dec     qword ptr [rbp-24]

@@ -69,9 +69,16 @@ externdef g_zi_u8pw:byte            ; ZIP import: password (zipimport.asm)
 externdef g_zi_sbuf:byte            ;   last decoded JSON string - a value
 externdef g_zi_nbuf:byte            ;   last decoded attachment name
 externdef g_zi_ref:byte             ;   last staged AttachRef
+externdef g_zi_rk:byte              ;   expanded AES key schedule (zipimport.asm)
+externdef g_zi_tbuf:byte            ;   staged entry titles (zipimport.asm)
 externdef g_ze_u8pw:byte            ; ZIP export: password (zipexport.asm)
 externdef g_ae_dk:byte              ;   PBKDF2 output = AES key + HMAC key
 externdef g_ze_rk:byte              ;   expanded AES key schedule
+externdef g_pb_u:byte               ;   PBKDF2 block scratch (zipexport.asm)
+externdef g_pb_un:byte
+externdef g_pb_t:byte
+externdef g_fmac_ctx:byte           ; keyed BLAKE2b file-MAC state (vault.asm)
+externdef g_sha32:byte              ; SHA-256(vkey) KCV scratch (vault.asm)
 externdef g_totp_key:byte           ; decoded TOTP secret (totp.asm)
 
 ; Sizes of the buffers above, mirrored from the modules that allocate them -
@@ -84,6 +91,8 @@ VALBLOB_W    equ (MAXROWS+1)*CONVW_MAX
 MAX_TFILES   equ 24
 TFILE_ENTRY  equ 328
 ZI_SBUF      equ 256*1024
+ZI_TBUF      equ 1024*1024
+ZI_NBUF      equ 1024
 ZI_PWCAP     equ 1024
 ZE_PWCAP     equ 1024
 ARF_SIZE     equ 68
@@ -126,7 +135,7 @@ SEC_WS_FLAGS        equ 9
 ; arena); overflow fails the alloc closed.  Single-threaded like the shadow
 ; stack: body allocs run on the GUI thread; the secdesk worker's KDF alloc happens
 ; while the main thread is blocked in WaitForSingleObject - never concurrent.
-SECREG_CAP          equ 64
+SECREG_CAP          equ 1024
 
 ; ---------------------------------------------------------------------------
 ; sec_regions - every STATIC buffer that can hold a secret: {address, bytes}.
@@ -168,26 +177,36 @@ sec_regions label qword
     dq  g_sub_w,        512*2
     dq  g_zi_u8pw,      ZI_PWCAP
     dq  g_zi_sbuf,      ZI_SBUF
-    dq  g_zi_nbuf,      1024
+    dq  g_zi_nbuf,      ZI_NBUF
     dq  g_zi_ref,       ARF_SIZE
+    dq  g_zi_rk,        15*16
+    dq  g_zi_tbuf,      ZI_TBUF
     dq  g_ze_u8pw,      ZE_PWCAP
     dq  g_ae_dk,        80
     dq  g_ze_rk,        15*16
-    dq  g_totp_key,     64
+    dq  g_pb_u,         20
+    dq  g_pb_un,        20
+    dq  g_pb_t,         20
+    dq  g_fmac_ctx,     256
+    dq  g_sha32,        32
+    dq  g_totp_key,     160
 sec_regions_end label qword
 
 .code
 
-; secreg_add(rcx = base) -> eax = 1 stored / 0 registry full.  Leaf.
+; secreg_add(rcx = base, rdx = len) -> eax = 1 stored / 0 registry full.  Leaf.
 secreg_add proc
     lea     r10, [g_secreg]
     xor     r8d, r8d
 sra_lp:
     cmp     r8d, SECREG_CAP
     jae     sra_full
-    cmp     qword ptr [r10+r8*8], 0
+    mov     rax, r8
+    shl     rax, 4
+    cmp     qword ptr [r10+rax], 0
     jne     sra_next
-    mov     qword ptr [r10+r8*8], rcx
+    mov     qword ptr [r10+rax], rcx
+    mov     qword ptr [r10+rax+8], rdx
     mov     eax, 1
     ret
 sra_next:
@@ -198,7 +217,7 @@ sra_full:
     ret
 secreg_add endp
 
-; secreg_take(rcx = base) -> eax = 1 found (and cleared) / 0 absent.  Leaf.
+; secreg_take(rcx = base) -> rax = stored_len (0 if absent), entry cleared.  Leaf.
 secreg_take proc
     test    rcx, rcx
     jz      srt_absent
@@ -207,11 +226,17 @@ secreg_take proc
 srt_lp:
     cmp     r8d, SECREG_CAP
     jae     srt_absent
-    cmp     qword ptr [r10+r8*8], rcx
+    mov     r9, r8
+    shl     r9, 4
+    cmp     qword ptr [r10+r9], rcx
     jne     srt_next
-    mov     qword ptr [r10+r8*8], 0
+    mov     rax, qword ptr [r10+r9+8]
+    mov     qword ptr [r10+r9], 0
+    mov     qword ptr [r10+r9+8], 0
+    test    rax, rax
+    jnz     @F
     mov     eax, 1
-    ret
+@@: ret
 srt_next:
     inc     r8d
     jmp     srt_lp
@@ -272,16 +297,43 @@ sec_lock endp
 public sec_ws_grow
 sec_ws_grow proc frame
     FRAME_PROLOG 48
-    ; min = statics + all concurrently live body arenas.
-    ; Clamp to the max.
-    mov     eax, SEC_BODY_RESERVE
-    add     eax, SEC_WS_STATICS
-    cmp     eax, SEC_WS_MAX
-    jbe     @F
-    mov     eax, SEC_WS_MAX
-@@: mov     qword ptr [rbp-24], rax           ; computed min (survive the call setup)
+    ; Sum all currently registered dynamic arenas + pending request + statics,
+    ; floored at SEC_BODY_RESERVE + SEC_WS_STATICS so large attachment/ZIP
+    ; secmem arenas never exhaust the VirtualLock working-set quota.
+    mov     rax, qword ptr [g_secreg_pending]
+    add     rax, 0FFFh
+    and     rax, -1000h
+    lea     r10, [g_secreg]
+    xor     r8d, r8d
+swg_sum:
+    cmp     r8d, SECREG_CAP
+    jae     swg_sumd
+    mov     r9, r8
+    shl     r9, 4
+    cmp     qword ptr [r10+r9], 0
+    je      swg_next
+    mov     rcx, qword ptr [r10+r9+8]
+    add     rcx, 0FFFh
+    and     rcx, -1000h
+    add     rax, rcx
+swg_next:
+    inc     r8d
+    jmp     swg_sum
+swg_sumd:
+    add     rax, SEC_WS_STATICS
+    mov     ecx, SEC_BODY_RESERVE + SEC_WS_STATICS
+    cmp     rax, rcx
+    jae     @F
+    mov     rax, rcx
+@@: mov     qword ptr [rbp-24], rax           ; computed min
+    lea     rdx, [rax + 04000000h]            ; max = max(SEC_WS_MAX, min + 64 MiB)
+    mov     ecx, SEC_WS_MAX
+    cmp     rdx, rcx
+    jae     @F
+    mov     rdx, rcx
+@@: mov     qword ptr [rbp-32], rdx           ; computed max
     WINCALL GetCurrentProcess
-    WINCALL SetProcessWorkingSetSizeEx, rax, qword ptr [rbp-24], SEC_WS_MAX, SEC_WS_FLAGS
+    WINCALL SetProcessWorkingSetSizeEx, rax, qword ptr [rbp-24], qword ptr [rbp-32], SEC_WS_FLAGS
     test    eax, eax
     jnz     swg_ok
     WINCALL GetLastError
@@ -359,6 +411,22 @@ secmem_wipe_statics endp
 secmem_panic_wipe proc frame
     FRAME_PROLOG 48
     call    secmem_wipe_statics                 ; every static secret buffer
+    ; Wipe every dynamic secret arena registered in g_secreg ({base, size})
+    mov     dword ptr [rbp-24], 0
+spw_reg:
+    mov     eax, dword ptr [rbp-24]
+    cmp     eax, SECREG_CAP
+    jae     spw_body
+    shl     rax, 4
+    lea     r10, [g_secreg]
+    mov     rcx, qword ptr [r10+rax]
+    test    rcx, rcx
+    jz      spw_reg_next
+    mov     rdx, qword ptr [r10+rax+8]
+    call    secure_zero
+spw_reg_next:
+    inc     dword ptr [rbp-24]
+    jmp     spw_reg
 spw_body:
     mov     rax, qword ptr [g_body_ptr]         ; decrypted vault body, if resident
     test    rax, rax
@@ -398,18 +466,19 @@ secmem_alloc proc frame
     mov     qword ptr [rbp-32], rax         ; remember the base across the lock call
 
     ; keep it resident / out of the pagefile.  RE-ASSERT the hard working-set
-    ; minimum first: Argon2's 512 MiB KDF arena balloons the working set and, on
-    ; free, the OS trims it back and drops our startup reservation - so without
-    ; this the post-unlock body lock fails ERROR_WORKING_SET_QUOTA even though the
-    ; startup buffers locked fine.  (Diagnosed with Thomas: startup-fail flag = 0.)
+    ; minimum first, accounting for this pending allocation.
+    mov     rcx, qword ptr [rbp-24]
+    mov     qword ptr [g_secreg_pending], rcx
     call    sec_ws_grow
+    mov     qword ptr [g_secreg_pending], 0
     mov     rcx, qword ptr [rbp-32]
     mov     rdx, qword ptr [rbp-24]
     call    sec_lock
     test    eax, eax
     jz      sa_lockfail
 
-    mov     rcx, qword ptr [rbp-32]         ; register the live base (double-free guard)
+    mov     rcx, qword ptr [rbp-32]         ; register {base, len}
+    mov     rdx, qword ptr [rbp-24]
     call    secreg_add
     test    eax, eax
     jz      sa_regfull
@@ -418,9 +487,6 @@ secmem_alloc proc frame
     FRAME_EPILOG
     ret
 sa_lockfail:
-    ; A secret arena that cannot be pinned must never escape to a caller.  It is
-    ; still zero-filled by VirtualAlloc, but wipe it explicitly before release
-    ; so this cleanup remains correct if the allocation strategy changes.
     mov     rcx, qword ptr [rbp-32]
     mov     rdx, qword ptr [rbp-24]
     call    secure_zero
@@ -429,8 +495,6 @@ sa_lockfail:
     FRAME_EPILOG
     ret
 sa_regfull:
-    ; registry saturated (should never happen: CAP >> live set) - fail closed so no
-    ; untracked, un-double-free-guarded arena escapes.  Release what we allocated.
     WINCALL VirtualUnlock, qword ptr [rbp-32], qword ptr [rbp-24]
     WINCALL VirtualFree, qword ptr [rbp-32], 0, MEM_RELEASE
 sa_fail:
@@ -448,17 +512,14 @@ secmem_free proc frame
     test    rcx, rcx
     jz      sf_done
 
-    ; double-free guard: only wipe+release a base that is CURRENTLY registered as
-    ; live.  A second or stale free (an aliased/dangling vault body) finds it absent
-    ; and no-ops here - which is exactly the secure_zero-on-released-pages crash we
-    ; keep hitting on multi-vault teardown.  secreg_take clears the entry atomically
-    ; w.r.t. this single-threaded free, so the wipe below runs exactly once per base.
     mov     rcx, qword ptr [rbp-24]
     call    secreg_take
-    test    eax, eax
+    test    rax, rax
     jz      sf_done
-
-    ; wipe first - secrets must be gone before the pages can be reused
+    cmp     rax, qword ptr [rbp-32]
+    jbe     @F
+    mov     qword ptr [rbp-32], rax         ; wipe at least the registered byte span
+@@:
     mov     rcx, qword ptr [rbp-24]
     mov     rdx, qword ptr [rbp-32]
     call    secure_zero
@@ -472,15 +533,11 @@ secmem_free endp
 
 ; =============================================================================
 ; cmd_secscan (probe) - prove the secret-wipe path leaves no residue.
-;   Plant a random 16-byte sentinel into g_cfg_pass; scan this process's own
-;   committed read/write pages for it (must find the plant -> the scanner
-;   works); wipe g_cfg_pass with the real secure_zero; scan again (must find 0
-;   -> the wipe removed it).  The reference copy in secscan_ref is excluded by
-;   address.  exit 0 = pass.
 ; =============================================================================
 .data?
 align 8
-g_secreg    dq SECREG_CAP dup (?)       ; live secmem allocation bases (0 = free slot)
+g_secreg         dq (SECREG_CAP * 2) dup (?) ; live secmem {base, size} pairs
+g_secreg_pending dq ?                        ; in-flight secmem_alloc request size
 secscan_ref db 16 dup (?)               ; runtime-random reference sentinel
 align 8
 ss_mbi      db 48 dup (?)               ; MEMORY_BASIC_INFORMATION (static: no stack use)

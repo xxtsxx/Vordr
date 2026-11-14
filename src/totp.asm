@@ -18,12 +18,13 @@ extern GetSystemTimeAsFileTime:proc
 extern secure_zero:proc
 
 TOTP_PERIOD     equ 30
+TOTP_KEY_CAP    equ 160
 FT_UNIX_EPOCH   equ 116444736000000000     ; 100-ns ticks between 1601 and 1970
 
 .data?
 align 16
 public g_totp_key                         ; pinned + crash-wiped by secmem.asm
-g_totp_key  db 64 dup (?)                  ; decoded TOTP secret (wiped after use)
+g_totp_key  db TOTP_KEY_CAP dup (?)        ; decoded TOTP secret (wiped after use)
 
 .code
 
@@ -36,6 +37,7 @@ public base32_decode
 base32_decode proc frame
     FRAME_PROLOG 64
     ; [rbp-24]=dst [rbp-32]=cap [rbp-40]=outcount [rbp-48]=src [rbp-56]=srclen
+    mov     edx, edx                        ; zero-extend 32-bit srclen into rdx
     mov     qword ptr [rbp-24], r8
     mov     r8d, r9d
     mov     qword ptr [rbp-32], r8
@@ -105,10 +107,12 @@ b32_acc:
     inc     qword ptr [rbp-40]
     jmp     b32_loop
 b32_done:
+    xor     r10, r10
     mov     rax, qword ptr [rbp-40]
     FRAME_EPILOG
     ret
 b32_bad:
+    xor     r10, r10
     xor     eax, eax
     FRAME_EPILOG
     ret
@@ -139,9 +143,10 @@ public hotp
 hotp proc frame
     FRAME_PROLOG 96
     ; [rbp-24]=out  [rbp-40]=counterBE(8)  [rbp-72..rbp-53]=mac(20)
+    mov     edx, edx                        ; zero-extend 32-bit keylen into rdx
     mov     qword ptr [rbp-24], r9
     mov     rax, r8
-    bswap    rax                            ; counter -> big-endian
+    bswap   rax                             ; counter -> big-endian
     mov     qword ptr [rbp-40], rax
     ; hmac_sha1(key=rcx, keylen=rdx, msg=&counterBE, msglen=8, out=&mac)
     lea     r8, [rbp-40]
@@ -182,10 +187,107 @@ hotp_fmt:
     mov     byte ptr [r8+rcx], dl
     test    ecx, ecx
     jnz     hotp_fmt
+    ; wipe mac + counterBE ([rbp-72 .. rbp-32))
+    lea     rcx, [rbp-72]
+    mov     edx, 40
+    call    secure_zero
     mov     eax, 1
     FRAME_EPILOG
     ret
 hotp endp
+
+; ===========================================================================
+; totp_at(rcx=key, edx=keylen, r8=unix_sec, r9d=period,
+;         [rbp+48]=digits, [rbp+56]=out) -> eax = 1 ok / 0 invalid.
+;   Parameterized RFC 6238 TOTP (6..9 digits, caller-chosen period/time) used
+;   by the RFC 6238 Appendix B KATs and differential test suite.
+; ===========================================================================
+public totp_at
+totp_at proc frame
+    FRAME_PROLOG 128
+    ; [rbp-24]=key [rbp-32]=keylen [rbp-40]=digits [rbp-48]=out
+    ; [rbp-64]=counterBE(8) [rbp-96..rbp-77]=mac(20)
+    mov     edx, edx
+    test    rcx, rcx
+    jz      ta_bad
+    test    edx, edx
+    jz      ta_bad
+    test    r9d, r9d
+    jz      ta_bad
+    mov     eax, dword ptr [rbp+48]         ; digits
+    cmp     eax, 6
+    jb      ta_bad
+    cmp     eax, 9
+    ja      ta_bad
+    mov     r10, qword ptr [rbp+56]         ; out
+    test    r10, r10
+    jz      ta_bad
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], rdx
+    mov     dword ptr [rbp-40], eax
+    mov     qword ptr [rbp-48], r10
+    ; counter = unix_sec / period
+    mov     rax, r8
+    xor     edx, edx
+    mov     ecx, r9d
+    div     rcx
+    bswap   rax
+    mov     qword ptr [rbp-64], rax
+    mov     rcx, qword ptr [rbp-24]
+    mov     rdx, qword ptr [rbp-32]
+    lea     r8, [rbp-64]
+    mov     r9, 8
+    lea     rax, [rbp-96]
+    mov     qword ptr [rsp+32], rax
+    call    hmac_sha1
+    lea     r10, [rbp-96]
+    movzx   ecx, byte ptr [r10+19]
+    and     ecx, 0Fh
+    movzx   eax, byte ptr [r10+rcx]
+    and     eax, 7Fh
+    shl     eax, 24
+    mov     r9d, eax
+    movzx   eax, byte ptr [r10+rcx+1]
+    shl     eax, 16
+    or      r9d, eax
+    movzx   eax, byte ptr [r10+rcx+2]
+    shl     eax, 8
+    or      r9d, eax
+    movzx   eax, byte ptr [r10+rcx+3]
+    or      r9d, eax                        ; 31-bit binary code
+    ; modulus = 10^digits (64-bit so 10^9 fits cleanly)
+    mov     r10, 1
+    mov     ecx, dword ptr [rbp-40]
+ta_pow:
+    imul    r10, r10, 10
+    dec     ecx
+    jnz     ta_pow
+    mov     eax, r9d
+    xor     edx, edx
+    div     r10                             ; rdx = code mod 10^digits
+    mov     r8, qword ptr [rbp-48]
+    mov     rax, rdx
+    mov     r9d, 10
+    mov     ecx, dword ptr [rbp-40]
+ta_fmt:
+    dec     ecx
+    xor     edx, edx
+    div     r9
+    add     dl, '0'
+    mov     byte ptr [r8+rcx], dl
+    test    ecx, ecx
+    jnz     ta_fmt
+    lea     rcx, [rbp-96]
+    mov     edx, 40
+    call    secure_zero
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+ta_bad:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+totp_at endp
 
 ; ===========================================================================
 ; totp_now(rcx=key, edx=keylen, r8=out6) -> eax = 1.  Current TOTP code.
@@ -193,6 +295,7 @@ hotp endp
 public totp_now
 totp_now proc frame
     FRAME_PROLOG 48
+    mov     edx, edx
     mov     qword ptr [rbp-24], rcx
     mov     dword ptr [rbp-32], edx
     mov     qword ptr [rbp-40], r8
@@ -216,9 +319,10 @@ totp_now endp
 public totp_from_b32
 totp_from_b32 proc frame
     FRAME_PROLOG 48
+    mov     edx, edx
     mov     qword ptr [rbp-24], r8          ; out
     lea     r8, [g_totp_key]
-    mov     r9d, 64
+    mov     r9d, TOTP_KEY_CAP
     call    base32_decode                   ; eax = key length
     test    eax, eax
     jz      tfb_bad
@@ -228,14 +332,14 @@ totp_from_b32 proc frame
     mov     r8, qword ptr [rbp-24]
     call    totp_now
     lea     rcx, [g_totp_key]
-    mov     edx, 64
+    mov     edx, TOTP_KEY_CAP
     call    secure_zero
     mov     eax, 1
     FRAME_EPILOG
     ret
 tfb_bad:
     lea     rcx, [g_totp_key]
-    mov     edx, 64
+    mov     edx, TOTP_KEY_CAP
     call    secure_zero
     xor     eax, eax
     FRAME_EPILOG

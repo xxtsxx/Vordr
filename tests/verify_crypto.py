@@ -69,21 +69,22 @@ def _mul(a, b):
     return p & 0xFF
 
 
-def _key_expansion_256(key):
-    assert len(key) == 32
-    words = [list(key[i:i + 4]) for i in range(0, 32, 4)]  # 8 words
-    for i in range(8, 60):                                 # 15 round keys * 4
+def _key_expansion_any(key):
+    assert len(key) in (16, 24, 32)
+    nk = len(key) // 4
+    nr = nk + 6
+    words = [list(key[i:i + 4]) for i in range(0, len(key), 4)]
+    for i in range(nk, 4 * (nr + 1)):
         temp = list(words[i - 1])
-        if i % 8 == 0:
-            temp = temp[1:] + temp[:1]                     # RotWord
-            temp = [_SBOX[b] for b in temp]                # SubWord
-            temp[0] ^= _RCON[i // 8 - 1]
-        elif i % 8 == 4:
+        if i % nk == 0:
+            temp = temp[1:] + temp[:1]
             temp = [_SBOX[b] for b in temp]
-        words.append([words[i - 8][j] ^ temp[j] for j in range(4)])
-    # group into 15 round keys of 16 bytes
+            temp[0] ^= _RCON[i // nk - 1]
+        elif nk > 6 and i % nk == 4:
+            temp = [_SBOX[b] for b in temp]
+        words.append([words[i - nk][j] ^ temp[j] for j in range(4)])
     rk = []
-    for r in range(15):
+    for r in range(nr + 1):
         blk = []
         for w in range(4):
             blk += words[r * 4 + w]
@@ -91,7 +92,13 @@ def _key_expansion_256(key):
     return rk
 
 
-def _aes256_encrypt_block(block, rk):
+def _key_expansion_256(key):
+    assert len(key) == 32
+    return _key_expansion_any(key)
+
+
+def _aes_encrypt_block_nr(block, rk):
+    nr = len(rk) - 1
     s = [[block[r + 4 * c] for c in range(4)] for r in range(4)]  # column-major
 
     def add_rk(rkey):
@@ -100,7 +107,7 @@ def _aes256_encrypt_block(block, rk):
                 s[r][c] ^= rkey[c * 4 + r]
 
     add_rk(rk[0])
-    for rnd in range(1, 14):
+    for rnd in range(1, nr):
         for r in range(4):
             for c in range(4):
                 s[r][c] = _SBOX[s[r][c]]
@@ -120,8 +127,45 @@ def _aes256_encrypt_block(block, rk):
     s[1] = s[1][1:] + s[1][:1]
     s[2] = s[2][2:] + s[2][:2]
     s[3] = s[3][3:] + s[3][:3]
-    add_rk(rk[14])
+    add_rk(rk[nr])
     return bytes(s[r][c] for c in range(4) for r in range(4))
+
+
+def _aes256_encrypt_block(block, rk):
+    return _aes_encrypt_block_nr(block, rk)
+
+
+def _aes_ecb_hex(key, pt16):
+    rk = _key_expansion_any(key)
+    return _aes_encrypt_block_nr(pt16, rk).hex()
+
+
+def _winzip_ctr_hex(key, pt):
+    rk = _key_expansion_any(key)
+    ctr = 0
+    out = bytearray()
+    for off in range(0, len(pt), 16):
+        ctr = (ctr + 1) & ((1 << 128) - 1)
+        ks = _aes_encrypt_block_nr(ctr.to_bytes(16, "little"), rk)
+        chunk = pt[off:off + 16]
+        out += bytes(a ^ b for a, b in zip(chunk, ks))
+    return bytes(out).hex()
+
+
+def _blake2b_long_hex(data, outlen):
+    inp = struct.pack("<I", outlen) + data
+    if outlen <= 64:
+        return hashlib.blake2b(inp, digest_size=outlen).hexdigest()
+    out = bytearray()
+    v = hashlib.blake2b(inp, digest_size=64).digest()
+    out += v[:32]
+    rem = outlen - 32
+    while rem > 64:
+        v = hashlib.blake2b(v, digest_size=64).digest()
+        out += v[:32]
+        rem -= 32
+    out += hashlib.blake2b(v, digest_size=rem).digest()
+    return bytes(out).hex()
 
 
 def _ghash(h_int, data):
@@ -196,6 +240,12 @@ def hotp(key, counter, digits=6):
 #  These inputs are byte-identical to cmd_katreport in src/selftest.asm.
 # --------------------------------------------------------------------------- #
 OTP_KEY = b"12345678901234567890"          # RFC 4226 secret "12345678901234567890"
+B32_K64 = (
+    "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
+    "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNA="
+)
+K64_SECRET = b"1234567890123456789012345678901234567890123456789012345678901234"
+FIPS_PT16 = bytes.fromhex("00112233445566778899aabbccddeeff")
 
 
 def _sha256(d):
@@ -233,9 +283,15 @@ EXPECT = {
     "blake2b512/empty":    lambda: _b2b(b""),
     "blake2b512/abc":      lambda: _b2b(b"abc"),
     "blake2b512/fox":      lambda: _b2b(b"The quick brown fox jumps over the lazy dog"),
+    "blake2b-long96/abc":  lambda: _blake2b_long_hex(b"abc", 96),
+    "blake2b-long100/abc": lambda: _blake2b_long_hex(b"abc", 100),
     "hmac-sha1/rfc2202-1": lambda: _hmac1(b"\x0b" * 20, b"Hi There"),
     "hmac-sha1/rfc2202-2": lambda: _hmac1(b"Jefe", b"what do ya want for nothing?"),
     "hmac-sha1/custom":    lambda: _hmac1(b"vordr-key", b"differential test vector"),
+    "aes128/fips197c1":    lambda: _aes_ecb_hex(bytes(range(16)), FIPS_PT16),
+    "aes192/fips197c2":    lambda: _aes_ecb_hex(bytes(range(24)), FIPS_PT16),
+    "aes256/fips197c3":    lambda: _aes_ecb_hex(bytes(range(32)), FIPS_PT16),
+    "aes256ctr/winzip19":  lambda: _winzip_ctr_hex(bytes(range(32)), bytes(range(19))),
     "gcm256/zero/ct":      lambda: _gcm(b"\x00" * 32, b"\x00" * 12, b"", b"\x00" * 16, "ct"),
     "gcm256/zero/tag":     lambda: _gcm(b"\x00" * 32, b"\x00" * 12, b"", b"\x00" * 16, "tag"),
     "gcm256/aad/ct":       lambda: _gcm(b"\x00" * 32, b"\x00" * 12, bytes(range(16)), bytes(range(16)), "ct"),
@@ -245,6 +301,7 @@ EXPECT = {
     "gcm256/emptypt/tag":  lambda: _gcm(b"\x00" * 32, b"\x00" * 12, bytes(range(16)), b"", "tag"),
     "base32/hello":        lambda: base64.b32decode("JBSWY3DP").hex(),
     "base32/otp16":        lambda: base64.b32decode("JBSWY3DPEHPK3PXP").hex(),
+    "base32/rfc6238-k64":  lambda: base64.b32decode(B32_K64).hex(),
     # argon2id has no stdlib reference; checked against the published vector below.
     "argon2id/rfc9106":    None,
     "argon2id/ref-t2m64":  None,
@@ -253,6 +310,10 @@ EXPECT = {
 
 def hotp_expect(counter):
     return hotp(OTP_KEY, counter, 6).encode("ascii").hex()
+
+
+def totp8_expect(key, unix_sec):
+    return hotp(key, unix_sec // 30, 8).encode("ascii").hex()
 
 
 # --------------------------------------------------------------------------- #
@@ -268,6 +329,10 @@ PUBLISHED = {
     # RFC 2202, HMAC-SHA-1 test cases 1 and 2
     "hmac-sha1/rfc2202-1": "b617318655057264e28bc0b6fb378c8ef146be00",
     "hmac-sha1/rfc2202-2": "effcdf6ae5eb2fa2d27416d5f184df9c259a7c79",
+    # FIPS 197, Appendix C.1 / C.2 / C.3 (AES-128, AES-192, AES-256)
+    "aes128/fips197c1": "69c4e0d86a7b0430d8cdb78070b4c55a",
+    "aes192/fips197c2": "dda97ca4864cdfe06eaf70a0ec0d7191",
+    "aes256/fips197c3": "8ea2b7ca516745bfeafc49904b496089",
     # NIST SP800-38D / GCM spec Test Case 14 (AES-256, all-zero key/iv, 16 zero pt)
     "gcm256/zero/ct": "cea7403d4d606b6e074ec5d3baf39d18",
     "gcm256/zero/tag": "d0d1c8a799996bf0265b98b5d48ab919",
@@ -281,6 +346,13 @@ PUBLISHED = {
 # RFC 4226, Appendix D truncated 6-digit HOTP values, counters 0..9
 PUBLISHED_HOTP = ["755224", "287082", "359152", "969429", "338314",
                   "254676", "287922", "162583", "399871", "520489"]
+# RFC 6238, Appendix B 8-digit SHA-1 TOTP values
+PUBLISHED_TOTP8 = {
+    59: "94287082",
+    1111111109: "07081804",
+    1234567890: "89005924",
+    2000000000: "69279037",
+}
 
 
 def run_vordr(exe):
@@ -347,6 +419,9 @@ def main():
         check(f"hotp/rfc4226:{c}", hotp_expect(c))
     for c in [1, 37037036, 41152263, 66666666]:
         check(f"totp/rfc6238:{c}", hotp_expect(c))
+    for t in [59, 1111111109, 1234567890, 2000000000]:
+        check(f"totp8/rfc6238:{t}", totp8_expect(OTP_KEY, t))
+        check(f"totp8-k64/custom:{t}", totp8_expect(K64_SECRET, t))
     print("\n".join(lines))
 
     # 2) published official vectors
@@ -369,6 +444,9 @@ def main():
         "blake2b512/abc": "RFC 7693 App.A",
         "hmac-sha1/rfc2202-1": "RFC 2202 case 1",
         "hmac-sha1/rfc2202-2": "RFC 2202 case 2",
+        "aes128/fips197c1": "FIPS 197 App.C.1",
+        "aes192/fips197c2": "FIPS 197 App.C.2",
+        "aes256/fips197c3": "FIPS 197 App.C.3",
         "gcm256/zero/ct": "NIST SP800-38D TC14",
         "gcm256/zero/tag": "NIST SP800-38D TC14",
         "argon2id/rfc9106": "RFC 9106 sec.5.3",
@@ -378,6 +456,8 @@ def main():
         pcheck(label, expected, cites[label])
     for c, val in enumerate(PUBLISHED_HOTP):
         pcheck(f"hotp/rfc4226:{c}", val.encode().hex(), "RFC 4226 App.D")
+    for t, val in PUBLISHED_TOTP8.items():
+        pcheck(f"totp8/rfc6238:{t}", val.encode().hex(), "RFC 6238 App.B")
     print("\n".join(plines))
 
     print("\n" + "=" * 64)

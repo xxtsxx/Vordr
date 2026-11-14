@@ -63,14 +63,52 @@ def documents():
     return os.path.join(os.path.expanduser('~'), 'Documents')
 
 
+def _csidl_folder(csidl):
+    buf = ctypes.create_unicode_buffer(260)
+    if ctypes.windll.shell32.SHGetFolderPathW(None, csidl, None, 0, buf) == 0:
+        return buf.value
+    return None
+
+
+def _expand_hklm_vault(val):
+    """Match regcfg.asm: never run ExpandEnvironmentStringsW on HKLM policy;
+    resolve only leading %USERPROFILE%\\, %LOCALAPPDATA%\\, or %APPDATA%\\ via
+    SHGetFolderPathW and reject any remaining '%'."""
+    prefixes = (
+        ('%USERPROFILE%\\', 0x28),
+        ('%LOCALAPPDATA%\\', 0x1C),
+        ('%APPDATA%\\', 0x1A),
+    )
+    up = val.upper()
+    for pfx, csidl in prefixes:
+        if up.startswith(pfx):
+            base = _csidl_folder(csidl)
+            if not base:
+                return None
+            val = os.path.join(base, val[len(pfx):])
+            break
+    if '%' in val:
+        return None
+    return val
+
+
 def registered_paths():
     out = []
     for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
         try:
             with winreg.OpenKey(root, r'SOFTWARE\Vordr') as k:
                 v, t = winreg.QueryValueEx(k, 'vault')
-                if v and t == winreg.REG_EXPAND_SZ:
+                if not v or not isinstance(v, str):
+                    continue
+                if root == winreg.HKEY_LOCAL_MACHINE:
+                    if t in (winreg.REG_SZ, winreg.REG_EXPAND_SZ):
+                        v = _expand_hklm_vault(v)
+                    else:
+                        v = None
+                elif t == winreg.REG_EXPAND_SZ:
                     v = winreg.ExpandEnvironmentStrings(v)
+                elif t != winreg.REG_SZ:
+                    v = None
                 if v:
                     out.append(v)
         except OSError:
@@ -110,9 +148,12 @@ def main():
         print('list only - nothing changed.  Run with --delete to remove the "other" values '
               '(a .reg backup is written first).')
         return 0
-    backup = os.path.join(tempfile.gettempdir(),
-                          'vordr-rollback-backup-%s.reg' % time.strftime('%Y%m%d-%H%M%S'))
-    subprocess.run(['reg', 'export', 'HKCU\\' + KEY, backup, '/y'], check=True, capture_output=True)
+    stamp = time.strftime('%Y%m%d-%H%M%S-')
+    fd, backup = tempfile.mkstemp(prefix='vordr-rollback-backup-' + stamp, suffix='.reg')
+    os.close(fd)
+    sysroot = os.environ.get('SystemRoot') or r'C:\Windows'
+    reg_exe = os.path.join(sysroot, 'System32', 'reg.exe')
+    subprocess.run([reg_exe, 'export', 'HKCU\\' + KEY, backup, '/y'], check=True, capture_output=True)
     print('backup: %s' % backup)
     for n in other:
         winreg.DeleteValue(k, n)

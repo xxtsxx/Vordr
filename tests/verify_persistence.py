@@ -24,18 +24,26 @@ def main():
     try:
         deep = root / ("a" * 90) / ("b" * 90) / ("c" * 60)
         (owned_root / deep.relative_to(root)).mkdir(parents=True)
+        # VDR-15: cwd stays below MAX_PATH so a non-longPathAware Python can spawn
+        # the child, while the relative filename resolves past 260 chars inside
+        # Vordr's dynamic GetFullPathNameW retry path in path_longify.
+        rel_cwd = root / ("a" * 90) / ("b" * 90)
+        rel_name = ("r" * 90) + ".vordr"
+        assert len(str(rel_cwd)) < 245
+        assert len(str(rel_cwd / rel_name)) > 275
         env = os.environ.copy()
         env["TEMP"] = env["TMP"] = str(root)
-        cases = [("preview cleanup", ["tmptest"])]
+        cases = [("preview cleanup", ["tmptest"], None)]
         for label, directory in (("short", root), ("long", deep)):
             for command in ("vexselkat", "vimpkat"):
                 path = directory / (command + ".vordr")
                 if label == "long":
                     assert len(str(path)) > 260
-                cases.append((label + " " + command, [command, str(path)]))
-        for label, command in cases:
+                cases.append((label + " " + command, [command, str(path)], None))
+        cases.append(("relative long-cwd vexselkat", ["vexselkat", rel_name], str(rel_cwd)))
+        for label, command, cwd in cases:
             result = subprocess.run(
-                [exe, *command], env=env, capture_output=True, text=True, timeout=60
+                [exe, *command], cwd=cwd, env=env, capture_output=True, text=True, timeout=60
             )
             if result.returncode:
                 raise RuntimeError(

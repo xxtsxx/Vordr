@@ -33,6 +33,7 @@ extern vault_title_at:proc
 extern vault_field_count:proc
 extern vault_field_get:proc
 extern attach_open:proc
+extern attach_free:proc
 externdef g_sel:byte                     ; per-entry export selection mask (gui.asm)
 MAX_SEL     equ 8192                     ; its size - mirrors gui/vault/zipimport,
                                          ;   constcheck gates the set
@@ -79,7 +80,7 @@ g_pb_t      db 20 dup (?)
 ;   PBKDF2-HMAC-SHA1, PBKDF2_ITERS iterations, 4 x 20-byte blocks.
 ; =============================================================================
 public pbkdf2_ae
-public g_ae_dk
+public g_ae_dk, g_pb_u, g_pb_un, g_pb_t
 pbkdf2_ae proc frame
     FRAME_PROLOG 96
     mov     qword ptr [rbp-24], rcx             ; pw
@@ -229,6 +230,12 @@ zf_done:
     call    secure_zero
     lea     rcx, [g_ze_ctr]
     mov     edx, 16
+    call    secure_zero
+    lea     rcx, [g_ze_auth]
+    mov     edx, 20
+    call    secure_zero
+    lea     rcx, [g_zj_fld]
+    mov     edx, 40
     call    secure_zero
     FRAME_EPILOG
     ret
@@ -791,10 +798,13 @@ zbj_edone:
     lea     rcx, [g_json]
     mov     dl, ']'
     call    buf_putb
+    cmp     byte ptr [g_xl_err], 0              ; JSON_CAP overflow? fail closed instead of
+    jne     zbj_err                             ;   sealing a truncated vordr.json
     xor     eax, eax
     FRAME_EPILOG
     ret
 zbj_err:
+    call    ze_json_free
     mov     eax, 1
     FRAME_EPILOG
     ret
@@ -1044,6 +1054,13 @@ zea_elp:
     call    vault_is_deleted                    ;   ship either (its json entry is gone, so
     test    eax, eax                            ;   these would be orphaned blobs anyway)
     jnz     zea_enext
+    mov     eax, dword ptr [rbp-44]
+    cmp     eax, MAX_SEL                        ; past the checklist -> never selectable, and
+    jae     zea_enext                           ;   reading g_sel there runs off the array
+    lea     r10, [g_sel]                        ; export selection: skip unchecked entries so
+    movzx   ecx, byte ptr [r10+rax]             ;   deselected records never leak attachments
+    test    ecx, ecx
+    je      zea_enext
     mov     ecx, dword ptr [rbp-44]
     call    vault_field_count
     mov     dword ptr [rbp-48], eax             ; fc
@@ -1085,12 +1102,9 @@ zea_att:
     mov     r8, qword ptr [rbp-80]
     mov     r9, qword ptr [rbp-72]
     call    ze_add_file
-    mov     rcx, qword ptr [rbp-80]              ; wipe plaintext (holds secret bytes)
-    mov     rdx, qword ptr [rbp-72]              ; before returning it to the heap
-    call    secure_zero
-    mov     rcx, qword ptr [rbp-80]
+    mov     rcx, qword ptr [rbp-80]             ; wipe + release secmem attachment plaintext
     mov     rdx, qword ptr [rbp-72]
-    call    mem_free
+    call    attach_free
 zea_fnext:
     inc     dword ptr [rbp-52]
     jmp     zea_flp
@@ -1150,6 +1164,8 @@ comp_pwok:
     test    eax, eax
     jnz     comp_ziperr
     call    ze_finish
+    cmp     byte ptr [g_xl_err], 0              ; CD/EOCD append hit ZE_MAXCAP or OOM?
+    jne     comp_ziperr
     lea     rcx, [g_ze_u8pw]                    ; wipe the UTF-8 password copy
     mov     edx, ZE_PWCAP
     call    secure_zero
@@ -1157,14 +1173,12 @@ comp_pwok:
     FRAME_EPILOG
     ret
 comp_ziperr:
-    call    ze_json_free                        ; an abort must not leave it either
+    call    ze_json_free                        ; an abort must not leave plaintext json
+    call    ze_free                             ;   or a half-built archive + derived keys
+comp_err:
     lea     rcx, [g_ze_u8pw]
     mov     edx, ZE_PWCAP
     call    secure_zero
-    mov     eax, 1
-    FRAME_EPILOG
-    ret
-comp_err:
     mov     eax, 1
     FRAME_EPILOG
     ret
@@ -1189,16 +1203,17 @@ buf_reserve proc frame
     jbe     brs_ok
     cmp     qword ptr [rcx+24], 0               ; fixed-capacity buffer
     je      brs_no
-    cmp     rax, ZE_MAXCAP
+    mov     r9d, ZE_MAXCAP
+    cmp     rax, r9
     ja      brs_no
     mov     r8, qword ptr [rcx+16]              ; new cap = max(2*cap, needed)
     shl     r8, 1
     cmp     r8, rax
     jae     @F
     mov     r8, rax
-@@: cmp     r8, ZE_MAXCAP
+@@: cmp     r8, r9
     jbe     @F
-    mov     r8, ZE_MAXCAP
+    mov     r8, r9
 @@: mov     qword ptr [rbp-32], r8
     mov     rcx, r8
     call    mem_alloc
@@ -1544,5 +1559,136 @@ zxn_fail:
     FRAME_EPILOG
     ret
 cmd_zexname endp
+
+; =============================================================================
+; cmd_zexselkat - VDR-04 selective AES-ZIP attachment filter probe.
+;   Builds a 2-entry in-memory vault where BOTH Entry 0 and Entry 1 carry 2
+;   attachments, ticks ONLY Entry 0 (g_sel[0]=1, g_sel[1]=0), composes the ZIP,
+;   and asserts:
+;     1) g_ze_cn == 3 (vordr.json + Entry 0's 2 attachments, NOT 5).
+;     2) Ticking neither entry (g_sel[0]=0, g_sel[1]=0) yields g_ze_cn == 1.
+;     3) Stage+commit importing the 3-member archive into an empty vault yields
+;        vault_count == 1 with both of Entry 0's attachments intact.
+; =============================================================================
+extern do_attgen:proc
+extern vault_build_entry:proc
+extern vault_lock:proc
+extern attach_reset:proc
+extern zi_stage:proc
+extern zi_commit:proc
+extern zi_att_verify:proc
+externdef g_body_ptr:qword
+externdef g_body_len:qword
+
+.data
+CSTR zxs_ok,  "zexselkat: PASS (unchecked entries emit zero attachment members in AES-ZIP)",13,10
+CSTR zxs_bad, "zexselkat: FAIL (unchecked entry leaked attachments into AES-ZIP)",13,10
+align 2
+WSTR zxs_wpw, <VordrSelZip1>
+.code
+LANDING_PAD
+public cmd_zexselkat
+cmd_zexselkat proc frame
+    FRAME_PROLOG 64
+    call    do_attgen                           ; Entry 0 (2 attachments), g_field_list still live
+    test    eax, eax
+    jnz     zxs_fail
+    call    vault_build_entry                   ; Entry 1 (also 2 attachments)
+    test    eax, eax
+    jnz     zxs_faillk
+    call    vault_count
+    cmp     eax, 2
+    jne     zxs_faillk
+    ; Case 1: select ONLY Entry 0 (g_sel[0]=1, g_sel[1]=0) -> expect 1 json + 2 att = 3
+    lea     r10, [g_sel]
+    mov     byte ptr [r10+0], 1
+    mov     byte ptr [r10+1], 0
+    lea     rcx, [zxs_wpw]
+    mov     edx, 24                             ; 12 wide chars * 2
+    call    ze_compose
+    test    eax, eax
+    jnz     zxs_faillk
+    cmp     dword ptr [g_ze_cn], 3
+    jne     zxs_failz
+    ; Save copy of the 3-member archive so we can round-trip import it after Case 2
+    lea     r10, [g_zbuf]
+    mov     rax, qword ptr [r10+8]              ; archive byte len
+    mov     qword ptr [rbp-32], rax
+    mov     rcx, rax
+    call    mem_alloc
+    test    rax, rax
+    jz      zxs_failz
+    mov     qword ptr [rbp-24], rax             ; saved archive copy
+    mov     rcx, rax
+    lea     r10, [g_zbuf]
+    mov     rdx, qword ptr [r10]
+    mov     r8, qword ptr [rbp-32]
+    call    buf_copy
+    call    ze_free
+    ; Case 2: select NEITHER entry -> expect vordr.json only (g_ze_cn == 1)
+    lea     r10, [g_sel]
+    mov     byte ptr [r10+0], 0
+    mov     byte ptr [r10+1], 0
+    lea     rcx, [zxs_wpw]
+    mov     edx, 24
+    call    ze_compose
+    test    eax, eax
+    jnz     zxs_failbuf
+    cmp     dword ptr [g_ze_cn], 1
+    jne     zxs_failbuf
+    call    ze_free
+    ; Case 3: wipe attachments + reset vault body to 0 entries, then round-trip import
+    call    attach_reset
+    mov     rax, qword ptr [g_body_ptr]
+    mov     dword ptr [rax], 0
+    mov     qword ptr [g_body_len], 4
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-32]
+    lea     r8, [zxs_wpw]
+    mov     r9d, 24
+    call    zi_stage
+    cmp     eax, 1                              ; exactly 1 entry staged
+    jne     zxs_failbuf
+    lea     r10, [g_sel]
+    mov     byte ptr [r10+0], 1
+    call    zi_commit
+    cmp     eax, 1
+    jne     zxs_failbuf
+    call    vault_count
+    cmp     eax, 1
+    jne     zxs_failbuf
+    mov     ecx, 1
+    call    zi_att_verify
+    cmp     eax, 2                              ; both of Entry 0's attachments survived
+    jne     zxs_failbuf
+    mov     rcx, qword ptr [rbp-24]
+    mov     rdx, qword ptr [rbp-32]
+    call    mem_free
+    call    vault_lock
+    lea     rcx, [zxs_ok]
+    mov     edx, zxs_ok_len
+    call    print_a
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+zxs_failbuf:
+    call    ze_free
+    mov     rcx, qword ptr [rbp-24]
+    mov     rdx, qword ptr [rbp-32]
+    call    mem_free
+    call    vault_lock
+    jmp     zxs_fail
+zxs_failz:
+    call    ze_free
+zxs_faillk:
+    call    vault_lock
+zxs_fail:
+    lea     rcx, [zxs_bad]
+    mov     edx, zxs_bad_len
+    call    print_a
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_zexselkat endp
 
 end

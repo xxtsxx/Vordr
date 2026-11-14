@@ -30,6 +30,7 @@ SRC  = os.path.normpath(os.path.join(HERE, "..", "src"))
 CONTRACTS = {
     "gui_wstrcpy":       ("r8",  6),
     "cfg_default_vault": ("edx", 4),
+    "zj_str":            ("edx", 4),
 }
 
 SETS = {

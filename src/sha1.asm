@@ -148,6 +148,10 @@ sb_r4:
     add     dword ptr [rcx+12], eax
     mov     eax, dword ptr [rbp-356]
     add     dword ptr [rcx+16], eax
+    ; wipe working state a..e + message schedule W[0..79] ([rbp-356 .. rbp-16))
+    lea     rcx, [rbp-356]
+    mov     edx, 340
+    call    secure_zero
     FRAME_EPILOG
     ret
 sha1_block endp
@@ -267,6 +271,9 @@ sf_out:
     inc     r9d
     cmp     r9d, 5
     jb      sf_out
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, 96
+    call    secure_zero
     FRAME_EPILOG
     ret
 sha1_final endp

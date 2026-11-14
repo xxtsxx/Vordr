@@ -10,16 +10,18 @@
 ; and asserts the child died with the expected fastfail / access-violation code,
 ; proving the control both fires and fails closed.
 ;
-;   vordr redteam canary     -> FF_STACK_COOKIE (2)
-;   vordr redteam shadow     -> FF_SHADOW_STACK (0xF001)
-;   vordr redteam dlpv       -> FF_GUARD_ICALL  (10)
-;   vordr redteam overflow   -> FF_OVERFLOW     (0xF005)
-;   vordr redteam bounds     -> FF_BOUNDS       (0xF004)
-;   vordr redteam typemagic  -> FF_TYPE_MAGIC   (0xF003)
-;   vordr redteam heaptag    -> FF_HEAP_TAG     (0xF002)
-;   vordr redteam iat        -> FF_IAT_RO       (0x1A70) - see rt_iat_veh
-;   vordr redteam crash      -> 0xC0000409 via crash containment + a breadcrumb
-;                               (tests/redteam.py checks both)
+;   vordr redteam canary      -> FF_STACK_COOKIE (2)
+;   vordr redteam shadow      -> FF_SHADOW_STACK (0xF001)
+;   vordr redteam shadow_anc  -> FF_SHADOW_STACK (0xF001) - ancestor-frame skip
+;   vordr redteam dlpv        -> FF_GUARD_ICALL  (10)
+;   vordr redteam overflow    -> FF_OVERFLOW     (0xF005)
+;   vordr redteam bounds      -> FF_BOUNDS       (0xF004)
+;   vordr redteam typemagic   -> FF_TYPE_MAGIC   (0xF003)
+;   vordr redteam heaptag     -> FF_HEAP_TAG     (0xF002) - via mem_alloc/mem_free
+;   vordr redteam heapmagic   -> FF_TYPE_MAGIC   (0xF003) - via mem_alloc/mem_free
+;   vordr redteam iat         -> FF_IAT_RO       (0x1A70) - see rt_iat_veh
+;   vordr redteam crash       -> 0xC0000409 via crash containment + a breadcrumb
+;   vordr redteam crash_reent -> 0xC0000409 immediate fast-exit when g_in_crash=1
 ;
 ; If a case RETURNS (the control failed to fire), cmd_redteam exits non-zero so
 ; the harness records a FAIL.  Compiled only into the instrumented build
@@ -31,10 +33,11 @@ include macros.inc
 ifdef DBG_TRACE
 
 externdef g_cfg_in:qword                ; first positional arg (the case name)
+externdef g_in_crash:dword              ; hardening.asm: crash re-entrancy latch
 extern wstr_eq:proc                     ; (rcx,rdx) -> eax=1 if equal UTF-16
 extern print_a:proc                     ; (rcx=ptr, edx=len)
-extern tagged_alloc:proc                ; (rcx=size) -> rax=user ptr
-extern tagged_check:proc                ; (rcx=user ptr) fastfails on violation
+extern mem_alloc:proc                   ; production allocator -> tagged_alloc
+extern mem_free:proc                    ; production deallocator -> tagged_free
 extern __imp_CloseHandle:qword          ; an IAT slot (RO after iat_lockdown)
 extern AddVectoredExceptionHandler:proc
 extern ExitProcess:proc
@@ -56,17 +59,21 @@ EXCEPTION_AV        equ 0C0000005h
 EXC_CONTINUE_SEARCH equ 0
 
 .const
-WSTR rc_canary,    <canary>
-WSTR rc_shadow,    <shadow>
-WSTR rc_dlpv,      <dlpv>
-WSTR rc_overflow,  <overflow>
-WSTR rc_bounds,    <bounds>
-WSTR rc_typemagic, <typemagic>
-WSTR rc_heaptag,   <heaptag>
-WSTR rc_iat,       <iat>
-WSTR rc_crash,     <crash>
+align 2
+WSTR rc_canary,      <canary>
+WSTR rc_shadow,      <shadow>
+WSTR rc_shadow_anc,  <shadow_anc>
+WSTR rc_dlpv,        <dlpv>
+WSTR rc_overflow,    <overflow>
+WSTR rc_bounds,      <bounds>
+WSTR rc_typemagic,   <typemagic>
+WSTR rc_heaptag,     <heaptag>
+WSTR rc_heapmagic,   <heapmagic>
+WSTR rc_iat,         <iat>
+WSTR rc_crash,       <crash>
+WSTR rc_crash_reent, <crash_reent>
 CSTR rt_msg_nofire, "redteam: control did NOT fire - FAIL",13,10
-CSTR rt_msg_unkn,   "redteam: unknown case (canary|shadow|dlpv|overflow|bounds|typemagic|heaptag|iat|crash)",13,10
+CSTR rt_msg_unkn,   "redteam: unknown case (canary|shadow|shadow_anc|dlpv|overflow|bounds|typemagic|heaptag|heapmagic|iat|crash|crash_reent)",13,10
 
 .data?
 align 16
@@ -92,34 +99,43 @@ cmd_redteam proc frame
     test    rcx, rcx
     jz      rt_unknown
 
-    RTCASE  rt_do_canary,    rc_canary
-    RTCASE  rt_do_shadow,    rc_shadow
-    RTCASE  rt_do_dlpv,      rc_dlpv
-    RTCASE  rt_do_overflow,  rc_overflow
-    RTCASE  rt_do_bounds,    rc_bounds
-    RTCASE  rt_do_type,      rc_typemagic
-    RTCASE  rt_do_heap,      rc_heaptag
-    RTCASE  rt_do_iat,       rc_iat
-    RTCASE  rt_do_crash,     rc_crash
+    RTCASE  rt_do_canary,      rc_canary
+    RTCASE  rt_do_shadow,      rc_shadow
+    RTCASE  rt_do_shadow_anc,  rc_shadow_anc
+    RTCASE  rt_do_dlpv,        rc_dlpv
+    RTCASE  rt_do_overflow,    rc_overflow
+    RTCASE  rt_do_bounds,      rc_bounds
+    RTCASE  rt_do_type,        rc_typemagic
+    RTCASE  rt_do_heap,        rc_heaptag
+    RTCASE  rt_do_heapmagic,   rc_heapmagic
+    RTCASE  rt_do_iat,         rc_iat
+    RTCASE  rt_do_crash,       rc_crash
+    RTCASE  rt_do_crash_reent, rc_crash_reent
     jmp     rt_unknown
 
-rt_do_canary:   call rt_v_canary
+rt_do_canary:      call rt_v_canary
     jmp     rt_nofire
-rt_do_shadow:   call rt_v_shadow
+rt_do_shadow:      call rt_v_shadow
     jmp     rt_nofire
-rt_do_dlpv:     call rt_v_dlpv
+rt_do_shadow_anc:  call rt_v_shadow_anc
     jmp     rt_nofire
-rt_do_overflow: call rt_v_overflow
+rt_do_dlpv:        call rt_v_dlpv
     jmp     rt_nofire
-rt_do_bounds:   call rt_v_bounds
+rt_do_overflow:    call rt_v_overflow
     jmp     rt_nofire
-rt_do_type:     call rt_v_type
+rt_do_bounds:      call rt_v_bounds
     jmp     rt_nofire
-rt_do_heap:     call rt_v_heap
+rt_do_type:        call rt_v_type
     jmp     rt_nofire
-rt_do_iat:      call rt_v_iat
+rt_do_heap:        call rt_v_heap
     jmp     rt_nofire
-rt_do_crash:    call rt_v_crash
+rt_do_heapmagic:   call rt_v_heapmagic
+    jmp     rt_nofire
+rt_do_iat:         call rt_v_iat
+    jmp     rt_nofire
+rt_do_crash:       call rt_v_crash
+    jmp     rt_nofire
+rt_do_crash_reent: call rt_v_crash_reent
     jmp     rt_nofire
 
 rt_nofire:
@@ -161,6 +177,24 @@ rt_v_shadow proc frame
     ret
 rt_v_shadow endp
 
+; B2b strict top-of-stack shadow check (VDR-12): overwrite leaf's saved return
+;   address with an ANCESTOR frame's valid return address that IS present deeper
+;   on the per-thread shadow stack.  Strict top-of-stack comparison must trap.
+rt_v_shadow_leaf proc frame
+    FRAME_PROLOG 32
+    mov     qword ptr [rbp+8], rcx           ; ancestor return addr (valid deeper entry)
+    FRAME_EPILOG                             ; top-of-stack != rcx -> FF_SHADOW_STACK
+    ret
+rt_v_shadow_leaf endp
+
+rt_v_shadow_anc proc frame
+    FRAME_PROLOG 32
+    mov     rcx, qword ptr [rbp+8]           ; our own pushed return address
+    call    rt_v_shadow_leaf
+    FRAME_EPILOG
+    ret
+rt_v_shadow_anc endp
+
 ; B4 DLPV: guarded indirect call through a pointer with no landing-pad magic.
 rt_v_dlpv proc frame
     FRAME_PROLOG 32
@@ -197,24 +231,44 @@ rt_v_type proc frame
     ret
 rt_v_type endp
 
-; B9 tagged heap: smash a live block's rear canary, then validate it.
+; B9 tagged heap (VDR-22): smash a live block's rear canary via production
+;   mem_alloc / mem_free -> tagged_check traps with FF_HEAP_TAG.
 rt_v_heap proc frame
-    FRAME_PROLOG 32
-    mov     rcx, 64
-    call    tagged_alloc
+    FRAME_PROLOG 48
+    mov     ecx, 64
+    call    mem_alloc
     test    rax, rax
     jz      rt_heap_done                     ; OOM: can't run the test
-    mov     qword ptr [rbp-24], rax          ; save user ptr
+    mov     qword ptr [rbp-16], rax          ; save user ptr
     xor     byte ptr [rax+64], 1             ; overflow past user region -> rear canary
                                              ;   (XOR, not a fixed store: a random canary
                                              ;   byte that already equals the stored value
                                              ;   is left intact - a false FAIL 1 in 256)
-    mov     rcx, qword ptr [rbp-24]
-    call    tagged_check                     ; rear-canary mismatch -> FF_HEAP_TAG
+    mov     rcx, qword ptr [rbp-16]
+    mov     edx, 64
+    call    mem_free                         ; rear-canary mismatch -> FF_HEAP_TAG
 rt_heap_done:
     FRAME_EPILOG
     ret
 rt_v_heap endp
+
+; B9b tagged heap header magic (VDR-22): corrupt HEAPBLK.magic at [ptr-32] on a
+;   production mem_alloc block -> mem_free -> TYPE_CHECK -> FF_TYPE_MAGIC.
+rt_v_heapmagic proc frame
+    FRAME_PROLOG 48
+    mov     ecx, 64
+    call    mem_alloc
+    test    rax, rax
+    jz      rt_hm_done
+    mov     qword ptr [rbp-16], rax
+    xor     dword ptr [rax-32], 1            ; corrupt HEAPBLK.magic (TM_HEAPBLK)
+    mov     rcx, qword ptr [rbp-16]
+    mov     edx, 64
+    call    mem_free                         ; -> FF_TYPE_MAGIC
+rt_hm_done:
+    FRAME_EPILOG
+    ret
+rt_v_heapmagic endp
 
 ; B5 IAT lockdown: write to a read-only IAT slot -> access violation.
 rt_v_iat proc frame
@@ -278,6 +332,19 @@ rt_v_crash proc frame
     FRAME_EPILOG
     ret
 rt_v_crash endp
+
+; Crash re-entrancy fast-exit (VDR-12): pre-arm g_in_crash = 1 to simulate a
+;   secondary fault inside crash_contain / secmem_panic_wipe / crash_dump.
+;   crash_veh -> crash_contain must immediately TerminateProcess(0xC0000409)
+;   without recursing or writing a breadcrumb.
+rt_v_crash_reent proc frame
+    FRAME_PROLOG 32
+    mov     dword ptr [g_in_crash], 1
+    xor     eax, eax
+    mov     qword ptr [rax+8], rax
+    FRAME_EPILOG
+    ret
+rt_v_crash_reent endp
 
 endif ; DBG_TRACE
 

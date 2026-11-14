@@ -49,16 +49,16 @@ flowchart LR
 
 | Stage | Evidence produced | Important limit |
 |---|---|---|
-| Fault injection | Deliberate canary, shadow-stack, indirect-call, arithmetic, bounds, type, heap-tag, and IAT violations each end the process with that control's own fail-fast code (`tests/redteam.py`); an ordinary access violation is contained (0xC0000409, no crash dialog) with a breadcrumb naming the fault | Checks termination behavior, not all paths; the IAT case shows the slot is read-only at the write, not that `iat_lockdown` alone made it so |
-| Strict build | Nine Python source checkers plus assembly/resource/link success; framecheck warnings gate too | Python absence skips source checks; pattern-based checkers have blind spots |
+| Fault injection | Deliberate canary, shadow-stack (top and ancestor-skip), indirect-call, arithmetic, bounds, type, production heap-tag (`mem_alloc`/`mem_free`), crash-reentrancy, DLL System32 load-config, and IAT violations each end or pass with that control's expected result (`tests/redteam.py`); an ordinary access violation is contained (0xC0000409, no crash dialog) with a breadcrumb naming the fault | Checks termination behavior, not all paths; the IAT case shows the slot is read-only at the write, not that `iat_lockdown` alone made it so |
+| Strict build | Ten Python source/doc checkers plus assembly/resource/link success and PE `LOAD_CONFIG` `DependentLoadFlags == 0x0800` verification (`pe_normalise.py`); `build.cmd release strict` fails closed if Python is absent | Pattern-based checkers have blind spots |
 | Self-tests | Known-answer checks pass; normal release rejects diagnostic file-writing verbs in the following stage | Fixed vectors exercise selected cases |
-| Round-trip | Serialization, imports/exports, attachments, policy, locking, parsers, preview cleanup, and persistence probes; an independent reader of the vault format; frozen v0.2.3 vaults; a real, isolated GUI instance driven from outside | Synthetic and bounded input space; geometry and GUI tests skip without a desktop |
+| Round-trip | Serialization, imports/exports, attachments, policy, TPM label binding, SecureUnlock fail-closed policy, locking, parsers, preview cleanup, and persistence probes; an independent reader of the vault format; frozen v0.2.3 vaults; a real, isolated GUI instance driven from outside | Synthetic and bounded input space; geometry and GUI tests skip without a desktop |
 | Crypto differential | Output compared with independent Python calculations and published vectors | Functional output checks, not a side-channel proof |
-| Installer | MSI tables and component costing checked | Does not install, upgrade, or uninstall the program |
+| Installer | MSI tables, policy `LaunchCondition` guards, downgrade prevention (`NEWERVERSIONDETECTED`), and component costing checked | Does not install, upgrade, or uninstall the program |
 
-`--quick` skips fault injection. Missing Python can skip crypto/persistence
-checks; missing `makecab` can skip the installer stage. The final banner treats
-allowed skips as success. A release review must explicitly inspect them.
+`--quick` skips fault injection. `build.cmd release strict` requires Python and
+fails closed when Python is missing; missing `makecab` can skip the installer
+stage in `run_all.cmd`. A release review must explicitly inspect any skipped stage.
 
 ## Cryptographic checks
 
@@ -69,12 +69,12 @@ reference that first checks itself against a fixed GCM vector.
 | Primitive | Independent comparison or vector source |
 |---|---|
 | SHA-256 | Python hashlib; published “abc” digest and block-boundary inputs |
-| BLAKE2b | Python hashlib; RFC 7693 digest and block-boundary inputs |
+| BLAKE2b | Python hashlib; RFC 7693 digest, block-boundary inputs, and `blake2b_long` (> 64 B) variable-length outputs |
 | HMAC-SHA1 | Python hmac; RFC 2202 cases |
-| AES-256-GCM | In-file Python implementation; fixed GCM vectors, AAD, partial and empty plaintext |
-| Argon2id | RFC 9106 §5.3 vector, and the reference implementation's `test.c` vector (t=2, 64 MiB, p=1), which - unlike the RFC's two-block segments - regenerates the address block past 128 blocks as every real vault does |
-| HOTP/TOTP | HMAC-based recomputation; RFC 4226 HOTP values and time-step inputs |
-| Base32 | Python base64 implementation |
+| AES-256-GCM & AES-128/192/256 ECB/CTR | In-file Python implementation; FIPS-197 Appendix A.1/A.2/A.3, SP 800-38A/WinZip LE-CTR, fixed GCM vectors, AAD, partial/empty plaintext, and SP 800-38D length bounds |
+| Argon2id | RFC 9106 §5.3 vector, parameter-validation bounds, and the reference implementation's `test.c` vector (t=2, 64 MiB, p=1), which - unlike the RFC's two-block segments - regenerates the address block past 128 blocks as every real vault does |
+| HOTP/TOTP | HMAC-based recomputation; RFC 4226 HOTP values, RFC 6238 Appendix B 8-digit 64-byte SHA-1 vectors, and time-step inputs |
+| Base32 | Python base64 implementation, including 64-byte decoded secrets |
 
 `tests/verify_vault.py` carries a second, independent Argon2id, written from
 RFC 9106 and checked against the RFC's vector before it is trusted. It decrypts
@@ -98,7 +98,7 @@ not expose a command-line option for reading an edited report file.
 
 | Checker under `tools/` | Detects |
 |---|---|
-| `framecheck.py` | Stack/frame and call-argument layout problems, including a raw epilogue that gives back a different size than its prologue took |
+| `framecheck.py` | Stack/frame and call-argument layout problems, mismatched raw epilogues, and OS-dispatched callbacks (`WndProc`, `DialogProc`, `SubclassProc`, `TimerProc`, `EnumWindowsProc`, exception handlers) that improperly use `FRAME_PROLOG` |
 | `nvcheck.py` | A procedure that writes a callee-saved register (rbx, rsi, rdi, r12-r15, xmm6-15) without saving and restoring it |
 | `idcheck.py` | Resource/assembly control-ID drift and collisions |
 | `constcheck.py` | Inconsistent constants between modules |
@@ -107,6 +107,8 @@ not expose a command-line option for reading an edited report file.
 | `rccheck.py` | Resource-template geometry problems |
 | `wstrcheck.py` | Bounded string-copy calls missing their bound |
 | `aligncheck.py` | Misaligned wide-string declarations (sizes written as names or expressions are resolved, not guessed) |
+| `check_docs.py` | Broken relative links/anchors, duplicate heading slugs, unclosed fences, and control characters in documentation |
+| `pe_normalise.py` | Missing or misconfigured PE `IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG` `DependentLoadFlags == 0x0800` (`LOAD_LIBRARY_SEARCH_SYSTEM32`) and non-deterministic timestamps |
 
 These are source-pattern checks, not a complete compiler or program proof.
 A refactor can reduce what a checker recognizes without introducing a reported
@@ -121,12 +123,13 @@ rather than the conventional zero-on-success result.
 | Area | Relevant probes |
 |---|---|
 | Secret cleanup and allocation | `secscan`, `secfreedup`, `lktest`, `tmptest` |
-| Input parsing and bounds | `vfuzz`, `fuzzzip`, `jfuzz`, `attfuzz`, `kdfparam`, `convcap` |
+| Input parsing and bounds | `vfuzz`, `fuzzzip`, `jfuzz`, `attfuzz`, `attovfkat`, `kdfparam`, `convcap` |
 | Save integrity and concurrency | `bktest`, `mactest`, `rbtest`, `xctest`, `reload`, `cowrite` |
-| Native exchange and metadata | `sysitemkat`, `vexselkat`, `c9kat`, `vimpkat`, `vaultexportkat`, `vaultexpattkat` |
-| ZIP export | `atgen`, `zitest`, `zexcap`, `zexname` |
+| Native exchange and metadata | `sysitemkat`, `vexselkat`, `c9kat`, `vimpkat`, `vattcolkat`, `vaultexportkat`, `vaultexpattkat` |
+| ZIP export | `atgen`, `zitest`, `zexcap`, `zexname`, `zexselkat` |
+| Policy, TPM, and private desktop | `polkat`, `tpmkat`, `secdeskkat` |
 | GUI geometry and failed-edit retry | `layoutkat` (with `savefail` and `guardkat` in the same window) |
-| GUI behaviour from outside | `tests/guitest.ps1`: input limits, the drawn scrollbars (entry list, checklist, detail pane), lock while a dialog is open, what a lock wipes, GDI leaks |
+| GUI behaviour from outside | `tests/guitest.ps1`: input limits, the drawn scrollbars (entry list, checklist, detail pane), modal dialog dismissal on lock, `WM_COPYDATA` rejection while modal, tray clipboard auto-clear, what a lock wipes, GDI leaks |
 | Vault format, tamper and nonce reuse | `tests/verify_vault.py` |
 | Opening vaults written by a release | `tests/compattest.py` (frozen `tests/fixtures/v023-*.vordr`) |
 | Long-path context restoration | `tests/verify_persistence.py` |

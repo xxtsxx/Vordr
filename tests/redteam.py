@@ -17,23 +17,25 @@ process); crash_dump writes the breadcrumb immediately before crash_contain wipe
 
     python tests/redteam.py <dbg vordr.exe>        exit 0 = every case passed
 """
-import ctypes, os, struct, subprocess, sys
+import ctypes, os, shutil, struct, subprocess, sys, tempfile
 
 CASES = {                      # case -> exact exit code
-    'canary':    0xFADE0002,   # FF_STACK_COOKIE
-    'shadow':    0xFADEF001,   # FF_SHADOW_STACK
-    'dlpv':      0xFADE000A,   # FF_GUARD_ICALL
-    'overflow':  0xFADEF005,   # FF_OVERFLOW
-    'bounds':    0xFADEF004,   # FF_BOUNDS
-    'typemagic': 0xFADEF003,   # FF_TYPE_MAGIC
-    'heaptag':   0xFADEF002,   # FF_HEAP_TAG
-    'iat':       0xFADE1A70,   # FF_IAT_RO (rt_iat_veh)
+    'canary':     0xFADE0002,  # FF_STACK_COOKIE
+    'shadow':     0xFADEF001,  # FF_SHADOW_STACK
+    'shadow_anc': 0xFADEF001,  # FF_SHADOW_STACK (ancestor-frame skip blocked)
+    'dlpv':       0xFADE000A,  # FF_GUARD_ICALL
+    'overflow':   0xFADEF005,  # FF_OVERFLOW
+    'bounds':     0xFADEF004,  # FF_BOUNDS
+    'typemagic':  0xFADEF003,  # FF_TYPE_MAGIC
+    'heaptag':    0xFADEF002,  # FF_HEAP_TAG (via mem_alloc / mem_free)
+    'heapmagic':  0xFADEF003,  # FF_TYPE_MAGIC (corrupt HEAPBLK.magic -> mem_free)
+    'iat':        0xFADE1A70,  # FF_IAT_RO (rt_iat_veh)
 }
 
 
-def run(exe, case):
+def run(exe, case, timeout=30):
     try:
-        p = subprocess.run([exe, 'redteam', case], capture_output=True, timeout=30)
+        p = subprocess.run([exe, 'redteam', case], capture_output=True, timeout=timeout)
         return p.returncode & 0xFFFFFFFF
     except subprocess.TimeoutExpired:
         return None
@@ -55,7 +57,7 @@ def main():
             rc = run(exe, case)
             if rc != want:
                 break
-        check(rc == want, 'redteam %-9s -> %s (want 0x%08X)'
+        check(rc == want, 'redteam %-11s -> %s (want 0x%08X)'
               % (case, 'timeout' if rc is None else '0x%08X' % rc, want))
 
     # where crash_dump writes it: GetTempPathW (TMP first), not tempfile's TEMP-first
@@ -65,8 +67,8 @@ def main():
     if os.path.exists(crumb):
         os.remove(crumb)
     rc = run(exe, 'crash')
-    check(rc is not None, 'redteam crash     -> ended by itself (no crash dialog held it open)')
-    check(rc == 0xC0000409, 'redteam crash     -> 0x%08X (want 0xC0000409 from crash_contain)'
+    check(rc is not None, 'redteam crash       -> ended by itself (no crash dialog held it open)')
+    check(rc == 0xC0000409, 'redteam crash       -> 0x%08X (want 0xC0000409 from crash_contain)'
           % (rc or 0))
     check(os.path.exists(crumb), 'breadcrumb %s written' % crumb)
     if os.path.exists(crumb):
@@ -81,7 +83,33 @@ def main():
                   'at an address inside the image (0x%X, base 0x%X)' % (addr, base))
         os.remove(crumb)
 
-    print('redteam: %s' % ('PASS (%d cases + crash containment)' % len(CASES)
+    # crash_reent: simulate a secondary fault while already inside crash handling;
+    # must terminate immediately with 0xC0000409 (< 2s) and write no new breadcrumb.
+    rc_re = run(exe, 'crash_reent', timeout=2)
+    check(rc_re == 0xC0000409,
+          'redteam crash_reent -> %s (want immediate 0xC0000409, no recursion)'
+          % ('timeout' if rc_re is None else '0x%08X' % rc_re))
+    check(not os.path.exists(crumb), 'crash_reent skipped crash_dump cleanly')
+    if os.path.exists(crumb):
+        os.remove(crumb)
+
+    # dllhijack: place a corrupt wtsapi32.dll beside a temp copy of vordr.exe;
+    # DependentLoadFlags = 0x0800 (LOAD_LIBRARY_SEARCH_SYSTEM32) must make the OS
+    # loader resolve System32\wtsapi32.dll and ignore the application directory.
+    tdir = tempfile.mkdtemp(prefix='vordr_dllgate_')
+    try:
+        texe = os.path.join(tdir, 'vordr.exe')
+        shutil.copy2(exe, texe)
+        with open(os.path.join(tdir, 'wtsapi32.dll'), 'wb') as f:
+            f.write(b'NOT_A_VALID_PE_IMAGE_CANARY')
+        p = subprocess.run([texe, 'selftest'], cwd=tdir, capture_output=True, timeout=30)
+        check(p.returncode == 0,
+              'dllhijack System32 load-config -> rc=%d (app-dir wtsapi32.dll ignored)'
+              % p.returncode)
+    finally:
+        shutil.rmtree(tdir, ignore_errors=True)
+
+    print('redteam: %s' % ('PASS (%d cases + crash/reent + dllhijack)' % len(CASES)
                            if not fails else '%d FAILURE(S)' % len(fails)))
     return 1 if fails else 0
 

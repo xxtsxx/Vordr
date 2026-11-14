@@ -145,6 +145,12 @@ try {
     Check ((& $G 'g_cur_idx') -ge 0 -and (& $G 'g_lbsb_track') -eq 0) 'the click went to the bar, not a card drag'
     # drag the thumb 60px down (real cursor: the drag reads GetCursorPos)
     Add-Type -AssemblyName System.Windows.Forms
+    $canMoveCursor = $false
+    $pProbe = [Windows.Forms.Cursor]::Position
+    $probeX = if ($pProbe.X -eq 47) { 48 } else { 47 }
+    [void][VordrGui.Native]::SetCursorPos($probeX, $pProbe.Y)
+    if ([Windows.Forms.Cursor]::Position.X -eq $probeX) { $canMoveCursor = $true }
+    [void][VordrGui.Native]::SetCursorPos($pProbe.X, $pProbe.Y)
     $saved = [Windows.Forms.Cursor]::Position
     try {
         [void](Send-VordrMessage -Hwnd $lb -Msg 0x020A -W ([IntPtr]0))
@@ -158,16 +164,24 @@ try {
         [void][VordrGui.Native]::SetCursorPos($wr.L + $x, $wr.T + $cy + 60)
         [void](Send-VordrMessage -Hwnd $lb -Msg 0x0200 -W ([IntPtr]1) -L $lp)
         $tm = & $top
-        Check ($tm -gt $td) ("dragging the thumb down scrolls the list ({0} -> {1})" -f $td, $tm)
+        if ($canMoveCursor) {
+            Check ($tm -gt $td) ("dragging the thumb down scrolls the list ({0} -> {1})" -f $td, $tm)
+        } else {
+            Write-Host '  (listbox thumb drag delta skipped: SetCursorPos blocked by non-interactive desktop)'
+        }
         [void](Send-VordrMessage -Hwnd $lb -Msg 0x0202 -L $lp)
         Check ((& $G 'g_lbsb_track') -eq 0) 'releasing ends the drag'
         # hovering the strip widens the thumb; leaving narrows it
-        [void][VordrGui.Native]::SetCursorPos($wr.L + $x, $wr.T + 20)
-        [void](Send-VordrMessage -Hwnd $lb -Msg 0x0200 -L ([IntPtr](20 * 65536 + $x)))
-        Check ((& $G 'g_lbsb_hover') -eq 1) 'the pointer over the strip marks it hovered'
-        [void][VordrGui.Native]::SetCursorPos($wr.L + 30, $wr.T + 20)
-        [void](Send-VordrMessage -Hwnd $lb -Msg 0x0200 -L ([IntPtr](20 * 65536 + 30)))
-        Check ((& $G 'g_lbsb_hover') -eq 0) 'moving off the strip clears the hover'
+        if ($canMoveCursor) {
+            [void][VordrGui.Native]::SetCursorPos($wr.L + $x, $wr.T + 20)
+            [void](Send-VordrMessage -Hwnd $lb -Msg 0x0200 -L ([IntPtr](20 * 65536 + $x)))
+            Check ((& $G 'g_lbsb_hover') -eq 1) 'the pointer over the strip marks it hovered'
+            [void][VordrGui.Native]::SetCursorPos($wr.L + 30, $wr.T + 20)
+            [void](Send-VordrMessage -Hwnd $lb -Msg 0x0200 -L ([IntPtr](20 * 65536 + 30)))
+            Check ((& $G 'g_lbsb_hover') -eq 0) 'moving off the strip clears the hover'
+        } else {
+            Write-Host '  (listbox strip hover check skipped: SetCursorPos blocked by non-interactive desktop)'
+        }
     } finally { [Windows.Forms.Cursor]::Position = $saved }
     # ---- what reaches the screen (drawing can be silently discarded - Myrkr measured
     # exactly that).  At rest there is no bar at all; pointing at the strip shows it;
@@ -203,9 +217,13 @@ try {
         $offM = & $pix $ym; $offB = & $pix $yb
         if ($restM -eq 0xFFFFFFFF -or $hotM -eq 0xFFFFFFFF) { Write-Host '  (thumb pixel checks skipped: the window is not on screen)' }
         else {
-            Check ($hov -eq 1 -and $hotM -ne $restM -and $hotB -ne $restB) ("pointing at the strip draws the thumb, down to the bottom edge (mid 0x{0:X6} -> 0x{1:X6}, bottom 0x{2:X6} -> 0x{3:X6}; thumb {4}+{5} of {6}, top {7}/{8}; hovered {9})" -f $restM, $hotM, $restB, $hotB, $thy, $thh, $cr.B, (& $G 'g_lbsb_curtop'), (& $G 'g_lbsb_topmax'), $hov)
             Check ($restM -eq $bgM) ("at rest there is no bar at all (0x{0:X6} where it would be, 0x{1:X6} beside it)" -f $restM, $bgM)
-            Check ($offM -eq $restM -and $offB -eq $restB) ("leaving the strip removes it completely, bottom end included (mid 0x{0:X6}, bottom 0x{1:X6}; at rest 0x{2:X6}, 0x{3:X6})" -f $offM, $offB, $restM, $restB)
+            if ($canMoveCursor) {
+                Check ($hov -eq 1 -and $hotM -ne $restM -and $hotB -ne $restB) ("pointing at the strip draws the thumb, down to the bottom edge (mid 0x{0:X6} -> 0x{1:X6}, bottom 0x{2:X6} -> 0x{3:X6}; thumb {4}+{5} of {6}, top {7}/{8}; hovered {9})" -f $restM, $hotM, $restB, $hotB, $thy, $thh, $cr.B, (& $G 'g_lbsb_curtop'), (& $G 'g_lbsb_topmax'), $hov)
+                Check ($offM -eq $restM -and $offB -eq $restB) ("leaving the strip removes it completely, bottom end included (mid 0x{0:X6}, bottom 0x{1:X6}; at rest 0x{2:X6}, 0x{3:X6})" -f $offM, $offB, $restM, $restB)
+            } else {
+                Write-Host '  (thumb hover pixel transition skipped: SetCursorPos blocked by non-interactive desktop)'
+            }
         }
     } finally { [Windows.Forms.Cursor]::Position = $saved }
 
@@ -278,22 +296,26 @@ try {
     # the frameless header buttons' halo fades in and out too (the star)
     $star = Get-VordrControl -Window $v -Id 237                                     # IDC_V_FAV
     if ($star -ne [IntPtr]::Zero) {
-        $so = Get-VordrClientOrigin $star; $sr = Get-VordrRect $star -Client
-        $saved = [Windows.Forms.Cursor]::Position
-        try {
-            [void][VordrGui.Native]::SetCursorPos($so.X + [int]($sr.R / 2), $so.Y + [int]($sr.B / 2))
-            [void](Send-VordrMessage -Hwnd $star -Msg 0x0200 -L ([IntPtr](([int]($sr.B / 2)) * 65536 + [int]($sr.R / 2))))
-            Start-Sleep -Milliseconds 300
-            $dc = [VordrGui.Native]::GetDC($star)
-            $halo = [VordrGui.Native]::GetPixel($dc, 2, [int]($sr.B / 2)); [void][VordrGui.Native]::ReleaseDC($star, $dc)
-            $hot = & $G 'g_ghot_hwnd'
-            [void][VordrGui.Native]::SetCursorPos($lo.X + 150, $lo.Y - 40)
-            [void](Send-VordrMessage -Hwnd $star -Msg 0x02A3)                        # WM_MOUSELEAVE
-            Start-Sleep -Milliseconds 450
-            $dc = [VordrGui.Native]::GetDC($star)
-            $bare = [VordrGui.Native]::GetPixel($dc, 2, [int]($sr.B / 2)); [void][VordrGui.Native]::ReleaseDC($star, $dc)
-            Check ($hot -eq [int64]$star -and (& $G 'g_ghot_hwnd') -eq 0 -and (& $G 'g_gold_hwnd') -eq 0 -and ($halo -eq 0xFFFFFFFF -or $halo -ne $bare)) ("a header button's halo fades in under the pointer and out after it (0x{0:X6} -> 0x{1:X6})" -f $halo, $bare)
-        } finally { [Windows.Forms.Cursor]::Position = $saved }
+        if ($canMoveCursor) {
+            $so = Get-VordrClientOrigin $star; $sr = Get-VordrRect $star -Client
+            $saved = [Windows.Forms.Cursor]::Position
+            try {
+                [void][VordrGui.Native]::SetCursorPos($so.X + [int]($sr.R / 2), $so.Y + [int]($sr.B / 2))
+                [void](Send-VordrMessage -Hwnd $star -Msg 0x0200 -L ([IntPtr](([int]($sr.B / 2)) * 65536 + [int]($sr.R / 2))))
+                Start-Sleep -Milliseconds 300
+                $dc = [VordrGui.Native]::GetDC($star)
+                $halo = [VordrGui.Native]::GetPixel($dc, 2, [int]($sr.B / 2)); [void][VordrGui.Native]::ReleaseDC($star, $dc)
+                $hot = & $G 'g_ghot_hwnd'
+                [void][VordrGui.Native]::SetCursorPos($lo.X + 150, $lo.Y - 40)
+                [void](Send-VordrMessage -Hwnd $star -Msg 0x02A3)                    # WM_MOUSELEAVE
+                Start-Sleep -Milliseconds 450
+                $dc = [VordrGui.Native]::GetDC($star)
+                $bare = [VordrGui.Native]::GetPixel($dc, 2, [int]($sr.B / 2)); [void][VordrGui.Native]::ReleaseDC($star, $dc)
+                Check ($hot -eq [int64]$star -and (& $G 'g_ghot_hwnd') -eq 0 -and (& $G 'g_gold_hwnd') -eq 0 -and ($halo -eq 0xFFFFFFFF -or $halo -ne $bare)) ("a header button's halo fades in under the pointer and out after it (0x{0:X6} -> 0x{1:X6})" -f $halo, $bare)
+            } finally { [Windows.Forms.Cursor]::Position = $saved }
+        } else {
+            Write-Host '  (header button halo check skipped: SetCursorPos blocked by non-interactive desktop)'
+        }
     }
     # at rest: no timer, no CPU.  (A focus redraw that re-invalidated the list once
     # repainted it forever: a core spinning, and every WM_TIMER starved.)
@@ -348,12 +370,25 @@ try {
     [void](Send-VordrMessage -Hwnd $v -Msg 0x0028 -W $star -L ([IntPtr]1))
     Start-Sleep -Milliseconds 600
     Add-Type -AssemblyName System.Drawing
+    if (-not ('VordrT.Blt' -as [type])) {
+        Add-Type -Name Blt -Namespace VordrT -MemberDefinition '[DllImport("gdi32.dll")] public static extern bool BitBlt(IntPtr dst, int dx, int dy, int w, int h, IntPtr src, int sx, int sy, uint rop);'
+    }
     $vcr = Get-VordrRect $v -Client
     $grab = {
         [void][VordrGui.Native]::RedrawWindow($v, [IntPtr]::Zero, [IntPtr]::Zero, 0x0185)    # everything, now
         Start-Sleep -Milliseconds 300
         $bm = New-Object Drawing.Bitmap $vcr.R, $vcr.B
-        $gr = [Drawing.Graphics]::FromImage($bm); $gr.CopyFromScreen($vo.X, $vo.Y, 0, 0, $bm.Size); $gr.Dispose()
+        $gr = [Drawing.Graphics]::FromImage($bm)
+        try {
+            $gr.CopyFromScreen($vo.X, $vo.Y, 0, 0, $bm.Size)
+        } catch {
+            $hdcDst = $gr.GetHdc()
+            $hdcSrc = [VordrGui.Native]::GetDC($v)
+            try { [void][VordrT.Blt]::BitBlt($hdcDst, 0, 0, $vcr.R, $vcr.B, $hdcSrc, 0, 0, 0x00CC0020) }
+            finally { [void][VordrGui.Native]::ReleaseDC($v, $hdcSrc); $gr.ReleaseHdc($hdcDst) }
+        } finally {
+            $gr.Dispose()
+        }
         $bd = $bm.LockBits((New-Object Drawing.Rectangle 0, 0, $bm.Width, $bm.Height), 'ReadOnly', 'Format32bppArgb')
         $bytes = New-Object byte[] ($bd.Stride * $bd.Height)
         [Runtime.InteropServices.Marshal]::Copy($bd.Scan0, $bytes, 0, $bytes.Length)
@@ -379,10 +414,52 @@ try {
     Check (($gdi1 - $gdi0) -le 4 -and ($usr1 - $usr0) -le 4 -and (& $G 'g_xfade_hwnd') -eq 0) ("20 cross-faded switches leak no GDI/USER objects (GDI {0} -> {1}, USER {2} -> {3})" -f $gdi0, $gdi1, $usr0, $usr1)
 
     # ---- the export checklist (a report ListView) has the same drawn bar --------
+    $tray = Assert-VordrIsolated -Process $p -Map $map
+    if (-not ('VordrT.Cds' -as [type])) {
+        Add-Type -Name Cds -Namespace VordrT -MemberDefinition '[StructLayout(LayoutKind.Sequential)] public struct COPYDATASTRUCT { public IntPtr dwData; public uint cbData; public IntPtr lpData; }'
+    }
+    function Send-CopyDataVault([IntPtr]$Target, [string]$PathText) {
+        $bytes = [Text.Encoding]::Unicode.GetBytes($PathText + "`0")
+        $buf = [Runtime.InteropServices.Marshal]::AllocHGlobal($bytes.Length)
+        $cdsMem = [Runtime.InteropServices.Marshal]::AllocHGlobal([Runtime.InteropServices.Marshal]::SizeOf([type][VordrT.Cds+COPYDATASTRUCT]))
+        try {
+            [Runtime.InteropServices.Marshal]::Copy($bytes, 0, $buf, $bytes.Length)
+            $cds = New-Object VordrT.Cds+COPYDATASTRUCT
+            $cds.dwData = [IntPtr]0x4E504F56
+            $cds.cbData = [uint32]$bytes.Length
+            $cds.lpData = $buf
+            [Runtime.InteropServices.Marshal]::StructureToPtr($cds, $cdsMem, $false)
+            return [int64](Send-VordrMessage -Hwnd $Target -Msg 0x004A -W ([IntPtr]::Zero) -L $cdsMem)
+        } finally {
+            [Runtime.InteropServices.Marshal]::FreeHGlobal($cdsMem)
+            [Runtime.InteropServices.Marshal]::FreeHGlobal($buf)
+        }
+    }
+    # VDR-07: UNC WM_COPYDATA hand-off must be rejected before touching SMB
+    $cdUnc = Send-CopyDataVault -Target $tray -PathText '\\198.51.100.1\share\evil.vordr'
+    Check ($cdUnc -eq 0 -and (& $G 'g_openfile_set') -eq 0) 'VDR-07: UNC WM_COPYDATA hand-off rejected before SMB access'
+
+    # VDR-11 + VDR-27: standalone password generator arms clipboard timer on tray and scrubs scratch
+    Send-VordrCommand -Window $v -Id 294                                                # IDC_T_GEN
+    $pg = Wait-VordrOwned -Process $p -Owner $v -TimeoutMs 8000
+    Check ($pg -ne [IntPtr]::Zero) 'standalone password generator opens'
+    if ($pg -ne [IntPtr]::Zero) {
+        Send-VordrCommand -Window $pg -Id 1                                             # IDOK ("Copy")
+        Check (Wait-VordrGone -Hwnd $pg -TimeoutMs 5000) 'Copy closes standalone password generator'
+        $go1 = Read-VordrGlobal -Process $p -Map $map -Symbol 'g_genout' -Size 260
+        $go2 = Read-VordrGlobal -Process $p -Map $map -Symbol 'g_genout_w' -Size 520
+        Check ($null -ne $go1 -and -not ($go1 | Where-Object { $_ -ne 0 }) -and $null -ne $go2 -and -not ($go2 | Where-Object { $_ -ne 0 })) 'VDR-27: g_genout and g_genout_w scrubbed on generator close'
+        Check ((& $G 'g_clip_seq') -ne 0) 'VDR-11: clipboard sequence recorded on standalone generator Copy'
+        [void](Send-VordrMessage -Hwnd $tray -Msg 0x0113 -W ([IntPtr]1))                # WM_TIMER CLIP_TIMER on tray
+        Check ((& $G 'g_clip_seq') -eq 0) 'VDR-11: tray CLIP_TIMER clears clipboard after dialog destruction'
+    }
+
     Send-VordrCommand -Window $v -Id 245                                                # IDC_V_MEXPORT
     $sel = Wait-VordrOwned -Process $p -Owner $v -TimeoutMs 8000
     Check ($sel -ne [IntPtr]::Zero) 'the export checklist opens'
     if ($sel -ne [IntPtr]::Zero) {
+        $cdModal = Send-CopyDataVault -Target $tray -PathText $vault
+        Check ($cdModal -eq 0 -and (& $G 'g_openfile_set') -eq 0) 'VDR-07: WM_COPYDATA hand-off refused while a modal dialog is active'
         $lv = Get-VordrControl -Window $sel -Id 752
         Start-Sleep -Milliseconds 500
         Check ((([VordrT.GwlS]::GetWindowLongW($lv, -16)) -band 0x00300000) -eq 0) 'the checklist has no native scrollbar, vertical or horizontal'
@@ -422,6 +499,8 @@ try {
         $b = Read-VordrGlobal -Process $p -Map $map -Symbol $sym -Size 256
         Check ($null -ne $b -and -not ($b | Where-Object { $_ -ne 0 })) "$sym is zero after lock"
     }
+    $vk = Read-VordrGlobal -Process $p -Map $map -Symbol 'g_vkey' -Size 32
+    Check ($null -ne $vk -and -not ($vk | Where-Object { $_ -ne 0 })) 'g_vkey is zero after lock-with-modal (VDR-06)'
     Check ((Read-VordrGlobal -Process $p -Map $map -Symbol 'g_body_ptr' -Size 8) -eq 0) 'no decrypted body after lock'
     Check ((Read-VordrGlobal -Process $p -Map $map -Symbol 'tc_dc' -Size 8) -eq 0) 'no cached icon tiles after lock (they carry title letters)'
 
@@ -526,7 +605,11 @@ try {
             Check ((& $G 'g_dsb_track') -eq 1) 'pressing the pane thumb starts a drag'
             [void][VordrGui.Native]::SetCursorPos($co.X + $cx, $co.Y + $cy + 60)
             [void](Send-VordrMessage -Hwnd $vb -Msg 0x0200 -W ([IntPtr]1) -L (& $sp $cx ($cy + 60)))
-            Check ((& $G 'g_cur_page') -gt $t0) ("dragging it scrolls the pane ({0} -> {1})" -f $t0, (& $G 'g_cur_page'))
+            if ($canMoveCursor) {
+                Check ((& $G 'g_cur_page') -gt $t0) ("dragging it scrolls the pane ({0} -> {1})" -f $t0, (& $G 'g_cur_page'))
+            } else {
+                Write-Host '  (pane thumb drag delta skipped: SetCursorPos blocked by non-interactive desktop)'
+            }
             [void](Send-VordrMessage -Hwnd $vb -Msg 0x0202 -L (& $sp $cx ($cy + 60)))
             Check ((& $G 'g_dsb_track') -eq 0) 'releasing ends the drag'
             # -Slow: a REAL press, through the window's own hit test (the messages above
@@ -589,8 +672,12 @@ try {
         } finally { [Windows.Forms.Cursor]::Position = $saved }
         if ($in -eq 0xFFFFFFFF -or $out -eq 0xFFFFFFFF) { Write-Host '  (pane thumb pixel check skipped: the window is not on screen)' }
         else {
-            Check ($hov -eq 1 -and $in -ne $out) ("pointing at the pane's strip draws its thumb (0x{0:X6} inside vs 0x{1:X6} above)" -f $in, $out)
             Check ($rest -eq $out -and $off -eq $out) ("the pane has no thumb at rest, before or after (0x{0:X6}, 0x{1:X6} vs 0x{2:X6})" -f $rest, $off, $out)
+            if ($canMoveCursor) {
+                Check ($hov -eq 1 -and $in -ne $out) ("pointing at the pane's strip draws its thumb (0x{0:X6} inside vs 0x{1:X6} above)" -f $in, $out)
+            } else {
+                Write-Host '  (pane thumb hover pixel transition skipped: SetCursorPos blocked by non-interactive desktop)'
+            }
         }
         $pgbar = @(267, 268, 269) | ForEach-Object { Get-VordrControl -Window $vb -Id $_ } | Where-Object { $_ -ne [IntPtr]::Zero }
         Check ($pgbar.Count -eq 3 -and -not ($pgbar | Where-Object { [VordrGui.Native]::IsWindowVisible($_) })) 'the "< n / m >" page bar stays hidden: the pane scrolls instead'

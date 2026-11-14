@@ -71,13 +71,13 @@ Not every secret-bearing allocation is managed by `secmem_alloc`.
 | Area | Exposure and cleanup to review |
 |---|---|
 | Argon2 arena (`g_arena`) | Large ordinary VirtualAlloc arena, too large to pin; wiped before release. The one block that is key-equivalent by itself - the last column's final block, input to the final hash - is `VirtualLock`ed (best-effort) while the KDF runs |
-| Argon2 H0 staging (`g_hbuf`) | Sensitive pre-hash state, not in the fixed lock list; wiped on hash exit |
-| `g_urlbuf`, `g_urlbuf2` | URLs may contain private hosts or tokens; wiped after the launch path |
+| Argon2 H0 and compression state | `g_hbuf`, `g_inp`, `g_addr`, and `g_le4` are wiped on both normal and error exits; scalar/SSE2/AVX2 compressors scrub their stack scratch and volatile `xmm`/`ymm` registers (`vzeroupper` on AVX2) on return |
+| `g_urlbuf`, `g_urlbuf2` | URLs may contain private hosts or tokens; wiped after the launch path, and only explicit `http://` / `https://` schemes are passed to `ShellExecuteW` |
 | ZIP export buffers | Plaintext JSON (in a `secmem` arena), password copies, keys, and archive staging; normal cleanup in `ze_compose`/`ze_free` |
 | ZIP import | The decrypted JSON is in a `secmem` arena; the raw archive is `VirtualLock`ed best-effort while it is parsed |
-| Crypto stack frames | HMAC-SHA1 pads, the BLAKE2b long-hash state and the last AES-CTR keystream block are wiped on return |
-| Attachment staging/open buffers | Plaintext copies can use ordinary heap allocation; follow `attach_stage`, `attach_open`, and caller ownership |
-| Windows controls and API buffers | Edit controls, clipboard, and provider buffers can hold copies beyond the named application arrays |
+| Crypto stack frames and registers | AES-GCM, SHA-256, SHA-1, BLAKE2b, HOTP/TOTP (`g_totp_key` 160 B), and password-generation helpers wipe stack scratch and volatile `xmm0..xmm5` registers on return; AES key expansion uses hardware `aeskeygenassist` without table S-boxes |
+| Attachment staging/open buffers | Plaintext copies are allocated in `secmem` arenas (`attach_stage`, `attach_open`, `gui_tile_view`, `gui_tile_download`) and wiped on teardown |
+| Windows controls and API buffers | Password and secret edit controls are scrubbed via `gui_edit_scrub` (`EM_SETSEL` + `WM_CLEAR` + `SetWindowTextW("")`) before teardown, though OS/control internal buffers and clipboard/provider copies can still exist outside application arrays |
 
 These are implementation limitations, not a claim that sensitive intermediate
 values are harmless. Wiping a working buffer cannot erase a copy already made
@@ -109,20 +109,28 @@ new allocation must not be treated as safe through an old alias.
 
 Clipboard exclusion formats request that cooperating Windows features avoid
 history/cloud handling. They are not access control for the current clipboard.
-The clear timer checks sequence ownership before clearing.
+The clear timer checks sequence ownership before clearing and falls back to a
+windowless `SetTimer(NULL, ...)` callback when the main window is closed to the
+system tray.
 
 Preview files are created exclusively inside separate random temporary
-directories. `gui_temp_purge` attempts overwrite, flush, deletion, and directory
-removal. Failed cleanup stays tracked; the locked tray retries every five seconds.
-Normal Exit asks the user to close blocked viewers. Forced termination or shutdown
-can leave files behind, and overwrite/delete is not guaranteed physical erasure.
+directories protected by an explicit owner-only DACL (`S:(ML;;NW;;;ME)` and the
+current user's SID). Attachment filenames are sanitized via
+`gui_sanitize_attname` to strip directory components, drive prefixes, ADS
+`:stream` suffixes, control characters, trailing dots/spaces, and reserved DOS
+device names. `gui_temp_purge` attempts overwrite, flush, deletion, and
+directory removal. Failed cleanup stays tracked; the locked tray retries every
+five seconds. Normal Exit asks the user to close blocked viewers. Forced
+termination or shutdown can leave files behind, and overwrite/delete is not
+guaranteed physical erasure.
 
-Every file Vordr writes out of an attachment - a preview temp file, or a
-download of an executable type - gets a Mark of the Web (`Zone.Identifier`,
-`ZoneId=3`), so Office opens it in Protected View and Windows asks before running
-it. Executable and script types (`exec_exts` in `gui.asm`: programs, scripts,
-installers, shortcuts, disk images, search/library connectors and the like) are
-never handed to the shell at all; they can only be saved.
+Every preview temporary file and downloaded attachment receives a Mark of the
+Web (`Zone.Identifier`, `ZoneId=3`) verified fail-closed by `gui_motw` before
+proceeding; if writing the stream fails on a preview file, the preview is
+aborted and deleted. Automatic shell preview is restricted to a strict
+safe-preview allowlist (`preview_exts` in `gui.asm`: `txt`, `png`, `jpg`,
+`jpeg`, `gif`, `bmp`, `webp`, `pdf`); all other extensions route exclusively to
+Save As and are never passed to `ShellExecuteExW`.
 
 `NoPreview` disables the automatic preview hand-off. Downloads still write
 plaintext wherever the user explicitly chooses. The viewer's own caches and

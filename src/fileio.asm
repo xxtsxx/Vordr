@@ -18,8 +18,8 @@ extern WriteFile:proc
 extern GetFileSizeEx:proc
 extern SetFilePointerEx:proc
 extern CloseHandle:proc
-extern VirtualAlloc:proc
-extern VirtualFree:proc
+extern GetFileType:proc
+extern ReplaceFileW:proc
 extern MoveFileExW:proc
 extern DeleteFileW:proc
 extern CopyFileW:proc
@@ -27,10 +27,12 @@ extern FlushFileBuffers:proc
 extern GetDiskFreeSpaceExW:proc
 extern GetFullPathNameW:proc            ; a relative long path must be resolved first
 extern GetCurrentDirectoryW:proc        ; ...and measured against what it resolves to
-extern secure_zero:proc
+extern tagged_alloc:proc
+extern tagged_free:proc
 
 MOVEFILE_REPLACE_EXISTING equ 1
 MOVEFILE_WRITE_THROUGH    equ 8
+REPLACEFILE_WRITE_THROUGH equ 1
 
 GENERIC_READ        equ 80000000h
 GENERIC_WRITE       equ 40000000h
@@ -39,10 +41,8 @@ FILE_SHARE_RWD      equ 7               ; READ|WRITE|DELETE - read-only-by-defau
 OPEN_EXISTING       equ 3
 CREATE_ALWAYS       equ 2
 FILE_ATTR_NORMAL    equ 80h
-MEM_COMMIT          equ 1000h
-MEM_RESERVE         equ 2000h
-MEM_RELEASE         equ 8000h
-PAGE_READWRITE      equ 04h
+FILE_FLAG_OPEN_RP   equ 00200000h       ; FILE_FLAG_OPEN_REPARSE_POINT
+FILE_TYPE_DISK_     equ 1
 IO_CHUNK            equ 1000000h         ; 16 MiB per ReadFile/WriteFile
 
 .data?
@@ -90,7 +90,7 @@ mem_alloc proc frame
     xIFZ rcx
         mov     rcx, 1                   ; never request 0 bytes
     xENDIF
-    WINCALL VirtualAlloc, 0, rcx, <MEM_RESERVE or MEM_COMMIT>, PAGE_READWRITE
+    call    tagged_alloc
     FRAME_EPILOG
     ret
 mem_alloc endp
@@ -99,13 +99,7 @@ mem_alloc endp
 public mem_free
 mem_free proc frame
     FRAME_PROLOG 48
-    xIFT rcx                             ; ptr != 0
-        mov     qword ptr [rbp-24], rcx
-        xIFT rdx                         ; len != 0 -> wipe before release
-            call    secure_zero          ; (rcx=ptr, rdx=len)
-        xENDIF
-        WINCALL VirtualFree, qword ptr [rbp-24], 0, MEM_RELEASE
-    xENDIF
+    call    tagged_free
     FRAME_EPILOG
     ret
 mem_free endp
@@ -234,10 +228,13 @@ write_file proc frame
     jnz     @F
     mov     r10d, CREATE_ALWAYS
 @@:
-    WINCALL CreateFileW, rcx, GENERIC_WRITE, 0, 0, r10d, FILE_ATTR_NORMAL, 0
+    WINCALL CreateFileW, rcx, GENERIC_WRITE, 0, 0, r10d, <FILE_ATTR_NORMAL or FILE_FLAG_OPEN_RP>, 0
     cmp     rax, -1
     je      wf_io
     mov     qword ptr [rbp-40], rax
+    WINCALL GetFileType, rax
+    cmp     eax, FILE_TYPE_DISK_
+    jne     wf_badtype
 
     mov     rax, qword ptr [rbp-24]
     mov     dword ptr [g_wf_created], 1
@@ -288,6 +285,11 @@ wf_flush_nosupp:
     WINCALL CloseHandle, qword ptr [rbp-40]
     xor     eax, eax
     jmp     wf_done
+wf_badtype:
+    mov     dword ptr [g_io_err], 5             ; ERROR_ACCESS_DENIED (reparse/device refused)
+    WINCALL CloseHandle, qword ptr [rbp-40]
+    mov     eax, EXIT_IO
+    jmp     wf_done
 wf_io_close:
     call    GetLastError                         ; capture BEFORE CloseHandle overwrites it
     mov     dword ptr [g_io_err], eax
@@ -325,13 +327,9 @@ write_file endp
 ;   feedback is a planned follow-up.)
 public file_rename
 file_rename proc frame
-    FRAME_PROLOG 64   ; >= 64: keep locals clear of the callee 32-byte home area
+    FRAME_PROLOG 80   ; >= 80: keep locals clear of ReplaceFileW's 6-arg spill area
     mov     qword ptr [rbp-24], rcx             ; from
     mov     qword ptr [rbp-32], rdx             ; to
-    ; Both ends need the Win32 form.  The atomic save renames "<vault>.tmp" onto
-    ; "<vault>", and the destination came straight from g_cfg_in - so on a long
-    ; path the temp file was written correctly and then could not be moved into
-    ; place, leaving a .tmp orphan next to a vault that never got the update.
     mov     rcx, qword ptr [rbp-24]
     lea     rdx, [fr_from]
     mov     r8d, MAX_PATH_CHARS + 16
@@ -344,6 +342,38 @@ file_rename proc frame
     mov     qword ptr [rbp-32], rax
     mov     dword ptr [rbp-40], 0               ; attempt count
 frn_try:
+    ; Prefer ReplaceFileW(to, from, NULL, REPLACEFILE_WRITE_THROUGH, 0, 0) so an
+    ; existing target's DACLs, owner, encryption attributes, and creation metadata
+    ; are preserved across saves; fall back to MoveFileExW when the target does
+    ; not yet exist or the volume does not implement ReplaceFileW.
+    WINCALL ReplaceFileW, qword ptr [rbp-32], qword ptr [rbp-24], 0, \
+            REPLACEFILE_WRITE_THROUGH, 0, 0
+    test    eax, eax
+    jnz     frn_ok
+    call    GetLastError
+    mov     dword ptr [g_io_err], eax
+    cmp     eax, 2                              ; ERROR_FILE_NOT_FOUND (dest absent)
+    je      frn_move
+    cmp     eax, 1                              ; ERROR_INVALID_FUNCTION
+    je      frn_move
+    cmp     eax, 50                             ; ERROR_NOT_SUPPORTED
+    je      frn_move
+    cmp     eax, 1177                           ; ERROR_UNABLE_TO_MOVE_REPLACEMENT_2
+    je      frn_move
+    cmp     eax, 5                              ; ERROR_ACCESS_DENIED -> try MoveFileExW
+    je      frn_move
+    cmp     eax, 32                             ; ERROR_SHARING_VIOLATION
+    je      frn_retry
+    cmp     eax, 33                             ; ERROR_LOCK_VIOLATION
+    je      frn_retry
+    cmp     eax, 1175                           ; ERROR_UNABLE_TO_REMOVE_REPLACED
+    je      frn_retry
+    cmp     eax, 1176                           ; ERROR_UNABLE_TO_MOVE_REPLACEMENT
+    je      frn_retry
+    mov     eax, EXIT_IO
+    FRAME_EPILOG
+    ret
+frn_move:
     WINCALL MoveFileExW, qword ptr [rbp-24], qword ptr [rbp-32], \
             <MOVEFILE_REPLACE_EXISTING or MOVEFILE_WRITE_THROUGH>
     test    eax, eax
@@ -442,20 +472,27 @@ PATH_MIN_CAP    equ 32
 ;   bug hunt.  tools/wstrcheck.py fails the build on a direct assignment.
 public cfg_in_set
 cfg_in_set proc frame
-    FRAME_PROLOG 96
-    mov     qword ptr [rbp-24], rdx
-    mov     qword ptr [rbp-32], r8
-    mov     qword ptr [rbp-40], r9
-    mov     qword ptr [rbp-48], r10
-    mov     qword ptr [rbp-56], r11
+    push    rbp
+    .pushreg rbp
+    mov     rbp, rsp
+    .setframe rbp, 0
+    sub     rsp, 96
+    .allocstack 96
+    .endprolog
+    mov     qword ptr [rbp-16], rdx
+    mov     qword ptr [rbp-24], r8
+    mov     qword ptr [rbp-32], r9
+    mov     qword ptr [rbp-40], r10
+    mov     qword ptr [rbp-48], r11
     call    path_io
     mov     qword ptr [g_cfg_in], rax
-    mov     rdx, qword ptr [rbp-24]
-    mov     r8,  qword ptr [rbp-32]
-    mov     r9,  qword ptr [rbp-40]
-    mov     r10, qword ptr [rbp-48]
-    mov     r11, qword ptr [rbp-56]
-    FRAME_EPILOG
+    mov     rdx, qword ptr [rbp-16]
+    mov     r8,  qword ptr [rbp-24]
+    mov     r9,  qword ptr [rbp-32]
+    mov     r10, qword ptr [rbp-40]
+    mov     r11, qword ptr [rbp-48]
+    mov     rsp, rbp
+    pop     rbp
     ret
 cfg_in_set endp
 

@@ -116,7 +116,8 @@ rebuild the exact tag with a matching toolchain. A mismatch requires
 investigation; it does not by itself identify the cause or prove maliciousness.
 
 The repository includes startup known-answer tests, a Python crypto
-cross-check, fault injection, static source checkers, and persistence tests.
+cross-check, fault injection, static source and PE load-config checkers,
+installer upgrade/downgrade verification, and persistence tests.
 Their coverage and skip conditions are described in
 [ASSURANCE.md](docs/ASSURANCE.md).
 

@@ -26,47 +26,43 @@ a reason in the commit message.
 FLOORS = {
     "framecheck": {
         # FRAME_PROLOG procs whose frame was actually sized and checked.
-        "procs": 450,                    # 496 at time of writing
-        "raw": 20,                       # 29 raw procs (2026-10-11, framecheck v3)
+        "procs": 540,                    # 608 after VDR-01..28 remediation
+        "raw": 40,                       # 47 raw procs (incl. OS callbacks)
     },
     "idcheck": {
         # control IDs defined in BOTH vordr.rc and gui.asm, i.e. comparable.
-        "shared_ids": 120,               # 136
+        "shared_ids": 120,               # 138
     },
     "constcheck": {
         # constants deliberately mirrored across modules and compared.
-        "mirrored": 15,                  # 20
-        "files": 25,                     # 30
+        "mirrored": 30,                  # 36
+        "files": 28,                     # 31
     },
     "dlgtarget": {
         # every dialog-item call the parser recognised at all.  This is the
         # number that proves the PARSER still works; "verified" below is the
         # number that proves the CHECK still reaches something.
-        "calls": 120,                    # 135
-        "verified": 40,                  # see the note in dlgtarget.py
-        "settings_rows": 10,             # 12
+        "calls": 135,                    # 150
+        "verified": 95,                  # 110 verified
+        "settings_rows": 12,             # 13
     },
     "rccheck": {
         # dialog templates and controls whose geometry was parsed and checked.
         "dialogs": 13,                   # 15 at time of writing
-        "controls": 140,                 # 160
+        "controls": 140,                 # 162
     },
     "wstrcheck": {
         # call sites whose bound-carrying register was checked.
-        "calls": 25,                     # 29 at time of writing
+        "calls": 45,                     # 54
     },
     "deadcode": {
-        "symbols": 2000,                 # 2305
+        "symbols": 2500,                 # 2821
     },
     "nvcheck": {
-        "procs": 550,                    # 654 procs (2026-10-11)
+        "procs": 670,                    # 749 procs
     },
     "aligncheck": {
-        # 50 measured with aligncheck v2 (2026-10-11).  It was 104 under v1, which
-        # guessed the size of arrays whose dup count is a name or an expression -
-        # every label after one sat at a wrong offset and many were reported as
-        # misaligned when they were not.  v2 resolves those sizes (and stops a
-        # section rather than guess), so the honest count is lower.
+        # 51 measured with aligncheck v2.
         "scalars": 40,
     },
 }

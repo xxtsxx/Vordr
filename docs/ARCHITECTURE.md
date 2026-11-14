@@ -95,22 +95,27 @@ conflict. Nearby rotating backups are not an independent backup.
 | Full-file authentication | BLAKE2b-256 over a domain prefix, vault key, and file image through the counter |
 | TOTP | HMAC-SHA-1, base32 keys, HOTP/TOTP |
 | ZIP interoperability | WinZip AE-2: PBKDF2-HMAC-SHA1, AES-256-CTR, truncated HMAC-SHA1 |
-| Randomness | `BCryptGenRandom`, supplemented by RDSEED when available |
-| TPM convenience | RSA-OAEP with SHA-256 through Microsoft Platform Crypto Provider; RSA-2048 requested |
+| Randomness | `BCryptGenRandom`, supplemented by RDSEED across 8-byte lanes and `1..7`-byte tails when available |
+| TPM convenience | RSA-OAEP with SHA-256 (bound to `SHA-256("Vordr-TPM-v2" \|\| vault_salt \|\| LE32(reqhello))`) through Microsoft Platform Crypto Provider; RSA-2048 minimum enforced |
 
 These are in-repository implementations of published primitives. That does not
 make their composition or implementation automatically secure. In particular,
 the file MAC uses an explicit prefix construction, not BLAKE2's native keyed mode;
 see [the exact format](formats.md#file-authentication-trailer).
 
-The TPM key-length property request is best-effort, and existing keys are reused
-without a length check. Provider UI policy is also best-effort. Neither should
-be treated as a guaranteed enforcement control.
+TPM key creation requests RSA-2048, and existing persistent keys are verified via
+`NCryptGetProperty("Length")` so keys shorter than 2048 bits are rejected and
+recreated. RSA-OAEP wrapping and unwrapping pass a 32-byte domain-separated
+digest over the vault header's salt and the active `TpmRequireHello` bit as the
+OAEP label (`pbLabel`), binding a sealed blob to that vault and policy state.
+Provider UI policy (`NCRYPT_UI_POLICY_PROPERTY`) remains best-effort and should
+not be treated as a guaranteed enforcement control.
 
-Random generation fails if the OS RNG fails. RDSEED is optional, can run out of
-retries, and only mixes complete eight-byte lanes; the OS output remains the
-primary random source. Random nonces have a nonzero collision probability.
-The save counter is for rollback detection, not nonce generation.
+Random generation fails closed if the OS RNG fails or the output pointer is NULL.
+RDSEED is optional, can run out of retries, and mixes into both eight-byte lanes
+and `1..7`-byte trailing bytes when available; the OS output remains the primary
+random source. Random nonces have a nonzero collision probability. The save
+counter is for rollback detection, not nonce generation.
 
 New attachments get independent random keys and nonces. Existing attachment
 ciphertext can be copied unchanged into a new image or native export. A pending
@@ -130,9 +135,9 @@ backup format. See the [WinZip specification](https://www.winzip.com/en/support/
 | Concurrent saves | Advisory lock and changed-image check | Sync clients and non-cooperating writers need not honor the lock |
 | Older intact vault | Counter compared with local HKCU history | No trusted global monotonic counter |
 | Unlocked process memory | Selected locked buffers, wiping, runtime checks | Not all scratch is locked; no hostile-OS guarantee |
-| Password entry | Optional private desktop | Normal-prompt fallback and privileged observation remain possible |
-| Convenience unlock | TPM wrapping; optional provider UI policy | An alternative unlock route, not a second factor; provider UI policy is best-effort |
-| Clipboard and previews | Time limits, exclusion flags, tracked cleanup | Other applications may copy or retain plaintext |
+| Password entry | Optional private desktop | Policy-locked `SecureUnlock` refuses fallback; unlocked `SecureUnlock` requires explicit user confirmation before normal-desktop fallback; privileged observation remains possible |
+| Convenience unlock | TPM wrapping; RSA-2048 minimum + vault-header OAEP label; optional provider UI policy | An alternative unlock route, not a second factor; provider UI policy is best-effort |
+| Clipboard and previews | Time limits (including tray timer), safe-preview allowlist, owner-only temp ACLs, tracked cleanup | Other applications may copy or retain plaintext |
 
 Avoid calling the whole application “quantum-proof.” The native vault uses
 symmetric cryptography, while the optional TPM path uses RSA. A hardware-bound
@@ -141,17 +146,25 @@ private key does not turn RSA into a post-quantum algorithm.
 ## Runtime hardening
 
 Shared macros provide stack canaries, software shadow-stack checks, guarded
-indirect-call landing pads, checked arithmetic, and bounds/type checks. Heap
-allocations carry canaries and tags. The import table is made read-only after
-startup. Link flags enable ASLR, DEP/NX, high-entropy address space, and CET
-compatibility where supported.
+indirect-call landing pads, checked arithmetic, and bounds/type checks. General
+heap allocations (`mem_alloc`/`mem_free`) carry header/footer canaries and
+allocation magic tags (`tagged_alloc`/`tagged_free`). The import table is made
+read-only after startup. Link flags and `loadcfg.asm` enable ASLR, DEP/NX,
+high-entropy address space, CET compatibility where supported, and PE
+`DependentLoadFlags = 0x0800` (`LOAD_LIBRARY_SEARCH_SYSTEM32`), reinforced at
+runtime by `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32)`, safe
+search-path mode, extension-point disable, and remote/low-label image-load
+mitigations.
 
 The software shadow stack is per thread: `FRAME_PROLOG` and `FRAME_EPILOG` find
 the calling thread's block through a TLS slot (`sstk_thread_init` gives each
-thread one, between guard pages). Threads Windows creates on Vordr's behalf, and
-any code before `hardening_init`, run with the canary only. Worker threads
-(`secdesk_thread`, the parallel KAT workers) initialise their own block first and
-free it last.
+thread one, between guard pages), and `FRAME_EPILOG` checks the top-of-stack
+slot directly so skipped ancestor frames trap immediately. Threads Windows
+creates on Vordr's behalf, OS-dispatched callbacks (`WndProc`, `DialogProc`,
+`SubclassProc`, `TimerProc`, `EnumWindowsProc`, exception handlers), and any
+code before `hardening_init` use raw stack frames verified by `framecheck.py`.
+Worker threads (`secdesk_thread`, the parallel KAT workers) initialise their own
+block first and free it last.
 
 These checks detect particular misuse patterns; they do not make assembly
 memory-safe. Windows CFG (`/guard:cf`) is deliberately not enabled because the

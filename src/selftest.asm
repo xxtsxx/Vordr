@@ -27,9 +27,16 @@ extern sstk_thread_init:proc            ; hardening.asm: per-thread shadow stack
 extern sstk_thread_free:proc
 extern gcm_seal:proc
 extern gcm_open:proc
+extern aes_expand_key:proc
+extern aes_ecb_block:proc
+extern aes_ctr_xor:proc
+extern blake2b_init:proc
 extern blake2b_hash:proc
+extern blake2b_long:proc
 extern argon2_compress:proc
 extern argon2id_hash:proc
+extern rng_fill:proc
+extern cpu_eval_features:proc
 extern check_password_policy:proc
 extern pwgen:proc
 extern pwgen_ex:proc
@@ -38,7 +45,19 @@ extern vault_selftest:proc
 extern hmac_sha1:proc
 extern base32_decode:proc
 extern hotp:proc
+extern totp_at:proc
 extern gui_wstr_eq:proc                  ; constant-time wide-string equality (gui.asm)
+extern gui_sanitize_attname:proc
+extern gui_ext_can_preview:proc
+extern gui_url_prepare:proc
+extern zj_str:proc
+externdef g_zi_p:qword
+externdef g_zi_jend:qword
+externdef g_zi_err:dword
+extern tpm_build_oaep:proc
+externdef g_tpm_label:byte
+externdef g_tpm_reqhello:dword
+externdef g_hdr:byte
 externdef g_cfg_pass:byte
 externdef g_cfg_passlen:dword
 externdef g_cfg_pwminlen:dword
@@ -932,6 +951,8 @@ st_ctm_fail:
     STPRINT st_fail_ctm, st_fail_ctm_len
     inc     qword ptr [rbp-24]
 st_after_ctm:
+    call    selftest_ext
+    add     qword ptr [rbp-24], rax
     ; scrub the KAT's test-password state.  run_selftest is the startup gate
     ; (wstart runs it on every launch), so it must not leave a stale constant
     ; password + non-zero length in g_cfg_pass for the unlock flow to inherit.
@@ -947,6 +968,756 @@ st_after_ctm:
     FRAME_EPILOG
     ret
 run_selftest endp
+
+; =============================================================================
+; Extended KAT & regression self-test suite (FIPS 197 AES-128/192/256 + CTR,
+; BLAKE2b H' >64B + init bounds, RFC 6238 8-digit/64B TOTP + dirty-rdx ABI,
+; SP 800-38D / RFC 9106 bounds + volatile XMM scrubbing + RNG/XCR0 gates,
+; JSON/attachment/URL/TPM-OAEP-label sanitizers).
+; =============================================================================
+.const
+CSTR st_pass_aesv, "  [PASS] aes-128/192/256 ecb+ctr  (FIPS 197 C.1-C.3 + WinZip CTR)",13,10
+CSTR st_fail_aesv, "  [FAIL] aes-128/192/256 ecb+ctr",13,10
+CSTR st_pass_b2l,  "  [PASS] blake2b_long + init bounds  (RFC 9106 H' 96B/100B)",13,10
+CSTR st_fail_b2l,  "  [FAIL] blake2b_long + init bounds",13,10
+CSTR st_pass_t64,  "  [PASS] totp 8-digit + 64B base32 + dirty-rdx ABI  (RFC 6238)",13,10
+CSTR st_fail_t64,  "  [FAIL] totp 8-digit + 64B base32 + dirty-rdx ABI",13,10
+CSTR st_pass_grd,  "  [PASS] crypto guards + xmm scrub + rng/xcr0 gates",13,10
+CSTR st_fail_grd,  "  [FAIL] crypto guards + xmm scrub + rng/xcr0 gates",13,10
+CSTR st_pass_prs,  "  [PASS] json/attachment/url/tpm-label sanitizers",13,10
+CSTR st_fail_prs,  "  [FAIL] json/attachment/url/tpm-label sanitizers",13,10
+
+fips_key32  db 00h,01h,02h,03h,04h,05h,06h,07h,08h,09h,0ah,0bh,0ch,0dh,0eh,0fh
+            db 10h,11h,12h,13h,14h,15h,16h,17h,18h,19h,1ah,1bh,1ch,1dh,1eh,1fh
+fips_pt16   db 00h,11h,22h,33h,44h,55h,66h,77h,88h,99h,0aah,0bbh,0cch,0ddh,0eeh,0ffh
+fips_c1_exp db 69h,0c4h,0e0h,0d8h,6ah,7bh,04h,30h,0d8h,0cdh,0b7h,80h,70h,0b4h,0c5h,5ah
+fips_c2_exp db 0ddh,0a9h,7ch,0a4h,86h,4ch,0dfh,0e0h,6eh,0afh,70h,0a0h,0ech,0dh,71h,91h
+fips_c3_exp db 8eh,0a2h,0b7h,0cah,51h,67h,45h,0bfh,0eah,0fch,49h,90h,4bh,49h,60h,89h
+ctr_pt19    db 00h,01h,02h,03h,04h,05h,06h,07h,08h,09h,0ah,0bh,0ch,0dh,0eh,0fh,10h,11h,12h
+ctr_ct19_exp db 0c7h,0b4h,1bh,87h,6eh,14h,47h,1bh,0deh,0a5h,0dh,0c0h,0fh,0f5h,0fh,0a7h,5eh,0e5h,0aah
+
+b2l_96_exp  db 41h,0b5h,59h,0dh,90h,9ah,09h,0f9h,9ch,2ch,54h,75h,0f7h,82h,0bah,72h
+            db 13h,97h,0c7h,0dch,62h,67h,36h,0a3h,0b5h,0b0h,0b3h,69h,0bah,0b7h,8ah,0f2h
+            db 4ah,80h,0fh,0fdh,07h,0bdh,9bh,94h,0e0h,73h,0feh,54h,51h,0b2h,0ch,0afh
+            db 77h,0bh,68h,0afh,0e0h,83h,98h,42h,0b4h,72h,35h,50h,0bdh,0f0h,83h,0cfh
+            db 9eh,20h,5eh,53h,04h,0aah,0ech,15h,84h,0f1h,00h,08h,28h,5fh,56h,32h
+            db 52h,0fch,0fch,0f2h,07h,0cah,8ch,75h,5dh,16h,52h,16h,8bh,90h,24h,0afh
+
+b2l_100_exp db 4ch,9bh,0a2h,3bh,0cah,0fah,0e5h,0e5h,71h,0a5h,0d4h,16h,73h,0bbh,80h,84h
+            db 0a4h,0a1h,0deh,26h,88h,41h,6eh,0d3h,90h,0f6h,69h,0d3h,3dh,36h,4fh,3dh
+            db 4dh,9bh,0fah,7fh,0e7h,62h,68h,0ch,6bh,23h,62h,71h,1ch,4ch,0e5h,0b2h
+            db 0c6h,0dh,0dch,0d1h,4ch,12h,77h,0ech,13h,69h,0c7h,9fh,44h,0c2h,89h,66h
+            db 98h,0a2h,0b0h,77h,3ah,3ch,0e2h,0e4h,10h,53h,2fh,0a7h,0c7h,2fh,0bh,0b6h
+            db 1ch,0cch,0a0h,0c2h,4ch,36h,2fh,33h,75h,55h,0cbh,0f2h,99h,8fh,2dh,36h
+            db 01h,0beh,70h,0d1h
+
+b32_k64_src db "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
+            db "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNA="
+k64_raw_exp db "1234567890123456789012345678901234567890123456789012345678901234"
+totp8_59_exp    db "94287082"
+totp8_11_exp    db "07081804"
+totp8_k64_59    db "14779409"
+
+; JSON zj_str vectors
+zj_v_ok     db '"', '\', '"', 'A', '\', '\', 'B', '\', 'u', '0', '0', '4', '1'
+            db '\', 'u', 'D', '8', '3', 'D', '\', 'u', 'D', 'D', '1', '2', '"'
+zj_v_ok_n   equ $ - zj_v_ok
+zj_v_ok_exp db '"', 'A', '\', 'B', 'A', 0F0h, 9Fh, 94h, 92h
+zj_v_lone   db '"', '\', 'u', 'D', '8', '3', 'D', 'a', 'b', 'c', '"'
+zj_v_lone_n equ $ - zj_v_lone
+zj_v_nul    db '"', '\', 'u', '0', '0', '0', '0', '"'
+zj_v_nul_n  equ $ - zj_v_nul
+zj_v_long   db '"', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', '"'
+zj_v_long_n equ $ - zj_v_long
+
+st_zero96   db 96 dup (0)
+align 16
+st_xmm_pat  dq 0A5A5A5A55A5A5A5Ah, 0123456789ABCDEF0h
+
+align 2
+ws_san_trv_in   dw '.','.','\','.','.','\','e','v','i','l','.','e','x','e',0
+ws_san_trv_exp  dw 'e','v','i','l','.','e','x','e',0
+ws_san_ads_in   dw 'i','n','v','o','i','c','e','.','p','d','f',':','Z','o','n','e','.','I','d','e','n','t','i','f','i','e','r',0
+ws_san_ads_exp  dw 'i','n','v','o','i','c','e','.','p','d','f',0
+ws_san_dev_in   dw 'C','O','N','.','t','x','t',0
+ws_san_dev_exp  dw '_','C','O','N','.','t','x','t',0
+ws_san_dot_in   dw 'r','e','p','o','r','t','.','p','d','f',' ','.',' ',0
+ws_san_dot_exp  dw 'r','e','p','o','r','t','.','p','d','f',0
+ws_san_dd_in    dw '.','.',0
+ws_san_dd_exp   dw 'v','o','r','d','r','_','a','t','t','a','c','h','.','b','i','n',0
+ws_ext_docm     dw 'm','a','c','r','o','.','d','o','c','m',0
+ws_ext_hta      dw 's','c','r','i','p','t','.','h','t','a',0
+ws_ext_png      dw 'p','h','o','t','o','.','P','N','G',0
+
+ws_url_bare_in  dw 'e','x','a','m','p','l','e','.','c','o','m',0
+ws_url_bare_exp dw 'h','t','t','p','s',':','/','/','e','x','a','m','p','l','e','.','c','o','m',0
+ws_url_http_in  dw 'H','T','T','P',':','/','/','E','x','a','m','p','l','e','.','o','r','g','/','p',0
+ws_url_http_exp dw 'h','t','t','p',':','/','/','E','x','a','m','p','l','e','.','o','r','g','/','p',0
+ws_url_file_in  dw 'f','i','l','e',':','/','/','/','C',':','/','x',0
+ws_url_js_in    dw 'j','a','v','a','s','c','r','i','p','t',':','a','l','e','r','t','(','1',')',0
+ws_url_unc_in   dw '\','\','a','t','t','a','c','k','e','r','\','s','h','a','r','e',0
+
+.data?
+align 16
+st_aes_rk   db 240 dup (?)
+st_aes_blk  db 32 dup (?)
+st_aes_ctr  db 16 dup (?)
+st_b2ctx    db 256 dup (?)
+st_b2l_out  db 128 dup (?)
+st_k64_dec  db 160 dup (?)
+st_otp8_out db 16 dup (?)
+align 16
+st_xmm_dump db 96 dup (?)
+st_rng_buf  db 16 dup (?)
+st_zj_out   db 32 dup (?)
+align 2
+st_san_out  dw 128 dup (?)
+st_url_out  dw 128 dup (?)
+align 8
+st_tpm_sav  db 32 dup (?)
+st_tpm_lbl1 db 32 dup (?)
+st_tpm_rh   dd ?
+
+.code
+selftest_ext proc frame
+    FRAME_PROLOG 128
+    mov     qword ptr [rbp-24], 0           ; local failure count
+
+    ; ---- 1. AES-128/192/256 ECB (FIPS 197 C.1-C.3) + WinZip CTR -------------
+    lea     rcx, [fips_key32]
+    mov     rdx, 20                         ; unsupported key size -> 0
+    lea     r8, [st_aes_rk]
+    call    aes_expand_key
+    test    eax, eax
+    jnz     ste_aes_fail
+
+    ; AES-128
+    lea     rcx, [fips_key32]
+    mov     rdx, 16
+    lea     r8, [st_aes_rk]
+    call    aes_expand_key
+    cmp     eax, 10
+    jne     ste_aes_fail
+    movdqu  xmm0, xmmword ptr [fips_pt16]
+    movdqu  xmmword ptr [st_aes_blk], xmm0
+    lea     rcx, [st_aes_rk]
+    lea     rdx, [st_aes_blk]
+    mov     r8, 10
+    call    aes_ecb_block
+    lea     rcx, [st_aes_blk]
+    lea     rdx, [fips_c1_exp]
+    mov     r8, 16
+    call    ct_memcmp
+    test    eax, eax
+    jnz     ste_aes_fail
+
+    ; AES-192
+    lea     rcx, [fips_key32]
+    mov     rdx, 24
+    lea     r8, [st_aes_rk]
+    call    aes_expand_key
+    cmp     eax, 12
+    jne     ste_aes_fail
+    movdqu  xmm0, xmmword ptr [fips_pt16]
+    movdqu  xmmword ptr [st_aes_blk], xmm0
+    lea     rcx, [st_aes_rk]
+    lea     rdx, [st_aes_blk]
+    mov     r8, 12
+    call    aes_ecb_block
+    lea     rcx, [st_aes_blk]
+    lea     rdx, [fips_c2_exp]
+    mov     r8, 16
+    call    ct_memcmp
+    test    eax, eax
+    jnz     ste_aes_fail
+
+    ; AES-256 + 19-byte WinZip CTR (encrypt + decrypt round-trip)
+    lea     rcx, [fips_key32]
+    mov     rdx, 32
+    lea     r8, [st_aes_rk]
+    call    aes_expand_key
+    cmp     eax, 14
+    jne     ste_aes_fail
+    movdqu  xmm0, xmmword ptr [fips_pt16]
+    movdqu  xmmword ptr [st_aes_blk], xmm0
+    lea     rcx, [st_aes_rk]
+    lea     rdx, [st_aes_blk]
+    mov     r8, 14
+    call    aes_ecb_block
+    lea     rcx, [st_aes_blk]
+    lea     rdx, [fips_c3_exp]
+    mov     r8, 16
+    call    ct_memcmp
+    test    eax, eax
+    jnz     ste_aes_fail
+
+    lea     r10, [ctr_pt19]
+    lea     r11, [st_aes_blk]
+    xor     ecx, ecx
+ste_cp19:
+    mov     al, byte ptr [r10 + rcx]
+    mov     byte ptr [r11 + rcx], al
+    inc     ecx
+    cmp     ecx, 19
+    jb      ste_cp19
+    pxor    xmm0, xmm0
+    movdqu  xmmword ptr [st_aes_ctr], xmm0
+    WINCALL aes_ctr_xor, addr st_aes_rk, addr st_aes_blk, 19, addr st_aes_ctr, 14
+    lea     rcx, [st_aes_blk]
+    lea     rdx, [ctr_ct19_exp]
+    mov     r8, 19
+    call    ct_memcmp
+    test    eax, eax
+    jnz     ste_aes_fail
+    pxor    xmm0, xmm0
+    movdqu  xmmword ptr [st_aes_ctr], xmm0
+    WINCALL aes_ctr_xor, addr st_aes_rk, addr st_aes_blk, 19, addr st_aes_ctr, 14
+    lea     rcx, [st_aes_blk]
+    lea     rdx, [ctr_pt19]
+    mov     r8, 19
+    call    ct_memcmp
+    test    eax, eax
+    jnz     ste_aes_fail
+    STPASS  st_pass_aesv, st_pass_aesv_len
+    jmp     ste_after_aes
+ste_aes_fail:
+    STPRINT st_fail_aesv, st_fail_aesv_len
+    inc     qword ptr [rbp-24]
+ste_after_aes:
+
+    ; ---- 2. BLAKE2b init bounds + blake2b_long (96B + 100B) -----------------
+    lea     rcx, [st_b2ctx]
+    xor     edx, edx
+    call    blake2b_init
+    cmp     eax, 1
+    jne     ste_b2l_fail
+    lea     rcx, [st_b2ctx]
+    mov     edx, 65
+    call    blake2b_init
+    cmp     eax, 1
+    jne     ste_b2l_fail
+    lea     rcx, [st_b2ctx]
+    mov     edx, 32
+    call    blake2b_init
+    test    eax, eax
+    jnz     ste_b2l_fail
+
+    lea     rcx, [st_b2l_out]
+    mov     edx, 96
+    lea     r8, [st_abc]
+    mov     r9, 3
+    call    blake2b_long
+    lea     rcx, [st_b2l_out]
+    lea     rdx, [b2l_96_exp]
+    mov     r8, 96
+    call    ct_memcmp
+    test    eax, eax
+    jnz     ste_b2l_fail
+
+    lea     rcx, [st_b2l_out]
+    mov     edx, 100
+    lea     r8, [st_abc]
+    mov     r9, 3
+    call    blake2b_long
+    lea     rcx, [st_b2l_out]
+    lea     rdx, [b2l_100_exp]
+    mov     r8, 100
+    call    ct_memcmp
+    test    eax, eax
+    jnz     ste_b2l_fail
+    STPASS  st_pass_b2l, st_pass_b2l_len
+    jmp     ste_after_b2l
+ste_b2l_fail:
+    STPRINT st_fail_b2l, st_fail_b2l_len
+    inc     qword ptr [rbp-24]
+ste_after_b2l:
+
+    ; ---- 3. TOTP 8-digit + 64B Base32 + dirty upper-32 rdx ABI --------------
+    WINCALL totp_at, addr otp_key, 20, 59, 30, 8, addr st_otp8_out
+    cmp     eax, 1
+    jne     ste_t64_fail
+    lea     rcx, [st_otp8_out]
+    lea     rdx, [totp8_59_exp]
+    mov     r8, 8
+    call    ct_memcmp
+    test    eax, eax
+    jnz     ste_t64_fail
+
+    WINCALL totp_at, addr otp_key, 20, 1111111109, 30, 8, addr st_otp8_out
+    cmp     eax, 1
+    jne     ste_t64_fail
+    lea     rcx, [st_otp8_out]
+    lea     rdx, [totp8_11_exp]
+    mov     r8, 8
+    call    ct_memcmp
+    test    eax, eax
+    jnz     ste_t64_fail
+
+    WINCALL base32_decode, addr b32_k64_src, 104, addr st_k64_dec, 160
+    cmp     eax, 64
+    jne     ste_t64_fail
+    lea     rcx, [st_k64_dec]
+    lea     rdx, [k64_raw_exp]
+    mov     r8, 64
+    call    ct_memcmp
+    test    eax, eax
+    jnz     ste_t64_fail
+
+    WINCALL totp_at, addr st_k64_dec, 64, 59, 30, 8, addr st_otp8_out
+    cmp     eax, 1
+    jne     ste_t64_fail
+    lea     rcx, [st_otp8_out]
+    lea     rdx, [totp8_k64_59]
+    mov     r8, 8
+    call    ct_memcmp
+    test    eax, eax
+    jnz     ste_t64_fail
+
+    ; Dirty upper-32 rdx ABI checks (0DEAD000000000000h | len)
+    lea     rcx, [b32_src]
+    mov     rdx, 0DEAD000000000008h
+    lea     r8, [b32_out]
+    mov     r9d, 16
+    call    base32_decode
+    cmp     eax, 5
+    jne     ste_t64_fail
+    lea     rcx, [otp_key]
+    mov     rdx, 0DEAD000000000014h
+    mov     r8, 1
+    lea     r9, [otp_out]
+    call    hotp
+    lea     rcx, [otp_out]
+    lea     rdx, [otp_exp]
+    mov     r8, 6
+    call    ct_memcmp
+    test    eax, eax
+    jnz     ste_t64_fail
+    lea     rcx, [st_b2l_out]
+    mov     rdx, 0DEAD000000000060h         ; 96 in edx, dirty upper 32
+    lea     r8, [st_abc]
+    mov     r9, 3
+    call    blake2b_long
+    lea     rcx, [st_b2l_out]
+    lea     rdx, [b2l_96_exp]
+    mov     r8, 96
+    call    ct_memcmp
+    test    eax, eax
+    jnz     ste_t64_fail
+    STPASS  st_pass_t64, st_pass_t64_len
+    jmp     ste_after_t64
+ste_t64_fail:
+    STPRINT st_fail_t64, st_fail_t64_len
+    inc     qword ptr [rbp-24]
+ste_after_t64:
+
+    ; ---- 4. Crypto bounds + volatile XMM scrubbing + RNG/XCR0 gates ---------
+    ; Volatile XMM0..XMM5 scrub check across sha256_hash + gcm_seal
+    movdqa  xmm0, xmmword ptr [st_xmm_pat]
+    movdqa  xmm1, xmm0
+    movdqa  xmm2, xmm0
+    movdqa  xmm3, xmm0
+    movdqa  xmm4, xmm0
+    movdqa  xmm5, xmm0
+    lea     rcx, [st_abc]
+    mov     rdx, 3
+    lea     r8, [st_out]
+    call    sha256_hash
+    movdqa  xmmword ptr [st_xmm_dump+0],  xmm0
+    movdqa  xmmword ptr [st_xmm_dump+16], xmm1
+    movdqa  xmmword ptr [st_xmm_dump+32], xmm2
+    movdqa  xmmword ptr [st_xmm_dump+48], xmm3
+    movdqa  xmmword ptr [st_xmm_dump+64], xmm4
+    movdqa  xmmword ptr [st_xmm_dump+80], xmm5
+    lea     rcx, [st_xmm_dump]
+    lea     rdx, [st_zero96]
+    mov     r8, 96
+    call    ct_memcmp
+    test    eax, eax
+    jnz     ste_grd_fail
+
+    lea     rax, [gcm_key]
+    mov     qword ptr [greq].GCMREQ.key, rax
+    lea     rax, [gcm_iv]
+    mov     qword ptr [greq].GCMREQ.iv, rax
+    mov     qword ptr [greq].GCMREQ.aad, 0
+    mov     qword ptr [greq].GCMREQ.aadlen, 0
+    lea     rax, [gcm_pt]
+    mov     qword ptr [greq].GCMREQ.inp, rax
+    mov     qword ptr [greq].GCMREQ.inlen, 16
+    lea     rax, [gcm_ct]
+    mov     qword ptr [greq].GCMREQ.outp, rax
+    lea     rax, [gcm_tag]
+    mov     qword ptr [greq].GCMREQ.tag, rax
+    movdqa  xmm0, xmmword ptr [st_xmm_pat]
+    movdqa  xmm1, xmm0
+    movdqa  xmm2, xmm0
+    movdqa  xmm3, xmm0
+    movdqa  xmm4, xmm0
+    movdqa  xmm5, xmm0
+    lea     rcx, [greq]
+    call    gcm_seal
+    test    eax, eax
+    jnz     ste_grd_fail
+    movdqa  xmmword ptr [st_xmm_dump+0],  xmm0
+    movdqa  xmmword ptr [st_xmm_dump+16], xmm1
+    movdqa  xmmword ptr [st_xmm_dump+32], xmm2
+    movdqa  xmmword ptr [st_xmm_dump+48], xmm3
+    movdqa  xmmword ptr [st_xmm_dump+64], xmm4
+    movdqa  xmmword ptr [st_xmm_dump+80], xmm5
+    lea     rcx, [st_xmm_dump]
+    lea     rdx, [st_zero96]
+    mov     r8, 96
+    call    ct_memcmp
+    test    eax, eax
+    jnz     ste_grd_fail
+
+    ; NIST SP 800-38D over-limit inlen (2^36 - 31 = 0FFFFFFFE1h) -> eax == 1
+    mov     rax, 0FFFFFFFE1h
+    mov     qword ptr [greq].GCMREQ.inlen, rax
+    lea     rcx, [greq]
+    call    gcm_seal
+    cmp     eax, 1
+    jne     ste_grd_fail
+    lea     rcx, [greq]
+    call    gcm_open
+    cmp     eax, 1
+    jne     ste_grd_fail
+    mov     qword ptr [greq].GCMREQ.inlen, 16
+
+    ; Argon2id RFC 9106 parameter guards (lanes=0, t_cost=0, m_cost < 8*lanes)
+    lea     r10, [a2_req]
+    mov     dword ptr [r10].ARGON2REQ.t_cost, 1
+    mov     dword ptr [r10].ARGON2REQ.m_cost, 32
+    mov     dword ptr [r10].ARGON2REQ.lanes, 0
+    mov     dword ptr [r10].ARGON2REQ.outlen, 32
+    lea     rax, [a2_out]
+    mov     qword ptr [r10].ARGON2REQ.outp, rax
+    lea     rcx, [a2_req]
+    call    argon2id_hash
+    cmp     eax, 1
+    jne     ste_grd_fail
+    lea     r10, [a2_req]
+    mov     dword ptr [r10].ARGON2REQ.lanes, 1
+    mov     dword ptr [r10].ARGON2REQ.t_cost, 0
+    lea     rcx, [a2_req]
+    call    argon2id_hash
+    cmp     eax, 1
+    jne     ste_grd_fail
+    lea     r10, [a2_req]
+    mov     dword ptr [r10].ARGON2REQ.t_cost, 1
+    mov     dword ptr [r10].ARGON2REQ.m_cost, 4     ; < 8 * lanes
+    lea     rcx, [a2_req]
+    call    argon2id_hash
+    cmp     eax, 1
+    jne     ste_grd_fail
+
+    ; rng_fill: NULL rejected, 0/1/7/12-byte lengths succeed
+    xor     ecx, ecx
+    mov     edx, 16
+    call    rng_fill
+    test    eax, eax
+    jnz     ste_grd_fail
+    lea     rcx, [st_rng_buf]
+    xor     edx, edx
+    call    rng_fill
+    cmp     eax, 1
+    jne     ste_grd_fail
+    lea     rcx, [st_rng_buf]
+    mov     edx, 1
+    call    rng_fill
+    cmp     eax, 1
+    jne     ste_grd_fail
+    lea     rcx, [st_rng_buf]
+    mov     edx, 7
+    call    rng_fill
+    cmp     eax, 1
+    jne     ste_grd_fail
+    lea     rcx, [st_rng_buf]
+    mov     edx, 12
+    call    rng_fill
+    cmp     eax, 1
+    jne     ste_grd_fail
+
+    ; cpu_eval_features: AVX2 gated on OSXSAVE + AVX + XCR0[2:1] == 06h
+    mov     ecx, (1 SHL 25) or (1 SHL 1) or (1 SHL 19) or (1 SHL 28) ; OSXSAVE=0
+    mov     edx, (1 SHL 29) or (1 SHL 5)
+    mov     r8d, 06h
+    call    cpu_eval_features
+    test    eax, CPUF_AVX2
+    jnz     ste_grd_fail
+    mov     ecx, (1 SHL 25) or (1 SHL 1) or (1 SHL 19) or (1 SHL 27) or (1 SHL 28)
+    mov     edx, (1 SHL 29) or (1 SHL 5)
+    mov     r8d, 02h                                ; XMM only, YMM disabled in XCR0
+    call    cpu_eval_features
+    test    eax, CPUF_AVX2
+    jnz     ste_grd_fail
+    mov     ecx, (1 SHL 25) or (1 SHL 1) or (1 SHL 19) or (1 SHL 27) or (1 SHL 28)
+    mov     edx, (1 SHL 29) or (1 SHL 5)
+    mov     r8d, 06h                                ; XMM + YMM OS-enabled
+    call    cpu_eval_features
+    test    eax, CPUF_AVX2
+    jz      ste_grd_fail
+    STPASS  st_pass_grd, st_pass_grd_len
+    jmp     ste_after_grd
+ste_grd_fail:
+    STPRINT st_fail_grd, st_fail_grd_len
+    inc     qword ptr [rbp-24]
+ste_after_grd:
+
+    ; ---- 5. JSON zj_str + attachment sanitizer + URL + TPM OAEP label -------
+    ; zj_str: valid escapes + UTF-16 surrogate pair -> U+1F512 (F0 9F 94 92)
+    mov     dword ptr [g_zi_err], 0
+    lea     rax, [zj_v_ok]
+    mov     qword ptr [g_zi_p], rax
+    add     rax, zj_v_ok_n
+    mov     qword ptr [g_zi_jend], rax
+    lea     rcx, [st_zj_out]
+    mov     edx, 32
+    call    zj_str
+    cmp     eax, 9
+    jne     ste_prs_fail
+    cmp     dword ptr [g_zi_err], 0
+    jne     ste_prs_fail
+    lea     rcx, [st_zj_out]
+    lea     rdx, [zj_v_ok_exp]
+    mov     r8, 9
+    call    ct_memcmp
+    test    eax, eax
+    jnz     ste_prs_fail
+
+    ; zj_str: lone high surrogate rejected
+    mov     dword ptr [g_zi_err], 0
+    lea     rax, [zj_v_lone]
+    mov     qword ptr [g_zi_p], rax
+    add     rax, zj_v_lone_n
+    mov     qword ptr [g_zi_jend], rax
+    lea     rcx, [st_zj_out]
+    mov     edx, 32
+    call    zj_str
+    test    eax, eax
+    jnz     ste_prs_fail
+    cmp     dword ptr [g_zi_err], 1
+    jne     ste_prs_fail
+
+    ; zj_str: embedded \u0000 rejected
+    mov     dword ptr [g_zi_err], 0
+    lea     rax, [zj_v_nul]
+    mov     qword ptr [g_zi_p], rax
+    add     rax, zj_v_nul_n
+    mov     qword ptr [g_zi_jend], rax
+    lea     rcx, [st_zj_out]
+    mov     edx, 32
+    call    zj_str
+    test    eax, eax
+    jnz     ste_prs_fail
+    cmp     dword ptr [g_zi_err], 1
+    jne     ste_prs_fail
+
+    ; zj_str: capacity overflow rejected cleanly
+    mov     dword ptr [g_zi_err], 0
+    lea     rax, [zj_v_long]
+    mov     qword ptr [g_zi_p], rax
+    add     rax, zj_v_long_n
+    mov     qword ptr [g_zi_jend], rax
+    lea     rcx, [st_zj_out]
+    mov     edx, 8
+    call    zj_str
+    test    eax, eax
+    jnz     ste_prs_fail
+    cmp     dword ptr [g_zi_err], 1
+    jne     ste_prs_fail
+    mov     qword ptr [g_zi_p], 0
+    mov     qword ptr [g_zi_jend], 0
+    mov     dword ptr [g_zi_err], 0
+
+    ; gui_sanitize_attname + gui_ext_can_preview
+    lea     rcx, [ws_san_trv_in]
+    lea     rdx, [st_san_out]
+    call    gui_sanitize_attname
+    lea     rcx, [st_san_out]
+    lea     rdx, [ws_san_trv_exp]
+    call    gui_wstr_eq
+    cmp     eax, 1
+    jne     ste_prs_fail
+    lea     rcx, [st_san_out]
+    call    gui_ext_can_preview
+    test    eax, eax
+    jnz     ste_prs_fail
+
+    lea     rcx, [ws_san_ads_in]
+    lea     rdx, [st_san_out]
+    call    gui_sanitize_attname
+    lea     rcx, [st_san_out]
+    lea     rdx, [ws_san_ads_exp]
+    call    gui_wstr_eq
+    cmp     eax, 1
+    jne     ste_prs_fail
+    lea     rcx, [st_san_out]
+    call    gui_ext_can_preview
+    cmp     eax, 1
+    jne     ste_prs_fail
+
+    lea     rcx, [ws_san_dev_in]
+    lea     rdx, [st_san_out]
+    call    gui_sanitize_attname
+    lea     rcx, [st_san_out]
+    lea     rdx, [ws_san_dev_exp]
+    call    gui_wstr_eq
+    cmp     eax, 1
+    jne     ste_prs_fail
+    lea     rcx, [st_san_out]
+    call    gui_ext_can_preview
+    cmp     eax, 1
+    jne     ste_prs_fail
+
+    lea     rcx, [ws_san_dot_in]
+    lea     rdx, [st_san_out]
+    call    gui_sanitize_attname
+    lea     rcx, [st_san_out]
+    lea     rdx, [ws_san_dot_exp]
+    call    gui_wstr_eq
+    cmp     eax, 1
+    jne     ste_prs_fail
+
+    lea     rcx, [ws_san_dd_in]
+    lea     rdx, [st_san_out]
+    call    gui_sanitize_attname
+    lea     rcx, [st_san_out]
+    lea     rdx, [ws_san_dd_exp]
+    call    gui_wstr_eq
+    cmp     eax, 1
+    jne     ste_prs_fail
+    lea     rcx, [st_san_out]
+    call    gui_ext_can_preview
+    test    eax, eax
+    jnz     ste_prs_fail
+
+    lea     rcx, [ws_ext_docm]
+    call    gui_ext_can_preview
+    test    eax, eax
+    jnz     ste_prs_fail
+    lea     rcx, [ws_ext_hta]
+    call    gui_ext_can_preview
+    test    eax, eax
+    jnz     ste_prs_fail
+    lea     rcx, [ws_ext_png]
+    call    gui_ext_can_preview
+    cmp     eax, 1
+    jne     ste_prs_fail
+
+    ; gui_url_prepare
+    lea     rcx, [ws_url_bare_in]
+    lea     rdx, [st_url_out]
+    mov     r8d, 128
+    call    gui_url_prepare
+    cmp     eax, 1
+    jne     ste_prs_fail
+    lea     rcx, [st_url_out]
+    lea     rdx, [ws_url_bare_exp]
+    call    gui_wstr_eq
+    cmp     eax, 1
+    jne     ste_prs_fail
+
+    lea     rcx, [ws_url_http_in]
+    lea     rdx, [st_url_out]
+    mov     r8d, 128
+    call    gui_url_prepare
+    cmp     eax, 1
+    jne     ste_prs_fail
+    lea     rcx, [st_url_out]
+    lea     rdx, [ws_url_http_exp]
+    call    gui_wstr_eq
+    cmp     eax, 1
+    jne     ste_prs_fail
+
+    lea     rcx, [ws_url_file_in]
+    lea     rdx, [st_url_out]
+    mov     r8d, 128
+    call    gui_url_prepare
+    test    eax, eax
+    jnz     ste_prs_fail
+    lea     rcx, [ws_url_js_in]
+    lea     rdx, [st_url_out]
+    mov     r8d, 128
+    call    gui_url_prepare
+    test    eax, eax
+    jnz     ste_prs_fail
+    lea     rcx, [ws_url_unc_in]
+    lea     rdx, [st_url_out]
+    mov     r8d, 128
+    call    gui_url_prepare
+    test    eax, eax
+    jnz     ste_prs_fail
+
+    ; tpm_build_oaep(1): label binds both vault salt (g_hdr+20) and g_tpm_reqhello
+    movdqu  xmm0, xmmword ptr [g_hdr+20]
+    movdqu  xmmword ptr [st_tpm_sav+0], xmm0
+    movdqu  xmm0, xmmword ptr [g_hdr+36]
+    movdqu  xmmword ptr [st_tpm_sav+16], xmm0
+    mov     eax, dword ptr [g_tpm_reqhello]
+    mov     dword ptr [st_tpm_rh], eax
+
+    mov     dword ptr [g_tpm_reqhello], 0
+    mov     ecx, 1
+    call    tpm_build_oaep
+    movdqu  xmm0, xmmword ptr [g_tpm_label+0]
+    movdqu  xmmword ptr [st_tpm_lbl1+0], xmm0
+    movdqu  xmm0, xmmword ptr [g_tpm_label+16]
+    movdqu  xmmword ptr [st_tpm_lbl1+16], xmm0
+
+    xor     byte ptr [g_hdr+20], 01h        ; 1-bit header salt flip
+    mov     ecx, 1
+    call    tpm_build_oaep
+    xor     byte ptr [g_hdr+20], 01h        ; restore salt immediately
+    lea     rcx, [g_tpm_label]
+    lea     rdx, [st_tpm_lbl1]
+    mov     r8, 32
+    call    ct_memcmp
+    test    eax, eax
+    jz      ste_tpm_fail                    ; label MUST change on salt flip
+
+    mov     dword ptr [g_tpm_reqhello], 1   ; flip reqhello policy bit
+    mov     ecx, 1
+    call    tpm_build_oaep
+    lea     rcx, [g_tpm_label]
+    lea     rdx, [st_tpm_lbl1]
+    mov     r8, 32
+    call    ct_memcmp
+    test    eax, eax
+    jz      ste_tpm_fail                    ; label MUST change on reqhello flip
+
+    ; restore g_hdr+20..51 + g_tpm_reqhello and scrub g_tpm_label
+    movdqu  xmm0, xmmword ptr [st_tpm_sav+0]
+    movdqu  xmmword ptr [g_hdr+20], xmm0
+    movdqu  xmm0, xmmword ptr [st_tpm_sav+16]
+    movdqu  xmmword ptr [g_hdr+36], xmm0
+    mov     eax, dword ptr [st_tpm_rh]
+    mov     dword ptr [g_tpm_reqhello], eax
+    pxor    xmm0, xmm0
+    lea     rcx, [g_tpm_label]
+    mov     edx, 32
+    call    secure_zero
+    STPASS  st_pass_prs, st_pass_prs_len
+    jmp     ste_after_prs
+ste_tpm_fail:
+    movdqu  xmm0, xmmword ptr [st_tpm_sav+0]
+    movdqu  xmmword ptr [g_hdr+20], xmm0
+    movdqu  xmm0, xmmword ptr [st_tpm_sav+16]
+    movdqu  xmmword ptr [g_hdr+36], xmm0
+    mov     eax, dword ptr [st_tpm_rh]
+    mov     dword ptr [g_tpm_reqhello], eax
+ste_prs_fail:
+    mov     qword ptr [g_zi_p], 0
+    mov     qword ptr [g_zi_jend], 0
+    mov     dword ptr [g_zi_err], 0
+    STPRINT st_fail_prs, st_fail_prs_len
+    inc     qword ptr [rbp-24]
+ste_after_prs:
+
+    mov     rax, qword ptr [rbp-24]
+    FRAME_EPILOG
+    ret
+selftest_ext endp
 
 PKAT_MAX    equ 4
 PKAT_ITERS  equ 2000
@@ -1134,6 +1905,15 @@ CSTR krl_hotp,       "hotp/rfc4226 "
 CSTR krl_totp,       "totp/rfc6238 "
 CSTR krl_b32h,       "base32/hello "
 CSTR krl_b32o,       "base32/otp16 "
+CSTR krl_b32k64,     "base32/rfc6238-k64 "
+CSTR krl_b2l96,      "blake2b-long96/abc "
+CSTR krl_b2l100,     "blake2b-long100/abc "
+CSTR krl_aes128,     "aes128/fips197c1 "
+CSTR krl_aes192,     "aes192/fips197c2 "
+CSTR krl_aes256,     "aes256/fips197c3 "
+CSTR krl_aesctr,     "aes256ctr/winzip19 "
+CSTR krl_totp8,      "totp8/rfc6238 "
+CSTR krl_totp8k64,   "totp8-k64/custom "
 CSTR krl_a2,         "argon2id/rfc9106 "
 CSTR krl_a2ref,      "argon2id/ref-t2m64 "
 ; The RFC 9106 vector (m=32, p=4) has two-block segments, so it never reaches the
@@ -1164,11 +1944,13 @@ kr_aad8     db 0a0h,0a1h,0a2h,0a3h,0a4h,0a5h,0a6h,0a7h
 kr_pt20     db 10h,11h,12h,13h,14h,15h,16h,17h,18h,19h,1ah,1bh,1ch,1dh,1eh,1fh,20h,21h,22h,23h
 align 8
 kr_totp_ctrs dq 1, 37037036, 41152263, 66666666   ; T=59,1111111109,1234567890,2000000000 (/30)
+kr_totp_secs dq 59, 1111111109, 1234567890, 2000000000
 kr_sp       db ' '
 kr_nl       db 10
 
 .data?
 kr_o64      db 64 dup(?)
+kr_o160     db 160 dup(?)
 kr_ct       db 32 dup(?)
 kr_tag      db 16 dup(?)
 kr_otp      db 8 dup(?)
@@ -1209,7 +1991,7 @@ endm
 LANDING_PAD
 public cmd_katreport
 cmd_katreport proc frame
-    FRAME_PROLOG 96
+    FRAME_PROLOG 128
     ; locals: [rbp-32] counter/scratch (q), [rbp-40] loop index (q), [rbp-48] declen (d)
 
     ; ---- SHA-256 ----
@@ -1504,6 +2286,152 @@ kr_a2ad:
     lea     rcx, [a2_req]
     call    argon2id_hash
     KEMIT   krl_a2ref, a2_out, 32
+
+    ; ---- BLAKE2b H' variable-length (96B + 100B; chunked <=64B for print_hex) ----
+    lea     rcx, [kr_o160]
+    mov     edx, 96
+    lea     r8, [st_abc]
+    mov     r9, 3
+    call    blake2b_long
+    lea     rcx, [krl_b2l96]
+    mov     edx, krl_b2l96_len
+    call    print_a
+    lea     rcx, [kr_o160]
+    mov     edx, 64
+    call    print_hex
+    lea     rcx, [kr_o160+64]
+    mov     edx, 32
+    call    print_hex
+    lea     rcx, [kr_nl]
+    mov     edx, 1
+    call    print_a
+
+    lea     rcx, [kr_o160]
+    mov     edx, 100
+    lea     r8, [st_abc]
+    mov     r9, 3
+    call    blake2b_long
+    lea     rcx, [krl_b2l100]
+    mov     edx, krl_b2l100_len
+    call    print_a
+    lea     rcx, [kr_o160]
+    mov     edx, 64
+    call    print_hex
+    lea     rcx, [kr_o160+64]
+    mov     edx, 36
+    call    print_hex
+    lea     rcx, [kr_nl]
+    mov     edx, 1
+    call    print_a
+
+    ; ---- AES-128 / AES-192 / AES-256 ECB (FIPS 197 C.1-C.3) + WinZip CTR ----
+    lea     rcx, [fips_key32]
+    mov     rdx, 16
+    lea     r8, [st_aes_rk]
+    call    aes_expand_key
+    movdqu  xmm0, xmmword ptr [fips_pt16]
+    movdqu  xmmword ptr [kr_ct], xmm0
+    lea     rcx, [st_aes_rk]
+    lea     rdx, [kr_ct]
+    mov     r8, 10
+    call    aes_ecb_block
+    KEMIT   krl_aes128, kr_ct, 16
+
+    lea     rcx, [fips_key32]
+    mov     rdx, 24
+    lea     r8, [st_aes_rk]
+    call    aes_expand_key
+    movdqu  xmm0, xmmword ptr [fips_pt16]
+    movdqu  xmmword ptr [kr_ct], xmm0
+    lea     rcx, [st_aes_rk]
+    lea     rdx, [kr_ct]
+    mov     r8, 12
+    call    aes_ecb_block
+    KEMIT   krl_aes192, kr_ct, 16
+
+    lea     rcx, [fips_key32]
+    mov     rdx, 32
+    lea     r8, [st_aes_rk]
+    call    aes_expand_key
+    movdqu  xmm0, xmmword ptr [fips_pt16]
+    movdqu  xmmword ptr [kr_ct], xmm0
+    lea     rcx, [st_aes_rk]
+    lea     rdx, [kr_ct]
+    mov     r8, 14
+    call    aes_ecb_block
+    KEMIT   krl_aes256, kr_ct, 16
+
+    lea     r10, [ctr_pt19]
+    lea     r11, [kr_ct]
+    xor     ecx, ecx
+kr_cp19:
+    mov     al, byte ptr [r10 + rcx]
+    mov     byte ptr [r11 + rcx], al
+    inc     ecx
+    cmp     ecx, 19
+    jb      kr_cp19
+    pxor    xmm0, xmm0
+    movdqu  xmmword ptr [st_aes_ctr], xmm0
+    WINCALL aes_ctr_xor, addr st_aes_rk, addr kr_ct, 19, addr st_aes_ctr, 14
+    KEMIT   krl_aesctr, kr_ct, 19
+
+    ; ---- Base32 64-byte secret + 8-digit RFC 6238 TOTP ----
+    WINCALL base32_decode, addr b32_k64_src, 104, addr kr_o160, 160
+    mov     dword ptr [rbp-48], eax
+    lea     rcx, [krl_b32k64]
+    mov     edx, krl_b32k64_len
+    call    print_a
+    lea     rcx, [kr_o160]
+    mov     edx, dword ptr [rbp-48]
+    call    print_hex
+    lea     rcx, [kr_nl]
+    mov     edx, 1
+    call    print_a
+
+    mov     qword ptr [rbp-40], 0
+kr_totp8_lp:
+    cmp     qword ptr [rbp-40], 4
+    jae     kr_totp8_done
+    lea     r10, [kr_totp_secs]
+    mov     rax, qword ptr [rbp-40]
+    mov     rax, qword ptr [r10 + rax*8]
+    mov     qword ptr [rbp-32], rax
+
+    lea     rcx, [krl_totp8]
+    mov     edx, krl_totp8_len
+    call    print_a
+    mov     rcx, qword ptr [rbp-32]
+    call    print_u64
+    lea     rcx, [kr_sp]
+    mov     edx, 1
+    call    print_a
+    WINCALL totp_at, addr otp_key, 20, qword ptr [rbp-32], 30, 8, addr kr_otp
+    lea     rcx, [kr_otp]
+    mov     edx, 8
+    call    print_hex
+    lea     rcx, [kr_nl]
+    mov     edx, 1
+    call    print_a
+
+    lea     rcx, [krl_totp8k64]
+    mov     edx, krl_totp8k64_len
+    call    print_a
+    mov     rcx, qword ptr [rbp-32]
+    call    print_u64
+    lea     rcx, [kr_sp]
+    mov     edx, 1
+    call    print_a
+    WINCALL totp_at, addr kr_o160, 64, qword ptr [rbp-32], 30, 8, addr kr_otp
+    lea     rcx, [kr_otp]
+    mov     edx, 8
+    call    print_hex
+    lea     rcx, [kr_nl]
+    mov     edx, 1
+    call    print_a
+
+    inc     qword ptr [rbp-40]
+    jmp     kr_totp8_lp
+kr_totp8_done:
 
     xor     eax, eax
     FRAME_EPILOG
