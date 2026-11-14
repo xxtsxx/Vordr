@@ -259,13 +259,13 @@ theme_boot endp
 ; theme_del_gdi(rcx = &handle) - DeleteObject the handle if non-zero, then 0 it.
 ; =============================================================================
 theme_del_gdi proc frame
-    FRAME_PROLOG 32
-    mov     qword ptr [rbp-24], rcx
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-16], rcx
     mov     rcx, qword ptr [rcx]
     test    rcx, rcx
     jz      tdg_done
     call    DeleteObject
-    mov     r10, qword ptr [rbp-24]
+    mov     r10, qword ptr [rbp-16]
     mov     qword ptr [r10], 0
 tdg_done:
     FRAME_EPILOG

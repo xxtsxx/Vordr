@@ -119,8 +119,10 @@ endm
 ; argon2_p(rcx = ptr to 16 contiguous qwords) - BLAKE2 P permutation
 ; Leaf; uses rsi (saved).
 ; =============================================================================
-argon2_p proc
+argon2_p proc frame
     push    rsi
+    .pushreg rsi
+    .endprolog
     mov     rsi, rcx
     GBM 0,4,8,12
     GBM 1,5,9,13
@@ -733,6 +735,7 @@ argon2_compress_avx2 endp
 ; RIP-relative; the arena itself is VirtualAlloc'd).
 ; =============================================================================
 .data
+public g_arena, g_mb
 g_arena   dq 0
 g_p       dq 0
 g_t       dq 0
@@ -751,6 +754,7 @@ g_refidx  dq 0
 
 .data?
 align 16
+public g_b2bctx, g_hbuf
 g_b2bctx  db 256 dup (?)
 g_hbuf    db 80 dup (?)   ; H0(64) || LE32(blk) || LE32(lane)
 align 8
@@ -818,7 +822,27 @@ argon2id_hash proc frame
     jz      a2_badparam
     cmp     qword ptr [rcx].ARGON2REQ.outp, 0
     je      a2_badparam
-    mov     eax, dword ptr [rcx].ARGON2REQ.lanes
+    cmp     dword ptr [rcx].ARGON2REQ.atype, 2      ; Argon2id ONLY (never Argon2d/i)
+    jne     a2_badparam
+    cmp     dword ptr [rcx].ARGON2REQ.version, 13h  ; RFC 9106 v1.3 ONLY
+    jne     a2_badparam
+    cmp     dword ptr [rcx].ARGON2REQ.saltlen, 8    ; RFC 9106 min salt = 8 bytes
+    jb      a2_badparam
+    cmp     qword ptr [rcx].ARGON2REQ.salt, 0
+    je      a2_badparam
+    cmp     dword ptr [rcx].ARGON2REQ.pwdlen, 0
+    je      @F
+    cmp     qword ptr [rcx].ARGON2REQ.pwd, 0
+    je      a2_badparam
+@@: cmp     dword ptr [rcx].ARGON2REQ.secretlen, 0
+    je      @F
+    cmp     qword ptr [rcx].ARGON2REQ.secret, 0
+    je      a2_badparam
+@@: cmp     dword ptr [rcx].ARGON2REQ.adlen, 0
+    je      @F
+    cmp     qword ptr [rcx].ARGON2REQ.ad, 0
+    je      a2_badparam
+@@: mov     eax, dword ptr [rcx].ARGON2REQ.lanes
     test    eax, eax
     jz      a2_badparam
     cmp     eax, 0FFFFFFh
@@ -994,6 +1018,14 @@ a2_init_lane:
     ; fill loop
     ; =====================================================================
 a2_fill:
+    ; H0 (g_hbuf) and g_b2bctx are never read again once B[i][0..1] are seeded;
+    ; scrub both NOW rather than keeping key-equivalent H0 live across the ~700 ms fill!
+    lea     rcx, [g_hbuf]
+    mov     edx, 80
+    call    secure_zero
+    lea     rcx, [g_b2bctx]
+    mov     edx, 256
+    call    secure_zero
 ifdef DBG_TRACE
     mov     rcx, qword ptr [g_arena]
     mov     edx, 8

@@ -15,6 +15,7 @@ extern GetCurrentProcess:proc
 extern WideCharToMultiByte:proc
 extern GetStdHandle:proc
 extern WriteFile:proc
+extern SwitchDesktop:proc
 
 STD_OUTPUT_HANDLE_   equ -11
 
@@ -23,9 +24,11 @@ extern secure_zero:proc
 extern secmem_panic_wipe:proc           ; secmem.asm: zero every live secret buffer
 extern sstk_reset_current:proc          ; hardening.asm: empty this thread's shadow stack
 externdef g_in_crash:dword              ; hardening.asm: atomic crash re-entrancy latch
+externdef g_secdesk_orig:qword          ; gui.asm: caller's desktop while secure desktop is active
 extern run_selftest:proc
 extern log_result:proc
 externdef g_readonly:dword              ; E9: read-only launch flag (owned by gui.asm)
+ifdef PROBE_IO
 extern do_bench:proc                    ; benchmark (bench.asm)
 extern gui_phtest:proc                  ; pw-history capture probe (gui.asm)
 extern gui_tmptest:proc                 ; secure temp-file lifecycle probe (gui.asm)
@@ -34,9 +37,6 @@ extern gui_trtest:proc                  ; trash timestamp/threshold probe (gui.a
 extern cmd_secscan:proc                 ; secret-wipe page-scan probe (secmem.asm)
 extern cmd_lktest:proc                  ; C3: VirtualLock failure-detection probe (secmem)
 extern cmd_secfreedup:proc              ; secmem_free double-free-safety probe (secmem.asm)
-ifdef DBG_TRACE
-extern cmd_securedesk:proc              ; secure-desktop spike (gui.asm)
-endif
 extern cmd_vfuzz:proc                   ; vault record-parser fuzzer (vault.asm)
 extern cmd_zfuzz:proc                   ; zip-import parser fuzzer (zipimport.asm)
 extern cmd_jfuzz:proc                   ; decrypted-json parser fuzzer (zipimport.asm)
@@ -58,10 +58,8 @@ extern cmd_seedbig:proc                 ; a 40-field entry for the detail-pane s
 extern cmd_cowrite:proc                 ; C8: write-lock exclusivity probe (vault.asm)
 extern cmd_attfuzz:proc                 ; G8: attachment-index fuzzer (vault.asm)
 extern cmd_healthkat:proc               ; E6: vault-health analysis KAT (vault.asm)
-ifdef PROBE_IO
 extern gui_layout_probe:proc            ; runtime dialog-geometry probe (gui.asm)
 extern cmd_secdeskkat:proc              ; VDR-13 secure-desktop fallback/orphan KAT (gui.asm)
-endif
 extern cmd_xctest:proc                  ; external-change detection probe (vault.asm)
 extern cmd_vaultexportkat:proc          ; M6 vault export/merge KAT (vault.asm)
 extern cmd_vaultexpattkat:proc          ; M6 attachment-carry KAT (vault.asm)
@@ -72,26 +70,13 @@ extern cmd_vattcolkat:proc              ; VDR-19 real-GCM VATT tag-collision KAT
 extern cmd_polkat:proc                  ; VDR-09/VDR-23 registry policy + cfg_in_set KAT (regcfg.asm)
 extern cmd_tpmkat:proc                  ; VDR-10 TPM OAEP v2 label + cleanup KAT (tpm.asm)
 extern cmd_pkat:proc                    ; parallel fail-closed KAT gate (selftest.asm)
-extern cmd_katreport:proc               ; external-audit crypto proof battery (selftest.asm)
 extern read_file:proc
-ifdef DBG_TRACE
-extern cmd_redteam:proc                 ; fault-injection self-test (redteam.asm)
-extern cmd_tpmtest:proc                 ; TPM seal/unseal round-trip (tpm.asm)
-extern cmd_cttest:proc                  ; ct_memcmp timing probe (hardening.asm)
-endif
-
-extern print_a:proc
-extern cfg_in_set:proc                  ; the ONLY way to set g_cfg_in
-extern print_u64:proc                   ; console.asm: rcx = u64 -> decimal stdout
-extern rng_fill:proc                    ; random.asm: rcx=buf, edx=len -> eax=1 ok
 extern pwgen_ex:proc                    ; styled password generator (pwgen.asm)
 externdef g_pwgen_outcap:dword          ; E16: one-shot pwgen output capacity
 extern do_seed:proc                     ; bulk test-vault seeder (vault.asm)
-extern print_err:proc
 extern vault_unlock:proc
 extern vault_reseal:proc
 extern mem_free:proc
-; --- attachment export/import probes (atgen / zitest) ------------------------
 extern do_attgen:proc
 extern zi_stage:proc
 extern zi_commit:proc
@@ -101,6 +86,20 @@ extern ze_compose:proc
 extern ze_free:proc
 externdef g_zbuf:qword
 externdef g_sel:byte
+endif
+extern cmd_katreport:proc               ; external-audit crypto proof battery (selftest.asm)
+ifdef DBG_TRACE
+extern cmd_securedesk:proc              ; secure-desktop spike (gui.asm)
+extern cmd_redteam:proc                 ; fault-injection self-test (redteam.asm)
+extern cmd_tpmtest:proc                 ; TPM seal/unseal round-trip (tpm.asm)
+extern cmd_cttest:proc                  ; ct_memcmp timing probe (hardening.asm)
+endif
+
+extern print_a:proc
+extern cfg_in_set:proc                  ; the ONLY way to set g_cfg_in
+extern print_u64:proc                   ; console.asm: rcx = u64 -> decimal stdout
+extern rng_fill:proc                    ; random.asm: rcx=buf, edx=len -> eax=1 ok
+extern print_err:proc
 
 CP_UTF8              equ 65001
 WC_ERR_INVALID_CHARS equ 80h
@@ -173,11 +172,14 @@ msg_usage_len equ $ - msg_usage
 CSTR fs_seedlabel, "fuzz seed: "       ; G7: precedes the decimal seed on stdout
 fs_nl db 13,10
 CSTR msg_badnum,   "error: numeric argument out of range",13,10
+ifdef PROBE_IO
 CSTR msg_seedn_ok,  "seeded the requested test entries.  unlock the vault with password: vordrtest",13,10
 CSTR msg_seedn_bad, "error: seedn needs <path> <count>, count a plain number 1..200000",13,10
+endif
 CSTR msg_testverb, "error: that diagnostic runs only in test (PROBE_IO/dbg) builds; a release build exposes only 'selftest' and 'katreport'",13,10
 CSTR msg_st_ok,    "all self-tests passed",13,10
 CSTR msg_st_fail,  "SELFTEST FAILURE",13,10
+ifdef PROBE_IO
 gl_rand   db "  random     : "
 gl_rand_len   equ $ - gl_rand
 gl_phrase db "  passphrase : "
@@ -191,6 +193,16 @@ gl_hex_len    equ $ - gl_hex
 gp_crlf   db 13,10
 CSTR msg_seed_ok, "seeded 5000 realistic test entries.  unlock the vault with password: vordrtest",13,10
 seed_pw   db "vordrtest", 0
+endif
+ifdef DBG_TRACE
+    db "VORDR_NON_RELEASE_BUILD", 0
+endif
+ifdef PROBE_IO
+    db "VORDR_NON_RELEASE_BUILD", 0
+endif
+ifdef DBG_SHOW
+    db "VORDR_NON_RELEASE_BUILD", 0
+endif
 align 2                                   ; keep the verb-name WSTRs even-aligned
 
 WSTR w_selftest, <selftest>
@@ -248,7 +260,9 @@ WSTR w_tpmkat,   <tpmkat>
 ifdef DBG_TRACE
 WSTR w_securedesk, <securedesk>
 endif
+ifdef PROBE_IO
 WSTR wpw_exp,    <VordrExp1234>
+endif
 ifdef DBG_TRACE
 WSTR w_redteam,  <redteam>
 WSTR w_tpmtest,  <tpmtest>
@@ -285,7 +299,10 @@ cmd_table label CMDENT
     CMDENT { w_selftest,  cmd_selftest,  0, 0 }   ; fail-closed self-check (release + test)
     CMDENT { w_katreport, cmd_katreport, 0, 0 }   ; external-audit crypto proof (release + test)
     ; --- everything below is refused by a RELEASE build (see the dp_testonly guard
-    ;     in dispatch); it runs only in PROBE_IO / dbg test builds ---
+    ;     in dispatch); it runs only in PROBE_IO / dbg test builds.  Keep the verb
+    ;     names in cmd_table with handler = 0 in release so is_cli_command still
+    ;     routes `vordr seedtest <path>` to dp_testonly (EXIT_USAGE) instead of GUI! ---
+ifdef PROBE_IO
     CMDENT { w_bench,     cmd_bench,     0, 0 }
     CMDENT { w_genpw,     cmd_genpw,     0, 0 }   ; print one sample of each generator style
     CMDENT { w_seedtest,  cmd_seedtest,  1, 0 }   ; bulk-fill a test vault with 5000 entries
@@ -320,10 +337,8 @@ cmd_table label CMDENT
     CMDENT { w_cowrite,   cmd_cowrite,   1, 0 }   ; C8: write-lock exclusivity probe
     CMDENT { w_attfuzz,   cmd_attfuzz,   0, 0 }   ; G8: attachment-index fuzzer
     CMDENT { w_healthkat, cmd_healthkat, 0, 0 }   ; E6: vault-health analysis KAT
-ifdef PROBE_IO
     CMDENT { w_layoutkat, cmd_layoutkat, 1, 0 }   ; runtime dialog-geometry probe
     CMDENT { w_secdeskkat, cmd_secdeskkat, 0, 0 } ; VDR-13 secure-desktop fallback/orphan KAT
-endif
     CMDENT { w_vaultexportkat, cmd_vaultexportkat, 1, 0 } ; M6 vault export/merge KAT (<path>)
     CMDENT { w_vaultexpattkat, cmd_vaultexpattkat, 1, 0 } ; M6 attachment-carry KAT (<path>)
     CMDENT { w_kdfparam,  cmd_kdfparam,  0, 0 }   ; pre-auth KDF-param DoS-guard probe
@@ -334,6 +349,52 @@ endif
     CMDENT { w_tpmkat,    cmd_tpmkat,    0, 0 }   ; VDR-10 TPM OAEP v2 label + cleanup KAT
     CMDENT { w_pkat,      cmd_pkat,      0, 0 }   ; parallel fail-closed KAT gate
     CMDENT { w_trtest,    cmd_trtest,    0, 0 }   ; trash timestamp/threshold KAT
+else
+    CMDENT { w_bench,     0, 0, 0 }
+    CMDENT { w_genpw,     0, 0, 0 }
+    CMDENT { w_seedtest,  0, 1, 0 }
+    CMDENT { w_seedn,     0, 2, 0 }
+    CMDENT { w_atgen,     0, 1, 0 }
+    CMDENT { w_zitest,    0, 2, 0 }
+    CMDENT { w_phtest,    0, 0, 0 }
+    CMDENT { w_secscan,   0, 0, 0 }
+    CMDENT { w_lktest,    0, 0, 0 }
+    CMDENT { w_secfreedup, 0, 0, 0 }
+    CMDENT { w_tmptest,   0, 0, 0 }
+    CMDENT { w_fztest,    0, 0, 0 }
+    CMDENT { w_vfuzz,     0, 0, 0 }
+    CMDENT { w_fuzzzip,   0, 0, 0 }
+    CMDENT { w_jfuzz,     0, 0, 0 }
+    CMDENT { w_zexcap,    0, 0, 0 }
+    CMDENT { w_zexname,   0, 0, 0 }
+    CMDENT { w_convcap,   0, 0, 0 }
+    CMDENT { w_bktest,    0, 1, 0 }
+    CMDENT { w_mactest,   0, 1, 0 }
+    CMDENT { w_rbtest,    0, 1, 0 }
+    CMDENT { w_xctest,    0, 1, 0 }
+    CMDENT { w_reload,    0, 1, 0 }
+    CMDENT { w_sysitemkat, 0, 1, 0 }
+    CMDENT { w_vexselkat, 0, 1, 0 }
+    CMDENT { w_c9kat,     0, 1, 0 }
+    CMDENT { w_vimpkat,   0, 1, 0 }
+    CMDENT { w_vimpattkat, 0, 1, 0 }
+    CMDENT { w_vattgen,   0, 1, 0 }
+    CMDENT { w_vopen,     0, 1, 0 }
+    CMDENT { w_seedbig,   0, 1, 0 }
+    CMDENT { w_cowrite,   0, 1, 0 }
+    CMDENT { w_attfuzz,   0, 0, 0 }
+    CMDENT { w_healthkat, 0, 0, 0 }
+    CMDENT { w_vaultexportkat, 0, 1, 0 }
+    CMDENT { w_vaultexpattkat, 0, 1, 0 }
+    CMDENT { w_kdfparam,  0, 0, 0 }
+    CMDENT { w_zexselkat, 0, 0, 0 }
+    CMDENT { w_attovfkat, 0, 0, 0 }
+    CMDENT { w_vattcolkat, 0, 1, 0 }
+    CMDENT { w_polkat,    0, 0, 0 }
+    CMDENT { w_tpmkat,    0, 0, 0 }
+    CMDENT { w_pkat,      0, 0, 0 }
+    CMDENT { w_trtest,    0, 0, 0 }
+endif
 ifdef DBG_TRACE
     CMDENT { w_securedesk, cmd_securedesk, 0, 0 } ; private-desktop spike dialog (dbg)
     CMDENT { w_redteam,   cmd_redteam,   1, 0 }   ; fault-injection self-test (dbg)
@@ -386,6 +447,11 @@ ifdef DBG_TRACE
     jc      ff_dbg_reent
     call    sstk_reset_current
     call    secmem_panic_wipe
+    mov     rcx, qword ptr [g_secdesk_orig]
+    test    rcx, rcx
+    jz      @F
+    WINCALL SwitchDesktop, rcx
+@@:
     mov     al, 'F'
     call    dbg_putc
     mov     al, 'F'
@@ -428,10 +494,22 @@ endif
     ; vectored handler, so crash_veh -> crash_contain (which wipes on an ordinary AV)
     ; never runs here - yet this path fires on a DETECTED memory-corruption attack,
     ; exactly when secrets are most worth exfiltrating via a crash/hibernation dump.
-    ; Reset the shadow-stack depth first so secmem_panic_wipe's framed prolog can push
-    ; even when THIS trap is FF_SHADOW_STACK (a full shadow stack); we are terminating.
+    ; Guard against re-entrancy with g_in_crash, realign rsp + allocate shadow space,
+    ; reset shadow-stack depth, wipe secrets, and restore the user's desktop first.
+    mov     r15d, ecx
+    and     rsp, -16
+    sub     rsp, 32
+    lock bts dword ptr [g_in_crash], 0
+    jc      ff_rel_reent
     call    sstk_reset_current          ; this thread's - another thread's is not ours
     call    secmem_panic_wipe
+    mov     rcx, qword ptr [g_secdesk_orig]
+    test    rcx, rcx
+    jz      ff_rel_fastfail
+    WINCALL SwitchDesktop, rcx
+ff_rel_fastfail:
+ff_rel_reent:
+    mov     ecx, r15d
     int     29h                         ; release: real fast-fail
 ff_trap endp
 
@@ -1059,10 +1137,25 @@ p2u_wipe:
     mov     eax, 1
     jmp     p2u_done
 p2u_bad:
-    ; wipe whatever partial conversion landed in the buffer
+    ; wipe whatever partial conversion landed in the buffer AND scrub the wide source
+    mov     dword ptr [g_cfg_passlen], 0
     lea     rcx, [g_cfg_pass]
     mov     edx, MAX_PASSWORD_BYTES+1
     call    secure_zero
+    mov     rcx, qword ptr [rbp-24]
+    test    rcx, rcx
+    jz      p2u_bad_done
+    xor     edx, edx
+p2u_bad_meas:
+    cmp     word ptr [rcx+rdx*2], 0
+    je      p2u_bad_wipe
+    inc     edx
+    cmp     edx, ARGBUF_CHARS
+    jb      p2u_bad_meas
+p2u_bad_wipe:
+    shl     edx, 1
+    call    secure_zero
+p2u_bad_done:
     xor     eax, eax
 p2u_done:
     FRAME_EPILOG
@@ -1074,6 +1167,7 @@ password_to_utf8 endp
 ; CALL_GUARDED dispatch - thin wrappers over the implementation modules.
 ; =============================================================================
 ; --- diagnostics command handlers (DLPV landing-pad targets) ----------------
+ifdef PROBE_IO
 LANDING_PAD
 cmd_bench proc frame
     FRAME_PROLOG 32
@@ -1081,6 +1175,7 @@ cmd_bench proc frame
     FRAME_EPILOG
     ret
 cmd_bench endp
+endif
 
 
 LANDING_PAD
@@ -1105,6 +1200,7 @@ cst_ok:
     ret
 cmd_selftest endp
 
+ifdef PROBE_IO
 ; gp_println - print g_gen_buf (NUL-terminated, <160) then CRLF.  Internal.
 gp_println proc frame
     FRAME_PROLOG 32
@@ -1138,7 +1234,7 @@ cmd_genpw proc frame
     call    gp_println
     WINCALL print_a, addr gl_phrase, gl_phrase_len
     lea     rcx, [g_gen_buf]
-    mov     edx, 5
+    mov     edx, 6
     mov     r8d, PWS_PASSPHRASE
     mov     r9d, PWO_CAP or PWO_DASH or PWO_DIGIT
     mov     dword ptr [g_pwgen_outcap], 160     ; E16: g_gen_buf capacity
@@ -1168,6 +1264,9 @@ cmd_genpw proc frame
     mov     dword ptr [g_pwgen_outcap], 160     ; E16: g_gen_buf capacity
     call    pwgen_ex
     call    gp_println
+    lea     rcx, [g_gen_buf]
+    mov     edx, 160
+    call    secure_zero
     xor     eax, eax
     FRAME_EPILOG
     ret
@@ -1223,7 +1322,6 @@ cmd_seedtest endp
 ;   PROBE_IO / dbg only, like every other path-taking verb: it takes a vault path
 ;   and it puts a window on screen, neither of which belongs in a release CLI.
 ; ---------------------------------------------------------------------------
-ifdef PROBE_IO
 LANDING_PAD
 cmd_layoutkat proc frame
     FRAME_PROLOG 64
@@ -1268,7 +1366,6 @@ lk_fail:
 cmd_layoutkat endp
 CSTR lk_nounlock, "layoutkat: could not unlock that vault with the fixed test password",13,10
 CSTR lk_nodesk,   "layoutkat: no window could be created - no interactive desktop; skipping",13,10
-endif
 
 ; ---------------------------------------------------------------------------
 ; cmd_seedn - seedtest with a caller-chosen count: <path> <count>.
@@ -1658,6 +1755,7 @@ trt_fail:
     FRAME_EPILOG
     ret
 cmd_trtest endp
+endif
 
 ; =============================================================================
 ; is_cli_command -> eax = 1 if argv[1] names a known command verb, else 0.
@@ -1749,20 +1847,15 @@ dp_loop:
     jmp     dp_loop
 
 dp_found:
-    mov     rcx, qword ptr [rbp-24]     ; CMDENT*
-    call    collect_options
-    cmp     eax, EXIT_OK
-    jne     dp_done                     ; validation failed; eax = exit code
 ifndef PROBE_IO
     ; A RELEASE build exposes only the two assurance verbs (selftest / katreport);
     ; every other diagnostic - the fuzzers, IO/memory probes and internal KATs, plus
-    ; the path-taking ones that create/overwrite a file at a caller path (a data-loss
-    ; footgun) - is refused here.  It runs only in a PROBE_IO / dbg test build, where
-    ; this whole guard is compiled out.  collect_options only stashed arg pointers, so
-    ; nothing on disk has been touched yet.  Identify the two allowed verbs by their
-    ; handler address (their CMDENT is first in the table).
+    ; the path-taking ones that create/overwrite a file at a caller path - has its
+    ; handler set to 0 in release and is refused BEFORE collect_options runs.
     mov     r10, qword ptr [rbp-24]
     mov     rax, qword ptr [r10].CMDENT.handler
+    test    rax, rax
+    jz      dp_testonly
     lea     r11, [cmd_selftest]
     cmp     rax, r11
     je      dp_relok
@@ -1772,6 +1865,10 @@ ifndef PROBE_IO
     jmp     dp_testonly
 dp_relok:
 endif
+    mov     rcx, qword ptr [rbp-24]     ; CMDENT*
+    call    collect_options
+    cmp     eax, EXIT_OK
+    jne     dp_done                     ; validation failed; eax = exit code
     mov     r10, qword ptr [rbp-24]
     mov     rax, qword ptr [r10].CMDENT.handler
     CALL_GUARDED rax                    ; DLPV-checked indirect call

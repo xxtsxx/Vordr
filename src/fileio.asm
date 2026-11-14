@@ -9,6 +9,7 @@
 
 include macros.inc
 externdef g_cfg_in:qword                ; set ONLY through cfg_in_set below
+externdef g_allow_unc:dword             ; HKLM-only AllowUncVault policy (regcfg.asm)
 
 extern CreateFileW:proc
 extern GetLastError:proc
@@ -19,6 +20,8 @@ extern GetFileSizeEx:proc
 extern SetFilePointerEx:proc
 extern CloseHandle:proc
 extern GetFileType:proc
+extern GetFileInformationByHandle:proc
+extern GetFinalPathNameByHandleW:proc
 extern ReplaceFileW:proc
 extern MoveFileExW:proc
 extern DeleteFileW:proc
@@ -79,8 +82,151 @@ fr_to       dw (MAX_PATH_CHARS + 16) dup (?)   ;   the same time, so two buffers
 rf_path     dw (MAX_PATH_CHARS + 16) dup (?)   ; read_file's Win32-form path
 wf_path     dw (MAX_PATH_CHARS + 16) dup (?)   ; write_file's, kept separate so a
                                                ;   read during a write cannot share it
+fv_final    dw (MAX_PATH_CHARS + 16) dup (?)   ; GetFinalPathNameByHandleW scratch
+align 8
+fv_bhfi     db 64 dup (?)                      ; BY_HANDLE_FILE_INFORMATION (52 bytes)
 
 .code
+
+; =============================================================================
+; file_path_allowed(rcx = wide path) -> eax = 1 allowed / 0 refused.
+;   Pre-CreateFileW gate: blocks Win32 device namespace (\\.\, \\?\GLOBALROOT)
+;   unconditionally and blocks UNC paths (\\server\..., \\?\UNC\...) before any
+;   SMB/WebDAV NTLM handshake can occur unless HKLM AllowUncVault != 0.
+; =============================================================================
+public file_path_allowed
+file_path_allowed proc
+    test    rcx, rcx
+    jz      fpa_no
+    cmp     word ptr [rcx], 0
+    je      fpa_no
+    movzx   eax, word ptr [rcx]
+    cmp     ax, 5Ch
+    je      fpa_bs1
+    cmp     ax, '/'
+    jne     fpa_ok
+fpa_bs1:
+    movzx   eax, word ptr [rcx+2]
+    cmp     ax, 5Ch
+    je      fpa_bs2
+    cmp     ax, '/'
+    jne     fpa_ok
+fpa_bs2:
+    ; starts with "\\" or "//"
+    movzx   eax, word ptr [rcx+4]
+    cmp     ax, '.'
+    je      fpa_no                              ; "\\.\" device namespace -> refuse
+    cmp     ax, '?'
+    jne     fpa_unc                             ; "\\server\..." -> check g_allow_unc
+    movzx   eax, word ptr [rcx+6]
+    cmp     ax, 5Ch
+    je      fpa_qbody
+    cmp     ax, '/'
+    jne     fpa_no
+fpa_qbody:
+    ; "\\?\" prefix: allow "\\?\X:\..." local drive; check "\\?\UNC\..."; refuse others
+    movzx   eax, word ptr [rcx+8]
+    or      ax, 20h
+    cmp     ax, 'a'
+    jb      fpa_no
+    cmp     ax, 'z'
+    ja      fpa_no
+    cmp     word ptr [rcx+10], ':'
+    je      fpa_qdrive
+    ; check "UNC\"
+    cmp     ax, 'u'
+    jne     fpa_no                              ; e.g. "\\?\GLOBALROOT\..." -> refuse
+    movzx   eax, word ptr [rcx+10]
+    or      ax, 20h
+    cmp     ax, 'n'
+    jne     fpa_no
+    movzx   eax, word ptr [rcx+12]
+    or      ax, 20h
+    cmp     ax, 'c'
+    jne     fpa_no
+    movzx   eax, word ptr [rcx+14]
+    cmp     ax, 5Ch
+    je      fpa_unc
+    cmp     ax, '/'
+    je      fpa_unc
+    jmp     fpa_no
+fpa_qdrive:
+    movzx   eax, word ptr [rcx+12]
+    cmp     ax, 5Ch
+    je      fpa_ok
+    cmp     ax, '/'
+    je      fpa_ok
+    jmp     fpa_no
+fpa_unc:
+    cmp     dword ptr [g_allow_unc], 0
+    je      fpa_no
+fpa_ok:
+    mov     eax, 1
+    ret
+fpa_no:
+    xor     eax, eax
+    ret
+file_path_allowed endp
+
+; =============================================================================
+; file_validate_handle(rcx = hFile) -> eax = 1 valid disk file / 0 refused.
+;   Post-CreateFileW handle gate:
+;     1. GetFileType(h) == FILE_TYPE_DISK
+;     2. GetFileInformationByHandle: (dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0
+;     3. GetFinalPathNameByHandleW: resolves parent junctions / mapped drives;
+;        enforces g_allow_unc on "\\?\UNC\..." and rejects NTFS ADS ':' streams.
+; =============================================================================
+public file_validate_handle
+file_validate_handle proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    WINCALL GetFileType, rcx
+    cmp     eax, FILE_TYPE_DISK_
+    jne     fvh_no
+    WINCALL GetFileInformationByHandle, qword ptr [rbp-24], addr fv_bhfi
+    test    eax, eax
+    jz      fvh_no
+    test    dword ptr [fv_bhfi], 400h           ; FILE_ATTRIBUTE_REPARSE_POINT
+    jnz     fvh_no
+    WINCALL GetFinalPathNameByHandleW, qword ptr [rbp-24], addr fv_final, <MAX_PATH_CHARS + 16>, 0
+    test    eax, eax
+    jz      fvh_no
+    cmp     eax, MAX_PATH_CHARS + 16
+    jae     fvh_no
+    mov     dword ptr [rbp-32], eax             ; cch
+    lea     rcx, [fv_final]
+    call    file_path_allowed                   ; catches junction/mapped-drive -> UNC
+    test    eax, eax
+    jz      fvh_no
+    ; Scan fv_final for NTFS Alternate Data Stream ':' after drive colon
+    lea     r10, [fv_final]
+    mov     ecx, dword ptr [rbp-32]
+    xor     r8d, r8d
+fvh_colon_lp:
+    cmp     r8d, ecx
+    jae     fvh_ok
+    cmp     word ptr [r10 + r8*2], ':'
+    jne     fvh_colon_next
+    cmp     r8d, 1                              ; "X:\..."
+    je      fvh_colon_next
+    cmp     r8d, 5                              ; "\\?\X:\..."
+    jne     fvh_no
+    cmp     word ptr [r10], 5Ch
+    jne     fvh_no
+    cmp     word ptr [r10+4], '?'
+    jne     fvh_no
+fvh_colon_next:
+    inc     r8d
+    jmp     fvh_colon_lp
+fvh_ok:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+fvh_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+file_validate_handle endp
 
 
 ; =============================================================================
@@ -128,14 +274,23 @@ read_file proc frame
     lea     rdx, [rf_path]                    ; -> the form Win32 accepts
     mov     r8d, MAX_PATH_CHARS + 16
     call    path_longify
+    mov     qword ptr [rbp-80], rax
     mov     rcx, rax
+    call    file_path_allowed
+    test    eax, eax
+    jz      rf_denied
+    mov     rcx, qword ptr [rbp-80]
 
-    WINCALL CreateFileW, rcx, GENERIC_READ, FILE_SHARE_RWD, 0, OPEN_EXISTING, FILE_ATTR_NORMAL, 0
+    WINCALL CreateFileW, rcx, GENERIC_READ, FILE_SHARE_RWD, 0, OPEN_EXISTING, <FILE_ATTR_NORMAL or FILE_FLAG_OPEN_RP>, 0
     cmp     rax, -1
     je      rf_io
     mov     qword ptr [rbp-40], rax
+    mov     rcx, rax
+    call    file_validate_handle
+    test    eax, eax
+    jz      rf_badtype
 
-    WINCALL GetFileSizeEx, rax, addr rbp-48
+    WINCALL GetFileSizeEx, qword ptr [rbp-40], addr rbp-48
     test    eax, eax
     jz      rf_io_close
     mov     rax, qword ptr [rbp-88]          ; the cap taken at entry
@@ -199,7 +354,16 @@ rf_oom_close:
     WINCALL CloseHandle, qword ptr [rbp-40]
     mov     eax, EXIT_OOM
     jmp     rf_done
+rf_badtype:
+    mov     dword ptr [g_io_err], 5             ; ERROR_ACCESS_DENIED (reparse/device/UNC refused)
+    jmp     rf_io_close
+rf_denied:
+    mov     dword ptr [g_io_err], 5
+    mov     eax, EXIT_IO
+    jmp     rf_done
 rf_io:
+    call    GetLastError
+    mov     dword ptr [g_io_err], eax
     mov     eax, EXIT_IO
 rf_done:
     FRAME_EPILOG
@@ -211,7 +375,7 @@ read_file endp
 ; =============================================================================
 public write_file
 write_file proc frame
-    FRAME_PROLOG 96
+    FRAME_PROLOG 128
     mov     dword ptr [g_wf_created], 0
     ; [rbp-24]=buf [rbp-32]=size [rbp-40]=handle [rbp-48]=cursor [rbp-56]=remaining
     mov     qword ptr [rbp-24], rdx           ; stash the buffer and size first - they
@@ -228,13 +392,21 @@ write_file proc frame
     jnz     @F
     mov     r10d, CREATE_ALWAYS
 @@:
+    mov     dword ptr [rbp-64], r10d
+    mov     qword ptr [rbp-72], rcx
+    call    file_path_allowed
+    test    eax, eax
+    jz      wf_denied
+    mov     rcx, qword ptr [rbp-72]
+    mov     r10d, dword ptr [rbp-64]
     WINCALL CreateFileW, rcx, GENERIC_WRITE, 0, 0, r10d, <FILE_ATTR_NORMAL or FILE_FLAG_OPEN_RP>, 0
     cmp     rax, -1
     je      wf_io
     mov     qword ptr [rbp-40], rax
-    WINCALL GetFileType, rax
-    cmp     eax, FILE_TYPE_DISK_
-    jne     wf_badtype
+    mov     rcx, rax
+    call    file_validate_handle
+    test    eax, eax
+    jz      wf_badtype
 
     mov     rax, qword ptr [rbp-24]
     mov     dword ptr [g_wf_created], 1
@@ -288,6 +460,10 @@ wf_flush_nosupp:
 wf_badtype:
     mov     dword ptr [g_io_err], 5             ; ERROR_ACCESS_DENIED (reparse/device refused)
     WINCALL CloseHandle, qword ptr [rbp-40]
+    mov     eax, EXIT_IO
+    jmp     wf_done
+wf_denied:
+    mov     dword ptr [g_io_err], 5
     mov     eax, EXIT_IO
     jmp     wf_done
 wf_io_close:
@@ -575,6 +751,26 @@ pl_measure:
     mov     rdx, qword ptr [rbp-24]
     add     rdx, 4                            ; skip the leading "\\"
     call    pl_copy
+    ; advance collapse floor past "\\?\UNC\server\share\"
+    mov     rcx, qword ptr [rbp-32]
+    add     rcx, 16                           ; past "\\?\UNC\"
+    xor     edx, edx                          ; count 2 slashes (server\share\)
+pl_unc_shr:
+    movzx   eax, word ptr [rcx]
+    test    ax, ax
+    jz      pl_unc_done
+    add     rcx, 2
+    cmp     ax, 5Ch
+    je      pl_unc_sl
+    cmp     ax, '/'
+    jne     pl_unc_shr
+pl_unc_sl:
+    mov     word ptr [rcx-2], 5Ch
+    inc     edx
+    cmp     edx, 2
+    jb      pl_unc_shr
+    call    pl_collapse
+pl_unc_done:
     mov     rax, qword ptr [rbp-32]
     FRAME_EPILOG
     ret
@@ -590,6 +786,10 @@ pl_drive:
     mov     rcx, rax
     mov     rdx, qword ptr [rbp-24]
     call    pl_copy
+    mov     rcx, qword ptr [rbp-32]
+    mov     word ptr [rcx+12], 5Ch            ; normalise drive root slash ("X:/" -> "X:\")
+    add     rcx, 14                           ; floor right after "\\?\X:\"
+    call    pl_collapse
     mov     rax, qword ptr [rbp-32]
     FRAME_EPILOG
     ret
@@ -666,5 +866,107 @@ plc_d:
     lea     rax, [rcx+r8*2]
     ret
 pl_copy endp
+
+; pl_collapse(rcx = floor_ptr) - in-place Win32 path normaliser for "\\?\" paths:
+;   converts '/' -> '\', collapses "\\", "\.\", and "\seg\..\" (never retreating
+;   past floor_ptr), and trims trailing dots/spaces.  Leaf; clobbers volatiles.
+pl_collapse proc
+    mov     r8, rcx                             ; floor
+    mov     r9, rcx
+plc_slash:
+    movzx   eax, word ptr [r9]
+    test    ax, ax
+    jz      plc_scan_init
+    cmp     ax, '/'
+    jne     @F
+    mov     word ptr [r9], 5Ch
+@@: add     r9, 2
+    jmp     plc_slash
+plc_scan_init:
+    mov     r9, r8                              ; read cursor
+    mov     r10, r8                             ; write cursor
+plc_seg_lp:
+    cmp     word ptr [r9], 5Ch
+    jne     plc_seg_start
+    add     r9, 2
+    jmp     plc_seg_lp
+plc_seg_start:
+    cmp     word ptr [r9], 0
+    je      plc_finish
+    mov     r11, r9                             ; find segment end
+plc_find_end:
+    movzx   eax, word ptr [r11]
+    test    ax, ax
+    jz      plc_got_end
+    cmp     ax, 5Ch
+    je      plc_got_end
+    add     r11, 2
+    jmp     plc_find_end
+plc_got_end:
+    mov     rax, r11
+    sub     rax, r9                             ; byte length of segment
+    cmp     rax, 2                              ; "." (1 wchar = 2 bytes)?
+    jne     plc_chk_dd
+    cmp     word ptr [r9], '.'
+    jne     plc_emit
+    mov     r9, r11
+    jmp     plc_seg_lp
+plc_chk_dd:
+    cmp     rax, 4                              ; ".." (2 wchars = 4 bytes)?
+    jne     plc_emit
+    cmp     word ptr [r9], '.'
+    jne     plc_emit
+    cmp     word ptr [r9+2], '.'
+    jne     plc_emit
+    ; pop previous segment back to floor r8
+    cmp     r10, r8
+    jbe     plc_dd_next
+    cmp     word ptr [r10-2], 5Ch
+    jne     plc_dd_back
+    sub     r10, 2
+plc_dd_back:
+    cmp     r10, r8
+    jbe     plc_dd_sl
+    cmp     word ptr [r10-2], 5Ch
+    je      plc_dd_sl
+    sub     r10, 2
+    jmp     plc_dd_back
+plc_dd_sl:
+    cmp     r10, r8
+    jbe     plc_dd_next
+    cmp     word ptr [r10-2], 5Ch
+    jne     plc_dd_next
+    sub     r10, 2
+plc_dd_next:
+    mov     r9, r11
+    jmp     plc_seg_lp
+plc_emit:
+    cmp     r10, r8
+    jbe     plc_cp_lp
+    mov     word ptr [r10], 5Ch
+    add     r10, 2
+plc_cp_lp:
+    cmp     r9, r11
+    jae     plc_seg_lp
+    mov     ax, word ptr [r9]
+    mov     word ptr [r10], ax
+    add     r9, 2
+    add     r10, 2
+    jmp     plc_cp_lp
+plc_finish:
+    cmp     r10, r8
+    jbe     plc_nul
+    movzx   eax, word ptr [r10-2]
+    cmp     ax, ' '
+    je      plc_trim1
+    cmp     ax, '.'
+    jne     plc_nul
+plc_trim1:
+    sub     r10, 2
+    jmp     plc_finish
+plc_nul:
+    mov     word ptr [r10], 0
+    ret
+pl_collapse endp
 
 end

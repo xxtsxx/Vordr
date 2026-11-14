@@ -73,7 +73,7 @@ try {
     $rc = Invoke-VordrCli -Exe $Exe -Arguments @('seedtest', $vault)
     if ($rc -ne 0) { throw "seedtest failed ($rc) - is this a probeio/dbg build?" }
 
-    $p = Start-VordrTest -Exe $Exe -Vault $vault -Name $name -Anim on              # (whatever Windows says)
+    $p = Start-VordrTest -Exe $Exe -Vault $vault -Name $name -Anim on -Prefs @{ AllowScreenCapture = 1 }
     Write-Host "instance pid $($p.Id), HKCU -> Software\VordrGuiTest\$name"
 
     # ---- isolation actually engaged -------------------------------------------
@@ -418,7 +418,7 @@ try {
     if (-not ('VordrT.Cds' -as [type])) {
         Add-Type -Name Cds -Namespace VordrT -MemberDefinition '[StructLayout(LayoutKind.Sequential)] public struct COPYDATASTRUCT { public IntPtr dwData; public uint cbData; public IntPtr lpData; }'
     }
-    function Send-CopyDataVault([IntPtr]$Target, [string]$PathText) {
+    function Send-CopyDataVault([IntPtr]$Target, [string]$PathText, [IntPtr]$Sender = $v) {
         $bytes = [Text.Encoding]::Unicode.GetBytes($PathText + "`0")
         $buf = [Runtime.InteropServices.Marshal]::AllocHGlobal($bytes.Length)
         $cdsMem = [Runtime.InteropServices.Marshal]::AllocHGlobal([Runtime.InteropServices.Marshal]::SizeOf([type][VordrT.Cds+COPYDATASTRUCT]))
@@ -429,15 +429,22 @@ try {
             $cds.cbData = [uint32]$bytes.Length
             $cds.lpData = $buf
             [Runtime.InteropServices.Marshal]::StructureToPtr($cds, $cdsMem, $false)
-            return [int64](Send-VordrMessage -Hwnd $Target -Msg 0x004A -W ([IntPtr]::Zero) -L $cdsMem)
+            return [int64](Send-VordrMessage -Hwnd $Target -Msg 0x004A -W $Sender -L $cdsMem)
         } finally {
             [Runtime.InteropServices.Marshal]::FreeHGlobal($cdsMem)
             [Runtime.InteropServices.Marshal]::FreeHGlobal($buf)
         }
     }
     # VDR-07: UNC WM_COPYDATA hand-off must be rejected before touching SMB
-    $cdUnc = Send-CopyDataVault -Target $tray -PathText '\\198.51.100.1\share\evil.vordr'
+    $cdUnc = Send-CopyDataVault -Target $tray -Sender $v -PathText '\\198.51.100.1\share\evil.vordr'
     Check ($cdUnc -eq 0 -and (& $G 'g_openfile_set') -eq 0) 'VDR-07: UNC WM_COPYDATA hand-off rejected before SMB access'
+    # VDR2-10: WM_COPYDATA from a non-Vordr sender HWND (or NULL) must be rejected even with a valid local path
+    if (-not ('VordrT.Dsk' -as [type])) {
+        Add-Type -Name Dsk -Namespace VordrT -MemberDefinition '[DllImport("user32.dll")] public static extern IntPtr GetDesktopWindow();'
+    }
+    $cdForeign = Send-CopyDataVault -Target $tray -Sender ([VordrT.Dsk]::GetDesktopWindow()) -PathText $vault
+    $cdNull = Send-CopyDataVault -Target $tray -Sender ([IntPtr]::Zero) -PathText $vault
+    Check ($cdForeign -eq 0 -and $cdNull -eq 0 -and (& $G 'g_openfile_set') -eq 0) 'VDR2-10: WM_COPYDATA from non-Vordr sender HWND rejected'
 
     # VDR-11 + VDR-27: standalone password generator arms clipboard timer on tray and scrubs scratch
     Send-VordrCommand -Window $v -Id 294                                                # IDC_T_GEN
@@ -519,7 +526,7 @@ try {
     $big = Join-Path $work 'big.vault'
     $rc = Invoke-VordrCli -Exe $Exe -Arguments @('seedbig', $big)
     Check ($rc -eq 0) 'seedbig wrote a vault with one 40-field entry'
-    $p = Start-VordrTest -Exe $Exe -Vault $big -Name $name
+    $p = Start-VordrTest -Exe $Exe -Vault $big -Name $name -Prefs @{ AllowScreenCapture = 1 }
     $ub = Open-Unlock $p
     $vb = if ($ub) { Unlock $p $ub } else { [IntPtr]::Zero }
     Check ($vb -ne [IntPtr]::Zero) 'the 40-field vault opens'
@@ -681,6 +688,27 @@ try {
         }
         $pgbar = @(267, 268, 269) | ForEach-Object { Get-VordrControl -Window $vb -Id $_ } | Where-Object { $_ -ne [IntPtr]::Zero }
         Check ($pgbar.Count -eq 3 -and -not ($pgbar | Where-Object { [VordrGui.Native]::IsWindowVisible($_) })) 'the "< n / m >" page bar stays hidden: the pane scrolls instead'
+    }
+    Stop-VordrTest -Process $p -Name $name; $p = $null
+
+    # ---- VDR2-05: default display affinity blocks screen capture (AllowScreenCapture = 0) ----
+    if (-not ('VordrT.Aff' -as [type])) {
+        Add-Type -Name Aff -Namespace VordrT -MemberDefinition '[DllImport("user32.dll")] public static extern bool GetWindowDisplayAffinity(IntPtr h, out uint a);'
+    }
+    $p = Start-VordrTest -Exe $Exe -Vault $vault -Name $name
+    $uAff = Open-Unlock $p
+    Check ($null -ne $uAff -and $uAff -ne [IntPtr]::Zero) 'VDR2-05: default-policy unlock window opens'
+    if ($uAff -ne [IntPtr]::Zero) {
+        $affU = [uint32]0
+        $okAffU = [VordrT.Aff]::GetWindowDisplayAffinity($uAff, [ref]$affU)
+        Check ($okAffU -and ($affU -eq 0x11 -or $affU -eq 0x01)) ("VDR2-05: unlock dialog protected from screen capture by default (affinity=0x{0:X})" -f $affU)
+        $vAff = Unlock $p $uAff
+        Check ($vAff -ne [IntPtr]::Zero) 'VDR2-05: default-policy vault window opens'
+        if ($vAff -ne [IntPtr]::Zero) {
+            $affV = [uint32]0
+            $okAffV = [VordrT.Aff]::GetWindowDisplayAffinity($vAff, [ref]$affV)
+            Check ($okAffV -and ($affV -eq 0x11 -or $affV -eq 0x01)) ("VDR2-05: vault window protected from screen capture by default (affinity=0x{0:X})" -f $affV)
+        }
     }
     Stop-VordrTest -Process $p -Name $name; $p = $null
 

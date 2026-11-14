@@ -101,9 +101,10 @@ conflict. Nearby rotating backups are not an independent backup.
 | Key-check value | First 16 bytes of SHA-256 of the vault key |
 | Full-file authentication | BLAKE2b-256 over a domain prefix, vault key, and file image through the counter |
 | TOTP | HMAC-SHA-1, base32 keys, HOTP/TOTP |
-| ZIP interoperability | WinZip AE-2: PBKDF2-HMAC-SHA1, AES-256-CTR, truncated HMAC-SHA1 |
+| ZIP interoperability | WinZip AE-2: PBKDF2-HMAC-SHA1, AES-256-CTR, truncated HMAC-SHA1, plus per-attachment `SHA-256` plaintext digests inside `vordr.json` |
+| Passphrase generation | Unbiased 16-bit draws across an embedded `2,048`-word list (`11` bits/word, `6..24` words) |
 | Randomness | `BCryptGenRandom`, supplemented by RDSEED across 8-byte lanes and `1..7`-byte tails when available |
-| TPM convenience | RSA-2048 OAEP (SHA-256) wrapping a 64-byte context-bound payload `key32 \|\| SHA-256(key32 \|\| label32)` where `label32 = SHA-256("Vordr-TPM-v2" \|\| vault_salt \|\| LE32(reqhello))` via Microsoft Platform Crypto Provider |
+| TPM convenience | Non-exportable RSA-2048 OAEP (SHA-256, `NCRYPT_ALLOW_DECRYPT_FLAG`) wrapping a 64-byte context-bound payload `key32 \|\| SHA-256(key32 \|\| label32)` where `label32 = SHA-256("Vordr-TPM-v2" \|\| vault_salt \|\| LE32(reqhello))` via Microsoft Platform Crypto Provider |
 
 These are in-repository implementations of published primitives, verified at startup by
 23 known-answer suites and cross-checked against Python stdlib and published NIST/RFC
@@ -111,17 +112,19 @@ vectors (`tests/verify_crypto.py`, `tests/verify_vault.py`). The file MAC uses a
 explicit domain-prefixed `BLAKE2b-256` construction rather than BLAKE2's parameter-block
 keyed mode; see [the exact format](formats.md#file-authentication-trailer).
 
-TPM key creation requests RSA-2048 (`NCRYPT_OVERWRITE_KEY_FLAG`), and existing persistent
-keys are checked via `NCryptGetProperty("Length")` so keys shorter than 2048 bits are
-rejected. Because Windows `PCPKSP.dll` silently ignores `BCRYPT_OAEP_PADDING_INFO.pbLabel`
-on hardware TPM keys, Vordr enforces cryptographic vault-and-policy binding inside the
-sealed plaintext itself: `tpm_seal` encrypts `key32 || SHA-256(key32 || label32)` (64
-bytes) and `tpm_unseal` verifies the 32-byte binding digest in constant time (`ct_memcmp`)
-before releasing `key32`, preventing cross-vault or downgraded-policy blob transplants
-(`tpmkat`). Legacy 32-byte blobs are accepted only when `TpmRequireHello == 0`. When
-`TpmRequireHello` is active, Vordr propagates the owner `HWND` and omits
-`NCRYPT_SILENT_FLAG` so Windows Hello UI can prompt cleanly; provider UI enforcement
-itself depends on the local platform provider.
+TPM key creation requests RSA-2048 (`NCRYPT_OVERWRITE_KEY_FLAG`) restricted to decryption
+only (`NCRYPT_ALLOW_DECRYPT_FLAG`, non-exportable), existing persistent keys are checked
+via `NCryptGetProperty("Length")` so keys shorter than 2048 bits are rejected, and
+unenrollment deletes the persistent provider key via `NCryptDeleteKey`. Because Windows
+`PCPKSP.dll` silently ignores `BCRYPT_OAEP_PADDING_INFO.pbLabel` on hardware TPM keys,
+Vordr enforces cryptographic vault-and-policy binding inside the sealed plaintext itself:
+`tpm_seal` encrypts `key32 || SHA-256(key32 || label32)` (64 bytes) and `tpm_unseal`
+verifies the 32-byte binding digest in constant time (`ct_memcmp`) before releasing
+`key32`, preventing cross-vault or downgraded-policy blob transplants (`tpmkat`). Legacy
+32-byte blobs are accepted only when `TpmRequireHello == 0`. When `TpmRequireHello` is
+active, `tpm_seal` fails closed if `NCRYPT_UI_POLICY_PROPERTY` cannot be applied, and
+`tpm_unseal` propagates the owner `HWND` without `NCRYPT_SILENT_FLAG` so Windows Hello UI
+can prompt cleanly; provider UI enforcement itself depends on the local platform provider.
 
 Random generation fails closed if the OS RNG fails or the output pointer is NULL.
 RDSEED is optional, can run out of retries, and mixes into both eight-byte lanes
@@ -135,21 +138,26 @@ attachment is re-encrypted from the same staged bytes; changed content is staged
 with fresh encryption metadata.
 
 ZIP password derivation uses 1,000 iterations, substantially less costly than
-the native vault KDF. This is an interoperability trade-off, not an equivalent
-backup format. See the [WinZip specification](https://www.winzip.com/en/support/aes-encryption/).
+the native vault KDF. Within an exported archive, `vordr.json` embeds a `"sha256"`
+digest for each attachment so `zi_addattach` verifies plaintext integrity in
+constant time (`ct_memcmp`), and `zi_stage` fails closed with atomic rollback if
+any referenced member is missing or tampered (`zexselkat`). Legacy Vordr `.zip`
+exports without `"sha256"` remain readable. ZIP remains an interoperability
+trade-off rather than an equivalent backup format; see the
+[WinZip specification](https://www.winzip.com/en/support/aes-encryption/).
 
 ## Security boundaries
 
 | Boundary | Control | Limit |
 |---|---|---|
 | Stolen vault file | Password derivation and authenticated encryption | Weak passwords can still be guessed offline |
-| Untrusted file contents | Length/cost caps and authentication before record use | Parsers and crypto remain security-critical code |
+| Untrusted file contents | Length/cost caps, reparse/ADS/UNC handle validation (`file_validate_handle`), and authentication before record use | Parsers and crypto remain security-critical code |
 | Concurrent saves | Advisory lock and changed-image check | Sync clients and non-cooperating writers need not honor the lock |
 | Older intact vault | Counter compared with local HKCU history | No trusted global monotonic counter |
-| Unlocked process memory | Selected locked buffers, wiping, runtime checks | Not all scratch is locked; no hostile-OS guarantee |
-| Password entry | Optional private desktop | Policy-locked `SecureUnlock` refuses fallback; unlocked `SecureUnlock` requires explicit user confirmation before normal-desktop fallback; privileged observation remains possible |
-| Convenience unlock | TPM wrapping; RSA-2048 minimum + vault-header OAEP label; optional provider UI policy | An alternative unlock route, not a second factor; provider UI policy is best-effort |
-| Clipboard and previews | Time limits (including tray timer), safe-preview allowlist, owner-only temp ACLs, tracked cleanup | Other applications may copy or retain plaintext |
+| Unlocked process memory | Selected locked buffers, out-of-line `secmem` metadata, IME-detached edit scrubbing, runtime checks | Not all scratch is locked; no hostile-OS guarantee |
+| Screen & password entry | Default `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` (`AllowScreenCapture`) and DACL-protected private desktop (`SecureUnlock`) | Policy-locked `SecureUnlock` refuses fallback; privileged/kernel observation or physical cameras remain possible |
+| Convenience unlock | TPM wrapping; non-exportable RSA-2048 minimum + inner context digest; fail-closed provider UI policy setup | An alternative unlock route, not a second factor; runtime UI prompt depends on platform provider |
+| Clipboard and previews | Fail-closed exclusion markers, tray-timed clear, safe-preview allowlist, inheritable owner+`SYSTEM` temp ACLs, startup stale-dir sweep | Other applications may copy or retain active plaintext |
 
 Avoid calling the whole application “quantum-proof.” The native vault uses
 symmetric cryptography, while the optional TPM path uses RSA. A hardware-bound
@@ -165,8 +173,11 @@ read-only after startup. Link flags and `loadcfg.asm` enable ASLR, DEP/NX,
 high-entropy address space, CET compatibility where supported, and PE
 `DependentLoadFlags = 0x0800` (`LOAD_LIBRARY_SEARCH_SYSTEM32`), reinforced at
 runtime by `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32)`, safe
-search-path mode, extension-point disable, and remote/low-label image-load
-mitigations.
+search-path mode, and `SetProcessMitigationPolicy` (`ProcessExtensionPointDisablePolicy`,
+`ProcessStrictHandleCheckPolicy`, `ProcessImageLoadPolicy`, and
+`ProcessDynamicCodePolicy`). Singleton IPC applies an owner+`SYSTEM` DACL plus
+Medium-IL `NO_WRITE_UP` SACL on the named mutex and verifies both sender and
+receiver `WM_COPYDATA` endpoints against the running `vordr.exe` file identity.
 
 The software shadow stack is per thread: `FRAME_PROLOG` and `FRAME_EPILOG` find
 the calling thread's block through a TLS slot (`sstk_thread_init` gives each

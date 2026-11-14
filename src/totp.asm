@@ -30,23 +30,31 @@ g_totp_key  db TOTP_KEY_CAP dup (?)        ; decoded TOTP secret (wiped after us
 
 ; ===========================================================================
 ; base32_decode(rcx=src, edx=srclen, r8=dst, r9d=cap) -> eax = decoded bytes.
-;   RFC 4648 alphabet (A-Z, 2-7), case-insensitive; spaces / '-' / '=' ignored.
-;   Returns 0 on an invalid character or empty input.  Leaf-ish (no calls).
+;   RFC 4648 alphabet (A-Z, 2-7), case-insensitive; spaces / '-' ignored;
+;   '=' padding permitted only at the tail.  Data-symbol decoding is branchless
+;   (no secret-dependent conditional jumps or lookup tables).  Rejects empty
+;   inputs, invalid characters, truncated trailing groups, and non-zero pad bits,
+;   scrubbing any partial output bytes written to dst on failure.
 ; ===========================================================================
 public base32_decode
 base32_decode proc frame
-    FRAME_PROLOG 64
-    ; [rbp-24]=dst [rbp-32]=cap [rbp-40]=outcount [rbp-48]=src [rbp-56]=srclen
+    FRAME_PROLOG 80
+    ; [rbp-24]=dst [rbp-32]=cap [rbp-40]=outcount [rbp-48]=src [rbp-56]=srclen [rbp-64]=seen_pad
     mov     edx, edx                        ; zero-extend 32-bit srclen into rdx
+    test    rcx, rcx
+    jz      b32_bad_early
+    test    r8, r8
+    jz      b32_bad_early
     mov     qword ptr [rbp-24], r8
     mov     r8d, r9d
     mov     qword ptr [rbp-32], r8
     mov     qword ptr [rbp-40], 0
     mov     qword ptr [rbp-48], rcx
     mov     qword ptr [rbp-56], rdx
+    mov     dword ptr [rbp-64], 0
     xor     r10, r10                        ; acc (bit buffer)
     xor     r11d, r11d                      ; nbits in acc
-    xor     r8d, r8d                         ; src index
+    xor     r8d, r8d                        ; src index
 b32_loop:
     cmp     r8, qword ptr [rbp-56]
     jae     b32_done
@@ -60,28 +68,35 @@ b32_loop:
     cmp     al, '-'
     je      b32_loop
     cmp     al, '='
-    je      b32_loop
-    cmp     al, 'A'
-    jb      b32_lc
-    cmp     al, 'Z'
-    ja      b32_lc
-    sub     eax, 'A'
-    jmp     b32_acc
-b32_lc:
-    cmp     al, 'a'
-    jb      b32_dig
-    cmp     al, 'z'
-    ja      b32_dig
-    sub     eax, 'a'
-    jmp     b32_acc
-b32_dig:
-    cmp     al, '2'
-    jb      b32_bad
-    cmp     al, '7'
-    ja      b32_bad
-    sub     eax, '2'
-    add     eax, 26
-b32_acc:
+    jne     b32_sym
+    mov     dword ptr [rbp-64], 1
+    jmp     b32_loop
+b32_sym:
+    cmp     dword ptr [rbp-64], 0           ; data symbol after '=' padding is invalid
+    jne     b32_bad
+    ; Branchlessly fold 'a'..'z' -> 'A'..'Z'
+    mov     ecx, eax
+    sub     ecx, 'a'
+    cmp     ecx, 26
+    sbb     edx, edx                        ; -1 if 'a'..'z', else 0
+    and     edx, -32
+    add     eax, edx
+    ; Branchlessly map 'A'..'Z' -> 0..25 and '2'..'7' -> 26..31
+    mov     ecx, eax
+    sub     ecx, 'A'
+    cmp     ecx, 26
+    sbb     edx, edx                        ; -1 if 'A'..'Z', else 0
+    mov     r9d, eax
+    sub     r9d, '2'
+    cmp     r9d, 6
+    sbb     eax, eax                        ; -1 if '2'..'7', else 0
+    add     r9d, 26
+    and     ecx, edx
+    and     r9d, eax
+    or      edx, eax
+    jz      b32_bad                         ; invalid byte (neither A-Z nor 2-7)
+    or      ecx, r9d                        ; ecx = 5-bit symbol value (0..31)
+    mov     eax, ecx
     and     eax, 1Fh
     shl     r10, 5
     or      r10, rax
@@ -107,19 +122,33 @@ b32_acc:
     inc     qword ptr [rbp-40]
     jmp     b32_loop
 b32_done:
-    xor     r10, r10
+    cmp     qword ptr [rbp-40], 0           ; empty / padding-only input -> invalid
+    je      b32_bad
+    cmp     r11d, 5                         ; 5..7 leftover bits => truncated group
+    jae     b32_bad
+    test    r10, r10                        ; RFC 4648: unused low padding bits must be 0
+    jnz     b32_bad
+    xor     ecx, ecx
+    xor     edx, edx
+    xor     r10d, r10d
     mov     rax, qword ptr [rbp-40]
     FRAME_EPILOG
     ret
 b32_bad:
-    xor     r10, r10
+    xor     r10d, r10d
+    mov     rdx, qword ptr [rbp-40]
+    test    rdx, rdx
+    jz      b32_bad_early
+    mov     rcx, qword ptr [rbp-24]
+    call    secure_zero
+b32_bad_early:
     xor     eax, eax
     FRAME_EPILOG
     ret
 base32_decode endp
 
 ; ===========================================================================
-; totp_unix() -> rax = current Unix time in seconds.
+; totp_unix() -> rax = current Unix time in seconds (clamped to 0 if < 1970).
 ; ===========================================================================
 totp_unix proc frame
     FRAME_PROLOG 48
@@ -127,10 +156,16 @@ totp_unix proc frame
     call    GetSystemTimeAsFileTime
     mov     rax, qword ptr [rbp-24]
     mov     rcx, FT_UNIX_EPOCH
+    cmp     rax, rcx
+    jb      tu_pre1970
     sub     rax, rcx
     xor     edx, edx
     mov     rcx, 10000000
     div     rcx                             ; rax = seconds since 1970
+    FRAME_EPILOG
+    ret
+tu_pre1970:
+    xor     eax, eax
     FRAME_EPILOG
     ret
 totp_unix endp
@@ -212,6 +247,8 @@ totp_at proc frame
     jz      ta_bad
     test    edx, edx
     jz      ta_bad
+    test    r8, r8
+    js      ta_bad
     test    r9d, r9d
     jz      ta_bad
     mov     eax, dword ptr [rbp+48]         ; digits

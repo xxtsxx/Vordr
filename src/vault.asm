@@ -81,6 +81,10 @@ externdef g_readonly:dword              ; E9: read-only mode flag (owned by gui.
 extern reg_ctr_set:proc
 extern reg_ctr_get:proc
 extern reg_ctr_del:proc
+extern GetNamedSecurityInfoW:proc
+extern GetSecurityDescriptorControl:proc
+extern SetNamedSecurityInfoW:proc
+extern LocalFree:proc
 
 externdef g_cfg_in:qword
 externdef g_argv:qword
@@ -169,7 +173,7 @@ ARF_NONCE       equ 48          ;            12-byte GCM nonce
 ARF_PTLEN       equ 60          ;            u64 plaintext length
 ARF_SIZE        equ 68
 ATT_ENThDR      equ 24          ; on-disk entry header = id16 + u64 ctlen
-MAX_ATT         equ 512         ; pending (staged, not yet saved) attachments
+MAX_ATT         equ 8192        ; pending (staged, not yet saved) attachments
 ; The ON-DISK index is sized separately and far larger.  It was MAX_ATT too, and an
 ; attachment past the 512th was simply never indexed - so the next save could not
 ; find its ciphertext and wrote an empty blob in its place.  Overflowing this one
@@ -359,6 +363,11 @@ g_preloaded dd ?                             ; 1 = g_filebuf was filled by vault
                                              ;   vault_unlock must not re-read or free it
 g_bak_a     dw MAX_PATH_CHARS dup (?)        ; backup-rotation path scratch (from)
 g_bak_b     dw MAX_PATH_CHARS dup (?)        ; backup-rotation path scratch (to)
+g_bak_staged dd ?                            ; 1 if .bak0 was staged before file_rename
+align 8
+public g_vof_buf, g_vof_len
+g_vof_buf   dq ?                             ; one-shot pre-read foreign image (TOCTOU-free import)
+g_vof_len   dq ?
 g_ts        dq ?                ; GetSystemTimeAsFileTime scratch
 g_sys_ver   db ?                ; VF_SYSTEM value byte (schema version) - write scratch
 align 8
@@ -702,6 +711,10 @@ vmb_cp:
     inc     r8
     cmp     r8, MAX_PATH_CHARS-8
     jb      vmb_cp
+    mov     word ptr [r11], 0                   ; base path too long -> refuse truncation
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
 vmb_suf:
     mov     word ptr [r11+r8*2], '.'
     inc     r8
@@ -715,9 +728,47 @@ vmb_suf:
     mov     word ptr [r11+r8*2], ax
     inc     r8
     mov     word ptr [r11+r8*2], 0
+    mov     eax, 1
     FRAME_EPILOG
     ret
 vault_mkbak endp
+
+; ===========================================================================
+; vault_copy_dacl(rcx = src_wpath, rdx = dst_wpath) - best-effort copy of the
+;   source file's DACL (including SE_DACL_PROTECTED when set) onto dst_wpath so
+;   MoveFileExW fallbacks and .bak1..3 backups never widen explicit vault ACLs.
+; ===========================================================================
+vault_copy_dacl proc frame
+    FRAME_PROLOG 128
+    ; [rbp-24]=src [rbp-32]=dst [rbp-40]=pDacl [rbp-48]=pSD [rbp-56]=ctrl [rbp-60]=rev
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], rdx
+    mov     qword ptr [rbp-40], 0
+    mov     qword ptr [rbp-48], 0
+    WINCALL GetNamedSecurityInfoW, rcx, 1, 4, 0, 0, addr rbp-40, 0, addr rbp-48
+    test    eax, eax
+    jnz     vcd_done
+    cmp     qword ptr [rbp-40], 0
+    je      vcd_free
+    mov     word ptr [rbp-56], 0
+    mov     dword ptr [rbp-60], 0
+    WINCALL GetSecurityDescriptorControl, qword ptr [rbp-48], addr rbp-56, addr rbp-60
+    mov     r8d, 4                              ; DACL_SECURITY_INFORMATION
+    test    eax, eax
+    jz      vcd_set
+    test    word ptr [rbp-56], 1000h            ; SE_DACL_PROTECTED
+    jz      vcd_set
+    mov     r8d, 80000004h                      ; DACL | PROTECTED_DACL_SECURITY_INFORMATION
+vcd_set:
+    WINCALL SetNamedSecurityInfoW, qword ptr [rbp-32], 1, r8d, 0, 0, qword ptr [rbp-40], 0
+vcd_free:
+    cmp     qword ptr [rbp-48], 0
+    je      vcd_done
+    WINCALL LocalFree, qword ptr [rbp-48]
+vcd_done:
+    FRAME_EPILOG
+    ret
+vault_copy_dacl endp
 
 ; ===========================================================================
 ; vault_file_mac(rcx = data ptr, rdx = data len, r8 = out 32-byte) - keyed MAC
@@ -847,13 +898,23 @@ bnr_bad:
 bak_not_reparse endp
 
 vault_rotate_backups proc frame
-    FRAME_PROLOG 80                        ; 80, not 48: the staged CopyFileW source
-                                          ;   at rbp-48 sits in the callee home
-                                          ;   area at the smaller size
-    ; Refuse to rotate if any .bak1..3 slot is a planted reparse point / symlink.
+    FRAME_PROLOG 80
+    mov     dword ptr [g_bak_staged], 0
+    ; Skip backup staging if live vault does not exist yet or is a reparse point.
+    mov     rcx, qword ptr [g_cfg_in]
+    call    path_io
+    mov     qword ptr [rbp-48], rax
+    WINCALL GetFileAttributesW, rax
+    cmp     eax, -1
+    je      vrb_done
+    test    eax, 0400h                          ; FILE_ATTRIBUTE_REPARSE_POINT
+    jnz     vrb_done
+    ; Refuse to stage/rotate if any .bak0..3 slot is a planted reparse point / too long.
     lea     rcx, [g_bak_a]
     mov     dl, '0' + BAK_GENS
     call    vault_mkbak
+    test    eax, eax
+    jz      vrb_done
     lea     rcx, [g_bak_a]
     call    bak_not_reparse
     test    eax, eax
@@ -861,6 +922,8 @@ vault_rotate_backups proc frame
     lea     rcx, [g_bak_b]
     mov     dl, '0' + BAK_GENS - 1
     call    vault_mkbak
+    test    eax, eax
+    jz      vrb_done
     lea     rcx, [g_bak_b]
     call    bak_not_reparse
     test    eax, eax
@@ -868,12 +931,44 @@ vault_rotate_backups proc frame
     lea     rcx, [g_bak_b]
     mov     dl, '1'
     call    vault_mkbak
+    test    eax, eax
+    jz      vrb_done
     lea     rcx, [g_bak_b]
     call    bak_not_reparse
     test    eax, eax
     jz      vrb_done
+    lea     rcx, [g_bak_a]
+    mov     dl, '0'
+    call    vault_mkbak
+    test    eax, eax
+    jz      vrb_done
+    lea     rcx, [g_bak_a]
+    call    bak_not_reparse
+    test    eax, eax
+    jz      vrb_done
+    ; Stage live vault -> .bak0 BEFORE touching .bak1..3; only rotate after file_rename succeeds!
+    WINCALL DeleteFileW, addr g_bak_a
+    WINCALL CopyFileW, qword ptr [rbp-48], addr g_bak_a, 1
+    test    eax, eax
+    jz      vrb_done
+    mov     rcx, qword ptr [rbp-48]
+    lea     rdx, [g_bak_a]
+    call    vault_copy_dacl
+    mov     dword ptr [g_bak_staged], 1
+vrb_done:
+    FRAME_EPILOG
+    ret
+vault_rotate_backups endp
 
-    WINCALL DeleteFileW, addr g_bak_a           ; delete the oldest (bak3)
+vault_commit_backups proc frame
+    FRAME_PROLOG 48
+    cmp     dword ptr [g_bak_staged], 0
+    je      vcb_done
+    mov     dword ptr [g_bak_staged], 0
+    lea     rcx, [g_bak_a]                      ; delete oldest (bak3)
+    mov     dl, '0' + BAK_GENS
+    call    vault_mkbak
+    WINCALL DeleteFileW, addr g_bak_a
     lea     rcx, [g_bak_a]                      ; bak2 -> bak3
     mov     dl, '0' + BAK_GENS - 1
     call    vault_mkbak
@@ -888,18 +983,33 @@ vault_rotate_backups proc frame
     mov     dl, '2'
     call    vault_mkbak
     WINCALL MoveFileExW, addr g_bak_a, addr g_bak_b, MOVEFILE_REPLACE_EXISTING
-    lea     rcx, [g_bak_a]                      ; live vault -> bak1 (create-new after delete)
+    lea     rcx, [g_bak_a]                      ; staged bak0 -> bak1
+    mov     dl, '0'
+    call    vault_mkbak
+    lea     rcx, [g_bak_b]
     mov     dl, '1'
     call    vault_mkbak
-    WINCALL DeleteFileW, addr g_bak_a
-    mov     rcx, qword ptr [g_cfg_in]           ; the source needs the Win32 form too;
-    call    path_io                             ;   g_bak_a already has it
-    mov     qword ptr [rbp-48], rax
-    WINCALL CopyFileW, qword ptr [rbp-48], addr g_bak_a, 1
-vrb_done:
+    WINCALL MoveFileExW, addr g_bak_a, addr g_bak_b, MOVEFILE_REPLACE_EXISTING
+vcb_done:
     FRAME_EPILOG
     ret
-vault_rotate_backups endp
+vault_commit_backups endp
+
+vault_abort_backup proc frame
+    FRAME_PROLOG 32
+    cmp     dword ptr [g_bak_staged], 0
+    je      vab_done
+    mov     dword ptr [g_bak_staged], 0
+    lea     rcx, [g_bak_a]
+    mov     dl, '0'
+    call    vault_mkbak
+    test    eax, eax
+    jz      vab_done
+    WINCALL DeleteFileW, addr g_bak_a
+vab_done:
+    FRAME_EPILOG
+    ret
+vault_abort_backup endp
 
 ; ===========================================================================
 ; vault_seal_write() - seal g_body (g_body_len bytes) under g_vkey with a fresh
@@ -1054,6 +1164,8 @@ vsw_pcpy:
     inc     r8
     cmp     r8, MAX_PATH_CHARS-8
     jb      vsw_pcpy
+    mov     word ptr [r11], 0                   ; base path too long -> refuse truncation
+    jmp     vsw_io_dec
 vsw_pdone:
     mov     word ptr [r11+r8*2], '.'
     inc     r8
@@ -1091,15 +1203,21 @@ vsw_wtry:
     je      vsw_wretry                           ; ERROR_LOCK_VIOLATION
     cmp     r10d, 5
     je      vsw_wretry                           ; ERROR_ACCESS_DENIED
-    jmp     vsw_io
+    jmp     vsw_io_cleanup
 vsw_wretry:
     inc     dword ptr [rbp-48]
     cmp     dword ptr [rbp-48], 10               ; 10 attempts (~9s), then give up
-    jae     vsw_io
+    jae     vsw_io_cleanup
     WINCALL Sleep, 1000
     jmp     vsw_wtry
 vsw_wok:
-    ; roll the current file into .bak1..N before we overwrite it (best-effort)
+    ; Preserve any explicit/protected DACL from the live vault onto .tmp (for MoveFileExW fallback)
+    mov     rcx, qword ptr [g_cfg_in]
+    call    path_io
+    mov     rcx, rax
+    lea     rdx, [g_tmppath]
+    call    vault_copy_dacl
+    ; Stage the current file into .bak0 before overwrite (.bak1..3 untouched until rename succeeds)
     call    vault_rotate_backups
     ; atomic replace: rename temp -> the real vault path
     lea     rcx, [g_tmppath]
@@ -1107,7 +1225,8 @@ vsw_wok:
     call    file_rename
     mov     dword ptr [rbp-24], eax
     test    eax, eax
-    jnz     vsw_free                            ; write/rename failed -> free outbuf
+    jnz     vsw_rename_fail                     ; rename failed -> abort backup, delete .tmp, roll back counter
+    call    vault_commit_backups
     ; success: the image we just wrote becomes the resident file image, so newly
     ; sealed attachments are readable without a re-read.  Retire the old image,
     ; drop the pending list, and rebuild the attachment index.
@@ -1158,6 +1277,15 @@ vsw_swap:
     mov     eax, dword ptr [rbp-24]
     FRAME_EPILOG
     ret
+vsw_rename_fail:
+    call    vault_abort_backup
+    WINCALL DeleteFileW, addr g_tmppath
+    dec     qword ptr [g_save_counter]
+    jmp     vsw_free
+vsw_io_cleanup:
+    WINCALL DeleteFileW, addr g_tmppath
+vsw_io_dec:
+    dec     qword ptr [g_save_counter]
 vsw_io:
     mov     dword ptr [rbp-24], EXIT_IO
 vsw_free:
@@ -1698,6 +1826,9 @@ vault_state_restore proc frame
     lea     rdx, [g_ps_ehash]
     mov     r8d, 32
     call    copy_bytes
+    lea     rcx, [g_attidx]
+    mov     edx, MAX_ATTIDX * 32
+    call    secure_zero
     lea     rcx, [g_attidx]
     lea     rdx, [g_ps_attidx]
     mov     r8d, dword ptr [g_attidx_n]
@@ -2555,6 +2686,7 @@ public cmd_kdfparam
 cmd_kdfparam proc frame
     FRAME_PROLOG 32
     ; --- must ACCEPT: legitimate params ---
+    mov     dword ptr [g_hdr+VH_LANES], 1               ; native vaults always use p=1
     mov     dword ptr [g_hdr+VH_T], ARGON2_DEF_T        ; t=3, m=512 MiB (default)
     mov     dword ptr [g_hdr+VH_M], ARGON2_DEF_M_KIB
     call    vk_params_ok
@@ -2571,6 +2703,17 @@ cmd_kdfparam proc frame
     test    eax, eax
     jz      kdp_fail
     ; --- must REJECT: the DoS / tamper vectors ---
+    mov     dword ptr [g_hdr+VH_T], ARGON2_DEF_T        ; lanes != 1
+    mov     dword ptr [g_hdr+VH_M], ARGON2_DEF_M_KIB
+    mov     dword ptr [g_hdr+VH_LANES], 0
+    call    vk_params_ok
+    test    eax, eax
+    jnz     kdp_fail
+    mov     dword ptr [g_hdr+VH_LANES], 2
+    call    vk_params_ok
+    test    eax, eax
+    jnz     kdp_fail
+    mov     dword ptr [g_hdr+VH_LANES], 1               ; restore valid lanes for t/m tests
     mov     dword ptr [g_hdr+VH_T], ARGON2_DEF_T        ; m_cost = 0
     mov     dword ptr [g_hdr+VH_M], 0
     call    vk_params_ok
@@ -4972,11 +5115,34 @@ vst_k:
     call    attach_selftest                 ; per-attachment seal/open + AAD binding
     test    eax, eax
     jnz     vst_fail
-    xor     eax, eax
-    FRAME_EPILOG
-    ret
+    mov     dword ptr [rbp-24], 0
+    jmp     vst_cleanup
 vst_fail:
-    mov     eax, 1
+    mov     dword ptr [rbp-24], 1
+vst_cleanup:
+    lea     rcx, [g_cfg_pass]
+    mov     edx, MAX_PASSWORD_BYTES+1
+    call    secure_zero
+    mov     dword ptr [g_cfg_passlen], 0
+    lea     rcx, [g_vkey]
+    mov     edx, 32
+    call    secure_zero
+    lea     rcx, [g_sha32]
+    mov     edx, 32
+    call    secure_zero
+    lea     rcx, [g_hdr]
+    mov     edx, VH_TOTAL
+    call    secure_zero
+    lea     rcx, [vst_ct]
+    mov     edx, 16
+    call    secure_zero
+    lea     rcx, [vst_dec]
+    mov     edx, 16
+    call    secure_zero
+    lea     rcx, [vst_tag]
+    mov     edx, 16
+    call    secure_zero
+    mov     eax, dword ptr [rbp-24]
     FRAME_EPILOG
     ret
 vault_selftest endp
@@ -5137,8 +5303,10 @@ lka_cp:
     test    ax, ax
     jz      lka_cpd
     inc     ecx
-    cmp     ecx, MAX_PATH_CHARS
+    cmp     ecx, MAX_PATH_CHARS-8
     jb      lka_cp
+    mov     word ptr [r11], 0                   ; base path too long -> refuse truncation
+    jmp     lka_busy
 lka_cpd:
     lea     r11, [g_lock_path]
     lea     r11, [r11+rcx*2]                    ; at the NUL
@@ -5706,6 +5874,9 @@ xs_restore:
     lea     rcx, [g_xs_vkey]                  ; no second copy of the key outlives this
     mov     edx, 32
     call    secure_zero
+    lea     rcx, [g_sha32]                    ; scrub child KCV digest
+    mov     edx, 32
+    call    secure_zero
     mov     rcx, qword ptr [rbp-72]
     mov     rdx, VAULT_BODY_MAX
     call    secmem_free
@@ -5739,15 +5910,22 @@ vault_export_sel endp
 ; ===========================================================================
 public vault_open_foreign
 vault_open_foreign proc frame
-    FRAME_PROLOG 176
+    FRAME_PROLOG 208
     ; [rbp-24]=path [rbp-32]=pw [rbp-40]=pwlen [rbp-48]=out
     ; parked: [rbp-56]=body [rbp-64]=bodylen [rbp-72]=cfg_in [rbp-80]=counter
     ;         [rbp-88]=ext_size [rbp-96]=filebuf [rbp-104]=filesize [rbp-112]=fmac_len
     ;         [rbp-120]=att_total [rbp-124]=newatt_n [rbp-128]=attidx_n [rbp-132]=passlen
+    ;         [rbp-140]=use_tpm [rbp-144]=preloaded [rbp-152]=vof_buf [rbp-160]=vof_len
     mov     qword ptr [rbp-24], rcx
     mov     qword ptr [rbp-32], rdx
     mov     dword ptr [rbp-40], r8d
     mov     qword ptr [rbp-48], r9
+    mov     rax, qword ptr [g_vof_buf]          ; consume one-shot pre-read buffer
+    mov     qword ptr [g_vof_buf], 0
+    mov     qword ptr [rbp-152], rax
+    mov     rax, qword ptr [g_vof_len]
+    mov     qword ptr [g_vof_len], 0
+    mov     qword ptr [rbp-160], rax
     mov     rax, qword ptr [g_body_ptr]
     mov     qword ptr [rbp-56], rax
     mov     rax, qword ptr [g_body_len]
@@ -5772,6 +5950,10 @@ vault_open_foreign proc frame
     mov     dword ptr [rbp-128], eax
     mov     eax, dword ptr [g_cfg_passlen]
     mov     dword ptr [rbp-132], eax
+    mov     eax, dword ptr [g_use_tpm]
+    mov     dword ptr [rbp-140], eax
+    mov     eax, dword ptr [g_preloaded]
+    mov     dword ptr [rbp-144], eax
     mov     rdx, qword ptr [rbp-72]
     call    vault_park_path
     mov     qword ptr [rbp-72], rax
@@ -5801,11 +5983,20 @@ vault_open_foreign proc frame
     mov     dword ptr [g_use_tpm], 0            ; a foreign vault is never TPM-enrolled here
     mov     dword ptr [g_reuse_key], 0          ; and its key must be derived, not reused
     mov     qword ptr [g_body_ptr], 0           ; vault_unlock allocates its own
-    mov     qword ptr [g_filebuf], 0            ; read_file OVERWRITES this rather than
-                                                ;   freeing, so the master's image survives
-                                                ;   regardless - nulling is belt and braces
-                                                ;   in case that contract ever changes
+    mov     rax, qword ptr [rbp-152]            ; optional pre-read foreign image
+    test    rax, rax
+    jz      vof_diskread
+    mov     qword ptr [g_filebuf], rax
+    mov     rax, qword ptr [rbp-160]
+    mov     qword ptr [g_filesize], rax
+    mov     dword ptr [g_preloaded], 1
+    jmp     vof_call_unlock
+vof_diskread:
+    mov     qword ptr [g_filebuf], 0
+    mov     dword ptr [g_preloaded], 0
+vof_call_unlock:
     call    vault_unlock
+    mov     dword ptr [g_preloaded], 0          ; vof_restore/vof_failed owns & frees g_filebuf
     mov     dword ptr [rbp-136], eax
     test    eax, eax
     jnz     vof_failed
@@ -5871,10 +6062,17 @@ vof_restore:
     lea     rcx, [g_xs_vkey]                    ; no second copy of the master key survives
     mov     edx, 32
     call    secure_zero
+    lea     rcx, [g_sha32]                      ; nor foreign KCV digest
+    mov     edx, 32
+    call    secure_zero
     lea     rcx, [g_cfg_pass]                   ; nor the foreign password we were handed
     mov     edx, MAX_PASSWORD_BYTES+1
     call    secure_zero
     mov     dword ptr [g_cfg_passlen], 0
+    mov     eax, dword ptr [rbp-140]
+    mov     dword ptr [g_use_tpm], eax
+    mov     eax, dword ptr [rbp-144]
+    mov     dword ptr [g_preloaded], eax
     mov     eax, dword ptr [rbp-136]
     FRAME_EPILOG
     ret
@@ -6685,6 +6883,17 @@ va_field_labeled proc frame
     mov     qword ptr [rbp-40], rax             ; vallen = 0 default
     test    r8, r8
     jz      vfl_lbl
+    ; Enforce UTF-16 code-unit cap (CONVW_MAX - 1) so every written/imported field
+    ; is guaranteed to round-trip losslessly through vault_field_get's CONVW_MAX buffer.
+    xor     ecx, ecx
+vfl_wchk:
+    cmp     word ptr [r8 + rcx*2], 0
+    je      vfl_wok
+    inc     ecx
+    cmp     ecx, CONVW_MAX
+    jb      vfl_wchk
+    jmp     vfl_of
+vfl_wok:
     mov     rcx, r8
     lea     rdx, [g_conv]
     mov     r8d, CONV_CAP
@@ -7706,6 +7915,9 @@ attach_stage proc frame
     mov     eax, dword ptr [g_newatt_n]
     cmp     eax, MAX_ATT
     jae     as_err
+    add     eax, dword ptr [g_attidx_n]
+    cmp     eax, MAX_ATTIDX
+    jae     as_err
     mov     rcx, qword ptr [rbp-32]
     cmp     rcx, ATT_FILE_MAX
     ja      as_err
@@ -8145,6 +8357,8 @@ ab_acc:
     jc      ab_ovf
     mov     qword ptr [rbp-32], rcx
 ab_cnt:
+    cmp     dword ptr [rbp-48], MAX_ATTIDX
+    jae     ab_ovf
     inc     dword ptr [rbp-48]
 ab_fadv:
     inc     dword ptr [rbp-80]

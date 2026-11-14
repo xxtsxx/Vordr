@@ -206,6 +206,10 @@ pw_oneclass db "abcdefghijklmnopqrs"         ; 19 lower only (too few classes)
 pw_oneclass_n equ $ - pw_oneclass
 pw_good3    db "Abcdefghij12"                ; 12 chars, U+L+D = 3 classes
 pw_good3_n  equ $ - pw_good3
+pw_utf8_11  db "Ab1defghij", 0C3h, 0A9h      ; 11 UTF-8 code points (12 bytes w/ 'e-acute'), 4 classes -> too short (1)
+pw_utf8_11_n equ $ - pw_utf8_11
+pw_utf8_2c  db "aaaaaaaaaaa", 0C3h, 0A9h     ; 12 UTF-8 code points ('e-acute'), L+S = 2 classes -> too few (2)
+pw_utf8_2c_n equ $ - pw_utf8_2c
 align 8
 arg_cksum   dq 05ee3a5c79eba0a63h
 arg_out0    dq 0dc71308d33513477h
@@ -292,7 +296,7 @@ gcm_tag         db 16 dup (?)
 gcm_dec         db 16 dup (?)
 align 8
 greq            GCMREQ <>
-pw_out          db 64 dup (?)
+pw_out          db 128 dup (?)
 hmac_out        db 20 dup (?)
 b32_out         db 16 dup (?)
 otp_out         db 8 dup (?)
@@ -346,12 +350,16 @@ endm
 ; =============================================================================
 public run_selftest
 run_selftest proc frame
-    FRAME_PROLOG 96
-    ; preserve callee-saved registers used as scratch below (r12/r13/r15).  These
-    ; slots sit above the 32-byte callee shadow and are untouched by any call here.
+    FRAME_PROLOG 112
+    ; preserve callee-saved registers used as scratch below (r12/r13/r15) and
+    ; caller's password-policy globals (run_selftest runs on startup after cfg_load).
     mov     qword ptr [rbp-48], r12
     mov     qword ptr [rbp-56], r13
     mov     qword ptr [rbp-64], r15
+    mov     eax, dword ptr [g_cfg_pwminlen]
+    mov     dword ptr [rbp-72], eax
+    mov     eax, dword ptr [g_cfg_pwminclasses]
+    mov     dword ptr [rbp-76], eax
     ; [rbp-24] = failure count
     mov     dword ptr [g_kat_n], 0
     mov     dword ptr [g_st_verbose], ecx
@@ -709,6 +717,14 @@ st_after_a2v:
     call    check_password_policy
     test    eax, eax
     jnz     st_pw_fail
+    LOADPW  pw_utf8_11, pw_utf8_11_n        ; 11 code points (12 bytes) -> too short (1)
+    call    check_password_policy
+    cmp     eax, 1
+    jne     st_pw_fail
+    LOADPW  pw_utf8_2c, pw_utf8_2c_n        ; 12 code points w/ UTF-8 cont byte, only 2 classes -> too few (2)
+    call    check_password_policy
+    cmp     eax, 2
+    jne     st_pw_fail
     STPASS st_pass_pw, st_pass_pw_len
     jmp     st_after_pw
 st_pw_fail:
@@ -750,13 +766,31 @@ st_after_gen:
     call    pwgen_ex
     cmp     eax, 90                             ; 20 chars * ~5.9 bits ~= 118, floor >= 90
     jb      st_gx_fail
-    lea     rcx, [pw_out]                       ; PASSPHRASE, 4 words, capitalized + dashes
-    mov     edx, 4
+    lea     rcx, [pw_out]                       ; PASSPHRASE < 6 words rejected (0)
+    mov     edx, 5
     mov     r8d, PWS_PASSPHRASE
     mov     r9d, PWO_CAP or PWO_DASH
-    mov     dword ptr [g_pwgen_outcap], 64      ; E16: pw_out capacity
+    mov     dword ptr [g_pwgen_outcap], 128
     call    pwgen_ex
-    cmp     eax, 32                             ; 4 words * 8 bits
+    test    eax, eax
+    jnz     st_gx_fail
+    lea     rcx, [pw_out]                       ; PASSPHRASE, 6 words, capitalized + dashes
+    mov     edx, 6
+    mov     r8d, PWS_PASSPHRASE
+    mov     r9d, PWO_CAP or PWO_DASH
+    mov     dword ptr [g_pwgen_outcap], 128
+    call    pwgen_ex
+    cmp     eax, 66                             ; 6 words * 11 bits (2,048-word list)
+    jne     st_gx_fail
+    lea     rcx, [pw_out]                       ; PASSPHRASE truncation fails closed + wipes outbuf
+    mov     edx, 6
+    mov     r8d, PWS_PASSPHRASE
+    mov     r9d, PWO_CAP or PWO_DASH
+    mov     dword ptr [g_pwgen_outcap], 16      ; too small for 6 words -> fail closed
+    call    pwgen_ex
+    test    eax, eax
+    jnz     st_gx_fail
+    cmp     byte ptr [pw_out], 0
     jne     st_gx_fail
     lea     rcx, [pw_out]                       ; PRONOUNCE, 12 chars
     mov     edx, 12
@@ -953,13 +987,19 @@ st_ctm_fail:
 st_after_ctm:
     call    selftest_ext
     add     qword ptr [rbp-24], rax
-    ; scrub the KAT's test-password state.  run_selftest is the startup gate
-    ; (wstart runs it on every launch), so it must not leave a stale constant
-    ; password + non-zero length in g_cfg_pass for the unlock flow to inherit.
+    ; scrub the KAT's test-password + pwgen scratch state, and restore caller's
+    ; password-policy globals (run_selftest runs on startup after cfg_load).
     lea     rcx, [g_cfg_pass]
     mov     edx, MAX_PASSWORD_BYTES+1
     call    secure_zero
     mov     dword ptr [g_cfg_passlen], 0
+    lea     rcx, [pw_out]
+    mov     edx, 128
+    call    secure_zero
+    mov     eax, dword ptr [rbp-72]
+    mov     dword ptr [g_cfg_pwminlen], eax
+    mov     eax, dword ptr [rbp-76]
+    mov     dword ptr [g_cfg_pwminclasses], eax
 
     mov     rax, qword ptr [rbp-24]
     mov     r12, qword ptr [rbp-48]     ; restore callee-saved registers
@@ -1017,6 +1057,16 @@ k64_raw_exp db "1234567890123456789012345678901234567890123456789012345678901234
 totp8_59_exp    db "94287082"
 totp8_11_exp    db "07081804"
 totp8_k64_59    db "14779409"
+; RFC 2202 HMAC-SHA1 case 6 (> 64-byte key = 80 * 0xaa)
+hm6_key         db 80 dup (0aah)
+hm6_msg         db "Test Using Larger Than Block-Size Key - Hash Key First"
+hm6_msg_n       equ $ - hm6_msg
+hm6_exp         db 0aah,04ah,0e5h,0e1h,052h,072h,0d0h,00eh,095h,070h
+                db 056h,037h,0ceh,08ah,03bh,055h,0edh,040h,021h,012h
+; Negative Base32 test vectors (RFC 4648 strictness)
+b32_bad_trunc   db "JBS"
+b32_bad_midpad  db "MY=Z===="
+b32_bad_nzpad   db "MZ======"
 
 ; JSON zj_str vectors
 zj_v_ok     db '"', '\', '"', 'A', '\', '\', 'B', '\', 'u', '0', '0', '4', '1'
@@ -1303,6 +1353,29 @@ ste_after_b2l:
     call    ct_memcmp
     test    eax, eax
     jnz     ste_t64_fail
+
+    ; RFC 2202 HMAC-SHA1 case 6 (80-byte key > 64-byte SHA-1 block)
+    WINCALL hmac_sha1, addr hm6_key, 80, addr hm6_msg, hm6_msg_n, addr hmac_out
+    lea     rcx, [hmac_out]
+    lea     rdx, [hm6_exp]
+    mov     r8, 20
+    call    ct_memcmp
+    test    eax, eax
+    jnz     ste_t64_fail
+
+    ; Strict Base32 rejection: truncated quantum, mid-string '=', non-zero pad bits
+    mov     byte ptr [b32_out], 0FFh
+    WINCALL base32_decode, addr b32_bad_trunc, 3, addr b32_out, 16
+    test    eax, eax
+    jnz     ste_t64_fail
+    cmp     byte ptr [b32_out], 0               ; partial output wiped on error
+    jne     ste_t64_fail
+    WINCALL base32_decode, addr b32_bad_midpad, 8, addr b32_out, 16
+    test    eax, eax
+    jnz     ste_t64_fail
+    WINCALL base32_decode, addr b32_bad_nzpad, 8, addr b32_out, 16
+    test    eax, eax
+    jnz     ste_t64_fail
     STPASS  st_pass_t64, st_pass_t64_len
     jmp     ste_after_t64
 ste_t64_fail:
@@ -1410,6 +1483,23 @@ ste_after_t64:
     call    argon2id_hash
     cmp     eax, 1
     jne     ste_grd_fail
+    ; Argon2id atype != 2 and saltlen < 8 guards
+    lea     r10, [a2_req]
+    mov     dword ptr [r10].ARGON2REQ.m_cost, 32
+    mov     dword ptr [r10].ARGON2REQ.atype, 1      ; Argon2i rejected
+    lea     rcx, [a2_req]
+    call    argon2id_hash
+    cmp     eax, 1
+    jne     ste_grd_fail
+    lea     r10, [a2_req]
+    mov     dword ptr [r10].ARGON2REQ.atype, 2
+    mov     dword ptr [r10].ARGON2REQ.saltlen, 7    ; < 8 rejected
+    lea     rcx, [a2_req]
+    call    argon2id_hash
+    cmp     eax, 1
+    jne     ste_grd_fail
+    lea     r10, [a2_req]
+    mov     dword ptr [r10].ARGON2REQ.saltlen, 16
 
     ; rng_fill: NULL rejected, 0/1/7/12-byte lengths succeed
     xor     ecx, ecx
@@ -1802,26 +1892,33 @@ pk_init:
     inc     qword ptr [rbp-24]
     jmp     pk_init
 pk_spawn:
-    mov     qword ptr [rbp-24], 0
+    mov     qword ptr [rbp-24], 0                    ; slot index
+    mov     qword ptr [rbp-40], 0                    ; actual spawned handle count
 pk_spawn_loop:
     mov     eax, dword ptr [rbp-24]
     cmp     eax, dword ptr [g_pkat_n]
     jae     pk_wait
     WINCALL CreateThread, 0, 0, addr pkat_worker, qword ptr [rbp-24], 0, 0
-    mov     r10, qword ptr [rbp-24]
+    test    rax, rax
+    jz      pk_spawn_next
+    mov     r10, qword ptr [rbp-40]
     lea     r11, [g_pkat_h]
     mov     qword ptr [r11+r10*8], rax
+    inc     qword ptr [rbp-40]
+pk_spawn_next:
     inc     qword ptr [rbp-24]
     jmp     pk_spawn_loop
 pk_wait:
-    ; watchdog-bounded join: WAIT_ALL, 10 s.  A timeout (or any non-signalled
-    ; return) is a failure - a worker that hung never cleared its slot anyway.
-    WINCALL WaitForMultipleObjects, dword ptr [g_pkat_n], addr g_pkat_h, 1, 10000
+    ; watchdog-bounded join: WAIT_ALL, 10 s over non-NULL spawned handles.
+    mov     dword ptr [rbp-32], 1                    ; default fail if 0 spawned
+    cmp     dword ptr [rbp-40], 0
+    je      pk_eval
+    WINCALL WaitForMultipleObjects, dword ptr [rbp-40], addr g_pkat_h, 1, 10000
     mov     dword ptr [rbp-32], eax
     mov     qword ptr [rbp-24], 0
 pk_close:
     mov     eax, dword ptr [rbp-24]
-    cmp     eax, dword ptr [g_pkat_n]
+    cmp     eax, dword ptr [rbp-40]
     jae     pk_eval
     mov     r10, qword ptr [rbp-24]
     lea     r11, [g_pkat_h]
@@ -1829,9 +1926,9 @@ pk_close:
     inc     qword ptr [rbp-24]
     jmp     pk_close
 pk_eval:
-    ; only destroy the CS once EVERY worker finished (WAIT_OBJECT_0).  On a timeout
-    ; a worker may still be alive and could enter a deleted CS (UB), so leak it -
-    ; the process exits (ExitProcess) immediately after pkat returns.
+    mov     eax, dword ptr [rbp-40]
+    cmp     eax, dword ptr [g_pkat_n]
+    jb      pk_fail                             ; any CreateThread failure -> fail closed
     cmp     dword ptr [rbp-32], 0               ; WAIT_OBJECT_0 = all signalled
     jne     pk_fail                             ; timeout / abandoned -> fail closed
     mov     qword ptr [rbp-24], 0               ; every slot must be PASS(0)

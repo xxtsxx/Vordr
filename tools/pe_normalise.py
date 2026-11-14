@@ -87,7 +87,8 @@ def normalise(path):
             s = sect + i * 40
             va, vsz = _u32(b, s + 12), _u32(b, s + 8)
             raw, rawsz = _u32(b, s + 20), _u32(b, s + 16)
-            if va <= rva < va + max(vsz, rawsz):
+            span = min(vsz, rawsz) if vsz else rawsz
+            if va <= rva < va + span:
                 return raw + (rva - va)
         return None
 

@@ -54,9 +54,9 @@ flowchart LR
 | Fault injection | Deliberate canary, shadow-stack (top and ancestor-skip), indirect-call, arithmetic, bounds, type, production heap-tag (`mem_alloc`/`mem_free`), crash-reentrancy, DLL System32 load-config, and IAT violations each end or pass with that control's expected result (`tests/redteam.py`); an ordinary access violation is contained (0xC0000409, no crash dialog) with a breadcrumb naming the fault | Checks termination behavior, not all paths; the IAT case shows the slot is read-only at the write, not that `iat_lockdown` alone made it so |
 | Strict build | Ten Python assembly/ABI/resource/doc analyzers (each guarded against silent coverage loss by `tools/floors.py`) plus assembly/link success and PE `LOAD_CONFIG` `DependentLoadFlags == 0x0800` verification (`pe_normalise.py`); `build.cmd strict` fails closed if Python is absent | Pattern-based static analyzers inspect source idioms rather than proving full program semantics |
 | Self-tests | 23 startup known-answer suites pass (also run fail-closed on every normal launch); release binary refuses diagnostic file-writing verbs in the next stage | Fixed vectors verify selected inputs and boundary cases |
-| Round-trip | Serialization, imports/exports, attachments, policy, TPM label binding, SecureUnlock fail-closed policy, locking, parsers, preview cleanup, and persistence probes; an independent reader of the vault format; frozen v0.2.3 vaults; a real, isolated GUI instance driven from outside | Synthetic and bounded input space; geometry and GUI tests skip without a desktop |
+| Round-trip | Serialization, imports/exports, attachments, policy, TPM label binding, SecureUnlock fail-closed policy, locking, parsers, preview cleanup, and persistence probes; an independent reader of the vault format; frozen v0.2.3 vaults; a 91-check isolated GUI instance driven from outside | Synthetic and bounded input space; geometry and GUI tests skip without a desktop |
 | Crypto differential | Output compared with independent Python calculations and published vectors | Functional output checks, not a side-channel proof |
-| Installer | MSI tables, policy `LaunchCondition` guards, downgrade prevention (`NEWERVERSIONDETECTED`), and component costing checked | Does not install, upgrade, or uninstall the program |
+| Installer | Release-PE validation (`make_msi.ps1`), MSI tables, 16 policy rows, numeric `LaunchCondition` guards, SDDL permissions, downgrade prevention (`NEWERVERSIONDETECTED`), and component costing checked (`verify_msi.ps1`) | Does not install, upgrade, or uninstall the program |
 
 `--quick` skips fault injection. `build.cmd release strict` requires Python and
 fails closed when Python is missing; missing `makecab` can skip the installer
@@ -100,17 +100,17 @@ not expose a command-line option for reading an edited report file.
 
 | Checker under `tools/` | Detects |
 |---|---|
-| `framecheck.py` | Stack/frame and call-argument layout problems, mismatched raw epilogues, and OS-dispatched callbacks (`WndProc`, `DialogProc`, `SubclassProc`, `TimerProc`, `EnumWindowsProc`, exception handlers) that improperly use `FRAME_PROLOG` |
-| `nvcheck.py` | A procedure that writes a callee-saved register (rbx, rsi, rdi, r12-r15, xmm6-15) without saving and restoring it |
+| `framecheck.py` | Stack/frame and call-argument layout problems (including nested-call outgoing stack-argument shadow space), mismatched raw epilogues, and OS-dispatched callbacks (`WndProc`, `DialogProc`, `SubclassProc`, `TimerProc`, `EnumWindowsProc`, exception handlers) that improperly use `FRAME_PROLOG` |
+| `nvcheck.py` | A procedure that writes a callee-saved register (rbx, rsi, rdi, r12-r15, xmm6-15) without saving and restoring it, or writes `ymm` registers without `vzeroupper` before returning |
 | `idcheck.py` | Resource/assembly control-ID drift and collisions |
 | `constcheck.py` | Inconsistent constants between modules |
 | `dlgtarget.py` | Controls addressed through the wrong known dialog, including settings-table ownership |
 | `deadcode.py` | Apparently unreferenced symbols |
 | `rccheck.py` | Resource-template geometry problems |
-| `wstrcheck.py` | Bounded string-copy calls missing their bound |
+| `wstrcheck.py` | Bounded string-copy calls missing their `r8`/`r8d` bound across the full preceding instruction window, or direct `g_cfg_in` assignments bypassing `cfg_in_set` |
 | `aligncheck.py` | Misaligned wide-string declarations (sizes written as names or expressions are resolved, not guessed) |
 | `check_docs.py` | Broken relative links/anchors, duplicate heading slugs, unclosed fences, and control characters in documentation |
-| `pe_normalise.py` | Missing or misconfigured PE `IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG` `DependentLoadFlags == 0x0800` (`LOAD_LIBRARY_SEARCH_SYSTEM32`) and non-deterministic timestamps |
+| `pe_normalise.py` | Missing or misconfigured PE `IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG` `DependentLoadFlags == 0x0800` (`LOAD_LIBRARY_SEARCH_SYSTEM32`) and non-deterministic COFF/export/debug/Rich timestamps |
 
 These are source-pattern checks, not a complete compiler or program proof.
 A refactor can reduce what a checker recognizes without introducing a reported
@@ -128,10 +128,10 @@ rather than the conventional zero-on-success result.
 | Input parsing and bounds | `vfuzz`, `fuzzzip`, `jfuzz`, `attfuzz`, `attovfkat`, `kdfparam`, `convcap` |
 | Save integrity and concurrency | `bktest`, `mactest`, `rbtest`, `xctest`, `reload`, `cowrite` |
 | Native exchange and metadata | `sysitemkat`, `vexselkat`, `c9kat`, `vimpkat`, `vattcolkat`, `vaultexportkat`, `vaultexpattkat` |
-| ZIP export | `atgen`, `zitest`, `zexcap`, `zexname`, `zexselkat` |
-| Policy, TPM, and private desktop | `polkat`, `tpmkat`, `secdeskkat` |
+| ZIP export and attachment binding | `atgen`, `zitest`, `zexcap`, `zexname`, `zexselkat` (selective export filter, `SHA-256` attachment swap rejection, and missing-member atomic rollback) |
+| Policy, TPM, and private desktop | `polkat` (`HKLM` fail-closed types, `HKLM`-only `AllowUncVault`, `ProfileList` path expansion), `tpmkat`, `secdeskkat` |
 | GUI geometry and failed-edit retry | `layoutkat` (with `savefail` and `guardkat` in the same window) |
-| GUI behaviour from outside | `tests/guitest.ps1`: input limits, the drawn scrollbars (entry list, checklist, detail pane), modal dialog dismissal on lock, `WM_COPYDATA` rejection while modal, tray clipboard auto-clear, what a lock wipes, GDI leaks |
+| GUI behaviour from outside | `tests/guitest.ps1` (91 checks): input limits, drawn scrollbars, modal dismissal on lock, `WM_COPYDATA` UNC/modal/non-Vordr-sender rejection, default `GetWindowDisplayAffinity` (`0x11`) screen-capture protection, tray clipboard auto-clear, post-lock secret wipes, GDI leaks |
 | Vault format, tamper and nonce reuse | `tests/verify_vault.py` |
 | Opening vaults written by a release | `tests/compattest.py` (frozen `tests/fixtures/v023-*.vordr`) |
 | Long-path context restoration | `tests/verify_persistence.py` |

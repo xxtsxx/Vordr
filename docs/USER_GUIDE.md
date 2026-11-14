@@ -85,15 +85,19 @@ An entry can contain usernames, secrets, URLs, notes, TOTP keys, custom-labeled
 fields, and attachments. Search and favorites help find entries; custom icons
 help distinguish them. TOTP uses a base32 key and depends on the computer's clock.
 
-The generator offers random passwords, passphrases, pronounceable strings, PINs,
+The generator offers random passwords, passphrases (`6` to `24` words drawn from an
+embedded `2,048`-word list, `11` bits per word), pronounceable strings, PINs,
 and hexadecimal strings. Its entropy display is an estimate for the selected
 generation method, not an assessment of an arbitrary password you typed.
 
 Changing a field can retain its previous value in encrypted history. Use the
 History browser to inspect or purge recorded values. “Do not save history” stops
 new capture; do not assume it removes records already stored. Likewise, deleting
-an entry into Trash is not the same as permanently purging it. Old backups and
-exports can retain data after you purge it from the active vault.
+an entry into Trash is not the same as permanently purging it. When you delete
+fields, purge history, or permanently delete an entry so the vault shrinks, Vordr
+automatically overwrites and removes local `.bak1`–`.bak3` files from alongside
+the active vault; separate external backups and exports can still retain earlier
+snapshots.
 
 An entry Vordr cannot show completely - more fields than the detail pane holds, a
 value too long to display, or an attachment it cannot list (possible only for
@@ -115,11 +119,15 @@ differs. An administrator can fix the choice with the `ui_anim` policy value
 (0 follow Windows, 1 always, 2 never). Each entry's tile shows the first letter of its title, unless the
 title names a known service or you picked an icon for it.
 
-## Locking and the clipboard
+## Locking, screen capture, and the clipboard
 
-By default, Vordr clears a copied secret after 20 seconds, locks after 10 minutes
-of system inactivity, and locks when Windows locks. Settings can change these
-values unless administrator policy fixes them.
+By default, Vordr clears a copied secret after 20 seconds, hides its windows from
+ordinary screenshots and screen-sharing (`SetWindowDisplayAffinity`), locks after
+10 minutes of system inactivity, and locks when Windows locks. Settings (or
+administrator policy via `AllowScreenCapture` and timeout rules) can adjust these
+choices. To inspect a separate vault without modifying it, launch
+`vordr.exe --ro <path\to\vault.vordr>` when the vault path is not locked by `HKLM`
+policy.
 
 Clipboard clearing checks the clipboard sequence number, so it does not erase
 something you copied afterward. Vordr also supplies Windows clipboard exclusion
@@ -212,11 +220,15 @@ is not a full-fidelity backup of the original vault.
 | `.vordr` (default) | Another Vordr instance will read the data | Native vault protection; attachments retain their own encryption metadata |
 | AES-encrypted `.zip` | Another compatible tool must read the data | Weaker password derivation; archive structure, sizes, and attachment extensions remain visible |
 
-ZIP exports contain `vordr.json` and attachments in the WinZip AE-2 format.
-Use a tool that explicitly supports AES-encrypted ZIP; ordinary ZIP support is
-not sufficient. Choose a strong export password and protect the resulting file.
-Vordr's ZIP importer supports **STORED (uncompressed)** members, not DEFLATE.
-If assembling a compatible archive elsewhere, select STORE/no compression.
+ZIP exports contain `vordr.json` (including per-attachment `SHA-256` plaintext
+digests) and attachments in the WinZip AE-2 format. Use a tool that explicitly
+supports AES-encrypted ZIP; ordinary ZIP support is not sufficient. Choose a
+strong export password and protect the resulting file. Vordr's ZIP importer
+supports **STORED (uncompressed)** members, not DEFLATE, and fails closed without
+importing partial data if any referenced attachment member is missing, fails AE-2
+authentication, or mismatches its `SHA-256` digest (older Vordr `.zip` exports
+without `"sha256"` fields remain supported). If assembling a compatible archive
+elsewhere, select STORE/no compression.
 
 Export refuses to write over the vault you have open, however its path is
 spelled. Import recognizes file contents rather than trusting the extension, and

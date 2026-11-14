@@ -53,8 +53,12 @@ WSTR tpm_prov, <Microsoft Platform Crypto Provider>
 WSTR tpm_alg,  <RSA>
 WSTR tpm_sha,  <SHA256>
 WSTR tpm_lenprop, <Length>              ; NCRYPT_LENGTH_PROPERTY
+WSTR key_usage_prop, <Key Usage>        ; NCRYPT_KEY_USAGE_PROPERTY
+WSTR export_pol_prop, <Export Policy>   ; NCRYPT_EXPORT_POLICY_PROPERTY
 WSTR hwnd_prop,   <HWND Handle>         ; NCRYPT_HWND_PROPERTY
-tpm_keylen  dd 2048                     ; force RSA-2048 (never the provider default)
+tpm_keylen   dd 2048                    ; force RSA-2048 (never the provider default)
+tpm_keyusage dd 1                       ; NCRYPT_ALLOW_DECRYPT_FLAG (decryption ONLY)
+tpm_exppol   dd 0                       ; non-exportable
 ; C4: UI policy stamped on the key when g_tpm_reqhello is set (opt-in).
 WSTR ui_policy_prop, <UI Policy>        ; NCRYPT_UI_POLICY_PROPERTY
 WSTR ui_friendly,    <Vordr>
@@ -73,21 +77,16 @@ g_tpm_prov  dq ?                ; NCRYPT_PROV_HANDLE
 g_tpm_key   dq ?                ; NCRYPT_KEY_HANDLE
 g_tpm_cbres dd ?                ; bytes produced by encrypt/decrypt
 align 8
-public g_tpm_oaep, g_tpm_label
+public g_tpm_oaep, g_tpm_label, g_tpm_sha_ctx
 g_tpm_oaep    db 24 dup (?)     ; BCRYPT_OAEP_PADDING_INFO
 g_tpm_label   db 32 dup (?)     ; SHA-256("Vordr-TPM-v2" || vault_salt || reqhello)
 g_tpm_sha_ctx db 128 dup (?)    ; SHA256_CTX scratch (108 bytes used)
 
 .code
 
-; tpm_build_oaep(ecx = use_v2) - fill g_tpm_oaep.
-;   use_v2 != 0: pbLabel = SHA-256("Vordr-TPM-v2" || g_hdr[VH_SALT..+32] || LE32(reqhello!=0))
-;   use_v2 == 0: legacy empty OAEP label { pszAlgId="SHA256", 0, 0 } (silent-only compat)
-public tpm_build_oaep
-tpm_build_oaep proc frame
+; tpm_compute_label() - compute g_tpm_label = SHA-256("Vordr-TPM-v2" || salt || LE32(reqhello!=0)).
+tpm_compute_label proc frame
     FRAME_PROLOG 48
-    test    ecx, ecx
-    jz      tbo_legacy
     lea     rcx, [g_tpm_sha_ctx]
     call    sha256_init
     lea     rcx, [g_tpm_sha_ctx]
@@ -109,6 +108,19 @@ tpm_build_oaep proc frame
     lea     rcx, [g_tpm_sha_ctx]
     lea     rdx, [g_tpm_label]
     call    sha256_final
+    FRAME_EPILOG
+    ret
+tpm_compute_label endp
+
+; tpm_build_oaep(ecx = use_v2) - fill g_tpm_oaep.
+;   use_v2 != 0: pbLabel = SHA-256("Vordr-TPM-v2" || g_hdr[VH_SALT..+32] || LE32(reqhello!=0))
+;   use_v2 == 0: empty OAEP label { pszAlgId="SHA256", 0, 0 } (PCPKSP wire format)
+public tpm_build_oaep
+tpm_build_oaep proc frame
+    FRAME_PROLOG 32
+    test    ecx, ecx
+    jz      tbo_legacy
+    call    tpm_compute_label
     lea     rax, [tpm_sha]
     mov     qword ptr [g_tpm_oaep], rax
     lea     rax, [g_tpm_label]
@@ -153,10 +165,12 @@ tpm_available proc frame
     test    eax, eax
     jnz     ta_no
     WINCALL NCryptFreeObject, qword ptr [g_tpm_prov]
+    mov     qword ptr [g_tpm_prov], 0
     mov     eax, 1
     FRAME_EPILOG
     ret
 ta_no:
+    mov     qword ptr [g_tpm_prov], 0
     xor     eax, eax
     FRAME_EPILOG
     ret
@@ -189,11 +203,25 @@ tpm_seal proc frame
             addr tpm_alg, qword ptr [rbp-24], 0, NCRYPT_OVERWRITE_KEY_FLAG
     test    eax, eax
     jnz     ts_freeprov
-    ; Enforce RSA-2048 modulus size (fail closed if provider rejects Length)
+    ; Enforce RSA-2048 modulus size, decryption-only Key Usage, and non-exportable policy
     WINCALL NCryptSetProperty, qword ptr [g_tpm_key], addr tpm_lenprop, \
             addr tpm_keylen, 4, 0
     test    eax, eax
-    jnz     ts_freekey
+    jnz     ts_delkey
+    WINCALL NCryptSetProperty, qword ptr [g_tpm_key], addr key_usage_prop, \
+            addr tpm_keyusage, 4, 0
+    test    eax, eax
+    jz      ts_chk_exp
+    cmp     eax, 80090029h              ; NTE_NOT_SUPPORTED on fixed-usage PCP providers
+    jne     ts_delkey
+ts_chk_exp:
+    WINCALL NCryptSetProperty, qword ptr [g_tpm_key], addr export_pol_prop, \
+            addr tpm_exppol, 4, 0
+    test    eax, eax
+    jz      ts_pol_ok
+    cmp     eax, 80090029h              ; NTE_NOT_SUPPORTED when TPM hardware fixes export=0
+    jne     ts_delkey
+ts_pol_ok:
     mov     dword ptr [rbp-56], NCRYPT_SILENT_FLAG
     mov     dword ptr [rbp-64], NCRYPT_OAEP_SILENT
     cmp     dword ptr [g_tpm_reqhello], 0
@@ -205,21 +233,16 @@ tpm_seal proc frame
     WINCALL NCryptSetProperty, qword ptr [g_tpm_key], addr ui_policy_prop, \
             addr g_ui_policy, 32, 0
     test    eax, eax
-    jnz     ts_freekey
+    jnz     ts_delkey
     mov     dword ptr [rbp-56], 0
     mov     dword ptr [rbp-64], NCRYPT_PAD_OAEP
 ts_finalize:
     WINCALL NCryptFinalizeKey, qword ptr [g_tpm_key], dword ptr [rbp-56]
     test    eax, eax
-    jnz     ts_freekey
+    jnz     ts_delkey
     ; Bind key32 to vault_salt + reqhello inside a 64-byte OAEP payload:
     ;   pt64 = key32 || SHA-256(key32 || g_tpm_label)
-    ; Windows PCPKSP.dll silently ignores BCRYPT_OAEP_PADDING_INFO.pbLabel on
-    ; TPM 2.0 RSA keys, so binding inside the encrypted OAEP block guarantees
-    ; cross-vault / policy-downgrade rejection on every provider while keeping
-    ; the 256-byte RSA-2048 ciphertext size unchanged.
-    mov     ecx, 1
-    call    tpm_build_oaep
+    call    tpm_compute_label
     xor     ecx, ecx
     call    tpm_build_oaep
     mov     r10, qword ptr [rbp-32]
@@ -259,22 +282,33 @@ ts_cpk:
     mov     edx, 32
     call    secure_zero
     cmp     dword ptr [rbp-52], 0
-    jne     ts_freekey
+    jne     ts_delkey
     mov     eax, dword ptr [g_tpm_cbres]
     test    eax, eax
-    jz      ts_freekey
+    jz      ts_delkey
     cmp     eax, dword ptr [rbp-48]
-    ja      ts_freekey
+    ja      ts_delkey
     WINCALL NCryptFreeObject, qword ptr [g_tpm_key]
+    mov     qword ptr [g_tpm_key], 0
     WINCALL NCryptFreeObject, qword ptr [g_tpm_prov]
+    mov     qword ptr [g_tpm_prov], 0
     mov     eax, dword ptr [g_tpm_cbres]
     FRAME_EPILOG
     ret
-ts_freekey:
+ts_delkey:
+    ; Clean up any half-created or unusable persisted key on error; NCryptDeleteKey
+    ; frees hKey ONLY when it returns ERROR_SUCCESS (0).
+    WINCALL NCryptDeleteKey, qword ptr [g_tpm_key], NCRYPT_SILENT_FLAG
+    test    eax, eax
+    jz      ts_keygone
     WINCALL NCryptFreeObject, qword ptr [g_tpm_key]
+ts_keygone:
+    mov     qword ptr [g_tpm_key], 0
 ts_freeprov:
     WINCALL NCryptFreeObject, qword ptr [g_tpm_prov]
+    mov     qword ptr [g_tpm_prov], 0
 ts_fail:
+    mov     qword ptr [g_tpm_prov], 0
     xor     eax, eax
     FRAME_EPILOG
     ret
@@ -283,7 +317,7 @@ tpm_seal endp
 ; ===========================================================================
 ; tpm_unseal(rcx=keyname, rdx=blob, r8d=bloblen, r9=out32) -> eax = 1 / 0.
 ;   Decrypts the wrapped blob with the TPM key back into the 32-byte buffer.
-;   Verifies the v2 64-byte context-binding tag in constant time, and wipes
+;   Requires a 64-byte v2 context-bound payload unconditionally and wipes
 ;   scratch + out32 on ANY failure path so partial output never lingers.
 ; ===========================================================================
 public tpm_unseal
@@ -323,8 +357,7 @@ tu_flags:
     mov     rcx, qword ptr [g_tpm_key]
     call    tpm_attach_hwnd
 tu_dec:
-    mov     ecx, 1
-    call    tpm_build_oaep
+    call    tpm_compute_label
     xor     ecx, ecx
     call    tpm_build_oaep
     lea     r10, [rbp-128]
@@ -333,15 +366,9 @@ tu_dec:
             addr g_tpm_cbres, dword ptr [rbp-64]
     test    eax, eax
     jnz     tu_freekey
+    ; Require the 64-byte v2 context-bound payload unconditionally (no unbound 32-byte fallback).
     cmp     dword ptr [g_tpm_cbres], 64
-    je      tu_v2_chk
-    ; Legacy pre-v2 32-byte blob: accepted ONLY when silent unlock (reqhello == 0).
-    cmp     dword ptr [g_tpm_cbres], 32
     jne     tu_freekey
-    cmp     dword ptr [g_tpm_reqhello], 0
-    jne     tu_freekey
-    jmp     tu_emit
-tu_v2_chk:
     lea     rcx, [g_tpm_sha_ctx]
     call    sha256_init
     lea     rcx, [g_tpm_sha_ctx]
@@ -361,7 +388,6 @@ tu_v2_chk:
     call    ct_memcmp
     test    eax, eax
     jnz     tu_freekey
-tu_emit:
     mov     r11, qword ptr [rbp-48]
     test    r11, r11
     jz      tu_freekey
@@ -383,15 +409,20 @@ tu_cpout:
     mov     edx, 32
     call    secure_zero
     WINCALL NCryptFreeObject, qword ptr [g_tpm_key]
+    mov     qword ptr [g_tpm_key], 0
     WINCALL NCryptFreeObject, qword ptr [g_tpm_prov]
+    mov     qword ptr [g_tpm_prov], 0
     mov     eax, 1
     FRAME_EPILOG
     ret
 tu_freekey:
     WINCALL NCryptFreeObject, qword ptr [g_tpm_key]
+    mov     qword ptr [g_tpm_key], 0
 tu_freeprov:
     WINCALL NCryptFreeObject, qword ptr [g_tpm_prov]
+    mov     qword ptr [g_tpm_prov], 0
 tu_fail:
+    mov     qword ptr [g_tpm_prov], 0
     lea     rcx, [rbp-160]
     mov     edx, 96
     call    secure_zero
@@ -436,15 +467,28 @@ tpm_delete proc frame
     je      @F
     mov     rcx, qword ptr [g_tpm_key]
     call    tpm_attach_hwnd
-@@: ; NCryptDeleteKey frees the key handle as well
+@@: ; NCryptDeleteKey frees the key handle ONLY on ERROR_SUCCESS (0); on failure
+    ; we must explicitly NCryptFreeObject(g_tpm_key) and return 0!
     WINCALL NCryptDeleteKey, qword ptr [g_tpm_key], dword ptr [rbp-32]
+    mov     dword ptr [rbp-40], eax
+    test    eax, eax
+    jz      td_deleted
+    WINCALL NCryptFreeObject, qword ptr [g_tpm_key]
+td_deleted:
+    mov     qword ptr [g_tpm_key], 0
     WINCALL NCryptFreeObject, qword ptr [g_tpm_prov]
-    mov     eax, 1
+    mov     qword ptr [g_tpm_prov], 0
+    xor     eax, eax
+    cmp     dword ptr [rbp-40], 0
+    sete    al
     FRAME_EPILOG
     ret
 td_freeprov:
+    mov     qword ptr [g_tpm_key], 0
     WINCALL NCryptFreeObject, qword ptr [g_tpm_prov]
+    mov     qword ptr [g_tpm_prov], 0
 td_fail:
+    mov     qword ptr [g_tpm_prov], 0
     xor     eax, eax
     FRAME_EPILOG
     ret

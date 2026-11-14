@@ -93,6 +93,11 @@ function CommonChecks($r) {
 }
 
 Write-Host ("policy values   : {0}" -f $polRows.Count)
+if ($polRows.Count -ne 16) { Bad "expected 16 policy Registry rows, found $($polRows.Count)" }
+$polNames = @($polRows | ForEach-Object { $_[3] })
+foreach ($reqPol in @("AllowUncVault", "AllowScreenCapture")) {
+    if ($polNames -notcontains $reqPol) { Bad "policy row '$reqPol' is missing from Registry table" }
+}
 foreach ($r in $polRows) {
     Write-Host ("  HKLM\{0}\{1} = {2}   [{3}]" -f $r[2], $r[3], $r[4], $r[5])
     $c = CommonChecks $r
@@ -276,6 +281,9 @@ if ($secure -notcontains "NEWERVERSIONDETECTED") {
 $lcConds = @($lcRows | ForEach-Object { $_[0] })
 if ($lcConds -notcontains "NOT NEWERVERSIONDETECTED") {
     Bad "LaunchCondition lacks 'NOT NEWERVERSIONDETECTED' - NEWERVERSIONDETECTED is detected and then ignored"
+}
+if ($lcRows.Count -lt 17) {
+    Bad "LaunchCondition has $($lcRows.Count) row(s); expected NOT NEWERVERSIONDETECTED + 16 numeric-property guards"
 }
 if (($seqMap.ContainsKey("FindRelatedProducts")) -and ($seqMap.ContainsKey("LaunchConditions"))) {
     if ($seqMap["FindRelatedProducts"] -ge $seqMap["LaunchConditions"]) {

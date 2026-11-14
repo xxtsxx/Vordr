@@ -19,6 +19,7 @@ include macros.inc
 extern aes_expand_key:proc
 extern aes_ctr_xor:proc
 extern hmac_sha1:proc
+extern sha256_hash:proc
 extern rng_fill:proc
 extern mem_alloc:proc
 extern print_a:proc
@@ -222,8 +223,14 @@ ze_free proc frame
     lea     r10, [g_zbuf]
     mov     qword ptr [r10], 0
 zf_done:
+    mov     qword ptr [g_ze_pw], 0
+    mov     dword ptr [g_ze_pwlen], 0
+    mov     dword ptr [g_ze_inplace], 0
     lea     rcx, [g_ae_dk]                       ; wipe key material
     mov     edx, 80
+    call    secure_zero
+    lea     rcx, [g_ze_salt]
+    mov     edx, 16
     call    secure_zero
     lea     rcx, [g_ze_rk]
     mov     edx, 15*16
@@ -236,6 +243,15 @@ zf_done:
     call    secure_zero
     lea     rcx, [g_zj_fld]
     mov     edx, 40
+    call    secure_zero
+    lea     rcx, [g_zj_fn]
+    mov     edx, 512
+    call    secure_zero
+    lea     rcx, [g_zj_sha]
+    mov     edx, 32
+    call    secure_zero
+    lea     rcx, [g_zj_shahex]
+    mov     edx, 64
     call    secure_zero
     FRAME_EPILOG
     ret
@@ -276,37 +292,33 @@ ze_aextra endp
 ; =============================================================================
 public ze_add_file
 ze_add_file proc frame
-    FRAME_PROLOG 128                            ; keep locals (to rbp-80) above the
-                                                ; callee shadow region
-    ; CAPACITY GUARD (must be first - before any write): the central-directory
-    ; array g_ze_cd holds only ZE_MAXFILE records, but nothing else bounds g_ze_cn.
-    ; A vault with >= ZE_MAXFILE attachment fields would drive the record write at
-    ; [g_ze_cd + g_ze_cn*24] straight past the array into adjacent key-material
-    ; globals (g_ae_dk / g_ze_rk) - an OOB write of attacker-influenced bytes.
-    ; Fail the export closed instead; the caller aborts on g_xl_err.
+    FRAME_PROLOG 144                            ; keep locals (to rbp-88) above the
+                                                ; 5-arg WINCALL spill region
+    ; Consume one-shot in-place encryption flag first so early exits never leave it set.
+    mov     eax, dword ptr [g_ze_inplace]
+    mov     dword ptr [g_ze_inplace], 0
+    mov     dword ptr [rbp-88], eax
+    ; CAPACITY GUARD (must precede any write): g_ze_cd holds only ZE_MAXFILE records.
     cmp     dword ptr [g_ze_cn], ZE_MAXFILE
-    jb      zaf_room
-    mov     byte ptr [g_xl_err], 1
-    mov     eax, 1
-    FRAME_EPILOG
-    ret
-zaf_room:
+    jae     zaf_fail
+    cmp     qword ptr [g_ze_pw], 0              ; refuse empty/missing password
+    je      zaf_fail
+    cmp     dword ptr [g_ze_pwlen], 0
+    je      zaf_fail
+    mov     eax, ZE_MAXCAP - 64                 ; guard 32-bit usize + 28 csize against wrap
+    cmp     r9, rax
+    ja      zaf_fail
     mov     qword ptr [rbp-24], rcx             ; name
     mov     dword ptr [rbp-32], edx             ; namelen
     mov     qword ptr [rbp-40], r8              ; data
     mov     qword ptr [rbp-48], r9              ; datalen
-    ; ---- copy the name into the persistent pool: the central-dir nameptr must
-    ; stay valid until ze_finish, but callers reuse one name buffer across files
-    ; (e.g. g_zj_fn per attachment), so a stored pointer would alias the last name.
+    ; ---- copy the name into the persistent pool (fail closed if exhausted) ----
     mov     eax, dword ptr [rbp-32]             ; namelen
     mov     r10d, dword ptr [g_ze_np]           ; pool cursor
     mov     r11d, ZE_NAMEPOOL
     sub     r11d, r10d                          ; remaining
     cmp     eax, r11d
-    jbe     zaf_ncap
-    mov     eax, r11d                           ; clamp (pathological only)
-    mov     dword ptr [rbp-32], eax
-zaf_ncap:
+    ja      zaf_fail
     lea     r11, [g_ze_names]
     add     r11, r10                            ; dst slot
     mov     rcx, qword ptr [rbp-24]             ; src name
@@ -321,9 +333,12 @@ zaf_ncp:
 zaf_ncpd:
     mov     qword ptr [rbp-24], r11             ; name -> pooled copy
     add     dword ptr [g_ze_np], eax            ; advance cursor
-    ; record cd offset
+    ; record cd offset (must fit in ZIP32)
     lea     r10, [g_zbuf]
     mov     rax, qword ptr [r10+8]
+    mov     ecx, ZE_MAXCAP
+    cmp     rax, rcx
+    jae     zaf_fail
     mov     dword ptr [rbp-56], eax             ; local-header offset
     ; csize = 16 + 2 + datalen + 10
     mov     eax, dword ptr [rbp-48]
@@ -346,22 +361,13 @@ zaf_ncpd:
     mov     r8d, dword ptr [rbp-32]
     call    buf_putn
     call    ze_aextra
-    ; ---- salt ----
-    ; MUST fail closed.  ze_add_file runs once per member, so if the CSPRNG fails and we
-    ; carry on, g_ze_salt still holds the PREVIOUS member's salt (or zeros on the first).
-    ; PBKDF2 then derives the same key and the same verifier, and AES-CTR starts from the
-    ; same counter - key-stream reuse across files, i.e. two plaintexts XORed together for
-    ; anyone holding the archive.  Silently, and only when the RNG is already failing.
+    ; ---- salt (MUST fail closed to prevent keystream reuse) ----
     lea     rcx, [g_ze_salt]
     mov     edx, 16
     call    rng_fill
     test    eax, eax
-    jnz     @F
-    mov     byte ptr [g_xl_err], 1              ; the caller aborts the whole export
-    mov     eax, 1
-    FRAME_EPILOG                                ; framed proc - a bare ret here would skip
-    ret                                         ;   the epilog and unbalance the stack
-@@: lea     rcx, [g_zbuf]
+    jz      zaf_fail
+    lea     rcx, [g_zbuf]
     lea     rdx, [g_ze_salt]
     mov     r8, 16
     call    buf_putn
@@ -376,7 +382,33 @@ zaf_ncpd:
     lea     rdx, [g_ae_dk+64]
     mov     r8, 2
     call    buf_putn
-    ; ---- ciphertext: append plaintext, encrypt in place ----
+    cmp     byte ptr [g_xl_err], 0
+    jne     zaf_fail_wipe
+    ; expand AES-256 key (dk[0..32]) + zero counter
+    lea     rcx, [g_ae_dk]
+    mov     rdx, 32
+    lea     r8, [g_ze_rk]
+    call    aes_expand_key
+    mov     dword ptr [g_ze_nr], eax
+    lea     rcx, [g_ze_ctr]
+    xor     eax, eax
+    mov     qword ptr [rcx], rax
+    mov     qword ptr [rcx+8], rax
+    ; When g_ze_inplace != 0, caller passed an owned VirtualLock'd secmem buffer:
+    ; encrypt in place BEFORE copying into pageable g_zbuf so plaintext never enters g_zbuf.
+    cmp     dword ptr [rbp-88], 0
+    je      zaf_copy_then_enc
+    WINCALL aes_ctr_xor, addr g_ze_rk, qword ptr [rbp-40], qword ptr [rbp-48], \
+            addr g_ze_ctr, dword ptr [g_ze_nr]
+    WINCALL hmac_sha1, addr g_ae_dk+32, 32, qword ptr [rbp-40], qword ptr [rbp-48], addr g_ze_auth
+    lea     rcx, [g_zbuf]
+    mov     rdx, qword ptr [rbp-40]
+    mov     r8, qword ptr [rbp-48]
+    call    buf_putn
+    cmp     byte ptr [g_xl_err], 0
+    jne     zaf_fail_wipe
+    jmp     zaf_put_mac
+zaf_copy_then_enc:
     lea     r10, [g_zbuf]
     mov     rax, qword ptr [r10+8]
     mov     qword ptr [rbp-72], rax             ; cipher start offset
@@ -384,41 +416,40 @@ zaf_ncpd:
     mov     rdx, qword ptr [rbp-40]
     mov     r8, qword ptr [rbp-48]
     call    buf_putn
-    ; The encryption below runs IN PLACE over [cipher start, +datalen).  If that
-    ; append did not happen - the archive could not grow - the range is not ours:
-    ; this used to XOR keystream straight past the end of the buffer.  Check it
-    ; landed, byte count and all, before touching it.
     cmp     byte ptr [g_xl_err], 0
-    jne     zaf_fail
+    jne     zaf_fail_wipe
     lea     r10, [g_zbuf]
     mov     rax, qword ptr [r10+8]
     sub     rax, qword ptr [rbp-72]
     cmp     rax, qword ptr [rbp-48]
-    jne     zaf_fail
-    ; expand AES-256 key (dk[0..32])
-    lea     rcx, [g_ae_dk]
-    mov     rdx, 32
-    lea     r8, [g_ze_rk]
-    call    aes_expand_key
-    mov     dword ptr [g_ze_nr], eax
-    ; counter := 0
-    lea     rcx, [g_ze_ctr]
-    xor     eax, eax
-    mov     qword ptr [rcx], rax
-    mov     qword ptr [rcx+8], rax
-    ; encrypt in place over [zbuf.ptr + cipher-start, datalen)
+    jne     zaf_fail_wipe
     lea     r10, [g_zbuf]
     mov     r11, qword ptr [r10]
     add     r11, qword ptr [rbp-72]
     mov     qword ptr [rbp-80], r11             ; cipher ptr
     WINCALL aes_ctr_xor, addr g_ze_rk, qword ptr [rbp-80], qword ptr [rbp-48], \
             addr g_ze_ctr, dword ptr [g_ze_nr]
-    ; ---- auth = HMAC-SHA1(authkey dk[32..64], ciphertext)[:10] ----
     WINCALL hmac_sha1, addr g_ae_dk+32, 32, qword ptr [rbp-80], qword ptr [rbp-48], addr g_ze_auth
+zaf_put_mac:
     lea     rcx, [g_zbuf]
     lea     rdx, [g_ze_auth]
     mov     r8, 10
     call    buf_putn
+    cmp     byte ptr [g_xl_err], 0
+    jne     zaf_fail_wipe
+    ; Scrub per-file derived key material immediately.
+    lea     rcx, [g_ae_dk]
+    mov     edx, 80
+    call    secure_zero
+    lea     rcx, [g_ze_rk]
+    mov     edx, 15*16
+    call    secure_zero
+    lea     rcx, [g_ze_ctr]
+    mov     edx, 16
+    call    secure_zero
+    lea     rcx, [g_ze_auth]
+    mov     edx, 20
+    call    secure_zero
     ; ---- record central-dir entry ----
     mov     eax, dword ptr [g_ze_cn]
     imul    eax, eax, 24
@@ -438,6 +469,19 @@ zaf_ncpd:
     xor     eax, eax                             ; ok
     FRAME_EPILOG
     ret
+zaf_fail_wipe:
+    lea     rcx, [g_ae_dk]
+    mov     edx, 80
+    call    secure_zero
+    lea     rcx, [g_ze_rk]
+    mov     edx, 15*16
+    call    secure_zero
+    lea     rcx, [g_ze_ctr]
+    mov     edx, 16
+    call    secure_zero
+    lea     rcx, [g_ze_auth]
+    mov     edx, 20
+    call    secure_zero
 zaf_fail:
     mov     byte ptr [g_xl_err], 1
     mov     eax, 1
@@ -516,6 +560,7 @@ zj_ftype  db '{"type":',0
 zj_flabel db ',"label":',0
 zj_fvalue db ',"value":',0
 zj_fname  db ',"name":',0        ; attachment only: the real filename (member is opaque)
+zj_fsha   db ',"sha256":',0      ; attachment only: SHA-256(plaintext) binding member to json
 zj_jsonname db "vordr.json"
 zj_defname  db "attachment.bin"
 hexdig    db "0123456789abcdef"
@@ -527,12 +572,15 @@ g_json      dq 4 dup (?)             ; {ptr,len,cap,grow=0} - secmem, fixed capa
 ; WideCharToMultiByte reports that by returning 0, the password became EMPTY.
 ZE_PWCAP    equ 1024
 ZE_EXT_MAX  equ 12                   ; max ".ext" kept in a ZIP member name (dot + 11)
-public g_ze_u8pw, g_ze_rk                 ; pinned + crash-wiped by secmem.asm
+public g_ze_u8pw, g_ze_rk, g_zj_fld, g_zj_fn ; pinned + crash-wiped by secmem.asm
 g_ze_u8pw   db ZE_PWCAP dup (?)      ; wide->UTF-8 export password scratch
 g_zj_fld    db 40 dup (?)            ; vault_field_get out struct
 g_zj_fn     db 512 dup (?)           ; attachment filename (UTF-8)
 g_zj_fnlen  dd ?                     ; its length - ze_build_json writes it into the
                                      ;   encrypted json, since the member name is opaque
+g_ze_inplace dd ?                    ; one-shot: encrypt caller's secmem buffer in place
+g_zj_sha    db 32 dup (?)            ; per-attachment SHA-256(plaintext)
+g_zj_shahex db 64 dup (?)            ; lowercase hex encoding of g_zj_sha
 g_zj_path   db 768 dup (?)           ; "<title-folder>/<filename>" zip path
 
 .code
@@ -649,7 +697,7 @@ ze_json_free endp
 
 ; ze_build_json() -> eax 0/err.  Builds g_json = [{"title":..,"fields":[..]},..].
 ze_build_json proc frame
-    FRAME_PROLOG 96
+    FRAME_PROLOG 128
     mov     rcx, JSON_CAP                       ; every exported value in clear: lock it
     call    secmem_alloc
     test    rax, rax
@@ -762,6 +810,37 @@ zbj_ffirst:
     call    json_str
     jmp     zbj_valdone
 zbj_attval:
+    cmp     qword ptr [g_zj_fld+32], 68         ; must hold at least a 68-byte AttachRef
+    jb      zbj_err
+    mov     rcx, qword ptr [g_zj_fld+24]        ; open attachment to bind SHA-256(plaintext)
+    lea     rdx, [rbp-72]                       ; &ptlen
+    call    attach_open
+    test    rax, rax
+    jz      zbj_err                             ; unreadable/tampered attachment -> fail closed
+    mov     qword ptr [rbp-64], rax             ; pt_ptr
+    mov     rcx, rax
+    mov     rdx, qword ptr [rbp-72]
+    lea     r8, [g_zj_sha]
+    call    sha256_hash
+    mov     rcx, qword ptr [rbp-64]
+    mov     rdx, qword ptr [rbp-72]
+    call    attach_free
+    lea     r10, [g_zj_sha]                     ; hex-encode 32-byte digest -> g_zj_shahex
+    lea     r11, [g_zj_shahex]
+    lea     r9, [hexdig]
+    xor     ecx, ecx
+zbj_shex:
+    movzx   eax, byte ptr [r10+rcx]
+    mov     edx, eax
+    shr     eax, 4
+    and     edx, 0Fh
+    mov     al, byte ptr [r9+rax]
+    mov     dl, byte ptr [r9+rdx]
+    mov     byte ptr [r11+rcx*2], al
+    mov     byte ptr [r11+rcx*2+1], dl
+    inc     ecx
+    cmp     ecx, 32
+    jb      zbj_shex
     mov     ecx, dword ptr [rbp-28]             ; entry
     mov     rdx, qword ptr [g_zj_fld+24]        ; value ptr
     mov     r8d, dword ptr [g_zj_fld+32]        ; value len
@@ -770,13 +849,26 @@ zbj_attval:
     lea     rdx, [g_zj_path]
     mov     r8d, eax
     call    json_str
-    lea     rcx, [g_json]                       ; ,"name":"<real filename>" - the member
-    lea     rdx, [zj_fname]                     ;   name is opaque, so the only copy of
-    call    buf_putcstr                         ;   the real name is here, inside the
-    lea     rcx, [g_json]                       ;   encrypted data file
+    lea     rcx, [g_json]                       ; ,"name":"<real filename>"
+    lea     rdx, [zj_fname]
+    call    buf_putcstr
+    lea     rcx, [g_json]
     lea     rdx, [g_zj_fn]
     mov     r8d, dword ptr [g_zj_fnlen]
     call    json_str
+    lea     rcx, [g_json]                       ; ,"sha256":"<64-hex>"
+    lea     rdx, [zj_fsha]
+    call    buf_putcstr
+    lea     rcx, [g_json]
+    lea     rdx, [g_zj_shahex]
+    mov     r8d, 64
+    call    json_str
+    lea     rcx, [g_zj_sha]
+    mov     edx, 32
+    call    secure_zero
+    lea     rcx, [g_zj_shahex]
+    mov     edx, 64
+    call    secure_zero
 zbj_valdone:
     lea     rcx, [g_json]
     mov     dl, '}'
@@ -864,7 +956,7 @@ azp_fnlen:
     test    r9d, r9d
     jz      azp_def                              ; empty filename -> default
     mov     dword ptr [rbp-64], r9d              ; cch (stops at NUL, never past navail)
-    WINCALL WideCharToMultiByte, CP_UTF8_, 0, qword ptr [rbp-72], dword ptr [rbp-64], addr g_zj_fn, 500, 0, 0
+    WINCALL WideCharToMultiByte, CP_UTF8_, 80h, qword ptr [rbp-72], dword ptr [rbp-64], addr g_zj_fn, 500, 0, 0
     cmp     eax, 0
     jg      azp_havefn                           ; eax = UTF-8 byte length (no NUL emitted)
 azp_def:
@@ -1086,28 +1178,36 @@ zea_att:
     mov     r11, qword ptr [g_zj_fld+24]        ; value ptr
     mov     qword ptr [rbp-64], r11
     mov     eax, dword ptr [g_zj_fld+32]        ; value len
+    cmp     eax, 68
+    jb      zea_att_fail
     mov     dword ptr [rbp-96], eax
     mov     rcx, r11                             ; AttachRef = value + 0
     lea     rdx, [rbp-72]                        ; &outlen
     call    attach_open
     test    rax, rax
-    jz      zea_fnext
-    mov     qword ptr [rbp-80], rax             ; plaintext ptr
-    mov     ecx, dword ptr [rbp-44]             ; build "<title>/<filename>"
+    jz      zea_att_fail
+    mov     qword ptr [rbp-80], rax             ; plaintext ptr (VirtualLock'd secmem)
+    mov     ecx, dword ptr [rbp-44]             ; build "<entry>/<id>"
     mov     rdx, qword ptr [rbp-64]
     mov     r8d, dword ptr [rbp-96]
     call    ze_att_zippath                      ; eax = pathlen (path in g_zj_path)
+    mov     dword ptr [g_ze_inplace], 1         ; encrypt secmem buffer in place before g_zbuf copy
     lea     rcx, [g_zj_path]
     mov     edx, eax
     mov     r8, qword ptr [rbp-80]
     mov     r9, qword ptr [rbp-72]
     call    ze_add_file
-    mov     rcx, qword ptr [rbp-80]             ; wipe + release secmem attachment plaintext
+    mov     rcx, qword ptr [rbp-80]             ; wipe + release secmem buffer
     mov     rdx, qword ptr [rbp-72]
     call    attach_free
+    cmp     byte ptr [g_xl_err], 0
+    jne     zea_fin
 zea_fnext:
     inc     dword ptr [rbp-52]
     jmp     zea_flp
+zea_att_fail:
+    mov     byte ptr [g_xl_err], 1
+    jmp     zea_fin
 zea_enext:
     inc     dword ptr [rbp-44]
     jmp     zea_elp
@@ -1134,14 +1234,13 @@ ze_compose proc frame
     mov     dword ptr [rbp-32], edx             ; pw bytes
     mov     eax, dword ptr [rbp-32]
     shr     eax, 1                              ; wide chars
+    test    eax, eax                            ; refuse empty export password outright
+    jz      comp_err
     mov     r9d, eax                            ; stage cchWideChar in r9d (WINCALL rax footgun)
-    WINCALL WideCharToMultiByte, CP_UTF8_, 0, qword ptr [rbp-24], r9d, addr g_ze_u8pw, ZE_PWCAP, 0, 0
+    WINCALL WideCharToMultiByte, CP_UTF8_, 80h, qword ptr [rbp-24], r9d, addr g_ze_u8pw, ZE_PWCAP, 0, 0
     mov     dword ptr [rbp-44], eax             ; UTF-8 length
-    test    eax, eax                            ; 0 = it did not fit (or a bad string).
-    jnz     comp_pwok                           ;   Refuse: deriving from a zero-length
-    cmp     dword ptr [rbp-32], 0               ;   password would encrypt every exported
-    jne     comp_err                            ;   secret under PBKDF2("", salt).
-comp_pwok:
+    test    eax, eax                            ; 0 = did not fit or invalid UTF-16 surrogates
+    jz      comp_err
     call    ze_reset
     test    eax, eax
     jnz     comp_err
@@ -1151,6 +1250,7 @@ comp_pwok:
     call    ze_build_json                       ; all tiles, history excluded
     test    eax, eax
     jnz     comp_ziperr
+    mov     dword ptr [g_ze_inplace], 1         ; encrypt g_json secmem in place before g_zbuf copy
     lea     rcx, [zj_jsonname]
     mov     edx, 10
     lea     r10, [g_json]
@@ -1589,7 +1689,7 @@ WSTR zxs_wpw, <VordrSelZip1>
 LANDING_PAD
 public cmd_zexselkat
 cmd_zexselkat proc frame
-    FRAME_PROLOG 64
+    FRAME_PROLOG 96
     call    do_attgen                           ; Entry 0 (2 attachments), g_field_list still live
     test    eax, eax
     jnz     zxs_fail
@@ -1610,6 +1710,10 @@ cmd_zexselkat proc frame
     jnz     zxs_faillk
     cmp     dword ptr [g_ze_cn], 3
     jne     zxs_failz
+    mov     eax, dword ptr [g_ze_cd+24]         ; LFH offset of attachment #1
+    mov     dword ptr [rbp-40], eax
+    mov     eax, dword ptr [g_ze_cd+48]         ; LFH offset of attachment #2
+    mov     dword ptr [rbp-44], eax
     ; Save copy of the 3-member archive so we can round-trip import it after Case 2
     lea     r10, [g_zbuf]
     mov     rax, qword ptr [r10+8]              ; archive byte len
@@ -1638,29 +1742,119 @@ cmd_zexselkat proc frame
     jne     zxs_failbuf
     call    ze_free
     ; Case 3: wipe attachments + reset vault body to 0 entries, then round-trip import
+    ; Allocate a working copy [rbp-56] because zi_decrypt mutates the buffer in place.
+    mov     rcx, qword ptr [rbp-32]
+    call    mem_alloc
+    test    rax, rax
+    jz      zxs_failbuf
+    mov     qword ptr [rbp-56], rax
+    mov     rcx, rax
+    mov     rdx, qword ptr [rbp-24]
+    mov     r8, qword ptr [rbp-32]
+    call    buf_copy
     call    attach_reset
     mov     rax, qword ptr [g_body_ptr]
     mov     dword ptr [rax], 0
     mov     qword ptr [g_body_len], 4
-    mov     rcx, qword ptr [rbp-24]
+    mov     rcx, qword ptr [rbp-56]
     mov     edx, dword ptr [rbp-32]
     lea     r8, [zxs_wpw]
     mov     r9d, 24
     call    zi_stage
     cmp     eax, 1                              ; exactly 1 entry staged
-    jne     zxs_failbuf
+    jne     zxs_failsc
     lea     r10, [g_sel]
     mov     byte ptr [r10+0], 1
     call    zi_commit
     cmp     eax, 1
-    jne     zxs_failbuf
+    jne     zxs_failsc
     call    vault_count
     cmp     eax, 1
-    jne     zxs_failbuf
+    jne     zxs_failsc
     mov     ecx, 1
     call    zi_att_verify
     cmp     eax, 2                              ; both of Entry 0's attachments survived
-    jne     zxs_failbuf
+    jne     zxs_failsc
+    ; Case 4 (VDR2-01): refresh [rbp-56] from pristine [rbp-24] and swap the two 29-byte
+    ; attachment member names in LFH + CD.  Both AE-2 verifiers and HMACs remain valid, so
+    ; zi_stage succeeds (1), while zi_commit MUST fail closed (-1) on SHA-256(plaintext)
+    ; mismatch and leave vault_count == 1.
+    mov     rcx, qword ptr [rbp-56]
+    mov     rdx, qword ptr [rbp-24]
+    mov     r8, qword ptr [rbp-32]
+    call    buf_copy
+    mov     r10, qword ptr [rbp-56]             ; working archive base
+    mov     eax, dword ptr [rbp-40]
+    lea     r8, [r10+rax+30]                    ; LFH1 name (29 bytes)
+    mov     eax, dword ptr [rbp-44]
+    lea     r9, [r10+rax+30]                    ; LFH2 name (29 bytes)
+    xor     ecx, ecx
+zxs_sw1:
+    mov     al, byte ptr [r8+rcx]
+    mov     dl, byte ptr [r9+rcx]
+    mov     byte ptr [r8+rcx], dl
+    mov     byte ptr [r9+rcx], al
+    inc     ecx
+    cmp     ecx, 29
+    jb      zxs_sw1
+    mov     rax, qword ptr [rbp-32]             ; archive len
+    mov     eax, dword ptr [r10+rax-6]          ; EOCD cd_off
+    lea     r8, [r10+rax+113]                   ; CD1 name (cd_off + 67 + 46)
+    lea     r9, [r10+rax+199]                   ; CD2 name (cd_off + 67 + 86 + 46)
+    xor     ecx, ecx
+zxs_sw2:
+    mov     al, byte ptr [r8+rcx]
+    mov     dl, byte ptr [r9+rcx]
+    mov     byte ptr [r8+rcx], dl
+    mov     byte ptr [r9+rcx], al
+    inc     ecx
+    cmp     ecx, 29
+    jb      zxs_sw2
+    mov     rcx, qword ptr [rbp-56]
+    mov     edx, dword ptr [rbp-32]
+    lea     r8, [zxs_wpw]
+    mov     r9d, 24
+    call    zi_stage
+    cmp     eax, 1
+    jne     zxs_failsc
+    lea     r10, [g_sel]
+    mov     byte ptr [r10+0], 1
+    call    zi_commit
+    cmp     eax, -1                             ; SHA-256 mismatch MUST abort commit
+    jne     zxs_failsc
+    call    vault_count
+    cmp     eax, 1                              ; existing vault untouched
+    jne     zxs_failsc
+    ; Case 5 (VDR2-01): refresh [rbp-56] from pristine [rbp-24] and rename member 1 in
+    ; LFH1 + CD1 so vordr.json's reference is missing.  zi_commit MUST fail closed (-1).
+    mov     rcx, qword ptr [rbp-56]
+    mov     rdx, qword ptr [rbp-24]
+    mov     r8, qword ptr [rbp-32]
+    call    buf_copy
+    mov     r10, qword ptr [rbp-56]
+    mov     eax, dword ptr [rbp-40]
+    xor     byte ptr [r10+rax+30], 1            ; corrupt LFH1 name[0]
+    mov     rax, qword ptr [rbp-32]
+    mov     eax, dword ptr [r10+rax-6]
+    xor     byte ptr [r10+rax+113], 1           ; matching CD1 name[0]
+    mov     rcx, qword ptr [rbp-56]
+    mov     edx, dword ptr [rbp-32]
+    lea     r8, [zxs_wpw]
+    mov     r9d, 24
+    call    zi_stage
+    cmp     eax, 1
+    jne     zxs_failsc
+    lea     r10, [g_sel]
+    mov     byte ptr [r10+0], 1
+    call    zi_commit
+    cmp     eax, -1                             ; missing attachment MUST abort commit
+    jne     zxs_failsc
+    call    vault_count
+    cmp     eax, 1
+    jne     zxs_failsc
+    mov     rcx, qword ptr [rbp-56]
+    mov     rdx, qword ptr [rbp-32]
+    call    mem_free
     mov     rcx, qword ptr [rbp-24]
     mov     rdx, qword ptr [rbp-32]
     call    mem_free
@@ -1671,6 +1865,10 @@ cmd_zexselkat proc frame
     xor     eax, eax
     FRAME_EPILOG
     ret
+zxs_failsc:
+    mov     rcx, qword ptr [rbp-56]
+    mov     rdx, qword ptr [rbp-32]
+    call    mem_free
 zxs_failbuf:
     call    ze_free
     mov     rcx, qword ptr [rbp-24]

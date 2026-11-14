@@ -90,7 +90,7 @@ every registry value has an MSI property or a visible policy-lock indicator.
 
 ## Properties
 
-Fourteen public MSI properties map to DWORD settings. Defaults apply only when
+Sixteen public MSI properties map to DWORD settings. Defaults apply only when
 no valid setting exists; the installer does not write defaults automatically.
 
 | Property | Registry value | Range | Vordr's default | Effect |
@@ -109,17 +109,27 @@ no valid setting exists; the installer does not write defaults automatically.
 | `VORDR_NOPREVIEW` | `NoPreview` | 0/1 | 0 | attachments download only, never previewed via another app |
 | `VORDR_LOGLEVEL` | `LogLevel` | 0–4 | 0 | audit-log verbosity, 0 = off |
 | `VORDR_UISCHEME` | `ui_scheme` | 0–8 | 8 | force a colour scheme (8 is the default) |
+| `VORDR_ALLOWUNCVAULT` | `AllowUncVault` | 0/1 | 0 | `HKLM`-only: allow UNC/SMB paths (`\\server\share\...`) for vaults, imports/exports, and logs |
+| `VORDR_ALLOWSCREENCAPTURE` | `AllowScreenCapture` | 0/1 | 0 | allow screenshots and screen sharing of Vordr windows (disables `SetWindowDisplayAffinity`) |
 
 `ui_anim` (DWORD under `HKLM\SOFTWARE\Vordr`) fixes Settings > Animations: 0
 follows Windows' "Animation effects" switch (the default), 1 always animates, 2
 never does. It has no installer property; set it by Group Policy or registry like
 any other value here, and the setting shows locked.
 
-`VORDR_NOASSOC` is a fifteenth property, not a policy value. Set it to any
+`AllowUncVault` is evaluated **only** from `HKLM\SOFTWARE\Vordr`; user-writable
+`HKCU` values cannot enable UNC/SMB access (`polkat`). When `AllowUncVault` is `0`
+(the default), Vordr blocks `\\server\share\...` and `\\?\UNC\...` paths before
+`CreateFileW` and rejects junctions or mapped drives whose resolved handle path
+(`GetFinalPathNameByHandleW`) points to UNC storage.
+
+`VORDR_NOASSOC` is a seventeenth property, not a policy value. Set it to any
 nonempty value to skip the `.vordr` association; omit it to register the association.
 
-The installer does not validate these numeric ranges. The application clamps
-values when reading them:
+`make_msi.ps1` emits `LaunchCondition` guards that reject non-numeric or out-of-range
+public policy properties at install time (`verify_msi.ps1`), and verifies that
+`bin\vordr.exe` is a normalized release build before packaging. At runtime, Vordr
+also clamps direct registry edits:
 
 | Value | Too high | Too low / zero |
 |---|---|---|
@@ -185,13 +195,17 @@ The `vault` value follows HKLM-over-HKCU precedence. It is intentionally not an
 MSI property: one literal path rarely suits every user.
 
 Use `REG_SZ` for a literal local path, or `REG_EXPAND_SZ` with one of the three trusted
-per-user folder prefixes resolved directly via `SHGetFolderPathW`:
-`%USERPROFILE%\`, `%LOCALAPPDATA%\`, or `%APPDATA%\`. Vordr intentionally never runs
-`ExpandEnvironmentStringsW` on `HKLM` policy values, preventing unprivileged
-`HKCU\Environment` edits from redirecting an administrator-pinned vault path (`polkat`).
-Any unrecognized `%...%` variable or overlong path under `HKLM` fails closed (`*locked = 1`)
-without falling back to `HKCU`. This elevated **PowerShell** example uses single quotes
-to preserve the literal percent signs:
+per-user folder prefixes—`%USERPROFILE%\`, `%LOCALAPPDATA%\`, or `%APPDATA%\`—resolved
+directly from `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\<UserSID>\ProfileImagePath`.
+Vordr never calls `ExpandEnvironmentStringsW` or `SHGetFolderPathW` on `HKLM` policy
+values, preventing unprivileged edits to `HKCU\Environment` or
+`HKCU\...\User Shell Folders` from redirecting an administrator-pinned vault path
+(`polkat`). When `HKLM\SOFTWARE\Vordr\vault` is present, Vordr locks the active vault
+location (`g_vault_lock = 1`), disabling both the GUI vault-file picker and `--ro <path>`
+command-line vault overrides. Any unrecognized `%...%` variable, UNC path (unless
+`HKLM\SOFTWARE\Vordr\AllowUncVault = 1`), or overlong path under `HKLM` fails closed
+(`*locked = 1`) without falling back to `HKCU`. This elevated **PowerShell** example uses
+single quotes to preserve the literal percent signs:
 
 ```powershell
 reg.exe add 'HKLM\SOFTWARE\Vordr' /v vault /t REG_EXPAND_SZ /d '%USERPROFILE%\Documents\Vordr\vault.vordr' /f /reg:64

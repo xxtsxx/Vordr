@@ -157,7 +157,7 @@ VF_KINDMASK         equ 00FFh      ; mask to recover the base kind from a type
 
 ; Password generator styles (pwgen_ex) + options
 PWS_RANDOM          equ 0          ; n random chars from the class mask (opt low nibble)
-PWS_PASSPHRASE      equ 1          ; n words from the embedded list, 8 bits/word
+PWS_PASSPHRASE      equ 1          ; n words from the embedded list, 11 bits/word
 PWS_PRONOUNCE       equ 2          ; n chars, alternating consonant/vowel (readable)
 PWS_PIN             equ 3          ; n decimal digits
 PWS_HEX             equ 4          ; n lowercase hex chars

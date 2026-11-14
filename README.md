@@ -69,7 +69,7 @@ See the [update guide](docs/USER_GUIDE.md#updates) for portable copies and manag
 | **Two-factor codes (2FA)** | Built-in TOTP code generator with a live countdown bar, right alongside your login. |
 | **Private files & images** | Attach sensitive PDFs, recovery codes, photos, or text files directly inside an entry—encrypted inside the same `.vordr` file. |
 | **Strong password generator** | Create random passwords, multi-word passphrases, pronounceable strings, PINs, or hex keys in one click. |
-| **Automatic tidy-up** | Clears copied secrets from the clipboard after 20 seconds, locks automatically when you step away or lock Windows, and can prompt for your master password on an isolated Windows desktop. |
+| **Automatic tidy-up** | Clears copied secrets from the clipboard after 20 seconds, hides Vordr windows from ordinary screenshots and screen-sharing by default, locks automatically when you step away or lock Windows, and can prompt for your master password on an isolated Windows desktop. |
 | **Optional hardware shortcut** | On PCs with a TPM chip, optionally unlock on that device without retyping your master password every time (with a gentle 30-day reminder so your password stays fresh). |
 | **Easy import, export & IT policy** | Share selected entries as a separate `.vordr` file or an encrypted `.zip` archive; organizations can deploy via MSI and lock settings through Windows Registry policy. |
 

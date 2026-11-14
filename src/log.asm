@@ -25,14 +25,17 @@
 include macros.inc
 
 extern CreateFileW:proc
-extern GetFileType:proc
 extern WriteFile:proc
 extern CloseHandle:proc
-extern GetEnvironmentVariableW:proc
+extern OpenProcessToken:proc
+extern GetUserProfileDirectoryW:proc
 extern CreateDirectoryW:proc
 extern GetLocalTime:proc
 extern WideCharToMultiByte:proc
 extern reg_hash_name:proc
+extern path_longify:proc
+extern file_path_allowed:proc
+extern file_validate_handle:proc
 
 externdef g_cfg_loglevel:dword
 externdef g_cfg_logfile:qword
@@ -55,7 +58,7 @@ INVALID              equ -1
 LINELEN              equ 16384        ; one log line, UTF-8 bytes
 
 .const
-WSTR w_localappdata, <LOCALAPPDATA>
+WSTR w_appdatalocal, <\AppData\Local>
 WSTR w_subdir,       <\Vordr>
 WSTR w_logname,      <\vordr.log>
 
@@ -84,6 +87,7 @@ align 16
 g_logline   db LINELEN dup (?)        ; assembled UTF-8 line
 align 2
 g_logpath   dw MAX_PATH_CHARS dup (?)  ; resolved default log path
+g_logio     dw (MAX_PATH_CHARS + 16) dup (?) ; path_longify scratch for log_open
 g_systime   db 16 dup (?)             ; SYSTEMTIME
 g_logwrote  dd ?
 
@@ -205,43 +209,75 @@ log_putw endp
 ; Vordr directory if needed).  Refuses reparse points and non-disk handles.
 ; -----------------------------------------------------------------------------
 log_open proc frame
-    FRAME_PROLOG 128
+    FRAME_PROLOG 144
     ; [rbp-24]=saved cursor  [rbp-32]=path ptr  [rbp-40]=handle
+    ; [rbp-48]=token handle  [rbp-56]=cchProfile
     mov     rax, qword ptr [g_cfg_logfile]
     test    rax, rax
     jz      lo_default
     mov     qword ptr [rbp-32], rax
     jmp     lo_open
 lo_default:
-    WINCALL GetEnvironmentVariableW, addr w_localappdata, addr g_logpath, MAX_PATH_CHARS-64
+    mov     qword ptr [rbp-48], 0
+    WINCALL OpenProcessToken, -1, 8, addr rbp-48    ; GetCurrentProcess()=-1, TOKEN_QUERY=8
     test    eax, eax
     jz      lo_fail
-    cmp     eax, MAX_PATH_CHARS-64      ; value didn't fit (returns required size), or
-    jae     lo_fail                     ; leaves no room for "\Vordr\vordr.log" -> skip
-    mov     ecx, eax                    ; dir length (chars)
+    mov     dword ptr [rbp-56], MAX_PATH_CHARS-64
+    WINCALL GetUserProfileDirectoryW, qword ptr [rbp-48], addr g_logpath, addr rbp-56
+    mov     dword ptr [rbp-60], eax
+    WINCALL CloseHandle, qword ptr [rbp-48]
+    cmp     dword ptr [rbp-60], 0
+    je      lo_fail
+    ; Measure profile length safely inside g_logpath
     lea     rdx, [g_logpath]
-    lea     rdx, [rdx + rcx*2]          ; cursor at the NUL
-    mov     rcx, rdx
+    xor     ecx, ecx
+lo_plen:
+    cmp     word ptr [rdx + rcx*2], 0
+    je      lo_phave
+    inc     ecx
+    cmp     ecx, MAX_PATH_CHARS-64
+    jb      lo_plen
+    jmp     lo_fail
+lo_phave:
+    test    ecx, ecx
+    jz      lo_fail
+    lea     rcx, [rdx + rcx*2]
+    cmp     word ptr [rcx-2], 5Ch
+    jne     @F
+    sub     rcx, 2                              ; strip trailing '\' if any
+@@: lea     rdx, [w_appdatalocal]
+    call    log_wapp                            ; append "\AppData\Local"
     lea     rdx, [w_subdir]
-    call    log_wapp                    ; append "\Vordr"
+    mov     rcx, rax
+    call    log_wapp                            ; append "\Vordr"
     mov     word ptr [rax], 0
     mov     qword ptr [rbp-24], rax
-    WINCALL CreateDirectoryW, addr g_logpath, 0     ; ignore result (may exist)
+    WINCALL CreateDirectoryW, addr g_logpath, 0 ; ignore result (may exist)
     mov     rcx, qword ptr [rbp-24]
     lea     rdx, [w_logname]
-    call    log_wapp                    ; append "\vordr.log"
+    call    log_wapp                            ; append "\vordr.log"
     mov     word ptr [rax], 0
     lea     rax, [g_logpath]
     mov     qword ptr [rbp-32], rax
 lo_open:
+    mov     rcx, qword ptr [rbp-32]
+    lea     rdx, [g_logio]
+    mov     r8d, MAX_PATH_CHARS + 16
+    call    path_longify
+    mov     qword ptr [rbp-32], rax
+    mov     rcx, rax
+    call    file_path_allowed
+    test    eax, eax
+    jz      lo_fail
     WINCALL CreateFileW, qword ptr [rbp-32], FILE_APPEND_DATA, FILE_SHARE_RW, 0, \
             OPEN_ALWAYS, <FILE_ATTR_NORMAL or FILE_FLAG_OPEN_RP>, 0
     cmp     rax, INVALID
     je      lo_fail
     mov     qword ptr [rbp-40], rax
-    WINCALL GetFileType, rax
-    cmp     eax, FILE_TYPE_DISK_
-    jne     lo_badtype
+    mov     rcx, rax
+    call    file_validate_handle
+    test    eax, eax
+    jz      lo_badtype
     mov     rax, qword ptr [rbp-40]
     FRAME_EPILOG
     ret

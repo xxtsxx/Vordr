@@ -29,11 +29,18 @@ extern TerminateProcess:proc
 extern GetCurrentProcess:proc
 extern SwitchDesktop:proc               ; restore the user's desktop before we die
 externdef g_secdesk_orig:qword          ; gui.asm: HDESK of the user's own input desktop
+extern HeapSetInformation:proc
+extern GetProcAddress:proc
+extern LoadLibraryExW:proc
+extern FreeLibrary:proc
+ifdef DBG_TRACE
 extern CreateFileW:proc
 extern GetFileType:proc
+extern GetFileInformationByHandle:proc
 extern WriteFile:proc
 extern CloseHandle:proc
 extern GetTempPathW:proc
+endif
 
 MEM_COMMIT          equ 1000h
 MEM_RESERVE         equ 2000h
@@ -77,12 +84,16 @@ public g_in_crash
 g_in_crash      dd 0                    ; atomic re-entrancy latch (lock bts)
 g_crash_code    dq 0                    ; last exception code (crash breadcrumb)
 g_crash_addr    dq 0                    ; last exception address
+ifdef DBG_TRACE
 g_crash_base    dq 0                    ; image base at crash time (RVA math)
+endif
 g_crash_info    dq 2 dup (0)            ; ExceptionInformation[0..1] (op, data addr)
+ifdef DBG_TRACE
 g_crash_regs    dq 10 dup (0)           ; rax rcx rdx rbx rsp rbp rsi rdi rip r8
 g_crash_h       dq 0                    ; breadcrumb file handle
 g_crash_nw      dd 0                    ; WriteFile bytes-written out
 g_crash_dumped  db 0                    ; reentry guard: dump once
+endif
 align 8
 g_img_lo        dq 0                    ; this image's [base, base+SizeOfImage):
 g_img_hi        dq 0                    ;   crash_veh only acts on faults inside it
@@ -91,19 +102,31 @@ align 2
 SEM_FAILCRITICALERRORS  equ 1
 SEM_NOGPFAULTERRORBOX   equ 2
 GENERIC_WRITE_          equ 40000000h
-CREATE_ALWAYS_          equ 2
+CREATE_NEW_             equ 1
 FILE_FLAG_OPEN_RP       equ 00200000h   ; FILE_FLAG_OPEN_REPARSE_POINT
+FILE_ATTR_REPARSE_PT    equ 00000400h   ; FILE_ATTRIBUTE_REPARSE_POINT
 FILE_TYPE_DISK_         equ 1
+STATUS_ILLEGAL_INST     equ 0C000001Dh
+STATUS_INT_DIV_ZERO     equ 0C0000094h
 STATUS_STACK_OVF        equ 0C00000FDh
+STATUS_HEAP_CORRUPT     equ 0C0000374h
+STATUS_STACK_OVERRUN    equ 0C0000409h
+WER_FLAGS_HARDEN        equ 00000060h   ; WER_FAULT_REPORTING_NO_UI | DISABLE_SNAPSHOT_CRASH
 LOAD_LIB_SYS32          equ 0800h       ; LOAD_LIBRARY_SEARCH_SYSTEM32
 MITIG_EXT_DISABLE       equ 7           ; ProcessExtensionPointDisablePolicy
 MITIG_IMG_LOAD          equ 10          ; ProcessImageLoadPolicy
-IMG_POL_FLAGS           equ 5           ; NoRemoteImages (1) | PreferSystem32Images (4)
+IMG_POL_FLAGS           equ 7           ; NoRemoteImages (1) | NoLowMandatoryLabelImages (2) | PreferSystem32Images (4)
 
 .const
+WSTR w_k32_dll,   <kernel32.dll>
+WSTR w_wer_dll,   <wer.dll>
+WSTR w_vordr_exe, <vordr.exe>
+a_wer_flags       db "WerSetFlags", 0
+a_wer_excl        db "WerAddExcludedApplication", 0
+ifdef DBG_TRACE
+align 2
 crash_fname label word
     dw 'v','o','r','d','r','_','c','r','a','s','h','.','b','i','n', 0
-ifdef DBG_TRACE
 CSTR crash_bc, "crash: unhandled exception - wiping secrets, terminating",13,10
 endif
 
@@ -234,16 +257,20 @@ crash_contain proc
     and     rsp, -16
     sub     rsp, 64
     call    sstk_reset_current
-    call    secmem_panic_wipe                   ; secrets gone before anything else
+    call    secmem_panic_wipe                   ; 1. secrets gone BEFORE any Win32 / file I/O
+    cmp     qword ptr [g_secdesk_orig], 0       ; 2. restore user's desktop BEFORE any I/O
+    je      cc_after_desk
+    WINCALL SwitchDesktop, qword ptr [g_secdesk_orig]
+cc_after_desk:
 ifdef DBG_TRACE
+    cmp     dword ptr [g_crash_code], STATUS_STACK_OVF
+    je      cc_nodump                           ; stack exhausted: skip Win32 file I/O
+    call    crash_dump                          ; 3. dbg-only breadcrumb AFTER wipe + desktop
+cc_nodump:
     lea     rcx, [crash_bc]
     mov     edx, crash_bc_len
     call    print_a
 endif
-    cmp     qword ptr [g_secdesk_orig], 0
-    je      cc_kill
-    WINCALL SwitchDesktop, qword ptr [g_secdesk_orig]
-cc_kill:
     WINCALL GetCurrentProcess
     WINCALL TerminateProcess, rax, 0C0000409h
     mov     ecx, 2
@@ -269,11 +296,28 @@ crash_veh proc
     cmp     r8d, 0C0000000h                     ; ERROR severity => fatal
     jne     cv_pass
     mov     r10, qword ptr [rax+16]             ; ExceptionAddress
+    ; Non-SEH-probed fatal faults (heap corruption, stack overflow/overrun, #UD, #DE,
+    ; or wild indirect jump to NULL/low page) are contained immediately regardless of
+    ; module RIP; ordinary AVs outside our image pass to SEH first so OS DLL __try
+    ; probes continue, with crash_filter catching any genuinely unhandled DLL fault.
+    cmp     edx, STATUS_HEAP_CORRUPT
+    je      cv_catch
+    cmp     edx, STATUS_STACK_OVERRUN
+    je      cv_catch
+    cmp     edx, STATUS_STACK_OVF
+    je      cv_catch
+    cmp     edx, STATUS_ILLEGAL_INST
+    je      cv_catch
+    cmp     edx, STATUS_INT_DIV_ZERO
+    je      cv_catch
+    cmp     r10, 10000h
+    jb      cv_catch
     cmp     r10, qword ptr [g_img_lo]
     jb      cv_pass
     cmp     r10, qword ptr [g_img_hi]
     jae     cv_pass
-    ; Re-entrancy guard: if we fault INSIDE crash_dump / crash_contain, kill immediately
+cv_catch:
+    ; Re-entrancy guard: if we fault INSIDE crash_contain, kill immediately
     lock bts dword ptr [g_in_crash], 0
     jc      cv_reent
     mov     dword ptr [g_crash_code], edx
@@ -308,11 +352,7 @@ ifdef DBG_TRACE
     mov     r10, qword ptr [rax+0B8h]
     mov     qword ptr [g_crash_regs+72], r10    ; r8
 endif
-    cmp     dword ptr [g_crash_code], STATUS_STACK_OVF
-    je      cv_nodump                           ; stack exhausted: skip Win32 file I/O
-    call    crash_dump
-cv_nodump:
-    call    crash_contain                       ; wipe + terminate (no return)
+    call    crash_contain                       ; wipe + restore desktop + terminate
 cv_reent:
     WINCALL GetCurrentProcess
     WINCALL TerminateProcess, rax, 0C0000409h
@@ -325,13 +365,16 @@ cv_pass:
     ret
 crash_veh endp
 
-; crash_dump() - best-effort crash breadcrumb: %TEMP%\vordr_crash.bin.
-;   RAW frame; refuses symlinks/reparse points and non-disk handles.
+ifdef DBG_TRACE
+; crash_dump() - dbg-only crash breadcrumb: %TEMP%\vordr_crash.bin, run AFTER
+;   secmem_panic_wipe + SwitchDesktop.  Refuses existing files, reparse points,
+;   hardlinks, and non-disk handles.
 crash_dump proc
     push    rbp
     mov     rbp, rsp
     and     rsp, -16
-    sub     rsp, 64
+    sub     rsp, 128
+    ; [rbp-64..-13] = BY_HANDLE_FILE_INFORMATION (52 bytes), clear of [rsp..rsp+31]
     cmp     byte ptr [g_crash_dumped], 0
     jne     cd_ret
     mov     byte ptr [g_crash_dumped], 1
@@ -355,20 +398,23 @@ cd_cp:
     add     r11, 2
     test    ax, ax
     jnz     cd_cp
-    WINCALL CreateFileW, addr g_crashpath, GENERIC_WRITE_, 0, 0, CREATE_ALWAYS_, FILE_FLAG_OPEN_RP, 0
+    WINCALL CreateFileW, addr g_crashpath, GENERIC_WRITE_, 0, 0, CREATE_NEW_, FILE_FLAG_OPEN_RP, 0
     cmp     rax, -1
     je      cd_ret
     mov     qword ptr [g_crash_h], rax
     WINCALL GetFileType, qword ptr [g_crash_h]
     cmp     eax, FILE_TYPE_DISK_
     jne     cd_close
+    WINCALL GetFileInformationByHandle, qword ptr [g_crash_h], addr rbp-64
+    test    eax, eax
+    jz      cd_close
+    test    dword ptr [rbp-64], FILE_ATTR_REPARSE_PT
+    jnz     cd_close
+    cmp     dword ptr [rbp-64+40], 1            ; nNumberOfLinks <= 1
+    ja      cd_close
     WINCALL GetModuleHandleW, 0
     mov     qword ptr [g_crash_base], rax
-ifdef DBG_TRACE
     WINCALL WriteFile, qword ptr [g_crash_h], addr g_crash_code, 120, addr g_crash_nw, 0
-else
-    WINCALL WriteFile, qword ptr [g_crash_h], addr g_crash_code, 24, addr g_crash_nw, 0
-endif
 cd_close:
     WINCALL CloseHandle, qword ptr [g_crash_h]
 cd_ret:
@@ -376,6 +422,7 @@ cd_ret:
     pop     rbp
     ret
 crash_dump endp
+endif
 
 ; crash_filter(rcx = PEXCEPTION_POINTERS) -> LONG.  Backup last-chance filter.
 crash_filter proc
@@ -390,10 +437,6 @@ crash_filter proc
     mov     dword ptr [g_crash_code], r10d
     mov     r10, qword ptr [rax+16]
     mov     qword ptr [g_crash_addr], r10
-    cmp     r10d, STATUS_STACK_OVF
-    je      cf_nodump
-    call    crash_dump
-cf_nodump:
     call    crash_contain
 cf_reent:
     WINCALL GetCurrentProcess
@@ -407,14 +450,14 @@ cf_reent:
 crash_filter endp
 
 ; =============================================================================
-; crash_install() - arm crash containment.  Suppresses the WER fault UI for
-;   this process (SetErrorMode, no registry change), installs the vectored
-;   handler as the first-chance responder, and the top-level filter as backup.
+; crash_install() - arm crash containment.  Suppresses WER UI + LocalDumps /
+;   crash snapshots for this process, installs the vectored handler as the
+;   first-chance responder, and the top-level filter as backup.
 ;   Call once, early in wstart, before any secret exists.
 ; =============================================================================
 public crash_install
 crash_install proc frame
-    FRAME_PROLOG 32
+    FRAME_PROLOG 64
     WINCALL GetModuleHandleW, 0                 ; our image range, for crash_veh
     mov     qword ptr [g_img_lo], rax
     mov     r10d, dword ptr [rax+3Ch]           ; e_lfanew
@@ -422,6 +465,30 @@ crash_install proc frame
     add     rax, r10
     mov     qword ptr [g_img_hi], rax
     WINCALL SetErrorMode, <SEM_FAILCRITICALERRORS or SEM_NOGPFAULTERRORBOX>
+    ; Best-effort WER snapshot/LocalDumps suppression (kernel32!WerSetFlags +
+    ; wer!WerAddExcludedApplication, resolved dynamically from System32).
+    WINCALL GetModuleHandleW, addr w_k32_dll
+    test    rax, rax
+    jz      ci_wer_dll
+    WINCALL GetProcAddress, rax, addr a_wer_flags
+    test    rax, rax
+    jz      ci_wer_dll
+    mov     ecx, WER_FLAGS_HARDEN
+    call    rax
+ci_wer_dll:
+    WINCALL LoadLibraryExW, addr w_wer_dll, 0, LOAD_LIB_SYS32
+    test    rax, rax
+    jz      ci_handlers
+    mov     qword ptr [rbp-24], rax
+    WINCALL GetProcAddress, rax, addr a_wer_excl
+    test    rax, rax
+    jz      ci_free_wer
+    lea     rcx, [w_vordr_exe]
+    xor     edx, edx
+    call    rax
+ci_free_wer:
+    WINCALL FreeLibrary, qword ptr [rbp-24]
+ci_handlers:
     WINCALL AddVectoredExceptionHandler, 1, addr crash_veh
     WINCALL SetUnhandledExceptionFilter, addr crash_filter
     FRAME_EPILOG
@@ -445,7 +512,8 @@ hardening_init proc frame
     .allocstack 64
     .endprolog
 
-    ; ---- lock dynamic DLL search path + process mitigation policies ---------
+    ; ---- lock dynamic DLL search path + process/heap mitigation policies ----
+    WINCALL HeapSetInformation, 0, 1, 0, 0      ; HeapEnableTerminationOnCorruption
     WINCALL SetDefaultDllDirectories, LOAD_LIB_SYS32
     mov     dword ptr [rbp-24], 1
     WINCALL SetProcessMitigationPolicy, MITIG_EXT_DISABLE, addr rbp-24, 4
@@ -515,12 +583,18 @@ iat_lockdown proc frame
 
     ; OptionalHeader at +24; DataDirectory at +112 within OptionalHeader;
     ; entry 12 (IMAGE_DIRECTORY_ENTRY_IAT) = +24+112+12*8 = +232
+    mov     ecx, dword ptr [r11+50h]    ; OptionalHeader.SizeOfImage
     mov     eax, dword ptr [r11+232]    ; IAT RVA
     mov     edx, dword ptr [r11+236]    ; IAT size
     test    eax, eax
     jz      il_fail
     test    edx, edx
     jz      il_fail
+    cmp     eax, ecx                    ; IAT_RVA < SizeOfImage
+    jae     il_fail
+    sub     ecx, eax
+    cmp     edx, ecx                    ; IAT_Size <= SizeOfImage - IAT_RVA
+    ja      il_fail
 
     ; IAT VA in r10+rax, size already in rdx
     WINCALL VirtualProtect, addr r10+rax, rdx, PAGE_READONLY, addr rbp-16
@@ -699,10 +773,9 @@ tagged_free endp
 ; =============================================================================
 .data?
 align 2
-; .data? and not .data: "dup (?)" in an initialised section emits the bytes.
-; This was 260 chars until long paths went in; at MAX_PATH_CHARS it put 64 KB
-; of zeros in the image for a path that is only ever under %TEMP%.
+ifdef DBG_TRACE
 g_crashpath     dw MAX_PATH_CHARS dup (?)  ; %TEMP%\vordr_crash.bin
+endif
 ctt_a   db 4096 dup (?)
 ctt_b   db 4096 dup (?)
 

@@ -97,13 +97,20 @@ sha256_init endp
 ; sha256_compress(rcx = state ptr, rdx = blocks ptr, r8 = block count)
 ; Leaf; saves nonvolatile xmm6..xmm10 per the Win64 ABI.
 ; =============================================================================
-sha256_compress proc
+sha256_compress proc frame
     sub     rsp, 16*5
+    .allocstack 80
     movdqu  xmmword ptr [rsp+0],  xmm6
+    .savexmm128 xmm6, 0
     movdqu  xmmword ptr [rsp+16], xmm7
+    .savexmm128 xmm7, 16
     movdqu  xmmword ptr [rsp+32], xmm8
+    .savexmm128 xmm8, 32
     movdqu  xmmword ptr [rsp+48], xmm9
+    .savexmm128 xmm9, 48
     movdqu  xmmword ptr [rsp+64], xmm10
+    .savexmm128 xmm10, 64
+    .endprolog
 
     test    r8, r8
     jz      sc_done

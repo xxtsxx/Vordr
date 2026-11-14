@@ -80,6 +80,19 @@ externdef g_pb_t:byte
 externdef g_fmac_ctx:byte           ; keyed BLAKE2b file-MAC state (vault.asm)
 externdef g_sha32:byte              ; SHA-256(vkey) KCV scratch (vault.asm)
 externdef g_totp_key:byte           ; decoded TOTP secret (totp.asm)
+externdef g_b2bctx:byte             ; Argon2id BLAKE2b state (argon2.asm)
+externdef g_hbuf:byte               ; Argon2id H0 pre-hash (argon2.asm)
+externdef g_arena:qword             ; Argon2id active arena ptr (argon2.asm)
+externdef g_mb:qword                ; Argon2id active arena block count (argon2.asm)
+externdef g_tpm_sha_ctx:byte        ; TPM key-binding SHA-256 state (tpm.asm)
+externdef g_tpm_label:byte          ; TPM OAEP context label (tpm.asm)
+externdef g_zj_fld:byte             ; ZIP export field descriptor scratch (zipexport.asm)
+externdef g_zj_fn:byte              ; ZIP export attachment filename scratch (zipexport.asm)
+externdef g_search_w:byte           ; Vault search query wide buffer (gui.asm)
+externdef g_totp_code6:byte         ; Live 6-digit TOTP ASCII buffer (gui.asm)
+externdef g_totp_code_w:byte        ; Live 6-digit TOTP wide buffer (gui.asm)
+externdef g_totp_disp_w:byte        ; Live grouped TOTP display buffer (gui.asm)
+externdef g_wordtmp:byte            ; Phonetic word scratch buffer (gui.asm)
 
 ; Sizes of the buffers above, mirrored from the modules that allocate them -
 ; constcheck fails the build if any of these drifts from its original.
@@ -190,6 +203,17 @@ sec_regions label qword
     dq  g_fmac_ctx,     256
     dq  g_sha32,        32
     dq  g_totp_key,     160
+    dq  g_b2bctx,       256
+    dq  g_hbuf,         80
+    dq  g_tpm_sha_ctx,  128
+    dq  g_tpm_label,    32
+    dq  g_zj_fld,       40
+    dq  g_zj_fn,        512
+    dq  g_search_w,     512*2
+    dq  g_totp_code6,   8
+    dq  g_totp_code_w,  16*2
+    dq  g_totp_disp_w,  16*2
+    dq  g_wordtmp,      32*2
 sec_regions_end label qword
 
 .code
@@ -258,8 +282,11 @@ sec_lock proc frame
     mov     qword ptr [rbp-32], rdx
     cmp     dword ptr [g_force_lockfail], 0     ; C3 test hook: force a lock failure
     jne     sl_failed_hook
-    ; The working-set quota is grown ONCE up front (sec_ws_grow, from
-    ; sec_lock_statics) so the lock isn't capped; here we just attempt it.
+    WINCALL VirtualLock, qword ptr [rbp-24], qword ptr [rbp-32]
+    test    eax, eax
+    jnz     sl_done
+    ; Retry once after growing the process working-set quota (handles transient WS trim)
+    call    sec_ws_grow
     WINCALL VirtualLock, qword ptr [rbp-24], qword ptr [rbp-32]
     test    eax, eax
     jnz     sl_done
@@ -270,8 +297,8 @@ sec_lock proc frame
     mov     dword ptr [g_lockerr_vl], eax       ; keep the FIRST error only
 sl_failed:
     ; C3: a secret buffer could not be pinned - it may reach the pagefile.  Record
-    ; it (the GUI shows a one-time warning; we do NOT fail closed, which would lock
-    ; the user out of their own vault on a constrained system).
+    ; it (the GUI shows a one-time warning; we do NOT fail closed on statics, which
+    ; would lock the user out of their own vault on a constrained system).
     mov     dword ptr [g_seclock_failed], 1
     xor     eax, eax
     FRAME_EPILOG
@@ -443,8 +470,15 @@ spw_slots:
 spw_history:
     mov     rcx, qword ptr [g_edit_history]
     test    rcx, rcx
-    jz      spw_done
+    jz      spw_a2
     mov     edx, MAX_PWHIST*PWHIST_ENTRY
+    call    secure_zero
+spw_a2:
+    mov     rcx, qword ptr [g_arena]            ; active Argon2id arena, if mid-KDF
+    test    rcx, rcx
+    jz      spw_done
+    mov     rdx, qword ptr [g_mb]
+    shl     rdx, 10
     call    secure_zero
 spw_done:
     FRAME_EPILOG
@@ -454,11 +488,16 @@ secmem_panic_wipe endp
 public secmem_alloc
 secmem_alloc proc frame
     FRAME_PROLOG 48
-    ; locals: [rbp-24] len, [rbp-32] base
-    mov     qword ptr [rbp-24], rcx
+    ; locals: [rbp-24] page-rounded len, [rbp-32] base
     mov     qword ptr [rbp-32], 0
     test    rcx, rcx
     jz      sa_fail                         ; zero-length: fail closed
+    mov     rax, 07FFFFFFFFFF0000h
+    cmp     rcx, rax
+    ja      sa_fail                         ; overflow guard before 4 KiB page rounding
+    add     rcx, 0FFFh
+    and     rcx, -1000h                     ; round up to full 4 KiB pages (no unwiped slack)
+    mov     qword ptr [rbp-24], rcx
 
     WINCALL VirtualAlloc, 0, qword ptr [rbp-24], <MEM_RESERVE or MEM_COMMIT>, PAGE_READWRITE
     test    rax, rax
@@ -477,7 +516,7 @@ secmem_alloc proc frame
     test    eax, eax
     jz      sa_lockfail
 
-    mov     rcx, qword ptr [rbp-32]         ; register {base, len}
+    mov     rcx, qword ptr [rbp-32]         ; register {base, page_rounded_len}
     mov     rdx, qword ptr [rbp-24]
     call    secreg_add
     test    eax, eax
@@ -506,9 +545,8 @@ secmem_alloc endp
 public secmem_free
 secmem_free proc frame
     FRAME_PROLOG 48
-    ; locals: [rbp-24] ptr, [rbp-32] len
+    ; locals: [rbp-24] ptr, [rbp-32] authoritative page-rounded len
     mov     qword ptr [rbp-24], rcx
-    mov     qword ptr [rbp-32], rdx
     test    rcx, rcx
     jz      sf_done
 
@@ -516,12 +554,11 @@ secmem_free proc frame
     call    secreg_take
     test    rax, rax
     jz      sf_done
-    cmp     rax, qword ptr [rbp-32]
-    jbe     @F
-    mov     qword ptr [rbp-32], rax         ; wipe at least the registered byte span
-@@:
+    ; Always wipe and unlock the authoritative registered allocation span (never
+    ; max(stored, caller), which would overrun the VirtualAlloc region on bad rdx).
+    mov     qword ptr [rbp-32], rax
     mov     rcx, qword ptr [rbp-24]
-    mov     rdx, qword ptr [rbp-32]
+    mov     rdx, rax
     call    secure_zero
 
     WINCALL VirtualUnlock, qword ptr [rbp-24], qword ptr [rbp-32]

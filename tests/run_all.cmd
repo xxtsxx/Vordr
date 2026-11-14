@@ -67,7 +67,7 @@ rem ------------------------------------------------------------------ build --
 :s_build
 call :now T0
 echo === stage: build (release, strict framecheck) ===
-call .\build.cmd strict > "%WORK%\build_rel.log" 2>&1
+call .\build.cmd release strict > "%WORK%\build_rel.log" 2>&1
 if errorlevel 1 (
     echo   release build FAILED - see %WORK%\build_rel.log
     goto :summary
@@ -344,7 +344,7 @@ set /a T_CRYPTODIFF=!T1!-!T0!
 
 rem --- restore a clean RELEASE binary in bin\ (roundtrip left a PROBE_IO build,
 rem     which exposes the path-taking verbs - never leave that as the artifact) --
-if "%R_BUILD%"=="PASS" call .\build.cmd strict > "%WORK%\build_restore.log" 2>&1
+if "%R_BUILD%"=="PASS" call .\build.cmd release strict > "%WORK%\build_restore.log" 2>&1
 
 
 rem --- 6. installer -----------------------------------------------------------

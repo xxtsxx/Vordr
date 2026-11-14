@@ -50,6 +50,11 @@ externdef g_wf_disp:dword
 externdef g_wf_created:dword
 extern secmem_panic_wipe:proc           ; wipe every pinned secret (shutdown/logoff)
 extern print_err:proc
+extern cfg_get_dword_hklm:proc
+externdef g_allow_unc:dword
+externdef g_allow_screencap:dword
+externdef g_vof_buf:qword
+externdef g_vof_len:qword
 
 ; ---- vault session API (vault.asm) + password helper (main.asm) -------------
 extern password_to_utf8:proc
@@ -378,8 +383,33 @@ extern UnregisterHotKey:proc
 extern VkKeyScanW:proc
 extern GetKeyNameTextW:proc
 extern MapVirtualKeyW:proc
+extern SetWindowDisplayAffinity:proc
+extern ImmAssociateContext:proc
+extern SetUserObjectSecurity:proc
+extern AddAccessAllowedAceEx:proc
+extern AddMandatoryAce:proc
+extern SetSecurityDescriptorSacl:proc
+extern SetSecurityDescriptorControl:proc
+extern SendMessageTimeoutW:proc
+extern GetWindowThreadProcessId:proc
+extern OpenProcess:proc
+extern QueryFullProcessImageNameW:proc
+extern GetClipboardOwner:proc
+extern FindFirstFileW:proc
+extern FindNextFileW:proc
+extern FindClose:proc
 
 ; ---- constants ---------------------------------------------------------------
+WM_SETTEXT_                 equ 0Ch
+WDA_MONITOR_                equ 1
+WDA_EXCLUDEFROMCAPTURE_     equ 11h
+DACL_SECURITY_INFORMATION_  equ 4
+SE_DACL_PROTECTED_          equ 1000h
+INHERIT_ACE_FLAGS_          equ 3
+DESKTOP_PRIV_USER_MASK_     equ 00020146h
+DESKTOP_CREATE_ACCESS_      equ 000601FFh
+PROCESS_QUERY_LIMITED_      equ 1000h
+SMTO_SAFE_                  equ 3
 MB_OK               equ 0
 MB_ICONERROR        equ 10h
 MB_ICONINFORMATION  equ 40h
@@ -1104,6 +1134,12 @@ WSTR wv_nophon,     <NoPhonetic>
 WSTR wv_secunlock,  <SecureUnlock>
 WSTR wv_tpm,        <TpmUnlock>
 WSTR wv_allowunc,   <AllowUncVault>
+WSTR wv_allowsccap, <AllowScreenCapture>
+WSTR tmp_dir_pfx,   <VordrPreview->
+WSTR tmp_sweep_glob,<VordrPreview-*>
+align 4
+sid_local_system    db 1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0
+sid_medium_il       db 1, 1, 0, 0, 0, 0, 0, 16, 0, 20h, 0, 0
 ; --- system tray strings ------------------------------------------------------
 WSTR t_about,       <About Vordr>
 m_welcome label word
@@ -1678,9 +1714,11 @@ g_home_numw  dw 16 dup (?)            ; one stat rendered as digits
 g_katline    dw 96 dup (?)            ; "<n> known-answer tests verified at launch"
 align 8
 g_openfile     dw MAX_PATH_CHARS dup (?)  ; .vordr handed to us by the shell, to IMPORT
+g_ro_vpath     dw MAX_PATH_CHARS dup (?)  ; --ro <vault.vordr> target (only when HKLM unlocked)
+g_imppath      dw MAX_PATH_CHARS dup (?)  ; private import source path (isolated from g_imgpath)
 public g_openfile_set
 g_openfile_set dd ?                   ; 1 = an import is pending for the open vault
-g_imp_preset   dd ?                   ; 1 = gui_import must use g_imgpath as-is
+g_imp_preset   dd ?                   ; 1 = gui_import must use g_imppath as-is
 align 8
 g_cds          db 24 dup (?)          ; COPYDATASTRUCT {dwData, cbData, pad, lpData}
 g_exedir    dw MAX_PATH_CHARS dup (?)  ; folder holding vordr.exe
@@ -1833,6 +1871,7 @@ align 8
 public g_vaulthwnd
 g_vaulthwnd dq ?                      ; the open DLG_VAULT window (0 when not shown)
 align 2
+public g_search_w
 g_search_w  dw 512 dup (?)            ; current search query (wide, upper-cased)
 g_match_w   dw EBUF*2 dup (?)         ; scratch: a field value/label folded for matching
 align 4
@@ -1863,6 +1902,7 @@ g_totp_on   dd ?                      ; 1 if the selected entry has a TOTP key
 g_totp_secs dd ?                      ; seconds left in the current TOTP window
 g_totp_b32len dd ?
 g_totp_b32  db 256 dup (?)            ; selected entry's base32 key (utf8)
+public g_totp_code6, g_totp_code_w, g_totp_disp_w
 g_totp_code6 db 8 dup (?)            ; computed 6-digit code (ascii)
 g_totp_code_w dw 16 dup (?)          ; code as wide, 6 digits no space (for clipboard)
 g_totp_disp_w dw 16 dup (?)          ; code grouped "nnn nnn" wide (on-screen only)
@@ -1897,7 +1937,7 @@ g_layout      dd ?                         ; UI layout/density index (0 comforta
 public g_fontdelta
 g_fontdelta   dd ?                         ; font-size delta in px (fixed 0 = Medium)
 g_colorpw_row dd ?                         ; row whose revealed secret is colored (-1=none)
-public g_rowpw_w
+public g_rowpw_w, g_wordtmp
 g_rowpw_w     dw 512 dup (?)               ; revealed secret text for the color overlay
 g_wordtmp     dw 32 dup (?)                ; one resolved phonetic word (scratch)
 g_cur_page    dd ?                        ; detail-pane current page (0-based)
@@ -2014,13 +2054,21 @@ g_exppath   dw MAX_PATH_CHARS dup (?) ; private export target path (isolated fro
 g_gsf_a     dw (MAX_PATH_CHARS + 16) dup (?) ; gui_same_file longified path A
 g_gsf_b     dw (MAX_PATH_CHARS + 16) dup (?) ; gui_same_file longified path B
 g_motw_io   dw (MAX_PATH_CHARS + 48) dup (?) ; gui_motw longified ADS path
-g_scrub_w   dw 1028 dup (?)           ; gui_edit_scrub 'X' overwrite scratch
+g_scrub_w   dw CONVW_MAX dup (?)      ; gui_edit_scrub 'X' overwrite scratch (full CONVW_MAX)
 g_san_tmp   dw 260 dup (?)            ; gui_sanitize_attname working scratch
 g_san_stem  dw 40 dup (?)             ; gui_sanitize_attname stem lowercase scratch
 align 8
-g_tmp_tokbuf db 128 dup (?)           ; gui_tile_make_temp TokenUser buffer
-g_tmp_acl    db 256 dup (?)           ; gui_tile_make_temp owner-only ACL buffer
-g_tmp_sd     db 64 dup (?)            ; gui_tile_make_temp SECURITY_DESCRIPTOR buffer
+g_tmp_tokbuf db 128 dup (?)           ; gui_build_user_dacl TokenUser buffer
+g_tmp_acl    db 256 dup (?)           ; gui_build_user_dacl owner+SYSTEM ACL buffer
+g_tmp_sacl   db 64 dup (?)            ; gui_build_user_dacl Medium-IL SACL buffer
+g_tmp_sd     db 64 dup (?)            ; gui_build_user_dacl SECURITY_DESCRIPTOR buffer
+align 8
+g_self_path  dw MAX_PATH_CHARS dup (?) ; gui_hwnd_is_self own module path
+g_peer_path  dw MAX_PATH_CHARS dup (?) ; gui_hwnd_is_self peer process image path
+g_sweep_wfd  db 608 dup (?)            ; WIN32_FIND_DATAW (592 bytes) for stale-preview sweep
+g_sweep_subwfd db 608 dup (?)          ; inner file enumeration WIN32_FIND_DATAW
+g_sweep_dir  dw TEMP_PATHW dup (?)     ; %TEMP%\VordrPreview-* scratch
+g_sweep_sub  dw TEMP_PATHW dup (?)     ; %TEMP%\VordrPreview-<hex>\* scratch
 align 8
 g_ofn       OPENFILENAMEW <>
 
@@ -2091,33 +2139,62 @@ gui_status proc frame
     ret
 gui_status endp
 
-; gui_edit_scrub(rcx = hdlg, edx = ctl_id) - overwrite a Win32 EDIT control's
-;   internal heap buffer with 1024 'X' characters, flush its undo buffer, clear it
-;   back to empty, and zero g_scrub_w (VDR-13).
-gui_edit_scrub proc frame
+; gui_hwnd_scrub(rcx = hwndEdit) - flush undo, overwrite a Win32 EDIT control's
+;   internal heap buffer with CONVW_MAX-1 'X' wide chars, flush undo, reset to
+;   empty, flush undo, and wipe g_scrub_w (VDR2-04).
+gui_hwnd_scrub proc frame
     FRAME_PROLOG 64
     test    rcx, rcx
-    jz      ges2_done
+    jz      ghsc_done
     mov     qword ptr [rbp-24], rcx
-    mov     dword ptr [rbp-32], edx
+    WINCALL SendMessageW, qword ptr [rbp-24], EM_EMPTYUNDOBUFFER_, 0, 0
     lea     r10, [g_scrub_w]
     xor     eax, eax
-ges2_fill:
+ghsc_fill:
     mov     word ptr [r10+rax*2], 'X'
     inc     eax
-    cmp     eax, 1024
-    jb      ges2_fill
+    cmp     eax, CONVW_MAX - 1
+    jb      ghsc_fill
     mov     word ptr [r10+rax*2], 0
-    WINCALL SetDlgItemTextW, qword ptr [rbp-24], dword ptr [rbp-32], addr g_scrub_w
-    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], dword ptr [rbp-32], EM_EMPTYUNDOBUFFER_, 0, 0
-    WINCALL SetDlgItemTextW, qword ptr [rbp-24], dword ptr [rbp-32], addr g_empty_w
+    WINCALL SendMessageW, qword ptr [rbp-24], WM_SETTEXT_, 0, addr g_scrub_w
+    WINCALL SendMessageW, qword ptr [rbp-24], EM_EMPTYUNDOBUFFER_, 0, 0
+    WINCALL SendMessageW, qword ptr [rbp-24], WM_SETTEXT_, 0, addr g_empty_w
+    WINCALL SendMessageW, qword ptr [rbp-24], EM_EMPTYUNDOBUFFER_, 0, 0
     lea     rcx, [g_scrub_w]
-    mov     edx, 1028*2
+    mov     edx, CONVW_MAX * 2
     call    secure_zero
+ghsc_done:
+    FRAME_EPILOG
+    ret
+gui_hwnd_scrub endp
+
+; gui_edit_scrub(rcx = hdlg, edx = ctl_id) - scrub a dialog item EDIT control.
+gui_edit_scrub proc frame
+    FRAME_PROLOG 32
+    test    rcx, rcx
+    jz      ges2_done
+    call    GetDlgItem
+    mov     rcx, rax
+    call    gui_hwnd_scrub
 ges2_done:
     FRAME_EPILOG
     ret
 gui_edit_scrub endp
+
+; gui_edit_noime(rcx = hdlg, edx = ctl_id) - detach IME / Text Services prediction
+;   context from a sensitive password/secret EDIT control (VDR2-18).
+gui_edit_noime proc frame
+    FRAME_PROLOG 32
+    test    rcx, rcx
+    jz      geni_done
+    call    GetDlgItem
+    test    rax, rax
+    jz      geni_done
+    WINCALL ImmAssociateContext, rax, 0
+geni_done:
+    FRAME_EPILOG
+    ret
+gui_edit_noime endp
 
 ; =============================================================================
 ; gui_unlock(rcx = hdlg) - validate inputs, (create then) unlock the vault.
@@ -2275,7 +2352,7 @@ gpil_qsep:
     cmp     eax, '/'
     je      gpil_yes
 gpil_unc:
-    WINCALL cfg_get_dword, addr wv_allowunc, 0, 0
+    WINCALL cfg_get_dword_hklm, addr wv_allowunc, 0
     test    eax, eax
     jz      gpil_no
 gpil_yes:
@@ -2376,6 +2453,9 @@ gui_stash_openfile endp
 public gui_shell_arg
 gui_shell_arg proc frame
     FRAME_PROLOG 48
+    mov     word ptr [g_ro_vpath], 0
+    cmp     dword ptr [g_readonly], 0
+    jne     gsa2_ro
     cmp     dword ptr [g_argc], 2
     jb      gsa2_no
     lea     r10, [g_argv]
@@ -2385,19 +2465,177 @@ gui_shell_arg proc frame
     call    gui_stash_openfile
     FRAME_EPILOG
     ret
+gsa2_ro:
+    cmp     dword ptr [g_argc], 3
+    jb      gsa2_no
+    lea     r10, [g_argv]
+    mov     rcx, qword ptr [r10+16]               ; argv[2] after --ro
+    test    rcx, rcx
+    jz      gsa2_no
+    mov     qword ptr [rbp-24], rcx
+    call    gui_vault_file_ok
+    test    eax, eax
+    jz      gsa2_no
+    lea     r10, [g_ro_vpath]
+    mov     r11, qword ptr [rbp-24]
+    xor     r8d, r8d
+gsa2_rocpy:
+    mov     ax, word ptr [r11+r8*2]
+    mov     word ptr [r10+r8*2], ax
+    test    ax, ax
+    jz      gsa2_rook
+    inc     r8d
+    cmp     r8d, MAX_PATH_CHARS-2
+    jb      gsa2_rocpy
+    mov     word ptr [r10], 0
+    jmp     gsa2_no
+gsa2_rook:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
 gsa2_no:
     xor     eax, eax
     FRAME_EPILOG
     ret
 gui_shell_arg endp
 
-; gui_send_openfile(rcx = target hwnd) -> eax = 1 if delivered.  Hands g_openfile
-;   to the already-running instance.  SendMessageW (not Post) because the receiver
-;   must copy the buffer while it is still alive.
+; gui_hwnd_is_self(rcx = hwnd) -> eax = 1 iff hwnd is owned by a process running
+;   this exact vordr.exe binary (volume serial + file index match) (VDR2-10).
+gui_hwnd_is_self proc frame
+    FRAME_PROLOG 96
+    test    rcx, rcx
+    jz      ghis_no
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-28], 0
+    WINCALL GetWindowThreadProcessId, qword ptr [rbp-24], addr rbp-28
+    test    eax, eax
+    jz      ghis_no
+    cmp     dword ptr [rbp-28], 0
+    je      ghis_no
+    WINCALL OpenProcess, PROCESS_QUERY_LIMITED_, 0, dword ptr [rbp-28]
+    test    rax, rax
+    jz      ghis_no
+    mov     qword ptr [rbp-48], rax
+    mov     dword ptr [rbp-36], MAX_PATH_CHARS - 1
+    WINCALL QueryFullProcessImageNameW, qword ptr [rbp-48], 0, addr g_peer_path, addr rbp-36
+    mov     dword ptr [rbp-52], eax
+    WINCALL CloseHandle, qword ptr [rbp-48]
+    cmp     dword ptr [rbp-52], 0
+    je      ghis_no
+    WINCALL GetModuleFileNameW, 0, addr g_self_path, MAX_PATH_CHARS - 1
+    test    eax, eax
+    jz      ghis_no
+    cmp     eax, MAX_PATH_CHARS - 1
+    jae     ghis_no
+    lea     rcx, [g_self_path]
+    lea     rdx, [g_peer_path]
+    call    gui_same_file
+    FRAME_EPILOG
+    ret
+ghis_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gui_hwnd_is_self endp
+
+; gui_build_user_dacl(ecx = user_mask, edx = ace_flags, r8d = add_medium_sacl)
+;   -> eax = 1 ok (g_tmp_sd populated with protected DACL for TokenUser + SYSTEM,
+;   plus optional Medium-IL NO_WRITE_UP SACL), 0 on failure.
+gui_build_user_dacl proc frame
+    FRAME_PROLOG 96
+    mov     dword ptr [rbp-24], ecx
+    mov     dword ptr [rbp-28], edx
+    mov     dword ptr [rbp-32], r8d
+    WINCALL GetCurrentProcess
+    mov     qword ptr [rbp-40], rax
+    WINCALL OpenProcessToken, qword ptr [rbp-40], TOKEN_QUERY_, addr rbp-48
+    test    eax, eax
+    jz      gbud_fail
+    WINCALL GetTokenInformation, qword ptr [rbp-48], 1, addr g_tmp_tokbuf, 128, addr rbp-52
+    mov     dword ptr [rbp-56], eax
+    WINCALL CloseHandle, qword ptr [rbp-48]
+    cmp     dword ptr [rbp-56], 0
+    je      gbud_fail
+    mov     rax, qword ptr [g_tmp_tokbuf]
+    test    rax, rax
+    jz      gbud_fail
+    mov     qword ptr [rbp-48], rax
+    WINCALL InitializeAcl, addr g_tmp_acl, 256, ACL_REVISION_
+    test    eax, eax
+    jz      gbud_fail
+    WINCALL AddAccessAllowedAceEx, addr g_tmp_acl, ACL_REVISION_, dword ptr [rbp-28], \
+            dword ptr [rbp-24], qword ptr [rbp-48]
+    test    eax, eax
+    jz      gbud_fail
+    WINCALL AddAccessAllowedAceEx, addr g_tmp_acl, ACL_REVISION_, dword ptr [rbp-28], \
+            GENERIC_ALL_, addr sid_local_system
+    test    eax, eax
+    jz      gbud_fail
+    WINCALL InitializeSecurityDescriptor, addr g_tmp_sd, 1
+    test    eax, eax
+    jz      gbud_fail
+    WINCALL SetSecurityDescriptorDacl, addr g_tmp_sd, 1, addr g_tmp_acl, 0
+    test    eax, eax
+    jz      gbud_fail
+    WINCALL SetSecurityDescriptorControl, addr g_tmp_sd, SE_DACL_PROTECTED_, SE_DACL_PROTECTED_
+    test    eax, eax
+    jz      gbud_fail
+    cmp     dword ptr [rbp-32], 0
+    je      gbud_ok
+    WINCALL InitializeAcl, addr g_tmp_sacl, 64, ACL_REVISION_
+    test    eax, eax
+    jz      gbud_fail
+    WINCALL AddMandatoryAce, addr g_tmp_sacl, ACL_REVISION_, 0, 1, addr sid_medium_il
+    test    eax, eax
+    jz      gbud_fail
+    WINCALL SetSecurityDescriptorSacl, addr g_tmp_sd, 1, addr g_tmp_sacl, 0
+    test    eax, eax
+    jz      gbud_fail
+gbud_ok:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gbud_fail:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gui_build_user_dacl endp
+
+; gui_create_singleton_mutex() -> rax = hMutex (created with protected owner+SYSTEM
+;   DACL and Medium-IL NO_WRITE_UP SACL; falls back to default SA only if SD build fails).
+gui_create_singleton_mutex proc frame
+    FRAME_PROLOG 80
+    mov     ecx, GENERIC_ALL_
+    xor     edx, edx
+    mov     r8d, 1
+    call    gui_build_user_dacl
+    test    eax, eax
+    jz      gcsm_def
+    mov     qword ptr [rbp-48], 24
+    lea     rax, [g_tmp_sd]
+    mov     qword ptr [rbp-40], rax
+    mov     qword ptr [rbp-32], 0
+    WINCALL CreateMutexW, addr rbp-48, 1, addr g_singleton_name
+    FRAME_EPILOG
+    ret
+gcsm_def:
+    WINCALL CreateMutexW, 0, 1, addr g_singleton_name
+    FRAME_EPILOG
+    ret
+gui_create_singleton_mutex endp
+
+; gui_send_openfile(rcx = target hwnd) -> eax = 1 if delivered to verified Vordr peer.
 public gui_send_openfile
 gui_send_openfile proc frame
-    FRAME_PROLOG 64
+    FRAME_PROLOG 160                              ; CreateWindowExW takes 12 args (96B spill)
     mov     qword ptr [rbp-24], rcx
+    call    gui_hwnd_is_self
+    test    eax, eax
+    jz      gsof_no
+    WINCALL CreateWindowExW, 0, addr dbg_static_cls, 0, WS_POPUP, 0, 0, 0, 0, 0, 0, 0, 0
+    test    rax, rax
+    jz      gsof_no
+    mov     qword ptr [rbp-40], rax               ; hSender owned by this vordr.exe process
     lea     r10, [g_openfile]                     ; byte length incl. the NUL
     xor     r8d, r8d
 gsof_len:
@@ -2414,8 +2652,20 @@ gsof_have:
     mov     dword ptr [r11+8], r8d
     lea     rax, [g_openfile]
     mov     qword ptr [r11+16], rax
-    WINCALL SendMessageW, qword ptr [rbp-24], WM_COPYDATA, 0, addr g_cds
+    mov     qword ptr [rbp-32], 0
+    WINCALL SendMessageTimeoutW, qword ptr [rbp-24], WM_COPYDATA, qword ptr [rbp-40], addr g_cds, \
+            SMTO_SAFE_, 2000, addr rbp-32
+    mov     qword ptr [rbp-48], rax
+    WINCALL DestroyWindow, qword ptr [rbp-40]
+    cmp     qword ptr [rbp-48], 0
+    je      gsof_no
+    cmp     qword ptr [rbp-32], 0
+    je      gsof_no
     mov     eax, 1
+    FRAME_EPILOG
+    ret
+gsof_no:
+    xor     eax, eax
     FRAME_EPILOG
     ret
 gui_send_openfile endp
@@ -3000,11 +3250,31 @@ gui_wipepw proc frame
     ret
 gui_wipepw endp
 
+; gui_protect_hwnd(rcx = hwnd) - exclude top-level window from screen capture / DWM
+;   duplication unless AllowScreenCapture != 0 (VDR2-05).
+gui_protect_hwnd proc frame
+    FRAME_PROLOG 64
+    test    rcx, rcx
+    jz      gph_done
+    cmp     dword ptr [g_allow_screencap], 0
+    jne     gph_done
+    mov     qword ptr [rbp-24], rcx
+    WINCALL SetWindowDisplayAffinity, qword ptr [rbp-24], WDA_EXCLUDEFROMCAPTURE_
+    test    eax, eax
+    jnz     gph_done
+    WINCALL SetWindowDisplayAffinity, qword ptr [rbp-24], WDA_MONITOR_
+gph_done:
+    FRAME_EPILOG
+    ret
+gui_protect_hwnd endp
+
 ; gui_set_winicon(rcx=hwnd) - give a top-level window the Vordr shield in its
-;   title bar (small 16x16 for the caption, default size for Alt-Tab).
+;   title bar (small 16x16 for the caption, default size for Alt-Tab) and apply
+;   display-affinity capture exclusion.
 gui_set_winicon proc frame
     FRAME_PROLOG 64
     mov     qword ptr [rbp-24], rcx
+    call    gui_protect_hwnd
     WINCALL LoadImageW, qword ptr [g_hinst], 1, 1, 16, 16, 0
     mov     qword ptr [rbp-32], rax
     WINCALL SendMessageW, qword ptr [rbp-24], 80h, 0, qword ptr [rbp-32]   ; WM_SETICON ICON_SMALL
@@ -3154,6 +3424,8 @@ gui_draw_storage endp
 ;   the storage-location button.
 gui_pick_vault proc frame
     FRAME_PROLOG 48
+    cmp     dword ptr [g_vault_lock], 0       ; VDR2-02: HKLM vault path is locked
+    jne     gpv_done
     mov     qword ptr [rbp-24], rcx
     lea     rcx, [g_ofn]
     mov     edx, sizeof OPENFILENAMEW
@@ -3270,6 +3542,9 @@ up_init:
     call    theme_attach
     mov     rcx, qword ptr [rbp-8]
     call    gui_set_winicon
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_U_PW
+    call    gui_edit_noime
     ; R7.1: the misplaced per-dialog theme cogwheel (id 990) is gone - theme switching
     ; lives in the settings menu (IDC_V_MTHEME) and the title-bar dock (IDC_T_SET).
     ; cue-banner label shown inside the (borderless) password box
@@ -3298,6 +3573,15 @@ up_init:
     lea     r8, [g_vpath]
     call    SetDlgItemTextW
 up_init_x:
+    cmp     dword ptr [g_vault_lock], 0
+    je      up_init_nolock
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_U_PATH
+    call    GetDlgItem
+    mov     rcx, rax
+    xor     edx, edx
+    call    EnableWindow
+up_init_nolock:
     add     rsp, 32
     ; R7.3: the read-only pill paints straight from g_readonly (which the --ro launch
     ; flag already set), so there is no checkbox to seed here.
@@ -3354,6 +3638,9 @@ up_unlock:
     mov     eax, 1
     jmp     up_ret
 up_destroy:
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_U_PW
+    call    gui_edit_scrub
     mov     qword ptr [g_secdesk_hwnd], 0
     xor     eax, eax
     jmp     up_ret
@@ -6397,56 +6684,75 @@ gui_totp_refresh endp
 ; gui_copy(rcx = hdlg, rdx = wide NUL-terminated source) - copy to the clipboard
 ;   and arm a timer to auto-clear it after g_clip_secs seconds (0 = off; only if
 ;   the copy is still ours).
-; gui_clip_markers() - while the clipboard is open, attach the three Windows
-;   markers that keep the current content out of clipboard history (Win+V), out
-;   of the cloud clipboard, and out of clipboard-monitor processing.  Each
-;   marker is its own zero-init HGLOBAL (the clipboard takes ownership).  Idempo-
-;   tently registers the formats on first use.  Best-effort - failures are
-;   silently ignored (the copy + auto-clear still work).
+; gui_clip_markers() -> eax = 1 iff all three Windows clipboard exclusion markers
+;   were attached (CanIncludeInClipboardHistory=0, CanUploadToCloudClipboard=0,
+;   ExcludeClipboardContentFromMonitorProcessing=1); 0 on any failure so gui_copy
+;   fails closed before publishing CF_UNICODETEXT (VDR2-17).
 gui_clip_markers proc frame
-    FRAME_PROLOG 48
-    cmp     dword ptr [g_cf_hist], 0            ; register the formats once
-    jne     cm_have
+    FRAME_PROLOG 64
+    cmp     dword ptr [g_cf_hist], 0
+    jne     cm_chk_cloud
     WINCALL RegisterClipboardFormatW, addr cf_hist_name
     mov     dword ptr [g_cf_hist], eax
+cm_chk_cloud:
+    cmp     dword ptr [g_cf_cloud], 0
+    jne     cm_chk_excl
     WINCALL RegisterClipboardFormatW, addr cf_cloud_name
     mov     dword ptr [g_cf_cloud], eax
+cm_chk_excl:
+    cmp     dword ptr [g_cf_excl], 0
+    jne     cm_have
     WINCALL RegisterClipboardFormatW, addr cf_excl_name
     mov     dword ptr [g_cf_excl], eax
 cm_have:
-    cmp     dword ptr [g_cf_hist], 0           ; CanIncludeInClipboardHistory = 0
-    je      cm_cloud
+    cmp     dword ptr [g_cf_hist], 0
+    je      cm_fail
+    cmp     dword ptr [g_cf_cloud], 0
+    je      cm_fail
+    cmp     dword ptr [g_cf_excl], 0
+    je      cm_fail
     WINCALL GlobalAlloc, <GMEM_MOVEABLE or GMEM_ZEROINIT>, 4
     test    rax, rax
-    jz      cm_cloud
+    jz      cm_fail
     mov     qword ptr [rbp-24], rax
     WINCALL SetClipboardData, dword ptr [g_cf_hist], rax
     test    rax, rax
     jnz     cm_cloud
     WINCALL GlobalFree, qword ptr [rbp-24]
+    jmp     cm_fail
 cm_cloud:
-    cmp     dword ptr [g_cf_cloud], 0          ; CanUploadToCloudClipboard = 0
-    je      cm_excl
     WINCALL GlobalAlloc, <GMEM_MOVEABLE or GMEM_ZEROINIT>, 4
     test    rax, rax
-    jz      cm_excl
+    jz      cm_fail
     mov     qword ptr [rbp-24], rax
     WINCALL SetClipboardData, dword ptr [g_cf_cloud], rax
     test    rax, rax
     jnz     cm_excl
     WINCALL GlobalFree, qword ptr [rbp-24]
+    jmp     cm_fail
 cm_excl:
-    cmp     dword ptr [g_cf_excl], 0           ; ExcludeClipboardContentFromMonitorProcessing
-    je      cm_done
-    WINCALL GlobalAlloc, <GMEM_MOVEABLE or GMEM_ZEROINIT>, 4
+    WINCALL GlobalAlloc, GMEM_MOVEABLE, 4
     test    rax, rax
-    jz      cm_done
+    jz      cm_fail
     mov     qword ptr [rbp-24], rax
-    WINCALL SetClipboardData, dword ptr [g_cf_excl], rax
+    WINCALL GlobalLock, rax
     test    rax, rax
-    jnz     cm_done
+    jnz     cm_excl_set
     WINCALL GlobalFree, qword ptr [rbp-24]
-cm_done:
+    jmp     cm_fail
+cm_excl_set:
+    mov     dword ptr [rax], 1
+    WINCALL GlobalUnlock, qword ptr [rbp-24]
+    WINCALL SetClipboardData, dword ptr [g_cf_excl], qword ptr [rbp-24]
+    test    rax, rax
+    jnz     cm_ok
+    WINCALL GlobalFree, qword ptr [rbp-24]
+cm_fail:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+cm_ok:
+    mov     eax, 1
     FRAME_EPILOG
     ret
 gui_clip_markers endp
@@ -6490,25 +6796,26 @@ gc_cp:
     jmp     gc_cp
 gc_cpd:
     WINCALL GlobalUnlock, qword ptr [rbp-24]
-    WINCALL OpenClipboard, 0
-    test    eax, eax
-    jz      gc_wipe_free
-    WINCALL EmptyClipboard
-    WINCALL SetClipboardData, CF_UNICODETEXT, qword ptr [rbp-24]
-    test    rax, rax
-    jz      gc_close_wipe_free
-    call    gui_clip_markers                ; exclude from history / cloud / monitors
-    WINCALL CloseClipboard
-    ; remember the clipboard state and arm the auto-clear timer on the persistent
-    ; tray window (falling back to hdlg only in headless/no-tray contexts)
-    WINCALL GetClipboardSequenceNumber
-    mov     dword ptr [g_clip_seq], eax
-    mov     dword ptr [g_clip_retries], 0
     mov     rcx, qword ptr [g_trayhwnd]
     test    rcx, rcx
     jnz     @F
     mov     rcx, qword ptr [rbp-40]
 @@: mov     qword ptr [rbp-40], rcx
+    WINCALL OpenClipboard, qword ptr [rbp-40]
+    test    eax, eax
+    jz      gc_wipe_free
+    WINCALL EmptyClipboard
+    call    gui_clip_markers                ; attach exclusion markers BEFORE secret data
+    test    eax, eax
+    jz      gc_empty_close_wipe
+    WINCALL SetClipboardData, CF_UNICODETEXT, qword ptr [rbp-24]
+    test    rax, rax
+    jz      gc_empty_close_wipe
+    ; Sample sequence number BEFORE CloseClipboard so listener races cannot skew it
+    WINCALL GetClipboardSequenceNumber
+    mov     dword ptr [g_clip_seq], eax
+    WINCALL CloseClipboard
+    mov     dword ptr [g_clip_retries], 0
     WINCALL KillTimer, qword ptr [rbp-40], CLIP_TIMER     ; cancel any prior
     mov     eax, dword ptr [g_clip_secs]        ; 0 = never auto-clear
     test    eax, eax
@@ -6517,7 +6824,8 @@ gc_cpd:
     mov     r10d, eax                           ; stage off the arg regs (r9 is arg4)
     WINCALL SetTimer, qword ptr [rbp-40], CLIP_TIMER, r10d, 0
     jmp     gc_done
-gc_close_wipe_free:
+gc_empty_close_wipe:
+    WINCALL EmptyClipboard
     WINCALL CloseClipboard
 gc_wipe_free:
     WINCALL GlobalLock, qword ptr [rbp-24]
@@ -6535,19 +6843,22 @@ gc_done:
     ret
 gui_copy endp
 
-; gui_clipclear() - if the clipboard still holds the secret we copied (unchanged
-;   sequence number), empty it; otherwise leave the user's newer content alone.
-;   When another process transiently holds OpenClipboard, preserve g_clip_seq and
-;   schedule bounded retries on g_trayhwnd so a clipboard listener cannot pin our
-;   copied secret indefinitely.
+; gui_clipclear() - if the clipboard still holds the secret we copied (matching
+;   g_clip_seq OR g_trayhwnd still owns the clipboard), empty it.
 gui_clipclear proc frame
     FRAME_PROLOG 48
     cmp     dword ptr [g_clip_seq], 0
     je      gcc_done
     WINCALL GetClipboardSequenceNumber
     cmp     eax, dword ptr [g_clip_seq]
-    jne     gcc_keep                        ; changed since our copy -> don't touch
-    WINCALL OpenClipboard, 0
+    je      gcc_do_clear
+    cmp     qword ptr [g_trayhwnd], 0
+    je      gcc_keep
+    WINCALL GetClipboardOwner
+    cmp     rax, qword ptr [g_trayhwnd]
+    jne     gcc_keep                        ; replaced by another owner -> don't touch
+gcc_do_clear:
+    WINCALL OpenClipboard, qword ptr [g_trayhwnd]
     test    eax, eax
     jz      gcc_busy
     WINCALL EmptyClipboard
@@ -9489,6 +9800,8 @@ gui_xfade_begin proc frame
     mov     qword ptr [rbp-136], rax
     test    rax, rax
     jz      gxb_unsel
+    mov     rcx, rax
+    call    gui_protect_hwnd
     mov     qword ptr [rbp-144], 0               ; POINT src {0, 0}
     mov     dword ptr [rbp-148], 00FF0000h       ; BLENDFUNCTION: over, alpha 255
     WINCALL UpdateLayeredWindow, qword ptr [rbp-136], 0, addr rbp-96, addr rbp-88, \
@@ -10188,7 +10501,7 @@ kind_label endp
 
 ; gui_rows_clear(rcx=hdlg) - destroy every runtime row control; count -> 0.
 gui_rows_clear proc frame
-    FRAME_PROLOG 64
+    FRAME_PROLOG 80
     mov     qword ptr [rbp-40], rcx              ; hdlg (for the post-clear repaint)
     mov     dword ptr [rbp-24], 0                ; i
 grc_row:
@@ -10204,6 +10517,7 @@ grc_slot:
     imul    eax, eax, DESCSZ
     lea     r10, [g_fields]
     add     r10, rax
+    mov     edx, dword ptr [r10 + FD_KIND]
     mov     eax, dword ptr [rbp-32]
     lea     r10, [r10 + FD_HANDLES + rax*8]
     mov     rcx, qword ptr [r10]
@@ -10211,7 +10525,20 @@ grc_slot:
     jz      grc_slotnext
     mov     qword ptr [r10], 0
     mov     qword ptr [rbp-48], rcx              ; drop its tooltip first: tools are keyed
-    mov     rdx, rcx                             ;   by hwnd, so destroying the control
+    cmp     eax, DS_LABEL
+    je      grc_scrub_ctl
+    cmp     eax, DS_VALUE
+    jne     grc_tipdel
+    cmp     edx, VF_FILE
+    je      grc_tipdel
+    cmp     edx, VF_IMAGE
+    je      grc_tipdel
+    cmp     edx, VF_SPACER
+    je      grc_tipdel
+grc_scrub_ctl:
+    call    gui_hwnd_scrub                       ; VDR2-04: scrub EDIT heap before DestroyWindow
+grc_tipdel:
+    mov     rdx, qword ptr [rbp-48]              ;   by hwnd, so destroying the control
     mov     rcx, qword ptr [rbp-40]              ;   without this strands a dead entry and
     call    ghost_tip_del                        ;   the list grows on every selection
     mov     rcx, qword ptr [rbp-48]
@@ -10350,6 +10677,7 @@ gra_file:
 gra_secret:
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_VALUE, addr cls_edit, 0, \
             ES_PASSWORD_ or ES_AUTOHSCROLL_ or WS_TABSTOP_ or WS_CLIPSIBLINGS_
+    WINCALL ImmAssociateContext, rax, 0
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_REVEAL, addr cls_button, addr wb_eye, \
             BS_OWNERDRAW_
     GHOSTIFY gt_reveal
@@ -10369,6 +10697,7 @@ gra_notes:
 gra_totp:
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_VALUE, addr cls_edit, 0, \
             ES_PASSWORD_ or ES_AUTOHSCROLL_ or WS_TABSTOP_ or WS_CLIPSIBLINGS_
+    WINCALL ImmAssociateContext, rax, 0
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_REVEAL, addr cls_button, addr wb_eye, \
             BS_OWNERDRAW_
     GHOSTIFY gt_reveal
@@ -11179,17 +11508,17 @@ gui_basename endp
 ; =============================================================================
 
 ; gui_tile_make_temp(ecx = file index) -> eax=1 with an exclusively created,
-;   owner-only ACL'd random directory (verified non-reparse) and sanitized
-;   g_tmpfile beneath it, or eax=0 on failure.
+;   protected inheritable owner+SYSTEM DACL directory (VordrPreview-<32hex>,
+;   verified non-reparse) and sanitized g_tmpfile beneath it, or eax=0 on failure.
 gui_tile_make_temp proc frame
     FRAME_PROLOG 176
     mov     dword ptr [rbp-24], ecx
     mov     dword ptr [g_tmpdir_len], 0
-    ; Reserve space for a 32-hex random directory, slash and 120-char basename.
-    WINCALL GetTempPathW, TEMP_PATHW-160, addr g_tmpfile
+    ; Reserve space for VordrPreview- (13) + 32-hex random dir, slash and 120-char basename.
+    WINCALL GetTempPathW, TEMP_PATHW-180, addr g_tmpfile
     test    eax, eax
     jz      gtmt_fail
-    cmp     eax, TEMP_PATHW-160
+    cmp     eax, TEMP_PATHW-180
     jae     gtmt_fail
     mov     dword ptr [rbp-32], eax                  ; base length incl trailing '\'
     lea     rcx, [rbp-64]
@@ -11198,41 +11527,25 @@ gui_tile_make_temp proc frame
     test    eax, eax
     jz      gtmt_fail
     mov     eax, dword ptr [rbp-32]
-    lea     rdx, [g_tmpfile]
-    lea     rdx, [rdx+rax*2]
+    lea     rcx, [g_tmpfile]
+    lea     rcx, [rcx+rax*2]
+    lea     rdx, [tmp_dir_pfx]                       ; "VordrPreview-" (13 wchars)
+    lea     r8, [g_tmpfile + (TEMP_PATHW-1)*2]
+    call    gui_wstrcpy
+    mov     qword ptr [rbp-72], rax                  ; ptr right after "VordrPreview-"
     mov     rcx, qword ptr [rbp-64]
+    mov     rdx, rax
     call    gui_ft_hex16
-    mov     eax, dword ptr [rbp-32]
-    lea     rdx, [g_tmpfile+32]
-    lea     rdx, [rdx+rax*2]
     mov     rcx, qword ptr [rbp-56]
+    mov     rdx, qword ptr [rbp-72]
+    add     rdx, 32
     call    gui_ft_hex16
-    ; Build an owner-only DACL from our process token's user SID so other local
-    ; users on shared systems cannot traverse or read the decrypt-to-temp subdir.
-    WINCALL GetCurrentProcess
-    mov     qword ptr [rbp-72], rax
-    WINCALL OpenProcessToken, qword ptr [rbp-72], TOKEN_QUERY_, addr rbp-80
-    test    eax, eax
-    jz      gtmt_fail
-    WINCALL GetTokenInformation, qword ptr [rbp-80], 1, addr g_tmp_tokbuf, 128, addr rbp-84
-    mov     dword ptr [rbp-88], eax
-    WINCALL CloseHandle, qword ptr [rbp-80]
-    cmp     dword ptr [rbp-88], 0
-    je      gtmt_fail
-    mov     rax, qword ptr [g_tmp_tokbuf]            ; TOKEN_USER.User.Sid
-    test    rax, rax
-    jz      gtmt_fail
-    mov     qword ptr [rbp-72], rax
-    WINCALL InitializeAcl, addr g_tmp_acl, 256, ACL_REVISION_
-    test    eax, eax
-    jz      gtmt_fail
-    WINCALL AddAccessAllowedAce, addr g_tmp_acl, ACL_REVISION_, GENERIC_ALL_, qword ptr [rbp-72]
-    test    eax, eax
-    jz      gtmt_fail
-    WINCALL InitializeSecurityDescriptor, addr g_tmp_sd, 1
-    test    eax, eax
-    jz      gtmt_fail
-    WINCALL SetSecurityDescriptorDacl, addr g_tmp_sd, 1, addr g_tmp_acl, 0
+    ; Protected inheritable DACL (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) for
+    ; TokenUser + SYSTEM so child preview files do not inherit permissive %TEMP% ACEs.
+    mov     ecx, GENERIC_ALL_
+    mov     edx, INHERIT_ACE_FLAGS_
+    xor     r8d, r8d
+    call    gui_build_user_dacl
     test    eax, eax
     jz      gtmt_fail
     mov     qword ptr [rbp-112], 24                  ; SECURITY_ATTRIBUTES.nLength = 24
@@ -11248,7 +11561,7 @@ gui_tile_make_temp proc frame
     test    eax, FILE_ATTRIBUTE_REPARSE_POINT_
     jnz     gtmt_rmdir_fail
     mov     eax, dword ptr [rbp-32]
-    add     eax, 32
+    add     eax, 45                                  ; 13 ("VordrPreview-") + 32 hex chars
     mov     dword ptr [g_tmpdir_len], eax
     lea     r10, [g_tmpfile]
     mov     word ptr [r10+rax*2], 5Ch
@@ -11546,6 +11859,123 @@ gtp_done:
     FRAME_EPILOG
     ret
 gui_temp_purge endp
+
+; gui_temp_sweep_stale() - at GUI startup (before any active preview exists),
+;   wipe + delete any leftover %TEMP%\VordrPreview-* directories from a prior
+;   abnormally terminated session (skipping reparse points) (VDR2-14).
+gui_temp_sweep_stale proc frame
+    FRAME_PROLOG 144
+    WINCALL GetTempPathW, TEMP_PATHW-320, addr g_sweep_dir
+    test    eax, eax
+    jz      gtss_ret
+    cmp     eax, TEMP_PATHW-320
+    jae     gtss_ret
+    mov     dword ptr [rbp-24], eax                  ; baseLen (incl. trailing '\')
+    lea     rcx, [g_sweep_dir]
+    lea     rcx, [rcx+rax*2]
+    lea     rdx, [tmp_sweep_glob]                    ; "VordrPreview-*"
+    lea     r8, [g_sweep_dir + (TEMP_PATHW-1)*2]
+    call    gui_wstrcpy
+    WINCALL FindFirstFileW, addr g_sweep_dir, addr g_sweep_wfd
+    cmp     rax, -1
+    je      gtss_ret
+    mov     qword ptr [rbp-32], rax                  ; hFind
+    mov     eax, dword ptr [rbp-24]
+    lea     r10, [g_sweep_dir]
+    mov     word ptr [r10+rax*2], 0                  ; restore %TEMP%\ NUL terminator
+gtss_dir_loop:
+    mov     eax, dword ptr [g_sweep_wfd]             ; dwFileAttributes
+    test    eax, 10h                                 ; must be directory
+    jz      gtss_dir_next
+    test    eax, FILE_ATTRIBUTE_REPARSE_POINT_       ; skip junctions / symlinks
+    jnz     gtss_dir_next
+    ; Build g_sweep_sub = "%TEMP%\VordrPreview-<hex>\*"
+    lea     rcx, [g_sweep_sub]
+    lea     rdx, [g_sweep_dir]
+    lea     r8, [g_sweep_sub + (TEMP_PATHW-280)*2]
+    call    gui_wstrcpy
+    mov     rcx, rax
+    lea     rdx, [g_sweep_wfd + 44]                  ; cFileName
+    lea     r8, [g_sweep_sub + (TEMP_PATHW-270)*2]
+    call    gui_wstrcpy
+    lea     r10, [g_sweep_sub]
+    sub     rax, r10
+    shr     rax, 1
+    mov     dword ptr [rbp-48], eax                  ; dirEndLen (wchars)
+    mov     word ptr [r10+rax*2], 5Ch                ; '\'
+    mov     word ptr [r10+rax*2+2], '*'
+    mov     word ptr [r10+rax*2+4], 0
+    WINCALL FindFirstFileW, addr g_sweep_sub, addr g_sweep_subwfd
+    cmp     rax, -1
+    je      gtss_rmdir
+    mov     qword ptr [rbp-40], rax                  ; hSub
+gtss_file_loop:
+    mov     eax, dword ptr [g_sweep_subwfd]
+    test    eax, 10h                                 ; skip '.' / '..' / subdirs
+    jnz     gtss_file_next
+    test    eax, FILE_ATTRIBUTE_REPARSE_POINT_       ; skip symlinks
+    jnz     gtss_file_next
+    mov     eax, dword ptr [rbp-48]
+    inc     eax
+    lea     rcx, [g_sweep_sub]
+    lea     rcx, [rcx+rax*2]
+    lea     rdx, [g_sweep_subwfd + 44]
+    lea     r8, [g_sweep_sub + (TEMP_PATHW-1)*2]
+    call    gui_wstrcpy
+    WINCALL SetFileAttributesW, addr g_sweep_sub, FILE_ATTR_NORMAL
+    WINCALL CreateFileW, addr g_sweep_sub, GENERIC_WRITE_, FILE_SHARE_RWD, 0, \
+            OPEN_EXISTING, 00200080h, 0              ; FILE_FLAG_OPEN_REPARSE_POINT | NORMAL
+    cmp     rax, -1
+    je      gtss_file_del
+    mov     qword ptr [rbp-56], rax                  ; hFile
+    mov     qword ptr [rbp-64], 0
+    WINCALL GetFileSizeEx, qword ptr [rbp-56], addr rbp-64
+    test    eax, eax
+    jz      gtss_file_close
+    cmp     qword ptr [rbp-64], 4000000h             ; cap overwrite at 64 MiB
+    jbe     gtss_wipe_lp
+    mov     qword ptr [rbp-64], 4000000h
+gtss_wipe_lp:
+    mov     r10, qword ptr [rbp-64]
+    test    r10, r10
+    jz      gtss_file_flush
+    cmp     r10, WIPE_CHUNK
+    jbe     @F
+    mov     r10, WIPE_CHUNK
+@@: mov     dword ptr [rbp-72], 0
+    WINCALL WriteFile, qword ptr [rbp-56], addr g_wipezeros, r10d, addr rbp-72, 0
+    test    eax, eax
+    jz      gtss_file_flush
+    mov     r10d, dword ptr [rbp-72]
+    test    r10d, r10d
+    jz      gtss_file_flush
+    sub     qword ptr [rbp-64], r10
+    jmp     gtss_wipe_lp
+gtss_file_flush:
+    WINCALL FlushFileBuffers, qword ptr [rbp-56]
+gtss_file_close:
+    WINCALL CloseHandle, qword ptr [rbp-56]
+gtss_file_del:
+    WINCALL DeleteFileW, addr g_sweep_sub
+gtss_file_next:
+    WINCALL FindNextFileW, qword ptr [rbp-40], addr g_sweep_subwfd
+    test    eax, eax
+    jnz     gtss_file_loop
+    WINCALL FindClose, qword ptr [rbp-40]
+gtss_rmdir:
+    mov     eax, dword ptr [rbp-48]
+    lea     r10, [g_sweep_sub]
+    mov     word ptr [r10+rax*2], 0
+    WINCALL RemoveDirectoryW, addr g_sweep_sub
+gtss_dir_next:
+    WINCALL FindNextFileW, qword ptr [rbp-32], addr g_sweep_wfd
+    test    eax, eax
+    jnz     gtss_dir_loop
+    WINCALL FindClose, qword ptr [rbp-32]
+gtss_ret:
+    FRAME_EPILOG
+    ret
+gui_temp_sweep_stale endp
 
 ; gui_tmptest() -> eax = 0 pass / 1 fail (headless probe for the secure temp
 ;   lifecycle). Checks unique directories, exclusive-create collision refusal,
@@ -13169,6 +13599,8 @@ grr_apply:
     mov     dword ptr [rbp-48], eax              ; id
     WINCALL SendDlgItemMessageW, qword ptr [rbp-24], dword ptr [rbp-48], \
             EM_SETPASSWORDCHAR, dword ptr [rbp-40], 0
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], dword ptr [rbp-48], \
+            EM_EMPTYUNDOBUFFER_, 0, 0
     mov     ecx, dword ptr [rbp-32]
     mov     edx, DS_VALUE
     call    gui_row_handle
@@ -14260,8 +14692,8 @@ gui_draw_rowcolor endp
 
 ; gui_colorpw_hide(rcx=hdlg) - hide the colour overlay + restore the value edit.
 gui_colorpw_hide proc frame
-    FRAME_PROLOG 32
-    mov     qword ptr [rbp-24], rcx
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-16], rcx
     cmp     dword ptr [g_colorpw_row], 0
     jl      cph_ovl
     mov     ecx, dword ptr [g_colorpw_row]    ; re-show the value edit we hid
@@ -14272,7 +14704,7 @@ gui_colorpw_hide proc frame
     call    ShowWindow
 cph_ovl:
     mov     dword ptr [g_colorpw_row], -1
-    mov     rcx, qword ptr [rbp-24]
+    mov     rcx, qword ptr [rbp-16]
     mov     edx, IDC_V_COLORPW
     call    GetDlgItem
     mov     rcx, rax
@@ -14453,23 +14885,15 @@ grp_fits:
     WINCALL GetDlgItemTextW, qword ptr [rbp-24], dword ptr [rbp-32], addr g_readpw, 256
     WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_PWREAD, qword ptr [rbp-24], \
             addr pwread_proc, 0
-    lea     r10, [g_readpw]                   ; wipe plaintext + phonetic scratch
-    xor     ecx, ecx
-grp_wipe:
-    cmp     ecx, 260
-    jae     grp_wiped
-    mov     word ptr [r10+rcx*2], 0
-    inc     ecx
-    jmp     grp_wipe
-grp_wiped:
-    lea     r10, [g_phon_w]
-    xor     ecx, ecx
-grp_wipe2:
-    cmp     ecx, 6144
-    jae     grp_done
-    mov     word ptr [r10+rcx*2], 0
-    inc     ecx
-    jmp     grp_wipe2
+    lea     rcx, [g_readpw]                   ; VDR2-22: non-elidable wipe of readout + phonetic scratch
+    mov     edx, 260 * 2
+    call    secure_zero
+    lea     rcx, [g_phon_w]
+    mov     edx, 6144 * 2
+    call    secure_zero
+    lea     rcx, [g_wordtmp]
+    mov     edx, 32 * 2
+    call    secure_zero
 grp_done:
     FRAME_EPILOG
     ret
@@ -14745,10 +15169,10 @@ gui_hex16_to_ft endp
 
 ; gui_set_deleted_now() - stamp g_deleted_ft with the current time (16 wide hex).
 gui_set_deleted_now proc frame
-    FRAME_PROLOG 48
-    lea     rcx, [rbp-40]                       ; FILETIME (8 bytes)
+    FRAME_PROLOG 64
+    lea     rcx, [rbp-24]                       ; FILETIME (8 bytes)
     call    GetSystemTimeAsFileTime
-    mov     rcx, qword ptr [rbp-40]
+    mov     rcx, qword ptr [rbp-24]
     lea     rdx, [g_deleted_ft]
     call    gui_ft_hex16
     FRAME_EPILOG
@@ -14759,17 +15183,17 @@ gui_set_deleted_now endp
 ;   high->low, hard-removing any VF_DELETED entry whose timestamp is older than 30
 ;   days.  Reseals if anything was purged.  Called once at unlock.
 gui_purge_trash proc frame
-    FRAME_PROLOG 64
+    FRAME_PROLOG 80
     cmp     dword ptr [g_readonly], 0           ; E9: no auto-purge on a read-only open
     je      pt_go
     xor     eax, eax
     FRAME_EPILOG
     ret
 pt_go:
-    ; [rbp-24] now-ft, [rbp-32] purged count, [rbp-40] index
-    lea     rcx, [rbp-56]
+    ; [rbp-24] now-ft, [rbp-32] purged count, [rbp-40] index, [rbp-48] ft scratch
+    lea     rcx, [rbp-48]
     call    GetSystemTimeAsFileTime
-    mov     rax, qword ptr [rbp-56]
+    mov     rax, qword ptr [rbp-48]
     mov     qword ptr [rbp-24], rax             ; now (FILETIME)
     mov     dword ptr [rbp-32], 0
     call    vault_count
@@ -16313,9 +16737,11 @@ vp_init:
     cmp     dword ptr [g_openfile_set], 0
     je      @F
     mov     dword ptr [g_openfile_set], 0
-    lea     rcx, [g_imgpath]
+    cmp     dword ptr [g_readonly], 0
+    jne     @F
+    lea     rcx, [g_imppath]
     lea     rdx, [g_openfile]
-    lea     r8, [g_imgpath + (MAX_PATH_CHARS-1)*2]        ; last slot the NUL may occupy
+    lea     r8, [g_imppath + (MAX_PATH_CHARS-1)*2]       ; last slot the NUL may occupy
     call    gui_wstrcpy
     mov     dword ptr [g_imp_preset], 1
     WINCALL PostMessageW, qword ptr [rbp-8], WM_COMMAND, IDC_V_MIMPORT, 0
@@ -17030,6 +17456,14 @@ vp_lock_go:
     call    WTSUnRegisterSessionNotification
     add     rsp, 32
     mov     dword ptr [g_totp_on], 0
+    mov     rcx, qword ptr [rbp-8]          ; VDR2-04: scrub search, title, and dynamic rows on lock
+    mov     edx, IDC_V_SEARCH
+    call    gui_edit_scrub
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_V_TITLE
+    call    gui_edit_scrub
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_rows_clear
     call    gui_temp_purge                  ; overwrite + delete any decrypt-to-temp files
     call    gui_clipclear                   ; clear the clipboard (or arm tray retry timer)
     lea     rcx, [g_secret_w]               ; wipe revealed secret + TOTP material
@@ -17164,6 +17598,18 @@ lp_tpm_done:
     jz      @F
     mov     eax, 1
 @@: mov     dword ptr [g_nopreview], eax
+    ; AllowUncVault: strictly HKLM-only (0/1; default 0; HKCU cannot weaken UNC block) (VDR2-02)
+    WINCALL cfg_get_dword_hklm, addr wv_allowunc, 0
+    test    eax, eax
+    jz      @F
+    mov     eax, 1
+@@: mov     dword ptr [g_allow_unc], eax
+    ; AllowScreenCapture: HKLM > HKCU > default 0 (0 = WDA_EXCLUDEFROMCAPTURE active) (VDR2-05)
+    WINCALL cfg_get_dword, addr wv_allowsccap, 0, 0
+    test    eax, eax
+    jz      @F
+    mov     eax, 1
+@@: mov     dword ptr [g_allow_screencap], eax
     FRAME_EPILOG
     ret
 gui_load_policy endp
@@ -17862,6 +18308,12 @@ cp_tunh:
     xor     eax, eax
     jmp     cp_ret
 cp_destroy:
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_C_PW
+    call    gui_edit_scrub
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_C_PW2
+    call    gui_edit_scrub
     mov     qword ptr [g_secdesk_hwnd], 0
     xor     eax, eax
     jmp     cp_ret
@@ -17873,6 +18325,12 @@ cp_init:
     call    theme_attach
     mov     rcx, qword ptr [rbp-8]
     call    gui_set_winicon
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_C_PW
+    call    gui_edit_noime
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_C_PW2
+    call    gui_edit_noime
     call    gui_pwbars_init                  ; build the strength brushes
     WINCALL LoadImageW, qword ptr [g_hinst], 1, 1, 64, 64, 0   ; large Vordr logo
     mov     qword ptr [rbp-16], rax
@@ -19447,9 +19905,13 @@ gim_ask:
     jz      gim_done
     cmp     qword ptr [g_body_ptr], 0           ; VDR-06: locked while picker was open?
     je      gim_done
+    lea     rcx, [g_imppath]
+    lea     rdx, [g_imgpath]
+    lea     r8, [g_imppath + (MAX_PATH_CHARS-1)*2]
+    call    gui_wstrcpy
 gim_havefile:
     mov     qword ptr [g_rf_cap], 0F0000000h    ; = ZE_MAXCAP: the lengths below are 32-bit
-    lea     rcx, [g_imgpath]
+    lea     rcx, [g_imppath]
     lea     rdx, [rbp-32]                       ; *raw
     lea     r8, [rbp-40]                        ; *rawlen
     call    read_file
@@ -19541,8 +20003,14 @@ gim_vpw_alive:
     test    eax, eax
     jz      gim_bad
     ; vault_open_foreign parks and restores every live global, so the open vault is
-    ; untouched by this - and it wipes the password we hand it.
-    lea     rcx, [g_imgpath]
+    ; untouched by this - and it wipes the password we hand it.  Pass the already-read
+    ; raw image via g_vof_buf/g_vof_len so it is never re-read from disk (VDR2-23).
+    mov     rax, qword ptr [rbp-32]
+    mov     qword ptr [g_vof_buf], rax
+    mov     qword ptr [rbp-32], 0
+    mov     rax, qword ptr [rbp-40]
+    mov     qword ptr [g_vof_len], rax
+    lea     rcx, [g_imppath]
     lea     rdx, [g_cfg_pass]
     mov     r8d, dword ptr [g_cfg_passlen]
     lea     r9, [rbp-56]                        ; -> foreign body
@@ -19683,7 +20151,7 @@ gui_pg_toggle_text endp
 ; gui_pg_sync(rcx=hdlg) - refresh all toggle captions, the style button and the
 ;   length readout from g_pg_opt / g_pg_style / g_pg_len.
 gui_pg_sync proc frame
-    FRAME_PROLOG 48
+    FRAME_PROLOG 64
     mov     qword ptr [rbp-24], rcx
     xor     r8d, r8d
     test    dword ptr [g_pg_opt], PWCLASS_U
@@ -19725,6 +20193,24 @@ gui_pg_sync proc frame
     lea     r8, [g_pg_tmpw + (128-1)*2]        ; last slot the NUL may occupy
     call    gui_wstrcpy
     WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_PG_STYLE, addr g_pg_tmpw
+    ; Clamp slider range + g_pg_len: [6..24] in passphrase mode, [6..64] otherwise (VDR2-25)
+    mov     ecx, 400006h
+    mov     edx, 64
+    cmp     dword ptr [g_pg_style], PWS_PASSPHRASE
+    jne     gps_rng
+    mov     ecx, 180006h
+    mov     edx, 24
+gps_rng:
+    mov     eax, dword ptr [g_pg_len]
+    cmp     eax, 6
+    jae     @F
+    mov     eax, 6
+@@: cmp     eax, edx
+    jbe     @F
+    mov     eax, edx
+@@: mov     dword ptr [g_pg_len], eax
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_PG_LEN, TBM_SETRANGE, 1, rcx
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-24], IDC_PG_LEN, TBM_SETPOS, 1, dword ptr [g_pg_len]
     ; length readout
     mov     ecx, dword ptr [g_pg_len]
     lea     rdx, [g_pg_tmpw]
@@ -19839,6 +20325,8 @@ pwgen_proc proc
     mov     qword ptr [rbp-8], rcx
     cmp     rdx, WM_INITDIALOG
     je      pp_init
+    cmp     rdx, WM_DESTROY
+    je      pp_destroy
     cmp     rdx, WM_COMMAND
     je      pp_cmd
     cmp     rdx, WM_HSCROLL_
@@ -19914,8 +20402,9 @@ pp_init:
 pp_init_lbl:
     mov     rcx, qword ptr [rbp-8]
     call    gui_set_winicon
-    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_PG_LEN, TBM_SETRANGE, 1, 400006h
-    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_PG_LEN, TBM_SETPOS, 1, dword ptr [g_pg_len]
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_PG_OUT
+    call    gui_edit_noime
     mov     rcx, qword ptr [rbp-8]
     call    gui_pg_sync
     mov     rcx, qword ptr [rbp-8]
@@ -20016,6 +20505,18 @@ pp_cancel:
     call    secure_zero
     WINCALL EndDialog, qword ptr [rbp-8], 0
     mov     eax, 1
+    jmp     pp_ret
+pp_destroy:
+    mov     rcx, qword ptr [rbp-8]               ; VDR2-04: also scrub when ended via gui_end_modals
+    mov     edx, IDC_PG_OUT
+    call    gui_edit_scrub
+    lea     rcx, [g_genout]
+    mov     edx, 260
+    call    secure_zero
+    lea     rcx, [g_genout_w]
+    mov     edx, 520
+    call    secure_zero
+    xor     eax, eax
 pp_ret:
     mov     rsp, rbp
     pop     rbp
@@ -20145,6 +20646,12 @@ xlpw_proc proc
     xor     eax, eax
     jmp     xpp_ret
 xpp_destroy:
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_XP_PW
+    call    gui_edit_scrub
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_XP_PW2
+    call    gui_edit_scrub
     mov     rax, qword ptr [rbp-8]
     cmp     qword ptr [g_secdesk_hwnd], rax
     jne     @F
@@ -20180,6 +20687,12 @@ xpp_init:
     call    theme_attach
     mov     rcx, qword ptr [rbp-8]
     call    gui_set_winicon
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_XP_PW
+    call    gui_edit_noime
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_XP_PW2
+    call    gui_edit_noime
     lea     rax, [exp_pw_vordr]                 ; the blurb must describe the format the
     cmp     dword ptr [g_exp_iszip], 0          ;   user actually picked, not whatever the
     je      @F                                  ;   .rc happened to say when ZIP was the
@@ -20349,6 +20862,9 @@ pwremind_proc proc
     xor     eax, eax
     jmp     rmp_ret
 rmp_destroy:
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_RM_PW
+    call    gui_edit_scrub
     mov     rax, qword ptr [rbp-8]
     cmp     qword ptr [g_secdesk_hwnd], rax
     jne     @F
@@ -20381,6 +20897,9 @@ rmp_init:
     call    theme_attach
     mov     rcx, qword ptr [rbp-8]
     call    gui_set_winicon
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_RM_PW
+    call    gui_edit_noime
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_RM_PW, EM_SETCUEBANNER, 1, addr cue_rmpw
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_RM_PW, EM_LIMITTEXT, PW_MAXCH, 0
     mov     eax, 1
@@ -20527,6 +21046,9 @@ imppw_proc proc
     xor     eax, eax
     jmp     ipp_ret
 ipp_destroy:
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_XP_PW
+    call    gui_edit_scrub
     mov     rax, qword ptr [rbp-8]
     cmp     qword ptr [g_secdesk_hwnd], rax
     jne     @F
@@ -20562,6 +21084,9 @@ ipp_init:
     call    theme_attach
     mov     rcx, qword ptr [rbp-8]
     call    gui_set_winicon
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_XP_PW
+    call    gui_edit_noime
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_XP_PW, EM_SETCUEBANNER, 1, addr cue_ippw
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_XP_PW, EM_LIMITTEXT, XLPW_MAXCH, 0
     mov     eax, 1
@@ -20888,7 +21413,7 @@ icon_proc endp
 ;   Mode:  no file at that path -> create (g_create=1); file present -> open.
 ;   Sets g_vpath / g_vpath_set / g_create / g_is_default / g_vault_lock.
 gui_resolve_vault proc frame
-    FRAME_PROLOG 32
+    FRAME_PROLOG 64
     mov     dword ptr [g_is_default], 0
     mov     dword ptr [g_vault_lock], 0
 ifdef PROBE_IO
@@ -20905,8 +21430,19 @@ endif
     mov     edx, MAX_PATH_CHARS
     lea     r8, [g_vault_lock]
     call    reg_load_vault                  ; HKLM>HKCU registered path, if any
-    test    eax, eax
-    jnz     grv_havepath
+    mov     dword ptr [rbp-24], eax
+    cmp     dword ptr [g_vault_lock], 0     ; HKLM vault lock wins over --ro <path>
+    jne     grv_havepath
+    cmp     word ptr [g_ro_vpath], 0
+    je      grv_chk_reg
+    lea     rcx, [g_vpath]
+    lea     rdx, [g_ro_vpath]
+    lea     r8, [g_vpath + (MAX_PATH_CHARS-1)*2]
+    call    gui_wstrcpy
+    jmp     grv_havepath
+grv_chk_reg:
+    cmp     dword ptr [rbp-24], 0
+    jne     grv_havepath
     ; nothing in the registry -> fall back to the default Documents\vault.vordr
     lea     rcx, [g_vpath]
     mov     edx, MAX_PATH_CHARS             ; g_vpath's declared size
@@ -21167,10 +21703,21 @@ endif
     mov     rcx, qword ptr [rbp-48]
     mov     rdx, qword ptr [rbp-40]
     call    gui_ft_hex16                         ; 16 hex + NUL
-    WINCALL CreateDesktopW, addr g_secdesk_name, 0, 0, 0, DESKTOP_MAXALLOWED, 0
+    WINCALL CreateDesktopW, addr g_secdesk_name, 0, 0, 0, DESKTOP_CREATE_ACCESS_, 0
     mov     qword ptr [g_secdesk_hd], rax
     test    rax, rax
     jz      gss_fallback                         ; no desktop -> fallback gate
+    ; VDR2-12: apply a protected DACL stripping DESKTOP_HOOKCONTROL, DESKTOP_READOBJECTS,
+    ; DESKTOP_WRITEOBJECTS, DESKTOP_JOURNALRECORD, and DESKTOP_JOURNALPLAYBACK for peers.
+    mov     ecx, DESKTOP_PRIV_USER_MASK_
+    xor     edx, edx
+    xor     r8d, r8d
+    call    gui_build_user_dacl
+    test    eax, eax
+    jz      gss_fallback
+    WINCALL SetUserObjectSecurity, qword ptr [g_secdesk_hd], DACL_SECURITY_INFORMATION_, addr g_tmp_sd
+    test    eax, eax
+    jz      gss_fallback
     WINCALL CreateThread, 0, 0, addr secdesk_thread, 0, 0, 0
     mov     qword ptr [rbp-24], rax              ; worker thread handle
     test    rax, rax
@@ -22021,6 +22568,16 @@ twp_copydata:
     ; VDR-07: refuse hand-offs whenever a modal dialog (Export, Import, Attach,
     ; Unlock, Create, ...) is already active, so g_imgpath / g_openfile cannot be
     ; mutated mid-flow.
+    mov     rcx, qword ptr [rbp-24]              ; VDR2-10: sender HWND must belong to vordr.exe
+    call    gui_hwnd_is_self
+    test    eax, eax
+    jz      twp_cd_no
+    cmp     dword ptr [g_readonly], 0
+    jne     twp_cd_no
+    cmp     qword ptr [g_secdesk_hd], 0
+    jne     twp_cd_no
+    cmp     dword ptr [g_imp_preset], 0
+    jne     twp_cd_no
     cmp     qword ptr [g_vaulthwnd], 0
     je      twp_cd_chkshow
     WINCALL GetWindow, qword ptr [g_vaulthwnd], GW_ENABLEDPOPUP_
@@ -22065,9 +22622,9 @@ twp_cd_parse:
     cmp     qword ptr [g_vaulthwnd], 0           ; vault already open -> import now
     je      twp_open                             ; otherwise run the usual open flow
     WINCALL SetForegroundWindow, qword ptr [g_vaulthwnd]
-    lea     rcx, [g_imgpath]                    ; arm the import BEFORE posting it
+    lea     rcx, [g_imppath]                     ; arm private import path BEFORE posting it
     lea     rdx, [g_openfile]
-    lea     r8, [g_imgpath + (MAX_PATH_CHARS-1)*2]        ; last slot the NUL may occupy
+    lea     r8, [g_imppath + (MAX_PATH_CHARS-1)*2]       ; last slot the NUL may occupy
     call    gui_wstrcpy
     mov     dword ptr [g_imp_preset], 1
     mov     dword ptr [g_openfile_set], 0
@@ -22491,6 +23048,7 @@ ifdef PROBE_IO
     mov     dword ptr [g_tpm_present], 0
 gm_notest:
 endif
+    call    gui_temp_sweep_stale            ; VDR2-14: wipe any stale %TEMP%\VordrPreview-* dirs
     call    gui_resolve_vault
     ; ---- register + create the hidden tray-owner window --------------------
     lea     rcx, [g_wc]
@@ -23783,15 +24341,19 @@ ifdef PROBE_IO
     cmp     dword ptr [g_testmode], 0       ;   or waits on, the user's own Vordr
     jne     ws_gui_go
 endif
+    WINCALL cfg_get_dword_hklm, addr wv_allowunc, 0
+    test    eax, eax
+    jz      @F
+    mov     eax, 1
+@@: mov     dword ptr [g_allow_unc], eax
     call    gui_shell_arg                   ; a .vordr from the shell association?
-    WINCALL CreateMutexW, 0, 1, addr g_singleton_name
+    call    gui_create_singleton_mutex
     call    GetLastError
     cmp     eax, 183                        ; ERROR_ALREADY_EXISTS
     jne     ws_gui_go
-    ; Already running.  If the shell handed US a vault, the running instance is
-    ; the one that must import it - just focusing it would drop the file on the
-    ; floor, which is what a double-click would do every time given Vordr lives
-    ; in the tray.
+    ; Already running.  Verify any candidate window actually belongs to this exact
+    ; vordr.exe binary (gui_hwnd_is_self) so a spoofed window title/class cannot
+    ; intercept WM_COPYDATA or suppress startup (VDR2-10).
     cmp     dword ptr [g_openfile_set], 0
     je      ws_gui_focuschain
     WINCALL FindWindowW, addr tray_cls, 0
@@ -23799,29 +24361,46 @@ endif
     jz      ws_gui_go                       ; squatted/stale mutex with no tray -> start up
     mov     rcx, rax
     call    gui_send_openfile
+    test    eax, eax
+    jz      ws_gui_go                       ; spoofed or hung tray -> start our own instance
     jmp     ws_gui_exit
 ws_gui_focuschain:
     WINCALL FindWindowW, 0, addr g_vault_title
-    test    rax, rax
+    mov     qword ptr [rsp+48], rax
+    mov     rcx, rax
+    call    gui_hwnd_is_self
+    test    eax, eax
     jnz     ws_gui_focus
     WINCALL FindWindowW, 0, addr g_vault_title_ro
-    test    rax, rax
+    mov     qword ptr [rsp+48], rax
+    mov     rcx, rax
+    call    gui_hwnd_is_self
+    test    eax, eax
     jnz     ws_gui_focus
     WINCALL FindWindowW, 0, addr g_unlock_title
-    test    rax, rax
+    mov     qword ptr [rsp+48], rax
+    mov     rcx, rax
+    call    gui_hwnd_is_self
+    test    eax, eax
     jnz     ws_gui_focus
     WINCALL FindWindowW, 0, addr g_create_title
-    test    rax, rax
+    mov     qword ptr [rsp+48], rax
+    mov     rcx, rax
+    call    gui_hwnd_is_self
+    test    eax, eax
     jnz     ws_gui_focus
     ; no dialog is up: the running instance is sitting in the tray - post it an
     ; Open command so IT shows the unlock/create flow, instead of dying silently
     WINCALL FindWindowW, addr tray_cls, 0
-    test    rax, rax
-    jz      ws_gui_go                       ; squatted/stale mutex with no tray -> start up
-    WINCALL PostMessageW, rax, WM_COMMAND, IDM_OPEN, 0
+    mov     qword ptr [rsp+48], rax
+    mov     rcx, rax
+    call    gui_hwnd_is_self
+    test    eax, eax
+    jz      ws_gui_go                       ; squatted/stale mutex or spoofed tray -> start up
+    WINCALL PostMessageW, qword ptr [rsp+48], WM_COMMAND, IDM_OPEN, 0
     jmp     ws_gui_exit
 ws_gui_focus:
-    WINCALL SetForegroundWindow, rax
+    WINCALL SetForegroundWindow, qword ptr [rsp+48]
 ws_gui_exit:
     WINCALL ExitProcess, 0
 ws_gui_go:

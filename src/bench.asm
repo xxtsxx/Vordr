@@ -16,6 +16,7 @@ extern gcm_seal:proc
 extern sha256_hash:proc
 extern argon2id_hash:proc
 extern rng_fill:proc
+extern secure_zero:proc
 extern print_a:proc
 extern print_u64:proc
 
@@ -120,9 +121,13 @@ do_bench proc frame
     lea     rcx, [b_key]
     mov     edx, 32
     call    rng_fill
+    test    eax, eax
+    jz      b_oomfree
     lea     rcx, [b_iv]
     mov     edx, 12
     call    rng_fill
+    test    eax, eax
+    jz      b_oomfree
     lea     rcx, [qpc_freq]
     call    QueryPerformanceFrequency
 
@@ -184,6 +189,8 @@ do_bench proc frame
     lea     rcx, [b_salt]
     mov     edx, 16
     call    rng_fill
+    test    eax, eax
+    jz      b_oomwipe
     lea     r10, [g_areq]
     mov     eax, dword ptr [g_cfg_t]
     mov     dword ptr [r10].ARGON2REQ.t_cost, eax
@@ -209,6 +216,8 @@ do_bench proc frame
     call    QueryPerformanceCounter
     lea     rcx, [g_areq]
     call    argon2id_hash
+    test    eax, eax
+    jnz     b_oomwipe
     lea     rcx, [qpc_b]
     call    QueryPerformanceCounter
     lea     rcx, [b_arg]
@@ -237,9 +246,21 @@ do_bench proc frame
     lea     rcx, [b_tend]
     mov     edx, b_tend_len
     call    print_a
+    lea     rcx, [b_key]
+    mov     edx, 32 + 12 + 16 + 32 + 16 + 32
+    call    secure_zero
     mov     eax, EXIT_OK
     FRAME_EPILOG
     ret
+b_oomfree:
+    mov     rcx, qword ptr [b_buf]
+    mov     rdx, BENCH_BYTES
+    call    mem_free
+    mov     qword ptr [b_buf], 0
+b_oomwipe:
+    lea     rcx, [b_key]
+    mov     edx, 32 + 12 + 16 + 32 + 16 + 32
+    call    secure_zero
 b_oomexit:
     lea     rcx, [b_oom]
     mov     edx, b_oom_len

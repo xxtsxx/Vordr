@@ -97,13 +97,15 @@ $Policies = @(
     @{ Prop="VORDR_NOHISTORY";       Value="NoHistory";       Comp="PolNoHistory";    Guid="{835B8733-0B32-4DFF-AE70-3DDB1F261FA6}"; Range="0/1";     Default="0";   Doc="do not keep per-entry history" }
     @{ Prop="VORDR_NOPHONETIC";      Value="NoPhonetic";      Comp="PolNoPhonetic";   Guid="{2C20D1F4-69BF-44A1-B131-44DFBE4DB6F3}"; Range="0/1";     Default="0";   Doc="disable the phonetic secret reader" }
     @{ Prop="VORDR_NOPREVIEW";       Value="NoPreview";       Comp="PolNoPreview";    Guid="{7887784C-D701-466E-B920-14E2DD01FB71}"; Range="0/1";     Default="0";   Doc="attachments download only, never preview via another app" }
-    @{ Prop="VORDR_LOGLEVEL";        Value="LogLevel";        Comp="PolLogLevel";     Guid="{A3BD3F2C-326F-4749-A57E-A78D1EC4AC0E}"; Range="0-4";     Default="0";   Doc="audit-log verbosity, 0 = off" }
-    @{ Prop="VORDR_UISCHEME";        Value="ui_scheme";       Comp="PolUiScheme";     Guid="{9B70EE1D-7B67-44A0-8C02-06B7BD8F982F}"; Range="0-8";     Default="8";   Doc="force a colour scheme (8 = the default)" }
+    @{ Prop="VORDR_ALLOWUNCVAULT";       Value="AllowUncVault";       Comp="PolAllowUnc";     Guid="{C4829E51-3D74-4A8B-9162-5E1B0F47A3C9}"; Range="0/1";     Default="0";   Doc="allow opening vault files over UNC/network shares (HKLM-only)" }
+    @{ Prop="VORDR_ALLOWSCREENCAPTURE";  Value="AllowScreenCapture";  Comp="PolAllowCap";     Guid="{6D3A14B8-79E2-4F55-8A1C-34B8E92D71F0}"; Range="0/1";     Default="0";   Doc="allow screen capture of Vordr windows (0 = WDA_EXCLUDEFROMCAPTURE)" }
+    @{ Prop="VORDR_LOGLEVEL";            Value="LogLevel";            Comp="PolLogLevel";     Guid="{A3BD3F2C-326F-4749-A57E-A78D1EC4AC0E}"; Range="0-4";     Default="0";   Doc="audit-log verbosity, 0 = off" }
+    @{ Prop="VORDR_UISCHEME";            Value="ui_scheme";           Comp="PolUiScheme";     Guid="{9B70EE1D-7B67-44A0-8C02-06B7BD8F982F}"; Range="0-8";     Default="8";   Doc="force a colour scheme (8 = the default)" }
 )
 # NOT exposed via MSI property: HKLM "vault".  Administrators who configure a
 # per-machine vault path via Group Policy can use safe per-user prefixes
-# (%APPDATA%\, %LOCALAPPDATA%\, %USERPROFILE%\) resolved via SHGetFolderPathW in
-# regcfg.asm, whereas an unparameterized MSI property could easily point every
+# (%APPDATA%\, %LOCALAPPDATA%\, %USERPROFILE%\) resolved via GetUserProfileDirectoryW
+# in regcfg.asm, whereas an unparameterized MSI property could easily point every
 # user on a shared machine at one literal path by mistake.
 
 # --- .vordr file association -------------------------------------------------
@@ -142,6 +144,63 @@ $tookIt = $run.ExitCode -eq 0
 if (Test-Path $probe) { Remove-Item $probe -Force; $tookIt = $true }
 if ($tookIt) {
     throw "$exePath accepts path-taking verbs - that is a PROBE_IO build, not a release. Run build.cmd release (or strict) and package that."
+}
+# Reject non-release (un-normalised, nohw, dbg, probeio, or guishow) binaries:
+#   1. Scan for the VORDR_NON_RELEASE_BUILD sentinel emitted whenever DBG_TRACE,
+#      PROBE_IO, or DBG_SHOW is defined (catches guishow even if normalised).
+#   2. Require COFF TimeDateStamp == 0 (written by pe_normalise.py in 'build.cmd release').
+#   3. Require IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS (type 20, /CETCOMPAT) present
+#      and all other debug payloads zeroed by pe_normalise.py.
+$peBytes = [System.IO.File]::ReadAllBytes($exePath)
+$sentinel = [System.Text.Encoding]::ASCII.GetBytes("VORDR_NON_RELEASE_BUILD")
+for ($si = 0; $si -le $peBytes.Length - $sentinel.Length; $si++) {
+    if ($peBytes[$si] -eq $sentinel[0]) {
+        $match = $true
+        for ($sj = 1; $sj -lt $sentinel.Length; $sj++) {
+            if ($peBytes[$si + $sj] -ne $sentinel[$sj]) { $match = $false; break }
+        }
+        if ($match) {
+            throw "$exePath contains VORDR_NON_RELEASE_BUILD (dbg/probeio/guishow build) - never package non-release builds. Run 'build.cmd release strict' first."
+        }
+    }
+}
+$peOff   = [BitConverter]::ToInt32($peBytes, 0x3C)
+$coffTs  = [BitConverter]::ToInt32($peBytes, $peOff + 8)
+if ($coffTs -ne 0) {
+    throw "$exePath has non-zero COFF TimeDateStamp (0x$($coffTs.ToString('X8'))) - not a normalised 'build.cmd release' binary."
+}
+$nSect   = [BitConverter]::ToUInt16($peBytes, $peOff + 6)
+$optSize = [BitConverter]::ToUInt16($peBytes, $peOff + 20)
+$optOff  = $peOff + 24
+$ddOff   = $optOff + 112                  # PE32+ DataDirectory[0]
+$sectOff = $optOff + $optSize
+$dbgRva  = [BitConverter]::ToInt32($peBytes, $ddOff + 6 * 8)
+$dbgSz   = [BitConverter]::ToInt32($peBytes, $ddOff + 6 * 8 + 4)
+$hasCet  = $false
+if ($dbgRva -ne 0 -and $dbgSz -ge 28) {
+    $dbgFileOff = -1
+    for ($si = 0; $si -lt $nSect; $si++) {
+        $s = $sectOff + $si * 40
+        $va = [BitConverter]::ToUInt32($peBytes, $s + 12)
+        $vsz = [BitConverter]::ToUInt32($peBytes, $s + 8)
+        $raw = [BitConverter]::ToUInt32($peBytes, $s + 20)
+        $rsz = [BitConverter]::ToUInt32($peBytes, $s + 16)
+        $span = if ($vsz -gt 0 -and $vsz -lt $rsz) { $vsz } else { $rsz }
+        if ($dbgRva -ge $va -and $dbgRva -lt ($va + $span)) {
+            $dbgFileOff = [int]($raw + ($dbgRva - $va))
+            break
+        }
+    }
+    if ($dbgFileOff -ge 0) {
+        for ($di = 0; $di -lt [int]($dbgSz / 28); $di++) {
+            $de = $dbgFileOff + $di * 28
+            $dtype = [BitConverter]::ToUInt32($peBytes, $de + 12)
+            if ($dtype -eq 20) { $hasCet = $true }
+        }
+    }
+}
+if (-not $hasCet) {
+    throw "$exePath lacks IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS (/CETCOMPAT) - never package a 'nohw' build."
 }
 
 # --- version comes from the binary, never typed twice ------------------------
@@ -288,7 +347,11 @@ try {
                 $terms = @("NOT $($p.Prop)") + ($lo..$hi | ForEach-Object { "($($p.Prop) = `"$_`")" })
                 $cond = $terms -join " OR "
             } else {
-                $cond = "(NOT {0}) OR ((NOT ({0} >< `"-`")) AND (NOT ({0} >< `"+`")) AND (NOT ({0} >< `" `")) AND (NOT ({0} >< `"#`")))" -f $p.Prop
+                # Reject signs, spaces, '#', 'x'/'X' (#x -> REG_BINARY), '%' (#% -> REG_EXPAND_SZ),
+                # and ASCII letters so #[PROP] can never coerce into a non-REG_DWORD registry type.
+                $badSub = @("-","+"," ","#","%","a","b","c","d","e","f","g","h","i","j","k","l","m","n","o","p","q","r","s","t","u","v","w","x","y","z") |
+                          ForEach-Object { "(NOT ({0} >< `"{1}`"))" -f $p.Prop, $_ }
+                $cond = "(NOT {0}) OR ({1})" -f $p.Prop, ($badSub -join " AND ")
             }
         } else {
             throw ("policy {0} has unrecognised Range '{1}'" -f $p.Prop, $p.Range)

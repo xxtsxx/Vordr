@@ -34,22 +34,49 @@ def name_for(path):
 _k32 = ctypes.WinDLL('kernel32', use_last_error=True)
 _u32 = ctypes.WinDLL('user32', use_last_error=True)
 _k32.GetFullPathNameW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.LPWSTR, ctypes.c_void_p]
+_k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                             wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+_k32.CreateFileW.restype = wintypes.HANDLE
+_k32.GetFinalPathNameByHandleW.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
+_k32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+_k32.CloseHandle.argtypes = [wintypes.HANDLE]
 _u32.CharUpperBuffW.argtypes = [wintypes.LPWSTR, wintypes.DWORD]
+
+_INVALID_HANDLE = wintypes.HANDLE(-1).value
+_FILE_SHARE_RWD = 0x7
+_OPEN_EXISTING  = 3
+_BACKUP_SEM     = 0x02000000
+
+
+def _strip_dos_prefix(p):
+    if p.startswith('\\\\?\\UNC\\'):
+        return '\\' + p[7:]
+    if p.startswith('\\\\?\\'):
+        return p[4:]
+    return p
 
 
 def normalised(path):
-    r"""reg_hash_name's normalisation, with the same Win32 calls: drop \\?\ (or
-    \\?\UNC\), GetFullPathNameW, CharUpperBuffW (not str.upper, which folds some
-    characters differently from the OS)."""
-    p = path
-    if p.startswith('\\\\?\\UNC\\'):
-        p = '\\' + p[7:]
-    elif p.startswith('\\\\?\\'):
-        p = p[4:]
+    r"""reg_hash_name's canonicalisation (src/regcfg.asm): resolve an existing
+    file via GetFinalPathNameByHandleW (VOLUME_NAME_DOS = 0) so symlinks,
+    junctions, subst drives, and 8.3 names match Vordr's live key; fall back to
+    GetFullPathNameW only when the file is absent, then CharUpperBuffW."""
     buf = ctypes.create_unicode_buffer(32768)
+    h = _k32.CreateFileW(path, 0, _FILE_SHARE_RWD, None, _OPEN_EXISTING, _BACKUP_SEM, None)
+    if h and h != _INVALID_HANDLE:
+        try:
+            n = _k32.GetFinalPathNameByHandleW(h, buf, len(buf), 0)
+        finally:
+            _k32.CloseHandle(h)
+        if 0 < n < len(buf):
+            canon = _strip_dos_prefix(buf.value)
+            ubuf = ctypes.create_unicode_buffer(canon, len(canon) + 1)
+            _u32.CharUpperBuffW(ubuf, len(canon))
+            return ubuf.value
+    p = _strip_dos_prefix(path)
     n = _k32.GetFullPathNameW(p, len(buf), buf, None)
     if n == 0 or n >= len(buf):
-        return path                                   # Vordr hashes it as written then
+        return path
     _u32.CharUpperBuffW(buf, n)
     return buf.value
 

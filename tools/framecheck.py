@@ -130,10 +130,13 @@ RE_SUBRSP = re.compile(r'^\s*sub\s+rsp\s*,\s*([0-9*+ ]+?)\s*$', re.I)
 RE_ADDRSP = re.compile(r'^\s*add\s+rsp\s*,\s*([0-9*+ ]+?)\s*$', re.I)
 RE_PUSH   = re.compile(r'^\s*push\s+\w+', re.I)
 RE_POP    = re.compile(r'^\s*pop\s+\w+', re.I)
-# A local is referenced either as [rbp-N] or, when its ADDRESS is handed to an
-# API, as "addr rbp-N".  Missing the second form hides an output buffer inside
-# the call's own home space.
-RE_LOCAL  = re.compile(r'(?:\[rbp\s*-\s*(\d+)\]|\baddr\s+rbp\s*-\s*(\d+)\b)', re.I)
+# A local is referenced as [rbp-...], [rbp+reg*scale-N], hex [rbp-20h], or
+# "addr rbp-N".  Capture the negative displacement token so hex/decimal/indexed
+# forms cannot hide an output buffer inside a callee's home space.
+RE_LOCAL  = re.compile(
+    r'(?:\[rbp(?:\s*\+\s*[^\]-]+?)?\s*-\s*(0x[0-9a-f]+|[0-9][0-9a-f]*h|\d+)\b'
+    r'|\baddr\s+rbp\s*-\s*(0x[0-9a-f]+|[0-9][0-9a-f]*h|\d+)\b)', re.I)
+RE_BARECALL = re.compile(r'^\s*call\s+([\w$]+)\b', re.I)
 RE_EXTERN = re.compile(r'^\s*extern\s+([\w$]+)\s*:\s*proc', re.I)
 # __WSTKARG stores an absolute constant or a 64-bit register straight to [rsp+K];
 # everything else (addr X, any 32-bit operand, 64-bit memory) round-trips via rax.
@@ -154,9 +157,13 @@ ST_SIZE = {'qword': 8, 'dword': 4, 'word': 2, 'byte': 1, 'xmmword': 16}
 RE_MOVRSPBASE = re.compile(r'^\s*mov\s+rsp\s*,\s*rbp', re.I)
 RE_POPRBP     = re.compile(r'^\s*pop\s+rbp\b', re.I)
 
+RE_CALLER_HOME = re.compile(
+    r'^\s*(?:mov\w*|lea|movdq\w*)\s+(?:\w+\s+ptr\s+)?\[rbp\s*\+\s*(16|24|32|40)\]\s*,', re.I)
+
 EQUS = {}
 STRUCTS = {}
-EXTERNS = set()          # `extern X:proc` - a Win32 callee, free to use its home space
+EXTERNS = set()          # `extern X:proc` across all modules
+DEFINED_PROCS = set()    # procs defined in src/*.asm (internal callees)
 OS_CALLBACKS = {}        # proc_name -> registration site ("gui.asm:123 SetWindowSubclass")
 STATS = {'fp': 0, 'sym': 0, 'raw': 0}
 
@@ -167,6 +174,10 @@ CB_ARG_INDEX = {
     'SetWindowSubclass': 2,
     'EnumThreadWindows': 1,
     'EnumChildWindows': 1,
+    'EnumWindows': 0,
+    'EnumDesktopWindows': 1,
+    'CreateThread': 2,
+    'SetWindowsHookExW': 1,
     'DialogBoxParamW': 3,
     'CreateDialogParamW': 3,
     'DialogBoxIndirectParamW': 3,
@@ -245,6 +256,8 @@ def build_tables(files):
         fname = os.path.basename(path)
         cur = None; size = 0
         for s in raw:
+            pm = RE_PROC.match(s)
+            if pm: DEFINED_PROCS.add(pm.group(1))
             xm = RE_EXTERN.match(s)
             if xm: EXTERNS.add(xm.group(1))
             em = RE_EQU.match(s)
@@ -302,9 +315,18 @@ def scan_file(path, results):
 
         fp = next((RE_FP.search(s) for _, s in merged if 'FRAME_PROLOG' in s), None)
         maxloc = 0
+        max_rsp_st = 0
         for _, s in merged:
             for mm in RE_LOCAL.finditer(s):
-                maxloc = max(maxloc, int(mm.group(1) or mm.group(2)))
+                tok = mm.group(1) or mm.group(2)
+                lv = masm_int(tok)
+                if lv is not None:
+                    maxloc = max(maxloc, lv)
+            rsm = RE_RSPST.match(s)
+            if rsm:
+                k = int(rsm.group(3))
+                sz = ST_SIZE.get((rsm.group(2) or 'qword').lower(), 8)
+                max_rsp_st = max(max_rsp_st, k + sz)
 
         if fp:
             if name in OS_CALLBACKS:
@@ -339,24 +361,30 @@ def scan_file(path, results):
             # homes four on its first instruction).  Internal procs never touch a
             # caller's home space - an unwritten invariant this codebase relies
             # on - so only extern callees are judged here.
+            win32_ext = EXTERNS - DEFINED_PROCS
             worst = 0; wat = start; wcallee = None
             for ln, s in merged:
-                callee, args = wincall_parts(s)
-                if not callee or callee not in EXTERNS: continue
-                span = 32 + max(0, len(args) - 4) * 8
-                if span > worst: worst, wat, wcallee = span, start + ln, callee
-                # ---- WINCALL rax-clobber ----------------------------------
-                # __WSTKARG emits the stack args BEFORE the register args, and
-                # every form except an absolute constant or a 64-bit register
-                # goes out through rax.  Passing rax itself as arg 1-4 then
-                # loads the wrong value.
-                if len(args) > 4 and any(a.strip().lower() in ('rax', 'eax')
-                                         for a in args[:4]) \
-                   and any(clobbers_rax(a) for a in args[4:]):
+                if RE_CALLER_HOME.match(s):
                     results.append(("FATAL", fname, start + ln + 1, name,
-                        f"WINCALL {callee} passes rax as a register arg while a "
-                        f"later stack arg routes through rax - the register arg "
-                        f"receives the WRONG value; stage the handle in a local"))
+                        "internal proc writes to caller home space [rbp+16..40]"))
+                callee, args = wincall_parts(s)
+                if callee:
+                    if len(args) > 4 and any(a.strip().lower() in ('rax', 'eax')
+                                             for a in args[:4]) \
+                       and any(clobbers_rax(a) for a in args[4:]):
+                        results.append(("FATAL", fname, start + ln + 1, name,
+                            f"WINCALL {callee} passes rax as a register arg while a "
+                            f"later stack arg routes through rax - the register arg "
+                            f"receives the WRONG value; stage the handle in a local"))
+                    if callee in win32_ext:
+                        span = 32 + max(0, len(args) - 4) * 8
+                        if span > worst: worst, wat, wcallee = span, start + ln, callee
+                    continue
+                bm = RE_BARECALL.match(s)
+                if bm and bm.group(1) in win32_ext:
+                    bcallee = bm.group(1)
+                    span = max(32, max_rsp_st)
+                    if span > worst: worst, wat, wcallee = span, start + ln, bcallee
             if worst and alloc - maxloc < worst and maxloc \
                and name not in ALLOW_FP and name not in ALLOW_HOME:
                 results.append(("warn", fname, wat + 1, name,

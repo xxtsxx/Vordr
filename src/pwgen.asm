@@ -28,9 +28,10 @@ externdef g_cfg_pwminclasses:dword
 
 PWGEN_MIN_LEN       equ 1
 PWGEN_MAX_LEN       equ 256
+PWGEN_MIN_WORDS     equ 6          ; minimum 6 words (66 bits @ 2,048-word list)
 ; E16: every write in pwgen_ex is bounded by the caller's output capacity, set
 ; one-shot in g_pwgen_outcap before the call (0 => a conservative default).  The
-; passphrase emit loop stops at the output end; fixed-length styles clamp n.
+; passphrase emit loop fails closed on truncation; fixed-length styles clamp n.
 
 PWCLASS_UPPER       equ 1
 PWCLASS_LOWER       equ 2
@@ -96,6 +97,11 @@ pwgen proc frame
     mov     qword ptr [rbp-24], rcx
     mov     dword ptr [rbp-32], edx
     mov     dword ptr [rbp-40], r8d
+    mov     qword ptr [rbp-48], 0
+    mov     byte ptr [rbp-56], 0
+
+    test    rcx, rcx
+    jz      pg_fail_nowipe
 
     ; ---- length bounds ------------------------------------------------------
     cmp     edx, PWGEN_MIN_LEN
@@ -174,6 +180,14 @@ pg_ok:
     FRAME_EPILOG
     ret
 pg_fail:
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-48]
+    test    rcx, rcx
+    jz      pg_fail_nowipe
+    test    edx, edx
+    jz      pg_fail_nowipe
+    call    secure_zero
+pg_fail_nowipe:
     mov     byte ptr [rbp-56], 0
     mov     dword ptr [pw_alpha_n], 0
     lea     rcx, [pw_alpha]
@@ -185,35 +199,40 @@ pg_fail:
 pwgen endp
 
 ; ---------------------------------------------------------------------------
-; rand_idx(ecx = N, 1..256) -> eax = uniform index 0..N-1, or -1 on CSPRNG fail.
-;   Rejection sampling over one CSPRNG byte (no modulo bias).  Leaf-ish.
+; rand_idx(ecx = N, 1..65536) -> eax = uniform index 0..N-1, or -1 on fail.
+;   Rejection sampling over 16 CSPRNG bits (no modulo bias).
 ; ---------------------------------------------------------------------------
 rand_idx proc frame
     FRAME_PROLOG 48
+    mov     word ptr [rbp-32], 0
+    test    ecx, ecx
+    jz      ri_fail
+    cmp     ecx, 65536
+    ja      ri_fail
     mov     dword ptr [rbp-24], ecx            ; N
-    mov     eax, 256                           ; threshold = 256 - (256 mod N)
+    mov     eax, 65536                         ; threshold = 65536 - (65536 mod N)
     xor     edx, edx
     div     dword ptr [rbp-24]
-    mov     r10d, 256
+    mov     r10d, 65536
     sub     r10d, edx
     mov     dword ptr [rbp-28], r10d
 ri_draw:
     lea     rcx, [rbp-32]
-    mov     edx, 1
+    mov     edx, 2
     call    rng_fill
     test    eax, eax
     jz      ri_fail
-    movzx   eax, byte ptr [rbp-32]
-    mov     byte ptr [rbp-32], 0
+    movzx   eax, word ptr [rbp-32]
+    mov     word ptr [rbp-32], 0
     cmp     eax, dword ptr [rbp-28]
     jae     ri_draw
     xor     edx, edx
-    div     dword ptr [rbp-24]                 ; edx = byte mod N
+    div     dword ptr [rbp-24]                 ; edx = word mod N
     mov     eax, edx
     FRAME_EPILOG
     ret
 ri_fail:
-    mov     byte ptr [rbp-32], 0
+    mov     word ptr [rbp-32], 0
     mov     eax, -1
     FRAME_EPILOG
     ret
@@ -223,8 +242,10 @@ rand_idx endp
 ; log2x1000(ecx = N >= 1) -> eax = round(log2(N) * 1000).
 ;   floor via BSR + a linear fractional term.  Leaf.
 ; ---------------------------------------------------------------------------
-log2x1000 proc
+log2x1000 proc frame
     push    rbx
+    .pushreg rbx
+    .endprolog
     mov     ebx, ecx                           ; N
     bsr     eax, ecx                           ; k = floor(log2 N)
     mov     r10d, eax
@@ -324,24 +345,31 @@ public pwgen_ex
 pwgen_ex proc frame
     FRAME_PROLOG 128
     mov     qword ptr [rbp-24], rcx            ; cursor
+    mov     qword ptr [rbp-96], rcx            ; base outbuf for fail-closed wipe
     mov     dword ptr [rbp-32], edx            ; n
     mov     dword ptr [rbp-40], r8d            ; style
     mov     dword ptr [rbp-48], r9d            ; opt
     ; E16: one-shot output capacity -> byte limit (outcap-1, leaves room for NUL)
     mov     ecx, dword ptr [g_pwgen_outcap]
-    mov     dword ptr [g_pwgen_outcap], 0     ; auto-reset (this call only)
+    mov     dword ptr [g_pwgen_outcap], 0      ; auto-reset (this call only)
+    cmp     qword ptr [rbp-96], 0
+    je      pex_fail_nowipe
     test    ecx, ecx
     jnz     @F
-    mov     ecx, PWGEN_MAX_LEN                ; no cap set -> conservative default
-@@: dec     ecx
-    mov     dword ptr [rbp-80], ecx           ; byte limit (outcap-1)
-    mov     rax, qword ptr [rbp-24]           ; end = outbuf + byte limit (all styles)
+    mov     ecx, PWGEN_MAX_LEN + 1             ; no cap set -> 256B + NUL default
+@@: cmp     ecx, 1
+    jbe     pex_fail_nowipe
+    dec     ecx
+    mov     dword ptr [rbp-80], ecx            ; byte limit (outcap-1)
+    mov     rax, qword ptr [rbp-24]            ; end = outbuf + byte limit (all styles)
     add     rax, rcx
     mov     qword ptr [rbp-72], rax
     mov     dword ptr [pw_entropy], 0
     cmp     edx, 1
     jb      pex_fail
     cmp     edx, PWGEN_MAX_LEN
+    ja      pex_fail
+    cmp     r8d, PWS_HEX
     ja      pex_fail
     ; E16: fixed-length styles emit n bytes - clamp n to the limit (passphrase n
     ; is a word count, bounded in its emit loop instead)
@@ -362,6 +390,8 @@ pwgen_ex proc frame
     je      pex_pin
     cmp     eax, PWS_HEX
     je      pex_hex
+    cmp     eax, PWS_RANDOM
+    jne     pex_fail
 ; ---- RANDOM: assemble class alphabet (+ optional no-ambiguous) --------------
     mov     dword ptr [pw_alpha_n], 0
     test    dword ptr [rbp-48], PWCLASS_UPPER
@@ -461,14 +491,16 @@ pex_pron_done:
     jmp     pex_afterphrase                     ; -> optional trailing digit
 ; ---- PASSPHRASE: n words from the embedded list ----------------------------
 pex_phrase:
+    cmp     dword ptr [rbp-32], PWGEN_MIN_WORDS
+    jb      pex_fail
     mov     dword ptr [rbp-56], 0               ; word i
 pex_phrase_lp:
     mov     eax, dword ptr [rbp-56]
     cmp     eax, dword ptr [rbp-32]
     jae     pex_phrase_done
-    mov     r10, qword ptr [rbp-24]             ; E16: stop when the output is full
+    mov     r10, qword ptr [rbp-24]             ; fail closed if output buffer full
     cmp     r10, qword ptr [rbp-72]
-    jae     pex_phrase_done
+    jae     pex_fail
     ; separator '-' between words
     cmp     eax, 0
     je      pex_phrase_word
@@ -505,14 +537,14 @@ pex_word_cp:
     sub     cl, 20h
 pex_word_put:
     mov     r11, qword ptr [rbp-24]
-    cmp     r11, qword ptr [rbp-72]             ; E16: output full mid-word -> stop
-    jae     pex_phrase_done
+    cmp     r11, qword ptr [rbp-72]             ; fail closed on mid-word truncation
+    jae     pex_fail
     mov     byte ptr [r11], cl
     inc     qword ptr [rbp-24]
     inc     dword ptr [rbp-64]
     jmp     pex_word_cp
 pex_word_done:
-    add     dword ptr [pw_entropy], 8000        ; 256-word list -> 8 bits/word
+    add     dword ptr [pw_entropy], 11000       ; 2,048-word list -> 11 bits/word
     inc     dword ptr [rbp-56]
     jmp     pex_phrase_lp
 pex_phrase_done:
@@ -526,8 +558,8 @@ pex_afterphrase:
     je      pex_fail
     add     eax, '0'
     mov     r10, qword ptr [rbp-24]
-    cmp     r10, qword ptr [rbp-72]             ; E16: no room for the digit -> skip
-    jae     pex_afterdigit
+    cmp     r10, qword ptr [rbp-72]             ; fail closed if no room for requested digit
+    jae     pex_fail
     mov     byte ptr [r10], al
     inc     qword ptr [rbp-24]
     add     dword ptr [pw_entropy], 3321        ; log2(10)
@@ -549,6 +581,17 @@ pex_finish:
     FRAME_EPILOG
     ret
 pex_fail:
+    mov     rcx, qword ptr [rbp-96]
+    test    rcx, rcx
+    jz      pex_fail_nowipe
+    mov     rdx, qword ptr [rbp-24]
+    sub     rdx, rcx
+    jz      pex_fail_zero0
+    call    secure_zero
+    mov     rcx, qword ptr [rbp-96]
+pex_fail_zero0:
+    mov     byte ptr [rcx], 0
+pex_fail_nowipe:
     mov     dword ptr [pw_entropy], 0
     mov     dword ptr [pw_alpha_n], 0
     lea     rcx, [pw_alpha]
@@ -578,9 +621,8 @@ cpp_loop:
     mov     edx, eax                    ; count code points: (b & 0xC0) != 0x80
     and     edx, 0C0h
     cmp     edx, 80h
-    je      cpp_noinc
+    je      cpp_next                    ; UTF-8 continuation byte -> skip classing
     inc     r10d
-cpp_noinc:
     cmp     eax, 'A'
     jb      cpp_lo
     cmp     eax, 'Z'
@@ -654,9 +696,8 @@ pmx_loop:
     mov     edx, eax                    ; code points: (b & 0xC0) != 0x80
     and     edx, 0C0h
     cmp     edx, 80h
-    je      pmx_noinc
+    je      pmx_next                    ; UTF-8 continuation byte -> skip classing
     inc     r10d
-pmx_noinc:
     cmp     eax, 'A'
     jb      pmx_lo
     cmp     eax, 'Z'

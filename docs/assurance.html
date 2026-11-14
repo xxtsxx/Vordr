@@ -109,7 +109,7 @@ footer { border-top: 1px solid var(--line); padding-top: 24px; margin-top: 48px;
     <li><span class="step">04 / ROUND-TRIPS &amp; GUI</span><h3>Exercise formats, fuzzers &amp; UI</h3>
       <p>Run 35+ container, parser-fuzz, policy, TPM, and persistence probes, a
       zero-shared-code Python vault reader (<code>verify_vault.py</code>), frozen
-      <code>v0.2.3</code> fixtures, and an 86-check isolated Win32 GUI suite
+      <code>v0.2.3</code> fixtures, and a 91-check isolated Win32 GUI suite
       (<code>guitest.ps1</code>).</p></li>
     <li><span class="step">05 / CRYPTO DIFFERENTIAL</span><h3>Cross-check 83 vectors</h3>
       <p>Compare 58 primitive outputs from <code>katreport</code> against independent
@@ -117,8 +117,8 @@ footer { border-top: 1px solid var(--line); padding-top: 24px; margin-top: 48px;
       <code>tests\verify_crypto.py</code>.</p></li>
     <li><span class="step">06 / INSTALLER</span><h3>Cost &amp; verify the MSI</h3>
       <p>Build the MSI around the restored release binary and cost its tables via
-      Windows Installer COM: 14 policy rows, SDDL permissions, and downgrade prevention
-      (<code>NEWERVERSIONDETECTED</code>).</p></li>
+      Windows Installer COM: 16 policy rows, numeric <code>LaunchCondition</code> guards,
+      SDDL permissions, and downgrade prevention (<code>NEWERVERSIONDETECTED</code>).</p></li>
   </ol>
   <p class="notice">Strict builds require Python and fail closed without it. Inspect the
     stage log if <code>makecab.exe</code> or an interactive desktop is unavailable on a
@@ -135,12 +135,12 @@ footer { border-top: 1px solid var(--line); padding-top: 24px; margin-top: 48px;
       64-bit save counter.</small></div>
     <span class="arrow" aria-hidden="true">→</span>
     <div class="zone"><h3>2. Unlocked process</h3><small><code>VirtualLock</code> static
-      table and <code>secmem</code> arenas, XMM/stack wipes, private-desktop prompt, and
-      modal-closing auto-lock.</small></div>
+      table and out-of-line <code>secmem</code> arenas, default screen-capture &amp; IME
+      exclusion, XMM/stack wipes, DACL-isolated private desktop, and modal-closing auto-lock.</small></div>
     <span class="arrow" aria-hidden="true">→</span>
-    <div class="zone"><h3>3. External OS boundary</h3><small>Tray-timed clipboard clear,
-      strict safe-preview allowlist, owner-only temp DACL, and fail-closed Mark of the
-      Web.</small></div>
+    <div class="zone"><h3>3. External OS boundary</h3><small>Fail-closed clipboard markers
+      and tray-timed clear, 8-extension preview allowlist, inheritable owner+<code>SYSTEM</code>
+      temp DACL, and fail-closed Mark of the Web.</small></div>
   </div>
   <p><a href="SECRETS.md">Review secret buffer ownership and cleanup boundaries →</a></p>
 </section>

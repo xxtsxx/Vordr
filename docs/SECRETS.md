@@ -16,9 +16,11 @@ shown as a warning; startup does not universally fail closed. The `lktest` probe
 checks that every listed buffer is actually resident-locked
 (`QueryWorkingSetEx`), not just that the call was made.
 
-`secmem_alloc` allocates, locks, and registers a dynamic arena. It returns failure
-rather than handing an unlocked arena to the caller. `secmem_free` wipes a
-registered live allocation before releasing it.
+`secmem_alloc` allocates, `VirtualLock`-pins, and registers a dynamic arena with its
+tracking metadata stored out-of-line in `g_secmem_live` (no header bytes placed inside
+or adjacent to the caller's locked pages). It returns failure rather than handing an
+unlocked arena to the caller. `secmem_free` wipes a registered live allocation and
+verifies `VirtualFree(MEM_RELEASE)` before clearing its registry slot.
 
 Successful [VirtualLock](https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtuallock)
 keeps the specified pages resident and out of ordinary paging while locked.
@@ -34,9 +36,11 @@ Names are in `src/`; the authoritative list is the `sec_regions` table in
 `secmem.asm`. The same table drives the lock at startup, the wipe when the vault
 window closes (`secmem_wipe_statics`, called after `vault_lock`), and the panic
 wipe. The rows below are the main ones; the table also covers the UTF-8 and wide
-conversion scratch, the commit blobs, the attachment tile (whose AttachRefs carry
-per-file keys), the generator output, export/import password copies and ZIP key
-material, and the TOTP key.
+conversion scratch, search input (`g_search_w`), commit blobs, attachment tile
+(whose AttachRefs carry per-file keys), generator output and word buffer
+(`g_wordtmp`), export/import password copies and ZIP key material, BLAKE2b and
+Argon2 initial hash state (`g_b2bctx`, `g_hbuf`), and the TOTP key and formatted
+code buffers (`g_totp_code6`, `g_totp_code_w`, `g_totp_disp_w`).
 
 | Buffer | Module | Contents | Normal cleanup |
 |---|---|---|---|
@@ -71,13 +75,13 @@ Not every secret-bearing allocation is managed by `secmem_alloc`.
 | Area | Exposure and cleanup to review |
 |---|---|
 | Argon2 arena (`g_arena`) | Large ordinary VirtualAlloc arena, too large to pin; wiped before release. The one block that is key-equivalent by itself - the last column's final block, input to the final hash - is `VirtualLock`ed (best-effort) while the KDF runs |
-| Argon2 H0 and compression state | `g_hbuf`, `g_inp`, `g_addr`, and `g_le4` are wiped on both normal and error exits; scalar/SSE2/AVX2 compressors scrub their stack scratch and volatile `xmm`/`ymm` registers (`vzeroupper` on AVX2) on return |
+| Argon2 H0 and compression state | `g_hbuf` (pinned in `sec_regions`) is scrubbed immediately after seeding initial lane blocks before the memory-hard fill loop runs; `g_inp`, `g_addr`, and `g_le4` are wiped on both normal and error exits; scalar/SSE2/AVX2 compressors scrub their stack scratch and volatile `xmm`/`ymm` registers (`vzeroupper` on AVX2) on return |
 | `g_urlbuf`, `g_urlbuf2` | URLs may contain private hosts or tokens; wiped after the launch path, and only explicit `http://` / `https://` schemes are passed to `ShellExecuteW` |
 | ZIP export buffers | Plaintext JSON (in a `secmem` arena), password copies, keys, and archive staging; normal cleanup in `ze_compose`/`ze_free` |
 | ZIP import | The decrypted JSON is in a `secmem` arena; the raw archive is `VirtualLock`ed best-effort while it is parsed |
-| Crypto stack frames and registers | AES-GCM, SHA-256, SHA-1, BLAKE2b, HOTP/TOTP (`g_totp_key` 160 B), and password-generation helpers wipe stack scratch and volatile `xmm0..xmm5` registers on return; AES key expansion uses hardware `aeskeygenassist` without table S-boxes |
+| Crypto stack frames and registers | AES-GCM (`gcm_seal`/`gcm_open` including `xmm6`), SHA-256 (`sha256_init`/`update`/`final`), SHA-1, BLAKE2b, HOTP/TOTP (`g_totp_key` 160 B + `totp_now` stack), and password-generation helpers wipe stack scratch and volatile `xmm0..xmm5` registers on return; AES key expansion uses hardware `aeskeygenassist` without table S-boxes |
 | Attachment staging/open buffers | Plaintext copies are allocated in `secmem` arenas (`attach_stage`, `attach_open`, `gui_tile_view`, `gui_tile_download`) and wiped on teardown |
-| Windows controls and API buffers | Password and secret edit controls are scrubbed via `gui_edit_scrub` (`EM_SETSEL` + `WM_CLEAR` + `SetWindowTextW("")`) before teardown, though OS/control internal buffers and clipboard/provider copies can still exist outside application arrays |
+| Windows controls and API buffers | Password and secret `EDIT` controls detach IME (`ImmAssociateContext(hwnd, 0)`) on creation and are scrubbed via `gui_edit_scrub` (overwriting `CONVW_MAX - 1` wide chars with `'X'`, `EM_EMPTYUNDOBUFFER`, `EM_SETSEL` + `WM_CLEAR`, and `SetWindowTextW("")`) before teardown, though OS/control internal allocations and clipboard/provider copies can still exist outside application arrays |
 
 These are implementation limitations, not a claim that sensitive intermediate
 values are harmless. Wiping a working buffer cannot erase a copy already made
@@ -107,17 +111,23 @@ new allocation must not be treated as safe through an old alias.
 
 ## Clipboard and previews
 
-Clipboard exclusion formats (`ExcludeClipboardContentFromMonitorProcessing`,
-`CanIncludeInClipboardHistory`, `CanUploadToCloudClipboard`) instruct cooperating
-Windows components not to index or sync copied secrets; they do not block other local
-processes from reading the active clipboard. The auto-clear timer verifies
-`GetClipboardSequenceNumber` ownership before clearing so a later user copy is untouched,
-and binds `CLIP_TIMER` to the persistent hidden tray window (`g_trayhwnd`) whenever a
-standalone dialog closes or the vault window minimizes/closes to the tray (`guitest.ps1`).
+Clipboard exclusion formats (`ExcludeClipboardContentFromMonitorProcessing` carrying
+a non-zero `DWORD 1` payload, plus `CanIncludeInClipboardHistory = 0` and
+`CanUploadToCloudClipboard = 0`) are applied fail-closed before placing secret text on
+the clipboard: if the exclusion marker cannot be set, Vordr calls `EmptyClipboard` and
+aborts the copy. These formats instruct cooperating Windows components not to index or
+sync copied secrets; they do not block other local processes from reading the active
+clipboard. The auto-clear timer verifies `GetClipboardSequenceNumber` ownership before
+clearing so a later user copy is untouched, and binds `CLIP_TIMER` to the persistent
+hidden tray window (`g_trayhwnd`) whenever a standalone dialog closes or the vault
+window minimizes/closes to the tray (`guitest.ps1`).
 
 Preview files are created exclusively inside separate random temporary
-directories protected by an explicit owner-only DACL (`S:(ML;;NW;;;ME)` and the
-current user's SID). Attachment filenames are sanitized via
+directories (`%TEMP%\VordrPreview-<hex>`) protected by an inheritable
+(`OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE`), protected (`SE_DACL_PROTECTED`)
+owner+`SYSTEM` DACL plus `S:(ML;;NW;;;ME)`. At GUI startup, `gui_temp_sweep_stale`
+also overwrites and removes any stale `VordrPreview-*` directories left by a prior
+power cut or forced stop. Attachment filenames are sanitized via
 `gui_sanitize_attname` to strip directory components, drive prefixes, ADS
 `:stream` suffixes, control characters, trailing dots/spaces, and reserved DOS
 device names. `gui_temp_purge` attempts overwrite, flush, deletion, and
@@ -148,9 +158,11 @@ microarchitectural side channels.
 | Use | Comparison path |
 |---|---|
 | Vault KCV, including TPM-recovered keys | `ct_memcmp` in vault open |
+| TPM v2 inner vault/policy binding digest | `ct_memcmp` in `tpm_unseal` |
 | GCM tag | `ct_memcmp` in `gcm_open` |
 | Full-file MAC | `ct_memcmp` in vault authentication |
 | ZIP password verifier and HMAC tag | `ct_memcmp` in `zi_decrypt` |
+| ZIP per-attachment `SHA-256` plaintext digest | `ct_memcmp` in `zi_addattach` |
 | Password and export confirmation | `gui_wstr_eq` |
 | Old/new values for history capture | `gui_wstr_eq` |
 

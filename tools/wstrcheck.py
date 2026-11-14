@@ -34,8 +34,8 @@ CONTRACTS = {
 }
 
 SETS = {
-    "r8":  re.compile(r'^\s*(lea|mov|xor)\s+r8d?\s*,'),
-    "edx": re.compile(r'^\s*(lea|mov|xor)\s+(e|r)dx\s*,'),
+    "r8":  re.compile(r'^\s*(lea|mov)\s+r8d?\s*,\s*(?!0\b|0h\b)'),
+    "edx": re.compile(r'^\s*(lea|mov)\s+(e|r)dx\s*,\s*(?!0\b|0h\b)'),
 }
 
 
@@ -44,7 +44,9 @@ SETS = {
 # conversion to a Win32-usable path happens in exactly one place; a direct
 # assignment silently reintroduces the raw form for whichever flow does it.
 SOLE_SETTER = ("g_cfg_in", "cfg_in_set")
-ASSIGN = re.compile(r'^\s*mov\s+qword ptr \[' + SOLE_SETTER[0] + r'\]\s*,')
+ASSIGN = re.compile(
+    r'^\s*(?:mov\s+\w+\s+ptr\s*\[' + SOLE_SETTER[0] + r'\]\s*,'
+    r'|lea\s+\w+\s*,\s*\[' + SOLE_SETTER[0] + r'\])', re.I)
 
 
 def sole_setter_check():
@@ -73,8 +75,17 @@ def main():
         base = os.path.basename(path)
         lines = [l.split(";")[0] for l in open(path, encoding="latin-1").read().split("\n")]
         for i, l in enumerate(lines):
-            m = re.match(r'^\s*call\s+(\w+)\s*$', l.rstrip())
+            m = re.match(r'^\s*(?:call|jmp)\s+(\w+)\s*$', l.rstrip(), re.I)
             if not m or m.group(1) not in CONTRACTS:
+                wm = re.match(r'^\s*WINCALL\s+(\w+)\b', l.rstrip(), re.I)
+                if wm and wm.group(1) in CONTRACTS:
+                    total += 1
+                    args = [a.strip() for a in l.split(',', 1)[1].split(',')] if ',' in l else []
+                    reg, _ = CONTRACTS[wm.group(1)]
+                    need_idx = 2 if reg == 'r8' else 1
+                    if len(args) <= need_idx or args[need_idx] in ('0', '0h'):
+                        bad += 1
+                        print(f"[NO BOUND] {base}:{i+1} WINCALL {wm.group(1)} missing non-zero {reg} arg")
                 continue
             reg, back = CONTRACTS[m.group(1)]
             total += 1

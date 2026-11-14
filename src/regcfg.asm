@@ -28,6 +28,8 @@ extern ExpandEnvironmentStringsW:proc   ; REG_EXPAND_SZ means expand it, not acc
 extern CreateDirectoryW:proc
 extern CreateFileW:proc
 extern CloseHandle:proc
+extern OpenProcessToken:proc
+extern GetUserProfileDirectoryW:proc
 extern GetFinalPathNameByHandleW:proc
 extern GetFullPathNameW:proc            ; reg_hash_name: one key per FILE, not per spelling
 extern CharUpperBuffW:proc
@@ -40,11 +42,8 @@ REG_DWORD       equ 4
 KEY_READ        equ 20019h
 KEY_WRITE       equ 20006h
 KEY_RW          equ 2001Fh          ; KEY_READ or KEY_WRITE (enumerate + delete values)
-CSIDL_PERSONAL      equ 5
-CSIDL_APPDATA       equ 1Ah
-CSIDL_LOCAL_APPDATA equ 1Ch
-CSIDL_PROFILE       equ 28h
-OPEN_EXISTING       equ 3
+CSIDL_PERSONAL  equ 5
+OPEN_EXISTING   equ 3
 FILE_SHARE_RWD      equ 7
 FILE_FLAG_BACKUP_SEM equ 02000000h
 ; "\Vordr" (6) + "\vault.vordr" (12) + NUL, and the filename tail on its own.
@@ -71,8 +70,6 @@ cfg_fname label word
     dw 5Ch,'v','a','u','l','t','.','v','o','r','d','r', 0
 env_onedrive label word
     dw 'O','n','e','D','r','i','v','e', 0
-env_userprofile label word
-    dw 'U','S','E','R','P','R','O','F','I','L','E', 0
 onedrive_sub label word
     dw 5Ch,'V','o','r','d','r', 0
 od_accounts label word
@@ -86,6 +83,10 @@ pfx_hklm_la label word
     dw '%','L','O','C','A','L','A','P','P','D','A','T','A','%', 5Ch, 0
 pfx_hklm_ad label word
     dw '%','A','P','P','D','A','T','A','%', 5Ch, 0
+sfx_hklm_la label word
+    dw 5Ch,'A','p','p','D','a','t','a',5Ch,'L','o','c','a','l', 0
+sfx_hklm_ad label word
+    dw 5Ch,'A','p','p','D','a','t','a',5Ch,'R','o','a','m','i','n','g', 0
 align 8
 public g_hklm
 g_hklm  dq 080000002h            ; HKEY_LOCAL_MACHINE (as a clean 64-bit value)
@@ -93,6 +94,10 @@ public g_hkcu                    ; gui_test_hooks (probeio/dbg) points it at a s
 g_hkcu  dq 080000001h            ; HKEY_CURRENT_USER
 
 .data?
+public g_allow_unc
+g_allow_unc         dd ?         ; HKLM-only AllowUncVault policy (0 = block UNC/SMB)
+public g_allow_screencap
+g_allow_screencap   dd ?         ; AllowScreenCapture policy (0 = WDA_EXCLUDEFROMCAPTURE)
 g_cfg_cb    dd ?                 ; RegGetValue/Set byte count
 g_cfg_type  dd ?                 ; RegQueryValueExW value type (REG_SZ check)
 g_cfg_dw    dd ?                 ; REG_DWORD value scratch
@@ -441,11 +446,61 @@ reg_prune_all proc frame
     ret
 reg_prune_all endp
 
+; cfg_profile_dir(rcx = wide dst, edx = cap chars) -> eax = chars written (0 = error).
+;   Resolves the current process token's profile root directly via
+;   GetUserProfileDirectoryW (backed by HKLM\...\ProfileList\<SID>\ProfileImagePath),
+;   so user-writable HKCU\...\User Shell Folders and %USERPROFILE% cannot redirect it.
+cfg_profile_dir proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-16], rcx             ; dst
+    mov     dword ptr [rbp-24], edx             ; cap chars
+    cmp     edx, 4
+    jb      cpd_bad
+    mov     qword ptr [rbp-32], 0               ; hTok
+    WINCALL OpenProcessToken, -1, 8, addr rbp-32 ; GetCurrentProcess()=-1, TOKEN_QUERY=8
+    test    eax, eax
+    jz      cpd_bad
+    mov     eax, dword ptr [rbp-24]
+    mov     dword ptr [rbp-40], eax
+    WINCALL GetUserProfileDirectoryW, qword ptr [rbp-32], qword ptr [rbp-16], addr rbp-40
+    mov     dword ptr [rbp-44], eax
+    WINCALL CloseHandle, qword ptr [rbp-32]
+    cmp     dword ptr [rbp-44], 0
+    je      cpd_bad
+    mov     r10, qword ptr [rbp-16]
+    mov     ecx, dword ptr [rbp-24]
+    xor     r8d, r8d
+cpd_len:
+    cmp     word ptr [r10+r8*2], 0
+    je      cpd_have
+    inc     r8d
+    cmp     r8d, ecx
+    jb      cpd_len
+    jmp     cpd_bad
+cpd_have:
+    test    r8d, r8d
+    jz      cpd_bad
+    cmp     r8d, 3
+    jbe     cpd_ret
+    cmp     word ptr [r10+r8*2-2], 5Ch
+    jne     cpd_ret
+    dec     r8d
+    mov     word ptr [r10+r8*2], 0
+cpd_ret:
+    mov     eax, r8d
+    FRAME_EPILOG
+    ret
+cpd_bad:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+cfg_profile_dir endp
+
 ; cfg_expand_hklm(rcx = wide in/out dst, edx = cap chars) -> eax = 1 ok / 0 invalid.
 ;   Expands HKLM REG_EXPAND_SZ templates WITHOUT calling ExpandEnvironmentStringsW
-;   (which evaluates untrusted process/HKCU environment variables).  Only a single
+;   (process env) or SHGetFolderPathW (HKCU User Shell Folders).  Only a single
 ;   leading "%USERPROFILE%\", "%LOCALAPPDATA%\", or "%APPDATA%\" token is permitted
-;   and is resolved strictly through SHGetFolderPathW; any other '%' fails closed.
+;   and is anchored strictly to GetUserProfileDirectoryW (HKLM ProfileList\<SID>).
 cfg_expand_hklm proc frame
     FRAME_PROLOG 96
     mov     qword ptr [rbp-24], rcx             ; dst
@@ -468,12 +523,13 @@ ceh_match:
     ; '%' appeared: must be at index 0 and match one of the 3 known folder prefixes
     test    r8d, r8d
     jnz     ceh_bad
+    mov     qword ptr [rbp-56], 0               ; optional subfolder suffix ptr
+    mov     dword ptr [rbp-60], 0               ; optional subfolder suffix chars
     mov     rcx, qword ptr [rbp-24]
     lea     rdx, [pfx_hklm_up]
     call    cfg_path_prefix
     test    eax, eax
     jz      ceh_try_la
-    mov     dword ptr [rbp-40], CSIDL_PROFILE
     mov     dword ptr [rbp-44], 13              ; offset of trailing '\' in "%USERPROFILE%\"
     jmp     ceh_have_pfx
 ceh_try_la:
@@ -482,7 +538,9 @@ ceh_try_la:
     call    cfg_path_prefix
     test    eax, eax
     jz      ceh_try_ad
-    mov     dword ptr [rbp-40], CSIDL_LOCAL_APPDATA
+    lea     rax, [sfx_hklm_la]
+    mov     qword ptr [rbp-56], rax
+    mov     dword ptr [rbp-60], 14              ; "\AppData\Local"
     mov     dword ptr [rbp-44], 14              ; offset of trailing '\' in "%LOCALAPPDATA%\"
     jmp     ceh_have_pfx
 ceh_try_ad:
@@ -491,7 +549,9 @@ ceh_try_ad:
     call    cfg_path_prefix
     test    eax, eax
     jz      ceh_bad
-    mov     dword ptr [rbp-40], CSIDL_APPDATA
+    lea     rax, [sfx_hklm_ad]
+    mov     qword ptr [rbp-56], rax
+    mov     dword ptr [rbp-60], 16              ; "\AppData\Roaming"
     mov     dword ptr [rbp-44], 9               ; offset of trailing '\' in "%APPDATA%\"
 ceh_have_pfx:
     ; Verify no remaining '%' exists in the tail after the prefix
@@ -509,37 +569,38 @@ ceh_tail_chk:
     jmp     ceh_tail_chk
 ceh_resolve:
     mov     dword ptr [rbp-48], r9d             ; tail chars (excl NUL)
-    WINCALL SHGetFolderPathW, 0, dword ptr [rbp-40], 0, 0, addr g_cfg_expand
+    lea     rcx, [g_cfg_expand]
+    mov     edx, CFG_EXPAND_CCH
+    call    cfg_profile_dir
     test    eax, eax
-    jnz     ceh_bad
-    ; Measure resolved folder length in g_cfg_expand (strip any trailing '\')
-    lea     r10, [g_cfg_expand]
-    xor     r8d, r8d
-ceh_flen:
-    cmp     word ptr [r10+r8*2], 0
-    je      ceh_fend
-    inc     r8d
-    cmp     r8d, CFG_EXPAND_CCH
-    jb      ceh_flen
-    jmp     ceh_bad
-ceh_fend:
-    test    r8d, r8d
     jz      ceh_bad
-    cmp     word ptr [r10+r8*2-2], 5Ch
-    jne     @F
-    dec     r8d
-@@: mov     eax, r8d
-    add     eax, dword ptr [rbp-48]             ; folder + "\..." tail
+    mov     r8d, eax                            ; profile root chars (no trailing '\')
+    add     eax, dword ptr [rbp-60]             ; + "\AppData\..." suffix chars
+    add     eax, dword ptr [rbp-48]             ; + "\..." tail chars
     inc     eax                                 ; + NUL
     cmp     eax, CFG_EXPAND_CCH
     ja      ceh_bad
     cmp     eax, dword ptr [rbp-32]             ; <= caller cap chars?
     ja      ceh_bad
-    ; Append tail (from '\') onto g_cfg_expand[r8d..]
+    ; Append optional subfolder suffix ("\AppData\Local" or "\AppData\Roaming")
+    lea     r10, [g_cfg_expand]
+    lea     r10, [r10+r8*2]
+    mov     r11, qword ptr [rbp-56]
+    test    r11, r11
+    jz      ceh_app_tail
+ceh_sfx:
+    mov     ax, word ptr [r11]
+    test    ax, ax
+    jz      ceh_app_tail
+    mov     word ptr [r10], ax
+    add     r11, 2
+    add     r10, 2
+    jmp     ceh_sfx
+ceh_app_tail:
+    ; Append tail (from '\') onto g_cfg_expand cursor r10
     mov     r11, qword ptr [rbp-24]
     mov     ecx, dword ptr [rbp-44]
     lea     r11, [r11+rcx*2]
-    lea     r10, [r10+r8*2]
 ceh_app:
     mov     ax, word ptr [r11]
     mov     word ptr [r10], ax
@@ -785,6 +846,30 @@ cgd_def:
     FRAME_EPILOG
     ret
 cfg_get_dword endp
+
+; ===========================================================================
+; cfg_get_dword_hklm(rcx=value name, edx=default) -> eax = value.
+;   Strictly machine-policy only: queries HKLM\SOFTWARE\Vordr and NEVER
+;   consults HKCU (prevents user-hive escalation on policies like AllowUncVault).
+; ===========================================================================
+public cfg_get_dword_hklm
+cfg_get_dword_hklm proc frame
+    FRAME_PROLOG 32
+    mov     dword ptr [rbp-16], edx          ; default
+    mov     rdx, rcx                         ; value name
+    mov     rcx, qword ptr [g_hklm]
+    lea     r8, [g_cfg_dw]
+    call    reg_query_dw
+    cmp     eax, 1
+    jne     cgdh_def
+    mov     eax, dword ptr [g_cfg_dw]
+    FRAME_EPILOG
+    ret
+cgdh_def:
+    mov     eax, dword ptr [rbp-16]
+    FRAME_EPILOG
+    ret
+cfg_get_dword_hklm endp
 
 ; ===========================================================================
 ; cfg_set_dword_hkcu(rcx=value name, edx=value) -> eax = 1/0.
@@ -1136,15 +1221,13 @@ cdv_no:
     FRAME_EPILOG
     ret
 cdv_profile:
-    ; Last resort, so this can never come back empty-handed.  Returning failure leaves
-    ; the GUI with no vault path at all, and the file picker then opens wherever the
-    ; process happens to be - which on a test machine was the program's own folder,
-    ; and is how a vault ended up living next to the exe.
-    WINCALL GetEnvironmentVariableW, addr env_userprofile, qword ptr [rbp-24], 980
+    ; Last resort, so this can never come back empty-handed.  Resolve the token's
+    ; HKLM ProfileList directory rather than %USERPROFILE% from the environment.
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-40]
+    call    cfg_profile_dir
     test    eax, eax
     jz      cdv_fail
-    cmp     eax, 980
-    jae     cdv_fail
     mov     r11, qword ptr [rbp-24]
     xor     r8d, r8d
     jmp     cdv_docs_end                     ; shared subfolder + filename tail
@@ -1202,6 +1285,8 @@ cfg_classify_path proc frame
     WINCALL GetEnvironmentVariableW, addr env_onedrive, addr cc_od, 1024
     test    eax, eax
     jz      ccp_docs
+    cmp     eax, 1024
+    jae     ccp_docs
     mov     rcx, qword ptr [rbp-24]
     lea     rdx, [cc_od]
     call    cfg_path_prefix
@@ -1431,10 +1516,12 @@ PLK_EVIL_CB equ ($ - plk_evil)
 WSTR plk_usrv, <C:\UserVault\user.vordr>
 PLK_USRV_CB equ (23 + 1) * 2
 WSTR plk_clip, <ClipSeconds>
+WSTR plk_unc,  <AllowUncVault>
 WSTR plk_zero, <0>
 PLK_ZERO_CB equ 4
 align 4
 plk_dw99    dd 99
+plk_dw1     dd 1
 .data?
 align 2
 plk_out     dw 512 dup (?)
@@ -1535,11 +1622,33 @@ cmd_polkat proc frame
     cmp     r8, rcx
     jne     plk_clean
 
+    ; 5) VDR2-11: HKLM-only policy (AllowUncVault) ignores HKCU and honours HKLM
+    WINCALL RegSetValueExW, qword ptr [rbp-40], addr plk_unc, 0, REG_DWORD, \
+            addr plk_dw1, 4
+    test    eax, eax
+    jnz     plk_clean
+    lea     rcx, [plk_unc]
+    xor     edx, edx
+    call    cfg_get_dword_hklm
+    test    eax, eax
+    jnz     plk_clean                        ; HKCU AllowUncVault=1 MUST be ignored!
+    WINCALL RegSetValueExW, qword ptr [rbp-32], addr plk_unc, 0, REG_DWORD, \
+            addr plk_dw1, 4
+    test    eax, eax
+    jnz     plk_clean
+    lea     rcx, [plk_unc]
+    xor     edx, edx
+    call    cfg_get_dword_hklm
+    cmp     eax, 1
+    jne     plk_clean
+
     ; Clean up values + handles and restore g_hklm
     WINCALL RegDeleteValueW, qword ptr [rbp-32], addr cfg_value
     WINCALL RegDeleteValueW, qword ptr [rbp-32], addr plk_clip
+    WINCALL RegDeleteValueW, qword ptr [rbp-32], addr plk_unc
     WINCALL RegDeleteValueW, qword ptr [rbp-40], addr cfg_value
     WINCALL RegDeleteValueW, qword ptr [rbp-40], addr plk_clip
+    WINCALL RegDeleteValueW, qword ptr [rbp-40], addr plk_unc
     WINCALL RegCloseKey, qword ptr [rbp-40]
     WINCALL RegCloseKey, qword ptr [rbp-32]
     WINCALL RegCloseKey, qword ptr [rbp-24]
@@ -1557,11 +1666,13 @@ plk_clean:
     je      @F
     WINCALL RegDeleteValueW, qword ptr [rbp-40], addr cfg_value
     WINCALL RegDeleteValueW, qword ptr [rbp-40], addr plk_clip
+    WINCALL RegDeleteValueW, qword ptr [rbp-40], addr plk_unc
     WINCALL RegCloseKey, qword ptr [rbp-40]
 @@: cmp     qword ptr [rbp-32], 0
     je      @F
     WINCALL RegDeleteValueW, qword ptr [rbp-32], addr cfg_value
     WINCALL RegDeleteValueW, qword ptr [rbp-32], addr plk_clip
+    WINCALL RegDeleteValueW, qword ptr [rbp-32], addr plk_unc
     WINCALL RegCloseKey, qword ptr [rbp-32]
 @@: cmp     qword ptr [rbp-24], 0
     je      @F

@@ -227,7 +227,6 @@ GC_CTR  equ 288          ; 16   running counter
 GC_AADN equ 304          ; 8    total AAD bytes
 GC_PTN  equ 312          ; 8    total data bytes
 GC_MODE equ 320          ; 8    0 = seal, 1 = open
-public GCM_CTX_SIZE
 GCM_CTX_SIZE equ 336
 
 ; ---------------------------------------------------------------------------
@@ -244,7 +243,6 @@ endm
 ; gcm_init(rcx = ctx, rdx = key, r8 = iv, r9 = mode)
 ; rsp layout: [rsp+32]=xmm14 save [rsp+48]=ctx [rsp+56]=iv [rsp+64]=mode
 ; =============================================================================
-public gcm_init
 gcm_init proc frame
     FRAME_PROLOG 80
     movdqu  xmmword ptr [rsp+32], xmm14
@@ -295,7 +293,6 @@ gcm_init endp
 ; gcm_aad(rcx = ctx, rdx = aad, r8 = len)
 ; rsp layout: [rsp+32..111]=xmm6,7,8,9,14  [rsp+112]=tail(16)  [rsp+128]=ctx
 ; =============================================================================
-public gcm_aad
 gcm_aad proc frame
     FRAME_PROLOG 144
     movdqu  xmmword ptr [rsp+32],  xmm6
@@ -360,7 +357,6 @@ gcm_aad endp
 ;             [rsp+144]=tail(16)
 ; ctx=r12 in=r13 out=r14 remaining=r15.  Only final call may be len%16!=0.
 ; =============================================================================
-public gcm_crypt
 gcm_crypt proc frame
     FRAME_PROLOG 192
     movdqu  xmmword ptr [rsp+32],  xmm6
@@ -475,7 +471,6 @@ gcm_crypt endp
 ; rsp layout: [rsp+32..111]=xmm6,7,8,9,14  [rsp+112]=lenblk(16)
 ;             [rsp+128]=ctx  [rsp+136]=tag
 ; =============================================================================
-public gcm_final
 gcm_final proc frame
     FRAME_PROLOG 160
     movdqu  xmmword ptr [rsp+32],  xmm6
@@ -605,6 +600,9 @@ gcm_open proc frame
     mov     r8,  qword ptr [r10].GCMREQ.iv
     mov     r9, 1
     call    gcm_init
+    ; Authenticate GHASH(aad, ciphertext) + J0 tag in constant time BEFORE
+    ; decrypting a single byte to outp.  This guarantees forged ciphertexts
+    ; never emit unauthenticated plaintext and preserves inp when outp == inp.
     mov     rcx, qword ptr [rbp-32]
     mov     r10, qword ptr [rbp-24]
     mov     rdx, qword ptr [r10].GCMREQ.aad
@@ -613,10 +611,14 @@ gcm_open proc frame
     mov     rcx, qword ptr [rbp-32]
     mov     r10, qword ptr [rbp-24]
     mov     rdx, qword ptr [r10].GCMREQ.inp
-    mov     r8,  qword ptr [r10].GCMREQ.outp
-    mov     r9,  qword ptr [r10].GCMREQ.inlen
-    call    gcm_crypt
+    mov     r8,  qword ptr [r10].GCMREQ.inlen
+    call    gcm_aad
     mov     rcx, qword ptr [rbp-32]
+    mov     r10, qword ptr [rbp-24]
+    mov     rax, qword ptr [r10].GCMREQ.aadlen
+    mov     qword ptr [rcx+GC_AADN], rax
+    mov     rax, qword ptr [r10].GCMREQ.inlen
+    mov     qword ptr [rcx+GC_PTN], rax
     lea     rdx, [rsp+32+GCM_CTX_SIZE]
     call    gcm_final
     lea     rcx, [rsp+32+GCM_CTX_SIZE]
@@ -624,22 +626,33 @@ gcm_open proc frame
     mov     rdx, qword ptr [r10].GCMREQ.tag
     mov     r8, 16
     call    ct_memcmp
-    ; Wipe the round keys, the GHASH subkey AND the computed tag behind them - they
-    ; are contiguous - keeping the compare result.  The tag used to stay on the stack:
-    ; after a forgery attempt it is a valid tag for the attacker's ciphertext.
     mov     dword ptr [rbp-40], eax
+    test    eax, eax
+    jnz     go_tagfail
+    ; Tag verified: now decrypt inp -> outp via CTR.
+    mov     rcx, qword ptr [rbp-32]
+    mov     qword ptr [rcx+GC_PTN], 0
+    mov     r10, qword ptr [rbp-24]
+    mov     rdx, qword ptr [r10].GCMREQ.inp
+    mov     r8,  qword ptr [r10].GCMREQ.outp
+    mov     r9,  qword ptr [r10].GCMREQ.inlen
+    call    gcm_crypt
+    jmp     go_cleanup
+go_tagfail:
+    ; If outp is a distinct destination buffer, zero it so callers never read stale bytes.
+    mov     r10, qword ptr [rbp-24]
+    mov     rcx, qword ptr [r10].GCMREQ.outp
+    test    rcx, rcx
+    jz      go_cleanup
+    cmp     rcx, qword ptr [r10].GCMREQ.inp
+    je      go_cleanup
+    mov     rdx, qword ptr [r10].GCMREQ.inlen
+    call    secure_zero
+go_cleanup:
+    ; Wipe the round keys, the GHASH subkey AND the computed tag behind them.
     mov     rcx, qword ptr [rbp-32]
     mov     rdx, GCM_CTX_SIZE + 16
     call    secure_zero
-    cmp     dword ptr [rbp-40], 0
-    je      go_ok                               ; tag verified -> plaintext is valid
-    ; tag mismatch: scrub the unauthenticated plaintext we already wrote to outp,
-    ; so a caller that neglects to check the return value cannot process forged data.
-    mov     r10, qword ptr [rbp-24]
-    mov     rcx, qword ptr [r10].GCMREQ.outp
-    mov     rdx, qword ptr [r10].GCMREQ.inlen
-    call    secure_zero
-go_ok:
     pxor    xmm0, xmm0
     pxor    xmm1, xmm1
     pxor    xmm2, xmm2
@@ -747,6 +760,8 @@ aek_xor:
     jmp     aek_loop
 aek_done:
     pxor    xmm0, xmm0
+    xor     ecx, ecx
+    xor     edx, edx
     mov     rax, qword ptr [rbp-32]
     add     rax, 6                           ; Nr = Nk + 6
     FRAME_EPILOG
@@ -759,6 +774,13 @@ aes_expand_key endp
 public aes_ecb_block
 aes_ecb_block proc frame
     FRAME_PROLOG 32
+    cmp     r8, 10
+    je      aeb_go
+    cmp     r8, 12
+    je      aeb_go
+    cmp     r8, 14
+    jne     aeb_out
+aeb_go:
     movdqu  xmm0, xmmword ptr [rdx]
     movdqu  xmm1, xmmword ptr [rcx]
     pxor    xmm0, xmm1                       ; round 0 (whitening)
@@ -780,6 +802,7 @@ aeb_last:
     movdqu  xmmword ptr [rdx], xmm0
     pxor    xmm0, xmm0
     pxor    xmm1, xmm1
+aeb_out:
     FRAME_EPILOG
     ret
 aes_ecb_block endp
@@ -845,6 +868,7 @@ acx_pb:
     inc     r11
     jmp     acx_pb
 acx_done:
+    xor     r10d, r10d
     pxor    xmm0, xmm0                       ; the last keystream block stays on the
     movdqu  xmmword ptr [rbp-80], xmm0       ;   stack otherwise
     pxor    xmm1, xmm1
