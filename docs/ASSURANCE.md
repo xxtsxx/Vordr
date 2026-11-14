@@ -1,6 +1,6 @@
 # Assurance and verification
 
-[Documentation](README.md) · [Visual guide](assurance.html) · [Secret memory](SECRETS.md)
+[Documentation](README.md) · [Trust overview](TRUST.md) · [Visual guide](assurance.html) · [Secret memory](SECRETS.md)
 
 This reference maps Vordr's security and reliability claims directly to automated
 verifiers, static analyzers, and runtime probes—and states the exact boundary of what

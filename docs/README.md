@@ -8,7 +8,7 @@ exact git tags.
 
 ## Trust, architecture, and assurance
 
-- [Why Vordr earns trust](../TRUST.md): architectural rationale, lifecycle trust boundaries, defense-in-depth controls, runnable verification proof, and honest limits.
+- [Why Vordr earns trust](TRUST.md): architectural rationale, lifecycle trust boundaries, defense-in-depth controls, runnable verification proof, and honest limits.
 - [Architecture](ARCHITECTURE.md): module design, why each trust boundary is structured this way, unlock/save state machines, cryptography, and runtime hardening.
 - [Assurance and verification](ASSURANCE.md): the six-stage automated gate, independent vault and crypto verifiers, 10 static analyzers, fuzz/regression probes, and explicit test limits.
 - [Visual verification map](assurance.html): self-contained offline HTML overview of how the six verification stages and trust boundaries fit together.

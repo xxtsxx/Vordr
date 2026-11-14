@@ -1,6 +1,6 @@
 # Why Vordr Earns Trust
 
-[Project overview](README.md) · [Architecture](docs/ARCHITECTURE.md) · [Assurance](docs/ASSURANCE.md) · [File format](docs/formats.md) · [Security policy](SECURITY.md)
+[Project overview](../README.md) · [Documentation](README.md) · [Architecture](ARCHITECTURE.md) · [Assurance](ASSURANCE.md) · [File format](formats.md) · [Security policy](../SECURITY.md)
 
 Trust in a password manager cannot rest on promises—it must be earned through an architecture that eliminates entire classes of risk by construction, transparent boundaries, and automated proof anyone can reproduce offline.
 
@@ -14,10 +14,10 @@ Vordr takes the opposite engineering path:
 
 | Architectural decision | Failure classes eliminated by construction | Where enforced |
 |---|---|---|
-| **Zero-network, offline-only binary** | Remote server breaches, credential-sync interception, silent telemetry, and compromised auto-update channels. Vordr links zero networking APIs (`ws2_32`, `winhttp`, `wininet` are absent). | Import table & [`src/`](docs/ARCHITECTURE.md#source-map) |
-| **Zero third-party libraries or runtime** | Transitive dependency supply-chain attacks, garbage-collector copies of plaintext in RAM, and JIT/runtime vulnerabilities. One native x64 executable (~26 assembly modules) links exclusively against Windows `System32` DLLs. | [`loadcfg.asm`](docs/ARCHITECTURE.md#runtime-hardening) (`DependentLoadFlags = 0x0800`), [`pe_normalise.py`](tools/pe_normalise.py) |
-| **Single authenticated container (`.vordr`)** | Unauthenticated metadata tampering, attachment splicing, and undetected cloud-sync rollbacks. Every byte on disk—header, encrypted body, encrypted attachments, and the 64-bit monotonic save counter—is covered by cryptographic authentication before any record is parsed. | [`vault.asm`](docs/formats.md), [`verify_vault.py`](tests/verify_vault.py) |
-| **Byte-for-byte reproducible builds** | Unverifiable release binaries. Two clean builds of the same git tag with the documented MSVC/SDK toolchain produce identical SHA-256 executables with ASLR, DEP/NX, high-entropy VA, and CET shadow-stack flags intact. | [`build.cmd`](docs/RELEASES.md#reproduce-an-executable), [`verify_repro.ps1`](tools/verify_repro.ps1) |
+| **Zero-network, offline-only binary** | Remote server breaches, credential-sync interception, silent telemetry, and compromised auto-update channels. Vordr links zero networking APIs (`ws2_32`, `winhttp`, `wininet` are absent). | Import table & [`src/`](ARCHITECTURE.md#source-map) |
+| **Zero third-party libraries or runtime** | Transitive dependency supply-chain attacks, garbage-collector copies of plaintext in RAM, and JIT/runtime vulnerabilities. One native x64 executable (~26 assembly modules) links exclusively against Windows `System32` DLLs. | [`loadcfg.asm`](ARCHITECTURE.md#runtime-hardening) (`DependentLoadFlags = 0x0800`), [`pe_normalise.py`](../tools/pe_normalise.py) |
+| **Single authenticated container (`.vordr`)** | Unauthenticated metadata tampering, attachment splicing, and undetected cloud-sync rollbacks. Every byte on disk—header, encrypted body, encrypted attachments, and the 64-bit monotonic save counter—is covered by cryptographic authentication before any record is parsed. | [`vault.asm`](formats.md), [`verify_vault.py`](../tests/verify_vault.py) |
+| **Byte-for-byte reproducible builds** | Unverifiable release binaries. Two clean builds of the same git tag with the documented MSVC/SDK toolchain produce identical SHA-256 executables with ASLR, DEP/NX, high-entropy VA, and CET shadow-stack flags intact. | [`build.cmd`](RELEASES.md#reproduce-an-executable), [`verify_repro.ps1`](../tools/verify_repro.ps1) |
 
 ---
 
@@ -75,9 +75,9 @@ flowchart LR
 
 | Verification layer | What it proves | Command to reproduce |
 |---|---|---|
-| **Independent vault reader** | A standalone Python reader (with its own RFC 9106 Argon2id and pure-Python AES-256-GCM, written solely from [`docs/formats.md`](docs/formats.md)) decrypts real `.vordr` vaults, rejects byte flips across every file region, and confirms fresh nonces per save. | `python tests\verify_vault.py bin\vordr.exe` |
+| **Independent vault reader** | A standalone Python reader (with its own RFC 9106 Argon2id and pure-Python AES-256-GCM, written solely from [`docs/formats.md`](formats.md)) decrypts real `.vordr` vaults, rejects byte flips across every file region, and confirms fresh nonces per save. | `python tests\verify_vault.py bin\vordr.exe` |
 | **Differential & standard crypto vectors** | Cross-checks 58 primitive outputs against Python `hashlib`/`hmac`/AES-GCM and 25 published FIPS 180-4, FIPS 197, SP 800-38A/D, RFC 2202, RFC 4226, RFC 6238, RFC 7693, and RFC 9106 vectors (including multi-segment 64 MiB Argon2id). | `python tests\verify_crypto.py --exe bin\vordr.exe` |
-| **10 static source/ABI/PE analyzers** | Verifies Win64 stack frames and raw OS callbacks (`framecheck`), callee-saved GP/XMM registers (`nvcheck`), control IDs (`idcheck`, `dlgtarget`, `rccheck`), cross-module constants (`constcheck`), string bounds (`wstrcheck`), wide alignment (`aligncheck`), dead symbols (`deadcode`), docs (`check_docs`), and `System32` PE load flags (`pe_normalise`)—all guarded against silent coverage drops by [`floors.py`](tools/floors.py). | `build.cmd release strict` |
+| **10 static source/ABI/PE analyzers** | Verifies Win64 stack frames and raw OS callbacks (`framecheck`), callee-saved GP/XMM registers (`nvcheck`), control IDs (`idcheck`, `dlgtarget`, `rccheck`), cross-module constants (`constcheck`), string bounds (`wstrcheck`), wide alignment (`aligncheck`), dead symbols (`deadcode`), docs (`check_docs`), and `System32` PE load flags (`pe_normalise`)—all guarded against silent coverage drops by [`floors.py`](../tools/floors.py). | `build.cmd release strict` |
 | **Fault injection & crash containment** | Deliberately triggers stack canary, TLS shadow-stack, landing-pad, heap-tag, bounds, overflow, crash-reentrancy, `System32` DLL load, and read-only IAT faults, asserting each exact fail-fast exit code (`0xFADExxxx`). | `python tests\redteam.py bin\vordr.exe` *(on a `dbg` build)* |
 | **Isolated GUI & parser fuzzing** | Exercises `vfuzz`, `fuzzzip`, `jfuzz`, `attfuzz`, attachment/overflow/policy/TPM/private-desktop KATs, `v0.2.3` backward compatibility (`compattest.py`), and 86 live Win32 checks in an `HKCU`-isolated process (`guitest.ps1`). | `tests\run_all.cmd` *(in a test checkout/VM)* |
 | **Byte-for-byte reproducibility** | Builds `release strict` twice from clean state and verifies identical SHA-256 hashes and PE mitigation flags. | `powershell -NoProfile -ExecutionPolicy Bypass -File tools\verify_repro.ps1` |
@@ -94,4 +94,4 @@ Credible security engineering states its boundaries as clearly as its protection
 - **Deliberate plaintext handoff**: Copying a secret to the clipboard, revealing it on screen, or opening/downloading an attachment places plaintext into Windows or a viewer application whose own memory and disk caches Vordr cannot erase.
 - **Local rollback history & TPM scope**: The `HKCU` save-counter mirror catches accidental sync rollbacks on the same PC, not an attacker who restores both the vault and registry (or opens an old copy on a fresh PC). TPM unlock is a local convenience wrapper, never a replacement for keeping your master password backed up.
 
-For deep module internals see [Architecture](docs/ARCHITECTURE.md), [Secret memory](docs/SECRETS.md), and [Assurance](docs/ASSURANCE.md). To report a vulnerability privately, follow [SECURITY.md](SECURITY.md).
+For deep module internals see [Architecture](ARCHITECTURE.md), [Secret memory](SECRETS.md), and [Assurance](ASSURANCE.md). To report a vulnerability privately, follow [SECURITY.md](../SECURITY.md).

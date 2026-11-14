@@ -23,7 +23,7 @@ flowchart LR
 - **Yours alone, completely offline**: Vordr has no internet connection, no telemetry, no background updater, and no online account. Nothing ever leaves your PC unless you copy or move the encrypted `.vordr` file yourself.
 - **One file, zero clutter**: Everything in your vault—logins, two-factor authentication codes, private notes, custom fields, and attached documents or images—lives inside one encrypted `.vordr` file that is easy to back up anywhere.
 - **Small, fast, and self-contained**: Written directly for Windows x64 without heavy frameworks, browser engines, or third-party libraries. It starts instantly, sits quietly in your system tray, and uses minimal battery and CPU at rest.
-- **Trust you can verify, not just take on faith**: Every part of Vordr is open source, checked by automated safety gates on every build, and reproducible byte-for-byte. Read **[Why Vordr Earns Trust](TRUST.md)** for the full design and verification story.
+- **Trust you can verify, not just take on faith**: Every part of Vordr is open source, checked by automated safety gates on every build, and reproducible byte-for-byte. Read **[Why Vordr Earns Trust](docs/TRUST.md)** for the full design and verification story.
 
 ---
 
@@ -83,7 +83,7 @@ Good security tools tell you both **how they protect you** and **what still depe
 - **Independently checked**: Every release is tested against published cryptographic standards, an independent vault reader that shares no code with Vordr, automated GUI and parser tests, and reproducible builds.
 - **Clear real-world expectations**: Keep a strong master password, lock Vordr before hibernating or leaving your PC unattended, remember that anything you copy or open in another app becomes visible to that app, and keep a separate backup of your `.vordr` file.
 
-Explore **[Why Vordr Earns Trust (`TRUST.md`)](TRUST.md)** for why the architecture was designed this way, how every safety layer works, and how to run the verification suite yourself.
+Explore **[Why Vordr Earns Trust (`docs/TRUST.md`)](docs/TRUST.md)** for why the architecture was designed this way, how every safety layer works, and how to run the verification suite yourself.
 
 ---
 
@@ -92,7 +92,7 @@ Explore **[Why Vordr Earns Trust (`TRUST.md`)](TRUST.md)** for why the architect
 | If you want to… | Read |
 |---|---|
 | Learn everyday features, backups, and import/export | [User guide](docs/USER_GUIDE.md) |
-| Understand why Vordr is trustworthy and how it is verified | **[Trust & safety overview](TRUST.md)** · [Visual verification map](docs/assurance.html) |
+| Understand why Vordr is trustworthy and how it is verified | **[Trust & safety overview](docs/TRUST.md)** · [Visual verification map](docs/assurance.html) |
 | Roll out Vordr across company PCs or set policies | [Deployment & policy guide](docs/DEPLOYMENT.md) |
 | Dive into architecture, file format, or memory handling | [Architecture](docs/ARCHITECTURE.md) · [File format](docs/formats.md) · [Secret memory](docs/SECRETS.md) |
 | Build from source, run the test suite, or verify a release hash | [Development](docs/DEVELOPMENT.md) · [Assurance](docs/ASSURANCE.md) · [Release hashes](docs/RELEASES.md) · [Release checklist](docs/RELEASE_CHECKLIST.md) |
@@ -106,3 +106,7 @@ Explore **[Why Vordr Earns Trust (`TRUST.md`)](TRUST.md)** for why the architect
 ## License
 
 Released under the [MIT License](LICENSE.txt).
+
+## AI-assisted development
+
+Vordr is developed using AI. Anthropic Opus 4.8-5.5, Fable 5-5.1, Moonshot Kimi K3, ChatGPT 6 Astra, and Google Gemini 4 Carbon have all contributed to the code, quality, and security—backed by deterministic builds, independent reference verifiers, and automated test gates on every change.

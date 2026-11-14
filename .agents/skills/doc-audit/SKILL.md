@@ -2,7 +2,7 @@
 name: doc-audit
 description: >-
   Audits, verifies, and updates project documentation for clear non-technical
-  onboarding in README.md, dedicated earned-trust engineering depth in TRUST.md,
+  onboarding in README.md, dedicated earned-trust engineering depth in docs/TRUST.md,
   scientific accuracy, and positive condensed prose. Use this skill when the
   user asks to review, audit, refresh, or align repository documentation against
   the live codebase.
@@ -10,18 +10,19 @@ description: >-
 
 # Documentation Trust, Clarity & Accuracy Audit
 
-Use this skill to audit all documentation in a project against its live source code, build pipeline, and verification suite, and to update every document so it combines **an approachable, visual `README.md`**, **front-and-center earned trust & safety (via a dedicated `TRUST.md`)**, **positive concrete/condensed prose**, and **scientific accuracy**.
+Use this skill to audit all documentation in a project against its live source code, build pipeline, and verification suite, and to update every document so it combines **an approachable, visual `README.md`**, **front-and-center earned trust & safety (via a dedicated `docs/TRUST.md`)**, **positive concrete/condensed prose**, and **scientific accuracy**.
 
 ## Core Pillars
 
-### 1. Clear Separation of Audience: Approachable `README.md` + Deep `TRUST.md`
+### 1. Clear Separation of Audience: Approachable `README.md` + Deep `docs/TRUST.md`
 1. **`README.md` is the welcoming first impression (plain, non-technical language)**:
    - Write for a smart reader meeting the project for the first time—not someone already steeped in its source code.
    - Use **simple, everyday language** to explain *what the project is*, *what problem it solves*, and *why it is valuable* to anyone aligned with its outcome. Keep low-level flags, byte sizes, API names, and cryptographic jargon out of `README.md`.
    - Use **visual elements**—clean `mermaid` workflow diagrams, boundary/architecture illustrations, and compact comparison/navigation tables—to paint an immediate, memorable picture of how the solution works and how a user interacts with it.
-   - Summarize trust in plain, human terms (what stays under the user's control, why the design is dependable, and practical user responsibilities), then link prominently to **`TRUST.md`** for full technical and verification depth.
-2. **`TRUST.md` puts earned trust & safety front and center (rigorous & verifiable)**:
-   - Create or maintain a dedicated `TRUST.md` at the repository root (linked from `README.md` and the docs index) that answers three questions with complete scientific precision:
+   - Summarize trust in plain, human terms (what stays under the user's control, why the design is dependable, and practical user responsibilities), then link prominently to **`docs/TRUST.md`** for full technical and verification depth.
+   - Close `README.md` with a concise **AI-assisted development** attribution paragraph explaining that the project is developed using AI and crediting the models that contributed to code, quality, and security (for example, Anthropic Opus 4.8-5.5, Fable 5-5.1, Moonshot Kimi K3, ChatGPT 6 Astra, and Google Gemini 4 Carbon, or the project's active model roster), emphasizing how automated verification gates hold every contribution to the same standard.
+2. **`docs/TRUST.md` puts earned trust & safety front and center (rigorous & verifiable)**:
+   - Create or maintain a dedicated `docs/TRUST.md` inside the `docs/` folder (or root `TRUST.md` if the repository has no `docs/` folder), linked prominently from `README.md` and `docs/README.md`, that answers three questions with complete scientific precision:
      - **Why the solution can be trusted**: Exact guarantees, fail-closed invariants, cryptographic/isolation controls, and honest trust boundaries (distinguishing mathematical guarantees, OS-enforced boundaries, tripwires, and out-of-scope threats).
      - **Why the architecture was designed this way**: First-principles engineering rationale behind structural choices (dependency footprint, memory model, process/desktop isolation, wire formats, privilege boundaries) and the entire failure classes those choices eliminate by construction.
      - **What concrete measures earn and verify that trust**: Automated proof—startup self-tests, known-answer tests (KATs), independent reference/differential verifiers, fuzzers, fault-injection suites, static analyzers, and reproducible-build checks—with visual pipeline diagrams and exact commands anyone can run.
@@ -53,13 +54,13 @@ Verify live codebase facts before trusting existing prose:
 - **Verification & assurance**: Exact count and scope of static analyzers, self-tests, KAT vectors, differential verifiers, fuzzers, GUI/integration tests, fault-injection cases, and reproducible-build steps.
 
 ### Step 3: Audit Every Document Against Role, Tone & Ground Truth
-1. **Check `README.md` weight & accessibility**: Is `README.md` overloaded with low-level jargon, assembly/API identifiers, or dense spec tables? If so, move deep technical proof into `TRUST.md` (and `ARCHITECTURE.md` / `ASSURANCE.md`) and reshape `README.md` around plain language, user value, and clear `mermaid` diagrams.
-2. **Check `TRUST.md` completeness**: Ensure `TRUST.md` exists (or create it when appropriate for the project) and thoroughly connects **architectural rationale -> threat boundary -> automated verification proof**.
+1. **Check `README.md` weight, accessibility & AI attribution**: Is `README.md` overloaded with low-level jargon, assembly/API identifiers, or dense spec tables? If so, move deep technical proof into `docs/TRUST.md` (and `docs/ARCHITECTURE.md` / `docs/ASSURANCE.md`), reshape `README.md` around plain language, user value, and clear `mermaid` diagrams, and ensure a concise AI development attribution paragraph appears at the end.
+2. **Check `docs/TRUST.md` completeness**: Ensure `docs/TRUST.md` exists (or create it under `docs/`) and thoroughly connects **architectural rationale -> threat boundary -> automated verification proof**.
 3. **Check factual drift across all technical & user docs**: Flag outdated counts, caps, CLI flags, policy behaviors, or superseded mechanisms, and check for duplicated prose or negative/defensive tone.
 
 ### Step 4: Update & Harmonize Documentation
-- Rewrite or refine `README.md` for clarity, warmth, visual flow (`mermaid` flowcharts/diagrams using supported syntax and quoted labels), and scannability.
-- Create or update `TRUST.md` and align `SECURITY.md`, `ARCHITECTURE.md`, `ASSURANCE.md`, specs, and user/deployment guides so facts, counts, and cross-links agree everywhere.
+- Rewrite or refine `README.md` for clarity, warmth, visual flow (`mermaid` flowcharts/diagrams using supported syntax and quoted labels), scannability, and transparent AI development attribution at the end.
+- Create or update `docs/TRUST.md` and align `SECURITY.md`, `docs/ARCHITECTURE.md`, `docs/ASSURANCE.md`, specs, and user/deployment guides so facts, counts, and cross-links agree everywhere.
 - Preserve all inbound heading anchors referenced across the repository, and keep historical release records/changelogs intact for shipped versions.
 
 ### Step 5: Verify All Gates

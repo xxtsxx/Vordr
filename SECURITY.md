@@ -95,7 +95,7 @@ verification, 23 startup known-answer suites, 35+ fuzz/round-trip/policy/TPM/GUI
 with an independent zero-shared-code vault reader, 83 differential + published crypto
 vectors, and MSI table/costing/downgrade verification.
 
-See [TRUST.md](TRUST.md), [ARCHITECTURE.md](docs/ARCHITECTURE.md), [SECRETS.md](docs/SECRETS.md),
+See [TRUST.md](docs/TRUST.md), [ARCHITECTURE.md](docs/ARCHITECTURE.md), [SECRETS.md](docs/SECRETS.md),
 and [ASSURANCE.md](docs/ASSURANCE.md) for exact coverage and limits. No external third-party
 audit is recorded in this repository, and passing test suites bound known failure
 classes rather than proving the absence of all defects.
