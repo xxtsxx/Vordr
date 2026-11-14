@@ -1139,6 +1139,8 @@ WSTR tmp_dir_pfx,   <VordrPreview->
 WSTR tmp_sweep_glob,<VordrPreview-*>
 align 4
 sid_local_system    db 1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0
+sid_dwm_grp         db 1, 2, 0, 0, 0, 0, 0, 5, 90, 0, 0, 0, 0, 0, 0, 0
+sid_umfd_grp        db 1, 2, 0, 0, 0, 0, 0, 5, 96, 0, 0, 0, 0, 0, 0, 0
 sid_medium_il       db 1, 1, 0, 0, 0, 0, 0, 16, 0, 20h, 0, 0
 ; --- system tray strings ------------------------------------------------------
 WSTR t_about,       <About Vordr>
@@ -2542,7 +2544,7 @@ gui_hwnd_is_self endp
 ;   -> eax = 1 ok (g_tmp_sd populated with protected DACL for TokenUser + SYSTEM,
 ;   plus optional Medium-IL NO_WRITE_UP SACL), 0 on failure.
 gui_build_user_dacl proc frame
-    FRAME_PROLOG 96
+    FRAME_PROLOG 112
     mov     dword ptr [rbp-24], ecx
     mov     dword ptr [rbp-28], edx
     mov     dword ptr [rbp-32], r8d
@@ -2571,6 +2573,19 @@ gui_build_user_dacl proc frame
             GENERIC_ALL_, addr sid_local_system
     test    eax, eax
     jz      gbud_fail
+    cmp     dword ptr [rbp-24], DESKTOP_PRIV_USER_MASK_
+    jne     gbud_init_sd
+    ; Grant Window Manager (DWM) and Font Driver Host (UMFD) subsystem groups access
+    ; so desktop composition and font rasterization succeed immediately on SwitchDesktop.
+    WINCALL AddAccessAllowedAceEx, addr g_tmp_acl, ACL_REVISION_, 0, \
+            GENERIC_ALL_, addr sid_dwm_grp
+    test    eax, eax
+    jz      gbud_fail
+    WINCALL AddAccessAllowedAceEx, addr g_tmp_acl, ACL_REVISION_, 0, \
+            GENERIC_ALL_, addr sid_umfd_grp
+    test    eax, eax
+    jz      gbud_fail
+gbud_init_sd:
     WINCALL InitializeSecurityDescriptor, addr g_tmp_sd, 1
     test    eax, eax
     jz      gbud_fail
@@ -11865,6 +11880,9 @@ gui_temp_purge endp
 ;   abnormally terminated session (skipping reparse points) (VDR2-14).
 gui_temp_sweep_stale proc frame
     FRAME_PROLOG 144
+    lea     rcx, [g_wipezeros]
+    mov     edx, WIPE_CHUNK
+    call    secure_zero
     WINCALL GetTempPathW, TEMP_PATHW-320, addr g_sweep_dir
     test    eax, eax
     jz      gtss_ret
@@ -12076,6 +12094,22 @@ gtt2_fill:
     cmp     dword ptr [g_tempfile_n], 0
     jne     gtt2_fail
     WINCALL GetFileAttributesW, addr g_imgpath
+    cmp     eax, -1
+    jne     gtt2_fail
+    ; Also verify startup sweep wipes + deletes an untracked stale VordrPreview-* directory.
+    xor     ecx, ecx
+    call    gui_tile_make_temp
+    test    eax, eax
+    jz      gtt2_fail
+    mov     dword ptr [g_wf_disp], 1
+    lea     rcx, [g_tmpfile]
+    lea     rdx, [g_wipezeros]
+    mov     r8d, 512
+    call    write_file
+    test    eax, eax
+    jnz     gtt2_fail
+    call    gui_temp_sweep_stale
+    WINCALL GetFileAttributesW, addr g_tmpfile
     cmp     eax, -1
     jne     gtt2_fail
     mov     dword ptr [rbp-32], 0
@@ -21530,11 +21564,23 @@ SECDESK_SLICE_MS equ 500                             ; watchdog poll interval
 SECDESK_MAX_MS   equ 600000                          ; 10 min: longer than any real
                                                      ;   password entry, short enough
                                                      ;   that a wedge is not forever
+ifdef PROBE_IO
+.data?
+public g_secdesk_force_fail
+g_secdesk_force_fail dd ?
+g_secdesk_noswitch   dd ?
+.code
+endif
+
 secdesk_restore proc frame
     FRAME_PROLOG 72                                  ; 72 -> 80 bytes: [rbp-40] holds the
                                                      ;   SwitchDesktop result ACROSS the
                                                      ;   CloseDesktop below, so it must sit
                                                      ;   clear of that call's home area
+ifdef PROBE_IO
+    cmp     dword ptr [g_secdesk_noswitch], 0
+    jne     sdr_ok
+endif
     mov     dword ptr [rbp-24], 0
 sdr_loop:
     cmp     qword ptr [g_secdesk_orig], 0
@@ -21577,6 +21623,10 @@ secdesk_restore endp
 ;   with no window to close.
 secdesk_switch proc frame
     FRAME_PROLOG 48
+ifdef PROBE_IO
+    cmp     dword ptr [g_secdesk_noswitch], 0
+    jne     sds_ok
+endif
     mov     qword ptr [rbp-24], rcx
     mov     dword ptr [rbp-32], 0
 sds_loop:
@@ -21618,7 +21668,10 @@ sdt_fail:
 sdt_run:
     WINCALL DialogBoxParamW, qword ptr [g_hinst], dword ptr [g_secdesk_dlg], 0, \
             qword ptr [g_secdesk_proc], 0
-    mov     qword ptr [g_secdesk_res], rax       ; marshal the result back to the caller
+    cmp     rax, -1
+    jne     @F
+    mov     rax, -2                              ; Win32 dialog-creation failure -> gss_fallback
+@@: mov     qword ptr [g_secdesk_res], rax       ; marshal the result back to the caller
     cmp     dword ptr [g_secdesk_orphan], 0      ; the watchdog already restored the user's
     jne     sdt_done                             ;   desktop and released these handles
     call    secdesk_restore                      ; checked + retried, never fire-and-forget
@@ -21650,19 +21703,12 @@ secdesk_thread proc
     ret
 secdesk_thread endp
 
-ifdef PROBE_IO
-.data?
-public g_secdesk_force_fail
-g_secdesk_force_fail dd ?
-.code
-endif
-
 ; gui_secdesk_show(ecx = dialog template id, rdx = dialog proc) -> rax = result.
 ;   Runs the given dialog on a private desktop via secdesk_thread and blocks
 ;   until it closes.  Enforces HKLM SecureUnlock fail-closed or explicit Yes/No consent.
 public gui_secdesk_show
 gui_secdesk_show proc frame
-    FRAME_PROLOG 112                             ; locals -24..-48 clear of 6-arg WINCALL spill
+    FRAME_PROLOG 128                             ; locals -24..-52 clear of 6-arg WINCALL spill
     mov     dword ptr [g_secdesk_dlg], ecx
     mov     qword ptr [g_secdesk_proc], rdx
     mov     qword ptr [g_secdesk_res], 0
@@ -21709,13 +21755,15 @@ endif
     jz      gss_fallback                         ; no desktop -> fallback gate
     ; VDR2-12: apply a protected DACL stripping DESKTOP_HOOKCONTROL, DESKTOP_READOBJECTS,
     ; DESKTOP_WRITEOBJECTS, DESKTOP_JOURNALRECORD, and DESKTOP_JOURNALPLAYBACK for peers.
+    ; Note: SetUserObjectSecurity takes PSECURITY_INFORMATION (pointer to DWORD), NOT by value.
     mov     ecx, DESKTOP_PRIV_USER_MASK_
     xor     edx, edx
     xor     r8d, r8d
     call    gui_build_user_dacl
     test    eax, eax
     jz      gss_fallback
-    WINCALL SetUserObjectSecurity, qword ptr [g_secdesk_hd], DACL_SECURITY_INFORMATION_, addr g_tmp_sd
+    mov     dword ptr [rbp-52], DACL_SECURITY_INFORMATION_
+    WINCALL SetUserObjectSecurity, qword ptr [g_secdesk_hd], addr rbp-52, addr g_tmp_sd
     test    eax, eax
     jz      gss_fallback
     WINCALL CreateThread, 0, 0, addr secdesk_thread, 0, 0, 0
@@ -24062,22 +24110,66 @@ glp_bad:
 gui_layout_probe endp
 
 ; =============================================================================
-; cmd_secdeskkat - VDR-13 headless secure-desktop fallback policy & orphan probe.
+; cmd_secdeskkat - VDR-13 / VDR2-12 secure-desktop policy, DACL & dialog KAT.
 ;   1) g_secunlock_lock=1 (HKLM policy) + forced secure-desktop failure ->
 ;      displays s_sdlocked and refuses fallback (returns 0).
 ;   2) g_secunlock_lock=0 (user pref) + forced failure -> prompts Yes/No via
 ;      s_sdfall and refuses fallback when declined (IDNO -> returns 0).
 ;   3) g_secdesk_orphan=1 -> create_proc(WM_COMMAND, IDOK) wipes g_pwbuf and
 ;      cancels instead of running gui_create_do.
+;   4) Live private-desktop creation + SetUserObjectSecurity DACL hardening +
+;      OpenDesktopW(DESKTOP_HOOKCONTROL) peer-hook denial + secdesk_thread
+;      DialogBoxParamW(DLG_UNLOCK) round-trip (without SwitchDesktop flicker).
 ; =============================================================================
 .const
-CSTR sdk_ok,  "secdeskkat: PASS (HKLM SecureUnlock fail-closed, user consent gate, and orphan IDOK block)",13,10
-CSTR sdk_bad, "secdeskkat: FAIL (secure-desktop fallback gate regressed)",13,10
+CSTR sdk_ok,  "secdeskkat: PASS (HKLM SecureUnlock fail-closed, consent gate, orphan block, and live private-desktop DACL)",13,10
+CSTR sdk_bad, "secdeskkat: FAIL (secure-desktop gate or private-desktop DACL regressed)",13,10
 .code
+
+; sdk_autoclose_proc - raw DLGPROC run on the private desktop by cmd_secdeskkat:
+;   verifies DESKTOP_HOOKCONTROL (8) is denied by the protected DACL, exercises
+;   theme_attach + gui_set_winicon + gui_edit_noime + gui_edit_scrub, and closes
+;   immediately with result 77h.
+sdk_autoclose_proc proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 64
+    mov     qword ptr [rbp-8], rcx
+    cmp     rdx, WM_INITDIALOG
+    jne     sap_unh
+    WINCALL OpenDesktopW, addr g_secdesk_name, 0, 0, 8      ; DESKTOP_HOOKCONTROL = 8
+    test    rax, rax
+    jz      sap_dacl_ok
+    WINCALL CloseDesktop, rax
+    WINCALL EndDialog, qword ptr [rbp-8], 0DEADh
+    mov     eax, 1
+    jmp     sap_ret
+sap_dacl_ok:
+    mov     rcx, qword ptr [rbp-8]
+    call    theme_attach
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_set_winicon
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_U_PW
+    call    gui_edit_noime
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_U_PW
+    call    gui_edit_scrub
+    WINCALL EndDialog, qword ptr [rbp-8], 77h
+    mov     eax, 1
+    jmp     sap_ret
+sap_unh:
+    xor     eax, eax
+sap_ret:
+    mov     rsp, rbp
+    pop     rbp
+    ret
+sdk_autoclose_proc endp
+
 LANDING_PAD
 public cmd_secdeskkat
 cmd_secdeskkat proc frame
-    FRAME_PROLOG 48
+    FRAME_PROLOG 64
     mov     dword ptr [g_sp_active], 1
     mov     dword ptr [g_sp_messages], 0
     mov     qword ptr [g_sp_lastmsg], 0
@@ -24126,13 +24218,41 @@ cmd_secdeskkat proc frame
     cmp     dword ptr [g_sp_messages], 0
     jne     sdk_fail
 
+    ; 4) Mutex DACL+SACL builder + live private-desktop SetUserObjectSecurity & DLG_UNLOCK
+    mov     ecx, GENERIC_ALL_
+    xor     edx, edx
+    mov     r8d, 1
+    call    gui_build_user_dacl
+    test    eax, eax
+    jz      sdk_fail
+
     mov     dword ptr [g_secdesk_force_fail], 0
+    WINCALL OpenInputDesktop, 0, 0, DESKTOP_MAXALLOWED
+    test    rax, rax
+    jz      sdk_done_live                       ; headless service session -> skip live desktop
+    WINCALL CloseDesktop, rax
+    WINCALL GetModuleHandleW, 0
+    mov     qword ptr [g_hinst], rax
+    mov     dword ptr [rbp-24], 8
+    mov     dword ptr [rbp-20], 4005h
+    WINCALL InitCommonControlsEx, addr rbp-24
+    call    theme_boot
+    mov     dword ptr [g_secdesk_noswitch], 1
+    mov     ecx, DLG_UNLOCK
+    lea     rdx, [sdk_autoclose_proc]
+    call    gui_secdesk_show
+    mov     dword ptr [g_secdesk_noswitch], 0
+    cmp     rax, 77h
+    jne     sdk_fail
+
+sdk_done_live:
     mov     dword ptr [g_sp_active], 0
     WINCALL print_a, addr sdk_ok, sdk_ok_len
     xor     eax, eax
     FRAME_EPILOG
     ret
 sdk_fail:
+    mov     dword ptr [g_secdesk_noswitch], 0
     mov     dword ptr [g_secdesk_orphan], 0
     mov     dword ptr [g_secdesk_force_fail], 0
     mov     dword ptr [g_secunlock_lock], 0
