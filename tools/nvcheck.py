@@ -60,6 +60,15 @@ IMPLICIT_RSI_RDI = re.compile(r'^\s*(?:rep\w*\s+)?(?:movs|cmps)[bwdq]\b', re.I)
 IMPLICIT_RDI     = re.compile(r'^\s*(?:rep\w*\s+)?(?:stos|scas)[bwdq]\b', re.I)
 IMPLICIT_CPUID   = re.compile(r'^\s*cpuid\b', re.I)
 
+ALIAS_TO_REG = {a: r for r, aliases in REGS.items() for a in aliases}
+_ALT_ALL     = '|'.join(sorted(ALIAS_TO_REG, key=len, reverse=True))
+RE_PROC      = re.compile(r'^(\w+)\s+proc\b', re.I)
+RE_ENDP      = re.compile(r'^(\w+)\s+endp\b', re.I)
+RE_PUSH      = re.compile(r'^push\s+(' + _ALT_ALL + r')\b')
+RE_SAVE      = re.compile(r'^\S+\s+(?:\w+\s+ptr\s*)?(\[[^\]]*\])\s*,\s*(' + _ALT_ALL + r')\b')
+RE_POP       = re.compile(r'^pop\s+(' + _ALT_ALL + r')\b')
+RE_LOAD      = re.compile(r'^\S+\s+(' + _ALT_ALL + r')\s*,\s*(?:\w+\s+ptr\s*)?(\[[^\]]*\])')
+
 
 def _norm_slot(slot):
     return re.sub(r'\s+', '', slot.lower())
@@ -69,15 +78,20 @@ def scan(path):
     findings, procs = [], 0
     lines = open(path, encoding='latin-1').read().split('\n')
     name = None
+    name_lo = None
     for i, raw in enumerate(lines, 1):
         l = raw.split(';', 1)[0].strip()
-        m = re.match(r'^(\w+)\s+proc\b', l, re.I)
-        if m:
-            name, start, saved, restored, written = m.group(1), i, {}, set(), {}
+        if not l:
             continue
         if name is None:
+            m = RE_PROC.match(l)
+            if m:
+                name, name_lo, start = m.group(1), m.group(1).lower(), i
+                saved, restored, written = {}, set(), {}
             continue
-        if re.match(r'^' + re.escape(name) + r'\s+endp\b', l, re.I):
+        lo = l.lower()
+        mend = RE_ENDP.match(lo)
+        if mend and mend.group(1) == name_lo:
             procs += 1
             if name not in EXEMPT:
                 for r, line in sorted(written.items(), key=lambda kv: kv[1]):
@@ -89,9 +103,6 @@ def scan(path):
                                         f"but never restores it from its save slot")
             name = None
             continue
-        if not l:
-            continue
-        lo = l.lower()
         # implicit clobbers
         if IMPLICIT_CPUID.match(lo):
             written.setdefault('rbx', i)
@@ -100,33 +111,45 @@ def scan(path):
             written.setdefault('rdi', i)
         if IMPLICIT_RDI.match(lo):
             written.setdefault('rdi', i)
-        xm = XCHG_TWO.match(lo)
-        for r, aliases in REGS.items():
-            alt = '|'.join(aliases)
-            # saves: push r, or a store of r into memory [slot] (before its first write)
-            if re.match(r'^push\s+(' + alt + r')\b', lo):
-                if r not in written:
-                    saved.setdefault(r, set()).add('push')
-                continue
-            msave = re.match(r'^\S+\s+(?:\w+\s+ptr\s*)?(\[[^\]]*\])\s*,\s*(' + alt + r')\b', lo)
-            if msave and r not in written:
+        mpush = RE_PUSH.match(lo)
+        if mpush:
+            r = ALIAS_TO_REG[mpush.group(1)]
+            if r not in written:
+                saved.setdefault(r, set()).add('push')
+            continue
+        msave = RE_SAVE.match(lo)
+        if msave:
+            r = ALIAS_TO_REG[msave.group(2)]
+            if r not in written:
                 saved.setdefault(r, set()).add(_norm_slot(msave.group(1)))
-                continue
-            # restores: pop r (when pushed), or load from the SAME memory slot it was saved to
-            if re.match(r'^pop\s+(' + alt + r')\b', lo):
-                if 'push' in saved.get(r, ()):
-                    restored.add(r)
-                written.setdefault(r, i)
-                continue
-            mload = re.match(r'^\S+\s+(' + alt + r')\s*,\s*(?:\w+\s+ptr\s*)?(\[[^\]]*\])', lo)
-            if mload and _norm_slot(mload.group(2)) in saved.get(r, ()):
+            continue
+        mpop = RE_POP.match(lo)
+        if mpop:
+            r = ALIAS_TO_REG[mpop.group(1)]
+            if 'push' in saved.get(r, ()):
+                restored.add(r)
+            written.setdefault(r, i)
+            continue
+        mload = RE_LOAD.match(lo)
+        if mload:
+            r = ALIAS_TO_REG[mload.group(1)]
+            if _norm_slot(mload.group(2)) in saved.get(r, ()):
                 restored.add(r)
                 continue
-            if xm and (xm.group(1) in aliases or xm.group(2) in aliases):
-                written.setdefault(r, i)
+        xm = XCHG_TWO.match(lo)
+        if xm:
+            hit_nv = False
+            for op in (xm.group(1), xm.group(2)):
+                r = ALIAS_TO_REG.get(op)
+                if r is not None:
+                    written.setdefault(r, i)
+                    hit_nv = True
+            if hit_nv:
                 continue
-            w = WRITE.match(lo)
-            if w and w.group(1) in aliases and not lo.startswith('push'):
+        w = WRITE.match(lo)
+        if w and not lo.startswith('push'):
+            r = ALIAS_TO_REG.get(w.group(1))
+            if r is not None:
                 written.setdefault(r, i)
     return findings, procs
 

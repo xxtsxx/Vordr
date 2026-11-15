@@ -34,13 +34,12 @@ extern tpm_available:proc               ; M2: TPM machine-secret binding (tpm.as
 extern tpm_seal:proc
 extern tpm_unseal:proc
 extern tpm_delete:proc
-extern tpm_seal_pin:proc
-extern tpm_unseal_pin:proc
 extern tpm_hello_seal:proc
 extern tpm_hello_unseal:proc
+extern tpm_hello_delete:proc
 externdef g_tpm_reqhello:dword
 ifdef PROBE_IO
-externdef g_tpm_kat_nohwpin:dword
+extern GetTempPathW:proc
 endif
 extern secure_zero:proc
 extern secmem_alloc:proc
@@ -148,6 +147,7 @@ VH_SALT         equ 20
 VH_NONCE        equ 52
 VH_KCV          equ 64
 VH_TOTAL        equ 80          ; header + KCV (= GCM AAD)
+VH_INV_AAD      equ 68          ; invariant header AAD (g_hdr[0..51] || g_hdr[64..79], sans VH_NONCE)
 VAULT_BODY_MAX  equ 16777216    ; 16 MiB plaintext cap (record fields only)
 ; UTF-8 scratch for one field value.  Must cover the widest value the UI can hold
 ; (CONVW_MAX-1 = 16383 wide chars) in the WORST script: a BMP character is up to 3
@@ -404,10 +404,9 @@ g_tpm_pin_u8len dd ?                ; UTF-8 byte length of g_tpm_pin_u8
 align 2
 g_tpm_kn        dw 64 dup (?)       ; TPM key name (wide): "Vordr-" + KCV[0..7] hex
 g_tpm_kn_s      dw 64 dup (?)       ; TPM state slot key name: "Vordr-<hex>-S0" / "-S1"
-public g_tpm_hwpin
-g_tpm_hwpin     dw 34 dup (?)       ; 32 wide hex chars + NUL (68 bytes)
 align 8
 g_tpm_blob      db TPM_BLOB_CAP dup (?)
+g_tpm_oldblob   db TPM_BLOB_CAP dup (?)
 public g_tpm_state, g_tpm_sec, g_tpm_dk, g_tpm_cand, g_tpm_pin_u8
 g_tpm_state     db 384 dup (?)      ; InnerState (380 bytes used, padded to 384)
 g_tpm_sec       db 64 dup (?)       ; tpm_secret[32] || second_half[32]
@@ -622,38 +621,6 @@ tks_tail:
     ret
 tpm_kn_slot_build endp
 
-; tpm_hex16_wide(rcx = in16, rdx = out_wide34) - 16 bytes -> 32 lowercase wide hex + NUL.
-tpm_hex16_wide proc
-    xor     r8d, r8d
-thw_lp:
-    movzx   eax, byte ptr [rcx+r8]
-    mov     r9d, eax
-    shr     r9d, 4
-    and     r9d, 0Fh
-    cmp     r9d, 10
-    jb      thw_hd
-    add     r9d, 'a'-10
-    jmp     thw_hs
-thw_hd:
-    add     r9d, '0'
-thw_hs:
-    mov     word ptr [rdx+r8*4], r9w
-    and     eax, 0Fh
-    cmp     eax, 10
-    jb      thw_ld
-    add     eax, 'a'-10
-    jmp     thw_ls
-thw_ld:
-    add     eax, '0'
-thw_ls:
-    mov     word ptr [rdx+r8*4+2], ax
-    inc     r8d
-    cmp     r8d, 16
-    jb      thw_lp
-    mov     word ptr [rdx+64], 0
-    ret
-tpm_hex16_wide endp
-
 ; tpm_wipe_scratch() - wipe all transient Mode 2 / Mode 3 secret buffers.
 tpm_wipe_scratch proc frame
     FRAME_PROLOG 32
@@ -665,9 +632,6 @@ tpm_wipe_scratch proc frame
     call    secure_zero
     lea     rcx, [g_tpm_dk]
     mov     edx, 64
-    call    secure_zero
-    lea     rcx, [g_tpm_hwpin]
-    mov     edx, 68
     call    secure_zero
     lea     rcx, [g_tpm_cand]
     mov     edx, 32
@@ -703,9 +667,64 @@ tpm_del_slots_silent proc frame
     ret
 tpm_del_slots_silent endp
 
+; tpm_stash_prev_hello() -> eax = ct_hello_len (>0) if g_cfg_in currently has a
+;   Mode 3 (WHLO) envelope in HKCU\..\TPM-Unlock (copied into g_tpm_oldblob), else 0.
+tpm_stash_prev_hello proc frame
+    FRAME_PROLOG 32
+    mov     rcx, qword ptr [g_cfg_in]
+    test    rcx, rcx
+    jz      tsph_no
+    lea     rdx, [g_tpm_oldblob]
+    mov     r8d, TPM_BLOB_CAP
+    call    reg_tpm_get
+    cmp     eax, 84
+    jb      tsph_no
+    cmp     eax, TPM_BLOB_CAP
+    ja      tsph_no
+    lea     r10, [g_tpm_oldblob]
+    cmp     dword ptr [r10+0], TPM_ENV_MAGIC
+    jne     tsph_no
+    cmp     word ptr [r10+4], TPM_ENV_VER
+    jne     tsph_no
+    cmp     byte ptr [r10+6], TPM_MODE_HELLO
+    jne     tsph_no
+    cmp     dword ptr [r10+12], eax
+    jne     tsph_no
+    cmp     word ptr [r10+16], 256
+    jne     tsph_no
+    movzx   ecx, word ptr [r10+18]
+    cmp     ecx, 65
+    jb      tsph_no
+    cmp     ecx, 512
+    ja      tsph_no
+    lea     edx, [rcx + 276 + 60]
+    cmp     edx, eax
+    jne     tsph_no
+    mov     eax, ecx
+    FRAME_EPILOG
+    ret
+tsph_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+tpm_stash_prev_hello endp
+
+; tpm_del_stashed_hello(ecx = ct_hello_len) - delete stashed WHLO platform credential if any.
+tpm_del_stashed_hello proc frame
+    FRAME_PROLOG 32
+    test    ecx, ecx
+    jz      tdsh_ret
+    mov     edx, ecx
+    lea     rcx, [g_tpm_oldblob + 276]
+    call    tpm_hello_delete
+tdsh_ret:
+    FRAME_EPILOG
+    ret
+tpm_del_stashed_hello endp
+
 ; tpm_pin_stretch() -> eax = 1 ok / 0 fail.
 ;   Argon2id(g_tpm_pin_u8[0..g_tpm_pin_u8len], salt = ST_SALT[32]) -> g_tpm_dk[64],
-;   wipes g_tpm_pin_u8, and formats g_tpm_dk[0..15] into g_tpm_hwpin.
+;   and wipes g_tpm_pin_u8.
 tpm_pin_stretch proc frame
     FRAME_PROLOG 32
     mov     eax, dword ptr [g_tpm_pin_u8len]
@@ -743,9 +762,6 @@ tpm_pin_stretch proc frame
     mov     dword ptr [g_tpm_pin_u8len], 0
     cmp     dword ptr [rbp-24], 0
     jne     tps_bad
-    lea     rcx, [g_tpm_dk]
-    lea     rdx, [g_tpm_hwpin]
-    call    tpm_hex16_wide
     mov     eax, 1
     FRAME_EPILOG
     ret
@@ -759,7 +775,9 @@ tps_bad:
     ret
 tpm_pin_stretch endp
 
-; tpm_build_aad(ecx = prefix_bytes) - g_tpm_aad = g_tpm_blob[0..prefix_bytes-1] || g_hdr[0..79].
+; tpm_build_aad(ecx = prefix_bytes) - g_tpm_aad = g_tpm_blob[0..prefix_bytes-1]
+;   || g_hdr[0..51] || g_hdr[64..79] (prefix_bytes + VH_INV_AAD = prefix_bytes + 68).
+;   Excludes mutable VH_NONCE (g_hdr[52..63]) so vault_reseal never invalidates TPM blobs.
 tpm_build_aad proc
     lea     r10, [g_tpm_blob]
     lea     r11, [g_tpm_aad]
@@ -775,18 +793,27 @@ tba_h0:
     add     r11, rcx
     lea     r10, [g_hdr]
     xor     r8d, r8d
-tba_h:
+tba_h1:
     mov     al, byte ptr [r10+r8]
     mov     byte ptr [r11+r8], al
     inc     r8d
-    cmp     r8d, VH_TOTAL
-    jb      tba_h
+    cmp     r8d, VH_NONCE
+    jb      tba_h1
+    add     r11, VH_NONCE
+    lea     r10, [g_hdr + VH_KCV]
+    xor     r8d, r8d
+tba_h2:
+    mov     al, byte ptr [r10+r8]
+    mov     byte ptr [r11+r8], al
+    inc     r8d
+    cmp     r8d, VH_TOTAL - VH_KCV
+    jb      tba_h2
     ret
 tpm_build_aad endp
 
 ; tpm_pin_seal_state(ecx = slot 0|1) -> eax = 1 ok / 0 fail.
 ;   Creates fresh RSA-2048 key in Vordr-<KCV>-S{slot}, seals random state_key[32],
-;   AES-256-GCM-encrypts g_tpm_state[380] with AAD = OuterHdr[16] || g_hdr[80],
+;   AES-256-GCM-encrypts g_tpm_state[380] with AAD = OuterHdr[16] || InvHdr[68],
 ;   and commits the 680-byte envelope to HKCU\..\TPM-Unlock.
 tpm_pin_seal_state proc frame
     FRAME_PROLOG 48
@@ -831,7 +858,7 @@ tpm_pin_seal_state proc frame
     mov     qword ptr [r10].GCMREQ.iv, rax
     lea     rax, [g_tpm_aad]
     mov     qword ptr [r10].GCMREQ.aad, rax
-    mov     qword ptr [r10].GCMREQ.aadlen, 16 + VH_TOTAL
+    mov     qword ptr [r10].GCMREQ.aadlen, 16 + VH_INV_AAD
     lea     rax, [g_tpm_state]
     mov     qword ptr [r10].GCMREQ.inp, rax
     mov     qword ptr [r10].GCMREQ.inlen, ST_SIZE
@@ -1045,7 +1072,7 @@ vk_derive_tpm_pin proc frame
     mov     qword ptr [r10].GCMREQ.iv, rax
     lea     rax, [g_tpm_aad]
     mov     qword ptr [r10].GCMREQ.aad, rax
-    mov     qword ptr [r10].GCMREQ.aadlen, 16 + VH_TOTAL
+    mov     qword ptr [r10].GCMREQ.aadlen, 16 + VH_INV_AAD
     lea     rax, [g_tpm_blob + 284]
     mov     qword ptr [r10].GCMREQ.inp, rax
     mov     qword ptr [r10].GCMREQ.inlen, ST_SIZE
@@ -1100,13 +1127,16 @@ vk_derive_tpm_pin proc frame
     lea     rcx, [g_tpm_kn_s]
     call    tpm_delete
 
-    ; 5) Stretch entered PIN + verify hardware SmartCardPin + unwrap g_vkey
+    ; 5) Stretch entered PIN + unseal machine PCP secret + unwrap g_vkey
     call    tpm_pin_stretch
     test    eax, eax
     jz      vdtp_badpin
     call    tpm_kn_build
-    WINCALL tpm_unseal_pin, addr g_tpm_kn, addr g_tpm_state + ST_CTTPM, 256, \
-            addr g_tpm_hwpin, addr g_tpm_sec
+    lea     rcx, [g_tpm_kn]
+    lea     rdx, [g_tpm_state + ST_CTTPM]
+    mov     r8d, 256
+    lea     r9, [g_tpm_sec]
+    call    tpm_unseal
     cmp     eax, 1
     jne     vdtp_badpin
     lea     r10, [g_tpm_dk + 32]
@@ -1123,14 +1153,16 @@ vdtp_cpw:
     lea     r8, [g_tpm_cand]
     mov     r9d, 32
     call    blake2b_hash
+    xor     ecx, ecx
+    call    tpm_build_aad
     lea     r10, [g_greq]
     lea     rax, [g_tpm_cand]
     mov     qword ptr [r10].GCMREQ.key, rax
     lea     rax, [g_tpm_state + ST_VKIV]
     mov     qword ptr [r10].GCMREQ.iv, rax
-    lea     rax, [g_hdr]
+    lea     rax, [g_tpm_aad]
     mov     qword ptr [r10].GCMREQ.aad, rax
-    mov     qword ptr [r10].GCMREQ.aadlen, VH_TOTAL
+    mov     qword ptr [r10].GCMREQ.aadlen, VH_INV_AAD
     lea     rax, [g_tpm_state + ST_VKCT]
     mov     qword ptr [r10].GCMREQ.inp, rax
     mov     qword ptr [r10].GCMREQ.inlen, 32
@@ -1282,7 +1314,7 @@ vk_derive_tpm_hello proc frame
     mov     qword ptr [r10].GCMREQ.iv, r11
     lea     rax, [g_tpm_aad]
     mov     qword ptr [r10].GCMREQ.aad, rax
-    mov     qword ptr [r10].GCMREQ.aadlen, 20 + VH_TOTAL
+    mov     qword ptr [r10].GCMREQ.aadlen, 20 + VH_INV_AAD
     lea     rax, [r11 + 12]
     mov     qword ptr [r10].GCMREQ.inp, rax
     mov     qword ptr [r10].GCMREQ.inlen, 32
@@ -1349,6 +1381,8 @@ vk_derive_tpm endp
 public vault_tpm_remember
 vault_tpm_remember proc frame
     FRAME_PROLOG 48
+    call    tpm_stash_prev_hello
+    mov     dword ptr [rbp-16], eax
     call    tpm_kn_build
     lea     rcx, [g_tpm_kn]
     lea     rdx, [g_vkey]
@@ -1371,6 +1405,8 @@ vault_tpm_remember proc frame
     test    eax, eax
     jz      vtr_fail
     call    tpm_del_slots_silent
+    mov     ecx, dword ptr [rbp-16]
+    call    tpm_del_stashed_hello
     mov     eax, 1
     FRAME_EPILOG
     ret
@@ -1388,11 +1424,14 @@ vault_tpm_remember endp
 public vault_tpm_enroll_pin
 vault_tpm_enroll_pin proc frame
     FRAME_PROLOG 48
+    ; [rbp-16]=saved reqhello [rbp-20]=old_hello_len
     mov     eax, dword ptr [g_tpm_reqhello]
-    mov     dword ptr [rbp-24], eax
+    mov     dword ptr [rbp-16], eax
     mov     dword ptr [g_tpm_reqhello], 0
     cmp     dword ptr [g_tpm_pin_u8len], 0
     je      vtep_fail
+    call    tpm_stash_prev_hello
+    mov     dword ptr [rbp-20], eax
     lea     rcx, [g_tpm_state]
     mov     edx, 384
     call    secure_zero
@@ -1415,8 +1454,11 @@ vault_tpm_enroll_pin proc frame
     test    eax, eax
     jz      vtep_fail
     call    tpm_kn_build
-    WINCALL tpm_seal_pin, addr g_tpm_kn, addr g_tpm_sec, addr g_tpm_hwpin, \
-            addr g_tpm_state + ST_CTTPM, 256
+    lea     rcx, [g_tpm_kn]
+    lea     rdx, [g_tpm_sec]
+    lea     r8, [g_tpm_state + ST_CTTPM]
+    mov     r9d, 256
+    call    tpm_seal
     cmp     eax, 256
     jne     vtep_fail
     mov     word ptr [g_tpm_state + ST_TLEN], 256
@@ -1434,14 +1476,16 @@ vtep_cpw:
     lea     r8, [g_tpm_cand]
     mov     r9d, 32
     call    blake2b_hash
+    xor     ecx, ecx
+    call    tpm_build_aad
     lea     r10, [g_greq]
     lea     rax, [g_tpm_cand]
     mov     qword ptr [r10].GCMREQ.key, rax
     lea     rax, [g_tpm_state + ST_VKIV]
     mov     qword ptr [r10].GCMREQ.iv, rax
-    lea     rax, [g_hdr]
+    lea     rax, [g_tpm_aad]
     mov     qword ptr [r10].GCMREQ.aad, rax
-    mov     qword ptr [r10].GCMREQ.aadlen, VH_TOTAL
+    mov     qword ptr [r10].GCMREQ.aadlen, VH_INV_AAD
     lea     rax, [g_vkey]
     mov     qword ptr [r10].GCMREQ.inp, rax
     mov     qword ptr [r10].GCMREQ.inlen, 32
@@ -1471,8 +1515,10 @@ vtep_cpw:
     call    tpm_kn_slot_build
     lea     rcx, [g_tpm_kn_s]
     call    tpm_delete
+    mov     ecx, dword ptr [rbp-20]
+    call    tpm_del_stashed_hello
     call    tpm_wipe_scratch
-    mov     eax, dword ptr [rbp-24]
+    mov     eax, dword ptr [rbp-16]
     mov     dword ptr [g_tpm_reqhello], eax
     mov     eax, 1
     FRAME_EPILOG
@@ -1482,7 +1528,7 @@ vtep_delmain:
     call    tpm_delete
 vtep_fail:
     call    tpm_wipe_scratch
-    mov     eax, dword ptr [rbp-24]
+    mov     eax, dword ptr [rbp-16]
     mov     dword ptr [g_tpm_reqhello], eax
     xor     eax, eax
     FRAME_EPILOG
@@ -1495,23 +1541,26 @@ vault_tpm_enroll_pin endp
 ; ===========================================================================
 public vault_tpm_enroll_hello
 vault_tpm_enroll_hello proc frame
-    FRAME_PROLOG 48
-    ; [rbp-16]=saved reqhello [rbp-20]=ct_hello_len [rbp-24]=total_len [rbp-32]=tail_ptr
+    FRAME_PROLOG 64
+    ; [rbp-16]=saved reqhello [rbp-20]=ct_hello_len [rbp-24]=total_len
+    ; [rbp-32]=tail_ptr       [rbp-36]=old_hello_len
     mov     eax, dword ptr [g_tpm_reqhello]
     mov     dword ptr [rbp-16], eax
     mov     dword ptr [g_tpm_reqhello], 0
+    call    tpm_stash_prev_hello
+    mov     dword ptr [rbp-36], eax
     lea     rcx, [g_tpm_sec]                    ; tpm_secret[32] || hello_secret[32]
     mov     edx, 64
     call    rng_fill
     test    eax, eax
     jz      vteh_fail
-    ; 1) Seal + live-verify hello_secret[32] via Passport KSP FIRST (so user cancel
-    ;    leaves any existing Mode 1 / Mode 2 enrollment untouched!)
+    ; 1) Create Windows Hello FIDO2 PRF credential FIRST (so user cancel leaves
+    ;    any existing Mode 1 / Mode 2 / Mode 3 enrollment untouched!)
     lea     rcx, [g_tpm_sec + 32]
     lea     rdx, [g_tpm_blob + 276]
     mov     r8d, 512
     call    tpm_hello_seal
-    cmp     eax, 64
+    cmp     eax, 65
     jb      vteh_fail
     cmp     eax, 512
     ja      vteh_fail
@@ -1525,7 +1574,7 @@ vault_tpm_enroll_hello proc frame
     mov     edx, 12
     call    rng_fill
     test    eax, eax
-    jz      vteh_fail
+    jz      vteh_delnew
     ; 2) Seal tpm_secret[32] to machine PCP key Vordr-<KCV>
     call    tpm_kn_build
     lea     rcx, [g_tpm_kn]
@@ -1534,7 +1583,7 @@ vault_tpm_enroll_hello proc frame
     mov     r9d, 256
     call    tpm_seal
     cmp     eax, 256
-    jne     vteh_fail
+    jne     vteh_delnew
     ; 3) Header + dual-key AES-256-GCM wrap of g_vkey
     lea     r10, [g_tpm_blob]
     mov     dword ptr [r10+0],  TPM_ENV_MAGIC
@@ -1561,7 +1610,7 @@ vault_tpm_enroll_hello proc frame
     mov     qword ptr [r10].GCMREQ.iv, r11
     lea     rax, [g_tpm_aad]
     mov     qword ptr [r10].GCMREQ.aad, rax
-    mov     qword ptr [r10].GCMREQ.aadlen, 20 + VH_TOTAL
+    mov     qword ptr [r10].GCMREQ.aadlen, 20 + VH_INV_AAD
     lea     rax, [g_vkey]
     mov     qword ptr [r10].GCMREQ.inp, rax
     mov     qword ptr [r10].GCMREQ.inlen, 32
@@ -1578,6 +1627,8 @@ vault_tpm_enroll_hello proc frame
     test    eax, eax
     jz      vteh_delmain
     call    tpm_del_slots_silent
+    mov     ecx, dword ptr [rbp-36]
+    call    tpm_del_stashed_hello
     call    tpm_wipe_scratch
     mov     eax, dword ptr [rbp-16]
     mov     dword ptr [g_tpm_reqhello], eax
@@ -1587,6 +1638,10 @@ vault_tpm_enroll_hello proc frame
 vteh_delmain:
     lea     rcx, [g_tpm_kn]
     call    tpm_delete
+vteh_delnew:
+    lea     rcx, [g_tpm_blob + 276]
+    mov     edx, dword ptr [rbp-20]
+    call    tpm_hello_delete
 vteh_fail:
     call    tpm_wipe_scratch
     mov     eax, dword ptr [rbp-16]
@@ -1597,19 +1652,22 @@ vteh_fail:
 vault_tpm_enroll_hello endp
 
 ; ===========================================================================
-; vault_tpm_forget() -> eax = 1.  Delete all TPM keys (main + S0 + S1) + the
-;   HKCU\..\TPM-Unlock entry for this vault.
+; vault_tpm_forget() -> eax = 1.  Delete all TPM keys (main + S0 + S1), any
+;   Windows Hello platform credential, and HKCU\..\TPM-Unlock for this vault.
 ; ===========================================================================
 public vault_tpm_forget
 vault_tpm_forget proc frame
     FRAME_PROLOG 32
+    ; [rbp-16]=saved reqhello [rbp-20]=old_hello_len
+    call    tpm_stash_prev_hello
+    mov     dword ptr [rbp-20], eax
     call    tpm_kn_build
     mov     eax, dword ptr [g_tpm_reqhello]
-    mov     dword ptr [rbp-24], eax
+    mov     dword ptr [rbp-16], eax
     mov     dword ptr [g_tpm_reqhello], 0
     lea     rcx, [g_tpm_kn]
     call    tpm_delete
-    mov     eax, dword ptr [rbp-24]
+    mov     eax, dword ptr [rbp-16]
     mov     dword ptr [g_tpm_reqhello], eax
     test    eax, eax
     jz      @F
@@ -1618,6 +1676,8 @@ vault_tpm_forget proc frame
 @@: call    tpm_del_slots_silent
     mov     rcx, qword ptr [g_cfg_in]       ; value name = vault path
     call    reg_tpm_del
+    mov     ecx, dword ptr [rbp-20]
+    call    tpm_del_stashed_hello
     mov     eax, 1
     FRAME_EPILOG
     ret
@@ -10787,26 +10847,36 @@ cmd_vattcolkat endp
 ifdef PROBE_IO
 ; ===========================================================================
 ; vault_tpm_pin_kat() -> eax = 0 (PASS) / 1 (FAIL).
-;   Headless Mode 2 (TPM + PIN) anti-replay & 3-strike revocation KAT.
+;   Headless Mode 2 (TPM + PIN) anti-replay, 3-strike revocation & disk lifecycle KAT.
 ;   Verifies:
 ;     1) Mode 2 enroll + Mode 1 downgrade refusal (EXIT_LOCKED).
 ;     2) Valid PIN round-trip + S0 -> S1 -> S0 key rotation.
 ;     3) Registry snapshot replay refusal (replaying old S0 blob fails & revokes).
 ;     4) Failed-attempt counter tracking + reset to 0 on subsequent valid PIN.
 ;     5) Automatic 3-strike revocation (deletes TPM keys + HKCU entry).
+;     6) Disk lifecycle: Vault 1 reseal (VH_NONCE rotation) + PIN unlock + 3-strike
+;        revocation + Master Password A unlock + Vault 2 create + PIN enroll +
+;        PIN unlock + Master Password B unlock.
 ; ===========================================================================
 .data
 WSTR vtpk_path, <C:\VordrTpmPinKat\kat.vordr>
+WSTR vtpk_fn1,  <vordr_tpkat1.vordr>
+WSTR vtpk_fn2,  <vordr_tpkat2.vordr>
 vtpk_pin_ok  db "739284"
+vtpk_pin_ok2 db "849205"
 vtpk_pin_b1  db "111111"
 vtpk_pin_b2  db "222222"
 vtpk_pin_b3  db "333333"
+vtpk_pw_a    db "CorrectHorse#99", 0
+vtpk_pw_b    db "SecondVault$88", 0
 .data?
 align 8
 vtpk_hdr_bk  db VH_TOTAL dup (?)
 vtpk_vkey_bk db 32 dup (?)
 vtpk_vkey_ex db 32 dup (?)
 vtpk_snap    db TPM_PIN_BLOB_SZ dup (?)
+vtpk_p1      dw 320 dup (?)
+vtpk_p2      dw 320 dup (?)
 .code
 vtpk_set_pin proc
     ; rcx = ptr, edx = len (<= 32)
@@ -10824,25 +10894,114 @@ vsp_dn:
     ret
 vtpk_set_pin endp
 
+vtpk_set_pw proc
+    ; rcx = ascii ptr, edx = len
+    mov     dword ptr [g_cfg_passlen], edx
+    lea     r10, [g_cfg_pass]
+    xor     r8d, r8d
+vspw_lp:
+    cmp     r8d, edx
+    jae     vspw_dn
+    mov     al, byte ptr [rcx+r8]
+    mov     byte ptr [r10+r8], al
+    inc     r8d
+    jmp     vspw_lp
+vspw_dn:
+    mov     byte ptr [r10+r8], 0
+    ret
+vtpk_set_pw endp
+
+vtpk_mk_tmppath proc frame
+    ; rcx = dst (320 wchars), rdx = leaf wideZ -> eax = 1 ok / 0 fail
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-16], rcx
+    mov     qword ptr [rbp-24], rdx
+    WINCALL GetTempPathW, 260, rcx
+    test    eax, eax
+    jz      vmtp_fail
+    cmp     eax, 260
+    jae     vmtp_fail
+    mov     r10, qword ptr [rbp-16]
+    lea     r10, [r10 + rax*2]
+    cmp     word ptr [r10-2], 5Ch
+    je      @F
+    mov     word ptr [r10], 5Ch
+    add     r10, 2
+@@: mov     r11, qword ptr [rbp-24]
+    xor     ecx, ecx
+vmtp_cp:
+    mov     ax, word ptr [r11 + rcx*2]
+    mov     word ptr [r10 + rcx*2], ax
+    test    ax, ax
+    jz      vmtp_ok
+    inc     ecx
+    cmp     ecx, 48
+    jb      vmtp_cp
+vmtp_fail:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+vmtp_ok:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+vtpk_mk_tmppath endp
+
+vtpk_clean_disk proc frame
+    ; rcx = wide vault path; locks, deletes TPM + anti-rollback reg entries + file + backups
+    FRAME_PROLOG 32
+    cmp     word ptr [rcx], 0
+    je      vpcd_ret
+    call    cfg_in_set
+    call    vault_lock
+    call    vault_tpm_forget
+    mov     rcx, qword ptr [g_cfg_in]
+    call    reg_ctr_del
+    WINCALL DeleteFileW, qword ptr [g_cfg_in]
+    lea     rcx, [g_bak_a]
+    mov     dl, '0'
+    call    vault_mkbak
+    WINCALL DeleteFileW, addr g_bak_a
+    lea     rcx, [g_bak_a]
+    mov     dl, '1'
+    call    vault_mkbak
+    WINCALL DeleteFileW, addr g_bak_a
+    lea     rcx, [g_bak_a]
+    mov     dl, '2'
+    call    vault_mkbak
+    WINCALL DeleteFileW, addr g_bak_a
+    lea     rcx, [g_bak_a]
+    mov     dl, '3'
+    call    vault_mkbak
+    WINCALL DeleteFileW, addr g_bak_a
+vpcd_ret:
+    FRAME_EPILOG
+    ret
+vtpk_clean_disk endp
+
 public vault_tpm_pin_kat
 vault_tpm_pin_kat proc frame
-    FRAME_PROLOG 64
-    ; [rbp-12]=saved use_tpm [rbp-16]=saved reqhello
-    ; [rbp-20]=saved pin_t   [rbp-24]=saved pin_m   [rbp-28]=saved pin_max
-    ; [rbp-32]=saved nohwpin [rbp-36]=rc
+    FRAME_PROLOG 80
+    ; [rbp-16]=saved use_tpm [rbp-20]=saved reqhello
+    ; [rbp-24]=saved pin_t   [rbp-28]=saved pin_m   [rbp-32]=saved pin_max
+    ; [rbp-36]=saved cfg_t   [rbp-40]=saved cfg_m   [rbp-44]=rc
     mov     eax, dword ptr [g_use_tpm]
-    mov     dword ptr [rbp-12], eax
-    mov     eax, dword ptr [g_tpm_reqhello]
     mov     dword ptr [rbp-16], eax
-    mov     eax, dword ptr [g_tpm_pin_t]
+    mov     eax, dword ptr [g_tpm_reqhello]
     mov     dword ptr [rbp-20], eax
-    mov     eax, dword ptr [g_tpm_pin_m]
+    mov     eax, dword ptr [g_tpm_pin_t]
     mov     dword ptr [rbp-24], eax
-    mov     eax, dword ptr [g_tpm_pin_max]
+    mov     eax, dword ptr [g_tpm_pin_m]
     mov     dword ptr [rbp-28], eax
-    mov     eax, dword ptr [g_tpm_kat_nohwpin]
+    mov     eax, dword ptr [g_tpm_pin_max]
     mov     dword ptr [rbp-32], eax
-    mov     dword ptr [rbp-36], 1
+    mov     eax, dword ptr [g_cfg_t]
+    mov     dword ptr [rbp-36], eax
+    mov     eax, dword ptr [g_cfg_m]
+    mov     dword ptr [rbp-40], eax
+    mov     dword ptr [rbp-44], 1
+    mov     word ptr [vtpk_p1], 0
+    mov     word ptr [vtpk_p2], 0
 
     lea     rcx, [vtpk_hdr_bk]
     lea     rdx, [g_hdr]
@@ -10857,7 +11016,6 @@ vault_tpm_pin_kat proc frame
     lea     rcx, [vtpk_path]
     call    cfg_in_set
     mov     dword ptr [g_tpm_reqhello], 0
-    mov     dword ptr [g_tpm_kat_nohwpin], 1
     mov     dword ptr [g_tpm_pin_t], 1
     mov     dword ptr [g_tpm_pin_m], 64
     mov     dword ptr [g_tpm_pin_max], 3
@@ -11018,11 +11176,163 @@ vtpk_seed:
     call    vk_derive_tpm
     cmp     eax, EXIT_LOCKED
     jne     vtpk_out
+    call    vault_tpm_forget
 
-    mov     dword ptr [rbp-36], 0
+    ; 7) Full disk lifecycle regression (VH_NONCE reseal + 3-strike pw survival + 2nd vault)
+    lea     rcx, [vtpk_p1]
+    lea     rdx, [vtpk_fn1]
+    call    vtpk_mk_tmppath
+    test    eax, eax
+    jz      vtpk_out
+    lea     rcx, [vtpk_p2]
+    lea     rdx, [vtpk_fn2]
+    call    vtpk_mk_tmppath
+    test    eax, eax
+    jz      vtpk_out
+    lea     rcx, [vtpk_p1]
+    call    vtpk_clean_disk
+    lea     rcx, [vtpk_p2]
+    call    vtpk_clean_disk
+
+    ; 7a) Create Vault 1 ("CorrectHorse#99"), enroll PIN, reseal (rotates VH_NONCE!), unlock by PIN
+    lea     rcx, [vtpk_p1]
+    call    cfg_in_set
+    mov     dword ptr [g_cfg_t], 1
+    mov     dword ptr [g_cfg_m], 64
+    mov     dword ptr [g_use_tpm], TPM_MODE_OFF
+    lea     rcx, [vtpk_pw_a]
+    mov     edx, 15
+    call    vtpk_set_pw
+    call    do_init
+    test    eax, eax
+    jnz     vtpk_out
+    lea     rcx, [vtpk_pw_a]
+    mov     edx, 15
+    call    vtpk_set_pw
+    call    vault_unlock
+    test    eax, eax
+    jnz     vtpk_out
+    call    vault_add_system_item
+    test    eax, eax
+    jz      vtpk_out
+    call    vault_reseal
+    test    eax, eax
+    jnz     vtpk_out
+    lea     rcx, [vtpk_pin_ok]
+    mov     edx, 6
+    call    vtpk_set_pin
+    call    vault_tpm_enroll_pin
+    cmp     eax, 1
+    jne     vtpk_out
+    call    vault_reseal                        ; rotates VH_NONCE at g_hdr[52..63]!
+    test    eax, eax
+    jnz     vtpk_out
+    call    vault_lock
+
+    mov     dword ptr [g_use_tpm], TPM_MODE_PIN
+    lea     rcx, [vtpk_pin_ok]
+    mov     edx, 6
+    call    vtpk_set_pin
+    call    vault_unlock
+    test    eax, eax
+    jnz     vtpk_out
+    call    vault_lock
+
+    ; 7b) Trigger 3-strike revocation on Vault 1 -> Master Password A MUST still open Vault 1!
+    mov     dword ptr [g_use_tpm], TPM_MODE_PIN
+    lea     rcx, [vtpk_pin_b1]
+    mov     edx, 6
+    call    vtpk_set_pin
+    call    vault_unlock
+    cmp     eax, EXIT_AUTH
+    jne     vtpk_out
+    lea     rcx, [vtpk_pin_b2]
+    mov     edx, 6
+    call    vtpk_set_pin
+    call    vault_unlock
+    cmp     eax, EXIT_AUTH
+    jne     vtpk_out
+    lea     rcx, [vtpk_pin_b3]
+    mov     edx, 6
+    call    vtpk_set_pin
+    call    vault_unlock
+    cmp     eax, EXIT_LOCKED
+    jne     vtpk_out
+    call    vault_tpm_has
+    test    eax, eax
+    jnz     vtpk_out
+
+    mov     dword ptr [g_use_tpm], TPM_MODE_OFF
+    lea     rcx, [vtpk_pw_a]
+    mov     edx, 15
+    call    vtpk_set_pw
+    call    vault_unlock
+    test    eax, eax
+    jnz     vtpk_out
+    call    vault_lock
+
+    ; 7c) Delete Vault 1 -> Create Vault 2 ("SecondVault$88") -> Enroll PIN -> Verify BOTH open!
+    lea     rcx, [vtpk_p1]
+    call    vtpk_clean_disk
+    lea     rcx, [vtpk_p2]
+    call    cfg_in_set
+    mov     dword ptr [g_use_tpm], TPM_MODE_OFF
+    lea     rcx, [vtpk_pw_b]
+    mov     edx, 14
+    call    vtpk_set_pw
+    call    do_init
+    test    eax, eax
+    jnz     vtpk_out
+    lea     rcx, [vtpk_pw_b]
+    mov     edx, 14
+    call    vtpk_set_pw
+    call    vault_unlock
+    test    eax, eax
+    jnz     vtpk_out
+    lea     rcx, [vtpk_pin_ok2]
+    mov     edx, 6
+    call    vtpk_set_pin
+    call    vault_tpm_enroll_pin
+    cmp     eax, 1
+    jne     vtpk_out
+    call    vault_reseal
+    test    eax, eax
+    jnz     vtpk_out
+    call    vault_lock
+
+    mov     dword ptr [g_use_tpm], TPM_MODE_PIN
+    lea     rcx, [vtpk_pin_ok2]
+    mov     edx, 6
+    call    vtpk_set_pin
+    call    vault_unlock
+    test    eax, eax
+    jnz     vtpk_out
+    call    vault_lock
+
+    mov     dword ptr [g_use_tpm], TPM_MODE_OFF
+    lea     rcx, [vtpk_pw_b]
+    mov     edx, 14
+    call    vtpk_set_pw
+    call    vault_unlock
+    test    eax, eax
+    jnz     vtpk_out
+    call    vault_lock
+
+    mov     dword ptr [rbp-44], 0
 
 vtpk_out:
+    call    vault_lock
+    lea     rcx, [vtpk_path]
+    call    cfg_in_set
     call    vault_tpm_forget
+    lea     rcx, [vtpk_p1]
+    call    vtpk_clean_disk
+    lea     rcx, [vtpk_p2]
+    call    vtpk_clean_disk
+    lea     rcx, [g_cfg_pass]
+    mov     edx, MAX_PASSWORD_BYTES + 1
+    call    secure_zero
+    mov     dword ptr [g_cfg_passlen], 0
     lea     rcx, [vtpk_vkey_ex]
     mov     edx, 32
     call    secure_zero
@@ -11037,19 +11347,21 @@ vtpk_out:
     lea     rcx, [vtpk_vkey_bk]
     mov     edx, 32
     call    secure_zero
-    mov     eax, dword ptr [rbp-12]
-    mov     dword ptr [g_use_tpm], eax
     mov     eax, dword ptr [rbp-16]
-    mov     dword ptr [g_tpm_reqhello], eax
+    mov     dword ptr [g_use_tpm], eax
     mov     eax, dword ptr [rbp-20]
-    mov     dword ptr [g_tpm_pin_t], eax
+    mov     dword ptr [g_tpm_reqhello], eax
     mov     eax, dword ptr [rbp-24]
-    mov     dword ptr [g_tpm_pin_m], eax
+    mov     dword ptr [g_tpm_pin_t], eax
     mov     eax, dword ptr [rbp-28]
-    mov     dword ptr [g_tpm_pin_max], eax
+    mov     dword ptr [g_tpm_pin_m], eax
     mov     eax, dword ptr [rbp-32]
-    mov     dword ptr [g_tpm_kat_nohwpin], eax
+    mov     dword ptr [g_tpm_pin_max], eax
     mov     eax, dword ptr [rbp-36]
+    mov     dword ptr [g_cfg_t], eax
+    mov     eax, dword ptr [rbp-40]
+    mov     dword ptr [g_cfg_m], eax
+    mov     eax, dword ptr [rbp-44]
     FRAME_EPILOG
     ret
 vault_tpm_pin_kat endp

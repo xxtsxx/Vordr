@@ -21,18 +21,33 @@
          no elevation is needed.
 
     Usage:  powershell -ExecutionPolicy Bypass -File tools\verify_msi.ps1 `
-                       -Msi bin\vordr-0.2.2.msi
+                       [-Msi bin\vordr-0.2.3.msi]
     Exit code 0 = all checks passed.
 #>
 [CmdletBinding()]
-param([Parameter(Mandatory=$true)][string]$Msi)
+param([string]$Msi = "")
 
 $ErrorActionPreference = "Stop"
+
+# Auto-discover bin\vordr-*.msi when -Msi is omitted so a bare invocation never
+# blocks indefinitely on an interactive PowerShell parameter prompt.
+if ([string]::IsNullOrWhiteSpace($Msi)) {
+    $repoBin = Join-Path (Split-Path -Parent $PSScriptRoot) "bin"
+    $cands   = @(Get-ChildItem -Path (Join-Path $repoBin "vordr-*.msi") -File -ErrorAction SilentlyContinue)
+    if ($cands.Count -eq 0) {
+        throw "No MSI found matching $repoBin\vordr-*.msi (run tools\make_msi.ps1 first, or pass -Msi <path>)."
+    }
+    if ($cands.Count -gt 1) {
+        throw ("Multiple MSIs found in $repoBin ({0}); pass -Msi <path> explicitly." -f (($cands | ForEach-Object { $_.Name }) -join ", "))
+    }
+    $Msi = $cands[0].FullName
+}
 
 # OpenPackage needs a rooted path - given a relative one it fails with the
 # generic "OpenPackage,PackagePath,Options" COM error, while OpenDatabase
 # accepts it, so the failure looks like a corrupt package rather than a path.
 $Msi = (Resolve-Path $Msi).Path
+Write-Host ("msi package     : {0}" -f $Msi)
 $installer = New-Object -ComObject WindowsInstaller.Installer
 $db = $installer.OpenDatabase($Msi, 0)          # msiOpenDatabaseModeReadOnly
 

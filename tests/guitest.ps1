@@ -90,18 +90,76 @@ try {
     Check ((Read-VordrGlobal -Process $p -Map $map -Symbol 'g_testmode') -eq 1) 'test isolation engaged (g_testmode = 1: HKCU remapped)'
     Check (Test-Path "HKCU:\Software\VordrGuiTest\$name") 'the scratch HKCU key exists'
 
-    # ---- input limits match the buffers they are read into --------------------
+    # ---- input limits, topmost elevation, and focus priority ------------------
+    if (-not ('VordrT.Gti' -as [type])) {
+        Add-Type -Name Gti -Namespace VordrT -MemberDefinition @'
+[StructLayout(LayoutKind.Sequential)]
+public struct RECT { public int L, T, R, B; }
+[StructLayout(LayoutKind.Sequential)]
+public struct GUITHREADINFO {
+    public int cbSize;
+    public int flags;
+    public IntPtr hwndActive;
+    public IntPtr hwndFocus;
+    public IntPtr hwndCapture;
+    public IntPtr hwndMenuOwner;
+    public IntPtr hwndMoveSize;
+    public IntPtr hwndCaret;
+    public RECT rcCaret;
+}
+[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+[DllImport("user32.dll")] public static extern bool GetGUIThreadInfo(uint idThread, ref GUITHREADINFO lpgui);
+[DllImport("user32.dll")] public static extern int GetWindowLongW(IntPtr h, int i);
+[DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
+public static GUITHREADINFO Info(IntPtr hwnd) {
+    uint pid; uint tid = GetWindowThreadProcessId(hwnd, out pid);
+    var g = new GUITHREADINFO();
+    g.cbSize = System.Runtime.InteropServices.Marshal.SizeOf(typeof(GUITHREADINFO));
+    GetGUIThreadInfo(tid, ref g);
+    return g;
+}
+public static bool IsTopmost(IntPtr hwnd) {
+    return (GetWindowLongW(hwnd, -20) & 0x00000008) != 0;
+}
+'@
+    }
+    Start-Sleep -Milliseconds 150
+    Check ([VordrT.Gti]::IsTopmost($u)) 'unlock dialog opens with WS_EX_TOPMOST'
     $ed = Get-VordrControl -Window $u -Id $IDC_U_PW
     Check ((Get-VordrEditLimit $ed) -eq 1023) ("unlock password box stops at 1023 characters (got {0})" -f (Get-VordrEditLimit $ed))
+    $gtiU = [VordrT.Gti]::Info($u)
+    if ($gtiU.hwndActive -eq $u) {
+        Check ($gtiU.hwndFocus -eq $ed) 'unlock dialog focuses the password field immediately on open'
+        $ro = Get-VordrControl -Window $u -Id 109                                   # IDC_U_RONLY
+        if ($ro -ne [IntPtr]::Zero) {
+            Send-VordrCommand -Window $u -Id 109 -Sync
+            $gtiU2 = [VordrT.Gti]::Info($u)
+            Check ($gtiU2.hwndFocus -eq $ed) 'toggling Read-only on unlock returns focus to the password field'
+            Send-VordrCommand -Window $u -Id 109 -Sync
+        }
+    } else {
+        Write-Host '  (unlock focus check skipped: OS foreground lock kept test process inactive)'
+    }
 
     $v = Unlock $p $u
     Check ($v -ne [IntPtr]::Zero) 'unlock with the test password opens the vault window'
     if ($v -eq [IntPtr]::Zero) { throw 'no vault window' }
+    Check ([VordrT.Gti]::IsTopmost($v)) 'vault main window opens with WS_EX_TOPMOST'
     $se = Get-VordrControl -Window $v -Id $IDC_V_SEARCH
     Check ((Get-VordrEditLimit $se) -eq 254) ("search box stops at 254 characters (got {0})" -f (Get-VordrEditLimit $se))
+    $lb = Get-VordrControl -Window $v -Id $IDC_V_LIST
+    $gtiV = [VordrT.Gti]::Info($v)
+    if ($gtiV.hwndActive -eq $v) {
+        Check ($gtiV.hwndFocus -eq $se) 'vault main window focuses the search field immediately on open'
+        [void](Send-VordrMessage -Hwnd $se -Msg 0x0100 -W ([IntPtr]0x28))           # WM_KEYDOWN VK_DOWN on search
+        $gtiVDn = [VordrT.Gti]::Info($v)
+        Check ($gtiVDn.hwndFocus -eq $lb) 'pressing Down in the search field moves focus to the entry list'
+    } else {
+        Write-Host '  (vault initial focus check skipped: OS foreground lock kept test process inactive)'
+    }
 
     # select the first entry
-    $lb = Get-VordrControl -Window $v -Id $IDC_V_LIST
     [void](Send-VordrMessage -Hwnd $lb -Msg 0x186 -W ([IntPtr]0))                     # LB_SETCURSEL 0
     Send-VordrCommand -Window $v -Id $IDC_V_LIST -Notify 1 -LParam $lb -Sync          # LBN_SELCHANGE
     Start-Sleep -Milliseconds 500
@@ -281,17 +339,21 @@ try {
         Check ((& $G 'g_pill_idx') -eq 3 -and ($q2 -eq 0xFFFFFFFF -or ($q3 -eq $sel -and $q2 -eq $side))) ("the pill comes to rest on the new row, and only there (0x{0:X6} / 0x{1:X6})" -f $q3, $q2)
         Check ((& $G 'g_xfade_hwnd') -eq 0) 'the cross-fade overlay is gone once the fade ends'
         # the row under the pointer is tinted, and the tint goes when the pointer does
-        $hy = 6 * $ih + [int]($ih / 2)
-        [void][VordrGui.Native]::SetCursorPos($lo.X + 150, $lo.Y + $hy)
-        [void](Send-VordrMessage -Hwnd $lb -Msg 0x0200 -L ([IntPtr]($hy * 65536 + 150)))
-        Start-Sleep -Milliseconds 400
-        $hv = & $pp 6
-        Check ((& $G 'g_lhot_idx') -eq 6 -and ($hv -eq 0xFFFFFFFF -or $hv -ne $side)) ("the row under the pointer is tinted (0x{0:X6} vs sidebar 0x{1:X6})" -f $hv, $side)
-        [void][VordrGui.Native]::SetCursorPos($lo.X + 150, $lo.Y - 40)
-        [void](Send-VordrMessage -Hwnd $lb -Msg 0x02A3)
-        Start-Sleep -Milliseconds 500
-        $hv2 = & $pp 6
-        Check ($hv2 -eq 0xFFFFFFFF -or $hv2 -eq $side) ("and the tint fades away when the pointer leaves (0x{0:X6})" -f $hv2)
+        if ($canMoveCursor) {
+            $hy = 6 * $ih + [int]($ih / 2)
+            [void][VordrGui.Native]::SetCursorPos($lo.X + 150, $lo.Y + $hy)
+            [void](Send-VordrMessage -Hwnd $lb -Msg 0x0200 -L ([IntPtr]($hy * 65536 + 150)))
+            Start-Sleep -Milliseconds 400
+            $hv = & $pp 6
+            Check ((& $G 'g_lhot_idx') -eq 6 -and ($hv -eq 0xFFFFFFFF -or $hv -ne $side)) ("the row under the pointer is tinted (0x{0:X6} vs sidebar 0x{1:X6})" -f $hv, $side)
+            [void][VordrGui.Native]::SetCursorPos($lo.X + 150, $lo.Y - 40)
+            [void](Send-VordrMessage -Hwnd $lb -Msg 0x02A3)
+            Start-Sleep -Milliseconds 500
+            $hv2 = & $pp 6
+            Check ($hv2 -eq 0xFFFFFFFF -or $hv2 -eq $side) ("and the tint fades away when the pointer leaves (0x{0:X6})" -f $hv2)
+        } else {
+            Write-Host '  (row hover tint check skipped: SetCursorPos blocked by non-interactive desktop)'
+        }
     } finally { [Windows.Forms.Cursor]::Position = $saved }
     # the frameless header buttons' halo fades in and out too (the star)
     $star = Get-VordrControl -Window $v -Id 237                                     # IDC_V_FAV
@@ -451,6 +513,7 @@ try {
     $pg = Wait-VordrOwned -Process $p -Owner $v -TimeoutMs 8000
     Check ($pg -ne [IntPtr]::Zero) 'standalone password generator opens'
     if ($pg -ne [IntPtr]::Zero) {
+        Check ([VordrT.Gti]::IsTopmost($pg)) 'standalone password generator opens with WS_EX_TOPMOST'
         Send-VordrCommand -Window $pg -Id 1                                             # IDOK ("Copy")
         Check (Wait-VordrGone -Hwnd $pg -TimeoutMs 5000) 'Copy closes standalone password generator'
         $go1 = Read-VordrGlobal -Process $p -Map $map -Symbol 'g_genout' -Size 260
@@ -465,6 +528,16 @@ try {
     $sel = Wait-VordrOwned -Process $p -Owner $v -TimeoutMs 8000
     Check ($sel -ne [IntPtr]::Zero) 'the export checklist opens'
     if ($sel -ne [IntPtr]::Zero) {
+        Check ([VordrT.Gti]::IsTopmost($sel)) 'export checklist opens with WS_EX_TOPMOST'
+        $selSrch = Get-VordrControl -Window $sel -Id 751                                # IDC_SEL_SEARCH
+        $gtiSel = [VordrT.Gti]::Info($sel)
+        if ($gtiSel.hwndActive -eq $sel) {
+            Check ($gtiSel.hwndFocus -eq $selSrch) 'export checklist focuses its search box immediately on open'
+            Send-VordrCommand -Window $sel -Id 754 -Sync                                # IDC_SEL_NONE
+            Send-VordrCommand -Window $sel -Id 753 -Sync                                # IDC_SEL_ALL
+            $gtiSel2 = [VordrT.Gti]::Info($sel)
+            Check ($gtiSel2.hwndFocus -eq $selSrch) 'clicking All/None in checklist returns focus to search box'
+        }
         $cdModal = Send-CopyDataVault -Target $tray -PathText $vault
         Check ($cdModal -eq 0 -and (& $G 'g_openfile_set') -eq 0) 'VDR-07: WM_COPYDATA hand-off refused while a modal dialog is active'
         $lv = Get-VordrControl -Window $sel -Id 752
@@ -489,11 +562,61 @@ try {
         Start-Sleep -Milliseconds 300
     }
 
+    # ---- Settings full-surface dragging & search refocus on close --------------
+    Send-VordrCommand -Window $v -Id 295 -Sync                                          # IDC_T_SET (open Settings)
+    Start-Sleep -Milliseconds 200
+    $setwV = [IntPtr](& $G 'g_settings_hwnd')
+    Check ($setwV -ne [IntPtr]::Zero -and [VordrGui.Native]::IsWindowVisible($setwV) -and (& $G 'g_menu_open') -eq 1) 'Settings child surface opens inside the vault window'
+    if ($setwV -ne [IntPtr]::Zero) {
+        $swCo = Get-VordrClientOrigin $setwV
+        $swPt = [IntPtr]([int64](((($swCo.Y + 12) -band 0xFFFF) -shl 16) -bor (($swCo.X + 12) -band 0xFFFF)))
+        $htSetBg = [int](Send-VordrMessage -Hwnd $setwV -Msg 0x0084 -L $swPt)           # WM_NCHITTEST on empty Settings bg
+        Check ($htSetBg -eq 1) ("Settings background hit-tests as HTCLIENT so clicks land on settings_proc without bleeding through (got {0})" -f $htSetBg)
+        $lblBad = 0
+        foreach ($lblId in @(218, 219, 266)) {                                          # IDC_V_MTITLE, IDC_V_MPOLL, IDC_V_MTOUTS
+            $lh = Get-VordrControl -Window $setwV -Id $lblId
+            if ($lh -ne [IntPtr]::Zero) {
+                $lo2 = Get-VordrClientOrigin $lh
+                $lpt = [IntPtr]([int64](((($lo2.Y + 4) -band 0xFFFF) -shl 16) -bor (($lo2.X + 4) -band 0xFFFF)))
+                if ([int](Send-VordrMessage -Hwnd $lh -Msg 0x0084 -L $lpt) -ne -1) { $lblBad++ }
+            }
+        }
+        Check ($lblBad -eq 0) 'Settings static labels return HTTRANSPARENT (-1) so dragging works across labels too'
+        [void][VordrGui.Native]::PostMessageW($setwV, 0x0201, [IntPtr]1, [IntPtr]0x000C000C) # WM_LBUTTONDOWN on Settings surface
+        Start-Sleep -Milliseconds 40
+        [void][VordrGui.Native]::PostMessageW($v, 0x0202, [IntPtr]0, [IntPtr]0x000C000C)     # WM_LBUTTONUP release
+        [void][VordrGui.Native]::PostMessageW($setwV, 0x0202, [IntPtr]0, [IntPtr]0x000C000C)
+        Start-Sleep -Milliseconds 100
+        Check ((& $G 'g_menu_open') -eq 1 -and [VordrGui.Native]::IsWindowVisible($setwV)) 'dragging on the Settings surface keeps Settings open and responsive'
+        Send-VordrCommand -Window $v -Id 295 -Sync                                      # IDC_T_SET (close Settings)
+        Start-Sleep -Milliseconds 150
+        Check ((& $G 'g_menu_open') -eq 0 -and -not [VordrGui.Native]::IsWindowVisible($setwV)) 'closing Settings returns to vault view'
+        $gtiSetClose = [VordrT.Gti]::Info($v)
+        if ($gtiSetClose.hwndActive -eq $v) {
+            Check ($gtiSetClose.hwndFocus -eq $se) 'closing Settings restores focus to the search field'
+        }
+    }
+
+    # ---- Revival from minimized state restores topmost & search focus ----------
+    [void][VordrT.Gti]::ShowWindow($v, 6)                                               # SW_MINIMIZE
+    Start-Sleep -Milliseconds 250
+    Check ([VordrT.Gti]::IsIconic($v)) 'minimizing the vault window makes it iconic'
+    [void](Send-VordrMessage -Hwnd $tray -Msg 0x8001 -L ([IntPtr]0x0202))               # WM_TRAYICON + WM_LBUTTONUP
+    Start-Sleep -Milliseconds 250
+    Check ((-not [VordrT.Gti]::IsIconic($v)) -and [VordrGui.Native]::IsWindowVisible($v) -and [VordrT.Gti]::IsTopmost($v)) 'clicking the tray icon revives an iconic vault window (instead of closing it) and keeps WS_EX_TOPMOST'
+    $gtiRev = [VordrT.Gti]::Info($v)
+    if ($gtiRev.hwndActive -eq $v) {
+        Check ($gtiRev.hwndFocus -eq $se) 'reviving the vault window restores focus to the search field'
+    }
+
     # ---- a lock while a Vordr modal is open closes the modal, then locks -------
     $before = (Get-Item $vault).LastWriteTimeUtc
     Send-VordrCommand -Window $v -Id $IDC_V_REMOVE                                     # "move to trash?" box
     $box = Wait-VordrOwned -Process $p -Owner $v -TimeoutMs 5000
     Check ($box -ne [IntPtr]::Zero) 'the trash confirmation box is up'
+    if ($box -ne [IntPtr]::Zero) {
+        Check ([VordrT.Gti]::IsTopmost($box)) 'modal confirmation box opens with WS_EX_TOPMOST'
+    }
     Send-VordrCommand -Window $v -Id $IDC_V_LOCK                                       # Ctrl+L / hotkey path
     Check (Wait-VordrGone -Hwnd $box -TimeoutMs 5000) 'locking closed the open confirmation box'
     Check (Wait-VordrGone -Hwnd $v -TimeoutMs 5000) 'and the vault window locked'
@@ -515,6 +638,13 @@ try {
     $u2 = Open-Unlock $p
     Check ($null -ne $u2 -and $u2 -ne [IntPtr]::Zero) 'the unlock window comes back after a lock'
     if ($u2) {
+        Start-Sleep -Milliseconds 150
+        Check ([VordrT.Gti]::IsTopmost($u2)) 'reopened unlock window preserves WS_EX_TOPMOST'
+        $ed2 = Get-VordrControl -Window $u2 -Id $IDC_U_PW
+        $gtiURe = [VordrT.Gti]::Info($u2)
+        if ($gtiURe.hwndActive -eq $u2) {
+            Check ($gtiURe.hwndFocus -eq $ed2) 'reopened unlock window focuses the password field immediately'
+        }
         $v2 = Unlock $p $u2
         Check ($v2 -ne [IntPtr]::Zero) 'a second unlock opens the vault again'
         Check ((Read-VordrGlobal -Process $p -Map $map -Symbol 'g_lock_tries') -eq 0) 'the lock retry counter was reset'

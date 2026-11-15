@@ -153,16 +153,17 @@ if ($tookIt) {
 #      and all other debug payloads zeroed by pe_normalise.py.
 $peBytes = [System.IO.File]::ReadAllBytes($exePath)
 $sentinel = [System.Text.Encoding]::ASCII.GetBytes("VORDR_NON_RELEASE_BUILD")
-for ($si = 0; $si -le $peBytes.Length - $sentinel.Length; $si++) {
-    if ($peBytes[$si] -eq $sentinel[0]) {
-        $match = $true
-        for ($sj = 1; $sj -lt $sentinel.Length; $sj++) {
-            if ($peBytes[$si + $sj] -ne $sentinel[$sj]) { $match = $false; break }
-        }
-        if ($match) {
-            throw "$exePath contains VORDR_NON_RELEASE_BUILD (dbg/probeio/guishow build) - never package non-release builds. Run 'build.cmd release strict' first."
-        }
+$si = 0
+$maxSi = $peBytes.Length - $sentinel.Length
+while (($si = [Array]::IndexOf($peBytes, $sentinel[0], $si)) -ge 0 -and $si -le $maxSi) {
+    $match = $true
+    for ($sj = 1; $sj -lt $sentinel.Length; $sj++) {
+        if ($peBytes[$si + $sj] -ne $sentinel[$sj]) { $match = $false; break }
     }
+    if ($match) {
+        throw "$exePath contains VORDR_NON_RELEASE_BUILD (dbg/probeio/guishow build) - never package non-release builds. Run 'build.cmd release strict' first."
+    }
+    $si++
 }
 $peOff   = [BitConverter]::ToInt32($peBytes, 0x3C)
 $coffTs  = [BitConverter]::ToInt32($peBytes, $peOff + 8)

@@ -102,116 +102,29 @@ rem that overlaps a sibling, escapes its dialog, or has collapsed to zero size -
 rem the IDC_V_HEADER "dip" class) gate the same way: any finding fails a strict
 rem build.
 rem ---------------------------------------------------------------------------
+set ASMFLAGS=/c /nologo /W3 /Zi %ASMEXTRA%
+set SOURCES=main console hardening random loadcfg sha256 sha1 aesgcm blake2b argon2 fileio secmem vault totp tpm regcfg pwgen bench log selftest redteam theme anim zipexport zipimport gui
+
 where python >nul 2>nul
 if errorlevel 1 (
     if "%STRICT%"=="1" (
         echo build: python not found on PATH - failing strict build
         goto :failed
     )
-    goto :nofc
-)
-echo === framecheck ===
-rem strict gates WARNINGS too: the tree is at zero, and a new frame overlap must be
-rem fixed or allowlisted with a reason, not printed into a list nobody reads.
-if "%STRICT%"=="1" (python tools\framecheck.py --strict) else (python tools\framecheck.py)
-if errorlevel 1 (
-    if "%STRICT%"=="1" (
-        echo framecheck: FATAL frame bug - failing strict build
-        goto :failed
+    echo === assembling ===
+    for %%f in (%SOURCES%) do (
+        ml64 %ASMFLAGS% /Foobj\%%f.obj /Flobj\%%f.lst /I src src\%%f.asm
+        if errorlevel 1 goto :failed
     )
-    echo framecheck: WARNING - fatal findings above; build continues. Use "build strict" to gate.
+    goto :assembled
 )
-echo === nvcheck ===
-python tools\nvcheck.py
-if errorlevel 1 (
-    if "%STRICT%"=="1" (
-        echo nvcheck: a callee-saved register is not preserved - failing strict build
-        goto :failed
-    )
-    echo nvcheck: WARNING - unsaved non-volatile registers above; build continues. Use "build strict" to gate.
+if "%STRICT%"=="1" (
+    python tools\build_fast.py build --strict %SOURCES% -- %ASMFLAGS%
+) else (
+    python tools\build_fast.py build %SOURCES% -- %ASMFLAGS%
 )
-echo === idcheck ===
-python tools\idcheck.py
-if errorlevel 1 (
-    if "%STRICT%"=="1" (
-        echo idcheck: rc/asm ID mismatch - failing strict build
-        goto :failed
-    )
-    echo idcheck: WARNING - ID mismatches above; build continues. Use "build strict" to gate.
-)
-echo === constcheck ===
-python tools\constcheck.py
-if errorlevel 1 (
-    if "%STRICT%"=="1" (
-        echo constcheck: a constant disagrees across modules - failing strict build
-        goto :failed
-    )
-    echo constcheck: WARNING - cross-module drift above; build continues. Use "build strict" to gate.
-)
-echo === dlgtarget ===
-python tools\dlgtarget.py
-if errorlevel 1 (
-    if "%STRICT%"=="1" (
-        echo dlgtarget: dialog-item call targets the wrong window - failing strict build
-        goto :failed
-    )
-    echo dlgtarget: WARNING - wrong-window calls above; build continues. Use "build strict" to gate.
-)
-echo === deadcode ===
-python tools\deadcode.py
-if errorlevel 1 (
-    if "%STRICT%"=="1" (
-        echo deadcode: dead proc/data/equ - failing strict build
-        goto :failed
-    )
-    echo deadcode: WARNING - dead symbols above; build continues. Use "build strict" to gate.
-)
-echo === rccheck ===
-python tools\rccheck.py
-if errorlevel 1 (
-    if "%STRICT%"=="1" (
-        echo rccheck: dialog geometry - failing strict build
-        goto :failed
-    )
-    echo rccheck: WARNING - layout findings above; build continues. Use "build strict" to gate.
-)
-echo === wstrcheck ===
-python tools\wstrcheck.py
-if errorlevel 1 (
-    if "%STRICT%"=="1" (
-        echo wstrcheck: a bounded copy called without its bound - failing strict build
-        goto :failed
-    )
-    echo wstrcheck: WARNING - unbounded call sites above; build continues. Use "build strict" to gate.
-)
-echo === aligncheck ===
-python tools\aligncheck.py
-if errorlevel 1 (
-    if "%STRICT%"=="1" (
-        echo aligncheck: misaligned wide-string labels - failing strict build
-        goto :failed
-    )
-    echo aligncheck: WARNING - misaligned labels above; build continues. Use "build strict" to gate.
-)
-echo === check_docs ===
-python tools\check_docs.py
-if errorlevel 1 (
-    if "%STRICT%"=="1" (
-        echo check_docs: documentation link/anchor error - failing strict build
-        goto :failed
-    )
-    echo check_docs: WARNING - documentation errors above; build continues. Use "build strict" to gate.
-)
-:nofc
-
-set ASMFLAGS=/c /nologo /W3 /Zi %ASMEXTRA%
-set SOURCES=main console hardening random loadcfg sha256 sha1 aesgcm blake2b argon2 fileio secmem vault totp tpm regcfg pwgen bench log selftest redteam theme anim zipexport zipimport gui
-
-echo === assembling ===
-for %%f in (%SOURCES%) do (
-    ml64 %ASMFLAGS% /Foobj\%%f.obj /Flobj\%%f.lst /I src src\%%f.asm
-    if errorlevel 1 goto :failed
-)
+if errorlevel 1 goto :failed
+:assembled
 
 rem ---------------------------------------------------------------------------
 rem Windows SDK paths.  The version is resolved at build time: the newest 10.*

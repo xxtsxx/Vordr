@@ -1,4 +1,4 @@
-# Prove the release build reproduces: build it twice, from scratch, and compare.
+﻿# Prove the release build reproduces: build it twice, from scratch, and compare.
 #
 # docs/RELEASES.md publishes the release executable's SHA-256 and tells users to
 # rebuild the tag and compare.  That only works if two builds of one commit are
@@ -24,7 +24,7 @@ function ExeHash { (Get-FileHash "bin\vordr.exe" -Algorithm SHA256).Hash }
 # obj\, and comparing a build that inherited them against a clean one reports the
 # difference as a reproducibility failure - a harness bug that looks exactly like
 # the defect under test.
-Remove-Item "obj\*.obj" -Force -EA SilentlyContinue
+Remove-Item "obj\*.obj","obj\.lint_cache" -Force -EA SilentlyContinue
 "verify_repro: building release (1 of 2), from clean objects..."
 $o1 = cmd /c "$root\build.cmd release strict" 2>&1
 if (($o1 -join "`n") -notmatch "BUILD OK") { "FAIL first build"; $o1 | Select-Object -Last 15; Pop-Location; exit 1 }

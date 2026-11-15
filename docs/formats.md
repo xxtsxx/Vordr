@@ -236,14 +236,14 @@ effective `TpmUnlockMode` is `1` (`TPM_MODE_ALONE`). If the stored envelope's `m
 differs from the effective policy mode, Vordr skips unsealing and prompts for the
 master password.
 
-- **Mode 1 — TPM Alone (`352` bytes)**:
-  `u32 "VTPM" | u16 ver=1 | u8 mode=1 | u8 rsv=0 | byte[16] kcv | u16 ct_len=256 | u16 rsv2=0 | byte[256] tpm_ct | byte[12] gcm_iv | byte[32] gcm_vkey | byte[16] gcm_tag`
-  (`tpm_ct` seals `tpm_secret[32]` under `Vordr-<KCV>`; `g_vkey` is encrypted under `AES-256-GCM(key = tpm_secret, AAD = blob[0..15] || g_hdr[0..79])`.)
+- **Mode 1 — TPM Alone (`272` bytes)**:
+  `u32 "VTPM" | u16 ver=1 | u8 mode=1 | u8 rsv=0 | u32 rsv2=0 | u32 total_len=272 | byte[256] tpm_ct`
+  (`tpm_ct` seals `g_vkey[32]` concatenated with `SHA-256(g_vkey || "Vordr-TPM-v2" || vault_salt || LE32(req_hello))` under `Vordr-<KCV>`; legacy `256`-byte raw RSA-OAEP blobs without the `16`-byte `VTPM` prefix remain readable in Mode 1 only.)
 - **Mode 2 — TPM + PIN (`680` bytes outer, `380` bytes inner)**:
-  Outer header (`680` B): `u32 "VTPM" | u16 ver=1 | u8 mode=2 | u8 active_slot (0/1) | byte[8] rsv=0 | byte[256] state_tpm_ct | byte[12] state_iv | byte[380] enc_state | byte[16] state_tag`
-  (`state_tpm_ct` seals random `state_key[32]` under rotating PCP key `Vordr-<KCV>-S{active_slot}`; `enc_state` is encrypted under `AES-256-GCM(key = state_key, AAD = outer[0..15] || g_hdr[0..79])`.)
-  Inner plaintext (`380` B): `u32 fails | u32 max_tries | u64 gen | byte[16] kcv | byte[32] pin_salt | u32 pin_t=2 | u32 pin_m=65536 | byte[256] main_tpm_ct | byte[12] wrap_iv | byte[32] enc_vkey | byte[16] wrap_tag`
-  (`Argon2id(pin, pin_salt, t=2, m=65536 KiB, p=1)` yields `k_auth[0..15]` for hardware TPM `SmartCardPin` on `Vordr-<KCV>` and `k_wrap[32..63]` so `wrap_key = BLAKE2b-256(tpm_secret || k_wrap)` decrypts `enc_vkey` with `AAD = g_hdr[0..79]`.)
-- **Mode 3 — TPM + Windows Hello (`424 + ct_hello_len` bytes, `ct_hello_len` in `64..512`)**:
-  `u32 "VTPM" | u16 ver=1 | u8 mode=3 | u8 rsv=0 | byte[16] kcv | u16 ct_tpm_len=256 | u16 ct_hello_len | byte[256] tpm_ct | byte[ct_hello_len] hello_ct | byte[12] gcm_iv | byte[32] enc_vkey | byte[16] gcm_tag`
-  (`tpm_ct` seals `tpm_secret[32]` under PCP `Vordr-<KCV>`; `hello_ct` encrypts `hello_secret[32]` under the user's `Microsoft Passport Key Storage Provider` default decryption key; `wrap_key = BLAKE2b-256(tpm_secret || hello_secret)` decrypts `enc_vkey` with `AAD = blob[0..19] || g_hdr[0..79]`.)
+  Outer header (`680` B): `u32 "VTPM" | u16 ver=1 | u8 mode=2 | u8 active_slot (0/1) | u32 rsv=0 | u32 total_len=680 | byte[256] state_tpm_ct | byte[12] state_iv | byte[380] enc_state | byte[16] state_tag`
+  (`state_tpm_ct` seals random `state_key[32]` under rotating PCP key `Vordr-<KCV>-S{active_slot}`; `enc_state` is encrypted under `AES-256-GCM(key = state_key, AAD = outer[0..15] || inv_hdr[68])`, where `inv_hdr[68] = g_hdr[0..51] || g_hdr[64..79]` excludes the per-save mutable `VH_NONCE`.)
+  Inner plaintext (`380` B): `u64 gen | u32 fails | u32 max_tries | u64 last_ft | byte[32] pin_salt | u16 ct_len=256 | u16 rsv=0 | byte[256] main_tpm_ct | byte[12] wrap_iv | byte[32] enc_vkey | byte[16] wrap_tag`
+  (`main_tpm_ct` silently seals `tpm_secret[32]` under machine PCP key `Vordr-<KCV>`; `Argon2id(pin, pin_salt, t=2, m=65536 KiB, p=1)` yields `k_wrap[32..63]` so `wrap_key = BLAKE2b-256(tpm_secret || k_wrap)` decrypts `enc_vkey` with `AAD = inv_hdr[68]` without tripping OS-wide TPM dictionary-attack lockout.)
+- **Mode 3 — TPM + Windows Hello (`336 + ct_hello_len` bytes, `ct_hello_len` in `65..512`)**:
+  `u32 "VTPM" | u16 ver=1 | u8 mode=3 | u8 rsv=0 | u32 rsv2=0 | u32 total_len | u16 ct_tpm_len=256 | u16 ct_hello_len | byte[256] tpm_ct | byte[ct_hello_len] hello_ct | byte[12] gcm_iv | byte[32] enc_vkey | byte[16] gcm_tag`
+  (`tpm_ct` seals `tpm_secret[32]` under PCP `Vordr-<KCV>`; `hello_ct` is a `WHLO` v1 envelope (`u32 "WHLO" | u16 ver=1 | u16 cred_len | byte[24] prf_salt | byte[32] masked_secret | byte[cred_len] cred_id`) backed by a Windows Hello platform FIDO2 `PRF` (`hmac-secret`) credential via `webauthn.dll`; `wrap_key = BLAKE2b-256(tpm_secret || hello_secret)` decrypts `enc_vkey` with `AAD = blob[0..19] || inv_hdr[68]`.)
