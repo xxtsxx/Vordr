@@ -431,8 +431,10 @@ try {
     Exec "INSERT INTO ``Upgrade`` (``UpgradeCode``,``VersionMin``,``VersionMax``,``Language``,``Attributes``,``Remove``,``ActionProperty``) VALUES ('$UpgradeCode','$productVersion','','',$DOWNGRADE_ATTR,'','NEWERVERSIONDETECTED')"
     Exec "INSERT INTO ``LaunchCondition`` (``Condition``,``Description``) VALUES ('NOT NEWERVERSIONDETECTED','A newer version of Vordr is already installed.')"
 
-    # Standard sequence.  RemoveExistingProducts runs after InstallFiles so an
-    # upgrade never leaves the user without the exe if it fails mid-way.
+    # Standard sequence.  RemoveExistingProducts runs immediately after
+    # InstallInitialize (before InstallFiles) so same-version rebuilds replace
+    # the old binary instead of hitting MSI's equal-version skip rule; MSI
+    # rollback restores the previous product if the install aborts mid-way.
     # Actions that establish properties for later actions run in the CLIENT
     # process.  Once the client's sequence finishes, the installer marks them
     # done - so if one is missing from InstallUISequence, the server-side pass
@@ -450,6 +452,18 @@ try {
         @("CostFinalize",          "", 1000),
         @("InstallValidate",       "", 1400),
         @("InstallInitialize",     "", 1500),
+        # RemoveExistingProducts EARLY - immediately after InstallInitialize, one
+        # of the five positions Windows Installer accepts (anywhere else fails at
+        # install time with error 2613, which msiexec /a never catches).
+        #
+        # Sequencing it after InstallFinalize silently breaks same-version
+        # rebuilds: MSI only overwrites a versioned file when the incoming
+        # FileVersion is strictly higher, so InstallFiles logs
+        #     "Won't Overwrite; Existing file is of an equal version"
+        # and leaves the old vordr.exe on disk while reporting success.  Removing
+        # the old product before InstallFiles guarantees the new binary lands;
+        # default MSI rollback restores the old product if installation fails.
+        @("RemoveExistingProducts","", 1550),
         @("ProcessComponents",     "", 1600),
         @("UnpublishFeatures",     "", 1800),
         # Policy values are put back by WriteRegistryValues on every install, so
@@ -465,19 +479,7 @@ try {
         @("RegisterProduct",       "", 6100),
         @("PublishFeatures",       "", 6300),
         @("PublishProduct",        "", 6400),
-        @("InstallFinalize",       "", 6600),
-        # RemoveExistingProducts is only legal immediately after InstallValidate,
-        # InstallInitialize, InstallExecute, InstallExecuteAgain or InstallFinalize.
-        # It was at 5000 - after InstallFiles, which is none of those - and Windows
-        # Installer rejected the package with error 2613 at install time.  /a never
-        # catches this: an administrative install does not run the upgrade logic.
-        #
-        # After InstallFinalize on purpose: the new build is fully installed before
-        # the old product is removed, so a failure part-way never leaves the user
-        # with no vordr.exe.  Safe because ComponentGuid is stable - the shared
-        # component is ref-counted, so removing the old product does not delete the
-        # file the new one still owns.
-        @("RemoveExistingProducts","", 6700)
+        @("InstallFinalize",       "", 6600)
     )
     foreach ($s in $seq) {
         Exec ("INSERT INTO ``InstallExecuteSequence`` (``Action``,``Condition``,``Sequence``) VALUES ('{0}','{1}',{2})" -f $s[0], $s[1], $s[2])
@@ -501,6 +503,7 @@ try {
     $ordered  = $seq | Sort-Object { $_[2] }
     $names    = @($ordered | ForEach-Object { $_[0] })
     $idx      = [array]::IndexOf($names, "RemoveExistingProducts")
+    $ifIdx    = [array]::IndexOf($names, "InstallFiles")
     $anchors  = @("InstallValidate","InstallInitialize","InstallExecute",
                   "InstallExecuteAgain","InstallFinalize")
     if ($idx -lt 1) { throw "RemoveExistingProducts is missing from InstallExecuteSequence" }
@@ -511,7 +514,10 @@ try {
         $fmt = "RemoveExistingProducts follows '{0}' - Windows Installer only accepts it immediately after {1}. A real install would fail with error 2613."
         throw ($fmt -f $prev, ($anchors -join ", "))
     }
-    Write-Host ("  sequence check : RemoveExistingProducts follows {0} - legal" -f $prev)
+    if ($ifIdx -lt 0 -or $idx -ge $ifIdx) {
+        throw "RemoveExistingProducts must precede InstallFiles so same-version rebuilds overwrite vordr.exe"
+    }
+    Write-Host ("  sequence check : RemoveExistingProducts follows {0} (< InstallFiles) - legal" -f $prev)
 
     # --- self-check the policy wiring ----------------------------------------
     # Every one of these is a silent failure in the field: the install succeeds,

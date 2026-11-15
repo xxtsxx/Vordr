@@ -81,8 +81,13 @@ references.
 
 ## Work with entries
 
-An entry can contain usernames, secrets, URLs, notes, TOTP keys, custom-labeled
-fields, and attachments. Search and favorites help find entries; custom icons
+An entry can contain usernames, passwords, dedicated PIN codes, URLs, notes, TOTP
+keys, custom-labeled fields, and attachments. PIN fields share the same masking,
+reveal, clipboard auto-clear, and change-history protections as password fields,
+but use PIN-specific health and policy checks (`PinMinLen = 6` characters by default,
+no character-class mix required, and detection of trivial patterns such as repeated
+characters, `123456` runs, short cycles, and palindromes, controlled by **Reject
+trivial PINs** in Settings). Search and favorites help find entries; custom icons
 help distinguish them. TOTP uses a base32 key and depends on the computer's clock.
 
 The generator offers random passwords, passphrases (`6` to `24` words drawn from an
@@ -157,12 +162,20 @@ against kernel-level or `SYSTEM`/admin attackers.
 
 ### TPM convenience unlock
 
-TPM unlock is enabled by default when a usable TPM is available. It wraps the
-vault key using a machine-local TPM key and stores the wrapped blob in HKCU.
-Like a password unlock, it warns before opening a vault file older than the last
-one saved on this PC.
-It is an alternative to typing the master password, not an additional factor.
-The optional `TpmRequireHello` setting requests provider-mediated confirmation.
+**Settings > TPM Unlock** lets you choose how this PC's TPM 2.0 chip unlocks the vault:
+
+- **Off:** always require your master password.
+- **TPM only (default when a TPM is available):** unseals silently on this PC.
+- **TPM + PIN:** pairs the TPM with a Vordr PIN (minimum 6 characters by default; digits
+  or letters allowed). Failed attempts are recorded under a rotating TPM state key so
+  registry backups cannot reset the counter; after **TPM PIN max tries** failed attempts
+  (default `3`), Vordr deletes the TPM shortcut and requires your master password.
+- **TPM + Hello:** requires both this PC's TPM key and Windows Hello (face, fingerprint,
+  or Windows Hello PIN).
+
+Like a password unlock, every TPM mode warns before opening a vault file older than the
+last one saved on this PC. TPM unlock is a local convenience path on one device, not a
+replacement for backing up your master password.
 
 A cleared TPM, hardware replacement, changed Windows setup, or a different
 computer can make this shortcut unavailable. The master password still matters.

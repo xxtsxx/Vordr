@@ -954,6 +954,8 @@ zi_type_ok proc
     je      zto_ok
     cmp     eax, VF_SPACER
     je      zto_ok
+    cmp     eax, VF_PIN
+    je      zto_ok
 zto_text:                                       ; history, trash marker, system kinds,
     mov     eax, VF_TEXT                        ;   flag bits, unknown: never as-is
 zto_ok:
@@ -1888,9 +1890,9 @@ zi_commit proc frame
     call    zi_walk
     mov     dword ptr [rbp-24], eax
     mov     ecx, dword ptr [g_zi_err]
-    mov     dword ptr [rbp-28], ecx
+    mov     dword ptr [rbp-44], ecx
     call    zi_free_wipe
-    cmp     dword ptr [rbp-28], 0
+    cmp     dword ptr [rbp-44], 0
     jne     zic_err
     mov     eax, dword ptr [rbp-24]
     FRAME_EPILOG
@@ -2143,8 +2145,10 @@ CSTR jfz_tbad, "jfuzz: FAIL (an archive field type reached the vault unsanitised
 align 4
 jfz_types label dword
     dd  VF_SECRET,                  VF_SECRET
+    dd  VF_PIN,                     VF_PIN
     dd  VF_SPACER,                  VF_SPACER
     dd  VF_LABELED or VF_USERNAME,  VF_TEXT
+    dd  VF_LABELED or VF_PIN,       VF_TEXT
     dd  40000000h or VF_IMAGE,      VF_TEXT
     dd  VF_SYSTEM,                  VF_TEXT
     dd  VF_SYS_PWVERIFY,            VF_TEXT

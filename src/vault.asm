@@ -34,6 +34,14 @@ extern tpm_available:proc               ; M2: TPM machine-secret binding (tpm.as
 extern tpm_seal:proc
 extern tpm_unseal:proc
 extern tpm_delete:proc
+extern tpm_seal_pin:proc
+extern tpm_unseal_pin:proc
+extern tpm_hello_seal:proc
+extern tpm_hello_unseal:proc
+externdef g_tpm_reqhello:dword
+ifdef PROBE_IO
+externdef g_tpm_kat_nohwpin:dword
+endif
 extern secure_zero:proc
 extern secmem_alloc:proc
 extern sec_lock:proc
@@ -70,9 +78,6 @@ extern blake2b_init:proc
 extern blake2b_update:proc
 extern blake2b_final:proc
 extern blake2b_hash:proc
-extern tpm_seal:proc
-extern tpm_unseal:proc
-extern tpm_delete:proc
 extern reg_tpm_set:proc
 extern reg_tpm_get:proc
 extern reg_tpm_del:proc
@@ -100,6 +105,8 @@ externdef g_cfg_notes:qword
 externdef g_cfg_totp:qword
 externdef g_field_list:qword
 externdef g_field_n:dword
+externdef g_cfg_pinminlen:dword
+externdef g_cfg_pinnotriv:dword
 
 CP_UTF8         equ 65001
 
@@ -391,12 +398,31 @@ att_katct   db 80 dup (?)               ;                 ciphertext+tag scratch
 att_katref  db ARF_SIZE dup (?)         ;                 AttachRef
 att_katout  dq ?                        ;                 opened plaintext len
 align 4
-public g_use_tpm
-g_use_tpm   dd ?                    ; GUI sets 1 to unlock via TPM, else password
+public g_use_tpm, g_tpm_pin_u8len
+g_use_tpm       dd ?                ; 0=pw, 1=TPM_MODE_ALONE, 2=TPM_MODE_PIN, 3=TPM_MODE_HELLO
+g_tpm_pin_u8len dd ?                ; UTF-8 byte length of g_tpm_pin_u8
 align 2
-g_tpm_kn    dw 64 dup (?)           ; TPM key name (wide): "Vordr-" + KCV[0..7] hex
+g_tpm_kn        dw 64 dup (?)       ; TPM key name (wide): "Vordr-" + KCV[0..7] hex
+g_tpm_kn_s      dw 64 dup (?)       ; TPM state slot key name: "Vordr-<hex>-S0" / "-S1"
+public g_tpm_hwpin
+g_tpm_hwpin     dw 34 dup (?)       ; 32 wide hex chars + NUL (68 bytes)
 align 8
-g_tpm_blob  db 512 dup (?)          ; sealed 32-byte master key (RSA-OAEP blob)
+g_tpm_blob      db TPM_BLOB_CAP dup (?)
+public g_tpm_state, g_tpm_sec, g_tpm_dk, g_tpm_cand, g_tpm_pin_u8
+g_tpm_state     db 384 dup (?)      ; InnerState (380 bytes used, padded to 384)
+g_tpm_sec       db 64 dup (?)       ; tpm_secret[32] || second_half[32]
+g_tpm_dk        db 64 dup (?)       ; Argon2id(PIN) 64-byte output
+g_tpm_cand      db 32 dup (?)       ; transient 32-byte key scratch (state_key / wrap_key)
+g_tpm_aad       db 112 dup (?)      ; AAD scratch (96 bytes Mode 2, 100 bytes Mode 3)
+g_tpm_pin_u8    db 256 dup (?)      ; UTF-8 PIN scratch for enroll / unlock
+
+.data
+align 4
+public g_tpm_pin_max, g_tpm_pin_rem
+g_tpm_pin_max   dd TPM_PIN_TRIES_DEF
+g_tpm_pin_rem   dd 0
+g_tpm_pin_t     dd 2
+g_tpm_pin_m     dd 65536
 
 .code
 
@@ -554,42 +580,771 @@ kn_lo_s:
     ret
 tpm_kn_build endp
 
-; ===========================================================================
-; vk_derive_tpm() - fetch the wrapped key from HKCU\..\TPM-Unlock and TPM-unseal
-;   it into g_vkey.  Precondition: g_hdr holds the vault header (KCV) and
-;   g_cfg_in points at the wide vault path.  -> eax = 0 / EXIT_LOCKED.
-; ===========================================================================
-vk_derive_tpm proc frame
-    FRAME_PROLOG 48
+; --- Mode 2 (TPM + PIN) InnerState byte offsets (380 bytes total) -------------
+ST_GEN          equ 0
+ST_FAILS        equ 8
+ST_MAXFAILS     equ 12
+ST_LASTFT       equ 16
+ST_SALT         equ 24
+ST_TLEN         equ 56
+ST_CTTPM        equ 60
+ST_VKIV         equ 316
+ST_VKCT         equ 328
+ST_VKTAG        equ 360
+ST_SIZE         equ 380
+TPM_PIN_BLOB_SZ equ 680
+
+; tpm_kn_slot_build(ecx = slot 0|1) - build L"Vordr-<16hex>-S0" / L"-S1" in g_tpm_kn_s.
+tpm_kn_slot_build proc frame
+    FRAME_PROLOG 32
+    mov     dword ptr [rbp-24], ecx
     call    tpm_kn_build
-    mov     rcx, qword ptr [g_cfg_in]       ; value name = vault path
-    lea     rdx, [g_tpm_blob]
-    mov     r8d, 512
-    call    reg_tpm_get
+    lea     r10, [g_tpm_kn]
+    lea     r11, [g_tpm_kn_s]
+    xor     r8d, r8d
+tks_cp:
+    mov     ax, word ptr [r10+r8*2]
+    test    ax, ax
+    jz      tks_tail
+    mov     word ptr [r11+r8*2], ax
+    inc     r8d
+    cmp     r8d, 56
+    jb      tks_cp
+tks_tail:
+    mov     word ptr [r11+r8*2+0], '-'
+    mov     word ptr [r11+r8*2+2], 'S'
+    mov     eax, dword ptr [rbp-24]
+    and     eax, 1
+    add     eax, '0'
+    mov     word ptr [r11+r8*2+4], ax
+    mov     word ptr [r11+r8*2+6], 0
+    FRAME_EPILOG
+    ret
+tpm_kn_slot_build endp
+
+; tpm_hex16_wide(rcx = in16, rdx = out_wide34) - 16 bytes -> 32 lowercase wide hex + NUL.
+tpm_hex16_wide proc
+    xor     r8d, r8d
+thw_lp:
+    movzx   eax, byte ptr [rcx+r8]
+    mov     r9d, eax
+    shr     r9d, 4
+    and     r9d, 0Fh
+    cmp     r9d, 10
+    jb      thw_hd
+    add     r9d, 'a'-10
+    jmp     thw_hs
+thw_hd:
+    add     r9d, '0'
+thw_hs:
+    mov     word ptr [rdx+r8*4], r9w
+    and     eax, 0Fh
+    cmp     eax, 10
+    jb      thw_ld
+    add     eax, 'a'-10
+    jmp     thw_ls
+thw_ld:
+    add     eax, '0'
+thw_ls:
+    mov     word ptr [rdx+r8*4+2], ax
+    inc     r8d
+    cmp     r8d, 16
+    jb      thw_lp
+    mov     word ptr [rdx+64], 0
+    ret
+tpm_hex16_wide endp
+
+; tpm_wipe_scratch() - wipe all transient Mode 2 / Mode 3 secret buffers.
+tpm_wipe_scratch proc frame
+    FRAME_PROLOG 32
+    lea     rcx, [g_tpm_state]
+    mov     edx, 384
+    call    secure_zero
+    lea     rcx, [g_tpm_sec]
+    mov     edx, 64
+    call    secure_zero
+    lea     rcx, [g_tpm_dk]
+    mov     edx, 64
+    call    secure_zero
+    lea     rcx, [g_tpm_hwpin]
+    mov     edx, 68
+    call    secure_zero
+    lea     rcx, [g_tpm_cand]
+    mov     edx, 32
+    call    secure_zero
+    lea     rcx, [g_tpm_aad]
+    mov     edx, 112
+    call    secure_zero
+    lea     rcx, [g_tpm_pin_u8]
+    mov     edx, 256
+    call    secure_zero
+    mov     dword ptr [g_tpm_pin_u8len], 0
+    FRAME_EPILOG
+    ret
+tpm_wipe_scratch endp
+
+; tpm_del_slots_silent() - delete S0 and S1 state keys silently.
+tpm_del_slots_silent proc frame
+    FRAME_PROLOG 32
+    mov     eax, dword ptr [g_tpm_reqhello]
+    mov     dword ptr [rbp-24], eax
+    mov     dword ptr [g_tpm_reqhello], 0
+    xor     ecx, ecx
+    call    tpm_kn_slot_build
+    lea     rcx, [g_tpm_kn_s]
+    call    tpm_delete
+    mov     ecx, 1
+    call    tpm_kn_slot_build
+    lea     rcx, [g_tpm_kn_s]
+    call    tpm_delete
+    mov     eax, dword ptr [rbp-24]
+    mov     dword ptr [g_tpm_reqhello], eax
+    FRAME_EPILOG
+    ret
+tpm_del_slots_silent endp
+
+; tpm_pin_stretch() -> eax = 1 ok / 0 fail.
+;   Argon2id(g_tpm_pin_u8[0..g_tpm_pin_u8len], salt = ST_SALT[32]) -> g_tpm_dk[64],
+;   wipes g_tpm_pin_u8, and formats g_tpm_dk[0..15] into g_tpm_hwpin.
+tpm_pin_stretch proc frame
+    FRAME_PROLOG 32
+    mov     eax, dword ptr [g_tpm_pin_u8len]
     test    eax, eax
-    jz      vdt_no
-    mov     dword ptr [rbp-32], eax         ; blob length
-    lea     rcx, [g_tpm_kn]
-    lea     rdx, [g_tpm_blob]
-    mov     r8d, dword ptr [rbp-32]
-    lea     r9, [g_vkey]
-    call    tpm_unseal
-    test    eax, eax
-    jz      vdt_no
+    jz      tps_bad
+    cmp     eax, 255
+    ja      tps_bad
+    lea     r10, [g_areq]
+    mov     ecx, dword ptr [g_tpm_pin_t]
+    mov     dword ptr [r10].ARGON2REQ.t_cost, ecx
+    mov     ecx, dword ptr [g_tpm_pin_m]
+    mov     dword ptr [r10].ARGON2REQ.m_cost, ecx
+    mov     dword ptr [r10].ARGON2REQ.lanes, 1
+    mov     dword ptr [r10].ARGON2REQ.outlen, 64
+    mov     dword ptr [r10].ARGON2REQ.version, 19
+    mov     dword ptr [r10].ARGON2REQ.atype, 2
+    lea     rcx, [g_tpm_pin_u8]
+    mov     qword ptr [r10].ARGON2REQ.pwd, rcx
+    mov     dword ptr [r10].ARGON2REQ.pwdlen, eax
+    mov     dword ptr [r10].ARGON2REQ.saltlen, 32
+    lea     rcx, [g_tpm_state + ST_SALT]
+    mov     qword ptr [r10].ARGON2REQ.salt, rcx
+    mov     qword ptr [r10].ARGON2REQ.secret, 0
+    mov     dword ptr [r10].ARGON2REQ.secretlen, 0
+    mov     dword ptr [r10].ARGON2REQ.adlen, 0
+    mov     qword ptr [r10].ARGON2REQ.ad, 0
+    lea     rcx, [g_tpm_dk]
+    mov     qword ptr [r10].ARGON2REQ.outp, rcx
+    lea     rcx, [g_areq]
+    call    argon2id_hash
+    mov     dword ptr [rbp-24], eax
+    lea     rcx, [g_tpm_pin_u8]
+    mov     edx, 256
+    call    secure_zero
+    mov     dword ptr [g_tpm_pin_u8len], 0
+    cmp     dword ptr [rbp-24], 0
+    jne     tps_bad
+    lea     rcx, [g_tpm_dk]
+    lea     rdx, [g_tpm_hwpin]
+    call    tpm_hex16_wide
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+tps_bad:
+    lea     rcx, [g_tpm_pin_u8]
+    mov     edx, 256
+    call    secure_zero
+    mov     dword ptr [g_tpm_pin_u8len], 0
     xor     eax, eax
     FRAME_EPILOG
     ret
-vdt_no:
+tpm_pin_stretch endp
+
+; tpm_build_aad(ecx = prefix_bytes) - g_tpm_aad = g_tpm_blob[0..prefix_bytes-1] || g_hdr[0..79].
+tpm_build_aad proc
+    lea     r10, [g_tpm_blob]
+    lea     r11, [g_tpm_aad]
+    xor     r8d, r8d
+tba_p:
+    cmp     r8d, ecx
+    jae     tba_h0
+    mov     al, byte ptr [r10+r8]
+    mov     byte ptr [r11+r8], al
+    inc     r8d
+    jmp     tba_p
+tba_h0:
+    add     r11, rcx
+    lea     r10, [g_hdr]
+    xor     r8d, r8d
+tba_h:
+    mov     al, byte ptr [r10+r8]
+    mov     byte ptr [r11+r8], al
+    inc     r8d
+    cmp     r8d, VH_TOTAL
+    jb      tba_h
+    ret
+tpm_build_aad endp
+
+; tpm_pin_seal_state(ecx = slot 0|1) -> eax = 1 ok / 0 fail.
+;   Creates fresh RSA-2048 key in Vordr-<KCV>-S{slot}, seals random state_key[32],
+;   AES-256-GCM-encrypts g_tpm_state[380] with AAD = OuterHdr[16] || g_hdr[80],
+;   and commits the 680-byte envelope to HKCU\..\TPM-Unlock.
+tpm_pin_seal_state proc frame
+    FRAME_PROLOG 48
+    and     ecx, 1
+    mov     dword ptr [rbp-24], ecx             ; slot
+    mov     eax, dword ptr [g_tpm_reqhello]
+    mov     dword ptr [rbp-28], eax
+    mov     dword ptr [g_tpm_reqhello], 0
+    lea     rcx, [g_tpm_cand]                   ; state_key[32]
+    mov     edx, 32
+    call    rng_fill
+    test    eax, eax
+    jz      tpss_fail
+    lea     rcx, [g_tpm_blob + 272]             ; outer_iv[12]
+    mov     edx, 12
+    call    rng_fill
+    test    eax, eax
+    jz      tpss_fail
+    mov     ecx, dword ptr [rbp-24]
+    call    tpm_kn_slot_build
+    lea     rcx, [g_tpm_kn_s]
+    lea     rdx, [g_tpm_cand]
+    lea     r8, [g_tpm_blob + 16]
+    mov     r9d, 256
+    call    tpm_seal
+    cmp     eax, 256
+    jne     tpss_fail
+    lea     r10, [g_tpm_blob]
+    mov     dword ptr [r10+0],  TPM_ENV_MAGIC
+    mov     word ptr  [r10+4],  TPM_ENV_VER
+    mov     byte ptr  [r10+6],  TPM_MODE_PIN
+    mov     eax, dword ptr [rbp-24]
+    mov     byte ptr  [r10+7],  al
+    mov     dword ptr [r10+8],  0
+    mov     dword ptr [r10+12], TPM_PIN_BLOB_SZ
+    mov     ecx, 16
+    call    tpm_build_aad
+    lea     r10, [g_greq]
+    lea     rax, [g_tpm_cand]
+    mov     qword ptr [r10].GCMREQ.key, rax
+    lea     rax, [g_tpm_blob + 272]
+    mov     qword ptr [r10].GCMREQ.iv, rax
+    lea     rax, [g_tpm_aad]
+    mov     qword ptr [r10].GCMREQ.aad, rax
+    mov     qword ptr [r10].GCMREQ.aadlen, 16 + VH_TOTAL
+    lea     rax, [g_tpm_state]
+    mov     qword ptr [r10].GCMREQ.inp, rax
+    mov     qword ptr [r10].GCMREQ.inlen, ST_SIZE
+    lea     rax, [g_tpm_blob + 284]
+    mov     qword ptr [r10].GCMREQ.outp, rax
+    lea     rax, [g_tpm_blob + 664]
+    mov     qword ptr [r10].GCMREQ.tag, rax
+    lea     rcx, [g_greq]
+    call    gcm_seal
+    lea     rcx, [g_tpm_cand]
+    mov     edx, 32
+    call    secure_zero
+    mov     rcx, qword ptr [g_cfg_in]
+    lea     rdx, [g_tpm_blob]
+    mov     r8d, TPM_PIN_BLOB_SZ
+    call    reg_tpm_set
+    test    eax, eax
+    jz      tpss_delslot
+    mov     eax, dword ptr [rbp-28]
+    mov     dword ptr [g_tpm_reqhello], eax
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+tpss_delslot:
+    lea     rcx, [g_tpm_kn_s]
+    call    tpm_delete
+tpss_fail:
+    lea     rcx, [g_tpm_cand]
+    mov     edx, 32
+    call    secure_zero
+    mov     eax, dword ptr [rbp-28]
+    mov     dword ptr [g_tpm_reqhello], eax
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+tpm_pin_seal_state endp
+
+; ===========================================================================
+; vault_tpm_mode_get() -> eax = 0 (none/invalid) or TPM_MODE_ALONE..TPM_MODE_HELLO (1..3).
+;   Inspects HKCU\..\TPM-Unlock for g_cfg_in (keyed by path, works pre-header).
+; ===========================================================================
+public vault_tpm_mode_get
+vault_tpm_mode_get proc frame
+    FRAME_PROLOG 32
+    mov     rcx, qword ptr [g_cfg_in]
+    test    rcx, rcx
+    jz      vtmg_no
+    lea     rdx, [g_tpm_blob]
+    mov     r8d, TPM_BLOB_CAP
+    call    reg_tpm_get
+    test    eax, eax
+    jz      vtmg_no
+    cmp     eax, 16
+    jb      vtmg_no
+    lea     r10, [g_tpm_blob]
+    cmp     dword ptr [r10+0], TPM_ENV_MAGIC
+    jne     vtmg_legacy
+    cmp     word ptr [r10+4], TPM_ENV_VER
+    jne     vtmg_no
+    cmp     dword ptr [r10+12], eax
+    jne     vtmg_no
+    movzx   ecx, byte ptr [r10+6]
+    cmp     ecx, TPM_MODE_ALONE
+    je      vtmg_m1
+    cmp     ecx, TPM_MODE_PIN
+    je      vtmg_m2
+    cmp     ecx, TPM_MODE_HELLO
+    je      vtmg_m3
+    jmp     vtmg_no
+vtmg_m1:
+    cmp     eax, 272
+    jne     vtmg_no
+    mov     eax, TPM_MODE_ALONE
+    FRAME_EPILOG
+    ret
+vtmg_m2:
+    cmp     eax, TPM_PIN_BLOB_SZ
+    jne     vtmg_no
+    mov     eax, TPM_MODE_PIN
+    FRAME_EPILOG
+    ret
+vtmg_m3:
+    cmp     eax, 84
+    jb      vtmg_no
+    cmp     eax, TPM_BLOB_CAP
+    ja      vtmg_no
+    mov     eax, TPM_MODE_HELLO
+    FRAME_EPILOG
+    ret
+vtmg_legacy:
+    cmp     eax, 256                            ; legacy v0.2.3 raw RSA-2048 OAEP blob
+    jne     vtmg_no
+    mov     eax, TPM_MODE_ALONE
+    FRAME_EPILOG
+    ret
+vtmg_no:
+    mov     eax, TPM_MODE_OFF
+    FRAME_EPILOG
+    ret
+vault_tpm_mode_get endp
+
+; ===========================================================================
+; vk_derive_tpm_alone() - Mode 1 unseal (accepts VTPM Mode 1 or legacy 256B ONLY).
+; ===========================================================================
+vk_derive_tpm_alone proc frame
+    FRAME_PROLOG 48
+    call    tpm_kn_build
+    mov     rcx, qword ptr [g_cfg_in]
+    lea     rdx, [g_tpm_blob]
+    mov     r8d, TPM_BLOB_CAP
+    call    reg_tpm_get
+    test    eax, eax
+    jz      vdta_no
+    lea     r10, [g_tpm_blob]
+    cmp     eax, 272
+    jne     vdta_chk_leg
+    cmp     dword ptr [r10+0], TPM_ENV_MAGIC
+    jne     vdta_no
+    cmp     word ptr [r10+4], TPM_ENV_VER
+    jne     vdta_no
+    cmp     byte ptr [r10+6], TPM_MODE_ALONE
+    jne     vdta_no
+    cmp     dword ptr [r10+12], 272
+    jne     vdta_no
+    lea     rcx, [g_tpm_kn]
+    lea     rdx, [g_tpm_blob + 16]
+    mov     r8d, 256
+    lea     r9, [g_vkey]
+    call    tpm_unseal
+    test    eax, eax
+    jz      vdta_no
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+vdta_chk_leg:
+    cmp     eax, 256
+    jne     vdta_no
+    cmp     dword ptr [r10+0], TPM_ENV_MAGIC
+    je      vdta_no
+    lea     rcx, [g_tpm_kn]
+    lea     rdx, [g_tpm_blob]
+    mov     r8d, 256
+    lea     r9, [g_vkey]
+    call    tpm_unseal
+    test    eax, eax
+    jz      vdta_no
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+vdta_no:
     mov     eax, EXIT_LOCKED
+    FRAME_EPILOG
+    ret
+vk_derive_tpm_alone endp
+
+; ===========================================================================
+; vk_derive_tpm_pin() - Mode 2 (TPM + PIN) atomic pre-commit unlock.
+;   -> eax = 0 (unlocked) / EXIT_AUTH (wrong PIN, g_tpm_pin_rem > 0) /
+;            EXIT_LOCKED (tamper/replay or threshold reached -> auto-revoked).
+; ===========================================================================
+vk_derive_tpm_pin proc frame
+    FRAME_PROLOG 64
+    ; [rbp-16]=saved reqhello [rbp-20]=cur_slot [rbp-24]=next_slot [rbp-28]=fails_after
+    mov     eax, dword ptr [g_tpm_reqhello]
+    mov     dword ptr [rbp-16], eax
+    mov     dword ptr [g_tpm_reqhello], 0
+    mov     dword ptr [g_tpm_pin_rem], 0
+    call    tpm_kn_build
+    mov     rcx, qword ptr [g_cfg_in]
+    lea     rdx, [g_tpm_blob]
+    mov     r8d, TPM_BLOB_CAP
+    call    reg_tpm_get
+    cmp     eax, TPM_PIN_BLOB_SZ
+    jne     vdtp_revoke
+    lea     r10, [g_tpm_blob]
+    cmp     dword ptr [r10+0], TPM_ENV_MAGIC
+    jne     vdtp_revoke
+    cmp     word ptr [r10+4], TPM_ENV_VER
+    jne     vdtp_revoke
+    cmp     byte ptr [r10+6], TPM_MODE_PIN
+    jne     vdtp_revoke
+    movzx   ecx, byte ptr [r10+7]               ; slot in {0, 1}
+    cmp     ecx, 1
+    ja      vdtp_revoke
+    cmp     dword ptr [r10+8], 0
+    jne     vdtp_revoke
+    cmp     dword ptr [r10+12], TPM_PIN_BLOB_SZ
+    jne     vdtp_revoke
+    mov     dword ptr [rbp-20], ecx             ; cur_slot
+    xor     ecx, 1
+    mov     dword ptr [rbp-24], ecx             ; next_slot
+
+    ; 1) Unseal outer state_key[32] using Vordr-<KCV>-S{cur_slot}
+    mov     ecx, dword ptr [rbp-20]
+    call    tpm_kn_slot_build
+    lea     rcx, [g_tpm_kn_s]
+    lea     rdx, [g_tpm_blob + 16]
+    mov     r8d, 256
+    lea     r9, [g_tpm_cand]
+    call    tpm_unseal
+    cmp     eax, 1
+    jne     vdtp_revoke                         ; replayed old HKCU snapshot -> S{cur_slot} gone/rotated!
+
+    ; 2) Authenticate + decrypt InnerState[380]
+    mov     ecx, 16
+    call    tpm_build_aad
+    lea     r10, [g_greq]
+    lea     rax, [g_tpm_cand]
+    mov     qword ptr [r10].GCMREQ.key, rax
+    lea     rax, [g_tpm_blob + 272]
+    mov     qword ptr [r10].GCMREQ.iv, rax
+    lea     rax, [g_tpm_aad]
+    mov     qword ptr [r10].GCMREQ.aad, rax
+    mov     qword ptr [r10].GCMREQ.aadlen, 16 + VH_TOTAL
+    lea     rax, [g_tpm_blob + 284]
+    mov     qword ptr [r10].GCMREQ.inp, rax
+    mov     qword ptr [r10].GCMREQ.inlen, ST_SIZE
+    lea     rax, [g_tpm_state]
+    mov     qword ptr [r10].GCMREQ.outp, rax
+    lea     rax, [g_tpm_blob + 664]
+    mov     qword ptr [r10].GCMREQ.tag, rax
+    lea     rcx, [g_greq]
+    call    gcm_open
+    mov     dword ptr [rbp-32], eax
+    lea     rcx, [g_tpm_cand]
+    mov     edx, 32
+    call    secure_zero
+    cmp     dword ptr [rbp-32], 0
+    jne     vdtp_revoke
+
+    ; 3) Validate InnerState invariants + honour tightened policy ceiling
+    cmp     qword ptr [g_tpm_state + ST_GEN], 1
+    jb      vdtp_revoke
+    cmp     word ptr [g_tpm_state + ST_TLEN], 256
+    jne     vdtp_revoke
+    mov     eax, dword ptr [g_tpm_state + ST_MAXFAILS]
+    cmp     eax, 1
+    jb      vdtp_revoke
+    cmp     eax, TPM_PIN_TRIES_MAX
+    ja      vdtp_revoke
+    mov     ecx, dword ptr [g_tpm_pin_max]
+    cmp     ecx, 1
+    jb      @F
+    cmp     ecx, eax
+    jae     @F
+    mov     eax, ecx
+    mov     dword ptr [g_tpm_state + ST_MAXFAILS], eax
+@@: mov     edx, dword ptr [g_tpm_state + ST_FAILS]
+    cmp     edx, eax
+    jae     vdtp_revoke
+
+    ; 4) ATOMIC PRE-COMMIT BEFORE TESTING PIN:
+    ;    Increment fails' = fails + 1, gen' = gen + 1, rotate S{cur} -> S{next},
+    ;    write updated HKCU blob, and destroy S{cur} BEFORE Argon2id / PIN check!
+    inc     edx
+    mov     dword ptr [rbp-28], edx             ; fails_after
+    mov     dword ptr [g_tpm_state + ST_FAILS], edx
+    inc     qword ptr [g_tpm_state + ST_GEN]
+    WINCALL GetSystemTimeAsFileTime, addr g_tpm_state + ST_LASTFT
+    mov     ecx, dword ptr [rbp-24]             ; next_slot
+    call    tpm_pin_seal_state
+    test    eax, eax
+    jz      vdtp_failclosed                     ; could not commit counter -> refuse PIN check!
+    mov     ecx, dword ptr [rbp-20]             ; delete old S{cur_slot}
+    call    tpm_kn_slot_build
+    lea     rcx, [g_tpm_kn_s]
+    call    tpm_delete
+
+    ; 5) Stretch entered PIN + verify hardware SmartCardPin + unwrap g_vkey
+    call    tpm_pin_stretch
+    test    eax, eax
+    jz      vdtp_badpin
+    call    tpm_kn_build
+    WINCALL tpm_unseal_pin, addr g_tpm_kn, addr g_tpm_state + ST_CTTPM, 256, \
+            addr g_tpm_hwpin, addr g_tpm_sec
+    cmp     eax, 1
+    jne     vdtp_badpin
+    lea     r10, [g_tpm_dk + 32]
+    lea     r11, [g_tpm_sec + 32]
+    xor     ecx, ecx
+vdtp_cpw:
+    mov     al, byte ptr [r10+rcx]
+    mov     byte ptr [r11+rcx], al
+    inc     ecx
+    cmp     ecx, 32
+    jb      vdtp_cpw
+    lea     rcx, [g_tpm_sec]
+    mov     edx, 64
+    lea     r8, [g_tpm_cand]
+    mov     r9d, 32
+    call    blake2b_hash
+    lea     r10, [g_greq]
+    lea     rax, [g_tpm_cand]
+    mov     qword ptr [r10].GCMREQ.key, rax
+    lea     rax, [g_tpm_state + ST_VKIV]
+    mov     qword ptr [r10].GCMREQ.iv, rax
+    lea     rax, [g_hdr]
+    mov     qword ptr [r10].GCMREQ.aad, rax
+    mov     qword ptr [r10].GCMREQ.aadlen, VH_TOTAL
+    lea     rax, [g_tpm_state + ST_VKCT]
+    mov     qword ptr [r10].GCMREQ.inp, rax
+    mov     qword ptr [r10].GCMREQ.inlen, 32
+    lea     rax, [g_vkey]
+    mov     qword ptr [r10].GCMREQ.outp, rax
+    lea     rax, [g_tpm_state + ST_VKTAG]
+    mov     qword ptr [r10].GCMREQ.tag, rax
+    lea     rcx, [g_greq]
+    call    gcm_open
+    test    eax, eax
+    jnz     vdtp_badpin
+    call    vk_kcv
+    lea     rcx, [g_sha32]
+    lea     rdx, [g_hdr + VH_KCV]
+    mov     r8, KCV_LEN
+    call    ct_memcmp
+    test    eax, eax
+    jnz     vdtp_badpin
+
+    ; 6) PIN VALID: reset fails = 0, increment gen, rotate S{next} -> S{cur}
+    mov     dword ptr [g_tpm_state + ST_FAILS], 0
+    inc     qword ptr [g_tpm_state + ST_GEN]
+    WINCALL GetSystemTimeAsFileTime, addr g_tpm_state + ST_LASTFT
+    mov     eax, dword ptr [g_tpm_state + ST_MAXFAILS]
+    mov     dword ptr [g_tpm_pin_rem], eax
+    mov     ecx, dword ptr [rbp-20]             ; rotate back to fresh S{cur_slot}
+    call    tpm_pin_seal_state
+    test    eax, eax
+    jz      @F
+    mov     ecx, dword ptr [rbp-24]             ; delete S{next_slot}
+    call    tpm_kn_slot_build
+    lea     rcx, [g_tpm_kn_s]
+    call    tpm_delete
+@@: call    tpm_wipe_scratch
+    mov     eax, dword ptr [rbp-16]
+    mov     dword ptr [g_tpm_reqhello], eax
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+
+vdtp_badpin:
+    lea     rcx, [g_vkey]
+    mov     edx, 32
+    call    secure_zero
+    mov     eax, dword ptr [g_tpm_state + ST_MAXFAILS]
+    mov     edx, dword ptr [rbp-28]             ; fails_after
+    cmp     edx, eax
+    jae     vdtp_revoke                         ; reached X failed attempts -> revoke!
+    sub     eax, edx
+    mov     dword ptr [g_tpm_pin_rem], eax
+    call    tpm_wipe_scratch
+    mov     eax, dword ptr [rbp-16]
+    mov     dword ptr [g_tpm_reqhello], eax
+    mov     eax, EXIT_AUTH
+    FRAME_EPILOG
+    ret
+
+vdtp_revoke:
+    call    tpm_wipe_scratch
+    mov     eax, dword ptr [rbp-16]
+    mov     dword ptr [g_tpm_reqhello], eax
+    call    vault_tpm_forget
+    mov     dword ptr [g_tpm_pin_rem], 0
+    mov     eax, EXIT_LOCKED
+    FRAME_EPILOG
+    ret
+
+vdtp_failclosed:
+    call    tpm_wipe_scratch
+    mov     eax, dword ptr [rbp-16]
+    mov     dword ptr [g_tpm_reqhello], eax
+    mov     eax, EXIT_LOCKED
+    FRAME_EPILOG
+    ret
+vk_derive_tpm_pin endp
+
+; ===========================================================================
+; vk_derive_tpm_hello() - Mode 3 (TPM + Windows Hello) dual-key unlock.
+; ===========================================================================
+vk_derive_tpm_hello proc frame
+    FRAME_PROLOG 48
+    ; [rbp-16]=saved reqhello [rbp-20]=blob_len [rbp-24]=ct_hello_len [rbp-32]=tail_ptr
+    mov     eax, dword ptr [g_tpm_reqhello]
+    mov     dword ptr [rbp-16], eax
+    mov     dword ptr [g_tpm_reqhello], 0
+    call    tpm_kn_build
+    mov     rcx, qword ptr [g_cfg_in]
+    lea     rdx, [g_tpm_blob]
+    mov     r8d, TPM_BLOB_CAP
+    call    reg_tpm_get
+    cmp     eax, 84
+    jb      vdth_fail
+    cmp     eax, TPM_BLOB_CAP
+    ja      vdth_fail
+    mov     dword ptr [rbp-20], eax
+    lea     r10, [g_tpm_blob]
+    cmp     dword ptr [r10+0], TPM_ENV_MAGIC
+    jne     vdth_fail
+    cmp     word ptr [r10+4], TPM_ENV_VER
+    jne     vdth_fail
+    cmp     byte ptr [r10+6], TPM_MODE_HELLO
+    jne     vdth_fail
+    cmp     dword ptr [r10+12], eax
+    jne     vdth_fail
+    cmp     word ptr [r10+16], 256              ; ct_tpm_len == 256
+    jne     vdth_fail
+    movzx   ecx, word ptr [r10+18]              ; ct_hello_len in [64, 512]
+    cmp     ecx, 64
+    jb      vdth_fail
+    cmp     ecx, 512
+    ja      vdth_fail
+    mov     dword ptr [rbp-24], ecx
+    lea     edx, [rcx + 276 + 60]
+    cmp     edx, eax
+    jne     vdth_fail
+    lea     rax, [g_tpm_blob + 276]
+    add     rax, rcx
+    mov     qword ptr [rbp-32], rax             ; tail = vkey_iv[12] || vkey_ct[32] || vkey_tag[16]
+
+    ; 1) Silent machine-bound PCP unseal -> g_tpm_sec[0..31]
+    lea     rcx, [g_tpm_kn]
+    lea     rdx, [g_tpm_blob + 20]
+    mov     r8d, 256
+    lea     r9, [g_tpm_sec]
+    call    tpm_unseal
+    cmp     eax, 1
+    jne     vdth_fail
+
+    ; 2) Live Windows Hello unseal (Face / Fingerprint / Hello PIN) -> g_tpm_sec[32..63]
+    lea     rcx, [g_tpm_blob + 276]
+    mov     edx, dword ptr [rbp-24]
+    lea     r8, [g_tpm_sec + 32]
+    call    tpm_hello_unseal
+    cmp     eax, 1
+    jne     vdth_fail
+
+    ; 3) Derive dual-key AES-256-GCM key and unwrap g_vkey
+    mov     ecx, 20
+    call    tpm_build_aad
+    lea     rcx, [g_tpm_sec]
+    mov     edx, 64
+    lea     r8, [g_tpm_cand]
+    mov     r9d, 32
+    call    blake2b_hash
+    mov     r11, qword ptr [rbp-32]
+    lea     r10, [g_greq]
+    lea     rax, [g_tpm_cand]
+    mov     qword ptr [r10].GCMREQ.key, rax
+    mov     qword ptr [r10].GCMREQ.iv, r11
+    lea     rax, [g_tpm_aad]
+    mov     qword ptr [r10].GCMREQ.aad, rax
+    mov     qword ptr [r10].GCMREQ.aadlen, 20 + VH_TOTAL
+    lea     rax, [r11 + 12]
+    mov     qword ptr [r10].GCMREQ.inp, rax
+    mov     qword ptr [r10].GCMREQ.inlen, 32
+    lea     rax, [g_vkey]
+    mov     qword ptr [r10].GCMREQ.outp, rax
+    lea     rax, [r11 + 44]
+    mov     qword ptr [r10].GCMREQ.tag, rax
+    lea     rcx, [g_greq]
+    call    gcm_open
+    test    eax, eax
+    jnz     vdth_fail
+    call    tpm_wipe_scratch
+    mov     eax, dword ptr [rbp-16]
+    mov     dword ptr [g_tpm_reqhello], eax
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+
+vdth_fail:
+    lea     rcx, [g_vkey]
+    mov     edx, 32
+    call    secure_zero
+    call    tpm_wipe_scratch
+    mov     eax, dword ptr [rbp-16]
+    mov     dword ptr [g_tpm_reqhello], eax
+    mov     eax, EXIT_LOCKED
+    FRAME_EPILOG
+    ret
+vk_derive_tpm_hello endp
+
+; ===========================================================================
+; vk_derive_tpm() - dispatch by g_use_tpm (TPM_MODE_ALONE / PIN / HELLO).
+;   -> eax = 0 / EXIT_AUTH / EXIT_LOCKED.
+; ===========================================================================
+vk_derive_tpm proc frame
+    FRAME_PROLOG 32
+    mov     eax, dword ptr [g_use_tpm]
+    cmp     eax, TPM_MODE_ALONE
+    je      vdt_m1
+    cmp     eax, TPM_MODE_PIN
+    je      vdt_m2
+    cmp     eax, TPM_MODE_HELLO
+    je      vdt_m3
+    mov     eax, EXIT_LOCKED
+    FRAME_EPILOG
+    ret
+vdt_m1:
+    call    vk_derive_tpm_alone
+    FRAME_EPILOG
+    ret
+vdt_m2:
+    call    vk_derive_tpm_pin
+    FRAME_EPILOG
+    ret
+vdt_m3:
+    call    vk_derive_tpm_hello
     FRAME_EPILOG
     ret
 vk_derive_tpm endp
 
 ; ===========================================================================
-; vault_tpm_remember() -> eax = 1/0.  Seal the current master key (g_vkey) to
-;   the TPM and store the wrapped blob under HKCU\..\TPM-Unlock, enabling fast
-;   unlock on this PC.  Precondition: vault just unlocked (g_vkey + g_hdr valid,
-;   g_cfg_in = path).
+; vault_tpm_remember() -> eax = 1/0.  Mode 1 (TPM Alone) enrollment.
 ; ===========================================================================
 public vault_tpm_remember
 vault_tpm_remember proc frame
@@ -597,18 +1352,25 @@ vault_tpm_remember proc frame
     call    tpm_kn_build
     lea     rcx, [g_tpm_kn]
     lea     rdx, [g_vkey]
-    lea     r8, [g_tpm_blob]
-    mov     r9d, 512
+    lea     r8, [g_tpm_blob + 16]
+    mov     r9d, 256
     call    tpm_seal
-    test    eax, eax
-    jz      vtr_fail
-    mov     dword ptr [rbp-32], eax         ; blob length
-    mov     rcx, qword ptr [g_cfg_in]       ; value name = vault path
+    cmp     eax, 256
+    jne     vtr_fail
+    lea     r10, [g_tpm_blob]
+    mov     dword ptr [r10+0],  TPM_ENV_MAGIC
+    mov     word ptr  [r10+4],  TPM_ENV_VER
+    mov     byte ptr  [r10+6],  TPM_MODE_ALONE
+    mov     byte ptr  [r10+7],  0
+    mov     dword ptr [r10+8],  0
+    mov     dword ptr [r10+12], 272
+    mov     rcx, qword ptr [g_cfg_in]
     lea     rdx, [g_tpm_blob]
-    mov     r8d, dword ptr [rbp-32]
+    mov     r8d, 272
     call    reg_tpm_set
     test    eax, eax
     jz      vtr_fail
+    call    tpm_del_slots_silent
     mov     eax, 1
     FRAME_EPILOG
     ret
@@ -619,16 +1381,241 @@ vtr_fail:
 vault_tpm_remember endp
 
 ; ===========================================================================
-; vault_tpm_forget() -> eax = 1.  Delete the TPM key + the HKCU\..\TPM-Unlock
-;   entry for this vault.  Precondition: g_hdr holds the vault header (so the key
-;   name resolves) and g_cfg_in points at the vault path.
+; vault_tpm_enroll_pin() -> eax = 1/0.  Mode 2 (TPM + PIN) enrollment.
+;   Precondition: g_vkey + g_hdr + g_cfg_in valid; g_tpm_pin_u8[0..g_tpm_pin_u8len]
+;   holds the validated UTF-8 PIN (always wiped before returning).
+; ===========================================================================
+public vault_tpm_enroll_pin
+vault_tpm_enroll_pin proc frame
+    FRAME_PROLOG 48
+    mov     eax, dword ptr [g_tpm_reqhello]
+    mov     dword ptr [rbp-24], eax
+    mov     dword ptr [g_tpm_reqhello], 0
+    cmp     dword ptr [g_tpm_pin_u8len], 0
+    je      vtep_fail
+    lea     rcx, [g_tpm_state]
+    mov     edx, 384
+    call    secure_zero
+    lea     rcx, [g_tpm_state + ST_SALT]
+    mov     edx, 32
+    call    rng_fill
+    test    eax, eax
+    jz      vtep_fail
+    lea     rcx, [g_tpm_sec]
+    mov     edx, 32
+    call    rng_fill
+    test    eax, eax
+    jz      vtep_fail
+    lea     rcx, [g_tpm_state + ST_VKIV]
+    mov     edx, 12
+    call    rng_fill
+    test    eax, eax
+    jz      vtep_fail
+    call    tpm_pin_stretch
+    test    eax, eax
+    jz      vtep_fail
+    call    tpm_kn_build
+    WINCALL tpm_seal_pin, addr g_tpm_kn, addr g_tpm_sec, addr g_tpm_hwpin, \
+            addr g_tpm_state + ST_CTTPM, 256
+    cmp     eax, 256
+    jne     vtep_fail
+    mov     word ptr [g_tpm_state + ST_TLEN], 256
+    lea     r10, [g_tpm_dk + 32]
+    lea     r11, [g_tpm_sec + 32]
+    xor     ecx, ecx
+vtep_cpw:
+    mov     al, byte ptr [r10+rcx]
+    mov     byte ptr [r11+rcx], al
+    inc     ecx
+    cmp     ecx, 32
+    jb      vtep_cpw
+    lea     rcx, [g_tpm_sec]
+    mov     edx, 64
+    lea     r8, [g_tpm_cand]
+    mov     r9d, 32
+    call    blake2b_hash
+    lea     r10, [g_greq]
+    lea     rax, [g_tpm_cand]
+    mov     qword ptr [r10].GCMREQ.key, rax
+    lea     rax, [g_tpm_state + ST_VKIV]
+    mov     qword ptr [r10].GCMREQ.iv, rax
+    lea     rax, [g_hdr]
+    mov     qword ptr [r10].GCMREQ.aad, rax
+    mov     qword ptr [r10].GCMREQ.aadlen, VH_TOTAL
+    lea     rax, [g_vkey]
+    mov     qword ptr [r10].GCMREQ.inp, rax
+    mov     qword ptr [r10].GCMREQ.inlen, 32
+    lea     rax, [g_tpm_state + ST_VKCT]
+    mov     qword ptr [r10].GCMREQ.outp, rax
+    lea     rax, [g_tpm_state + ST_VKTAG]
+    mov     qword ptr [r10].GCMREQ.tag, rax
+    lea     rcx, [g_greq]
+    call    gcm_seal
+    mov     qword ptr [g_tpm_state + ST_GEN], 1
+    mov     dword ptr [g_tpm_state + ST_FAILS], 0
+    mov     eax, dword ptr [g_tpm_pin_max]
+    cmp     eax, 1
+    jae     @F
+    mov     eax, TPM_PIN_TRIES_DEF
+@@: cmp     eax, TPM_PIN_TRIES_MAX
+    jbe     @F
+    mov     eax, TPM_PIN_TRIES_MAX
+@@: mov     dword ptr [g_tpm_state + ST_MAXFAILS], eax
+    mov     dword ptr [g_tpm_pin_rem], eax
+    WINCALL GetSystemTimeAsFileTime, addr g_tpm_state + ST_LASTFT
+    xor     ecx, ecx                            ; initial slot = S0
+    call    tpm_pin_seal_state
+    test    eax, eax
+    jz      vtep_delmain
+    mov     ecx, 1                              ; remove stale S1 if any
+    call    tpm_kn_slot_build
+    lea     rcx, [g_tpm_kn_s]
+    call    tpm_delete
+    call    tpm_wipe_scratch
+    mov     eax, dword ptr [rbp-24]
+    mov     dword ptr [g_tpm_reqhello], eax
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+vtep_delmain:
+    lea     rcx, [g_tpm_kn]
+    call    tpm_delete
+vtep_fail:
+    call    tpm_wipe_scratch
+    mov     eax, dword ptr [rbp-24]
+    mov     dword ptr [g_tpm_reqhello], eax
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+vault_tpm_enroll_pin endp
+
+; ===========================================================================
+; vault_tpm_enroll_hello() -> eax = 1/0.  Mode 3 (TPM + Windows Hello) enrollment.
+;   Prompts live Windows Hello verification BEFORE touching existing TPM keys/HKCU.
+; ===========================================================================
+public vault_tpm_enroll_hello
+vault_tpm_enroll_hello proc frame
+    FRAME_PROLOG 48
+    ; [rbp-16]=saved reqhello [rbp-20]=ct_hello_len [rbp-24]=total_len [rbp-32]=tail_ptr
+    mov     eax, dword ptr [g_tpm_reqhello]
+    mov     dword ptr [rbp-16], eax
+    mov     dword ptr [g_tpm_reqhello], 0
+    lea     rcx, [g_tpm_sec]                    ; tpm_secret[32] || hello_secret[32]
+    mov     edx, 64
+    call    rng_fill
+    test    eax, eax
+    jz      vteh_fail
+    ; 1) Seal + live-verify hello_secret[32] via Passport KSP FIRST (so user cancel
+    ;    leaves any existing Mode 1 / Mode 2 enrollment untouched!)
+    lea     rcx, [g_tpm_sec + 32]
+    lea     rdx, [g_tpm_blob + 276]
+    mov     r8d, 512
+    call    tpm_hello_seal
+    cmp     eax, 64
+    jb      vteh_fail
+    cmp     eax, 512
+    ja      vteh_fail
+    mov     dword ptr [rbp-20], eax
+    lea     ecx, [rax + 276 + 60]
+    mov     dword ptr [rbp-24], ecx
+    lea     rdx, [g_tpm_blob + 276]
+    add     rdx, rax
+    mov     qword ptr [rbp-32], rdx             ; tail = vkey_iv[12] || vkey_ct[32] || vkey_tag[16]
+    mov     rcx, rdx
+    mov     edx, 12
+    call    rng_fill
+    test    eax, eax
+    jz      vteh_fail
+    ; 2) Seal tpm_secret[32] to machine PCP key Vordr-<KCV>
+    call    tpm_kn_build
+    lea     rcx, [g_tpm_kn]
+    lea     rdx, [g_tpm_sec]
+    lea     r8, [g_tpm_blob + 20]
+    mov     r9d, 256
+    call    tpm_seal
+    cmp     eax, 256
+    jne     vteh_fail
+    ; 3) Header + dual-key AES-256-GCM wrap of g_vkey
+    lea     r10, [g_tpm_blob]
+    mov     dword ptr [r10+0],  TPM_ENV_MAGIC
+    mov     word ptr  [r10+4],  TPM_ENV_VER
+    mov     byte ptr  [r10+6],  TPM_MODE_HELLO
+    mov     byte ptr  [r10+7],  0
+    mov     dword ptr [r10+8],  0
+    mov     eax, dword ptr [rbp-24]
+    mov     dword ptr [r10+12], eax
+    mov     word ptr  [r10+16], 256
+    mov     eax, dword ptr [rbp-20]
+    mov     word ptr  [r10+18], ax
+    mov     ecx, 20
+    call    tpm_build_aad
+    lea     rcx, [g_tpm_sec]
+    mov     edx, 64
+    lea     r8, [g_tpm_cand]
+    mov     r9d, 32
+    call    blake2b_hash
+    mov     r11, qword ptr [rbp-32]
+    lea     r10, [g_greq]
+    lea     rax, [g_tpm_cand]
+    mov     qword ptr [r10].GCMREQ.key, rax
+    mov     qword ptr [r10].GCMREQ.iv, r11
+    lea     rax, [g_tpm_aad]
+    mov     qword ptr [r10].GCMREQ.aad, rax
+    mov     qword ptr [r10].GCMREQ.aadlen, 20 + VH_TOTAL
+    lea     rax, [g_vkey]
+    mov     qword ptr [r10].GCMREQ.inp, rax
+    mov     qword ptr [r10].GCMREQ.inlen, 32
+    lea     rax, [r11 + 12]
+    mov     qword ptr [r10].GCMREQ.outp, rax
+    lea     rax, [r11 + 44]
+    mov     qword ptr [r10].GCMREQ.tag, rax
+    lea     rcx, [g_greq]
+    call    gcm_seal
+    mov     rcx, qword ptr [g_cfg_in]
+    lea     rdx, [g_tpm_blob]
+    mov     r8d, dword ptr [rbp-24]
+    call    reg_tpm_set
+    test    eax, eax
+    jz      vteh_delmain
+    call    tpm_del_slots_silent
+    call    tpm_wipe_scratch
+    mov     eax, dword ptr [rbp-16]
+    mov     dword ptr [g_tpm_reqhello], eax
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+vteh_delmain:
+    lea     rcx, [g_tpm_kn]
+    call    tpm_delete
+vteh_fail:
+    call    tpm_wipe_scratch
+    mov     eax, dword ptr [rbp-16]
+    mov     dword ptr [g_tpm_reqhello], eax
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+vault_tpm_enroll_hello endp
+
+; ===========================================================================
+; vault_tpm_forget() -> eax = 1.  Delete all TPM keys (main + S0 + S1) + the
+;   HKCU\..\TPM-Unlock entry for this vault.
 ; ===========================================================================
 public vault_tpm_forget
 vault_tpm_forget proc frame
     FRAME_PROLOG 32
     call    tpm_kn_build
+    mov     eax, dword ptr [g_tpm_reqhello]
+    mov     dword ptr [rbp-24], eax
+    mov     dword ptr [g_tpm_reqhello], 0
     lea     rcx, [g_tpm_kn]
     call    tpm_delete
+    mov     eax, dword ptr [rbp-24]
+    mov     dword ptr [g_tpm_reqhello], eax
+    test    eax, eax
+    jz      @F
+    lea     rcx, [g_tpm_kn]
+    call    tpm_delete
+@@: call    tpm_del_slots_silent
     mov     rcx, qword ptr [g_cfg_in]       ; value name = vault path
     call    reg_tpm_del
     mov     eax, 1
@@ -637,16 +1624,13 @@ vault_tpm_forget proc frame
 vault_tpm_forget endp
 
 ; ===========================================================================
-; vault_tpm_has() -> eax = 1 if a TPM-Unlock registry entry exists for g_cfg_in,
-;   else 0.  Keyed by the vault path, so it works before the header is read.
+; vault_tpm_has() -> eax = 1 if a valid TPM-Unlock registry entry exists for
+;   g_cfg_in, else 0.  Keyed by the vault path, so it works pre-header.
 ; ===========================================================================
 public vault_tpm_has
 vault_tpm_has proc frame
     FRAME_PROLOG 32
-    mov     rcx, qword ptr [g_cfg_in]
-    lea     rdx, [g_tpm_blob]
-    mov     r8d, 512
-    call    reg_tpm_get
+    call    vault_tpm_mode_get
     test    eax, eax
     jz      vth_no
     mov     eax, 1
@@ -1362,7 +2346,7 @@ vu_hcpy:
     je      vu_pwderive
     call    vk_derive_tpm
     test    eax, eax
-    jnz     vu_locked                   ; no/failed TPM -> GUI falls back to pw
+    jnz     vu_cleanfile                ; preserve EXIT_AUTH vs EXIT_LOCKED from vk_derive_tpm
     jmp     vu_havekey
 vu_pwderive:
     call    vk_derive                   ; Argon2id
@@ -1694,6 +2678,7 @@ vl_wipe:
     lea     rcx, [g_convlabel]                  ; wipe plaintext field-label scratch
     mov     edx, MAX_LABEL_BYTES
     call    secure_zero
+    call    tpm_wipe_scratch
     FRAME_EPILOG
     ret
 vault_lock endp
@@ -6457,8 +7442,290 @@ vault_field_at endp
 HEALTH_MINLEN     equ 12                          ; code points
 HEALTH_MINCLASS   equ 3                            ; distinct character classes
 HEALTH_OLD_100NS  equ 365 * 86400 * 10000000       ; 365 days in FILETIME ticks
-HDIG              equ 16                            ; BLAKE2b digest bytes / entry
-HSTRIDE           equ 17                            ; {digest16, haspw1} per entry
+HDIG              equ 16                            ; BLAKE2b digest bytes / field
+HCRED_STRIDE      equ 24                            ; {digest16, u32 entry_idx, u32 kind}
+
+; ===========================================================================
+; pin_eval(rcx = utf8 bytes, edx = len, r8d = minlen)
+;   -> eax = grade (0 = Weak, 2 = Good, 3 = Strong), edx = reason (PIN_*).
+;   Evaluates a PIN / passcode with NO character-class requirement:
+;     - Strict UTF-8 scalar decoding (digits, letters, symbols all welcome)
+;     - Length >= minlen codepoints (else grade 0, PIN_SHORT)
+;     - Rejects trivial patterns as grade 0, PIN_TRIVIAL:
+;         1) All codepoints identical ("000000", "aaaaaa")
+;         2) Straight +1 or -1 arithmetic run ("123456", "654321", "abcdef")
+;         3) Exact repeating 2- or 3-codepoint cycle ("121212", "123123", "ababab")
+;         4) Exact palindrome of length >= 4 ("123321", "1221", "984489")
+;     - Non-trivial: length >= max(minlen+2, 8) -> 3 (Strong), else 2 (Good).
+;   Decoded scalar scratch on the stack is wiped via secure_zero before return.
+; ===========================================================================
+public pin_eval
+pin_eval proc frame
+    FRAME_PROLOG 608
+    ; [rbp-16]=utf8 [rbp-24]=len [rbp-28]=minlen [rbp-32]=cp_total
+    ; [rbp-36]=stream_same [rbp-40]=stream_step [rbp-44]=prev_cp [rbp-48]=step_delta
+    ; [rbp-52]=grade [rbp-56]=reason [rbp-576..-65]=cp_buf[128]
+    mov     qword ptr [rbp-16], rcx
+    mov     dword ptr [rbp-24], edx
+    cmp     r8d, 1
+    jge     @F
+    mov     r8d, PIN_MINLEN_DEF
+@@: mov     dword ptr [rbp-28], r8d
+    mov     dword ptr [rbp-32], 0
+    mov     dword ptr [rbp-36], 1
+    mov     dword ptr [rbp-40], 1
+    mov     dword ptr [rbp-44], 0
+    mov     dword ptr [rbp-48], 0
+    mov     dword ptr [rbp-52], 0
+    mov     dword ptr [rbp-56], PIN_SHORT
+    lea     rcx, [rbp-576]
+    mov     edx, 512
+    call    secure_zero
+    mov     r10, qword ptr [rbp-16]
+    mov     r11d, dword ptr [rbp-24]
+    test    r10, r10
+    jz      pe_finish
+    test    r11d, r11d
+    jz      pe_finish
+    xor     r9d, r9d                            ; byte cursor
+    xor     ecx, ecx                            ; cp_total
+pe_u8_lp:
+    cmp     r9d, r11d
+    jae     pe_u8_done
+    movzx   eax, byte ptr [r10+r9]
+    cmp     eax, 80h
+    jae     pe_u8_mb
+    mov     edx, eax
+    inc     r9d
+    jmp     pe_got_cp
+pe_u8_mb:
+    cmp     eax, 0C2h
+    jb      pe_badutf                           ; 80..C1: stray continuation or overlong
+    cmp     eax, 0DFh
+    ja      pe_u8_3or4
+    lea     r8d, [r9+2]
+    cmp     r8d, r11d
+    ja      pe_badutf
+    movzx   edx, byte ptr [r10+r9+1]
+    mov     r8d, edx
+    and     r8d, 0C0h
+    cmp     r8d, 80h
+    jne     pe_badutf
+    and     eax, 1Fh
+    shl     eax, 6
+    and     edx, 3Fh
+    or      edx, eax
+    add     r9d, 2
+    jmp     pe_got_cp
+pe_u8_3or4:
+    cmp     eax, 0EFh
+    ja      pe_u8_4
+    lea     r8d, [r9+3]
+    cmp     r8d, r11d
+    ja      pe_badutf
+    movzx   edx, byte ptr [r10+r9+1]
+    mov     r8d, edx
+    and     r8d, 0C0h
+    cmp     r8d, 80h
+    jne     pe_badutf
+    and     eax, 0Fh
+    shl     eax, 12
+    and     edx, 3Fh
+    shl     edx, 6
+    or      eax, edx
+    movzx   edx, byte ptr [r10+r9+2]
+    mov     r8d, edx
+    and     r8d, 0C0h
+    cmp     r8d, 80h
+    jne     pe_badutf
+    and     edx, 3Fh
+    or      edx, eax
+    cmp     edx, 800h
+    jb      pe_badutf                           ; overlong 3-byte
+    cmp     edx, 0D800h
+    jb      pe_3ok
+    cmp     edx, 0DFFFh
+    jbe     pe_badutf                           ; UTF-16 surrogate half
+pe_3ok:
+    add     r9d, 3
+    jmp     pe_got_cp
+pe_u8_4:
+    cmp     eax, 0F4h
+    ja      pe_badutf
+    lea     r8d, [r9+4]
+    cmp     r8d, r11d
+    ja      pe_badutf
+    and     eax, 07h
+    shl     eax, 18
+    movzx   edx, byte ptr [r10+r9+1]
+    mov     r8d, edx
+    and     r8d, 0C0h
+    cmp     r8d, 80h
+    jne     pe_badutf
+    and     edx, 3Fh
+    shl     edx, 12
+    or      eax, edx
+    movzx   edx, byte ptr [r10+r9+2]
+    mov     r8d, edx
+    and     r8d, 0C0h
+    cmp     r8d, 80h
+    jne     pe_badutf
+    and     edx, 3Fh
+    shl     edx, 6
+    or      eax, edx
+    movzx   edx, byte ptr [r10+r9+3]
+    mov     r8d, edx
+    and     r8d, 0C0h
+    cmp     r8d, 80h
+    jne     pe_badutf
+    and     edx, 3Fh
+    or      edx, eax
+    cmp     edx, 10000h
+    jb      pe_badutf                           ; overlong 4-byte
+    cmp     edx, 10FFFFh
+    ja      pe_badutf                           ; > Unicode max
+    add     r9d, 4
+pe_got_cp:
+    cmp     ecx, 128
+    jae     pe_stream
+    mov     dword ptr [rbp-576+rcx*4], edx
+pe_stream:
+    test    ecx, ecx
+    jnz     pe_not_first
+    mov     dword ptr [rbp-44], edx             ; prev_cp = cp[0]
+    inc     ecx
+    jmp     pe_u8_lp
+pe_not_first:
+    cmp     edx, dword ptr [rbp-576]
+    je      @F
+    mov     dword ptr [rbp-36], 0               ; differs from cp[0] -> not all-same
+@@: mov     eax, edx
+    sub     eax, dword ptr [rbp-44]             ; delta = cp[i] - cp[i-1]
+    cmp     ecx, 1
+    jne     pe_step_n
+    mov     dword ptr [rbp-48], eax             ; step_delta = cp[1] - cp[0]
+    cmp     eax, 1
+    je      pe_step_done
+    cmp     eax, -1
+    je      pe_step_done
+    mov     dword ptr [rbp-40], 0
+    jmp     pe_step_done
+pe_step_n:
+    cmp     eax, dword ptr [rbp-48]
+    je      pe_step_done
+    mov     dword ptr [rbp-40], 0
+pe_step_done:
+    mov     dword ptr [rbp-44], edx
+    inc     ecx
+    jmp     pe_u8_lp
+
+pe_badutf:
+    mov     dword ptr [rbp-52], 0
+    mov     dword ptr [rbp-56], PIN_BADUTF8
+    jmp     pe_finish
+
+pe_u8_done:
+    mov     dword ptr [rbp-32], ecx
+    cmp     ecx, dword ptr [rbp-28]             ; cp_total < minlen?
+    jb      pe_short
+    ; 1) All identical ("000000", "aaaaaa")
+    cmp     ecx, 2
+    jb      pe_grade_ok
+    cmp     dword ptr [rbp-36], 0
+    jne     pe_triv
+    ; 2) Straight +1 / -1 run ("123456", "654321", "abcdef")
+    cmp     ecx, 3
+    jb      pe_chk_bounded
+    cmp     dword ptr [rbp-40], 0
+    jne     pe_triv
+pe_chk_bounded:
+    cmp     ecx, 128
+    ja      pe_grade_ok                         ; > 128 non-same non-run codepoints
+    ; 3a) Period-2 repeating cycle ("121212", "ababab", len >= 4)
+    cmp     ecx, 4
+    jb      pe_grade_ok
+    mov     r8d, 2
+pe_p2_lp:
+    cmp     r8d, ecx
+    jae     pe_triv                             ; all cp[i] == cp[i-2] -> period-2!
+    mov     eax, dword ptr [rbp-576+r8*4]
+    cmp     eax, dword ptr [rbp-576+r8*4-8]
+    jne     pe_chk_p3
+    inc     r8d
+    jmp     pe_p2_lp
+pe_chk_p3:
+    ; 3b) Period-3 repeating cycle ("123123", "abcabc", len >= 6)
+    cmp     ecx, 6
+    jb      pe_chk_pal
+    mov     r8d, 3
+pe_p3_lp:
+    cmp     r8d, ecx
+    jae     pe_triv                             ; all cp[i] == cp[i-3] -> period-3!
+    mov     eax, dword ptr [rbp-576+r8*4]
+    cmp     eax, dword ptr [rbp-576+r8*4-12]
+    jne     pe_chk_pal
+    inc     r8d
+    jmp     pe_p3_lp
+pe_chk_pal:
+    ; 4) Exact palindrome of length >= 4 ("123321", "1221", "984489")
+    xor     r8d, r8d
+    lea     r9d, [rcx-1]
+pe_pal_lp:
+    cmp     r8d, r9d
+    jae     pe_triv                             ; mirrored across entire length -> palindrome!
+    mov     eax, dword ptr [rbp-576+r8*4]
+    cmp     eax, dword ptr [rbp-576+r9*4]
+    jne     pe_grade_ok
+    inc     r8d
+    dec     r9d
+    jmp     pe_pal_lp
+
+pe_grade_ok:
+    mov     dword ptr [rbp-56], PIN_OK
+    mov     eax, dword ptr [rbp-28]             ; strong floor = max(minlen + 2, 8)
+    add     eax, 2
+    cmp     eax, 8
+    jae     @F
+    mov     eax, 8
+@@: mov     edx, 2                              ; Good
+    cmp     ecx, eax
+    jb      @F
+    mov     edx, 3                              ; Strong
+@@: mov     dword ptr [rbp-52], edx
+    jmp     pe_finish
+
+pe_short:
+    mov     dword ptr [rbp-52], 0
+    mov     dword ptr [rbp-56], PIN_SHORT
+    jmp     pe_finish
+
+pe_triv:
+    mov     dword ptr [rbp-52], 0
+    mov     dword ptr [rbp-56], PIN_TRIVIAL
+
+pe_finish:
+    lea     rcx, [rbp-576]
+    mov     edx, 512
+    call    secure_zero
+    mov     eax, dword ptr [rbp-52]
+    mov     edx, dword ptr [rbp-56]
+    FRAME_EPILOG
+    ret
+pin_eval endp
+
+; vh_pin_weak(rcx = utf8 bytes, edx = len) -> eax = 1 if the PIN is weak (grade 0).
+public vh_pin_weak
+vh_pin_weak proc frame
+    FRAME_PROLOG 32
+    mov     r8d, dword ptr [g_cfg_pinminlen]
+    call    pin_eval
+    xor     ecx, ecx
+    test    eax, eax
+    setz    cl
+    mov     eax, ecx
+    FRAME_EPILOG
+    ret
+vh_pin_weak endp
 
 ; vh_pw_weak(rcx = utf8 bytes, edx = len) -> eax = 1 if the password is weak.
 ;   Weak = fewer than HEALTH_MINLEN bytes, or fewer than HEALTH_MINCLASS of
@@ -6529,160 +7796,272 @@ vw_weak:
 vh_pw_weak endp
 
 ; vault_health(rcx = out) - fill four dwords at [out]: {weak, reused, old,
-;   total}.  reused = entries whose VF_SECRET is byte-identical (BLAKE2b-128)
-;   to some other entry's; old = modified more than HEALTH_OLD_100NS ago.
-;   Entries with no password count toward total only.  Requires an unlocked
-;   body; if the scratch allocation fails the dup pass is skipped (reused = 0).
+;   total}.  Walks every non-empty VF_SECRET (graded via vh_pw_weak) and VF_PIN
+;   (graded via vh_pin_weak) across all user entries:
+;     - weak   = entries carrying at least one weak password or weak PIN
+;     - reused = entries sharing a same-kind credential (BLAKE2b-128, domain-
+;                separated by base kind so VF_PIN never collides with VF_SECRET)
+;                with at least one other entry
+;     - old    = credential-bearing entries modified > HEALTH_OLD_100NS ago
+;     - total  = vault_user_count (entries with no credentials count here only)
 public vault_health
 vault_health proc frame
-    FRAME_PROLOG 128
-    ; [rbp-24]=out [rbp-32]=n [rbp-40]=scratch [rbp-48]=i [rbp-56]=len
-    ; [rbp-64]=weak [rbp-72]=old [rbp-80]=now [rbp-88]=reused [rbp-96]=j
-    ; [rbp-104]=pw ptr
-    mov     qword ptr [rbp-24], rcx
+    FRAME_PROLOG 176
+    ; [rbp-16]=out [rbp-24]=n [rbp-32]=scratch [rbp-40]=cred_total [rbp-48]=cred_written
+    ; [rbp-56]=i [rbp-64]=weak [rbp-72]=old [rbp-80]=reused [rbp-88]=now
+    ; [rbp-96]=f_ptr [rbp-104]=f_rem [rbp-112]=val_ptr [rbp-116]=val_len
+    ; [rbp-120]=base_kind [rbp-124]=has_cred [rbp-128]=is_weak
+    ; [rbp-132]=last_reused_ei [rbp-136]=j
+    mov     qword ptr [rbp-16], rcx
     mov     dword ptr [rcx+0], 0
     mov     dword ptr [rcx+4], 0
     mov     dword ptr [rcx+8], 0
     mov     dword ptr [rcx+12], 0
+    mov     dword ptr [rbp-40], 0
+    mov     dword ptr [rbp-48], 0
     mov     dword ptr [rbp-64], 0
     mov     dword ptr [rbp-72], 0
-    mov     dword ptr [rbp-88], 0
-    call    vault_count                         ; PHYSICAL: the loop below indexes entries,
-    mov     dword ptr [rbp-32], eax             ;   so its bound must include system items
-    call    vault_user_count                    ; the REPORTED total must not
-    mov     r10, qword ptr [rbp-24]
+    mov     dword ptr [rbp-80], 0
+    mov     qword ptr [rbp-32], 0
+    call    vault_count
+    mov     dword ptr [rbp-24], eax
+    call    vault_user_count
+    mov     r10, qword ptr [rbp-16]
     mov     dword ptr [r10+12], eax             ; total
-    mov     eax, dword ptr [rbp-32]
+    mov     eax, dword ptr [rbp-24]
     test    eax, eax
     jz      vh_done
-    mov     ecx, dword ptr [rbp-32]
-    imul    rcx, rcx, HSTRIDE
+
+    ; --- Pass 1: count non-empty VF_SECRET / VF_PIN fields across user entries ---
+    mov     dword ptr [rbp-56], 0
+vh_cnt_ent:
+    mov     eax, dword ptr [rbp-56]
+    cmp     eax, dword ptr [rbp-24]
+    jae     vh_alloc
+    mov     ecx, eax
+    call    vault_is_system
+    test    eax, eax
+    jnz     vh_cnt_next
+    mov     ecx, dword ptr [rbp-56]
+    call    vault_entry_ptr
+    test    rax, rax
+    jz      vh_cnt_next
+    mov     r8d, dword ptr [rax+32]             ; field_count
+    lea     r10, [rax+36]
+vh_cnt_fld:
+    test    r8d, r8d
+    jz      vh_cnt_next
+    movzx   eax, word ptr [r10]
+    mov     r9d, dword ptr [r10+2]              ; field bytes len
+    mov     ecx, eax
+    and     ecx, VF_KINDMASK
+    cmp     ecx, VF_SECRET
+    je      vh_cnt_cred
+    cmp     ecx, VF_PIN
+    jne     vh_cnt_fadv
+vh_cnt_cred:
+    mov     edx, r9d
+    test    eax, VF_LABELED
+    jz      @F
+    movzx   eax, word ptr [r10+6]
+    add     eax, 2
+    sub     edx, eax
+@@: test    edx, edx
+    jle     vh_cnt_fadv
+    inc     dword ptr [rbp-40]
+vh_cnt_fadv:
+    add     r10, 6
+    add     r10, r9
+    dec     r8d
+    jmp     vh_cnt_fld
+vh_cnt_next:
+    inc     dword ptr [rbp-56]
+    jmp     vh_cnt_ent
+
+vh_alloc:
+    mov     ecx, dword ptr [rbp-40]
+    test    ecx, ecx
+    jz      vh_time
+    imul    rcx, rcx, HCRED_STRIDE
     call    mem_alloc
-    mov     qword ptr [rbp-40], rax             ; 0 => dup pass disabled
+    mov     qword ptr [rbp-32], rax             ; 0 => dup pass gracefully skipped
+vh_time:
     lea     rcx, [g_ts]
     call    GetSystemTimeAsFileTime
     mov     rax, qword ptr [g_ts]
-    mov     qword ptr [rbp-80], rax             ; now
-    mov     dword ptr [rbp-48], 0               ; i
+    mov     qword ptr [rbp-88], rax             ; now
+
+    ; --- Pass 2: evaluate weak/old per entry and emit domain-tagged digests ------
+    mov     dword ptr [rbp-56], 0               ; i
 vh_loop:
-    mov     eax, dword ptr [rbp-48]
-    cmp     eax, dword ptr [rbp-32]
+    mov     eax, dword ptr [rbp-56]
+    cmp     eax, dword ptr [rbp-24]
     jae     vh_dups
-    ; default haspw = 0
-    mov     rax, qword ptr [rbp-40]
-    test    rax, rax
-    jz      vh_pw
-    mov     ecx, dword ptr [rbp-48]
-    imul    rcx, rcx, HSTRIDE
-    mov     byte ptr [rax+rcx+16], 0
-vh_pw:
-    mov     ecx, dword ptr [rbp-48]             ; a system item is not a user record.  It
-    call    vault_is_system                     ;   carries no VF_SECRET so it could never
-    test    eax, eax                            ;   score weak/old/reused anyway - skip it
-    jnz     vh_next                             ;   explicitly rather than lean on that.
-    mov     ecx, dword ptr [rbp-48]             ;   (haspw is already 0, so the dup pass
-    mov     edx, VF_SECRET                      ;    ignores it too.)
-    lea     r8, [rbp-56]
-    call    vault_field_at                      ; rax=ptr, [rbp-56]=len
-    test    rax, rax
-    jz      vh_next                             ; no password
-    mov     qword ptr [rbp-104], rax
-    mov     rcx, rax
-    mov     edx, dword ptr [rbp-56]
-    call    vh_pw_weak
+    mov     ecx, eax
+    call    vault_is_system
     test    eax, eax
-    jz      vh_old
-    inc     dword ptr [rbp-64]
-vh_old:
-    mov     ecx, dword ptr [rbp-48]
+    jnz     vh_next
+    mov     ecx, dword ptr [rbp-56]
     call    vault_entry_ptr
     test    rax, rax
-    jz      vh_hash
-    mov     rdx, qword ptr [rbp-80]             ; now
-    sub     rdx, qword ptr [rax+24]             ; now - modified
-    js      vh_hash                             ; future timestamp -> not old
-    mov     r8, HEALTH_OLD_100NS                ; 64-bit: can't be a cmp immediate
-    cmp     rdx, r8
-    jbe     vh_hash
-    inc     dword ptr [rbp-72]
-vh_hash:
-    mov     rax, qword ptr [rbp-40]
-    test    rax, rax
     jz      vh_next
-    mov     ecx, dword ptr [rbp-48]
-    imul    rcx, rcx, HSTRIDE
-    lea     r8, [rax+rcx]                       ; digest dest
-    mov     byte ptr [r8+16], 1                 ; haspw
-    mov     rcx, qword ptr [rbp-104]
-    mov     edx, dword ptr [rbp-56]
+    mov     dword ptr [rbp-124], 0              ; has_cred = 0
+    mov     dword ptr [rbp-128], 0              ; is_weak = 0
+    mov     ecx, dword ptr [rax+32]
+    mov     dword ptr [rbp-104], ecx            ; f_rem
+    lea     rcx, [rax+36]
+    mov     qword ptr [rbp-96], rcx             ; f_ptr
+vh_floop:
+    cmp     dword ptr [rbp-104], 0
+    je      vh_entry_fin
+    mov     r10, qword ptr [rbp-96]
+    movzx   eax, word ptr [r10]                 ; raw type
+    mov     r9d, dword ptr [r10+2]              ; field bytes len
+    lea     rdx, [r10+6]                        ; val_ptr
+    mov     r11d, r9d                           ; val_len
+    lea     rcx, [r10+6]
+    add     rcx, r9
+    mov     qword ptr [rbp-96], rcx             ; advance f_ptr now
+    dec     dword ptr [rbp-104]
+    mov     ecx, eax
+    and     ecx, VF_KINDMASK
+    cmp     ecx, VF_SECRET
+    je      vh_fcred
+    cmp     ecx, VF_PIN
+    jne     vh_floop
+vh_fcred:
+    test    eax, VF_LABELED
+    jz      @F
+    movzx   eax, word ptr [rdx]
+    add     eax, 2
+    add     rdx, rax
+    sub     r11d, eax
+@@: test    r11d, r11d
+    jle     vh_floop
+    mov     dword ptr [rbp-124], 1              ; has_cred = 1
+    mov     qword ptr [rbp-112], rdx            ; val_ptr
+    mov     dword ptr [rbp-116], r11d           ; val_len
+    mov     dword ptr [rbp-120], ecx            ; base_kind
+    cmp     ecx, VF_PIN
+    je      vh_chk_pin
+    mov     rcx, rdx
+    mov     edx, r11d
+    call    vh_pw_weak
+    jmp     vh_got_weak
+vh_chk_pin:
+    mov     rcx, rdx
+    mov     edx, r11d
+    call    vh_pin_weak
+vh_got_weak:
+    test    eax, eax
+    jz      vh_fhash
+    mov     dword ptr [rbp-128], 1
+vh_fhash:
+    mov     r10, qword ptr [rbp-32]
+    test    r10, r10
+    jz      vh_floop
+    mov     eax, dword ptr [rbp-48]
+    cmp     eax, dword ptr [rbp-40]
+    jae     vh_floop
+    imul    rax, rax, HCRED_STRIDE
+    lea     r8, [r10+rax]                       ; &row[cred_written]
+    mov     ecx, dword ptr [rbp-56]
+    mov     dword ptr [r8+16], ecx              ; entry_idx
+    mov     ecx, dword ptr [rbp-120]
+    mov     dword ptr [r8+20], ecx              ; kind (domain tag)
+    mov     rcx, qword ptr [rbp-112]
+    mov     edx, dword ptr [rbp-116]
     mov     r9, HDIG
     call    blake2b_hash
-vh_next:
     inc     dword ptr [rbp-48]
-    jmp     vh_loop
-vh_dups:
-    mov     rax, qword ptr [rbp-40]
+    jmp     vh_floop
+
+vh_entry_fin:
+    cmp     dword ptr [rbp-124], 0
+    je      vh_next
+    cmp     dword ptr [rbp-128], 0
+    je      @F
+    inc     dword ptr [rbp-64]                  ; weak++
+@@: mov     ecx, dword ptr [rbp-56]
+    call    vault_entry_ptr
     test    rax, rax
-    jz      vh_store                            ; no scratch -> reused = 0
-    mov     dword ptr [rbp-48], 0               ; i
-vh_di:
-    mov     eax, dword ptr [rbp-48]
-    cmp     eax, dword ptr [rbp-32]
-    jae     vh_store
-    mov     r10, qword ptr [rbp-40]
-    mov     ecx, dword ptr [rbp-48]
-    imul    rcx, rcx, HSTRIDE
-    cmp     byte ptr [r10+rcx+16], 0
-    je      vh_di_next
-    mov     dword ptr [rbp-96], 0               ; j
-vh_dj:
-    mov     eax, dword ptr [rbp-96]
-    cmp     eax, dword ptr [rbp-32]
-    jae     vh_di_next                          ; no partner found
+    jz      vh_next
+    mov     rdx, qword ptr [rbp-88]             ; now
+    sub     rdx, qword ptr [rax+24]             ; now - modified
+    js      vh_next
+    mov     r8, HEALTH_OLD_100NS
+    cmp     rdx, r8
+    jbe     vh_next
+    inc     dword ptr [rbp-72]                  ; old++
+vh_next:
+    inc     dword ptr [rbp-56]
+    jmp     vh_loop
+
+    ; --- Pass 3: cross-entry, same-kind duplicate check (at most 1 per entry) ----
+vh_dups:
+    mov     rax, qword ptr [rbp-32]
+    test    rax, rax
+    jz      vh_store
+    mov     dword ptr [rbp-132], -1             ; last_reused_ei = -1
+    mov     dword ptr [rbp-56], 0               ; a = 0
+vh_da:
+    mov     eax, dword ptr [rbp-56]
     cmp     eax, dword ptr [rbp-48]
-    je      vh_dj_next
-    mov     r10, qword ptr [rbp-40]
-    mov     ecx, dword ptr [rbp-96]
-    imul    rcx, rcx, HSTRIDE
-    cmp     byte ptr [r10+rcx+16], 0
-    je      vh_dj_next
-    mov     r8, qword ptr [rbp-40]
-    mov     eax, dword ptr [rbp-48]
-    imul    rax, rax, HSTRIDE
-    lea     r10, [r8+rax]                       ; digest[i]
-    mov     eax, dword ptr [rbp-96]
-    imul    rax, rax, HSTRIDE
-    lea     r11, [r8+rax]                       ; digest[j]
+    jae     vh_store
+    mov     r8, qword ptr [rbp-32]
+    imul    rcx, rax, HCRED_STRIDE
+    lea     r10, [r8+rcx]                       ; row[a]
+    mov     edx, dword ptr [r10+16]             ; ei = row[a].entry_idx
+    cmp     edx, dword ptr [rbp-132]
+    je      vh_da_next                          ; entry ei already counted as reused
+    mov     dword ptr [rbp-136], 0              ; b = 0
+vh_db:
+    mov     eax, dword ptr [rbp-136]
+    cmp     eax, dword ptr [rbp-48]
+    jae     vh_da_next
+    mov     r8, qword ptr [rbp-32]
+    mov     ecx, dword ptr [rbp-56]
+    imul    rcx, rcx, HCRED_STRIDE
+    lea     r10, [r8+rcx]                       ; row[a]
+    mov     ecx, dword ptr [rbp-136]
+    imul    rcx, rcx, HCRED_STRIDE
+    lea     r11, [r8+rcx]                       ; row[b]
+    mov     edx, dword ptr [r10+16]
+    cmp     edx, dword ptr [r11+16]             ; same entry? skip
+    je      vh_db_next
+    mov     ecx, dword ptr [r10+20]
+    cmp     ecx, dword ptr [r11+20]             ; different kind (VF_SECRET vs VF_PIN)? skip
+    jne     vh_db_next
     mov     rax, qword ptr [r10]
     cmp     rax, qword ptr [r11]
-    jne     vh_dj_next
+    jne     vh_db_next
     mov     rax, qword ptr [r10+8]
     cmp     rax, qword ptr [r11+8]
-    jne     vh_dj_next
-    inc     dword ptr [rbp-88]                  ; entry i is reused
-    jmp     vh_di_next
-vh_dj_next:
-    inc     dword ptr [rbp-96]
-    jmp     vh_dj
-vh_di_next:
-    inc     dword ptr [rbp-48]
-    jmp     vh_di
+    jne     vh_db_next
+    inc     dword ptr [rbp-80]                  ; entry ei is reused
+    mov     dword ptr [rbp-132], edx
+    jmp     vh_da_next
+vh_db_next:
+    inc     dword ptr [rbp-136]
+    jmp     vh_db
+vh_da_next:
+    inc     dword ptr [rbp-56]
+    jmp     vh_da
+
 vh_store:
-    mov     r10, qword ptr [rbp-24]
+    mov     r10, qword ptr [rbp-16]
     mov     eax, dword ptr [rbp-64]
     mov     dword ptr [r10+0], eax              ; weak
-    mov     eax, dword ptr [rbp-88]
+    mov     eax, dword ptr [rbp-80]
     mov     dword ptr [r10+4], eax              ; reused
     mov     eax, dword ptr [rbp-72]
     mov     dword ptr [r10+8], eax              ; old
-    mov     rcx, qword ptr [rbp-40]
+    mov     rcx, qword ptr [rbp-32]
     test    rcx, rcx
     jz      vh_done
-    ; wipe the scratch before releasing it: it holds unsalted BLAKE2b-128
-    ; fingerprints of every password, which must not linger in freed pages.
-    mov     eax, dword ptr [rbp-32]             ; n
-    imul    rax, rax, HSTRIDE
-    mov     rdx, rax                            ; mem_free wipes rdx bytes
+    mov     eax, dword ptr [rbp-40]
+    imul    rax, rax, HCRED_STRIDE
+    mov     rdx, rax
     call    mem_free
 vh_done:
     FRAME_EPILOG
@@ -6717,25 +8096,180 @@ ves_no:
     ret
 vault_entry_stale endp
 
+; vault_entry_health_status(rcx = index) -> eax = 0 (healthy / no credentials),
+;   1 (stale: >= 1yr unmodified), or 2 (weak VF_SECRET or VF_PIN).
+;   Powers the sidebar tile health dot identically for passwords and PINs.
+public vault_entry_health_status
+vault_entry_health_status proc frame
+    FRAME_PROLOG 64
+    ; [rbp-16]=index [rbp-24]=f_ptr [rbp-32]=f_rem [rbp-36]=has_cred
+    mov     qword ptr [rbp-16], rcx
+    call    vault_is_system
+    test    eax, eax
+    jnz     vehs_zero
+    mov     rcx, qword ptr [rbp-16]
+    call    vault_entry_ptr
+    test    rax, rax
+    jz      vehs_zero
+    mov     ecx, dword ptr [rax+32]
+    mov     dword ptr [rbp-32], ecx
+    lea     rcx, [rax+36]
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-36], 0
+vehs_lp:
+    cmp     dword ptr [rbp-32], 0
+    je      vehs_stale
+    mov     r10, qword ptr [rbp-24]
+    movzx   eax, word ptr [r10]
+    mov     r9d, dword ptr [r10+2]
+    lea     rdx, [r10+6]
+    mov     r11d, r9d
+    lea     rcx, [r10+6]
+    add     rcx, r9
+    mov     qword ptr [rbp-24], rcx
+    dec     dword ptr [rbp-32]
+    mov     ecx, eax
+    and     ecx, VF_KINDMASK
+    cmp     ecx, VF_SECRET
+    je      vehs_cred
+    cmp     ecx, VF_PIN
+    jne     vehs_lp
+vehs_cred:
+    test    eax, VF_LABELED
+    jz      @F
+    movzx   eax, word ptr [rdx]
+    add     eax, 2
+    add     rdx, rax
+    sub     r11d, eax
+@@: test    r11d, r11d
+    jle     vehs_lp
+    mov     dword ptr [rbp-36], 1
+    cmp     ecx, VF_PIN
+    je      vehs_pin
+    mov     rcx, rdx
+    mov     edx, r11d
+    call    vh_pw_weak
+    jmp     vehs_chk
+vehs_pin:
+    mov     rcx, rdx
+    mov     edx, r11d
+    call    vh_pin_weak
+vehs_chk:
+    test    eax, eax
+    jz      vehs_lp
+    mov     eax, 2
+    FRAME_EPILOG
+    ret
+vehs_stale:
+    cmp     dword ptr [rbp-36], 0
+    je      vehs_zero
+    mov     rcx, qword ptr [rbp-16]
+    call    vault_entry_stale
+    FRAME_EPILOG
+    ret
+vehs_zero:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+vault_entry_health_status endp
+
 ; ===========================================================================
-; cmd_healthkat - E6 known-answer test for vault_health.  Points g_body_ptr at
-;   a hand-built 10-entry fixture with a known health profile, runs the
-;   analysis, and asserts the four counts.  No vault file, no unlock: the
-;   fixture is a raw body image, exactly the layout the trusting accessors
-;   expect.  exit 0 = counts match, 1 = mismatch.
-;
-;   Fixture profile:
-;     e0 "abc"                old,  weak(len),   dup with e9
-;     e1 "Password1!"         new,  weak(len)
-;     e2 "Str0ng#Password9"   new,  strong,      dup with e3
-;     e3 "Str0ng#Password9"   new,  strong,      dup with e2
-;     e4 "reused-pass-000"    new,  strong,      dup with e5
-;     e5 "reused-pass-000"    new,  strong,      dup with e4
-;     e6 "aaaaaaaaaaaaaaaa"   new,  weak(1 class)
-;     e7 (title only, no pw)  new,  -            counted in total only
-;     e8 "Zx9$Qw7!Lp2@"       old,  strong
-;     e9 "abc"                new,  weak(len),   dup with e0
-;   => weak=4  reused=6  old=2  total=10
+; cmd_pinkat - Known-answer test for pin_eval (UTF-8 codepoints, zero char-class
+;   requirements, configurable minlen, and trivial-pattern rejection).
+; ===========================================================================
+.data
+CSTR pnk_ok,  "pinkat: PASS (PIN length, UTF-8 scalar count, no-class rule, trivial patterns)",13,10
+CSTR pnk_bad, "pinkat: FAIL",13,10
+pnk_good6   db "839204"
+pnk_good8   db "83920471"
+pnk_alpha6  db "kqmpzv"
+pnk_utf8_6  db 0C3h,0A4h,'9',0C3h,0B6h,'2',0C3h,0BCh,'7'    ; "ä9ö2ü7" (9 bytes, 6 codepoints)
+pnk_utf8_5  db 0C3h,0A4h,0C3h,0B6h,0C3h,0BCh,'1','2'        ; "äöü12"  (8 bytes, 5 codepoints)
+pnk_short5  db "48291"
+pnk_same6   db "000000"
+pnk_samea   db "aaaaaa"
+pnk_asc6    db "123456"
+pnk_asca    db "abcdef"
+pnk_desc6   db "654321"
+pnk_desca   db "fedcba"
+pnk_cyc2    db "121212"
+pnk_cyc2a   db "ababab"
+pnk_cyc3    db "123123"
+pnk_cyc3a   db "abcabc"
+pnk_pal6    db "123321"
+pnk_pal4    db "1221"
+pnk_good4   db "4829"
+pnk_badu8   db 0FFh,'8','3','9','2','0','4'
+
+align 8
+pnk_cases label qword
+    ; { ptr, byte_len, minlen, exp_grade, exp_reason } (5 qwords = 40 bytes/row)
+    dq pnk_good6,   6, 6, 2, PIN_OK
+    dq pnk_good8,   8, 6, 3, PIN_OK
+    dq pnk_alpha6,  6, 6, 2, PIN_OK
+    dq pnk_utf8_6,  9, 6, 2, PIN_OK
+    dq pnk_utf8_5,  8, 6, 0, PIN_SHORT
+    dq pnk_short5,  5, 6, 0, PIN_SHORT
+    dq pnk_good6,   0, 6, 0, PIN_SHORT
+    dq pnk_same6,   6, 6, 0, PIN_TRIVIAL
+    dq pnk_samea,   6, 6, 0, PIN_TRIVIAL
+    dq pnk_asc6,    6, 6, 0, PIN_TRIVIAL
+    dq pnk_asca,    6, 6, 0, PIN_TRIVIAL
+    dq pnk_desc6,   6, 6, 0, PIN_TRIVIAL
+    dq pnk_desca,   6, 6, 0, PIN_TRIVIAL
+    dq pnk_cyc2,    6, 6, 0, PIN_TRIVIAL
+    dq pnk_cyc2a,   6, 6, 0, PIN_TRIVIAL
+    dq pnk_cyc3,    6, 6, 0, PIN_TRIVIAL
+    dq pnk_cyc3a,   6, 6, 0, PIN_TRIVIAL
+    dq pnk_pal6,    6, 6, 0, PIN_TRIVIAL
+    dq pnk_pal4,    4, 4, 0, PIN_TRIVIAL
+    dq pnk_good4,   4, 4, 2, PIN_OK
+    dq pnk_badu8,   7, 6, 0, PIN_BADUTF8
+PNK_CASES_N equ ($ - pnk_cases) / 40
+.code
+
+LANDING_PAD
+public cmd_pinkat
+cmd_pinkat proc frame
+    FRAME_PROLOG 48
+    mov     dword ptr [rbp-24], 0               ; i
+pnk_lp:
+    mov     eax, dword ptr [rbp-24]
+    cmp     eax, PNK_CASES_N
+    jae     pnk_pass
+    imul    rax, rax, 40
+    lea     r10, [pnk_cases]
+    add     r10, rax
+    mov     qword ptr [rbp-32], r10
+    mov     rcx, qword ptr [r10+0]
+    mov     edx, dword ptr [r10+8]
+    mov     r8d, dword ptr [r10+16]
+    call    pin_eval
+    mov     r10, qword ptr [rbp-32]
+    cmp     eax, dword ptr [r10+24]
+    jne     pnk_fail
+    cmp     edx, dword ptr [r10+32]
+    jne     pnk_fail
+    inc     dword ptr [rbp-24]
+    jmp     pnk_lp
+pnk_pass:
+    lea     rcx, [pnk_ok]
+    mov     edx, pnk_ok_len
+    call    print_a
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+pnk_fail:
+    lea     rcx, [pnk_bad]
+    mov     edx, pnk_bad_len
+    call    print_a
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+cmd_pinkat endp
+
+; ===========================================================================
+; cmd_healthkat - E6 known-answer test for vault_health (VF_SECRET + VF_PIN).
 ; ===========================================================================
 .data
 align 8
@@ -6821,46 +8355,143 @@ hk_body:
     dw  VF_SECRET
     dd  3
     db  "abc"
+
+align 8
+hk_pin_body:
+    dd  7                                     ; entry_count
+    ; --- p0 VF_PIN "839204" (old, strong PIN, dup with p5) -----------------
+    db  16 dup(0)
+    dq  0
+    dq  0
+    dd  1
+    dw  VF_PIN
+    dd  6
+    db  "839204"
+    ; --- p1 VF_PIN "k9m2p7" (new, strong alphanumeric PIN) -----------------
+    db  16 dup(0)
+    dq  0
+    dq  7FFFFFFFFFFFFFFFh
+    dd  1
+    dw  VF_PIN
+    dd  6
+    db  "k9m2p7"
+    ; --- p2 VF_PIN "123456" (new, weak trivial run) ------------------------
+    db  16 dup(0)
+    dq  0
+    dq  7FFFFFFFFFFFFFFFh
+    dd  1
+    dw  VF_PIN
+    dd  6
+    db  "123456"
+    ; --- p3 VF_PIN "9472" (new, weak < 6 chars) ----------------------------
+    db  16 dup(0)
+    dq  0
+    dq  7FFFFFFFFFFFFFFFh
+    dd  1
+    dw  VF_PIN
+    dd  4
+    db  "9472"
+    ; --- p4 VF_PIN "984489" (new, weak palindrome) -------------------------
+    db  16 dup(0)
+    dq  0
+    dq  7FFFFFFFFFFFFFFFh
+    dd  1
+    dw  VF_PIN
+    dd  6
+    db  "984489"
+    ; --- p5 VF_PIN "839204" (new, dup of p0) -------------------------------
+    db  16 dup(0)
+    dq  0
+    dq  7FFFFFFFFFFFFFFFh
+    dd  1
+    dw  VF_PIN
+    dd  6
+    db  "839204"
+    ; --- p6 VF_SECRET "839204" (new, weak password; MUST NOT dup VF_PIN!) --
+    db  16 dup(0)
+    dq  0
+    dq  7FFFFFFFFFFFFFFFh
+    dd  1
+    dw  VF_SECRET
+    dd  6
+    db  "839204"
 .code
 
 LANDING_PAD
 public cmd_healthkat
 cmd_healthkat proc frame
-    FRAME_PROLOG 80
+    FRAME_PROLOG 96
     ; [rbp-24] saved g_body_ptr ; [rbp-48..-33] health {weak,reused,old,total}
-    ; [rbp-56]=vault_entry_stale(0) [rbp-64]=vault_entry_stale(1)
+    ; [rbp-56]=stale(0) [rbp-64]=stale(1) [rbp-72]=saved pinminlen
     mov     rax, qword ptr [g_body_ptr]
     mov     qword ptr [rbp-24], rax
+    mov     eax, dword ptr [g_cfg_pinminlen]
+    mov     dword ptr [rbp-72], eax
+    mov     dword ptr [g_cfg_pinminlen], PIN_MINLEN_DEF
+
+    ; 1) Original 10-entry VF_SECRET fixture
     lea     rax, [hk_body]
     mov     qword ptr [g_body_ptr], rax
     lea     rcx, [rbp-48]
     call    vault_health
-    ; per-entry stale probe while the fixture body is still mounted: e0 is old
-    ; (modified=0), e1 is recent (modified=max).
     xor     ecx, ecx
     call    vault_entry_stale
     mov     dword ptr [rbp-56], eax
     mov     ecx, 1
     call    vault_entry_stale
     mov     dword ptr [rbp-64], eax
-    mov     rax, qword ptr [rbp-24]
-    mov     qword ptr [g_body_ptr], rax         ; restore before any assert exit
     cmp     dword ptr [rbp-48], 4               ; weak
-    jne     hk_fail
+    jne     hk_fail_rest
     cmp     dword ptr [rbp-44], 6               ; reused
-    jne     hk_fail
+    jne     hk_fail_rest
     cmp     dword ptr [rbp-40], 2               ; old
-    jne     hk_fail
+    jne     hk_fail_rest
     cmp     dword ptr [rbp-36], 10              ; total
-    jne     hk_fail
+    jne     hk_fail_rest
     cmp     dword ptr [rbp-56], 1               ; e0 stale
-    jne     hk_fail
+    jne     hk_fail_rest
     cmp     dword ptr [rbp-64], 0               ; e1 not stale
-    jne     hk_fail
+    jne     hk_fail_rest
+
+    ; 2) 7-entry VF_PIN + domain-separation fixture:
+    ;    weak = 4 (p2, p3, p4, p6), reused = 2 (p0, p5 only!), old = 1 (p0), total = 7
+    lea     rax, [hk_pin_body]
+    mov     qword ptr [g_body_ptr], rax
+    lea     rcx, [rbp-48]
+    call    vault_health
+    cmp     dword ptr [rbp-48], 4               ; weak
+    jne     hk_fail_rest
+    cmp     dword ptr [rbp-44], 2               ; reused (p6 VF_SECRET != VF_PIN!)
+    jne     hk_fail_rest
+    cmp     dword ptr [rbp-40], 1               ; old
+    jne     hk_fail_rest
+    cmp     dword ptr [rbp-36], 7               ; total
+    jne     hk_fail_rest
+    xor     ecx, ecx                            ; p0: healthy PIN, stale -> status 1
+    call    vault_entry_health_status
+    cmp     eax, 1
+    jne     hk_fail_rest
+    mov     ecx, 1                              ; p1: healthy PIN, fresh -> status 0
+    call    vault_entry_health_status
+    test    eax, eax
+    jnz     hk_fail_rest
+    mov     ecx, 2                              ; p2: trivial PIN -> status 2 (weak)
+    call    vault_entry_health_status
+    cmp     eax, 2
+    jne     hk_fail_rest
+
+    mov     eax, dword ptr [rbp-72]
+    mov     dword ptr [g_cfg_pinminlen], eax
+    mov     rax, qword ptr [rbp-24]
+    mov     qword ptr [g_body_ptr], rax
     xor     eax, eax
     FRAME_EPILOG
     ret
-hk_fail:
+hk_fail_rest:
+    mov     eax, dword ptr [rbp-72]
+    mov     dword ptr [g_cfg_pinminlen], eax
+    mov     rax, qword ptr [rbp-24]
+    mov     qword ptr [g_body_ptr], rax
     mov     eax, 1
     FRAME_EPILOG
     ret
@@ -9152,5 +10783,276 @@ vck_fail:
     FRAME_EPILOG
     ret
 cmd_vattcolkat endp
+
+ifdef PROBE_IO
+; ===========================================================================
+; vault_tpm_pin_kat() -> eax = 0 (PASS) / 1 (FAIL).
+;   Headless Mode 2 (TPM + PIN) anti-replay & 3-strike revocation KAT.
+;   Verifies:
+;     1) Mode 2 enroll + Mode 1 downgrade refusal (EXIT_LOCKED).
+;     2) Valid PIN round-trip + S0 -> S1 -> S0 key rotation.
+;     3) Registry snapshot replay refusal (replaying old S0 blob fails & revokes).
+;     4) Failed-attempt counter tracking + reset to 0 on subsequent valid PIN.
+;     5) Automatic 3-strike revocation (deletes TPM keys + HKCU entry).
+; ===========================================================================
+.data
+WSTR vtpk_path, <C:\VordrTpmPinKat\kat.vordr>
+vtpk_pin_ok  db "739284"
+vtpk_pin_b1  db "111111"
+vtpk_pin_b2  db "222222"
+vtpk_pin_b3  db "333333"
+.data?
+align 8
+vtpk_hdr_bk  db VH_TOTAL dup (?)
+vtpk_vkey_bk db 32 dup (?)
+vtpk_vkey_ex db 32 dup (?)
+vtpk_snap    db TPM_PIN_BLOB_SZ dup (?)
+.code
+vtpk_set_pin proc
+    ; rcx = ptr, edx = len (<= 32)
+    mov     dword ptr [g_tpm_pin_u8len], edx
+    lea     r10, [g_tpm_pin_u8]
+    xor     r8d, r8d
+vsp_lp:
+    cmp     r8d, edx
+    jae     vsp_dn
+    mov     al, byte ptr [rcx+r8]
+    mov     byte ptr [r10+r8], al
+    inc     r8d
+    jmp     vsp_lp
+vsp_dn:
+    ret
+vtpk_set_pin endp
+
+public vault_tpm_pin_kat
+vault_tpm_pin_kat proc frame
+    FRAME_PROLOG 64
+    ; [rbp-12]=saved use_tpm [rbp-16]=saved reqhello
+    ; [rbp-20]=saved pin_t   [rbp-24]=saved pin_m   [rbp-28]=saved pin_max
+    ; [rbp-32]=saved nohwpin [rbp-36]=rc
+    mov     eax, dword ptr [g_use_tpm]
+    mov     dword ptr [rbp-12], eax
+    mov     eax, dword ptr [g_tpm_reqhello]
+    mov     dword ptr [rbp-16], eax
+    mov     eax, dword ptr [g_tpm_pin_t]
+    mov     dword ptr [rbp-20], eax
+    mov     eax, dword ptr [g_tpm_pin_m]
+    mov     dword ptr [rbp-24], eax
+    mov     eax, dword ptr [g_tpm_pin_max]
+    mov     dword ptr [rbp-28], eax
+    mov     eax, dword ptr [g_tpm_kat_nohwpin]
+    mov     dword ptr [rbp-32], eax
+    mov     dword ptr [rbp-36], 1
+
+    lea     rcx, [vtpk_hdr_bk]
+    lea     rdx, [g_hdr]
+    mov     r8d, VH_TOTAL
+    call    copy_bytes
+    lea     rcx, [vtpk_vkey_bk]
+    lea     rdx, [g_vkey]
+    mov     r8d, 32
+    call    copy_bytes
+
+    ; Set isolated test vault path + deterministic header/vkey + fast KDF params
+    lea     rcx, [vtpk_path]
+    call    cfg_in_set
+    mov     dword ptr [g_tpm_reqhello], 0
+    mov     dword ptr [g_tpm_kat_nohwpin], 1
+    mov     dword ptr [g_tpm_pin_t], 1
+    mov     dword ptr [g_tpm_pin_m], 64
+    mov     dword ptr [g_tpm_pin_max], 3
+
+    xor     ecx, ecx
+vtpk_seed:
+    lea     eax, [rcx + 31h]
+    lea     r10, [g_vkey]
+    mov     byte ptr [r10+rcx], al
+    lea     r10, [vtpk_vkey_ex]
+    mov     byte ptr [r10+rcx], al
+    lea     r10, [g_hdr + VH_SALT]
+    xor     eax, 55h
+    mov     byte ptr [r10+rcx], al
+    inc     ecx
+    cmp     ecx, 32
+    jb      vtpk_seed
+    call    vk_kcv
+    lea     rcx, [g_hdr + VH_KCV]
+    lea     rdx, [g_sha32]
+    mov     r8d, KCV_LEN
+    call    copy_bytes
+
+    ; 1) Enroll Mode 2 with PIN "739284"
+    lea     rcx, [vtpk_pin_ok]
+    mov     edx, 6
+    call    vtpk_set_pin
+    call    vault_tpm_enroll_pin
+    cmp     eax, 1
+    jne     vtpk_out
+    call    vault_tpm_mode_get
+    cmp     eax, TPM_MODE_PIN
+    jne     vtpk_out
+
+    ; 2) Mode 1 (TPM Alone) MUST refuse a Mode 2 envelope (no policy-downgrade bypass)
+    mov     dword ptr [g_use_tpm], TPM_MODE_ALONE
+    call    vk_derive_tpm
+    cmp     eax, EXIT_LOCKED
+    jne     vtpk_out
+
+    ; Snapshot HKCU envelope BEFORE first unlock (S0 key #1, gen=1)
+    mov     rcx, qword ptr [g_cfg_in]
+    lea     rdx, [vtpk_snap]
+    mov     r8d, TPM_PIN_BLOB_SZ
+    call    reg_tpm_get
+    cmp     eax, TPM_PIN_BLOB_SZ
+    jne     vtpk_out
+
+    ; 3) Unlock with valid PIN "739284" -> recovers g_vkey & rotates S0 -> S1 -> S0 (key #3)
+    lea     rcx, [g_vkey]
+    mov     edx, 32
+    call    secure_zero
+    mov     dword ptr [g_use_tpm], TPM_MODE_PIN
+    lea     rcx, [vtpk_pin_ok]
+    mov     edx, 6
+    call    vtpk_set_pin
+    call    vk_derive_tpm
+    test    eax, eax
+    jnz     vtpk_out
+    lea     rcx, [g_vkey]
+    lea     rdx, [vtpk_vkey_ex]
+    mov     r8d, 32
+    call    ct_memcmp
+    test    eax, eax
+    jnz     vtpk_out
+
+    ; 4) REPLAY ATTACK: restore old HKCU snapshot -> MUST fail closed & revoke!
+    mov     rcx, qword ptr [g_cfg_in]
+    lea     rdx, [vtpk_snap]
+    mov     r8d, TPM_PIN_BLOB_SZ
+    call    reg_tpm_set
+    cmp     eax, 1
+    jne     vtpk_out
+    lea     rcx, [vtpk_pin_ok]
+    mov     edx, 6
+    call    vtpk_set_pin
+    call    vk_derive_tpm
+    cmp     eax, EXIT_LOCKED
+    jne     vtpk_out
+    call    vault_tpm_has
+    test    eax, eax
+    jnz     vtpk_out                            ; must have auto-revoked on replay!
+
+    ; 5) Re-enroll "739284": 2 wrong PINs (rem=2, rem=1) then valid PIN resets fails to 0
+    lea     rcx, [g_vkey]
+    lea     rdx, [vtpk_vkey_ex]
+    mov     r8d, 32
+    call    copy_bytes
+    lea     rcx, [vtpk_pin_ok]
+    mov     edx, 6
+    call    vtpk_set_pin
+    call    vault_tpm_enroll_pin
+    cmp     eax, 1
+    jne     vtpk_out
+
+    lea     rcx, [vtpk_pin_b1]
+    mov     edx, 6
+    call    vtpk_set_pin
+    call    vk_derive_tpm
+    cmp     eax, EXIT_AUTH
+    jne     vtpk_out
+    cmp     dword ptr [g_tpm_pin_rem], 2
+    jne     vtpk_out
+
+    lea     rcx, [vtpk_pin_b2]
+    mov     edx, 6
+    call    vtpk_set_pin
+    call    vk_derive_tpm
+    cmp     eax, EXIT_AUTH
+    jne     vtpk_out
+    cmp     dword ptr [g_tpm_pin_rem], 1
+    jne     vtpk_out
+
+    lea     rcx, [vtpk_pin_ok]
+    mov     edx, 6
+    call    vtpk_set_pin
+    call    vk_derive_tpm
+    test    eax, eax
+    jnz     vtpk_out
+    cmp     dword ptr [g_tpm_pin_rem], 3
+    jne     vtpk_out
+
+    ; 6) 3-strike automatic revocation: 3 consecutive wrong PINs -> EXIT_LOCKED + deleted
+    lea     rcx, [vtpk_pin_b1]
+    mov     edx, 6
+    call    vtpk_set_pin
+    call    vk_derive_tpm
+    cmp     eax, EXIT_AUTH
+    jne     vtpk_out
+    cmp     dword ptr [g_tpm_pin_rem], 2
+    jne     vtpk_out
+
+    lea     rcx, [vtpk_pin_b2]
+    mov     edx, 6
+    call    vtpk_set_pin
+    call    vk_derive_tpm
+    cmp     eax, EXIT_AUTH
+    jne     vtpk_out
+    cmp     dword ptr [g_tpm_pin_rem], 1
+    jne     vtpk_out
+
+    lea     rcx, [vtpk_pin_b3]
+    mov     edx, 6
+    call    vtpk_set_pin
+    call    vk_derive_tpm
+    cmp     eax, EXIT_LOCKED
+    jne     vtpk_out
+    cmp     dword ptr [g_tpm_pin_rem], 0
+    jne     vtpk_out
+    call    vault_tpm_has
+    test    eax, eax
+    jnz     vtpk_out
+
+    ; Valid PIN after revocation MUST still return EXIT_LOCKED
+    lea     rcx, [vtpk_pin_ok]
+    mov     edx, 6
+    call    vtpk_set_pin
+    call    vk_derive_tpm
+    cmp     eax, EXIT_LOCKED
+    jne     vtpk_out
+
+    mov     dword ptr [rbp-36], 0
+
+vtpk_out:
+    call    vault_tpm_forget
+    lea     rcx, [vtpk_vkey_ex]
+    mov     edx, 32
+    call    secure_zero
+    lea     rcx, [g_hdr]
+    lea     rdx, [vtpk_hdr_bk]
+    mov     r8d, VH_TOTAL
+    call    copy_bytes
+    lea     rcx, [g_vkey]
+    lea     rdx, [vtpk_vkey_bk]
+    mov     r8d, 32
+    call    copy_bytes
+    lea     rcx, [vtpk_vkey_bk]
+    mov     edx, 32
+    call    secure_zero
+    mov     eax, dword ptr [rbp-12]
+    mov     dword ptr [g_use_tpm], eax
+    mov     eax, dword ptr [rbp-16]
+    mov     dword ptr [g_tpm_reqhello], eax
+    mov     eax, dword ptr [rbp-20]
+    mov     dword ptr [g_tpm_pin_t], eax
+    mov     eax, dword ptr [rbp-24]
+    mov     dword ptr [g_tpm_pin_m], eax
+    mov     eax, dword ptr [rbp-28]
+    mov     dword ptr [g_tpm_pin_max], eax
+    mov     eax, dword ptr [rbp-32]
+    mov     dword ptr [g_tpm_kat_nohwpin], eax
+    mov     eax, dword ptr [rbp-36]
+    FRAME_EPILOG
+    ret
+vault_tpm_pin_kat endp
+endif
 
 end

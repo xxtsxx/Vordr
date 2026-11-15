@@ -114,8 +114,15 @@ no valid setting exists; the installer does not write defaults automatically.
 
 `ui_anim` (DWORD under `HKLM\SOFTWARE\Vordr`) fixes Settings > Animations: 0
 follows Windows' "Animation effects" switch (the default), 1 always animates, 2
-never does. It has no installer property; set it by Group Policy or registry like
-any other value here, and the setting shows locked.
+never does. Five additional `REG_DWORD` values under `HKLM\SOFTWARE\Vordr` enforce
+PIN secret rules and granular TPM unlock policy (locking their corresponding Settings
+controls in the same fail-closed manner):
+
+- `TpmUnlockMode` (`0..3`, default `1`): `0` = Off, `1` = TPM only, `2` = TPM + PIN, `3` = TPM + Windows Hello. When `TpmUnlockMode` is absent, Vordr migrates legacy `TpmUnlock` / `TpmRequireHello` values (`TpmUnlock = 0` -> `0`; `TpmRequireHello = 1` -> `3`; otherwise `1`).
+- `TpmMinMode` (`0..3`, default `0`, **`HKLM`-only**): raises the minimum allowed `TpmUnlockMode` whenever TPM unlock is enabled (`mode != 0`) while still permitting users to turn TPM unlock completely `Off` (`0`), unless `TpmUnlockMode` itself is locked in `HKLM`.
+- `TpmPinMaxAttempts` (`1..20`, default `3`): failed `TPM + PIN` attempts before Vordr deletes the TPM keys and revokes the `HKCU` shortcut.
+- `PinMinLen` (`4..32`, default `6`): minimum scalar length for `VF_PIN` entry fields and `TPM + PIN` enrollment.
+- `PinRejectTrivial` (`0/1`, default `1`): when `1`, blocks saving or enrolling trivial PIN patterns (`000000`, `123456`, `121212`, `123321`); when `0`, allows saving weak PINs in vault entries while still flagging them as Weak in Vault Health.
 
 `AllowUncVault` is evaluated **only** from `HKLM\SOFTWARE\Vordr`; user-writable
 `HKCU` values cannot enable UNC/SMB access (`polkat`). When `AllowUncVault` is `0`
@@ -141,12 +148,17 @@ also clamps direct registry edits:
 | `LogLevel` | **0** — off, not 4 | 0 is valid: off |
 | `ui_scheme` | **8** — the default | — |
 | `ui_anim` | **0** — follow Windows | 0 is valid: follow Windows |
+| `TpmUnlockMode` / `TpmMinMode` | **0** — off / no floor | 0 is valid: off |
+| `TpmPinMaxAttempts` | 20 | **3** — the default, not 1 |
+| `PinMinLen` | 32 | **6** when 0; 4 when 1–3 |
 | the 0/1 values | any non-zero reads as 1 | — |
 
-`TpmRequireHello` sets provider UI policy (`NCRYPT_UI_POLICY_PROPERTY`), propagates the
-owner window handle for Windows Hello prompts, and binds the `TpmRequireHello` bit into
-the 64-byte TPM-sealed payload digest (`tpmkat`); treat it as local hardware-assisted
-convenience hardening rather than an independent second factor. When `SecureUnlock=1` is
+`TpmUnlockMode = 2` (`TPM + PIN`) enforces hardware TPM `SmartCardPin` plus pre-commit
+`S0`/`S1` state-key rotation so `HKCU` registry snapshots cannot replay failed attempts,
+and `TpmUnlockMode = 3` (`TPM + Hello`) requires both the Platform Crypto Provider TPM
+key and the user's Windows Hello NGC decryption key (`tpmkat`); treat all TPM modes as
+local hardware-bound convenience paths rather than replacements for a strong master
+password. When `SecureUnlock=1` is
 enforced via `HKLM`, Vordr **fails closed** if private-desktop creation fails and refuses
 normal-desktop fallback (`secdeskkat`); when `SecureUnlock=1` comes from `HKCU` or the
 default, Vordr warns and requires explicit user confirmation before opening a prompt on

@@ -93,6 +93,12 @@ externdef g_totp_code6:byte         ; Live 6-digit TOTP ASCII buffer (gui.asm)
 externdef g_totp_code_w:byte        ; Live 6-digit TOTP wide buffer (gui.asm)
 externdef g_totp_disp_w:byte        ; Live grouped TOTP display buffer (gui.asm)
 externdef g_wordtmp:byte            ; Phonetic word scratch buffer (gui.asm)
+externdef g_tpm_state:byte          ; TPM+PIN decrypted InnerState scratch (vault.asm)
+externdef g_tpm_sec:byte            ; TPM+PIN / TPM+Hello secret material (vault.asm)
+externdef g_tpm_dk:byte             ; Argon2id(PIN) 64-byte output (vault.asm)
+externdef g_tpm_hwpin:byte          ; SmartCardPin wide hex buffer (vault.asm)
+externdef g_tpm_cand:byte           ; Transient 32-byte wrap/state key (vault.asm)
+externdef g_tpm_pin_u8:byte         ; UTF-8 PIN staging buffer (vault.asm)
 
 ; Sizes of the buffers above, mirrored from the modules that allocate them -
 ; constcheck fails the build if any of these drifts from its original.
@@ -214,6 +220,12 @@ sec_regions label qword
     dq  g_totp_code_w,  16*2
     dq  g_totp_disp_w,  16*2
     dq  g_wordtmp,      32*2
+    dq  g_tpm_state,    384
+    dq  g_tpm_sec,      64
+    dq  g_tpm_dk,       64
+    dq  g_tpm_hwpin,    68
+    dq  g_tpm_cand,     32
+    dq  g_tpm_pin_u8,   256
 sec_regions_end label qword
 
 .code

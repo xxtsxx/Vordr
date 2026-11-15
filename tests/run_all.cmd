@@ -94,7 +94,7 @@ set /a T_SELFTEST=!T1!-!T0!
 
 rem -------------------------------------------------------------- roundtrip --
 call :now T0
-echo === stage: roundtrip (seedtest / atgen / zitest / phtest / secscan / secfreedup / tmptest / fztest / trtest / vfuzz / fuzzzip / jfuzz / bktest / mactest / rbtest / sysitemkat / vexselkat / c9kat / vimpkat / vimpattkat / xctest / reload / attfuzz / zexcap / zexname / convcap / healthkat / pkat / kdfparam / vaultexportkat / vaultexpattkat / zexselkat / attovfkat / vattcolkat / polkat / tpmkat / secdeskkat) ===
+echo === stage: roundtrip (seedtest / atgen / zitest / phtest / secscan / secfreedup / tmptest / fztest / trtest / vfuzz / fuzzzip / jfuzz / bktest / mactest / rbtest / sysitemkat / vexselkat / c9kat / vimpkat / vimpattkat / xctest / reload / attfuzz / zexcap / zexname / convcap / healthkat / pkat / kdfparam / vaultexportkat / vaultexpattkat / zexselkat / attovfkat / vattcolkat / polkat / tpmkat / pinkat / secdeskkat) ===
 set RT=PASS
 
 rem --- data-loss guard: the RELEASE binary (still in bin\ from the build stage)
@@ -275,6 +275,9 @@ if not "!errorlevel!"=="0" ( echo   polkat: FAIL ^(exit !errorlevel!, VDR-09/VDR
 
 bin\vordr.exe tpmkat > "%WORK%\tpmkat.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   tpmkat: FAIL ^(exit !errorlevel!, VDR-10 TPM OAEP v2 label + cleanup^) & set RT=FAIL )
+
+bin\vordr.exe pinkat > "%WORK%\pinkat.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   pinkat: FAIL ^(exit !errorlevel!, PIN length + trivial-pattern grading^) & set RT=FAIL )
 
 bin\vordr.exe secdeskkat > "%WORK%\secdeskkat.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   secdeskkat: FAIL ^(exit !errorlevel!, VDR-13 secure-desktop fallback/orphan^) & set RT=FAIL )

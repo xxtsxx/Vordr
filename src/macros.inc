@@ -123,8 +123,30 @@ VF_SPACER           equ 16         ; layout block: a blank gap (no label, no val
 ; Fields are written raw (VFL_RAW), never labelled.
 VF_SYSTEM           equ 17         ; marker, MUST be field[0]; value = u8 schema version
 VF_SYS_PWVERIFY     equ 18         ; C9: u64 FILETIME the master password was last typed
-;                    19+           ; free: the next per-vault setting takes 19
+;                    19            ; retired (earlier grace-period field; do not reuse)
+VF_PIN              equ 20         ; PIN / passcode secret (own length + pattern grading)
+;                    21+           ; free: the next field / system setting takes 21
 SYSITEM_VER         equ 1          ; VF_SYSTEM value byte
+
+; --- PIN secret policy & grading reason codes ----------------------------------
+PIN_MINLEN_DEF      equ 6          ; default minimum PIN length (codepoints)
+PIN_MINLEN_MIN      equ 4          ; minimum configurable PIN floor
+PIN_MINLEN_MAX      equ 32         ; maximum configurable PIN floor
+PIN_OK              equ 0          ; meets length + non-trivial
+PIN_SHORT           equ 1          ; fewer than minlen codepoints
+PIN_TRIVIAL         equ 2          ; trivial pattern (same, +/-1 run, 2/3-cycle, palindrome)
+PIN_BADUTF8         equ 3          ; malformed UTF-8 sequence
+
+; --- Configurable TPM Unlock modes & anti-replay envelope ----------------------
+TPM_MODE_OFF        equ 0          ; disabled (always prompt for master password)
+TPM_MODE_ALONE      equ 1          ; silent machine-bound TPM unseal
+TPM_MODE_PIN        equ 2          ; TPM + PIN (pre-commit S0/S1 rotation + HW SmartCardPin)
+TPM_MODE_HELLO      equ 3          ; TPM + Windows Hello (PCP + Passport KSP dual-key)
+TPM_PIN_TRIES_DEF   equ 3          ; default failed-PIN revocation threshold
+TPM_PIN_TRIES_MAX   equ 20         ; maximum configurable failed-PIN threshold
+TPM_BLOB_CAP        equ 1024       ; max serialized HKCU\..\TPM-Unlock envelope bytes
+TPM_ENV_MAGIC       equ 4D505456h  ; "VTPM" little-endian versioned envelope magic
+TPM_ENV_VER         equ 1          ; envelope wire version
 ; C9 - periodic master-password reminder under TPM Unlock.
 ; A REMINDER ONLY: nothing is ever withheld and TPM enrolment is never revoked.  Locking
 ; someone out of their own vault is the worst possible response to the very situation

@@ -292,7 +292,19 @@ if (($seqMap.ContainsKey("FindRelatedProducts")) -and ($seqMap.ContainsKey("Laun
 } else {
     Bad "InstallExecuteSequence must contain both FindRelatedProducts and LaunchConditions"
 }
-if ($names -notcontains "RemoveExistingProducts") { Bad "RemoveExistingProducts is not sequenced - detection would happen and nothing would be removed" }
+if (-not $seqMap.ContainsKey("RemoveExistingProducts")) {
+    Bad "RemoveExistingProducts is not sequenced - detection would happen and nothing would be removed"
+} else {
+    $before  = $seqMap.GetEnumerator() | Where-Object { $_.Value -lt $seqMap["RemoveExistingProducts"] } |
+               Sort-Object Value | Select-Object -Last 1
+    $anchors = @("InstallValidate","InstallInitialize","InstallExecute","InstallExecuteAgain","InstallFinalize")
+    if ((-not $before) -or ($anchors -notcontains $before.Key)) {
+        Bad "RemoveExistingProducts does not immediately follow a legal anchor ($($anchors -join ', ')) - install fails with error 2613"
+    }
+    if ($seqMap.ContainsKey("InstallFiles") -and ($seqMap["RemoveExistingProducts"] -ge $seqMap["InstallFiles"])) {
+        Bad "RemoveExistingProducts ($($seqMap['RemoveExistingProducts'])) runs after InstallFiles ($($seqMap['InstallFiles'])) - same-version upgrades skip overwriting vordr.exe"
+    }
+}
 
 # Property-establishing actions run in the CLIENT process.  When the client's
 # sequence completes, the installer marks them done; a server-side pass then logs

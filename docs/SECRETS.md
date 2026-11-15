@@ -47,7 +47,8 @@ code buffers (`g_totp_code6`, `g_totp_code_w`, `g_totp_disp_w`).
 | `g_cfg_pass` (1025 B) | main | UTF-8 master password | GUI password-attempt cleanup and process exit |
 | `g_vkey` (32 B) | vault | Active vault key | `vault_lock` |
 | `g_xs_vkey` (32 B) | vault | Parked key during temporary context operations | Export/password-check context cleanup |
-| `g_pwbuf`, `g_pw2buf` (2048 B each) | gui | Wide password and confirmation | Password conversion and create/unlock cleanup |
+| `g_pwbuf`, `g_pw2buf` (2048 B each) | gui | Wide password / PIN and confirmation | Password/PIN conversion and create/unlock cleanup |
+| `g_pin_u8`, `g_pin2_u8` (256 B each) | vault | UTF-8 `TPM + PIN` enrollment and unlock buffers | `vault_tpm_enroll_pin` / `vk_derive_tpm_pin` and `vault_lock` |
 | `g_secret_w` (`CONVW_MAX`*2 B) | gui | Revealed/copied secret | Vault close/lock |
 | `g_rowpw_w` (1024 B) | gui | Reveal overlay | `gui_colorpw_hide` and close/lock |
 | `g_e_totp` (512 B), `g_totp_b32` (256 B) | gui | TOTP edit/selected key | Vault close/lock |

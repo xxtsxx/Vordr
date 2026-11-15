@@ -93,8 +93,8 @@ extern vault_pwverify_set:proc          ;   stamp it once confirmed
 extern vault_health:proc                ; E6: {weak,reused,old,total} analysis
 extern vault_title_at:proc
 extern vault_field_at:proc
-extern vh_pw_weak:proc                  ; E6: weak-password predicate (rcx=bytes,edx=len)
-extern vault_entry_stale:proc           ; E6/R6: stale-entry predicate (rcx=index)
+extern vault_entry_health_status:proc   ; E6/R6: per-entry health dot (2=weak, 1=stale, 0=ok)
+extern pin_eval:proc                    ; PIN strength & trivial-pattern evaluator
 extern vault_entry_ptr:proc
 extern g_carry_created:qword
 extern pwgen_ex:proc
@@ -153,9 +153,13 @@ externdef g_field_n:dword
 extern totp_from_b32:proc
 extern totp_secs_left:proc
 extern vault_tpm_remember:proc
+extern vault_tpm_enroll_pin:proc
+extern vault_tpm_enroll_hello:proc
 extern vault_tpm_forget:proc
 extern vault_tpm_has:proc
+extern vault_tpm_mode_get:proc
 extern tpm_available:proc
+extern tpm_hello_available:proc
 extern reg_load_vault:proc
 extern reg_save_vault:proc
 extern cfg_default_vault:proc
@@ -168,6 +172,12 @@ extern check_password_policy:proc
 externdef g_use_tpm:dword
 externdef g_cfg_pwminlen:dword
 externdef g_cfg_pwminclasses:dword
+externdef g_cfg_pinminlen:dword
+externdef g_cfg_pinnotriv:dword
+externdef g_tpm_pin_max:dword
+externdef g_tpm_pin_rem:dword
+externdef g_tpm_pin_u8:byte
+externdef g_tpm_pin_u8len:dword
 externdef g_uline_ctl:dword             ; theme focus-underline colour overrides
 externdef g_uline_br:qword
 externdef g_uline_ctl2:dword
@@ -401,6 +411,7 @@ extern FindClose:proc
 
 ; ---- constants ---------------------------------------------------------------
 WM_SETTEXT_                 equ 0Ch
+WM_GETTEXTLENGTH_           equ 0Eh
 WDA_MONITOR_                equ 1
 WDA_EXCLUDEFROMCAPTURE_     equ 11h
 DACL_SECURITY_INFORMATION_  equ 4
@@ -732,6 +743,12 @@ IDC_V_MTHEME equ 240                  ; color-scheme cycle button (settings)
 IDC_V_MTHEMEL equ 241                 ; "Color scheme" label
 IDC_V_MANIM  equ 281                  ; animations cycle button (settings)
 IDC_V_MANIML equ 282                  ; "Animations" label
+IDC_V_MPINLENL equ 283                ; "Minimum PIN length:" label
+IDC_V_MPINLEN  equ 284                ; minimum PIN length edit
+IDC_V_MPINTRIVL equ 285               ; "Reject trivial PINs" label
+IDC_V_MPINTRIV equ 286                ; reject-trivial-PINs toggle
+IDC_V_MTPMTRIESL equ 287              ; "TPM PIN max attempts:" label
+IDC_V_MTPMTRIES equ 288               ; TPM PIN max attempts edit
 IDC_V_COLORPW equ 244                 ; overlay: colored revealed secret (owner-draw)
 IDC_V_MEXPORT equ 245                 ; "Export secrets..." button (.vaultz archive)
 IDC_V_MIMPORT equ 246                 ; "Import..." button (Vordr .vaultz archives)
@@ -770,6 +787,16 @@ IDC_XP_WARN  equ 723
 IDC_XP_PWL   equ 724
 IDC_XP_PW2L  equ 725
 DLG_IMPPW    equ 730                  ; import-password prompt (single field)
+DLG_PIN_SET  equ 710                  ; TPM + PIN enrollment modal
+IDC_PS_INFO  equ 711
+IDC_PS_PIN   equ 712
+IDC_PS_PIN2  equ 713
+IDC_PS_STATUS equ 714
+DLG_PIN_UNLOCK equ 772                ; TPM + PIN unlock prompt
+IDC_PU_INFO  equ 773
+IDC_PU_PIN   equ 774
+IDC_PU_STATUS equ 775
+IDC_PU_MPW   equ 776
 DLG_PWREMIND equ 795                  ; C9 master-password reminder
 DLG_SETTINGS equ 796                  ; settings screen: a WS_CHILD dialog over the
                                       ;   vault client area (docs/SETTINGS_DESIGN.md)
@@ -1087,7 +1114,7 @@ WSTR cue_search,    <Search>
 WSTR sel_cap_imp,   <Vordr - Select entries to import>
 WSTR sel_ok_imp,    <Import>
 WSTR t_tpminfo,     <TPM Unlock>
-WSTR m_tpminfo,     <The TPM chip in this computer can unlock the vault automatically on this device. You will not need to type the master password at startup. The password still works everywhere and is never stored.>
+WSTR m_tpminfo,     <Choose how TPM 2.0 unlocks this vault: Off, TPM only, TPM + PIN (Argon2id-stretched PIN with rotating TPM state key that revokes TPM unlock after max failed tries), or TPM + Hello. Master password always works.>
 WSTR t_msecinfo,    <Secure Unlock>
 WSTR m_msecinfo,    <Password entry uses a private desktop to block opportunistic normal-desktop keystroke hooks. Same-user processes are not isolated (unlike UAC). If unavailable, Vordr asks before falling back (unless locked by policy).>
 WSTR cue_pw,        <Master password>
@@ -1129,10 +1156,15 @@ WSTR wv_winlock,    <LockOnWinLock>
 WSTR wv_nopreview,  <NoPreview>
 WSTR wv_pwlen,      <PwMinLen>
 WSTR wv_pwcls,      <PwMinClasses>
+WSTR wv_pinlen,     <PinMinLen>
+WSTR wv_pinnotriv,  <PinRejectTrivial>
 WSTR wv_nohist,     <NoHistory>
 WSTR wv_nophon,     <NoPhonetic>
 WSTR wv_secunlock,  <SecureUnlock>
 WSTR wv_tpm,        <TpmUnlock>
+WSTR wv_tpmmode,    <TpmUnlockMode>
+WSTR wv_tpmminmode, <TpmMinMode>
+WSTR wv_tpmtries,   <TpmPinMaxAttempts>
 WSTR wv_allowunc,   <AllowUncVault>
 WSTR wv_allowsccap, <AllowScreenCapture>
 WSTR tmp_dir_pfx,   <VordrPreview->
@@ -1228,8 +1260,8 @@ WSTR imp_g_title,    <Import>
 ; E6: vault-health summary (Ctrl+H) - labels chained with gui_wstrcpy/gui_u32w
 WSTR t_health,       <Vordr - vault health>
 WSTR hb_l1,          <Entries: >
-WSTR hb_l2,          <Weak passwords: >
-WSTR hb_l3,          <Reused passwords: >
+WSTR hb_l2,          <Weak passwords / PINs: >
+WSTR hb_l3,          <Reused passwords / PINs: >
 WSTR hb_l4,          <Unchanged over a year: >
 WSTR hb_locked,      <Unlock a vault first to see its health.>
 hb_crlf  dw 13,10,0
@@ -1404,6 +1436,30 @@ kl_user label word
     dw 'U','s','e','r','n','a','m','e', 0
 kl_secret label word
     dw 'P','a','s','s','w','o','r','d', 0
+kl_pin label word
+    dw 'P','I','N', 0
+WSTR tm_off,         <Off>
+WSTR tm_alone,       <TPM only>
+WSTR tm_pin,         <TPM + PIN>
+WSTR tm_hello,       <TPM + Hello>
+align 8
+tpm_mode_names dq tm_off, tm_alone, tm_pin, tm_hello
+WSTR g_pinset_title,    <Vordr - Set TPM PIN>
+WSTR g_pinunlock_title, <Vordr - Enter TPM PIN>
+WSTR cue_pin,        <PIN>
+WSTR cue_pin2,       <Confirm PIN>
+WSTR s_pinempty,     <Please enter a PIN.>
+WSTR s_pinshort,     <PIN is shorter than the minimum PIN length policy.>
+WSTR s_pintrivial,   <PIN uses a trivial pattern (repeated characters, sequential run, cycle, or palindrome).>
+WSTR s_pinmismatch,  <The two PINs do not match.>
+WSTR s_pinbadutf8,   <PIN must be 1 to 256 UTF-8 bytes.>
+WSTR t_pinrevoked,   <TPM Unlock revoked>
+WSTR s_pinrevoked,   <Too many incorrect PIN attempts. TPM unlock has been revoked on this device - please enter your master password.>
+WSTR s_pu_rem1,      <Incorrect PIN (>
+WSTR s_pu_rem2,      < attempts remaining).>
+WSTR s_pu_rem_one,   <Incorrect PIN (1 attempt remaining before TPM unlock is revoked).>
+WSTR s_hello_fail,   <Windows Hello enrollment was cancelled or unavailable. Set up Windows Hello in Windows Settings first.>
+WSTR s_tpm_pin_fail, <TPM + PIN enrollment could not be completed.>
 kl_url label word
     dw 'U','R','L', 0
 kl_notes label word
@@ -1639,6 +1695,15 @@ g_setrows label byte
     dd IDC_V_MCLS,    SK_NUM
     dq g_cfg_pwminclasses, wv_pwcls,     g_pol_cls_lock
     dd 4,             0
+    dd IDC_V_MPINLEN, SK_NUM
+    dq g_cfg_pinminlen,    wv_pinlen,    g_pol_pinlen_lock
+    dd PIN_MINLEN_MAX, 0
+    dd IDC_V_MPINTRIV, SK_TOG
+    dq g_cfg_pinnotriv,    wv_pinnotriv, g_pol_pintriv_lock
+    dd 0,             0
+    dd IDC_V_MTPMTRIES, SK_NUM
+    dq g_tpm_pin_max,      wv_tpmtries,  g_tpm_tries_lock
+    dd TPM_PIN_TRIES_MAX, 0
     dd IDC_V_MCLIP,   SK_NUM
     dq g_clip_secs,        wv_clip,      g_clip_lock
     dd 3600,          SF_ZEROOK
@@ -1648,8 +1713,8 @@ g_setrows label byte
     dd IDC_V_MPWD,    SK_NUM
     dq g_pwdays,           wv_pwdays,    g_pwdays_lock
     dd C9_DAYS_MAX,   SF_ZEROOK
-    dd IDC_V_MTPM,    SK_TOG
-    dq g_tpm_want,         wv_tpm,       g_tpm_lock
+    dd IDC_V_MTPM,    SK_BTN            ; mode cycle button; gui_menu_save enrolls + persists
+    dq 0,                  0,            g_tpm_lock
     dd 0,             SF_NEEDHW
     dd IDC_V_MSECD,   SK_TOG
     dq g_secunlock,        wv_secunlock, g_secunlock_lock
@@ -1682,7 +1747,17 @@ g_showing   dd ?                      ; 1 = a modal dialog is currently open (re
 g_msg_text  dq ?                      ; Fluent message box: body text / title / flags
 g_msg_title dq ?
 g_msg_flags dd ?
-g_tpm_want  dd ?                      ; Fluent TPM toggle state (1 = enrolled/on)
+g_tpm_want  dd ?                      ; TPM Unlock mode (0=Off, 1=Alone, 2=PIN, 3=Hello)
+g_hello_present dd ?                  ; 1 = Windows Hello default NGC key provisioned
+g_tpm_minmode   dd ?                  ; HKLM-only TpmMinMode floor (0..3)
+g_pol_pinlen_lock dd ?                ; 1 = PinMinLen forced by HKLM policy
+g_pol_pintriv_lock dd ?               ; 1 = PinRejectTrivial forced by HKLM policy
+g_tpm_tries_lock dd ?                 ; 1 = TpmPinMaxAttempts forced by HKLM policy
+g_pinset_lvl    dd ?                  ; DLG_PIN_SET live strength level (0..3)
+g_pinset_match  dd ?                  ; DLG_PIN_SET confirm-match flag (0/1)
+align 2
+g_pu_msgw       dw 128 dup (?)        ; DLG_PIN_UNLOCK remaining-attempts status scratch
+align 4
 ; ---- secure-desktop password entry (anti-keylogger) -------------------------
 g_secunlock      dd ?                 ; setting: 1 = Secure Unlock (master pw on a private desktop)
 g_secunlock_lock dd ?                 ; 1 = Secure Unlock forced by HKLM policy (locked)
@@ -2142,28 +2217,38 @@ gui_status proc frame
 gui_status endp
 
 ; gui_hwnd_scrub(rcx = hwndEdit) - flush undo, overwrite a Win32 EDIT control's
-;   internal heap buffer with CONVW_MAX-1 'X' wide chars, flush undo, reset to
-;   empty, flush undo, and wipe g_scrub_w (VDR2-04).
+;   live heap buffer in-place with exact-length 'X' wide chars (avoiding both
+;   multi-hundred-ms 16K glyph shaping and HeapReAlloc relocation of short secrets),
+;   flush undo, reset to empty, flush undo, and wipe g_scrub_w (VDR2-04).
 gui_hwnd_scrub proc frame
     FRAME_PROLOG 64
     test    rcx, rcx
     jz      ghsc_done
     mov     qword ptr [rbp-24], rcx
     WINCALL SendMessageW, qword ptr [rbp-24], EM_EMPTYUNDOBUFFER_, 0, 0
-    lea     r10, [g_scrub_w]
-    xor     eax, eax
-ghsc_fill:
-    mov     word ptr [r10+rax*2], 'X'
-    inc     eax
+    WINCALL SendMessageW, qword ptr [rbp-24], WM_GETTEXTLENGTH_, 0, 0
+    cmp     eax, 0
+    jle     ghsc_done
     cmp     eax, CONVW_MAX - 1
+    jbe     @F
+    mov     eax, CONVW_MAX - 1
+@@: mov     dword ptr [rbp-28], eax
+    lea     r10, [g_scrub_w]
+    xor     ecx, ecx
+ghsc_fill:
+    mov     word ptr [r10+rcx*2], 'X'
+    inc     ecx
+    cmp     ecx, eax
     jb      ghsc_fill
-    mov     word ptr [r10+rax*2], 0
+    mov     word ptr [r10+rcx*2], 0
     WINCALL SendMessageW, qword ptr [rbp-24], WM_SETTEXT_, 0, addr g_scrub_w
     WINCALL SendMessageW, qword ptr [rbp-24], EM_EMPTYUNDOBUFFER_, 0, 0
     WINCALL SendMessageW, qword ptr [rbp-24], WM_SETTEXT_, 0, addr g_empty_w
     WINCALL SendMessageW, qword ptr [rbp-24], EM_EMPTYUNDOBUFFER_, 0, 0
     lea     rcx, [g_scrub_w]
-    mov     edx, CONVW_MAX * 2
+    mov     edx, dword ptr [rbp-28]
+    inc     edx
+    shl     edx, 1
     call    secure_zero
 ghsc_done:
     FRAME_EPILOG
@@ -4792,32 +4877,19 @@ gli_nopill:
     WINCALL DrawTextW, qword ptr [rbp-32], addr g_sub_w, -1, addr rbp-152, 8024h
 gli_subdone:
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-104]   ; restore font
-    ; E6/R6: health dot on the card's right edge (normal view only).  Reuses the
-    ; tested vault_field_at + vh_pw_weak + vault_entry_stale; a single bullet just
-    ; left of the star, red when the password is weak, amber when it is stale
-    ; (unchanged over a year), absent when healthy.  Colour is stashed in the
-    ; now-dead len scratch [rbp-136] so it survives the WINCALLs below.
+    ; E6/R6: health dot on the card's right edge (normal view only).  Evaluates all
+    ; VF_SECRET and VF_PIN fields on the entry plus entry staleness: red when any
+    ; password or PIN is weak, amber when stale (unchanged over a year), absent when healthy.
     cmp     dword ptr [g_trash_view], 0
     jne     gli_weakdone
     mov     ecx, dword ptr [rbp-80]                               ; entry index
-    mov     edx, VF_SECRET
-    lea     r8, [rbp-136]                                         ; len scratch (free after)
-    call    vault_field_at
-    test    rax, rax
-    jz      gli_weakdone                                          ; no password -> no dot
-    mov     rcx, rax
-    mov     edx, dword ptr [rbp-136]
-    call    vh_pw_weak
+    call    vault_entry_health_status                             ; 2=weak, 1=stale, 0=ok
     test    eax, eax
-    jz      gli_dot_stale
-    mov     dword ptr [rbp-136], 03B3BEFh                         ; red = weak
-    jmp     gli_dot_draw
-gli_dot_stale:
-    mov     ecx, dword ptr [rbp-80]
-    call    vault_entry_stale
-    test    eax, eax
-    jz      gli_weakdone                                          ; healthy -> no dot
+    jz      gli_weakdone
     mov     dword ptr [rbp-136], 02EB2F6h                         ; amber = stale
+    cmp     eax, 2
+    jne     gli_dot_draw
+    mov     dword ptr [rbp-136], 03B3BEFh                         ; red = weak
 gli_dot_draw:
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_symfont]
     mov     qword ptr [rbp-104], rax
@@ -5126,6 +5198,65 @@ gpg_ret:
     FRAME_EPILOG
     ret
 gui_pw_grade endp
+
+; gui_pin_grade(rcx = utf8 ptr, edx = len) -> eax = level 0..3, edx = PIN_*.
+gui_pin_grade proc frame
+    FRAME_PROLOG 32
+    mov     r8d, dword ptr [g_cfg_pinminlen]
+    call    pin_eval
+    FRAME_EPILOG
+    ret
+gui_pin_grade endp
+
+; gui_wide_pin_eval(rcx = wideZ ptr) -> eax = level 0..3, edx = PIN_*.
+;   Converts NUL-terminated wide PIN into pinned g_match_w, runs pin_eval against
+;   g_cfg_pinminlen, and scrubs the UTF-8 copy before returning.
+gui_wide_pin_eval proc frame
+    FRAME_PROLOG 112
+    test    rcx, rcx
+    jz      gwpe_short
+    mov     qword ptr [rbp-24], rcx
+    xor     edx, edx
+gwpe_len:
+    cmp     word ptr [rcx+rdx*2], 0
+    je      gwpe_gotlen
+    inc     edx
+    cmp     edx, CONVW_MAX
+    jb      gwpe_len
+    jmp     gwpe_badu8
+gwpe_gotlen:
+    test    edx, edx
+    jz      gwpe_short
+    mov     dword ptr [rbp-32], edx
+    WINCALL WideCharToMultiByte, CP_UTF8_, 80h, qword ptr [rbp-24], dword ptr [rbp-32], \
+            addr g_match_w, EBUF*4, 0, 0
+    test    eax, eax
+    jz      gwpe_badu8
+    mov     dword ptr [rbp-36], eax
+    lea     rcx, [g_match_w]
+    mov     edx, eax
+    mov     r8d, dword ptr [g_cfg_pinminlen]
+    call    pin_eval
+    mov     dword ptr [rbp-40], eax
+    mov     dword ptr [rbp-44], edx
+    lea     rcx, [g_match_w]
+    mov     edx, dword ptr [rbp-36]
+    call    secure_zero
+    mov     eax, dword ptr [rbp-40]
+    mov     edx, dword ptr [rbp-44]
+    FRAME_EPILOG
+    ret
+gwpe_short:
+    xor     eax, eax
+    mov     edx, PIN_SHORT
+    FRAME_EPILOG
+    ret
+gwpe_badu8:
+    xor     eax, eax
+    mov     edx, PIN_BADUTF8
+    FRAME_EPILOG
+    ret
+gui_wide_pin_eval endp
 
 ; gui_draw_sbadge(rcx=lpdis) - draw a secret row's password-strength badge: a
 ;   colored rounded pill with Weak/Fair/Good/Strong, keyed off FD_PWLEVEL.
@@ -6004,6 +6135,8 @@ gem_loop:
     mov     eax, dword ptr [rbp-88]              ; kind
     cmp     eax, VF_SECRET                       ; sensitive -> never searched
     je      gem_next
+    cmp     eax, VF_PIN
+    je      gem_next
     cmp     eax, VF_TOTP
     je      gem_next
     mov     rcx, qword ptr [rbp-64]              ; value ptr
@@ -6185,6 +6318,8 @@ gef_loop:
     mov     eax, dword ptr [rbp-88]              ; kind
     cmp     eax, VF_SECRET                       ; sensitive -> never searched
     je      gef_next
+    cmp     eax, VF_PIN
+    je      gef_next
     cmp     eax, VF_TOTP
     je      gef_next
     mov     rcx, qword ptr [rbp-64]              ; value ptr
@@ -6324,7 +6459,14 @@ gui_copy_topmost proc frame
     lea     r8, [rbp-40]                         ; &len
     call    vault_field_at                       ; rax = first secret ptr
     test    rax, rax
-    jz      gct_done                             ; no password on that record
+    jnz     gct_have
+    mov     ecx, dword ptr [rbp-32]              ; fall back to first PIN on PIN-only entries
+    mov     edx, VF_PIN
+    lea     r8, [rbp-40]
+    call    vault_field_at
+    test    rax, rax
+    jz      gct_done                             ; no password or PIN on that record
+gct_have:
     mov     rcx, rax
     mov     edx, dword ptr [rbp-40]
     lea     r8, [g_match_w]
@@ -6491,14 +6633,22 @@ gsd_cap_go:
     mov     eax, dword ptr [rbp-96]             ; kind
     cmp     eax, VF_SECRET
     je      gsd_secret
+    cmp     eax, VF_PIN
+    je      gsd_pin
     cmp     eax, VF_TOTP
     je      gsd_mask
     jmp     gsd_fnext
+gsd_pin:
+    mov     rcx, qword ptr [rbp-72]            ; valptr (utf8)
+    mov     edx, dword ptr [rbp-64]            ; vallen
+    call    gui_pin_grade                      ; eax = 0..3
+    jmp     gsd_store_lvl
 gsd_secret:
     ; grade the password for the strength badge (uses the plaintext value)
     mov     rcx, qword ptr [rbp-72]            ; valptr (utf8)
     mov     edx, dword ptr [rbp-64]            ; vallen
     call    gui_pw_grade                       ; eax = 0..3
+gsd_store_lvl:
     shl     eax, FDF_PWLVL_SHIFT
     mov     ecx, dword ptr [rbp-44]           ; row
     imul    ecx, ecx, DESCSZ
@@ -6598,11 +6748,13 @@ gui_showdetail proc frame
     ret
 gui_showdetail endp
 
-; gui_freeze(rcx = hdlg) / gui_thaw(rcx = hdlg) - suspend the vault window's
-;   painting around a rebuild of the detail pane; the outermost thaw repaints the
-;   pane once (children included).  Nested pairs only count.  A window that is not
-;   visible is left alone: nothing paints anyway, and WM_SETREDRAW TRUE would set
-;   WS_VISIBLE on a window hidden in the tray.
+; gui_freeze(rcx = hdlg) / gui_thaw(rcx = hdlg) - suspend detail-pane erases and
+;   intermediate child repaints around a rebuild of the detail pane; the outermost
+;   thaw repaints the pane once (children included).  Nested pairs only count.
+;   IMPORTANT: never send WM_SETREDRAW(FALSE) to the top-level vault window:
+;   win32kfull!xxxDWP_SetRedraw clears WS_VISIBLE on top-level windows, causing
+;   DWM (especially under WS_EX_LAYERED + WDA_EXCLUDEFROMCAPTURE) to unmap and
+;   re-show the entire window on selection switches.
 gui_freeze proc frame
     FRAME_PROLOG 48
     mov     qword ptr [rbp-24], rcx
@@ -6613,7 +6765,6 @@ gui_freeze proc frame
     WINCALL IsWindowVisible, qword ptr [rbp-24]
     test    eax, eax
     jz      gfz_ret
-    WINCALL SendMessageW, qword ptr [rbp-24], WM_SETREDRAW_, 0, 0
     mov     dword ptr [g_freeze_on], 1
 gfz_ret:
     FRAME_EPILOG
@@ -6630,7 +6781,6 @@ gui_thaw proc frame
     cmp     dword ptr [g_freeze_on], 0
     je      gth2_ret
     mov     dword ptr [g_freeze_on], 0
-    WINCALL SendMessageW, qword ptr [rbp-24], WM_SETREDRAW_, 1, 0
     WINCALL GetClientRect, qword ptr [rbp-24], addr rbp-56
     mov     dword ptr [rbp-80], 210              ; the pane: DLU x 210 to the right edge
     mov     dword ptr [rbp-76], 0                ;   (as gui_inval_detail)
@@ -7495,6 +7645,59 @@ gtr_done:
     ret
 gui_trunc_refuse endp
 
+; gui_commit_check_pins(rcx = hdlg) -> eax = 0 ok / 1 rejected (warning shown).
+;   When PinRejectTrivial (g_cfg_pinnotriv) is enabled and the entry is not being
+;   soft-deleted, refuses saving any non-empty VF_PIN field that fails pin_eval.
+gui_commit_check_pins proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    cmp     dword ptr [g_cfg_pinnotriv], 0
+    je      gccp_ok
+    cmp     dword ptr [g_deleted_state], 0
+    jne     gccp_ok
+    mov     dword ptr [rbp-32], 1                ; i = 1 (skip VF_TITLE at 0)
+gccp_lp:
+    mov     eax, dword ptr [rbp-32]
+    cmp     eax, dword ptr [g_field_n]
+    jae     gccp_ok
+    imul    eax, eax, 24
+    lea     r10, [g_field_list]
+    add     r10, rax
+    mov     eax, dword ptr [r10+0]               ; kind & 0FFh
+    and     eax, 0FFh
+    cmp     eax, VF_PIN
+    jne     gccp_next
+    mov     rcx, qword ptr [r10+16]              ; wide value ptr
+    test    rcx, rcx
+    jz      gccp_next
+    cmp     word ptr [rcx], 0                    ; empty PIN row is allowed; non-empty is checked
+    je      gccp_next
+    call    gui_wide_pin_eval                    ; eax = lvl, edx = PIN_*
+    test    eax, eax
+    jnz     gccp_next
+    lea     rax, [s_pinshort]
+    cmp     edx, PIN_SHORT
+    je      gccp_warn
+    lea     rax, [s_pintrivial]
+    cmp     edx, PIN_TRIVIAL
+    je      gccp_warn
+    lea     rax, [s_pinbadutf8]
+gccp_warn:
+    mov     qword ptr [rbp-40], rax
+    WINCALL gui_msgbox, qword ptr [rbp-24], qword ptr [rbp-40], addr t_err, \
+            <MB_OK or MB_ICONWARNING>
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gccp_next:
+    inc     dword ptr [rbp-32]
+    jmp     gccp_lp
+gccp_ok:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gui_commit_check_pins endp
+
 ; gui_commit(rcx = hdlg) - gather Title + rows into g_field_list and write the
 ;   record back (remove the old entry, rebuild via vault_build_entry, reseal).
 ;   Reselects the entry.  Refuses to save an empty title (keeps the old entry).
@@ -7525,6 +7728,10 @@ gco_noext:
     jz      gco_notitle
     cmp     word ptr [r10], 0                 ; empty title -> keep the old entry
     je      gco_notitle
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_commit_check_pins
+    test    eax, eax
+    jnz     gco_done
     mov     ecx, dword ptr [g_cur_idx]        ; preserve the original creation date
     call    vault_entry_ptr
     test    rax, rax
@@ -7992,7 +8199,7 @@ row_mk proc frame
     add     eax, IDC_DYN_BASE
     mov     dword ptr [rbp-56], eax              ; id
     WINCALL mk_ctl, qword ptr [rbp-24], dword ptr [rbp-56], qword ptr [rbp-48], \
-            qword ptr [rbp+48], qword ptr [rbp+56], 0, 0, 1, 1
+            qword ptr [rbp+48], qword ptr [rbp+56], 220, 10000, 1, 1
     mov     qword ptr [rbp-64], rax              ; hwnd
     mov     eax, dword ptr [rbp-32]
     imul    eax, eax, DESCSZ
@@ -8278,7 +8485,7 @@ vck_chkn:
     jne     vck_no
     mov     dword ptr [rbp-44], IDC_V_LOCK
 vck_post:
-    WINCALL PostMessageW, qword ptr [rbp-40], WM_COMMAND, qword ptr [rbp-44], 0
+    WINCALL PostMessageW, qword ptr [rbp-40], WM_COMMAND, dword ptr [rbp-44], 0
 vck_yes:
     mov     eax, 1
     FRAME_EPILOG
@@ -10490,6 +10697,10 @@ kind_label proc
     jne     @F
     lea     rax, [kl_secret]
     ret
+@@: cmp     edx, VF_PIN
+    jne     @F
+    lea     rax, [kl_pin]
+    ret
 @@: cmp     edx, VF_URL
     jne     @F
     lea     rax, [kl_url]
@@ -10533,6 +10744,7 @@ grc_slot:
     lea     r10, [g_fields]
     add     r10, rax
     mov     edx, dword ptr [r10 + FD_KIND]
+    mov     dword ptr [rbp-28], edx
     mov     eax, dword ptr [rbp-32]
     lea     r10, [r10 + FD_HANDLES + rax*8]
     mov     rcx, qword ptr [r10]
@@ -10540,6 +10752,10 @@ grc_slot:
     jz      grc_slotnext
     mov     qword ptr [r10], 0
     mov     qword ptr [rbp-48], rcx              ; drop its tooltip first: tools are keyed
+    WINCALL SendMessageW, rcx, WM_SETREDRAW_, 0, 0 ; hide child without synchronous parent erase
+    mov     rcx, qword ptr [rbp-48]
+    mov     eax, dword ptr [rbp-32]
+    mov     edx, dword ptr [rbp-28]
     cmp     eax, DS_LABEL
     je      grc_scrub_ctl
     cmp     eax, DS_VALUE
@@ -10661,6 +10877,8 @@ gra_zero:
     ; value (kind-specific)
     mov     eax, dword ptr [rbp-32]
     cmp     eax, VF_SECRET
+    je      gra_secret
+    cmp     eax, VF_PIN
     je      gra_secret
     cmp     eax, VF_NOTES
     je      gra_notes
@@ -12347,9 +12565,9 @@ gem_cb endp
 ;   opens with FILE_FLAG_OPEN_REPARSE_POINT so long paths and symlinks cannot
 ;   silently skip or redirect Mark-of-the-Web.
 gui_motw proc frame
-    FRAME_PROLOG 112                            ; locals to -48 clear of the 7-arg spill
+    FRAME_PROLOG 112                            ; locals to -52 clear of the 7-arg spill
     mov     qword ptr [rbp-24], rcx
-    mov     dword ptr [rbp-44], 0               ; result = 0 (fail-closed)
+    mov     dword ptr [rbp-52], 0               ; result = 0 (fail-closed)
     test    rcx, rcx
     jz      gmw_done
     xor     r8d, r8d                            ; a path that does not fit would be cut,
@@ -12384,11 +12602,11 @@ gmw_fits:
     jz      gmw_close
     cmp     dword ptr [rbp-40], motw_body_len
     jne     gmw_close
-    mov     dword ptr [rbp-44], 1
+    mov     dword ptr [rbp-52], 1
 gmw_close:
     WINCALL CloseHandle, qword ptr [rbp-32]
 gmw_done:
-    mov     eax, dword ptr [rbp-44]
+    mov     eax, dword ptr [rbp-52]
     FRAME_EPILOG
     ret
 gui_motw endp
@@ -12698,8 +12916,11 @@ move_ctl proc frame
     mov     eax, dword ptr [rbp-36]
     sub     eax, dword ptr [rbp-44]
     mov     qword ptr [rbp-80], rax              ; ph
+    xor     r10d, r10d
+    cmp     dword ptr [g_freeze_on], 0
+    sete    r10b
     WINCALL MoveWindow, qword ptr [rbp-32], qword ptr [rbp-56], qword ptr [rbp-64], \
-            qword ptr [rbp-72], qword ptr [rbp-80], 1
+            qword ptr [rbp-72], qword ptr [rbp-80], r10
 mvc_ret:
     FRAME_EPILOG
     ret
@@ -12941,11 +13162,14 @@ grl_lbl_done:
     jmp     grl_valpos
 grl_chksecw:
     cmp     dword ptr [r10+FD_KIND], VF_SECRET
+    je      grl_issecw
+    cmp     dword ptr [r10+FD_KIND], VF_PIN
     jne     grl_chktotpw
-    mov     dword ptr [rbp-76], 118             ; card secret: stop before the badge (x=300)
+grl_issecw:
+    mov     dword ptr [rbp-76], 118             ; card secret/PIN: stop before the badge (x=300)
     cmp     dword ptr [rbp-68], 0
     jne     grl_valpos
-    mov     dword ptr [rbp-76], 130             ; flat secret
+    mov     dword ptr [rbp-76], 130             ; flat secret/PIN
     jmp     grl_valpos
 grl_chktotpw:
     cmp     dword ptr [r10+FD_KIND], VF_TOTP     ; totp key edit: stop before the reveal (x=344)
@@ -13069,10 +13293,13 @@ grl_copydone:
     mov     rcx, qword ptr [r10+FD_HANDLES+DS_DEL*8]
     mov     edx, dword ptr [rbp-52]
     call    ShowWindow
-    ; secret strength badge: top-right cluster (left of the trash) in view mode
+    ; secret / PIN strength badge: top-right cluster (left of the trash) in view mode
     mov     r10, qword ptr [rbp-32]
     cmp     dword ptr [r10+FD_KIND], VF_SECRET
+    je      grl_issecb
+    cmp     dword ptr [r10+FD_KIND], VF_PIN
     jne     grl_sbadge_done
+grl_issecb:
     mov     rcx, qword ptr [rbp-24]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_SBADGE*8]
     mov     r8d, 300                             ; view mode: left of the reveal/copy cluster
@@ -13823,10 +14050,16 @@ grb_setval:
     mov     r10, qword ptr [rbp-40]
     mov     eax, dword ptr [r10]
     cmp     eax, VF_SECRET
-    je      grb_mask
+    je      grb_grade_mask
+    cmp     eax, VF_PIN
+    je      grb_grade_mask
     cmp     eax, VF_TOTP
     je      grb_mask
     jmp     grb_next
+grb_grade_mask:
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-44]
+    call    gui_row_regrade
 grb_mask:
     mov     ecx, dword ptr [rbp-44]
     mov     edx, DS_VALUE
@@ -13846,6 +14079,77 @@ grb_done:
     FRAME_EPILOG
     ret
 gui_rebuild_rows endp
+
+; gui_row_regrade(rcx=hdlg, edx=row) - recompute FDF_PWLVL_MASK for a VF_SECRET or
+;   VF_PIN row from its current DS_VALUE edit text and invalidate DS_SBADGE.
+gui_row_regrade proc frame
+    FRAME_PROLOG 112
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-32], edx
+    cmp     edx, dword ptr [g_field_count]
+    jae     grrg_done
+    mov     eax, edx
+    imul    eax, eax, DESCSZ
+    lea     r10, [g_fields]
+    add     r10, rax
+    mov     eax, dword ptr [r10+FD_KIND]
+    mov     dword ptr [rbp-36], eax
+    cmp     eax, VF_SECRET
+    je      grrg_read
+    cmp     eax, VF_PIN
+    jne     grrg_done
+grrg_read:
+    mov     ecx, dword ptr [rbp-32]
+    mov     edx, DS_VALUE
+    call    dynid
+    mov     dword ptr [rbp-40], eax
+    WINCALL GetDlgItemTextW, qword ptr [rbp-24], dword ptr [rbp-40], addr g_secret_w, CONVW_MAX
+    mov     dword ptr [rbp-44], eax               ; wchar count
+    cmp     dword ptr [rbp-36], VF_PIN
+    je      grrg_pin
+    xor     eax, eax
+    cmp     dword ptr [rbp-44], 0
+    je      grrg_store
+    WINCALL WideCharToMultiByte, CP_UTF8_, 0, addr g_secret_w, dword ptr [rbp-44], \
+            addr g_match_w, EBUF*4, 0, 0
+    mov     dword ptr [rbp-48], eax
+    test    eax, eax
+    jz      grrg_store
+    lea     rcx, [g_match_w]
+    mov     edx, eax
+    call    gui_pw_grade
+    mov     dword ptr [rbp-52], eax
+    lea     rcx, [g_match_w]
+    mov     edx, dword ptr [rbp-48]
+    call    secure_zero
+    mov     eax, dword ptr [rbp-52]
+    jmp     grrg_store
+grrg_pin:
+    lea     rcx, [g_secret_w]
+    call    gui_wide_pin_eval
+grrg_store:
+    mov     dword ptr [rbp-52], eax
+    lea     rcx, [g_secret_w]
+    mov     edx, CONVW_MAX*2
+    call    secure_zero
+    mov     eax, dword ptr [rbp-52]
+    shl     eax, FDF_PWLVL_SHIFT
+    mov     ecx, dword ptr [rbp-32]
+    imul    ecx, ecx, DESCSZ
+    lea     r10, [g_fields]
+    add     r10, rcx
+    mov     edx, dword ptr [r10+FD_FLAGS]
+    and     edx, NOT FDF_PWLVL_MASK
+    or      edx, eax
+    mov     dword ptr [r10+FD_FLAGS], edx
+    mov     rcx, qword ptr [r10+FD_HANDLES+DS_SBADGE*8]
+    test    rcx, rcx
+    jz      grrg_done
+    WINCALL InvalidateRect, rcx, 0, 1
+grrg_done:
+    FRAME_EPILOG
+    ret
+gui_row_regrade endp
 
 ; swap24(rcx=ptr a, rdx=ptr b) - swap two 24-byte field-list descriptors.  Leaf.
 swap24 proc
@@ -13989,6 +14293,8 @@ gao_mask:
     mov     eax, dword ptr [rbp-32]
     cmp     eax, VF_SECRET
     je      gao_dom
+    cmp     eax, VF_PIN
+    je      gao_dom
     cmp     eax, VF_TOTP
     je      gao_dom
     jmp     gao_show
@@ -14099,6 +14405,10 @@ gui_palette_add proc frame
 @@: cmp     ecx, 11                             ; spacer (layout block)
     jne     @F
     mov     edx, VF_SPACER
+    jmp     gpa_go
+@@: cmp     ecx, 12                             ; PIN secret
+    jne     @F
+    mov     edx, VF_PIN
     jmp     gpa_go
 @@: mov     edx, VF_TEXT                        ; 7 = custom (empty label)
 gpa_go:
@@ -14322,6 +14632,10 @@ gom_nothist:
     jmp     gom_done
 gom_cppw:
     mov     edx, VF_SECRET
+    call    gui_row_of_kind
+    cmp     eax, 0
+    jge     gom_have_row
+    mov     edx, VF_PIN
     jmp     gom_docopy
 gom_cpuser:
     mov     edx, VF_USERNAME
@@ -14329,6 +14643,7 @@ gom_docopy:
     call    gui_row_of_kind                     ; eax = row or -1
     cmp     eax, 0
     jl      gom_done
+gom_have_row:
     mov     edx, eax
     mov     rcx, qword ptr [rbp-24]
     call    gui_row_copy
@@ -14903,7 +15218,12 @@ gui_read_password proc frame
     mov     edx, VF_SECRET
     call    gui_row_of_kind
     cmp     eax, 0
+    jge     grp_have
+    mov     edx, VF_PIN
+    call    gui_row_of_kind
+    cmp     eax, 0
     jl      grp_done
+grp_have:
     mov     ecx, eax                          ; row -> DS_VALUE id
     mov     edx, DS_VALUE
     call    dynid
@@ -15004,6 +15324,19 @@ gui_anim_label proc frame
     FRAME_EPILOG
     ret
 gui_anim_label endp
+
+; gui_tpm_label() - show the active TPM Unlock mode caption on IDC_V_MTPM.
+gui_tpm_label proc frame
+    FRAME_PROLOG 48
+    mov     eax, dword ptr [g_tpm_want]
+    and     eax, 3
+    lea     r10, [tpm_mode_names]
+    mov     rax, qword ptr [r10+rax*8]
+    mov     qword ptr [rbp-24], rax
+    WINCALL SetDlgItemTextW, qword ptr [g_settings_hwnd], IDC_V_MTPM, qword ptr [rbp-24]
+    FRAME_EPILOG
+    ret
+gui_tpm_label endp
 
 ; gui_load_prefs() - load the persisted UI scheme + layout (clamped to range).
 gui_load_prefs proc frame
@@ -15610,6 +15943,7 @@ gui_addfield_menu proc frame
     jz      gam_done
     WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 1, addr kl_user
     WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 2, addr kl_secret
+    WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 12, addr kl_pin
     WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 3, addr kl_url
     WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 4, addr kl_email
     WINCALL AppendMenuW, qword ptr [rbp-32], MF_OWNERDRAW, 5, addr kl_notes
@@ -15908,6 +16242,7 @@ gui_menu_open proc frame
     call    gui_settings_populate             ; every row: value + HKLM gating
     call    gui_hotkey_label                  ; show the live summon combo on its button
     call    gui_anim_label                    ; ... and the animations choice on its own
+    call    gui_tpm_label                     ; ... and the TPM Unlock mode caption
     mov     dword ptr [g_menu_open], 1
     WINCALL RedrawWindow, qword ptr [rbp-24], 0, 0, 0185h  ; INVALIDATE|ERASE|ALLCHILDREN|UPDATENOW
     FRAME_EPILOG
@@ -15946,43 +16281,95 @@ mtg_close:
     ret
 gui_menu_toggle endp
 
-; gui_menu_save(rcx=hdlg) - apply the policy fields (HKCU) + the TPM toggle,
+; gui_menu_save(rcx=hdlg) - apply the policy fields (HKCU) + the TPM mode,
 ;   then close the overlay.  HKLM-locked policy values are left untouched.
 gui_menu_save proc frame
-    FRAME_PROLOG 64
-    mov     qword ptr [rbp-24], rcx           ; the VAULT window (timers below), NOT the
-                                              ;   settings child - a store to
-                                              ;   g_settings_hwnd here overwrote the live
-                                              ;   child handle with it, and the caller's
-                                              ;   ShowWindow(SW_HIDE) then hid the vault.
+    FRAME_PROLOG 80
+    mov     qword ptr [rbp-24], rcx           ; the VAULT window (timers + modal owner)
     call    gui_settings_store                ; every row: clamp, store, persist
+    ; Enforce lower bounds on PinMinLen [PIN_MINLEN_MIN..PIN_MINLEN_MAX] and TpmPinMaxAttempts [1..20]
+    cmp     dword ptr [g_cfg_pinminlen], PIN_MINLEN_MIN
+    jae     msv_pinlen_ok
+    mov     dword ptr [g_cfg_pinminlen], PIN_MINLEN_MIN
+    cmp     dword ptr [g_pol_pinlen_lock], 0
+    jne     msv_pinlen_ok
+    WINCALL cfg_set_dword_hkcu, addr wv_pinlen, PIN_MINLEN_MIN
+msv_pinlen_ok:
+    cmp     dword ptr [g_tpm_pin_max], 1
+    jae     msv_tries_ok
+    mov     dword ptr [g_tpm_pin_max], 1
+    cmp     dword ptr [g_tpm_tries_lock], 0
+    jne     msv_tries_ok
+    WINCALL cfg_set_dword_hkcu, addr wv_tpmtries, 1
+msv_tries_ok:
     WINCALL KillTimer, qword ptr [rbp-24], IDLE_TIMER   ; re-arm the poll (auto-lock +
     WINCALL SetTimer, qword ptr [rbp-24], IDLE_TIMER, IDLE_POLL_MS, 0   ;   C8.4).
-                                              ; Unconditional now: the old chain reached
-                                              ;   this only on one path, so a changed
-                                              ;   idle timeout often did not take effect
-                                              ;   until the next unlock.
-    ; TPM is the one row with a side effect beyond the registry - enrolling seals the
-    ; vault key to the chip - so the enrol/forget decision stays hand-written here.
-    ; Persisting g_tpm_want is the table's job (neither call touches it, so the order
-    ; of the two does not matter).
 msv_tpm:
     cmp     dword ptr [g_tpm_present], 0
     je      msv_done                        ; no TPM -> nothing to enrol/forget
-    mov     eax, dword ptr [g_tpm_want]     ; Fluent toggle state
-    mov     dword ptr [rbp-32], eax         ; want enrolled?
     call    vault_tpm_has
-    mov     dword ptr [rbp-36], eax         ; currently enrolled?
-    cmp     dword ptr [rbp-32], 0
-    je      msv_unwant
+    test    eax, eax
+    jz      @F
+    call    vault_tpm_mode_get
+@@: mov     dword ptr [rbp-36], eax         ; currently enrolled mode (0..3)
+    mov     eax, dword ptr [g_tpm_want]
+    mov     dword ptr [rbp-32], eax         ; desired mode (0..3)
+    cmp     eax, TPM_MODE_OFF
+    je      msv_tpm_off
+    cmp     eax, TPM_MODE_ALONE
+    je      msv_tpm_alone
+    cmp     eax, TPM_MODE_PIN
+    je      msv_tpm_pin
+    cmp     eax, TPM_MODE_HELLO
+    je      msv_tpm_hello
+    jmp     msv_tpm_revert
+msv_tpm_off:
     cmp     dword ptr [rbp-36], 0
-    jne     msv_done                        ; want + have -> already sealed
-    call    vault_tpm_remember
-    jmp     msv_done
-msv_unwant:
-    cmp     dword ptr [rbp-36], 0
-    je      msv_done                        ; !want + !have
+    je      msv_tpm_persist
     call    vault_tpm_forget
+    jmp     msv_tpm_persist
+msv_tpm_alone:
+    cmp     dword ptr [rbp-36], TPM_MODE_ALONE
+    je      msv_tpm_persist
+    call    vault_tpm_remember
+    test    eax, eax
+    jnz     msv_tpm_persist
+    jmp     msv_tpm_revert
+msv_tpm_pin:
+    cmp     dword ptr [rbp-36], TPM_MODE_PIN
+    je      msv_tpm_persist
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_pin_set_modal
+    cmp     qword ptr [g_body_ptr], 0       ; vault locked while PIN dialog was up?
+    je      msv_done
+    test    eax, eax
+    jnz     msv_tpm_persist
+    jmp     msv_tpm_revert
+msv_tpm_hello:
+    cmp     dword ptr [rbp-36], TPM_MODE_HELLO
+    je      msv_tpm_persist
+    call    vault_tpm_enroll_hello
+    test    eax, eax
+    jnz     msv_tpm_persist
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr s_hello_fail, addr t_tpminfo, \
+            <MB_OK or MB_ICONWARNING>
+    cmp     qword ptr [g_body_ptr], 0
+    je      msv_done
+msv_tpm_revert:
+    call    vault_tpm_has
+    test    eax, eax
+    jz      @F
+    call    vault_tpm_mode_get
+@@: mov     dword ptr [g_tpm_want], eax
+msv_tpm_persist:
+    call    gui_tpm_label
+    cmp     dword ptr [g_tpm_lock], 0
+    jne     msv_done
+    WINCALL cfg_set_dword_hkcu, addr wv_tpmmode, dword ptr [g_tpm_want]
+    xor     edx, edx
+    cmp     dword ptr [g_tpm_want], 0
+    setne   dl
+    WINCALL cfg_set_dword_hkcu, addr wv_tpm, edx
 msv_done:
     FRAME_EPILOG
     ret
@@ -16400,9 +16787,12 @@ vp_tpaint:
     call    theme_paint
     jmp     vp_ret
 vp_terase:
+    cmp     dword ptr [g_freeze_on], 0
+    jne     vp_erase_frozen
     mov     rcx, r8                           ; background, cards (or the home panel)
     mov     rdx, qword ptr [rbp-8]            ;   and the pane's thumb, composed off
     call    gui_erase_buffered                ;   screen (gui_erase_into)
+vp_erase_frozen:
     mov     eax, 1
     jmp     vp_ret
 vp_tdraw:
@@ -16410,8 +16800,8 @@ vp_tdraw:
     cmp     dword ptr [r10+0], 1              ; ODT_MENU -> themed owner-draw menu item
     je      vp_tdraw_menu
     mov     eax, dword ptr [r10+4]            ; DRAWITEMSTRUCT.CtlID
-    cmp     eax, IDC_V_MTPM                   ; the TPM control = Fluent pill toggle
-    je      vp_tdraw_toggle
+    cmp     eax, IDC_V_MPINTRIV               ; reject-trivial-PINs Fluent pill toggle
+    je      vp_tdraw_tpintriv
     cmp     eax, IDC_V_MNOHIST               ; the two privacy pill toggles
     je      vp_tdraw_tnohist
     cmp     eax, IDC_V_MNOPHON
@@ -16476,9 +16866,9 @@ vp_tdraw_chev:
     call    gui_draw_flatchevron
     mov     eax, 1
     jmp     vp_ret
-vp_tdraw_toggle:
+vp_tdraw_tpintriv:
     mov     rcx, r9
-    mov     edx, dword ptr [g_tpm_want]
+    mov     edx, dword ptr [g_cfg_pinnotriv]
     call    theme_toggle
     jmp     vp_ret
 vp_tdraw_tnohist:
@@ -16648,6 +17038,7 @@ vp_init:
     WINCALL CreateDialogParamW, qword ptr [g_hinst], DLG_SETTINGS, qword ptr [rbp-8],             addr settings_proc, 0             ; the settings screen, created hidden
     mov     qword ptr [g_settings_hwnd], rax
     call    gui_anim_label                   ; never a blank caption, even before it opens
+    call    gui_tpm_label                    ; ... same for the TPM Unlock mode button
     mov     rcx, qword ptr [rbp-8]           ; every child must clip its siblings, or they
     call    gui_clip_children                ;   repaint straight over the settings child
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_ADD, addr wb_add
@@ -16866,6 +17257,8 @@ vp_cmd_fixed:
     je      vp_tpminfo
     cmp     eax, IDC_V_MTPM
     je      vp_mtpm
+    cmp     eax, IDC_V_MPINTRIV
+    je      vp_mpintriv
     cmp     eax, IDC_V_MNOHIST
     je      vp_mnohist
     cmp     eax, IDC_V_MNOPHON
@@ -16894,9 +17287,37 @@ vp_mtpm:
     cmp     dword ptr [g_tpm_lock], 0          ; HKLM-locked -> ignore the click
     jne     vp_handled
     mov     eax, dword ptr [g_tpm_want]
-    xor     eax, 1
+    xor     ecx, ecx
+vmt_next:
+    inc     eax
+    and     eax, 3
+    inc     ecx
+    cmp     ecx, 4
+    ja      vmt_set
+    cmp     eax, TPM_MODE_HELLO
+    jne     @F
+    cmp     dword ptr [g_hello_present], 0     ; skip Hello when NGC key is unavailable
+    je      vmt_next
+@@: mov     edx, dword ptr [g_tpm_minmode]
+    test    edx, edx
+    jz      vmt_set
+    test    eax, eax                           ; Off (0) stays reachable unless TpmUnlockMode locked
+    jz      vmt_set
+    cmp     eax, edx                           ; enforce HKLM TpmMinMode floor
+    jb      vmt_next
+vmt_set:
     mov     dword ptr [g_tpm_want], eax
-    mov     ecx, IDC_V_MTPM                ; repaint the toggle in the settings child
+    call    gui_tpm_label
+    mov     ecx, IDC_V_MTPM
+    call    gui_inval_setting
+    jmp     vp_handled
+vp_mpintriv:
+    cmp     dword ptr [g_pol_pintriv_lock], 0  ; HKLM-locked -> ignore the click
+    jne     vp_handled
+    mov     eax, dword ptr [g_cfg_pinnotriv]
+    xor     eax, 1
+    mov     dword ptr [g_cfg_pinnotriv], eax
+    mov     ecx, IDC_V_MPINTRIV
     call    gui_inval_setting
     jmp     vp_handled
 vp_mwlk:
@@ -16953,6 +17374,18 @@ vp_setdirty:
     cmp     dword ptr [g_loading], 0          ; ignore programmatic field loads
     jne     vp_handled
     mov     dword ptr [g_dirty], 1
+    cmp     eax, IDC_DYN_BASE
+    jb      vp_handled
+    mov     ecx, eax
+    sub     ecx, IDC_DYN_BASE
+    mov     edx, ecx
+    and     edx, DYN_SLOTS-1
+    cmp     edx, DS_VALUE
+    jne     vp_handled
+    shr     ecx, DYN_SLOTS_LOG2
+    mov     edx, ecx
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_row_regrade
     jmp     vp_handled
 vp_searchchg:
     call    vault_count                       ; big list -> debounce; small list -> live
@@ -17215,13 +17648,27 @@ vpd_copy:
     call    gui_row_copy
     jmp     vp_handled
 vpd_gen:
-    mov     dword ptr [g_pg_target], eax        ; clicked secret row
+    mov     dword ptr [g_pg_target], eax        ; clicked secret/PIN row
+    mov     ecx, eax
+    call    gui_desc
+    cmp     dword ptr [rax+FD_KIND], VF_PIN
+    jne     vpd_gen_pw
+    mov     dword ptr [g_pg_style], PWS_PIN
+    mov     dword ptr [g_pg_opt], PWCLASS_D
+    mov     eax, dword ptr [g_cfg_pinminlen]
+    cmp     eax, PIN_MINLEN_DEF
+    jae     @F
+    mov     eax, PIN_MINLEN_DEF
+@@: mov     dword ptr [g_pg_len], eax
+    jmp     vpd_gen_open
+vpd_gen_pw:
     cmp     dword ptr [g_pg_len], 0              ; first open -> sticky defaults
-    jne     @F
+    jne     vpd_gen_open
     mov     dword ptr [g_pg_len], 16
     mov     dword ptr [g_pg_style], 0
     mov     dword ptr [g_pg_opt], PWCLASS_U or PWCLASS_L or PWCLASS_D
-@@: WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_PWGEN, qword ptr [rbp-8], addr pwgen_proc, 0
+vpd_gen_open:
+    WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_PWGEN, qword ptr [rbp-8], addr pwgen_proc, 0
     jmp     vp_handled
 vpd_reveal:
     mov     edx, eax
@@ -17282,12 +17729,16 @@ va_build:
     mov     edx, dword ptr [g_cur_idx]
     call    gui_lb_selbydata
     mov     rcx, qword ptr [rbp-8]
+    call    gui_freeze
+    mov     rcx, qword ptr [rbp-8]
     mov     edx, dword ptr [g_cur_idx]
     call    gui_showdetail
     mov     dword ptr [g_new_pending], 1     ; mark as a placeholder: Cancel deletes it
     mov     rcx, qword ptr [rbp-8]            ; new entry opens straight into edit mode
     mov     edx, 1
     call    gui_set_editmode
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_thaw
     mov     rcx, qword ptr [rbp-8]            ; focus the title for quick typing
     mov     edx, IDC_V_TITLE
     call    GetDlgItem
@@ -17326,6 +17777,8 @@ ve_save:
     mov     dword ptr [g_dirty], 0
     cmp     dword ptr [g_new_pending], 0     ; cancelling a just-added placeholder?
     jne     ve_discard_new                   ;   -> delete it instead of reloading
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_freeze
     cmp     dword ptr [g_cur_idx], 0
     jl      ve_view
     mov     rcx, qword ptr [rbp-8]           ; reload the entry from the vault (drops edits)
@@ -17335,6 +17788,8 @@ ve_view:
     mov     rcx, qword ptr [rbp-8]           ; ...then apply view-mode read-only + layout
     xor     edx, edx
     call    gui_set_editmode
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_thaw
     jmp     vp_handled
 ve_discard_new:
     ; the user cancelled straight out of a freshly-added entry: delete the
@@ -17384,6 +17839,8 @@ vp_save_real:
     test    eax, eax
     jnz     vp_handled
     mov     dword ptr [g_new_pending], 0     ; only a successful Save keeps the entry
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_freeze
     cmp     dword ptr [g_cur_idx], 0
     jl      vsr_view
     mov     rcx, qword ptr [rbp-8]            ; rebuild the rows first...
@@ -17393,6 +17850,8 @@ vsr_view:
     mov     rcx, qword ptr [rbp-8]            ; ...then apply view-mode read-only + layout
     xor     edx, edx
     call    gui_set_editmode
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_thaw
     jmp     vp_handled
 vp_remove:
     cmp     dword ptr [g_readonly], 0           ; E9: no delete in read-only mode
@@ -17541,7 +18000,7 @@ vault_proc endp
 ;   g_cfg_pwminclasses (HKLM policy wins, then HKCU, then 12 / 3) and record
 ;   whether each came from HKLM (locked).
 gui_load_policy proc frame
-    FRAME_PROLOG 32
+    FRAME_PROLOG 64
     lea     rcx, [wv_pwlen]
     mov     edx, 12
     lea     r8, [g_pol_len_lock]
@@ -17564,6 +18023,45 @@ gui_load_policy proc frame
     jbe     @F
     mov     eax, 4
 @@: mov     dword ptr [g_cfg_pwminclasses], eax
+    ; PIN minimum length: HKLM > HKCU > default 6, clamped [PIN_MINLEN_MIN..PIN_MINLEN_MAX]
+    lea     rcx, [wv_pinlen]
+    mov     edx, PIN_MINLEN_DEF
+    lea     r8, [g_pol_pinlen_lock]
+    call    cfg_get_dword
+    cmp     eax, PIN_MINLEN_MIN
+    jae     @F
+    mov     eax, PIN_MINLEN_MIN
+@@: cmp     eax, PIN_MINLEN_MAX
+    jbe     @F
+    mov     eax, PIN_MINLEN_MAX
+@@: mov     dword ptr [g_cfg_pinminlen], eax
+    ; PIN trivial-pattern rejection: HKLM > HKCU > default 1 (reject)
+    lea     rcx, [wv_pinnotriv]
+    mov     edx, 1
+    lea     r8, [g_pol_pintriv_lock]
+    call    cfg_get_dword
+    test    eax, eax
+    jz      @F
+    mov     eax, 1
+@@: mov     dword ptr [g_cfg_pinnotriv], eax
+    ; TPM + PIN max attempts before revocation: HKLM > HKCU > default 3, clamped [1..20]
+    lea     rcx, [wv_tpmtries]
+    mov     edx, TPM_PIN_TRIES_DEF
+    lea     r8, [g_tpm_tries_lock]
+    call    cfg_get_dword
+    cmp     eax, 1
+    jae     @F
+    mov     eax, TPM_PIN_TRIES_DEF
+@@: cmp     eax, TPM_PIN_TRIES_MAX
+    jbe     @F
+    mov     eax, TPM_PIN_TRIES_MAX
+@@: mov     dword ptr [g_tpm_pin_max], eax
+    ; TpmMinMode: strictly HKLM-only floor (0..3; HKCU cannot weaken)
+    WINCALL cfg_get_dword_hklm, addr wv_tpmminmode, 0
+    cmp     eax, TPM_MODE_HELLO
+    jbe     @F
+    mov     eax, TPM_MODE_HELLO
+@@: mov     dword ptr [g_tpm_minmode], eax
     lea     rcx, [wv_nohist]                    ; "Do not save history" (0/1; HKLM locks)
     xor     edx, edx
     lea     r8, [g_nohist_lock]
@@ -17588,18 +18086,52 @@ gui_load_policy proc frame
     jz      @F
     mov     eax, 1
 @@: mov     dword ptr [g_secunlock], eax
-    ; TPM Unlock: HKLM > HKCU > default ON (only meaningful with hardware).  The
-    ; loaded value drives both the settings toggle AND the actual auto-unlock /
-    ; new-vault enrollment, so an HKLM "TpmUnlock=0" really disables the feature.
+    ; TPM Unlock mode: HKLM > HKCU > legacy TpmUnlock > default TPM_MODE_ALONE (1).
+    ;   0 = Off, 1 = TPM only, 2 = TPM + PIN, 3 = TPM + Windows Hello.
     mov     dword ptr [g_tpm_lock], 0
     mov     dword ptr [g_tpm_want], 0
     cmp     dword ptr [g_tpm_present], 0
     je      lp_tpm_done
+    WINCALL cfg_get_dword, addr wv_tpmmode, 0FFFFFFFFh, addr g_tpm_lock
+    cmp     eax, 0FFFFFFFFh
+    jne     lp_tpm_have
     WINCALL cfg_get_dword, addr wv_tpm, 1, addr g_tpm_lock
     test    eax, eax
-    jz      @F
-    mov     eax, 1
-@@: mov     dword ptr [g_tpm_want], eax
+    jz      lp_tpm_store
+    mov     eax, TPM_MODE_ALONE
+    cmp     dword ptr [g_tpm_reqhello], 0
+    je      lp_tpm_check
+    cmp     dword ptr [g_hello_present], 0
+    je      lp_tpm_check
+    mov     eax, TPM_MODE_HELLO
+    jmp     lp_tpm_check
+lp_tpm_have:
+    cmp     eax, TPM_MODE_HELLO
+    jbe     lp_tpm_check
+    mov     eax, TPM_MODE_ALONE
+lp_tpm_check:
+    test    eax, eax
+    jz      lp_tpm_store
+    mov     edx, dword ptr [g_tpm_minmode]
+    cmp     eax, edx
+    jae     @F
+    mov     eax, edx
+@@: cmp     eax, TPM_MODE_HELLO
+    jne     lp_tpm_store
+    cmp     dword ptr [g_hello_present], 0
+    jne     lp_tpm_store
+    ; Hello unavailable on this account: if HKLM TpmMinMode demands 3, fail closed to Off (0);
+    ; otherwise fall back to TPM + PIN when TpmMinMode == 2, else TPM Alone.
+    cmp     dword ptr [g_tpm_minmode], TPM_MODE_HELLO
+    jne     @F
+    xor     eax, eax
+    jmp     lp_tpm_store
+@@: mov     eax, TPM_MODE_ALONE
+    cmp     dword ptr [g_tpm_minmode], TPM_MODE_PIN
+    jne     lp_tpm_store
+    mov     eax, TPM_MODE_PIN
+lp_tpm_store:
+    mov     dword ptr [g_tpm_want], eax
 lp_tpm_done:
     ; clipboard auto-clear timeout (seconds; HKLM > HKCU > default 20; 0 = off)
     WINCALL cfg_get_dword, addr wv_clip, 20, addr g_clip_lock
@@ -17945,12 +18477,34 @@ ccm_open:
     test    eax, eax
     jnz     ccm_sysfail
     ; enroll TPM unlock for a new vault when supported AND the setting/policy
-    ; allows it (g_tpm_want: HKLM > HKCU > default ON, loaded at startup)
+    ; allows it (g_tpm_want: 0=Off, 1=Alone, 2=PIN, 3=Hello)
     cmp     dword ptr [g_tpm_present], 0
     je      ccm_done
-    cmp     dword ptr [g_tpm_want], 0
-    je      ccm_done
+    mov     eax, dword ptr [g_tpm_want]
+    cmp     eax, TPM_MODE_ALONE
+    je      ccm_tpm_alone
+    cmp     eax, TPM_MODE_PIN
+    je      ccm_tpm_pin
+    cmp     eax, TPM_MODE_HELLO
+    je      ccm_tpm_hello
+    jmp     ccm_done
+ccm_tpm_alone:
     call    vault_tpm_remember
+    jmp     ccm_done
+ccm_tpm_pin:
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_pin_set_modal
+    test    eax, eax
+    jnz     ccm_done
+    mov     dword ptr [g_tpm_want], 0
+    jmp     ccm_done
+ccm_tpm_hello:
+    call    vault_tpm_enroll_hello
+    test    eax, eax
+    jnz     ccm_done
+    mov     dword ptr [g_tpm_want], 0
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr s_hello_fail, addr t_tpminfo, \
+            <MB_OK or MB_ICONWARNING>
     jmp     ccm_done
 ccm_sysfail:
     call    vault_lock                       ; do not hand back a half-built vault
@@ -20227,18 +20781,25 @@ gui_pg_sync proc frame
     lea     r8, [g_pg_tmpw + (128-1)*2]        ; last slot the NUL may occupy
     call    gui_wstrcpy
     WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_PG_STYLE, addr g_pg_tmpw
-    ; Clamp slider range + g_pg_len: [6..24] in passphrase mode, [6..64] otherwise (VDR2-25)
+    ; Clamp slider range + g_pg_len: [6..24] in passphrase, [4..32] in PIN, [6..64] otherwise
     mov     ecx, 400006h
+    mov     r8d, 6
     mov     edx, 64
     cmp     dword ptr [g_pg_style], PWS_PASSPHRASE
-    jne     gps_rng
+    jne     @F
     mov     ecx, 180006h
     mov     edx, 24
+    jmp     gps_rng
+@@: cmp     dword ptr [g_pg_style], PWS_PIN
+    jne     gps_rng
+    mov     ecx, 200004h
+    mov     r8d, PIN_MINLEN_MIN
+    mov     edx, PIN_MINLEN_MAX
 gps_rng:
     mov     eax, dword ptr [g_pg_len]
-    cmp     eax, 6
+    cmp     eax, r8d
     jae     @F
-    mov     eax, 6
+    mov     eax, r8d
 @@: cmp     eax, edx
     jbe     @F
     mov     eax, edx
@@ -20259,6 +20820,8 @@ gui_pg_sync endp
 gui_pg_regen proc frame
     FRAME_PROLOG 48
     mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-32], 0               ; retry count for non-trivial PINs
+pgr_try:
     lea     rcx, [g_genout]
     mov     edx, dword ptr [g_pg_len]
     mov     r8d, dword ptr [g_pg_style]
@@ -20267,9 +20830,23 @@ gui_pg_regen proc frame
     call    pwgen_ex
     mov     dword ptr [g_pg_bits], eax
     test    eax, eax
-    jnz     pgr_ok
+    jnz     pgr_chkpin
     WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_PG_OUT, 0
     jmp     pgr_bits
+pgr_chkpin:
+    cmp     dword ptr [g_pg_style], PWS_PIN
+    jne     pgr_ok
+    cmp     dword ptr [g_cfg_pinnotriv], 0
+    je      pgr_ok
+    cmp     dword ptr [rbp-32], 16
+    jae     pgr_ok
+    lea     rcx, [g_genout]
+    mov     edx, dword ptr [g_pg_len]
+    call    gui_pin_grade
+    test    eax, eax
+    jnz     pgr_ok
+    inc     dword ptr [rbp-32]
+    jmp     pgr_try
 pgr_ok:
     lea     r10, [g_genout]
     xor     ecx, ecx
@@ -20320,9 +20897,19 @@ pga_sl:
     jb      pga_sl
 pga_sld:
     mov     dword ptr [rbp-28], ecx
+    mov     ecx, dword ptr [g_pg_target]
+    imul    ecx, ecx, DESCSZ
+    lea     r11, [g_fields]
+    add     r11, rcx
     lea     rcx, [g_genout]
     mov     edx, dword ptr [rbp-28]
+    cmp     dword ptr [r11+FD_KIND], VF_PIN
+    jne     pga_pw
+    call    gui_pin_grade
+    jmp     pga_setlvl
+pga_pw:
     call    gui_pw_grade
+pga_setlvl:
     shl     eax, FDF_PWLVL_SHIFT
     mov     ecx, dword ptr [g_pg_target]
     imul    ecx, ecx, DESCSZ
@@ -21507,30 +22094,600 @@ grv_none:
     ret
 gui_resolve_vault endp
 
-; gui_try_tpm_auto() -> eax = 1 if the registered vault was unlocked via TPM.
-gui_try_tpm_auto proc frame
-    FRAME_PROLOG 32
-    cmp     dword ptr [g_tpm_want], 0        ; TPM Unlock off (setting/HKLM) -> ask for password
-    je      gta_no
-    lea     rcx, [g_vpath]
-    call    cfg_in_set
-    call    vault_tpm_has
-    test    eax, eax
-    jz      gta_no
-    mov     dword ptr [g_use_tpm], 1
-    call    vault_unlock
-    mov     dword ptr [g_use_tpm], 0
-    test    eax, eax
-    jnz     gta_no
-    mov     eax, 1
+; gui_wstr_to_pin_u8(rcx = wideZ) -> eax = UTF-8 byte count (1..256), or 0 on error.
+;   Converts wide PIN strictly (WC_ERR_INVALID_CHARS = 80h) into g_tpm_pin_u8 / g_tpm_pin_u8len.
+gui_wstr_to_pin_u8 proc frame
+    FRAME_PROLOG 112                            ; 8-arg WideCharToMultiByte spills [rbp-80..-56]
+    test    rcx, rcx
+    jz      gwpu_fail
+    mov     qword ptr [rbp-24], rcx
+    xor     r8d, r8d
+gwpu_len:
+    cmp     word ptr [rcx+r8*2], 0
+    je      gwpu_gotlen
+    inc     r8d
+    cmp     r8d, 260
+    jb      gwpu_len
+    jmp     gwpu_fail
+gwpu_gotlen:
+    test    r8d, r8d
+    jz      gwpu_fail
+    WINCALL WideCharToMultiByte, CP_UTF8_, 80h, qword ptr [rbp-24], r8d, \
+            addr g_tpm_pin_u8, 256, 0, 0
+    cmp     eax, 1
+    jl      gwpu_fail
+    cmp     eax, 256
+    ja      gwpu_fail
+    mov     dword ptr [g_tpm_pin_u8len], eax
     FRAME_EPILOG
     ret
-gta_no:
-    mov     dword ptr [g_use_tpm], 0
+gwpu_fail:
+    lea     rcx, [g_tpm_pin_u8]
+    mov     edx, 256
+    call    secure_zero
+    mov     dword ptr [g_tpm_pin_u8len], 0
     xor     eax, eax
     FRAME_EPILOG
     ret
-gui_try_tpm_auto endp
+gui_wstr_to_pin_u8 endp
+
+; gui_pinset_strength(rcx = hdlg) - live strength/match evaluation for DLG_PIN_SET.
+gui_pinset_strength proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx             ; hdlg
+    call    gui_pwbars_init
+    WINCALL GetDlgItemTextW, qword ptr [rbp-24], IDC_PS_PIN, addr g_pwbuf, 260
+    mov     dword ptr [rbp-32], eax             ; pin1 wlen
+    WINCALL GetDlgItemTextW, qword ptr [rbp-24], IDC_PS_PIN2, addr g_pw2buf, 260
+    mov     dword ptr [rbp-36], eax             ; pin2 wlen
+    mov     dword ptr [g_pinset_match], 0
+    cmp     dword ptr [rbp-36], 0
+    je      gps_nomatch
+    call    gui_pw_match
+    mov     dword ptr [g_pinset_match], eax
+gps_nomatch:
+    mov     dword ptr [rbp-44], 0               ; ok flag
+    mov     dword ptr [rbp-48], 0               ; grade 0..3
+    lea     rax, [g_empty_w]
+    mov     qword ptr [rbp-56], rax             ; status wideZ
+    cmp     dword ptr [rbp-32], 0
+    je      gps_eval_done
+    lea     rcx, [g_pwbuf]
+    call    gui_wide_pin_eval                   ; eax = PIN_*, edx = codepoints
+    cmp     eax, PIN_BADUTF8
+    jne     @F
+    lea     rax, [s_pinbadutf8]
+    mov     qword ptr [rbp-56], rax
+    jmp     gps_eval_done
+@@: cmp     eax, PIN_SHORT
+    jne     @F
+    lea     rax, [s_pinshort]
+    mov     qword ptr [rbp-56], rax
+    jmp     gps_eval_done
+@@: cmp     eax, PIN_TRIVIAL
+    jne     gps_pin_ok
+    lea     rax, [s_pintrivial]
+    mov     qword ptr [rbp-56], rax
+    cmp     dword ptr [g_cfg_pinnotriv], 0
+    jne     gps_eval_done
+    mov     dword ptr [rbp-44], 1               ; trivial warning shown, allowed when toggle OFF
+    jmp     gps_eval_done
+gps_pin_ok:
+    mov     dword ptr [rbp-44], 1
+    mov     eax, 2
+    mov     r8d, dword ptr [g_cfg_pinminlen]
+    add     r8d, 4
+    cmp     edx, r8d
+    jb      @F
+    mov     eax, 3
+@@: mov     dword ptr [rbp-48], eax
+gps_eval_done:
+    call    gui_wipepw_create
+    cmp     dword ptr [rbp-44], 0
+    je      gps_status_set
+    cmp     dword ptr [rbp-36], 0
+    je      gps_status_set
+    cmp     dword ptr [g_pinset_match], 0
+    jne     gps_status_set
+    lea     rax, [s_pinmismatch]
+    mov     qword ptr [rbp-56], rax
+gps_status_set:
+    mov     eax, dword ptr [rbp-48]
+    mov     dword ptr [g_pinset_lvl], eax
+    WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_PS_STATUS, qword ptr [rbp-56]
+    mov     ecx, dword ptr [rbp-44]
+    and     ecx, dword ptr [g_pinset_match]
+    mov     dword ptr [rbp-40], ecx
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDOK
+    WINCALL EnableWindow, rax, dword ptr [rbp-40]
+    mov     dword ptr [g_uline_ctl], IDC_PS_PIN
+    cmp     dword ptr [rbp-32], 0
+    je      gps_ul1_def
+    mov     eax, dword ptr [rbp-48]
+    lea     r10, [g_br_red]
+    mov     rax, qword ptr [r10+rax*8]
+    mov     qword ptr [g_uline_br], rax
+    jmp     gps_ul2
+gps_ul1_def:
+    mov     qword ptr [g_uline_br], 0
+gps_ul2:
+    mov     dword ptr [g_uline_ctl2], IDC_PS_PIN2
+    cmp     dword ptr [rbp-36], 0
+    je      gps_ul2_def
+    cmp     dword ptr [g_pinset_match], 0
+    je      gps_ul2_bad
+    mov     rax, qword ptr [g_br_dgreen]
+    mov     qword ptr [g_uline_br2], rax
+    jmp     gps_inval
+gps_ul2_bad:
+    mov     rax, qword ptr [g_br_red]
+    mov     qword ptr [g_uline_br2], rax
+    jmp     gps_inval
+gps_ul2_def:
+    mov     qword ptr [g_uline_br2], 0
+gps_inval:
+    WINCALL InvalidateRect, qword ptr [rbp-24], 0, 1
+    FRAME_EPILOG
+    ret
+gui_pinset_strength endp
+
+; pinset_proc - DLG_PIN_SET dialog procedure (raw frame).
+;   Leaves validated UTF-8 PIN in g_tpm_pin_u8 / g_tpm_pin_u8len on IDOK (returns 1).
+pinset_proc proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 96
+    mov     qword ptr [rbp-8], rcx
+    cmp     rdx, WM_INITDIALOG
+    je      psp_init
+    cmp     rdx, WM_COMMAND
+    je      psp_cmd
+    cmp     rdx, WM_DESTROY
+    je      psp_destroy
+    cmp     rdx, WM_CTLCOLORSTATIC
+    je      psp_col
+    cmp     rdx, WM_CTLCOLOREDIT
+    je      psp_col
+    cmp     rdx, WM_CTLCOLORBTN
+    je      psp_col
+    cmp     rdx, WM_CTLCOLORDLG
+    je      psp_col
+    cmp     rdx, WM_PAINT
+    je      psp_paint
+    cmp     rdx, WM_ERASEBKGND
+    je      psp_erase
+    cmp     rdx, WM_DRAWITEM
+    je      psp_draw
+    xor     eax, eax
+    jmp     psp_ret
+psp_destroy:
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_PS_PIN
+    call    gui_edit_scrub
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_PS_PIN2
+    call    gui_edit_scrub
+    mov     dword ptr [g_uline_ctl], 0
+    mov     dword ptr [g_uline_ctl2], 0
+    mov     qword ptr [g_uline_br], 0
+    mov     qword ptr [g_uline_br2], 0
+    mov     rax, qword ptr [rbp-8]
+    cmp     qword ptr [g_secdesk_hwnd], rax
+    jne     @F
+    mov     qword ptr [g_secdesk_hwnd], 0
+@@: xor     eax, eax
+    jmp     psp_ret
+psp_col:
+    call    theme_ctlcolor
+    jmp     psp_ret
+psp_paint:
+    mov     rcx, qword ptr [rbp-8]
+    call    theme_paint
+    jmp     psp_ret
+psp_erase:
+    mov     rcx, r8
+    mov     rdx, qword ptr [rbp-8]
+    call    theme_erase
+    jmp     psp_ret
+psp_draw:
+    mov     rcx, r9
+    call    theme_drawitem
+    jmp     psp_ret
+psp_init:
+    cmp     qword ptr [g_secdesk_hd], 0
+    je      @F
+    mov     rax, qword ptr [rbp-8]
+    mov     qword ptr [g_secdesk_hwnd], rax
+@@: mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDOK
+    call    theme_attach
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_set_winicon
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_PS_PIN
+    call    gui_edit_noime
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_PS_PIN2
+    call    gui_edit_noime
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_PS_PIN, EM_SETCUEBANNER, 1, addr cue_pin
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_PS_PIN2, EM_SETCUEBANNER, 1, addr cue_pin2
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_PS_PIN, EM_LIMITTEXT, 256, 0
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_PS_PIN2, EM_LIMITTEXT, 256, 0
+    mov     dword ptr [g_uline_ctl], 0
+    mov     dword ptr [g_uline_ctl2], 0
+    mov     qword ptr [g_uline_br], 0
+    mov     qword ptr [g_uline_br2], 0
+    WINCALL GetDlgItem, qword ptr [rbp-8], IDOK
+    WINCALL EnableWindow, rax, 0
+    mov     eax, 1
+    jmp     psp_ret
+psp_cmd:
+    movzx   eax, r8w
+    mov     r10d, r8d
+    shr     r10d, 16
+    cmp     r10d, EN_SETFOCUS
+    je      psp_refocus
+    cmp     r10d, EN_KILLFOCUS
+    je      psp_refocus
+    cmp     eax, IDOK
+    je      psp_ok
+    cmp     eax, IDCANCEL
+    je      psp_cancel
+    cmp     eax, IDC_PS_PIN
+    je      psp_chg
+    cmp     eax, IDC_PS_PIN2
+    je      psp_chg
+    xor     eax, eax
+    jmp     psp_ret
+psp_refocus:
+    WINCALL InvalidateRect, qword ptr [rbp-8], 0, 1
+    mov     eax, 1
+    jmp     psp_ret
+psp_chg:
+    cmp     r10d, EN_CHANGE
+    jne     psp_unh
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_pinset_strength
+    mov     eax, 1
+    jmp     psp_ret
+psp_unh:
+    xor     eax, eax
+    jmp     psp_ret
+psp_ok:
+    cmp     dword ptr [g_secdesk_orphan], 0
+    jne     psp_cancel
+    WINCALL GetDlgItemTextW, qword ptr [rbp-8], IDC_PS_PIN, addr g_pwbuf, 260
+    mov     dword ptr [rbp-16], eax
+    WINCALL GetDlgItemTextW, qword ptr [rbp-8], IDC_PS_PIN2, addr g_pw2buf, 260
+    cmp     dword ptr [rbp-16], 0
+    jne     @F
+    lea     rdx, [s_pinempty]
+    jmp     psp_err_wipew
+@@: call    gui_pw_match
+    test    eax, eax
+    jnz     @F
+    lea     rdx, [s_pinmismatch]
+    jmp     psp_err_wipew
+@@: lea     rcx, [g_pwbuf]
+    call    gui_wstr_to_pin_u8
+    mov     dword ptr [rbp-20], eax
+    call    gui_wipepw_create
+    cmp     dword ptr [rbp-20], 0
+    jne     @F
+    lea     rdx, [s_pinbadutf8]
+    jmp     psp_err_set
+@@: lea     rcx, [g_tpm_pin_u8]
+    mov     edx, dword ptr [g_tpm_pin_u8len]
+    call    pin_eval
+    cmp     eax, PIN_BADUTF8
+    jne     @F
+    lea     rdx, [s_pinbadutf8]
+    jmp     psp_err_wipeu8
+@@: cmp     eax, PIN_SHORT
+    jne     @F
+    lea     rdx, [s_pinshort]
+    jmp     psp_err_wipeu8
+@@: cmp     eax, PIN_TRIVIAL
+    jne     psp_accept
+    cmp     dword ptr [g_cfg_pinnotriv], 0
+    je      psp_accept
+    lea     rdx, [s_pintrivial]
+    jmp     psp_err_wipeu8
+psp_accept:
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_PS_PIN
+    call    gui_edit_scrub
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_PS_PIN2
+    call    gui_edit_scrub
+    mov     dword ptr [g_uline_ctl], 0
+    mov     dword ptr [g_uline_ctl2], 0
+    mov     qword ptr [g_uline_br], 0
+    mov     qword ptr [g_uline_br2], 0
+    mov     qword ptr [g_secdesk_hwnd], 0
+    WINCALL EndDialog, qword ptr [rbp-8], 1
+    mov     eax, 1
+    jmp     psp_ret
+psp_err_wipew:
+    mov     qword ptr [rbp-24], rdx
+    call    gui_wipepw_create
+    mov     rdx, qword ptr [rbp-24]
+    jmp     psp_err_set
+psp_err_wipeu8:
+    mov     qword ptr [rbp-24], rdx
+    lea     rcx, [g_tpm_pin_u8]
+    mov     edx, 256
+    call    secure_zero
+    mov     dword ptr [g_tpm_pin_u8len], 0
+    mov     rdx, qword ptr [rbp-24]
+psp_err_set:
+    WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_PS_STATUS, rdx
+    mov     eax, 1
+    jmp     psp_ret
+psp_cancel:
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_PS_PIN
+    call    gui_edit_scrub
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_PS_PIN2
+    call    gui_edit_scrub
+    call    gui_wipepw_create
+    lea     rcx, [g_tpm_pin_u8]
+    mov     edx, 256
+    call    secure_zero
+    mov     dword ptr [g_tpm_pin_u8len], 0
+    mov     dword ptr [g_uline_ctl], 0
+    mov     dword ptr [g_uline_ctl2], 0
+    mov     qword ptr [g_uline_br], 0
+    mov     qword ptr [g_uline_br2], 0
+    mov     qword ptr [g_secdesk_hwnd], 0
+    WINCALL EndDialog, qword ptr [rbp-8], 0
+    mov     eax, 1
+psp_ret:
+    mov     rsp, rbp
+    pop     rbp
+    ret
+pinset_proc endp
+
+; gui_pin_set_modal(rcx = owner hwnd) -> eax = 1 enrolled / 0 cancelled or failed.
+;   Collects the PIN (on private desktop when SecureUnlock is enabled), then executes
+;   Argon2id + TPM key enrollment on the caller's normal desktop.
+gui_pin_set_modal proc frame
+    FRAME_PROLOG 80
+    mov     qword ptr [rbp-24], rcx
+    xor     eax, eax
+    cmp     qword ptr [g_body_ptr], 0
+    setne   al
+    mov     dword ptr [rbp-32], eax             ; was_open
+    cmp     dword ptr [g_secunlock], 0
+    je      psm_normal
+    mov     ecx, DLG_PIN_SET
+    lea     rdx, [pinset_proc]
+    call    gui_secdesk_show
+    jmp     psm_got
+psm_normal:
+    WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_PIN_SET, qword ptr [rbp-24], addr pinset_proc, 0
+psm_got:
+    cmp     rax, 1
+    jne     psm_cancel
+    cmp     dword ptr [rbp-32], 0
+    je      psm_enroll
+    cmp     qword ptr [g_body_ptr], 0           ; vault locked while PIN modal was open?
+    je      psm_cancel
+psm_enroll:
+    call    vault_tpm_enroll_pin                ; -> eax = 1 ok / 0 fail; wipes g_tpm_pin_u8
+    test    eax, eax
+    jz      psm_fail
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+psm_fail:
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr s_tpm_pin_fail, addr t_tpminfo, \
+            <MB_OK or MB_ICONWARNING>
+psm_cancel:
+    lea     rcx, [g_tpm_pin_u8]
+    mov     edx, 256
+    call    secure_zero
+    mov     dword ptr [g_tpm_pin_u8len], 0
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gui_pin_set_modal endp
+
+; pinunlock_proc - DLG_PIN_UNLOCK dialog procedure (raw frame).
+;   EndDialog results: 1 = unlocked, 2 = use master password, 3 = PIN revoked, 0 = cancel.
+pinunlock_proc proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 96
+    mov     qword ptr [rbp-8], rcx
+    cmp     rdx, WM_INITDIALOG
+    je      pup_init
+    cmp     rdx, WM_COMMAND
+    je      pup_cmd
+    cmp     rdx, WM_DESTROY
+    je      pup_destroy
+    cmp     rdx, WM_CTLCOLORSTATIC
+    je      pup_col
+    cmp     rdx, WM_CTLCOLOREDIT
+    je      pup_col
+    cmp     rdx, WM_CTLCOLORBTN
+    je      pup_col
+    cmp     rdx, WM_CTLCOLORDLG
+    je      pup_col
+    cmp     rdx, WM_PAINT
+    je      pup_paint
+    cmp     rdx, WM_ERASEBKGND
+    je      pup_erase
+    cmp     rdx, WM_DRAWITEM
+    je      pup_draw
+    xor     eax, eax
+    jmp     pup_ret
+pup_destroy:
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_PU_PIN
+    call    gui_edit_scrub
+    mov     rax, qword ptr [rbp-8]
+    cmp     qword ptr [g_secdesk_hwnd], rax
+    jne     @F
+    mov     qword ptr [g_secdesk_hwnd], 0
+@@: xor     eax, eax
+    jmp     pup_ret
+pup_col:
+    call    theme_ctlcolor
+    jmp     pup_ret
+pup_paint:
+    mov     rcx, qword ptr [rbp-8]
+    call    theme_paint
+    jmp     pup_ret
+pup_erase:
+    mov     rcx, r8
+    mov     rdx, qword ptr [rbp-8]
+    call    theme_erase
+    jmp     pup_ret
+pup_draw:
+    mov     rcx, r9
+    call    theme_drawitem
+    jmp     pup_ret
+pup_init:
+    cmp     qword ptr [g_secdesk_hd], 0
+    je      @F
+    mov     rax, qword ptr [rbp-8]
+    mov     qword ptr [g_secdesk_hwnd], rax
+@@: mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDOK
+    call    theme_attach
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_set_winicon
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_PU_PIN
+    call    gui_edit_noime
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_PU_PIN, EM_SETCUEBANNER, 1, addr cue_pin
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_PU_PIN, EM_LIMITTEXT, 256, 0
+    mov     eax, 1
+    jmp     pup_ret
+pup_cmd:
+    movzx   eax, r8w
+    mov     r10d, r8d
+    shr     r10d, 16
+    cmp     r10d, EN_SETFOCUS
+    je      pup_refocus
+    cmp     r10d, EN_KILLFOCUS
+    je      pup_refocus
+    cmp     eax, IDOK
+    je      pup_ok
+    cmp     eax, IDC_PU_MPW
+    je      pup_mpw
+    cmp     eax, IDCANCEL
+    je      pup_cancel
+    xor     eax, eax
+    jmp     pup_ret
+pup_refocus:
+    WINCALL InvalidateRect, qword ptr [rbp-8], 0, 1
+    mov     eax, 1
+    jmp     pup_ret
+pup_mpw:
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_PU_PIN
+    call    gui_edit_scrub
+    mov     qword ptr [g_secdesk_hwnd], 0
+    WINCALL EndDialog, qword ptr [rbp-8], 2
+    mov     eax, 1
+    jmp     pup_ret
+pup_ok:
+    cmp     dword ptr [g_secdesk_orphan], 0
+    jne     pup_cancel
+    WINCALL GetDlgItemTextW, qword ptr [rbp-8], IDC_PU_PIN, addr g_pwbuf, 260
+    test    eax, eax
+    jnz     @F
+    WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_PU_STATUS, addr s_pinempty
+    mov     eax, 1
+    jmp     pup_ret
+@@: lea     rcx, [g_pwbuf]
+    call    gui_wstr_to_pin_u8
+    mov     dword ptr [rbp-16], eax
+    lea     rcx, [g_pwbuf]
+    mov     edx, 2048
+    call    secure_zero
+    cmp     dword ptr [rbp-16], 0
+    jne     @F
+    WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_PU_STATUS, addr s_pinbadutf8
+    mov     eax, 1
+    jmp     pup_ret
+@@: cmp     dword ptr [g_secdesk_orphan], 0
+    jne     pup_cancel_wipe
+    mov     dword ptr [g_use_tpm], TPM_MODE_PIN
+    call    vault_unlock
+    mov     dword ptr [rbp-20], eax
+    mov     dword ptr [g_use_tpm], 0
+    lea     rcx, [ev_unlock]
+    mov     edx, dword ptr [rbp-20]
+    call    log_result
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_PU_PIN
+    call    gui_edit_scrub
+    WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_PU_PIN, 0
+    mov     eax, dword ptr [rbp-20]
+    test    eax, eax
+    jz      pup_unlocked
+    cmp     eax, EXIT_AUTH
+    je      pup_wrongpin
+    cmp     eax, EXIT_LOCKED
+    je      pup_revoked
+    ; Unexpected I/O or TPM state failure -> fall back to master password
+    mov     qword ptr [g_secdesk_hwnd], 0
+    WINCALL EndDialog, qword ptr [rbp-8], 2
+    mov     eax, 1
+    jmp     pup_ret
+pup_unlocked:
+    mov     qword ptr [g_secdesk_hwnd], 0
+    WINCALL EndDialog, qword ptr [rbp-8], 1
+    mov     eax, 1
+    jmp     pup_ret
+pup_revoked:
+    mov     qword ptr [g_secdesk_hwnd], 0
+    WINCALL EndDialog, qword ptr [rbp-8], 3
+    mov     eax, 1
+    jmp     pup_ret
+pup_wrongpin:
+    cmp     dword ptr [g_tpm_pin_rem], 1
+    ja      pup_rem_many
+    WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_PU_STATUS, addr s_pu_rem_one
+    jmp     pup_refocus_pin
+pup_rem_many:
+    lea     rcx, [g_pu_msgw]
+    lea     rdx, [s_pu_rem1]
+    call    gui_w_appendz
+    mov     rcx, rax
+    mov     edx, dword ptr [g_tpm_pin_rem]
+    call    gui_uint_w
+    mov     rcx, rax
+    lea     rdx, [s_pu_rem2]
+    call    gui_w_appendz
+    mov     word ptr [rax], 0
+    WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_PU_STATUS, addr g_pu_msgw
+pup_refocus_pin:
+    WINCALL GetDlgItem, qword ptr [rbp-8], IDC_PU_PIN
+    WINCALL SetFocus, rax
+    mov     eax, 1
+    jmp     pup_ret
+pup_cancel_wipe:
+    lea     rcx, [g_tpm_pin_u8]
+    mov     edx, 256
+    call    secure_zero
+    mov     dword ptr [g_tpm_pin_u8len], 0
+pup_cancel:
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_PU_PIN
+    call    gui_edit_scrub
+    mov     qword ptr [g_secdesk_hwnd], 0
+    WINCALL EndDialog, qword ptr [rbp-8], 0
+    mov     eax, 1
+pup_ret:
+    mov     rsp, rbp
+    pop     rbp
+    ret
+pinunlock_proc endp
 
 ; =============================================================================
 ; Secure-desktop master-password entry (anti-keylogger).
@@ -21708,7 +22865,7 @@ secdesk_thread endp
 ;   until it closes.  Enforces HKLM SecureUnlock fail-closed or explicit Yes/No consent.
 public gui_secdesk_show
 gui_secdesk_show proc frame
-    FRAME_PROLOG 128                             ; locals -24..-52 clear of 6-arg WINCALL spill
+    FRAME_PROLOG 128                             ; locals -24..-56 clear of 6-arg WINCALL spill
     mov     dword ptr [g_secdesk_dlg], ecx
     mov     qword ptr [g_secdesk_proc], rdx
     mov     qword ptr [g_secdesk_res], 0
@@ -21719,7 +22876,7 @@ gui_secdesk_show proc frame
     xor     eax, eax
     cmp     qword ptr [g_body_ptr], 0
     setne   al
-    mov     dword ptr [rbp-36], eax              ; 1 if vault was unlocked on entry
+    mov     dword ptr [rbp-56], eax              ; 1 if vault was unlocked on entry (distinct from qword [rbp-40])
 ifdef PROBE_IO
     cmp     dword ptr [g_secdesk_force_fail], 0
     jne     gss_fallback
@@ -21797,7 +22954,7 @@ gss_pump_mark:
     ; Dispatch any pending inter-thread SendMessage and mark remaining input seen
     ; so MsgWaitForMultipleObjects sleeps for its slice instead of busy-spinning.
     WINCALL PeekMessageW, addr g_msg, 0, 0, 0, 0
-    cmp     dword ptr [rbp-36], 0
+    cmp     dword ptr [rbp-56], 0
     je      gss_chk_timeout
     cmp     qword ptr [g_body_ptr], 0            ; vault locked while dialog was up?
     jne     gss_chk_timeout
@@ -21855,7 +23012,7 @@ gss_fb_ask:
     WINCALL gui_msgbox, 0, addr s_sdfall, addr t_err, <MB_YESNO or MB_ICONWARNING>
     cmp     eax, IDYES
     jne     gss_fb_deny
-    cmp     dword ptr [rbp-36], 0
+    cmp     dword ptr [rbp-56], 0
     je      gss_fb_run
     cmp     qword ptr [g_body_ptr], 0
     je      gss_fb_deny
@@ -21923,18 +23080,78 @@ endif
 ;   tray WITHOUT showing the unlock screen.
 ; =============================================================================
 gui_open proc frame
-    FRAME_PROLOG 64
+    FRAME_PROLOG 80
     mov     qword ptr [rbp-24], rcx
     cmp     dword ptr [g_showing], 0
     jne     go_done
     mov     dword ptr [g_showing], 1
     cmp     dword ptr [g_create], 0
     jne     go_create
-    call    gui_try_tpm_auto                ; silent unlock if this device is enrolled
+    ; Read the vault image once on the caller's desktop so neither DLG_PIN_UNLOCK nor
+    ; DLG_UNLOCK ever performs blocking file I/O while holding a private desktop.
+    cmp     dword ptr [g_vpath_set], 0
+    je      go_nopreload
+    lea     rcx, [g_vpath]
+    call    cfg_in_set
+    call    vault_preload
+go_nopreload:
+    cmp     dword ptr [g_tpm_want], 0
+    je      go_askpw
+    cmp     dword ptr [g_vpath_set], 0
+    je      go_askpw
+    call    vault_tpm_has
     test    eax, eax
     jz      go_askpw
-    ; anti-rollback: the password path asks before opening a file older than the last
-    ; one saved here; the TPM path opened it without a word.
+    call    vault_tpm_mode_get
+    mov     dword ptr [rbp-40], eax          ; blob's actual enrolled mode
+    cmp     eax, dword ptr [g_tpm_minmode]   ; enforce HKLM TpmMinMode floor
+    jb      go_askpw
+    cmp     eax, TPM_MODE_ALONE
+    je      go_tpm_alone
+    cmp     eax, TPM_MODE_PIN
+    je      go_tpm_pin
+    cmp     eax, TPM_MODE_HELLO
+    je      go_tpm_hello
+    jmp     go_askpw
+go_tpm_alone:
+    mov     dword ptr [g_use_tpm], TPM_MODE_ALONE
+    call    vault_unlock
+    mov     dword ptr [g_use_tpm], 0
+    test    eax, eax
+    jnz     go_askpw
+    jmp     go_tpm_unlocked
+go_tpm_hello:
+    cmp     dword ptr [g_hello_present], 0
+    je      go_askpw
+    mov     dword ptr [g_use_tpm], TPM_MODE_HELLO
+    call    vault_unlock
+    mov     dword ptr [g_use_tpm], 0
+    test    eax, eax
+    jnz     go_askpw
+    jmp     go_tpm_unlocked
+go_tpm_pin:
+    cmp     dword ptr [g_secunlock], 0
+    je      go_pin_normal
+    mov     ecx, DLG_PIN_UNLOCK
+    lea     rdx, [pinunlock_proc]
+    call    gui_secdesk_show
+    jmp     go_pin_res
+go_pin_normal:
+    WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_PIN_UNLOCK, qword ptr [rbp-24], addr pinunlock_proc, 0
+go_pin_res:
+    cmp     rax, 1
+    je      go_tpm_unlocked
+    cmp     rax, 0
+    je      go_abort_preload                 ; user pressed Cancel -> back to tray
+    cmp     rax, 3
+    jne     go_askpw                         ; 2 = "Master password..." or fallback
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr s_pinrevoked, addr t_pinrevoked, \
+            <MB_OK or MB_ICONWARNING>
+    jmp     go_askpw
+go_tpm_unlocked:
+    mov     ecx, 1                           ; transfer preloaded image to the live vault
+    call    vault_preload_end
+    ; anti-rollback: warn before opening a vault older than the last one saved here
     cmp     dword ptr [g_rollback], 0
     je      go_tpm_ok
     WINCALL gui_msgbox, qword ptr [rbp-24], addr s_rollback, addr t_rbtitle, \
@@ -21944,18 +23161,13 @@ gui_open proc frame
     call    vault_lock
     jmp     go_reset
 go_tpm_ok:
-    call    gui_pwremind                    ; C9: the password was NOT typed just now, so
-    jmp     go_vault                        ;   remind if it has gone stale
+    call    gui_pwremind                    ; C9: remind periodically under TPM Unlock
+    jmp     go_vault
+go_abort_preload:
+    xor     ecx, ecx
+    call    vault_preload_end
+    jmp     go_reset
 go_askpw:
-    ; Read the vault image here, on the caller's desktop.  vault_unlock then works
-    ; from memory, so a slow or stalled OneDrive read can no longer happen while the
-    ; user is parked on the private desktop with no shell and no way back.
-    cmp     dword ptr [g_vpath_set], 0
-    je      go_nopreload
-    lea     rcx, [g_vpath]
-    call    cfg_in_set
-    call    vault_preload
-go_nopreload:
     cmp     dword ptr [g_secunlock], 0     ; enter the master password on a private desktop?
     je      go_unlock_normal
     mov     ecx, DLG_UNLOCK
@@ -23084,6 +24296,8 @@ gui_main proc frame
     call    theme_boot                      ;   create/unlock dialogs use it too, not the default
     call    tpm_available
     mov     dword ptr [g_tpm_present], eax
+    call    tpm_hello_available
+    mov     dword ptr [g_hello_present], eax
     call    gui_load_policy
 ifdef DBG_SHOW
     mov     dword ptr [g_secunlock], 0      ; debug: use the normal desktop so the GUI is inspectable
@@ -23094,6 +24308,7 @@ ifdef PROBE_IO
     mov     dword ptr [g_secunlock], 0
     mov     dword ptr [g_tpm_want], 0
     mov     dword ptr [g_tpm_present], 0
+    mov     dword ptr [g_hello_present], 0
 gm_notest:
 endif
     call    gui_temp_sweep_stale            ; VDR2-14: wipe any stale %TEMP%\VordrPreview-* dirs
@@ -24074,7 +25289,28 @@ gui_layout_probe proc frame
     add     dword ptr [g_lp_bad], eax
     WINCALL DestroyWindow, qword ptr [rbp-32]
     call    lp_pump
-    jmp     glp_nowin                       ; do NOT fall into the no-desktop answer
+    ; Also measure the TPM + PIN enrollment and unlock dialogs at run time
+    WINCALL CreateDialogParamW, qword ptr [g_hinst], DLG_PIN_SET, 0, addr pinset_proc, 0
+    mov     qword ptr [rbp-32], rax
+    test    rax, rax
+    jz      @F
+    WINCALL ShowWindow, qword ptr [rbp-32], 4
+    call    lp_pump
+    mov     rcx, qword ptr [rbp-32]
+    call    lp_measure
+    WINCALL DestroyWindow, qword ptr [rbp-32]
+    call    lp_pump
+@@: WINCALL CreateDialogParamW, qword ptr [g_hinst], DLG_PIN_UNLOCK, 0, addr pinunlock_proc, 0
+    mov     qword ptr [rbp-32], rax
+    test    rax, rax
+    jz      @F
+    WINCALL ShowWindow, qword ptr [rbp-32], 4
+    call    lp_pump
+    mov     rcx, qword ptr [rbp-32]
+    call    lp_measure
+    WINCALL DestroyWindow, qword ptr [rbp-32]
+    call    lp_pump
+@@: jmp     glp_nowin                       ; do NOT fall into the no-desktop answer
 glp_nodesk:
     ; A build server without an interactive desktop cannot create a window at
     ; all.  That is not a layout failure and must not be reported as one, so it
@@ -24127,16 +25363,35 @@ CSTR sdk_bad, "secdeskkat: FAIL (secure-desktop gate or private-desktop DACL reg
 .code
 
 ; sdk_autoclose_proc - raw DLGPROC run on the private desktop by cmd_secdeskkat:
-;   verifies DESKTOP_HOOKCONTROL (8) is denied by the protected DACL, exercises
-;   theme_attach + gui_set_winicon + gui_edit_noime + gui_edit_scrub, and closes
-;   immediately with result 77h.
+;   delegates to unlock_proc so the real DLG_UNLOCK message loop, owner-draw controls,
+;   and IDCANCEL handler run live while the main thread pumps WM_TIMER inside gss_wait,
+;   verifies DESKTOP_HOOKCONTROL (8) is denied by the protected DACL, and closes with
+;   77h after 60 ms (whereas an erroneous IDCANCEL from gss_pump_mark returns 0).
 sdk_autoclose_proc proc
     push    rbp
     mov     rbp, rsp
-    sub     rsp, 64
+    sub     rsp, 80                             ; [rbp-8..-36] clear of 4-arg shadow [-80..-49]
     mov     qword ptr [rbp-8], rcx
-    cmp     rdx, WM_INITDIALOG
-    jne     sap_unh
+    mov     qword ptr [rbp-16], rdx
+    mov     qword ptr [rbp-24], r8
+    mov     qword ptr [rbp-32], r9
+    cmp     rdx, WM_TIMER
+    jne     sap_fwd
+    cmp     r8, 99
+    jne     sap_fwd
+    WINCALL KillTimer, qword ptr [rbp-8], 99
+    WINCALL EndDialog, qword ptr [rbp-8], 77h
+    mov     eax, 1
+    jmp     sap_ret
+sap_fwd:
+    mov     rcx, qword ptr [rbp-8]
+    mov     rdx, qword ptr [rbp-16]
+    mov     r8, qword ptr [rbp-24]
+    mov     r9, qword ptr [rbp-32]
+    call    unlock_proc
+    mov     dword ptr [rbp-36], eax
+    cmp     qword ptr [rbp-16], WM_INITDIALOG
+    jne     sap_done
     WINCALL OpenDesktopW, addr g_secdesk_name, 0, 0, 8      ; DESKTOP_HOOKCONTROL = 8
     test    rax, rax
     jz      sap_dacl_ok
@@ -24145,21 +25400,14 @@ sdk_autoclose_proc proc
     mov     eax, 1
     jmp     sap_ret
 sap_dacl_ok:
-    mov     rcx, qword ptr [rbp-8]
-    call    theme_attach
-    mov     rcx, qword ptr [rbp-8]
-    call    gui_set_winicon
-    mov     rcx, qword ptr [rbp-8]
-    mov     edx, IDC_U_PW
-    call    gui_edit_noime
-    mov     rcx, qword ptr [rbp-8]
-    mov     edx, IDC_U_PW
-    call    gui_edit_scrub
-    WINCALL EndDialog, qword ptr [rbp-8], 77h
+    WINCALL SetTimer, qword ptr [rbp-8], 99, 60, 0
+    test    rax, rax
+    jnz     sap_done
+    WINCALL EndDialog, qword ptr [rbp-8], 0DEADh
     mov     eax, 1
     jmp     sap_ret
-sap_unh:
-    xor     eax, eax
+sap_done:
+    mov     eax, dword ptr [rbp-36]
 sap_ret:
     mov     rsp, rbp
     pop     rbp
@@ -24169,7 +25417,7 @@ sdk_autoclose_proc endp
 LANDING_PAD
 public cmd_secdeskkat
 cmd_secdeskkat proc frame
-    FRAME_PROLOG 64
+    FRAME_PROLOG 80
     mov     dword ptr [g_sp_active], 1
     mov     dword ptr [g_sp_messages], 0
     mov     qword ptr [g_sp_lastmsg], 0
@@ -24237,12 +25485,21 @@ cmd_secdeskkat proc frame
     mov     dword ptr [rbp-20], 4005h
     WINCALL InitCommonControlsEx, addr rbp-24
     call    theme_boot
+    ; Arm a 15 ms thread timer on the main thread while g_body_ptr == 0 so gss_wait
+    ; wakes on WM_TIMER and runs gss_pump_tmr + gss_pump_mark while DLG_UNLOCK is live;
+    ; guards against false-positive auto-lock cancellation on the locked-entry path.
+    WINCALL SetTimer, 0, 0, 15, 0
+    mov     qword ptr [rbp-32], rax
     mov     dword ptr [g_secdesk_noswitch], 1
     mov     ecx, DLG_UNLOCK
     lea     rdx, [sdk_autoclose_proc]
     call    gui_secdesk_show
+    mov     qword ptr [rbp-40], rax
     mov     dword ptr [g_secdesk_noswitch], 0
-    cmp     rax, 77h
+    cmp     qword ptr [rbp-32], 0
+    je      @F
+    WINCALL KillTimer, 0, qword ptr [rbp-32]
+@@: cmp     qword ptr [rbp-40], 77h
     jne     sdk_fail
 
 sdk_done_live:
@@ -24498,6 +25755,18 @@ ws_gui_focuschain:
     test    eax, eax
     jnz     ws_gui_focus
     WINCALL FindWindowW, 0, addr g_unlock_title
+    mov     qword ptr [rsp+48], rax
+    mov     rcx, rax
+    call    gui_hwnd_is_self
+    test    eax, eax
+    jnz     ws_gui_focus
+    WINCALL FindWindowW, 0, addr g_pinunlock_title
+    mov     qword ptr [rsp+48], rax
+    mov     rcx, rax
+    call    gui_hwnd_is_self
+    test    eax, eax
+    jnz     ws_gui_focus
+    WINCALL FindWindowW, 0, addr g_pinset_title
     mov     qword ptr [rsp+48], rax
     mov     rcx, rax
     call    gui_hwnd_is_self

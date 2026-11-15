@@ -1517,11 +1517,19 @@ WSTR plk_usrv, <C:\UserVault\user.vordr>
 PLK_USRV_CB equ (23 + 1) * 2
 WSTR plk_clip, <ClipSeconds>
 WSTR plk_unc,  <AllowUncVault>
+WSTR plk_pmin, <PinMinLen>
+WSTR plk_ptriv,<PinRejectTrivial>
+WSTR plk_tmode,<TpmUnlockMode>
+WSTR plk_tmin, <TpmMinMode>
+WSTR plk_ttry, <TpmPinMaxAttempts>
 WSTR plk_zero, <0>
 PLK_ZERO_CB equ 4
 align 4
 plk_dw99    dd 99
 plk_dw1     dd 1
+plk_dw2     dd 2
+plk_dw5     dd 5
+plk_dw8     dd 8
 .data?
 align 2
 plk_out     dw 512 dup (?)
@@ -1642,13 +1650,80 @@ cmd_polkat proc frame
     cmp     eax, 1
     jne     plk_clean
 
+    ; 6) PIN & TPM Unlock policy precedence (HKLM > HKCU > default) + HKLM-only TpmMinMode
+    WINCALL RegSetValueExW, qword ptr [rbp-40], addr plk_pmin, 0, REG_DWORD, addr plk_dw8, 4
+    test    eax, eax
+    jnz     plk_clean
+    mov     dword ptr [plk_locked], 0
+    lea     rcx, [plk_pmin]
+    mov     edx, PIN_MINLEN_DEF
+    lea     r8, [plk_locked]
+    call    cfg_get_dword
+    cmp     eax, 8
+    jne     plk_clean
+    cmp     dword ptr [plk_locked], 0
+    jne     plk_clean
+    WINCALL RegSetValueExW, qword ptr [rbp-32], addr plk_pmin, 0, REG_DWORD, addr plk_dw5, 4
+    test    eax, eax
+    jnz     plk_clean
+    lea     rcx, [plk_pmin]
+    mov     edx, PIN_MINLEN_DEF
+    lea     r8, [plk_locked]
+    call    cfg_get_dword
+    cmp     eax, 5
+    jne     plk_clean
+    cmp     dword ptr [plk_locked], 1
+    jne     plk_clean
+
+    ; HKCU TpmMinMode MUST be ignored; HKLM TpmMinMode=2 MUST apply
+    WINCALL RegSetValueExW, qword ptr [rbp-40], addr plk_tmin, 0, REG_DWORD, addr plk_dw2, 4
+    test    eax, eax
+    jnz     plk_clean
+    lea     rcx, [plk_tmin]
+    xor     edx, edx
+    call    cfg_get_dword_hklm
+    test    eax, eax
+    jnz     plk_clean
+    WINCALL RegSetValueExW, qword ptr [rbp-32], addr plk_tmin, 0, REG_DWORD, addr plk_dw2, 4
+    test    eax, eax
+    jnz     plk_clean
+    lea     rcx, [plk_tmin]
+    xor     edx, edx
+    call    cfg_get_dword_hklm
+    cmp     eax, 2
+    jne     plk_clean
+
+    ; Defaults when unset: PinRejectTrivial=1, TpmUnlockMode=99(absent sentinel), TpmPinMaxAttempts=3
+    lea     rcx, [plk_ptriv]
+    mov     edx, 1
+    xor     r8d, r8d
+    call    cfg_get_dword
+    cmp     eax, 1
+    jne     plk_clean
+    lea     rcx, [plk_tmode]
+    mov     edx, 99
+    xor     r8d, r8d
+    call    cfg_get_dword
+    cmp     eax, 99
+    jne     plk_clean
+    lea     rcx, [plk_ttry]
+    mov     edx, TPM_PIN_TRIES_DEF
+    xor     r8d, r8d
+    call    cfg_get_dword
+    cmp     eax, TPM_PIN_TRIES_DEF
+    jne     plk_clean
+
     ; Clean up values + handles and restore g_hklm
     WINCALL RegDeleteValueW, qword ptr [rbp-32], addr cfg_value
     WINCALL RegDeleteValueW, qword ptr [rbp-32], addr plk_clip
     WINCALL RegDeleteValueW, qword ptr [rbp-32], addr plk_unc
+    WINCALL RegDeleteValueW, qword ptr [rbp-32], addr plk_pmin
+    WINCALL RegDeleteValueW, qword ptr [rbp-32], addr plk_tmin
     WINCALL RegDeleteValueW, qword ptr [rbp-40], addr cfg_value
     WINCALL RegDeleteValueW, qword ptr [rbp-40], addr plk_clip
     WINCALL RegDeleteValueW, qword ptr [rbp-40], addr plk_unc
+    WINCALL RegDeleteValueW, qword ptr [rbp-40], addr plk_pmin
+    WINCALL RegDeleteValueW, qword ptr [rbp-40], addr plk_tmin
     WINCALL RegCloseKey, qword ptr [rbp-40]
     WINCALL RegCloseKey, qword ptr [rbp-32]
     WINCALL RegCloseKey, qword ptr [rbp-24]
@@ -1667,12 +1742,16 @@ plk_clean:
     WINCALL RegDeleteValueW, qword ptr [rbp-40], addr cfg_value
     WINCALL RegDeleteValueW, qword ptr [rbp-40], addr plk_clip
     WINCALL RegDeleteValueW, qword ptr [rbp-40], addr plk_unc
+    WINCALL RegDeleteValueW, qword ptr [rbp-40], addr plk_pmin
+    WINCALL RegDeleteValueW, qword ptr [rbp-40], addr plk_tmin
     WINCALL RegCloseKey, qword ptr [rbp-40]
 @@: cmp     qword ptr [rbp-32], 0
     je      @F
     WINCALL RegDeleteValueW, qword ptr [rbp-32], addr cfg_value
     WINCALL RegDeleteValueW, qword ptr [rbp-32], addr plk_clip
     WINCALL RegDeleteValueW, qword ptr [rbp-32], addr plk_unc
+    WINCALL RegDeleteValueW, qword ptr [rbp-32], addr plk_pmin
+    WINCALL RegDeleteValueW, qword ptr [rbp-32], addr plk_tmin
     WINCALL RegCloseKey, qword ptr [rbp-32]
 @@: cmp     qword ptr [rbp-24], 0
     je      @F

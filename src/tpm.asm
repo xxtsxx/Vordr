@@ -29,17 +29,29 @@ extern NCryptEncrypt:proc
 extern NCryptDecrypt:proc
 extern NCryptDeleteKey:proc
 extern NCryptFreeObject:proc
+extern OpenProcessToken:proc
+extern GetTokenInformation:proc
+extern ConvertSidToStringSidW:proc
+extern LocalFree:proc
+extern CloseHandle:proc
+extern LoadLibraryExW:proc
+extern GetProcAddress:proc
+extern FreeLibrary:proc
 extern sha256_init:proc
 extern sha256_update:proc
 extern sha256_final:proc
 extern secure_zero:proc
 extern ct_memcmp:proc
+ifdef PROBE_IO
+extern vault_tpm_pin_kat:proc
+endif
 
 NCRYPT_SILENT_FLAG        equ 040h
 NCRYPT_OVERWRITE_KEY_FLAG equ 080h
 NCRYPT_OAEP_SILENT        equ 044h      ; NCRYPT_PAD_OAEP_FLAG | NCRYPT_SILENT_FLAG
 NCRYPT_PAD_OAEP           equ 004h      ; C4: OAEP without SILENT (lets the OS prompt)
 NCRYPT_UI_PROTECT_KEY     equ 1         ; NCRYPT_UI_POLICY dwFlags: prompt on each use
+LOAD_LIB_SYS32            equ 0800h     ; LOAD_LIBRARY_SEARCH_SYSTEM32
 VH_SALT                   equ 20        ; VAULT_HDR.salt byte offset (mirrors vault.asm)
 
 externdef g_tpm_reqhello:dword          ; C4: require Hello/PIN on TPM unlock (gui.asm)
@@ -50,15 +62,23 @@ externdef g_vaulthwnd:qword             ; main vault HWND (gui.asm)
 .data
 ; CNG provider / algorithm names as UTF-16 (no commas -> WSTR)
 WSTR tpm_prov, <Microsoft Platform Crypto Provider>
+WSTR ngc_prov, <Microsoft Passport Key Storage Provider>
+WSTR ngc_dll,  <cryptngc.dll>
 WSTR tpm_alg,  <RSA>
 WSTR tpm_sha,  <SHA256>
 WSTR tpm_lenprop, <Length>              ; NCRYPT_LENGTH_PROPERTY
 WSTR key_usage_prop, <Key Usage>        ; NCRYPT_KEY_USAGE_PROPERTY
 WSTR export_pol_prop, <Export Policy>   ; NCRYPT_EXPORT_POLICY_PROPERTY
 WSTR hwnd_prop,   <HWND Handle>         ; NCRYPT_HWND_PROPERTY
+WSTR pin_prop,    <SmartCardPin>        ; NCRYPT_PIN_PROPERTY (hardware TPM userAuth)
+CSTR ngc_fn_defkey, "NgcGetDefaultDecryptionKeyName"
 tpm_keylen   dd 2048                    ; force RSA-2048 (never the provider default)
 tpm_keyusage dd 1                       ; NCRYPT_ALLOW_DECRYPT_FLAG (decryption ONLY)
 tpm_exppol   dd 0                       ; non-exportable
+ifdef PROBE_IO
+public g_tpm_kat_nohwpin
+g_tpm_kat_nohwpin dd 0                  ; 1 in deliberate-fail KATs to spare physical TPM DA tries
+endif
 ; C4: UI policy stamped on the key when g_tpm_reqhello is set (opt-in).
 WSTR ui_policy_prop, <UI Policy>        ; NCRYPT_UI_POLICY_PROPERTY
 WSTR ui_friendly,    <Vordr>
@@ -297,8 +317,9 @@ ts_cpk:
     ret
 ts_delkey:
     ; Clean up any half-created or unusable persisted key on error; NCryptDeleteKey
-    ; frees hKey ONLY when it returns ERROR_SUCCESS (0).
-    WINCALL NCryptDeleteKey, qword ptr [g_tpm_key], NCRYPT_SILENT_FLAG
+    ; frees hKey ONLY when it returns ERROR_SUCCESS (0).  PCP rejects NCRYPT_SILENT_FLAG
+    ; on NCryptDeleteKey with NTE_BAD_FLAGS (80090009h) and deletes silently with 0.
+    WINCALL NCryptDeleteKey, qword ptr [g_tpm_key], 0
     test    eax, eax
     jz      ts_keygone
     WINCALL NCryptFreeObject, qword ptr [g_tpm_key]
@@ -469,7 +490,8 @@ tpm_delete proc frame
     call    tpm_attach_hwnd
 @@: ; NCryptDeleteKey frees the key handle ONLY on ERROR_SUCCESS (0); on failure
     ; we must explicitly NCryptFreeObject(g_tpm_key) and return 0!
-    WINCALL NCryptDeleteKey, qword ptr [g_tpm_key], dword ptr [rbp-32]
+    ; PCP requires dwFlags=0 on NCryptDeleteKey (0x40 fails with NTE_BAD_FLAGS).
+    WINCALL NCryptDeleteKey, qword ptr [g_tpm_key], 0
     mov     dword ptr [rbp-40], eax
     test    eax, eax
     jz      td_deleted
@@ -494,6 +516,628 @@ td_fail:
     ret
 tpm_delete endp
 
+; tpm_wbytes_incl_nul(rcx = wideZ) -> eax = byte count including terminating NUL.
+tpm_wbytes_incl_nul proc
+    xor     eax, eax
+    test    rcx, rcx
+    jz      twb_ret
+twb_lp:
+    cmp     word ptr [rcx+rax*2], 0
+    je      twb_done
+    inc     eax
+    cmp     eax, 256
+    jb      twb_lp
+twb_done:
+    inc     eax
+    shl     eax, 1
+twb_ret:
+    ret
+tpm_wbytes_incl_nul endp
+
+; ===========================================================================
+; tpm_seal_pin(rcx=keyname, rdx=in32, r8=pin_wide, r9=outblob, [rbp+48]=cap)
+;   -> eax = blob len (0=fail).
+;   Creates an RSA-2048 PCP key protected by hardware TPM 2.0 userAuth
+;   (NCRYPT_PIN_PROPERTY = "SmartCardPin", NCRYPT_SILENT_FLAG) and OAEP-seals
+;   the 64-byte context-bound payload {in32 || SHA-256(in32 || g_tpm_label)}.
+; ===========================================================================
+public tpm_seal_pin
+tpm_seal_pin proc frame
+    FRAME_PROLOG 224
+    ; [rbp-16]=keyname [rbp-24]=in32 [rbp-32]=pin_wide [rbp-40]=outblob
+    ; [rbp-48]=cap [rbp-52]=rc [rbp-56]=pin_bytes [rbp-128..-65]=pt64
+    mov     qword ptr [rbp-16], rcx
+    mov     qword ptr [rbp-24], rdx
+    mov     qword ptr [rbp-32], r8
+    mov     qword ptr [rbp-40], r9
+    mov     eax, dword ptr [rbp+48]
+    mov     dword ptr [rbp-48], eax
+    mov     qword ptr [g_tpm_prov], 0
+    mov     qword ptr [g_tpm_key], 0
+    mov     dword ptr [g_tpm_cbres], 0
+    mov     rcx, r8
+    call    tpm_wbytes_incl_nul
+    cmp     eax, 4                              ; require non-empty SmartCardPin
+    jb      tsp_fail
+    mov     dword ptr [rbp-56], eax
+    WINCALL NCryptOpenStorageProvider, addr g_tpm_prov, addr tpm_prov, 0
+    test    eax, eax
+    jnz     tsp_fail
+    WINCALL NCryptCreatePersistedKey, qword ptr [g_tpm_prov], addr g_tpm_key, \
+            addr tpm_alg, qword ptr [rbp-16], 0, NCRYPT_OVERWRITE_KEY_FLAG
+    test    eax, eax
+    jnz     tsp_freeprov
+    WINCALL NCryptSetProperty, qword ptr [g_tpm_key], addr tpm_lenprop, \
+            addr tpm_keylen, 4, 0
+    test    eax, eax
+    jnz     tsp_delkey
+    WINCALL NCryptSetProperty, qword ptr [g_tpm_key], addr key_usage_prop, \
+            addr tpm_keyusage, 4, 0
+    test    eax, eax
+    jz      tsp_exp
+    cmp     eax, 80090029h
+    jne     tsp_delkey
+tsp_exp:
+    WINCALL NCryptSetProperty, qword ptr [g_tpm_key], addr export_pol_prop, \
+            addr tpm_exppol, 4, 0
+    test    eax, eax
+    jz      tsp_pin
+    cmp     eax, 80090029h
+    jne     tsp_delkey
+tsp_pin:
+ifdef PROBE_IO
+    cmp     dword ptr [g_tpm_kat_nohwpin], 0
+    jne     tsp_fin
+endif
+    WINCALL NCryptSetProperty, qword ptr [g_tpm_key], addr pin_prop, \
+            qword ptr [rbp-32], dword ptr [rbp-56], NCRYPT_SILENT_FLAG
+    test    eax, eax
+    jnz     tsp_delkey
+tsp_fin:
+    WINCALL NCryptFinalizeKey, qword ptr [g_tpm_key], NCRYPT_SILENT_FLAG
+    test    eax, eax
+    jnz     tsp_delkey
+    call    tpm_compute_label
+    xor     ecx, ecx
+    call    tpm_build_oaep
+    mov     r10, qword ptr [rbp-24]
+    lea     r11, [rbp-128]
+    xor     ecx, ecx
+tsp_cpk:
+    mov     al, byte ptr [r10+rcx]
+    mov     byte ptr [r11+rcx], al
+    inc     ecx
+    cmp     ecx, 32
+    jb      tsp_cpk
+    lea     rcx, [g_tpm_sha_ctx]
+    call    sha256_init
+    lea     rcx, [g_tpm_sha_ctx]
+    lea     rdx, [rbp-128]
+    mov     r8d, 32
+    call    sha256_update
+    lea     rcx, [g_tpm_sha_ctx]
+    lea     rdx, [g_tpm_label]
+    mov     r8d, 32
+    call    sha256_update
+    lea     rcx, [g_tpm_sha_ctx]
+    lea     rdx, [rbp-96]
+    call    sha256_final
+    lea     r10, [rbp-128]
+    WINCALL NCryptEncrypt, qword ptr [g_tpm_key], r10, 64, \
+            addr g_tpm_oaep, qword ptr [rbp-40], dword ptr [rbp-48], \
+            addr g_tpm_cbres, NCRYPT_OAEP_SILENT
+    mov     dword ptr [rbp-52], eax
+    lea     rcx, [rbp-128]
+    mov     edx, 64
+    call    secure_zero
+    lea     rcx, [g_tpm_sha_ctx]
+    mov     edx, 128
+    call    secure_zero
+    lea     rcx, [g_tpm_label]
+    mov     edx, 32
+    call    secure_zero
+    cmp     dword ptr [rbp-52], 0
+    jne     tsp_delkey
+    mov     eax, dword ptr [g_tpm_cbres]
+    test    eax, eax
+    jz      tsp_delkey
+    cmp     eax, dword ptr [rbp-48]
+    ja      tsp_delkey
+    WINCALL NCryptFreeObject, qword ptr [g_tpm_key]
+    mov     qword ptr [g_tpm_key], 0
+    WINCALL NCryptFreeObject, qword ptr [g_tpm_prov]
+    mov     qword ptr [g_tpm_prov], 0
+    mov     eax, dword ptr [g_tpm_cbres]
+    FRAME_EPILOG
+    ret
+tsp_delkey:
+    WINCALL NCryptDeleteKey, qword ptr [g_tpm_key], 0
+    test    eax, eax
+    jz      tsp_keygone
+    WINCALL NCryptFreeObject, qword ptr [g_tpm_key]
+tsp_keygone:
+    mov     qword ptr [g_tpm_key], 0
+tsp_freeprov:
+    WINCALL NCryptFreeObject, qword ptr [g_tpm_prov]
+    mov     qword ptr [g_tpm_prov], 0
+tsp_fail:
+    mov     qword ptr [g_tpm_prov], 0
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+tpm_seal_pin endp
+
+; ===========================================================================
+; tpm_unseal_pin(rcx=keyname, rdx=blob, r8d=bloblen, r9=pin_wide, [rbp+48]=out32)
+;   -> eax = 1 / 0.
+; ===========================================================================
+public tpm_unseal_pin
+tpm_unseal_pin proc frame
+    FRAME_PROLOG 240
+    ; [rbp-16]=keyname [rbp-24]=blob [rbp-32]=bloblen [rbp-40]=pin_wide
+    ; [rbp-48]=out32 [rbp-56]=pin_bytes [rbp-128..-65]=pt64 [rbp-160..-129]=exp_tag
+    mov     qword ptr [rbp-16], rcx
+    mov     qword ptr [rbp-24], rdx
+    mov     dword ptr [rbp-32], r8d
+    mov     qword ptr [rbp-40], r9
+    mov     rax, qword ptr [rbp+48]
+    mov     qword ptr [rbp-48], rax
+    mov     qword ptr [g_tpm_prov], 0
+    mov     qword ptr [g_tpm_key], 0
+    mov     dword ptr [g_tpm_cbres], 0
+    lea     rcx, [rbp-160]
+    mov     edx, 96
+    call    secure_zero
+    mov     rcx, qword ptr [rbp-40]
+    call    tpm_wbytes_incl_nul
+    cmp     eax, 4
+    jb      tup_fail
+    mov     dword ptr [rbp-56], eax
+    WINCALL NCryptOpenStorageProvider, addr g_tpm_prov, addr tpm_prov, 0
+    test    eax, eax
+    jnz     tup_fail
+    WINCALL NCryptOpenKey, qword ptr [g_tpm_prov], addr g_tpm_key, \
+            qword ptr [rbp-16], 0, NCRYPT_SILENT_FLAG
+    test    eax, eax
+    jnz     tup_freeprov
+ifdef PROBE_IO
+    cmp     dword ptr [g_tpm_kat_nohwpin], 0
+    jne     tup_dec
+endif
+    WINCALL NCryptSetProperty, qword ptr [g_tpm_key], addr pin_prop, \
+            qword ptr [rbp-40], dword ptr [rbp-56], NCRYPT_SILENT_FLAG
+    test    eax, eax
+    jnz     tup_freekey
+tup_dec:
+    call    tpm_compute_label
+    xor     ecx, ecx
+    call    tpm_build_oaep
+    lea     r10, [rbp-128]
+    WINCALL NCryptDecrypt, qword ptr [g_tpm_key], qword ptr [rbp-24], dword ptr [rbp-32], \
+            addr g_tpm_oaep, r10, 64, \
+            addr g_tpm_cbres, NCRYPT_OAEP_SILENT
+    test    eax, eax
+    jnz     tup_freekey
+    cmp     dword ptr [g_tpm_cbres], 64
+    jne     tup_freekey
+    lea     rcx, [g_tpm_sha_ctx]
+    call    sha256_init
+    lea     rcx, [g_tpm_sha_ctx]
+    lea     rdx, [rbp-128]
+    mov     r8d, 32
+    call    sha256_update
+    lea     rcx, [g_tpm_sha_ctx]
+    lea     rdx, [g_tpm_label]
+    mov     r8d, 32
+    call    sha256_update
+    lea     rcx, [g_tpm_sha_ctx]
+    lea     rdx, [rbp-160]
+    call    sha256_final
+    lea     rcx, [rbp-160]
+    lea     rdx, [rbp-96]
+    mov     r8d, 32
+    call    ct_memcmp
+    test    eax, eax
+    jnz     tup_freekey
+    mov     r11, qword ptr [rbp-48]
+    test    r11, r11
+    jz      tup_freekey
+    lea     r10, [rbp-128]
+    xor     ecx, ecx
+tup_cp:
+    mov     al, byte ptr [r10+rcx]
+    mov     byte ptr [r11+rcx], al
+    inc     ecx
+    cmp     ecx, 32
+    jb      tup_cp
+    lea     rcx, [rbp-160]
+    mov     edx, 96
+    call    secure_zero
+    lea     rcx, [g_tpm_sha_ctx]
+    mov     edx, 128
+    call    secure_zero
+    lea     rcx, [g_tpm_label]
+    mov     edx, 32
+    call    secure_zero
+    WINCALL NCryptFreeObject, qword ptr [g_tpm_key]
+    mov     qword ptr [g_tpm_key], 0
+    WINCALL NCryptFreeObject, qword ptr [g_tpm_prov]
+    mov     qword ptr [g_tpm_prov], 0
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+tup_freekey:
+    WINCALL NCryptFreeObject, qword ptr [g_tpm_key]
+    mov     qword ptr [g_tpm_key], 0
+tup_freeprov:
+    WINCALL NCryptFreeObject, qword ptr [g_tpm_prov]
+    mov     qword ptr [g_tpm_prov], 0
+tup_fail:
+    mov     qword ptr [g_tpm_prov], 0
+    lea     rcx, [rbp-160]
+    mov     edx, 96
+    call    secure_zero
+    lea     rcx, [g_tpm_sha_ctx]
+    mov     edx, 128
+    call    secure_zero
+    lea     rcx, [g_tpm_label]
+    mov     edx, 32
+    call    secure_zero
+    mov     rcx, qword ptr [rbp-48]
+    test    rcx, rcx
+    jz      @F
+    mov     edx, 32
+    call    secure_zero
+@@: xor     eax, eax
+    FRAME_EPILOG
+    ret
+tpm_unseal_pin endp
+
+; ===========================================================================
+; Windows Hello (Microsoft Passport Key Storage Provider + cryptngc.dll)
+;   Uses the current user's OS-managed NGC default decryption key so unpackaged
+;   Win32 builds (standalone exe + MSI) support Windows Hello Face, Fingerprint,
+;   and Hello PIN without requiring MSIX package identity.
+; ===========================================================================
+; tpm_hello_keyname(rcx = *pwszOut) -> eax = 1 (caller LocalFree's *pwszOut) / 0.
+tpm_hello_keyname proc frame
+    FRAME_PROLOG 224
+    ; [rbp-16]=outp [rbp-24]=hTok [rbp-32]=pszSid [rbp-40]=hMod [rbp-48]=cbRet
+    ; [rbp-160..-49]=TOKEN_USER buffer (112 bytes)
+    mov     qword ptr [rbp-16], rcx
+    mov     qword ptr [rcx], 0
+    mov     qword ptr [rbp-24], 0
+    mov     qword ptr [rbp-32], 0
+    mov     qword ptr [rbp-40], 0
+    mov     dword ptr [rbp-48], 0
+    WINCALL OpenProcessToken, -1, 8, addr rbp-24            ; TOKEN_QUERY = 8
+    test    eax, eax
+    jz      thk_fail
+    WINCALL GetTokenInformation, qword ptr [rbp-24], 1, addr rbp-160, 112, addr rbp-48
+    test    eax, eax
+    jz      thk_clean
+    mov     rcx, qword ptr [rbp-160]                        ; TOKEN_USER.User.Sid
+    WINCALL ConvertSidToStringSidW, rcx, addr rbp-32
+    test    eax, eax
+    jz      thk_clean
+    WINCALL LoadLibraryExW, addr ngc_dll, 0, LOAD_LIB_SYS32
+    test    rax, rax
+    jz      thk_clean
+    mov     qword ptr [rbp-40], rax
+    WINCALL GetProcAddress, rax, addr ngc_fn_defkey
+    test    rax, rax
+    jz      thk_clean
+    mov     rcx, qword ptr [rbp-32]                         ; pszSid
+    xor     edx, edx                                        ; dwFlags = 0
+    xor     r8d, r8d                                        ; dwReserved = 0
+    mov     r9, qword ptr [rbp-16]                          ; &pwszKeyName
+    call    rax                                             ; NgcGetDefaultDecryptionKeyName
+    test    eax, eax
+    jnz     thk_clean
+    mov     rax, qword ptr [rbp-16]
+    cmp     qword ptr [rax], 0
+    je      thk_clean
+    WINCALL FreeLibrary, qword ptr [rbp-40]
+    WINCALL LocalFree, qword ptr [rbp-32]
+    WINCALL CloseHandle, qword ptr [rbp-24]
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+thk_clean:
+    cmp     qword ptr [rbp-40], 0
+    je      @F
+    WINCALL FreeLibrary, qword ptr [rbp-40]
+@@: cmp     qword ptr [rbp-32], 0
+    je      @F
+    WINCALL LocalFree, qword ptr [rbp-32]
+@@: cmp     qword ptr [rbp-24], 0
+    je      thk_fail
+    WINCALL CloseHandle, qword ptr [rbp-24]
+thk_fail:
+    mov     rax, qword ptr [rbp-16]
+    mov     qword ptr [rax], 0
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+tpm_hello_keyname endp
+
+; tpm_hello_available() -> eax = 1 iff Windows Hello NGC decryption key is provisioned.
+public tpm_hello_available
+tpm_hello_available proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], 0               ; pwszKeyName
+    mov     qword ptr [g_tpm_prov], 0
+    mov     qword ptr [g_tpm_key], 0
+    lea     rcx, [rbp-24]
+    call    tpm_hello_keyname
+    test    eax, eax
+    jz      tha_no
+    WINCALL NCryptOpenStorageProvider, addr g_tpm_prov, addr ngc_prov, 0
+    test    eax, eax
+    jnz     tha_freename
+    WINCALL NCryptOpenKey, qword ptr [g_tpm_prov], addr g_tpm_key, \
+            qword ptr [rbp-24], 0, NCRYPT_SILENT_FLAG
+    test    eax, eax
+    jnz     tha_freeprov
+    WINCALL NCryptFreeObject, qword ptr [g_tpm_key]
+    mov     qword ptr [g_tpm_key], 0
+    WINCALL NCryptFreeObject, qword ptr [g_tpm_prov]
+    mov     qword ptr [g_tpm_prov], 0
+    WINCALL LocalFree, qword ptr [rbp-24]
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+tha_freeprov:
+    WINCALL NCryptFreeObject, qword ptr [g_tpm_prov]
+    mov     qword ptr [g_tpm_prov], 0
+tha_freename:
+    WINCALL LocalFree, qword ptr [rbp-24]
+tha_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+tpm_hello_available endp
+
+; tpm_hello_seal(rcx=in32, rdx=outblob, r8d=cap) -> eax = blob len (0=fail/cancelled).
+;   Encrypts the 64-byte context-bound payload to the user's Passport NGC key AND
+;   immediately verifies live Windows Hello consent via NCryptDecrypt (prompting
+;   Face / Fingerprint / Hello PIN before enrollment commits).
+public tpm_hello_seal
+tpm_hello_seal proc frame
+    FRAME_PROLOG 272
+    ; [rbp-16]=in32 [rbp-24]=outblob [rbp-32]=cap [rbp-40]=pwszKeyName
+    ; [rbp-48]=enc_len [rbp-52]=rc [rbp-128..-65]=pt64 [rbp-192..-129]=verify64
+    mov     qword ptr [rbp-16], rcx
+    mov     qword ptr [rbp-24], rdx
+    mov     dword ptr [rbp-32], r8d
+    mov     qword ptr [rbp-40], 0
+    mov     qword ptr [g_tpm_prov], 0
+    mov     qword ptr [g_tpm_key], 0
+    mov     dword ptr [g_tpm_cbres], 0
+    lea     rcx, [rbp-192]
+    mov     edx, 128
+    call    secure_zero
+    lea     rcx, [rbp-40]
+    call    tpm_hello_keyname
+    test    eax, eax
+    jz      ths_fail
+    WINCALL NCryptOpenStorageProvider, addr g_tpm_prov, addr ngc_prov, 0
+    test    eax, eax
+    jnz     ths_freename
+    WINCALL NCryptOpenKey, qword ptr [g_tpm_prov], addr g_tpm_key, \
+            qword ptr [rbp-40], 0, 0
+    test    eax, eax
+    jnz     ths_freeprov
+    mov     rcx, qword ptr [g_tpm_key]
+    call    tpm_attach_hwnd
+    call    tpm_compute_label
+    xor     ecx, ecx
+    call    tpm_build_oaep
+    mov     r10, qword ptr [rbp-16]
+    lea     r11, [rbp-128]
+    xor     ecx, ecx
+ths_cp:
+    mov     al, byte ptr [r10+rcx]
+    mov     byte ptr [r11+rcx], al
+    inc     ecx
+    cmp     ecx, 32
+    jb      ths_cp
+    lea     rcx, [g_tpm_sha_ctx]
+    call    sha256_init
+    lea     rcx, [g_tpm_sha_ctx]
+    lea     rdx, [rbp-128]
+    mov     r8d, 32
+    call    sha256_update
+    lea     rcx, [g_tpm_sha_ctx]
+    lea     rdx, [g_tpm_label]
+    mov     r8d, 32
+    call    sha256_update
+    lea     rcx, [g_tpm_sha_ctx]
+    lea     rdx, [rbp-96]
+    call    sha256_final
+    lea     r10, [rbp-128]
+    WINCALL NCryptEncrypt, qword ptr [g_tpm_key], r10, 64, \
+            addr g_tpm_oaep, qword ptr [rbp-24], dword ptr [rbp-32], \
+            addr g_tpm_cbres, NCRYPT_OAEP_SILENT
+    test    eax, eax
+    jnz     ths_freekey
+    mov     eax, dword ptr [g_tpm_cbres]
+    test    eax, eax
+    jz      ths_freekey
+    cmp     eax, dword ptr [rbp-32]
+    ja      ths_freekey
+    mov     dword ptr [rbp-48], eax
+    ; Prompt Windows Hello now (no NCRYPT_SILENT_FLAG) to confirm user consent & key usability
+    lea     r10, [rbp-192]
+    WINCALL NCryptDecrypt, qword ptr [g_tpm_key], qword ptr [rbp-24], dword ptr [rbp-48], \
+            addr g_tpm_oaep, r10, 64, \
+            addr g_tpm_cbres, NCRYPT_PAD_OAEP
+    test    eax, eax
+    jnz     ths_freekey
+    cmp     dword ptr [g_tpm_cbres], 64
+    jne     ths_freekey
+    lea     rcx, [rbp-192]
+    lea     rdx, [rbp-128]
+    mov     r8d, 64
+    call    ct_memcmp
+    test    eax, eax
+    jnz     ths_freekey
+    lea     rcx, [rbp-192]
+    mov     edx, 128
+    call    secure_zero
+    lea     rcx, [g_tpm_sha_ctx]
+    mov     edx, 128
+    call    secure_zero
+    lea     rcx, [g_tpm_label]
+    mov     edx, 32
+    call    secure_zero
+    WINCALL NCryptFreeObject, qword ptr [g_tpm_key]
+    mov     qword ptr [g_tpm_key], 0
+    WINCALL NCryptFreeObject, qword ptr [g_tpm_prov]
+    mov     qword ptr [g_tpm_prov], 0
+    WINCALL LocalFree, qword ptr [rbp-40]
+    mov     eax, dword ptr [rbp-48]
+    FRAME_EPILOG
+    ret
+ths_freekey:
+    WINCALL NCryptFreeObject, qword ptr [g_tpm_key]
+    mov     qword ptr [g_tpm_key], 0
+ths_freeprov:
+    WINCALL NCryptFreeObject, qword ptr [g_tpm_prov]
+    mov     qword ptr [g_tpm_prov], 0
+ths_freename:
+    WINCALL LocalFree, qword ptr [rbp-40]
+ths_fail:
+    lea     rcx, [rbp-192]
+    mov     edx, 128
+    call    secure_zero
+    lea     rcx, [g_tpm_sha_ctx]
+    mov     edx, 128
+    call    secure_zero
+    lea     rcx, [g_tpm_label]
+    mov     edx, 32
+    call    secure_zero
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+tpm_hello_seal endp
+
+; tpm_hello_unseal(rcx=blob, edx=bloblen, r8=out32) -> eax = 1 / 0.
+;   Prompts Windows Hello (Face / Fingerprint / Hello PIN) via Passport KSP.
+public tpm_hello_unseal
+tpm_hello_unseal proc frame
+    FRAME_PROLOG 240
+    ; [rbp-16]=blob [rbp-24]=bloblen [rbp-32]=out32 [rbp-40]=pwszKeyName
+    ; [rbp-128..-65]=pt64 [rbp-160..-129]=exp_tag
+    mov     qword ptr [rbp-16], rcx
+    mov     dword ptr [rbp-24], edx
+    mov     qword ptr [rbp-32], r8
+    mov     qword ptr [rbp-40], 0
+    mov     qword ptr [g_tpm_prov], 0
+    mov     qword ptr [g_tpm_key], 0
+    mov     dword ptr [g_tpm_cbres], 0
+    lea     rcx, [rbp-160]
+    mov     edx, 96
+    call    secure_zero
+    lea     rcx, [rbp-40]
+    call    tpm_hello_keyname
+    test    eax, eax
+    jz      thu_fail
+    WINCALL NCryptOpenStorageProvider, addr g_tpm_prov, addr ngc_prov, 0
+    test    eax, eax
+    jnz     thu_freename
+    WINCALL NCryptOpenKey, qword ptr [g_tpm_prov], addr g_tpm_key, \
+            qword ptr [rbp-40], 0, 0
+    test    eax, eax
+    jnz     thu_freeprov
+    mov     rcx, qword ptr [g_tpm_key]
+    call    tpm_attach_hwnd
+    call    tpm_compute_label
+    xor     ecx, ecx
+    call    tpm_build_oaep
+    lea     r10, [rbp-128]
+    WINCALL NCryptDecrypt, qword ptr [g_tpm_key], qword ptr [rbp-16], dword ptr [rbp-24], \
+            addr g_tpm_oaep, r10, 64, \
+            addr g_tpm_cbres, NCRYPT_PAD_OAEP
+    test    eax, eax
+    jnz     thu_freekey
+    cmp     dword ptr [g_tpm_cbres], 64
+    jne     thu_freekey
+    lea     rcx, [g_tpm_sha_ctx]
+    call    sha256_init
+    lea     rcx, [g_tpm_sha_ctx]
+    lea     rdx, [rbp-128]
+    mov     r8d, 32
+    call    sha256_update
+    lea     rcx, [g_tpm_sha_ctx]
+    lea     rdx, [g_tpm_label]
+    mov     r8d, 32
+    call    sha256_update
+    lea     rcx, [g_tpm_sha_ctx]
+    lea     rdx, [rbp-160]
+    call    sha256_final
+    lea     rcx, [rbp-160]
+    lea     rdx, [rbp-96]
+    mov     r8d, 32
+    call    ct_memcmp
+    test    eax, eax
+    jnz     thu_freekey
+    mov     r11, qword ptr [rbp-32]
+    test    r11, r11
+    jz      thu_freekey
+    lea     r10, [rbp-128]
+    xor     ecx, ecx
+thu_cp:
+    mov     al, byte ptr [r10+rcx]
+    mov     byte ptr [r11+rcx], al
+    inc     ecx
+    cmp     ecx, 32
+    jb      thu_cp
+    lea     rcx, [rbp-160]
+    mov     edx, 96
+    call    secure_zero
+    lea     rcx, [g_tpm_sha_ctx]
+    mov     edx, 128
+    call    secure_zero
+    lea     rcx, [g_tpm_label]
+    mov     edx, 32
+    call    secure_zero
+    WINCALL NCryptFreeObject, qword ptr [g_tpm_key]
+    mov     qword ptr [g_tpm_key], 0
+    WINCALL NCryptFreeObject, qword ptr [g_tpm_prov]
+    mov     qword ptr [g_tpm_prov], 0
+    WINCALL LocalFree, qword ptr [rbp-40]
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+thu_freekey:
+    WINCALL NCryptFreeObject, qword ptr [g_tpm_key]
+    mov     qword ptr [g_tpm_key], 0
+thu_freeprov:
+    WINCALL NCryptFreeObject, qword ptr [g_tpm_prov]
+    mov     qword ptr [g_tpm_prov], 0
+thu_freename:
+    WINCALL LocalFree, qword ptr [rbp-40]
+thu_fail:
+    lea     rcx, [rbp-160]
+    mov     edx, 96
+    call    secure_zero
+    lea     rcx, [g_tpm_sha_ctx]
+    mov     edx, 128
+    call    secure_zero
+    lea     rcx, [g_tpm_label]
+    mov     edx, 32
+    call    secure_zero
+    mov     rcx, qword ptr [rbp-32]
+    test    rcx, rcx
+    jz      @F
+    mov     edx, 32
+    call    secure_zero
+@@: xor     eax, eax
+    FRAME_EPILOG
+    ret
+tpm_hello_unseal endp
+
 ; ===========================================================================
 ; cmd_tpmkat - VDR-10 OAEP v2 label domain/salt/reqhello binding KAT +
 ;   optional live Platform Crypto Provider cross-vault transplant refusal.
@@ -502,7 +1146,9 @@ extern print_a:proc
 
 .data
 WSTR tpk_key, <VordrTpmKatKey>
-CSTR tpk_ok_live, "tpmkat: PASS (OAEP v2 label + live TPM cross-vault transplant refused)",13,10
+WSTR tpk_pinkey, <VordrTpmKatPinKey>
+WSTR tpk_hwpin,  <0123456789abcdef0123456789abcdef>
+CSTR tpk_ok_live, "tpmkat: PASS (OAEP v2 + HW SmartCardPin + S0/S1 anti-replay + 3-strike revoke)",13,10
 CSTR tpk_ok_sw,   "tpmkat: PASS (OAEP v2 label binding ok; no writable PCP TPM on host)",13,10
 CSTR tpk_bad,     "tpmkat: FAIL",13,10
 .data?
@@ -656,6 +1302,51 @@ tpk_cp1:
     jnz     tpk_del_fail
     lea     rcx, [tpk_key]
     call    tpm_delete
+    cmp     eax, 1
+    jne     tpk_fail
+    ; Deleted key MUST no longer unseal!
+    lea     rcx, [tpk_key]
+    lea     rdx, [tpk_blob]
+    mov     r8d, dword ptr [rbp-28]
+    lea     r9, [tpk_out]
+    call    tpm_unseal
+    test    eax, eax
+    jnz     tpk_fail
+
+    ; 5) Hardware TPM 2.0 SmartCardPin seal + matching-PIN unseal + delete (0 DA tries)
+    WINCALL tpm_seal_pin, addr tpk_pinkey, addr tpk_in, addr tpk_hwpin, addr tpk_blob, 512
+    test    eax, eax
+    jz      tpk_fail
+    mov     dword ptr [rbp-28], eax
+    lea     rcx, [tpk_out]
+    mov     edx, 32
+    call    secure_zero
+    WINCALL tpm_unseal_pin, addr tpk_pinkey, addr tpk_blob, dword ptr [rbp-28], addr tpk_hwpin, addr tpk_out
+    cmp     eax, 1
+    jne     tpk_delpin_fail
+    lea     rcx, [tpk_out]
+    lea     rdx, [tpk_in]
+    mov     r8d, 32
+    call    ct_memcmp
+    test    eax, eax
+    jnz     tpk_delpin_fail
+    lea     rcx, [tpk_pinkey]
+    call    tpm_delete
+    cmp     eax, 1
+    jne     tpk_fail
+
+    ; 6) Silent Passport NGC availability probe must return 0 or 1 cleanly
+    call    tpm_hello_available
+    cmp     eax, 1
+    ja      tpk_fail
+
+ifdef PROBE_IO
+    ; 7) Full TPM+PIN envelope anti-replay (HKCU snapshot replay + 3-strike revoke)
+    call    vault_tpm_pin_kat
+    test    eax, eax
+    jnz     tpk_fail
+endif
+
     lea     rcx, [tpk_out]
     mov     edx, 32
     call    secure_zero
@@ -666,6 +1357,11 @@ tpk_cp1:
     xor     eax, eax
     FRAME_EPILOG
     ret
+
+tpk_delpin_fail:
+    lea     rcx, [tpk_pinkey]
+    call    tpm_delete
+    jmp     tpk_fail
 
 tpk_sw_ok:
     call    tpk_restore

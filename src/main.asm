@@ -58,6 +58,7 @@ extern cmd_seedbig:proc                 ; a 40-field entry for the detail-pane s
 extern cmd_cowrite:proc                 ; C8: write-lock exclusivity probe (vault.asm)
 extern cmd_attfuzz:proc                 ; G8: attachment-index fuzzer (vault.asm)
 extern cmd_healthkat:proc               ; E6: vault-health analysis KAT (vault.asm)
+extern cmd_pinkat:proc                  ; PIN secret strength & trivial-pattern KAT (vault.asm)
 extern gui_layout_probe:proc            ; runtime dialog-geometry probe (gui.asm)
 extern cmd_secdeskkat:proc              ; VDR-13 secure-desktop fallback/orphan KAT (gui.asm)
 extern cmd_xctest:proc                  ; external-change detection probe (vault.asm)
@@ -113,6 +114,7 @@ ARGBUF_CHARS         equ 20000h      ; total UTF-16 units for all parsed args
 .data
 public g_cfg_in, g_cfg_out, g_cfg_passlen, g_cfg_t, g_cfg_m
 public g_cfg_pwminlen, g_cfg_pwminclasses
+public g_cfg_pinminlen, g_cfg_pinnotriv
 public g_argc                           ; gui.asm reads argv[1] for a shell-associated .vordr
 g_argc          dd 0
 g_cfg_in        dq 0                ; -> UTF-16 input path  (into g_argbuf)
@@ -122,6 +124,8 @@ g_cfg_t         dd ARGON2_DEF_T
 g_cfg_m         dd ARGON2_DEF_M_KIB
 g_cfg_pwminlen      dd 12           ; password policy: min length (code points)
 g_cfg_pwminclasses  dd 3            ; password policy: min distinct char classes
+g_cfg_pinminlen     dd PIN_MINLEN_DEF ; PIN policy: min length (code points)
+g_cfg_pinnotriv     dd 1            ; PIN policy: 1 = reject trivial patterns on save/enrol
 public g_cfg_loglevel
 g_cfg_loglevel      dd 0            ; log verbosity (0 = none/off by default; see log.asm)
 public g_cfg_logfile
@@ -257,6 +261,7 @@ WSTR w_attovfkat, <attovfkat>
 WSTR w_vattcolkat, <vattcolkat>
 WSTR w_polkat,   <polkat>
 WSTR w_tpmkat,   <tpmkat>
+WSTR w_pinkat,   <pinkat>
 ifdef DBG_TRACE
 WSTR w_securedesk, <securedesk>
 endif
@@ -347,6 +352,7 @@ ifdef PROBE_IO
     CMDENT { w_vattcolkat, cmd_vattcolkat, 1, 0 } ; VDR-19 real-GCM VATT tag-collision KAT
     CMDENT { w_polkat,    cmd_polkat,    0, 0 }   ; VDR-09/VDR-23 registry policy + cfg_in_set KAT
     CMDENT { w_tpmkat,    cmd_tpmkat,    0, 0 }   ; VDR-10 TPM OAEP v2 label + cleanup KAT
+    CMDENT { w_pinkat,    cmd_pinkat,    0, 0 }   ; PIN strength & trivial-pattern KAT
     CMDENT { w_pkat,      cmd_pkat,      0, 0 }   ; parallel fail-closed KAT gate
     CMDENT { w_trtest,    cmd_trtest,    0, 0 }   ; trash timestamp/threshold KAT
 else
@@ -392,6 +398,7 @@ else
     CMDENT { w_vattcolkat, 0, 1, 0 }
     CMDENT { w_polkat,    0, 0, 0 }
     CMDENT { w_tpmkat,    0, 0, 0 }
+    CMDENT { w_pinkat,    0, 0, 0 }
     CMDENT { w_pkat,      0, 0, 0 }
     CMDENT { w_trtest,    0, 0, 0 }
 endif

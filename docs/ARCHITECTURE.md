@@ -104,7 +104,7 @@ conflict. Nearby rotating backups are not an independent backup.
 | ZIP interoperability | WinZip AE-2: PBKDF2-HMAC-SHA1, AES-256-CTR, truncated HMAC-SHA1, plus per-attachment `SHA-256` plaintext digests inside `vordr.json` |
 | Passphrase generation | Unbiased 16-bit draws across an embedded `2,048`-word list (`11` bits/word, `6..24` words) |
 | Randomness | `BCryptGenRandom`, supplemented by RDSEED across 8-byte lanes and `1..7`-byte tails when available |
-| TPM convenience | Non-exportable RSA-2048 OAEP (SHA-256, `NCRYPT_ALLOW_DECRYPT_FLAG`) wrapping a 64-byte context-bound payload `key32 \|\| SHA-256(key32 \|\| label32)` where `label32 = SHA-256("Vordr-TPM-v2" \|\| vault_salt \|\| LE32(reqhello))` via Microsoft Platform Crypto Provider |
+| TPM convenience (Modes 1–3) | Non-exportable RSA-2048 OAEP (SHA-256, `NCRYPT_ALLOW_DECRYPT_FLAG`) wrapping a 64-byte context-bound payload `secret32 \|\| SHA-256(secret32 \|\| label32)` (`label32 = SHA-256("Vordr-TPM-v2" \|\| vault_salt \|\| LE32(mode))`) in Microsoft Platform Crypto Provider, plus `S0`/`S1` pre-commit state-key rotation + `SmartCardPin` + `Argon2id` (`64 MiB`, `t=2`) in `TPM + PIN` (`Mode 2`) and `Microsoft Passport Key Storage Provider` NGC dual-key wrapping in `TPM + Hello` (`Mode 3`) |
 
 These are in-repository implementations of published primitives, verified at startup by
 23 known-answer suites and cross-checked against Python stdlib and published NIST/RFC
@@ -115,16 +115,20 @@ keyed mode; see [the exact format](formats.md#file-authentication-trailer).
 TPM key creation requests RSA-2048 (`NCRYPT_OVERWRITE_KEY_FLAG`) restricted to decryption
 only (`NCRYPT_ALLOW_DECRYPT_FLAG`, non-exportable), existing persistent keys are checked
 via `NCryptGetProperty("Length")` so keys shorter than 2048 bits are rejected, and
-unenrollment deletes the persistent provider key via `NCryptDeleteKey`. Because Windows
-`PCPKSP.dll` silently ignores `BCRYPT_OAEP_PADDING_INFO.pbLabel` on hardware TPM keys,
-Vordr enforces cryptographic vault-and-policy binding inside the sealed plaintext itself:
-`tpm_seal` encrypts `key32 || SHA-256(key32 || label32)` (64 bytes) and `tpm_unseal`
-verifies the 32-byte binding digest in constant time (`ct_memcmp`) before releasing
-`key32`, preventing cross-vault or downgraded-policy blob transplants (`tpmkat`). Legacy
-32-byte blobs are accepted only when `TpmRequireHello == 0`. When `TpmRequireHello` is
-active, `tpm_seal` fails closed if `NCRYPT_UI_POLICY_PROPERTY` cannot be applied, and
-`tpm_unseal` propagates the owner `HWND` without `NCRYPT_SILENT_FLAG` so Windows Hello UI
-can prompt cleanly; provider UI enforcement itself depends on the local platform provider.
+unenrollment or revocation deletes all persistent provider keys (`Vordr-<KCV>`, `-S0`,
+`-S1`) via `NCryptDeleteKey`. Because Windows `PCPKSP.dll` silently ignores
+`BCRYPT_OAEP_PADDING_INFO.pbLabel` on hardware TPM keys, Vordr enforces cryptographic
+vault-and-mode binding inside the sealed plaintext itself: `tpm_seal` encrypts
+`secret32 || SHA-256(secret32 || label32)` (64 bytes) and `tpm_unseal` verifies the
+32-byte binding digest in constant time (`ct_memcmp`) before releasing `secret32`,
+preventing cross-vault or cross-mode blob transplants (`tpmkat`). Legacy raw RSA-OAEP
+blobs are accepted only when `TpmUnlockMode == 1`. Under `TPM + PIN` (`Mode 2`), every
+attempt pre-commits `fails + 1` and `gen + 1` under a freshly created alternate TPM slot
+key (`S{slot ^ 1}`) and deletes `S{slot}` before running `Argon2id` or testing the PIN,
+defeating `HKCU` snapshot replay and revoking TPM enrollment once `fails >= max_tries`.
+Under `TPM + Windows Hello` (`Mode 3`), Vordr resolves the user's NGC decryption key via
+`System32\cryptngc.dll!NgcGetDefaultDecryptionKeyName` and combines both unsealed 32-byte
+halves with `BLAKE2b-256` before opening the AES-256-GCM vault-key envelope.
 
 Random generation fails closed if the OS RNG fails or the output pointer is NULL.
 RDSEED is optional, can run out of retries, and mixes into both eight-byte lanes
