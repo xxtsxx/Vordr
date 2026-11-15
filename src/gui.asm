@@ -361,6 +361,7 @@ extern FileTimeToSystemTime:proc
 extern GetSystemTimeAsFileTime:proc
 extern RedrawWindow:proc
 extern InitCommonControlsEx:proc
+extern tpm_cooldown_query:proc
 externdef g_tpm_last_err:dword
 extern theme_boot:proc
 extern theme_attach:proc
@@ -1469,7 +1470,29 @@ WSTR s_pu_rem2,      < attempts remaining).>
 WSTR s_pu_rem_one,   <Incorrect PIN (1 attempt remaining before TPM unlock is revoked).>
 WSTR s_hello_fail,   <Windows Hello enrollment was cancelled or unavailable. Set up Windows Hello in Windows Settings first.>
 WSTR s_tpm_pin_fail, <TPM + PIN enrollment could not be completed.>
-WSTR s_tpm_cooldown, <Windows TPM anti-hammering protection is temporarily active after repeated failed attempts. Unlock with your master password now and retry TPM enrollment after the cooldown expires.>
+WSTR s_cd_os1,       <Windows TPM anti-hammering protection is active (>
+WSTR s_cd_os2,       <Windows blocks standard-user TPM key operations for >
+WSTR s_cd_os3,       < after >
+WSTR s_cd_os4,       < failed TPM authorization attempts.>
+WSTR s_cd_os5,       <Remaining cooldown: ~>
+WSTR s_cd_os6,       < (clears around >
+WSTR s_cd_os7,       <Sleep or reboot does not pause this timer. Unlock with your master password for now and retry after the cooldown expires.>
+WSTR s_cd_hw1,       <Hardware TPM dictionary-attack lockout is active (>
+WSTR s_cd_hw2,       <TPM failure counter: >
+WSTR s_cd_hw3,       < of >
+WSTR s_cd_hw4,       < (heals by 1 every >
+WSTR s_cd_hw5,       < of powered-on time).>
+WSTR s_cd_hw6,       <Estimated heal time: up to >
+WSTR s_cd_hw7,       < while this PC stays powered on (sleep or shutdown pauses the hardware timer). An administrator can also run Unblock-Tpm.>
+WSTR s_cd_hw8,       <Unlock with your master password until the TPM heals.>
+WSTR s_cd_fb1,       <Windows or hardware TPM anti-hammering protection is active (>
+WSTR s_cd_fb2,       < (wall-clock time). Hardware TPM lockout heals by 1 attempt every 10-120m while powered on.>
+WSTR s_cd_rpar,      <).>
+WSTR s_cd_dot,       <.>
+s_cd_nl label word
+    dw 13, 10, 0
+s_cd_pbrk label word
+    dw 13, 10, 13, 10, 0
 kl_url label word
     dw 'U','R','L', 0
 kl_notes label word
@@ -1769,6 +1792,7 @@ g_pinset_match  dd ?                  ; DLG_PIN_SET confirm-match flag (0/1)
 g_in_scrub      dd ?                  ; >0 = gui_hwnd_scrub active (suppress EN_CHANGE re-entrancy)
 align 2
 g_pu_msgw       dw 128 dup (?)        ; DLG_PIN_UNLOCK remaining-attempts status scratch
+g_tpm_cd_msgw   dw 1024 dup (?)       ; detailed TPM anti-hammering / lockout diagnostic message
 align 4
 ; ---- secure-desktop password entry (anti-keylogger) -------------------------
 g_secunlock      dd ?                 ; setting: 1 = Secure Unlock (master pw on a private desktop)
@@ -3543,17 +3567,277 @@ grh_zero:
     ret
 gui_refresh_hello endp
 
-; gui_tpm_err_msg(rcx = default_wstr) -> rax = s_tpm_cooldown if TBS anti-hammering active, else rcx.
-gui_tpm_err_msg proc
-    mov     eax, dword ptr [g_tpm_last_err]
-    cmp     eax, 80290409h                      ; TPM_E_PCP_AUTHENTICATION_IGNORED
-    je      gtem_cd
-    cmp     eax, 80280921h                      ; TBS_E_BLOCKED
-    je      gtem_cd
-    mov     rax, rcx
+; gui_w_append_hex32(rcx = dst wide, edx = val32) -> rax = dst end.  Emits "0xXXXXXXXX" (no NUL).
+gui_w_append_hex32 proc
+    mov     r9, rcx
+    mov     word ptr [r9], '0'
+    mov     word ptr [r9+2], 'x'
+    add     r9, 4
+    mov     ecx, 28
+gwah_lp:
+    mov     eax, edx
+    shr     eax, cl
+    and     eax, 0Fh
+    cmp     eax, 10
+    jb      gwah_dig
+    add     eax, 'A' - 10
+    jmp     gwah_put
+gwah_dig:
+    add     eax, '0'
+gwah_put:
+    mov     word ptr [r9], ax
+    add     r9, 2
+    sub     ecx, 4
+    jns     gwah_lp
+    mov     rax, r9
     ret
-gtem_cd:
-    lea     rax, [s_tpm_cooldown]
+gui_w_append_hex32 endp
+
+; gui_w_append_dur(rcx = dst wide, edx = total_mins) -> rax = dst end.
+;   Formats e.g. "8h" (480), "2h 31m" (151), or "45m" (45), no NUL.
+gui_w_append_dur proc frame
+    FRAME_PROLOG 48
+    ; [rbp-16]=dst [rbp-20]=hrs [rbp-24]=mins
+    mov     qword ptr [rbp-16], rcx
+    mov     eax, edx
+    xor     edx, edx
+    mov     ecx, 60
+    div     ecx                                 ; eax = hrs, edx = mins
+    mov     dword ptr [rbp-20], eax
+    mov     dword ptr [rbp-24], edx
+    test    eax, eax
+    jz      gwad_only_m
+    mov     rcx, qword ptr [rbp-16]
+    mov     edx, eax
+    call    gui_uint_w
+    mov     word ptr [rax], 'h'
+    add     rax, 2
+    cmp     dword ptr [rbp-24], 0
+    je      gwad_ret
+    mov     word ptr [rax], ' '
+    add     rax, 2
+    mov     rcx, rax
+    mov     edx, dword ptr [rbp-24]
+    call    gui_uint_w
+    mov     word ptr [rax], 'm'
+    add     rax, 2
+    jmp     gwad_ret
+gwad_only_m:
+    mov     rcx, qword ptr [rbp-16]
+    mov     edx, dword ptr [rbp-24]
+    call    gui_uint_w
+    mov     word ptr [rax], 'm'
+    add     rax, 2
+gwad_ret:
+    FRAME_EPILOG
+    ret
+gui_w_append_dur endp
+
+; gui_w_append_hhmm(rcx = dst wide, edx = (hour<<16)|min) -> rax = dst end.  Emits "HH:MM" (no NUL).
+gui_w_append_hhmm proc
+    mov     r9, rcx
+    mov     r8d, edx
+    mov     eax, r8d
+    shr     eax, 16
+    xor     edx, edx
+    mov     ecx, 10
+    div     ecx
+    add     eax, '0'
+    add     edx, '0'
+    mov     word ptr [r9+0], ax
+    mov     word ptr [r9+2], dx
+    mov     word ptr [r9+4], ':'
+    movzx   eax, r8w
+    xor     edx, edx
+    div     ecx
+    add     eax, '0'
+    add     edx, '0'
+    mov     word ptr [r9+6], ax
+    mov     word ptr [r9+8], dx
+    lea     rax, [r9+10]
+    ret
+gui_w_append_hhmm endp
+
+; gui_tpm_err_msg(rcx = default_wstr) -> rax = detailed g_tpm_cd_msgw if anti-hammering active, else rcx.
+gui_tpm_err_msg proc frame
+    FRAME_PROLOG 96
+    ; [rbp-16]=def_wstr  [rbp-48..rbp-17]=TPM_CD_INFO(32B)
+    mov     qword ptr [rbp-16], rcx
+    lea     rcx, [rbp-48]
+    call    tpm_cooldown_query
+    test    eax, eax
+    jz      gtem_def
+    cmp     eax, 1
+    je      gtem_os
+    cmp     eax, 2
+    je      gtem_hw
+
+    ; Kind 3: anti-hammering HRESULT with policy/default summary
+    lea     rcx, [g_tpm_cd_msgw]
+    lea     rdx, [s_cd_fb1]
+    call    gui_w_appendz
+    mov     rcx, rax
+    mov     edx, dword ptr [rbp-48 + 0]         ; err_hr
+    call    gui_w_append_hex32
+    mov     rcx, rax
+    lea     rdx, [s_cd_rpar]
+    call    gui_w_appendz
+    mov     rcx, rax
+    lea     rdx, [s_cd_pbrk]
+    call    gui_w_appendz
+    mov     rcx, rax
+    lea     rdx, [s_cd_os2]
+    call    gui_w_appendz
+    mov     rcx, rax
+    mov     edx, dword ptr [rbp-48 + 4]         ; win_mins
+    call    gui_w_append_dur
+    mov     rcx, rax
+    lea     rdx, [s_cd_os3]
+    call    gui_w_appendz
+    mov     rcx, rax
+    mov     edx, dword ptr [rbp-48 + 16]        ; max_fails
+    call    gui_uint_w
+    mov     rcx, rax
+    lea     rdx, [s_cd_fb2]
+    call    gui_w_appendz
+    mov     rcx, rax
+    lea     rdx, [s_cd_pbrk]
+    call    gui_w_appendz
+    mov     rcx, rax
+    lea     rdx, [s_cd_os7]
+    call    gui_w_appendz
+    mov     word ptr [rax], 0
+    lea     rax, [g_tpm_cd_msgw]
+    FRAME_EPILOG
+    ret
+
+gtem_os:
+    ; Kind 1: Windows OS / TBS standard-user anti-hammering with live remaining time
+    lea     rcx, [g_tpm_cd_msgw]
+    lea     rdx, [s_cd_os1]
+    call    gui_w_appendz
+    mov     rcx, rax
+    mov     edx, dword ptr [rbp-48 + 0]         ; err_hr
+    call    gui_w_append_hex32
+    mov     rcx, rax
+    lea     rdx, [s_cd_rpar]
+    call    gui_w_appendz
+    mov     rcx, rax
+    lea     rdx, [s_cd_pbrk]
+    call    gui_w_appendz
+    mov     rcx, rax
+    lea     rdx, [s_cd_os2]
+    call    gui_w_appendz
+    mov     rcx, rax
+    mov     edx, dword ptr [rbp-48 + 4]         ; win_mins (e.g. 480 -> "8h")
+    call    gui_w_append_dur
+    mov     rcx, rax
+    lea     rdx, [s_cd_os3]
+    call    gui_w_appendz
+    mov     rcx, rax
+    mov     edx, dword ptr [rbp-48 + 16]        ; max_fails (e.g. 4)
+    call    gui_uint_w
+    mov     rcx, rax
+    lea     rdx, [s_cd_os4]
+    call    gui_w_appendz
+    mov     rcx, rax
+    lea     rdx, [s_cd_nl]
+    call    gui_w_appendz
+    mov     rcx, rax
+    lea     rdx, [s_cd_os5]
+    call    gui_w_appendz
+    mov     rcx, rax
+    mov     edx, dword ptr [rbp-48 + 8]         ; rem_mins (e.g. 151 -> "2h 31m")
+    call    gui_w_append_dur
+    cmp     dword ptr [rbp-48 + 20], 0FFFFFFFFh
+    je      gtem_os_nohm
+    mov     rcx, rax
+    lea     rdx, [s_cd_os6]
+    call    gui_w_appendz
+    mov     rcx, rax
+    mov     edx, dword ptr [rbp-48 + 20]        ; local_hm
+    call    gui_w_append_hhmm
+    mov     rcx, rax
+    lea     rdx, [s_cd_rpar]
+    call    gui_w_appendz
+    jmp     gtem_os_tail
+gtem_os_nohm:
+    mov     rcx, rax
+    lea     rdx, [s_cd_dot]
+    call    gui_w_appendz
+gtem_os_tail:
+    mov     rcx, rax
+    lea     rdx, [s_cd_pbrk]
+    call    gui_w_appendz
+    mov     rcx, rax
+    lea     rdx, [s_cd_os7]
+    call    gui_w_appendz
+    mov     word ptr [rax], 0
+    lea     rax, [g_tpm_cd_msgw]
+    FRAME_EPILOG
+    ret
+
+gtem_hw:
+    ; Kind 2: Hardware TPM 2.0 dictionary-attack lockout with live counter & heal interval
+    lea     rcx, [g_tpm_cd_msgw]
+    lea     rdx, [s_cd_hw1]
+    call    gui_w_appendz
+    mov     rcx, rax
+    mov     edx, dword ptr [rbp-48 + 0]         ; err_hr
+    call    gui_w_append_hex32
+    mov     rcx, rax
+    lea     rdx, [s_cd_rpar]
+    call    gui_w_appendz
+    mov     rcx, rax
+    lea     rdx, [s_cd_pbrk]
+    call    gui_w_appendz
+    mov     rcx, rax
+    lea     rdx, [s_cd_hw2]
+    call    gui_w_appendz
+    mov     rcx, rax
+    mov     edx, dword ptr [rbp-48 + 12]        ; cur_fails
+    call    gui_uint_w
+    mov     rcx, rax
+    lea     rdx, [s_cd_hw3]
+    call    gui_w_appendz
+    mov     rcx, rax
+    mov     edx, dword ptr [rbp-48 + 16]        ; max_fails
+    call    gui_uint_w
+    mov     rcx, rax
+    lea     rdx, [s_cd_hw4]
+    call    gui_w_appendz
+    mov     rcx, rax
+    mov     edx, dword ptr [rbp-48 + 4]         ; win_mins (per-decrement heal interval)
+    call    gui_w_append_dur
+    mov     rcx, rax
+    lea     rdx, [s_cd_hw5]
+    call    gui_w_appendz
+    mov     rcx, rax
+    lea     rdx, [s_cd_nl]
+    call    gui_w_appendz
+    mov     rcx, rax
+    lea     rdx, [s_cd_hw6]
+    call    gui_w_appendz
+    mov     rcx, rax
+    mov     edx, dword ptr [rbp-48 + 8]         ; rem_mins
+    call    gui_w_append_dur
+    mov     rcx, rax
+    lea     rdx, [s_cd_hw7]
+    call    gui_w_appendz
+    mov     rcx, rax
+    lea     rdx, [s_cd_pbrk]
+    call    gui_w_appendz
+    mov     rcx, rax
+    lea     rdx, [s_cd_hw8]
+    call    gui_w_appendz
+    mov     word ptr [rax], 0
+    lea     rax, [g_tpm_cd_msgw]
+    FRAME_EPILOG
+    ret
+
+gtem_def:
+    mov     rax, qword ptr [rbp-16]
+    FRAME_EPILOG
     ret
 gui_tpm_err_msg endp
 
@@ -16795,6 +17079,7 @@ msv_tpm_off:
 msv_tpm_alone:
     cmp     dword ptr [rbp-36], TPM_MODE_ALONE
     je      msv_tpm_persist
+    mov     dword ptr [g_tpm_last_err], 0
     call    vault_tpm_remember
     test    eax, eax
     jnz     msv_tpm_persist
@@ -16809,6 +17094,7 @@ msv_tpm_alone:
 msv_tpm_pin:
     cmp     dword ptr [rbp-36], TPM_MODE_PIN
     je      msv_tpm_persist
+    mov     dword ptr [g_tpm_last_err], 0
     mov     rcx, qword ptr [rbp-24]
     call    gui_pin_set_modal
     cmp     qword ptr [g_body_ptr], 0       ; vault locked while PIN dialog was up?
@@ -16819,6 +17105,7 @@ msv_tpm_pin:
 msv_tpm_hello:
     cmp     dword ptr [rbp-36], TPM_MODE_HELLO
     je      msv_tpm_persist
+    mov     dword ptr [g_tpm_last_err], 0
     call    vault_tpm_enroll_hello
     test    eax, eax
     jnz     msv_tpm_persist
@@ -18980,9 +19267,20 @@ ccm_open:
     je      ccm_tpm_hello
     jmp     ccm_done
 ccm_tpm_alone:
+    mov     dword ptr [g_tpm_last_err], 0
     call    vault_tpm_remember
+    test    eax, eax
+    jnz     ccm_done
+    mov     dword ptr [g_tpm_want], 0
+    xor     ecx, ecx
+    call    gui_tpm_err_msg
+    test    rax, rax
+    jz      ccm_done
+    WINCALL gui_msgbox, qword ptr [rbp-24], rax, addr t_tpminfo, \
+            <MB_OK or MB_ICONWARNING>
     jmp     ccm_done
 ccm_tpm_pin:
+    mov     dword ptr [g_tpm_last_err], 0
     mov     rcx, qword ptr [rbp-24]
     call    gui_pin_set_modal
     test    eax, eax
@@ -18990,6 +19288,7 @@ ccm_tpm_pin:
     mov     dword ptr [g_tpm_want], 0
     jmp     ccm_done
 ccm_tpm_hello:
+    mov     dword ptr [g_tpm_last_err], 0
     call    vault_tpm_enroll_hello
     test    eax, eax
     jnz     ccm_done
@@ -23777,24 +24076,27 @@ go_nopreload:
     je      go_tpm_hello
     jmp     go_askpw
 go_tpm_alone:
+    mov     dword ptr [g_tpm_last_err], 0
     mov     dword ptr [g_use_tpm], TPM_MODE_ALONE
     call    vault_unlock
     mov     dword ptr [g_use_tpm], 0
     test    eax, eax
-    jnz     go_askpw
+    jnz     go_tpm_fb_chk
     jmp     go_tpm_unlocked
 go_tpm_hello:
     call    gui_refresh_hello
     cmp     dword ptr [g_hello_present], 0
     je      go_askpw
     WINCALL SetForegroundWindow, qword ptr [g_trayhwnd]
+    mov     dword ptr [g_tpm_last_err], 0
     mov     dword ptr [g_use_tpm], TPM_MODE_HELLO
     call    vault_unlock
     mov     dword ptr [g_use_tpm], 0
     test    eax, eax
-    jnz     go_askpw
+    jnz     go_tpm_fb_chk
     jmp     go_tpm_unlocked
 go_tpm_pin:
+    mov     dword ptr [g_tpm_last_err], 0
     cmp     dword ptr [g_secunlock], 0
     je      go_pin_normal
     mov     ecx, DLG_PIN_UNLOCK
@@ -23809,8 +24111,16 @@ go_pin_res:
     cmp     rax, 0
     je      go_abort_preload                 ; user pressed Cancel -> back to tray
     cmp     rax, 3
-    jne     go_askpw                         ; 2 = "Master password..." or fallback
+    jne     go_tpm_fb_chk                    ; 2 = "Master password..." or TPM fallback
     WINCALL gui_msgbox, qword ptr [rbp-24], addr s_pinrevoked, addr t_pinrevoked, \
+            <MB_OK or MB_ICONWARNING>
+    jmp     go_askpw
+go_tpm_fb_chk:
+    xor     ecx, ecx
+    call    gui_tpm_err_msg
+    test    rax, rax
+    jz      go_askpw
+    WINCALL gui_msgbox, qword ptr [rbp-24], rax, addr t_tpminfo, \
             <MB_OK or MB_ICONWARNING>
     jmp     go_askpw
 go_tpm_unlocked:
@@ -26145,7 +26455,35 @@ gui_layout_probe proc frame
     call    lp_measure
     WINCALL DestroyWindow, qword ptr [rbp-32]
     call    lp_pump
-@@: mov     dword ptr [g_lp_active], 0
+    ; Verify detailed TPM anti-hammering diagnostic formatter & DLG_MSG layout
+@@: mov     dword ptr [g_tpm_last_err], 80290409h
+    xor     ecx, ecx
+    call    gui_tpm_err_msg
+    mov     dword ptr [g_tpm_last_err], 0
+    lea     rcx, [g_tpm_cd_msgw]
+    cmp     rax, rcx
+    jne     glp_cd_bad
+    cmp     word ptr [rax], 0
+    je      glp_cd_bad
+    mov     qword ptr [g_msg_text], rax
+    lea     rax, [t_tpminfo]
+    mov     qword ptr [g_msg_title], rax
+    mov     dword ptr [g_msg_flags], MB_OK or MB_ICONWARNING
+    WINCALL CreateDialogParamW, qword ptr [g_hinst], DLG_MSG, 0, addr msg_proc, 0
+    mov     qword ptr [rbp-32], rax
+    test    rax, rax
+    jz      glp_cd_done
+    WINCALL ShowWindow, qword ptr [rbp-32], 4
+    call    lp_pump
+    mov     rcx, qword ptr [rbp-32]
+    call    lp_measure
+    WINCALL DestroyWindow, qword ptr [rbp-32]
+    call    lp_pump
+    jmp     glp_cd_done
+glp_cd_bad:
+    inc     dword ptr [g_lp_bad]
+glp_cd_done:
+    mov     dword ptr [g_lp_active], 0
     jmp     glp_nowin                       ; do NOT fall into the no-desktop answer
 glp_nodesk:
     ; A build server without an interactive desktop cannot create a window at

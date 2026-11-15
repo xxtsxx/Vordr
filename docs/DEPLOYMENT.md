@@ -17,9 +17,9 @@ Run these Command Prompt examples in an elevated shell, replacing the filename
 with the package being deployed:
 
 ```bat
-msiexec /i vordr-0.2.3.msi /qn
-msiexec /i vordr-0.2.3.msi /qn VORDR_SECUREUNLOCK=1 VORDR_PWMINLEN=16
-msiexec /x vordr-0.2.3.msi /qn
+msiexec /i vordr-0.2.4.msi /qn
+msiexec /i vordr-0.2.4.msi /qn VORDR_SECUREUNLOCK=1 VORDR_PWMINLEN=16
+msiexec /x vordr-0.2.4.msi /qn
 ```
 
 The package replaces related versions from `0.0.0` through its own version, inclusive,
@@ -171,7 +171,7 @@ timeouts, session locking, and download-only attachments. Omitted settings
 remain user-configurable.
 
 ```bat
-msiexec /i vordr-0.2.3.msi /qn ^
+msiexec /i vordr-0.2.4.msi /qn ^
   VORDR_PWMINLEN=16 VORDR_PWMINCLASSES=4 ^
   VORDR_SECUREUNLOCK=1 VORDR_CLIPSECONDS=10 VORDR_IDLELOCKMIN=5 ^
   VORDR_LOCKONWINLOCK=1 VORDR_NOPREVIEW=1 VORDR_LOGLEVEL=2
@@ -276,7 +276,7 @@ the Explorer session rather than assuming the registry write failed.
 From the repository root:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\verify_msi.ps1 -Msi bin\vordr-0.2.3.msi
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\verify_msi.ps1 -Msi bin\vordr-0.2.4.msi
 ```
 
 The verifier reads MSI tables and evaluates component costing without installing.

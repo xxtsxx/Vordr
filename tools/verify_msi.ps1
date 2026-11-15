@@ -21,7 +21,7 @@
          no elevation is needed.
 
     Usage:  powershell -ExecutionPolicy Bypass -File tools\verify_msi.ps1 `
-                       [-Msi bin\vordr-0.2.3.msi]
+                       [-Msi bin\vordr-0.2.4.msi]
     Exit code 0 = all checks passed.
 #>
 [CmdletBinding()]

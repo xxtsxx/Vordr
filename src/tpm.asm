@@ -31,6 +31,15 @@ extern LoadLibraryExW:proc
 extern GetProcAddress:proc
 extern GetForegroundWindow:proc
 extern GetDesktopWindow:proc
+extern RegOpenKeyExW:proc
+extern RegQueryValueExW:proc
+extern RegCloseKey:proc
+extern OpenProcessToken:proc
+extern GetTokenInformation:proc
+extern CloseHandle:proc
+extern GetSystemTimeAsFileTime:proc
+extern FileTimeToLocalFileTime:proc
+extern FileTimeToSystemTime:proc
 extern sha256_init:proc
 extern sha256_update:proc
 extern sha256_final:proc
@@ -53,8 +62,13 @@ WHLO_MAGIC                equ 4F4C4857h ; "WHLO" little-endian
 WHLO_VER                  equ 1
 WHLO_HDR_LEN              equ 64
 WHLO_MAX_CRED             equ 400
+REG_BINARY                equ 3
+REG_DWORD                 equ 4
+KEY_READ                  equ 20019h
+FT_PER_MIN                equ 600000000 ; 60 * 10,000,000 (100-ns ticks per minute)
 
 externdef g_tpm_reqhello:dword          ; C4: require Hello/PIN on TPM unlock (gui.asm)
+externdef g_hklm:qword                  ; HKEY_LOCAL_MACHINE (regcfg.asm)
 externdef g_hdr:byte                    ; live vault header (vault.asm)
 externdef g_secdesk_hwnd:qword          ; active secure-desktop dialog HWND (gui.asm)
 externdef g_vaulthwnd:qword             ; main vault HWND (gui.asm)
@@ -81,8 +95,19 @@ WSTR wa_udisp_w,      <Vordr Vault Unlock>
 WSTR wa_hashalg_w,    <SHA-256>
 WSTR wa_credtype_w,   <public-key>
 WSTR wa_ext_hmac_w,   <hmac-secret>
+WSTR tbs_dll_w,       <tbs.dll>
+WSTR rk_tpm_pol,      <SOFTWARE\Policies\Microsoft\TPM>
+WSTR rv_su_dur,       <StandardUserAuthorizationFailureDuration>
+WSTR rv_su_ind,       <StandardUserAuthorizationFailureIndividualThreshold>
+WSTR rv_su_tot,       <StandardUserAuthorizationFailureTotalThreshold>
+WSTR rk_tpm_af,       <SYSTEM\CurrentControlSet\Services\TPM\AuthorizationFailure>
+WSTR rk_af_all,       <ALLSTANDARDUSERS>
+WSTR rv_af_hist,      <History>
 
 CSTR tpm_lbl_dom,     "Vordr-TPM-v2"
+CSTR tbs_n_create,    "Tbsi_Context_Create"
+CSTR tbs_n_submit,    "Tbsip_Submit_Command"
+CSTR tbs_n_close,     "Tbsip_Context_Close"
 CSTR wa_key_dom,      "Vordr-Hello-Key-v1"
 CSTR wa_tag_dom,      "Vordr-Hello-Tag-v1"
 CSTR wa_cjson_make,   '{"type":"webauthn.create","challenge":"Vm9yZHJIZWxsb0Vucm9sbA","origin":"https://vordr.local"}'
@@ -99,6 +124,9 @@ CSTR wa_n_freelist,   "WebAuthNFreeAuthenticatorList"
 
 ; Windows Hello platform authenticator AAGUID: 08987058-cadc-4b81-b6e1-30de50dcbe96
 wa_wh_aaguid db 08h,98h,70h,58h,0CAh,0DCh,4Bh,81h,0B6h,0E1h,30h,0DEh,50h,0DCh,0BEh,96h
+
+; TPM2_GetCapability(TPM_CAP_TPM_PROPERTIES=6, property=0x020E, count=3) - 22 bytes
+tbs_getcap_cmd db 80h,01h, 00h,00h,00h,16h, 00h,00h,01h,7Ah, 00h,00h,00h,06h, 00h,00h,02h,0Eh, 00h,00h,00h,03h
 
 align 4
 public g_tpm_last_err
@@ -164,6 +192,13 @@ wa_fn_getlist   dq ?
 wa_fn_freelist  dq ?
 wa_api_ver      dd ?
 wa_init_done    dd ?
+
+align 8
+tbs_hmod        dq ?
+tbs_fn_create   dq ?
+tbs_fn_submit   dq ?
+tbs_fn_close    dq ?
+tbs_init_done   dd ?
 
 ; Non-secret WebAuthn request option structs (zeroed before and after every call)
 align 8
@@ -1755,6 +1790,662 @@ thd_no:
 tpm_hello_delete endp
 
 ; ===========================================================================
+; TPM Anti-Hammering / Lockout Cooldown Diagnostics
+; ===========================================================================
+
+; tpm_u64_to_w(rcx = dst, rdx = dst_end, r8 = val_u64) -> rax = new dst (or 0 on overflow).
+tpm_u64_to_w proc frame
+    FRAME_PROLOG 64
+    ; [rbp-40 .. rbp-17] = reversed ASCII digits (24 bytes)
+    mov     r10, rcx                            ; dst
+    mov     r11, rdx                            ; dst_end
+    mov     rax, r8                             ; val
+    lea     r9, [rbp-16]                        ; end of scratch
+    mov     rcx, r9
+    mov     r8d, 10
+tuw_div:
+    xor     edx, edx
+    div     r8                                  ; rax /= 10, rdx = rem
+    add     edx, '0'
+    dec     rcx
+    mov     byte ptr [rcx], dl
+    test    rax, rax
+    jnz     tuw_div
+tuw_emit:
+    cmp     rcx, r9
+    jae     tuw_ok
+    cmp     r10, r11
+    jae     tuw_ovf
+    movzx   eax, byte ptr [rcx]
+    mov     word ptr [r10], ax
+    add     r10, 2
+    inc     rcx
+    jmp     tuw_emit
+tuw_ok:
+    mov     rax, r10
+    FRAME_EPILOG
+    ret
+tuw_ovf:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+tpm_u64_to_w endp
+
+; tpm_format_sid_w(rcx = psid, rdx = dst_w, r8d = cap_wchars) -> eax = 1 / 0.
+;   Formats a binary Win32 SID into L"S-<rev>-<auth>-<sub0>-..." without Heap/LocalAlloc.
+tpm_format_sid_w proc frame
+    FRAME_PROLOG 96
+    ; [rbp-16]=psid [rbp-24]=cur [rbp-32]=end [rbp-36]=subcnt [rbp-40]=idx [rbp-48]=auth64
+    test    rcx, rcx
+    jz      tfs_bad
+    test    rdx, rdx
+    jz      tfs_bad
+    cmp     r8d, 16
+    jb      tfs_bad
+    mov     qword ptr [rbp-16], rcx
+    mov     qword ptr [rbp-24], rdx
+    dec     r8d
+    lea     rax, [rdx + r8*2]
+    mov     qword ptr [rbp-32], rax             ; last NUL-safe slot
+
+    movzx   eax, byte ptr [rcx+0]               ; Revision (1..15)
+    test    eax, eax
+    jz      tfs_bad
+    cmp     eax, 15
+    ja      tfs_bad
+    mov     dword ptr [rbp-40], eax             ; temp save rev
+
+    movzx   eax, byte ptr [rcx+1]               ; SubAuthorityCount (1..15)
+    test    eax, eax
+    jz      tfs_bad
+    cmp     eax, 15
+    ja      tfs_bad
+    mov     dword ptr [rbp-36], eax
+
+    ; 48-bit big-endian IdentifierAuthority at [psid + 2..7]
+    xor     r9, r9
+    mov     r10d, 2
+tfs_auth:
+    shl     r9, 8
+    movzx   eax, byte ptr [rcx + r10]
+    or      r9, rax
+    inc     r10d
+    cmp     r10d, 8
+    jb      tfs_auth
+    mov     qword ptr [rbp-48], r9
+
+    ; Emit "S-"
+    mov     r10, qword ptr [rbp-24]
+    mov     r11, qword ptr [rbp-32]
+    lea     rax, [r10 + 4]
+    cmp     rax, r11
+    jae     tfs_bad
+    mov     word ptr [r10], 'S'
+    mov     word ptr [r10+2], '-'
+    add     r10, 4
+
+    ; Emit Revision
+    mov     rcx, r10
+    mov     rdx, r11
+    mov     r8d, dword ptr [rbp-40]
+    call    tpm_u64_to_w
+    test    rax, rax
+    jz      tfs_bad
+    mov     r10, rax
+    mov     r11, qword ptr [rbp-32]
+    cmp     r10, r11
+    jae     tfs_bad
+    mov     word ptr [r10], '-'
+    add     r10, 2
+
+    ; Emit IdentifierAuthority
+    mov     rcx, r10
+    mov     rdx, r11
+    mov     r8, qword ptr [rbp-48]
+    call    tpm_u64_to_w
+    test    rax, rax
+    jz      tfs_bad
+    mov     qword ptr [rbp-24], rax
+
+    ; Emit SubAuthorities[0 .. subcnt-1]
+    mov     dword ptr [rbp-40], 0
+tfs_sub_lp:
+    mov     eax, dword ptr [rbp-40]
+    cmp     eax, dword ptr [rbp-36]
+    jae     tfs_done
+    mov     r10, qword ptr [rbp-24]
+    mov     r11, qword ptr [rbp-32]
+    cmp     r10, r11
+    jae     tfs_bad
+    mov     word ptr [r10], '-'
+    add     r10, 2
+    mov     r9, qword ptr [rbp-16]
+    mov     r8d, dword ptr [r9 + rax*4 + 8]     ; zero-extended uint32 SubAuthority
+    mov     rcx, r10
+    mov     rdx, r11
+    call    tpm_u64_to_w
+    test    rax, rax
+    jz      tfs_bad
+    mov     qword ptr [rbp-24], rax
+    inc     dword ptr [rbp-40]
+    jmp     tfs_sub_lp
+
+tfs_done:
+    mov     rax, qword ptr [rbp-24]
+    mov     word ptr [rax], 0
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+tfs_bad:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+tpm_format_sid_w endp
+
+; tpm_calc_window_rem(rcx = hist_ptr, edx = hist_bytes, r8 = now_ft, r9 = (thresh<<32)|dur_mins)
+;   -> rax = unlock_ft (0 if active count < thresh or thresh == 0), edx = active_cnt.
+tpm_calc_window_rem proc frame
+    FRAME_PROLOG 608
+    ; [rbp-16]=hist_ptr [rbp-20]=n_entries [rbp-24]=dur_mins [rbp-28]=thresh
+    ; [rbp-40]=now_ft [rbp-48]=win_ft [rbp-56]=m_active [rbp-576 .. rbp-65]=active_ft[64]
+    test    rcx, rcx
+    jz      tcwr_zero
+    mov     qword ptr [rbp-16], rcx
+    cmp     edx, 512
+    jbe     @F
+    mov     edx, 512
+@@: shr     edx, 3                              ; n_entries = min(hist_bytes, 512) / 8
+    mov     dword ptr [rbp-20], edx
+    mov     qword ptr [rbp-40], r8
+    mov     eax, r9d                            ; dur_mins
+    test    eax, eax
+    jz      tcwr_zero
+    mov     dword ptr [rbp-24], eax
+    shr     r9, 32
+    mov     dword ptr [rbp-28], r9d             ; thresh
+    mov     ecx, FT_PER_MIN
+    imul    rax, rcx                            ; win_ft = dur_mins * 600,000,000
+    mov     qword ptr [rbp-48], rax
+
+    xor     r10d, r10d                          ; i = 0
+    xor     r11d, r11d                          ; m_active = 0
+tcwr_scan:
+    cmp     r10d, dword ptr [rbp-20]
+    jae     tcwr_eval
+    mov     rcx, qword ptr [rbp-16]
+    mov     rax, qword ptr [rcx + r10*8]        ; ft
+    test    rax, rax
+    jz      tcwr_next
+    mov     rdx, qword ptr [rbp-40]             ; now_ft
+    cmp     rax, rdx
+    ja      tcwr_next                           ; future timestamp -> ignore
+    sub     rdx, rax                            ; age = now_ft - ft
+    cmp     rdx, qword ptr [rbp-48]
+    jae     tcwr_next                           ; expired (>= win_ft)
+
+    ; Insertion-sort ft (rax) into active_ft[0..r11d-1] at [rbp-576]
+    mov     ecx, r11d                           ; j = m_active
+tcwr_ins:
+    test    ecx, ecx
+    jz      tcwr_put
+    mov     edx, ecx
+    dec     edx
+    mov     r8, qword ptr [rbp - 576 + rdx*8]
+    cmp     r8, rax
+    jbe     tcwr_put
+    mov     qword ptr [rbp - 576 + rcx*8], r8
+    dec     ecx
+    jmp     tcwr_ins
+tcwr_put:
+    mov     qword ptr [rbp - 576 + rcx*8], rax
+    inc     r11d
+tcwr_next:
+    inc     r10d
+    jmp     tcwr_scan
+
+tcwr_eval:
+    mov     edx, r11d                           ; edx = active_cnt
+    mov     ecx, dword ptr [rbp-28]             ; thresh
+    test    ecx, ecx
+    jz      tcwr_not_locked
+    cmp     r11d, ecx
+    jb      tcwr_not_locked
+    mov     eax, r11d
+    sub     eax, ecx                            ; idx = m_active - thresh
+    mov     rax, qword ptr [rbp - 576 + rax*8]
+    add     rax, qword ptr [rbp-48]             ; unlock_ft = active_ft[idx] + win_ft
+    FRAME_EPILOG
+    ret
+tcwr_not_locked:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+tcwr_zero:
+    xor     eax, eax
+    xor     edx, edx
+    FRAME_EPILOG
+    ret
+tpm_calc_window_rem endp
+
+; tpm_pol_dword(rcx = hkey, rdx = valname_w, r8d = def_val) -> eax = val (or def_val).
+tpm_pol_dword proc frame
+    FRAME_PROLOG 80
+    ; [rbp-16]=def [rbp-24]=type [rbp-28]=cb [rbp-32]=val
+    mov     dword ptr [rbp-16], r8d
+    test    rcx, rcx
+    jz      tpd_def
+    mov     dword ptr [rbp-28], 4
+    WINCALL RegQueryValueExW, rcx, rdx, 0, addr rbp-24, addr rbp-32, addr rbp-28
+    test    eax, eax
+    jnz     tpd_def
+    cmp     dword ptr [rbp-24], REG_DWORD
+    jne     tpd_def
+    cmp     dword ptr [rbp-28], 4
+    jne     tpd_def
+    mov     eax, dword ptr [rbp-32]
+    FRAME_EPILOG
+    ret
+tpd_def:
+    mov     eax, dword ptr [rbp-16]
+    FRAME_EPILOG
+    ret
+tpm_pol_dword endp
+
+; tpm_af_check_sub(rcx = hAfRoot, rdx = subkey_w, r8 = now_ft, r9 = (thresh<<32)|dur_mins)
+;   -> rax = unlock_ft (0 if not locked), edx = active_cnt.
+tpm_af_check_sub proc frame
+    FRAME_PROLOG 640
+    ; [rbp-16]=hSub [rbp-24]=now_ft [rbp-32]=packed [rbp-36]=type [rbp-40]=cb [rbp-560..rbp-49]=hist[512]
+    mov     qword ptr [rbp-16], 0
+    mov     qword ptr [rbp-24], r8
+    mov     qword ptr [rbp-32], r9
+    WINCALL RegOpenKeyExW, rcx, rdx, 0, KEY_READ, addr rbp-16
+    test    eax, eax
+    jnz     tacs_none
+    mov     dword ptr [rbp-40], 512
+    WINCALL RegQueryValueExW, qword ptr [rbp-16], addr rv_af_hist, 0, addr rbp-36, addr rbp-560, addr rbp-40
+    mov     dword ptr [rbp-44], eax
+    WINCALL RegCloseKey, qword ptr [rbp-16]
+    cmp     dword ptr [rbp-44], 0
+    jne     tacs_none
+    cmp     dword ptr [rbp-36], REG_BINARY
+    jne     tacs_none
+    lea     rcx, [rbp-560]
+    mov     edx, dword ptr [rbp-40]
+    mov     r8, qword ptr [rbp-24]
+    mov     r9, qword ptr [rbp-32]
+    call    tpm_calc_window_rem
+    FRAME_EPILOG
+    ret
+tacs_none:
+    xor     eax, eax
+    xor     edx, edx
+    FRAME_EPILOG
+    ret
+tpm_af_check_sub endp
+
+; tbs_load() -> eax = 1 if tbs.dll entry points resolved, 0 otherwise.
+tbs_load proc frame
+    FRAME_PROLOG 48
+    cmp     dword ptr [tbs_init_done], 1
+    je      tbsl_ok
+    cmp     dword ptr [tbs_init_done], -1
+    je      tbsl_no
+    WINCALL LoadLibraryExW, addr tbs_dll_w, 0, LOAD_LIB_SYS32
+    test    rax, rax
+    jz      tbsl_fail
+    mov     qword ptr [tbs_hmod], rax
+    WINCALL GetProcAddress, qword ptr [tbs_hmod], addr tbs_n_create
+    test    rax, rax
+    jz      tbsl_fail
+    mov     qword ptr [tbs_fn_create], rax
+    WINCALL GetProcAddress, qword ptr [tbs_hmod], addr tbs_n_submit
+    test    rax, rax
+    jz      tbsl_fail
+    mov     qword ptr [tbs_fn_submit], rax
+    WINCALL GetProcAddress, qword ptr [tbs_hmod], addr tbs_n_close
+    test    rax, rax
+    jz      tbsl_fail
+    mov     qword ptr [tbs_fn_close], rax
+    mov     dword ptr [tbs_init_done], 1
+tbsl_ok:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+tbsl_fail:
+    mov     dword ptr [tbs_init_done], -1
+tbsl_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+tbs_load endp
+
+; tpm_cooldown_query(rcx = out_info_32) -> eax = kind:
+;   0 = g_tpm_last_err is not an anti-hammering / DA lockout HRESULT
+;   1 = Windows OS / TBS standard-user anti-hammering active (live countdown populated)
+;   2 = Hardware TPM 2.0 dictionary-attack lockout active (live counter & heal interval populated)
+;   3 = Anti-hammering HRESULT active (policy/default summary populated, exact timer unavailable)
+;   out_info_32 layout:
+;     [+0]  dd err_hr        [+4]  dd win_mins     [+8]  dd rem_mins
+;     [+12] dd cur_fails     [+16] dd max_fails    [+20] dd local_hm ((hour<<16)|min, or -1)
+;     [+24] dq unlock_ft
+public tpm_cooldown_query
+tpm_cooldown_query proc frame
+    FRAME_PROLOG 640
+    ; [rbp-16]=out_ptr    [rbp-20]=err_hr     [rbp-24]=dur_mins   [rbp-28]=ind_thr
+    ; [rbp-32]=tot_thr    [rbp-40]=hKey       [rbp-48]=now_ft     [rbp-56]=best_ft
+    ; [rbp-60]=best_cur   [rbp-64]=best_max   [rbp-72]=loc_ft     [rbp-96..rbp-81]=SYSTEMTIME(16)
+    ; [rbp-104]=hTok      [rbp-108]=tok_ret   [rbp-240..rbp-113]=tok_buf(128)
+    ; [rbp-448..rbp-257]=sid_w(96 wchars = 192B)
+    ; [rbp-456]=tbs_h     [rbp-464]=tbs_prm   [rbp-468]=rsp_len   [rbp-560..rbp-481]=tbs_rsp(80B)
+    test    rcx, rcx
+    jz      tcq_not
+    mov     qword ptr [rbp-16], rcx
+    mov     eax, dword ptr [g_tpm_last_err]
+    cmp     eax, 80290409h                      ; TPM_E_PCP_AUTHENTICATION_IGNORED
+    je      tcq_go
+    cmp     eax, 80280921h                      ; TPM_20_E_LOCKOUT
+    je      tcq_go
+    cmp     eax, 80280803h                      ; TPM_E_DEFEND_LOCK_RUNNING
+    je      tcq_go
+    jmp     tcq_not
+
+tcq_go:
+    mov     dword ptr [rbp-20], eax
+    ; Zero output struct and initialize defaults
+    mov     qword ptr [rcx+0], 0
+    mov     qword ptr [rcx+8], 0
+    mov     qword ptr [rcx+16], 0
+    mov     qword ptr [rcx+24], 0
+    mov     dword ptr [rcx+0], eax
+    mov     dword ptr [rcx+20], 0FFFFFFFFh      ; local_hm = unavailable
+
+    ; 1) Read optional Windows TPM Group Policy thresholds (defaults: 480m, 4 indiv, 9 total)
+    mov     dword ptr [rbp-24], 480
+    mov     dword ptr [rbp-28], 4
+    mov     dword ptr [rbp-32], 9
+    mov     qword ptr [rbp-40], 0
+    WINCALL RegOpenKeyExW, qword ptr [g_hklm], addr rk_tpm_pol, 0, KEY_READ, addr rbp-40
+    test    eax, eax
+    jnz     tcq_pol_done
+    mov     rcx, qword ptr [rbp-40]
+    lea     rdx, [rv_su_dur]
+    mov     r8d, 480
+    call    tpm_pol_dword
+    test    eax, eax
+    jnz     @F
+    mov     eax, 480
+@@: cmp     eax, 10000
+    jbe     @F
+    mov     eax, 10000
+@@: mov     dword ptr [rbp-24], eax
+
+    mov     rcx, qword ptr [rbp-40]
+    lea     rdx, [rv_su_ind]
+    mov     r8d, 4
+    call    tpm_pol_dword
+    cmp     eax, 1000
+    jbe     @F
+    mov     eax, 1000
+@@: mov     dword ptr [rbp-28], eax
+
+    mov     rcx, qword ptr [rbp-40]
+    lea     rdx, [rv_su_tot]
+    mov     r8d, 9
+    call    tpm_pol_dword
+    cmp     eax, 1000
+    jbe     @F
+    mov     eax, 1000
+@@: mov     dword ptr [rbp-32], eax
+    WINCALL RegCloseKey, qword ptr [rbp-40]
+
+tcq_pol_done:
+    ; 2) Check Windows TBS Standard-User AuthorizationFailure History (<UserSID> and ALLSTANDARDUSERS)
+    WINCALL GetSystemTimeAsFileTime, addr rbp-48
+    mov     qword ptr [rbp-56], 0               ; best_ft
+    mov     dword ptr [rbp-60], 0               ; best_cur
+    mov     dword ptr [rbp-64], 0               ; best_max
+    mov     qword ptr [rbp-40], 0
+    WINCALL RegOpenKeyExW, qword ptr [g_hklm], addr rk_tpm_af, 0, KEY_READ, addr rbp-40
+    test    eax, eax
+    jnz     tcq_try_hw
+
+    ; Resolve current user's SID string for per-user threshold check
+    mov     qword ptr [rbp-104], 0
+    WINCALL OpenProcessToken, -1, 8, addr rbp-104
+    test    eax, eax
+    jz      tcq_af_all
+    mov     dword ptr [rbp-108], 0
+    WINCALL GetTokenInformation, qword ptr [rbp-104], 1, addr rbp-240, 128, addr rbp-108
+    mov     dword ptr [rbp-112], eax
+    WINCALL CloseHandle, qword ptr [rbp-104]
+    cmp     dword ptr [rbp-112], 0
+    je      tcq_af_all
+    mov     rcx, qword ptr [rbp-240]            ; TOKEN_USER.User.Sid
+    lea     rdx, [rbp-448]
+    mov     r8d, 96
+    call    tpm_format_sid_w
+    test    eax, eax
+    jz      tcq_af_all
+
+    mov     eax, dword ptr [rbp-28]             ; ind_thr
+    shl     rax, 32
+    mov     ecx, dword ptr [rbp-24]             ; dur_mins
+    or      rax, rcx
+    mov     r9, rax
+    mov     rcx, qword ptr [rbp-40]
+    lea     rdx, [rbp-448]
+    mov     r8, qword ptr [rbp-48]
+    call    tpm_af_check_sub
+    cmp     rax, qword ptr [rbp-48]
+    jbe     tcq_af_all
+    mov     qword ptr [rbp-56], rax
+    mov     dword ptr [rbp-60], edx
+    mov     ecx, dword ptr [rbp-28]
+    mov     dword ptr [rbp-64], ecx
+
+tcq_af_all:
+    mov     eax, dword ptr [rbp-32]             ; tot_thr
+    shl     rax, 32
+    mov     ecx, dword ptr [rbp-24]             ; dur_mins
+    or      rax, rcx
+    mov     r9, rax
+    mov     rcx, qword ptr [rbp-40]
+    lea     rdx, [rk_af_all]
+    mov     r8, qword ptr [rbp-48]
+    call    tpm_af_check_sub
+    mov     r8, rax
+    mov     r9d, edx
+    WINCALL RegCloseKey, qword ptr [rbp-40]
+    cmp     r8, qword ptr [rbp-48]
+    jbe     tcq_af_eval
+    cmp     r8, qword ptr [rbp-56]
+    jbe     tcq_af_eval
+    mov     qword ptr [rbp-56], r8
+    mov     dword ptr [rbp-60], r9d
+    mov     ecx, dword ptr [rbp-32]
+    mov     dword ptr [rbp-64], ecx
+
+tcq_af_eval:
+    mov     rax, qword ptr [rbp-56]
+    cmp     rax, qword ptr [rbp-48]
+    jbe     tcq_try_hw
+    ; Found live TBS standard-user cooldown!
+    mov     r10, qword ptr [rbp-16]
+    mov     ecx, dword ptr [rbp-24]
+    mov     dword ptr [r10+4], ecx              ; win_mins
+    mov     ecx, dword ptr [rbp-60]
+    mov     dword ptr [r10+12], ecx             ; cur_fails
+    mov     ecx, dword ptr [rbp-64]
+    mov     dword ptr [r10+16], ecx             ; max_fails
+    mov     qword ptr [r10+24], rax             ; unlock_ft
+    sub     rax, qword ptr [rbp-48]             ; rem_ft
+    mov     ecx, FT_PER_MIN - 1
+    add     rax, rcx
+    xor     edx, edx
+    mov     ecx, FT_PER_MIN
+    div     rcx                                 ; ceil(rem_ft / FT_PER_MIN)
+    test    eax, eax
+    jnz     @F
+    mov     eax, 1
+@@: mov     r10, qword ptr [rbp-16]
+    mov     dword ptr [r10+8], eax              ; rem_mins
+
+    ; Convert unlock_ft -> local HH:MM
+    WINCALL FileTimeToLocalFileTime, addr rbp-56, addr rbp-72
+    test    eax, eax
+    jz      tcq_ret1
+    WINCALL FileTimeToSystemTime, addr rbp-72, addr rbp-96
+    test    eax, eax
+    jz      tcq_ret1
+    movzx   eax, word ptr [rbp-96 + 8]          ; wHour
+    shl     eax, 16
+    movzx   ecx, word ptr [rbp-96 + 10]         ; wMinute
+    or      eax, ecx
+    mov     r10, qword ptr [rbp-16]
+    mov     dword ptr [r10+20], eax
+tcq_ret1:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+
+tcq_try_hw:
+    ; 3) Query Hardware TPM 2.0 DA Lockout properties via tbs.dll (unprivileged TPM2_GetCapability)
+    call    tbs_load
+    test    eax, eax
+    jz      tcq_fallback
+    mov     qword ptr [rbp-456], 0              ; tbs_h
+    mov     dword ptr [rbp-464], 2              ; TBS_CONTEXT_VERSION_TWO
+    mov     dword ptr [rbp-460], 4              ; includeTpm20 = 1 (bit 2)
+    lea     rcx, [rbp-464]
+    lea     rdx, [rbp-456]
+    mov     rax, qword ptr [tbs_fn_create]
+    sub     rsp, 32
+    call    rax
+    add     rsp, 32
+    test    eax, eax
+    jnz     tcq_fallback
+    mov     dword ptr [rbp-468], 80             ; rsp_len
+    sub     rsp, 64
+    mov     rcx, qword ptr [rbp-456]
+    xor     edx, edx                            ; TBS_COMMAND_LOCALITY_ZERO
+    mov     r8d, 200                            ; TBS_COMMAND_PRIORITY_NORMAL
+    lea     r9, [tbs_getcap_cmd]
+    mov     dword ptr [rsp+32], 22
+    lea     rax, [rbp-560]
+    mov     qword ptr [rsp+40], rax
+    lea     rax, [rbp-468]
+    mov     qword ptr [rsp+48], rax
+    mov     rax, qword ptr [tbs_fn_submit]
+    call    rax
+    add     rsp, 64
+    mov     dword ptr [rbp-108], eax            ; save submit rc
+    mov     rcx, qword ptr [rbp-456]
+    mov     rax, qword ptr [tbs_fn_close]
+    sub     rsp, 32
+    call    rax
+    add     rsp, 32
+    cmp     dword ptr [rbp-108], 0
+    jne     tcq_fallback
+    mov     ecx, dword ptr [rbp-468]
+    cmp     ecx, 19
+    jb      tcq_fallback
+    mov     eax, dword ptr [rbp-560 + 6]        ; responseCode (0 = TPM_RC_SUCCESS)
+    test    eax, eax
+    jnz     tcq_fallback
+    mov     eax, dword ptr [rbp-560 + 15]       ; count (big-endian)
+    bswap   eax
+    cmp     eax, 8
+    jbe     @F
+    mov     eax, 8
+@@: mov     dword ptr [rbp-60], 0FFFFFFFFh      ; lockout_counter
+    mov     dword ptr [rbp-64], 0               ; max_auth_fail
+    mov     dword ptr [rbp-112], 0              ; lockout_interval_sec
+    xor     r8d, r8d                            ; i = 0
+tcq_hw_lp:
+    cmp     r8d, eax
+    jae     tcq_hw_eval
+    lea     r9d, [r8*8 + 19]
+    lea     r10d, [r9 + 8]
+    cmp     r10d, ecx
+    ja      tcq_hw_eval
+    mov     edx, dword ptr [rbp-560 + r9]
+    bswap   edx                                 ; property ID
+    mov     r11d, dword ptr [rbp-560 + r9 + 4]
+    bswap   r11d                                ; property value
+    cmp     edx, 020Eh                          ; TPM_PT_LOCKOUT_COUNTER
+    jne     @F
+    mov     dword ptr [rbp-60], r11d
+    jmp     tcq_hw_nx
+@@: cmp     edx, 020Fh                          ; TPM_PT_MAX_AUTH_FAIL
+    jne     @F
+    mov     dword ptr [rbp-64], r11d
+    jmp     tcq_hw_nx
+@@: cmp     edx, 0210h                          ; TPM_PT_LOCKOUT_INTERVAL (seconds)
+    jne     tcq_hw_nx
+    mov     dword ptr [rbp-112], r11d
+tcq_hw_nx:
+    inc     r8d
+    jmp     tcq_hw_lp
+
+tcq_hw_eval:
+    mov     eax, dword ptr [rbp-64]             ; max_auth_fail
+    test    eax, eax
+    jz      tcq_fallback
+    mov     ecx, dword ptr [rbp-60]             ; lockout_counter
+    cmp     ecx, 0FFFFFFFFh
+    je      tcq_fallback
+    cmp     ecx, eax
+    jb      tcq_fallback
+    ; Hardware TPM 2.0 DA Lockout is active!
+    mov     r10, qword ptr [rbp-16]
+    mov     dword ptr [r10+12], ecx             ; cur_fails
+    mov     dword ptr [r10+16], eax             ; max_fails
+    sub     ecx, eax
+    inc     ecx                                 ; steps = counter - max + 1
+    mov     r8d, dword ptr [rbp-112]            ; interval_sec
+    test    r8d, r8d
+    jnz     @F
+    mov     r8d, 600                            ; 10m default if firmware reports 0
+@@: lea     eax, [r8 + 59]
+    xor     edx, edx
+    mov     r9d, 60
+    div     r9d
+    test    eax, eax
+    jnz     @F
+    mov     eax, 1
+@@: mov     dword ptr [r10+4], eax              ; win_mins (per-decrement heal interval)
+    mov     eax, ecx
+    imul    rax, r8                             ; total_sec = steps * interval_sec
+    add     rax, 59
+    xor     edx, edx
+    mov     r9d, 60
+    div     r9
+    test    eax, eax
+    jnz     @F
+    mov     eax, 1
+@@: mov     dword ptr [r10+8], eax              ; rem_mins
+    mov     eax, 2
+    FRAME_EPILOG
+    ret
+
+tcq_fallback:
+    mov     r10, qword ptr [rbp-16]
+    mov     eax, dword ptr [rbp-24]
+    mov     dword ptr [r10+4], eax              ; win_mins (policy/default TBS window)
+    mov     eax, dword ptr [rbp-28]
+    mov     dword ptr [r10+16], eax             ; max_fails (policy/default indiv threshold)
+    mov     eax, 3
+    FRAME_EPILOG
+    ret
+
+tcq_not:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+tpm_cooldown_query endp
+
+; ===========================================================================
 ; cmd_tpmkat - VDR-10 OAEP v2 label domain/salt/reqhello binding KAT +
 ;   live PCP / mock-PCP Mode 2 anti-replay, 3-strike revocation & reseal KAT.
 ; ===========================================================================
@@ -1763,8 +2454,11 @@ extern print_a:proc
 .data
 align 2
 WSTR tpk_key, <VordrTpmKatKey>
-CSTR tpk_ok_live, "tpmkat: PASS (OAEP v2 + S0/S1 anti-replay + 3-strike revoke + reseal + Hello probe)",13,10
-CSTR tpk_ok_sw,   "tpmkat: PASS (OAEP v2 + mock-PCP S0/S1 anti-replay + 3-strike revoke + reseal)",13,10
+WSTR tpk_sid_exp, <S-1-5-21-100-200-1002>
+tpk_sid_bin db 1, 4, 0,0,0,0,0,5
+            dd 21, 100, 200, 1002
+CSTR tpk_ok_live, "tpmkat: PASS (OAEP v2 + S0/S1 anti-replay + 3-strike revoke + reseal + cooldown + Hello probe)",13,10
+CSTR tpk_ok_sw,   "tpmkat: PASS (OAEP v2 + mock-PCP S0/S1 anti-replay + 3-strike revoke + reseal + cooldown)",13,10
 CSTR tpk_bad,     "tpmkat: FAIL",13,10
 .data?
 tpk_in      db 32 dup (?)
@@ -1873,6 +2567,72 @@ tpk_cp1:
     call    tpm_hello_available
     cmp     eax, 1
     ja      tpk_fail
+
+    ; 4b) Cooldown SID formatter + TBS rolling-window remaining-time math KAT
+    lea     rcx, [tpk_sid_bin]
+    lea     rdx, [tpk_blob]
+    mov     r8d, 96
+    call    tpm_format_sid_w
+    cmp     eax, 1
+    jne     tpk_fail
+    lea     rcx, [tpk_blob]
+    lea     rdx, [tpk_sid_exp]
+    mov     r8d, 44                             ; 21 chars + NUL = 22 words = 44 bytes
+    call    ct_memcmp
+    test    eax, eax
+    jnz     tpk_fail
+
+    ; Synthetic History: 1 expired (t=100m) + 4 active unsorted (t=680m, 678m, 682m, 679m), now=1000m, win=480m
+    lea     r10, [tpk_blob]
+    mov     ecx, FT_PER_MIN
+    mov     eax, 100
+    imul    rax, rcx
+    mov     qword ptr [r10+0], rax
+    mov     eax, 680
+    imul    rax, rcx
+    mov     qword ptr [r10+8], rax
+    mov     eax, 678
+    imul    rax, rcx
+    mov     qword ptr [r10+16], rax
+    mov     eax, 682
+    imul    rax, rcx
+    mov     qword ptr [r10+24], rax
+    mov     eax, 679
+    imul    rax, rcx
+    mov     qword ptr [r10+32], rax
+    ; With thresh=4 -> 4 active, oldest active is 678m -> unlock_ft = (678+480)*600M = 1158m -> 158m left
+    mov     eax, 1000
+    imul    rax, rcx
+    mov     r8, rax                             ; now_ft
+    mov     r9, (4 shl 32) or 480               ; thresh=4, dur=480
+    lea     rcx, [tpk_blob]
+    mov     edx, 40                             ; 5 QWORDs
+    call    tpm_calc_window_rem
+    cmp     edx, 4
+    jne     tpk_fail
+    mov     ecx, FT_PER_MIN
+    mov     r8d, 1158
+    imul    r8, rcx
+    cmp     rax, r8
+    jne     tpk_fail
+    ; With thresh=5 -> 4 active < 5 -> not locked (rax == 0, edx == 4)
+    mov     eax, 1000
+    imul    rax, rcx
+    mov     r8, rax
+    mov     r9, (5 shl 32) or 480
+    lea     rcx, [tpk_blob]
+    mov     edx, 40
+    call    tpm_calc_window_rem
+    test    rax, rax
+    jnz     tpk_fail
+    cmp     edx, 4
+    jne     tpk_fail
+    ; With non-cooldown g_tpm_last_err=0 -> tpm_cooldown_query returns 0
+    mov     dword ptr [g_tpm_last_err], 0
+    lea     rcx, [tpk_blob]
+    call    tpm_cooldown_query
+    test    eax, eax
+    jnz     tpk_fail
 
     ; 5) Live PCP check when silent TPM key creation succeeds on this host
     call    tpm_available

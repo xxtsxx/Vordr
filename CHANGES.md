@@ -7,8 +7,19 @@ in [docs/RELEASES.md](docs/RELEASES.md).
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-11-15
+
+### Added
+
+- **PIN secret type (`VF_PIN = 20`).** Dedicated masked secret rows for numeric or alphanumeric PIN codes with separate length policy (`PinMinLen`, default `6`), trivial-pattern detection (repeated digits, `+1`/`-1` runs, `2`/`3`-period cycles, palindromes) and optional save-time rejection (`PinRejectTrivial`), PIN-first random generator redraw, history archiving (`VF_PWHIST`), search exclusion, and domain-separated vault-health auditing (`pinkat`, `healthkat`).
+- **Strengthened TPM Unlock modes (`VTPM` v1).** Configurable per-vault TPM unlock in Settings (`Off`, `TPM only`, `TPM + PIN`, `TPM + Hello`) with administrator minimum-mode floor (`TpmMinMode`):
+  - **`TPM + PIN`:** Argon2id-stretched PIN combined with dual-slot (`S0`/`S1`) pre-commit rotating TPM 2.0 state keys (`Microsoft Platform Crypto Provider`) so replaying or rolling back the `HKCU` registry blob fails `AES-256-GCM` authentication, revoking the TPM shortcut after `TpmPinMaxAttempts` (default `3`) failed attempts without touching OS-wide TPM authorization counters (`tpmkat`).
+  - **`TPM + Windows Hello`:** Dual-key unwrap combining TPM 2.0 RSA-2048 OAEP with unpackaged Win32 Windows Hello FIDO2 `PRF` (`hmac-secret` via `webauthn.dll`, `WHLO` v1) requiring live biometric or Hello PIN verification.
+- **Live TPM anti-hammering cooldown diagnostics.** When Windows OS standard-user anti-hammering (`0x80290409`) or hardware TPM 2.0 dictionary-attack lockout (`0x80280921` / `0x80280803`) blocks a TPM call, Vordr queries the active Windows `AuthorizationFailure` rolling-window history or unprivileged `TPM2_GetCapability` lockout properties via `tbs.dll` and reports the active mechanism, configured window/threshold, remaining cooldown duration, local expiry clock time, and sleep/reboot behavior.
+
 ### Security
 
+- **Second-pass security audit remediation (`VDR2-01`–`VDR2-26`).** Hardened private-desktop DACLs (`SetUserObjectSecurity` pointer fix and restricted SIDs), screen-capture exclusion (`WDA_EXCLUDEFROMCAPTURE` default with `AllowScreenCapture` policy), UNC vault blocking (`AllowUncVault`), strict parser/clipboard/temp-cleanup bounds, and invariant `VH_INV_AAD` binding across `VTPM` v1 envelopes.
 - **Comprehensive security hardening (`VDR-01`–`VDR-28`).**
   - **Container, ZIP, and JSON parsers:** Bounded `zj_str` destination capacity (enforced statically in `wstrcheck.py`) with strict `\uXXXX`, surrogate-pair, and `\u0000` validation; enforced `256 MiB` per-attachment (`ATT_FILE_MAX`) and `3,840 MiB` section (`ATT_TOTAL_MAX`) caps with checked 64-bit arithmetic (`attovfkat`); honored per-entry selection masks (`g_sel[]`) on AES-ZIP attachment export (`zexselkat`); validated UTF-16LE tails on `VF_PWHIST`; added automatic nonce retry on `VATT` footer tag collisions (`vattcolkat`); switched `zi_scan` to EOCD Central Directory parsing and made `zi_decrypt` non-destructive across duplicate attachment references.
   - **Attachment preview, IPC, clipboard, and private desktop:** Replaced preview blocklisting with a strict eight-extension safe-preview allowlist (`.txt`, `.png`, `.jpg`, `.jpeg`, `.gif`, `.bmp`, `.webp`, `.pdf`), filename sanitization (`gui_sanitize_attname`), owner-only temp directory DACLs, and fail-closed `Zone.Identifier` (`ZoneId=3`) writes (`tmptest`); wiped `g_vkey`, arenas, and static buffers immediately inside `vp_lock` when locking over open modals (`guitest.ps1`); rejected UNC/device paths and modal-active hand-offs in `WM_COPYDATA`; bound `CLIP_TIMER` to `g_trayhwnd` so clipboard auto-clear survives dialog closure; made `HKLM`-locked `SecureUnlock=1` fail closed and added explicit user confirmation before normal-desktop fallback (`secdeskkat`); filtered whitespace/quotes/control bytes in URL launches.
@@ -92,6 +103,8 @@ in [docs/RELEASES.md](docs/RELEASES.md).
   - moving the keyboard focus repaints the underline strips, not the whole
     window and every control in it;
   - the sliding selection repaints only the rows it crosses.
+- **Topmost elevation, foreground revival, focus priority, and full-surface Settings dragging.** All 16 top-level dialogs carry `WS_EX_TOPMOST` and `DS_SETFOREGROUND` with deferred `WM_VORDR_RAISE` foreground restoration across tray/hotkey/`WM_COPYDATA` revivals, automatic focus into password/PIN inputs on credential dialogs and `IDC_V_SEARCH` on the main vault window, and full-surface window dragging across `DLG_SETTINGS`.
+- **Smooth zero-flicker detail switching and fast reproducible builds.** Buffered `WS_EX_COMPOSITED` child tearing/creation during entry switches, single-process lint caching + multi-core `ml64` compilation in `tools\build_fast.py`, precompiled regexes in `tools\nvcheck.py`, and auto-discovered MSI target in `tools\verify_msi.ps1`.
 - **Reproducible release builds.** Two builds of one commit differed (ml64 stamps
   every object, so `/Brepro` hashed different inputs each time).
   `tools\pe_normalise.py` zeroes the build stamps after the link, `build.cmd

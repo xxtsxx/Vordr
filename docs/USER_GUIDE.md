@@ -182,6 +182,13 @@ computer can make this shortcut unavailable. The master password still matters.
 The default reminder asks you to type it every 30 days. This is a reminder, not
 a lockout deadline: postponing it does not deliberately revoke TPM access.
 
+If Windows or the hardware TPM enters anti-hammering protection (for example,
+Windows's default 8-hour standard-user cooldown after 4 failed TPM authorization
+attempts on the PC, or a hardware TPM dictionary-attack heal interval of 10-120
+minutes of powered-on time per attempt), Vordr displays the active mechanism,
+remaining cooldown, and estimated expiry time. Your vault and master password are
+unaffected and can be used immediately while the cooldown expires.
+
 ## Attachments and plaintext copies
 
 Attachments are encrypted in the vault. Opening one in another application
