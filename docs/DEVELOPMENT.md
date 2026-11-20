@@ -8,6 +8,7 @@ Use Windows x64 and an **x64 Native Tools Command Prompt** with:
 
 - Visual Studio Build Tools: `ml64.exe` and `link.exe`.
 - A Windows 10 SDK: `rc.exe`, headers, and import libraries.
+- LLVM (`clang.exe` and `llvm-lib.exe`) for building the native ARM64 executable (`build_arm64.cmd`; see [ARM64.md](ARM64.md)).
 - Python 3 on PATH for static checks and differential/regression tests.
 - Windows PowerShell, Windows Installer, and `makecab.exe` for MSI checks.
 

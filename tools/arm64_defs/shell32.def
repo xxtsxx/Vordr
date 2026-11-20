@@ -1,0 +1,8 @@
+LIBRARY SHELL32.dll
+EXPORTS
+    DragAcceptFiles
+    DragFinish
+    DragQueryFileW
+    SHGetFolderPathW
+    ShellExecuteW
+    Shell_NotifyIconW

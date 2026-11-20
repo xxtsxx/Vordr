@@ -1,0 +1,4 @@
+LIBRARY WTSAPI32.dll
+EXPORTS
+    WTSRegisterSessionNotification
+    WTSUnRegisterSessionNotification

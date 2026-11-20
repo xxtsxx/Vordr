@@ -1,0 +1,25 @@
+LIBRARY ADVAPI32.dll
+EXPORTS
+    AddAccessAllowedAce
+    AddAccessAllowedAceEx
+    AddMandatoryAce
+    GetLengthSid
+    GetNamedSecurityInfoW
+    GetSecurityDescriptorControl
+    GetTokenInformation
+    InitializeAcl
+    InitializeSecurityDescriptor
+    OpenProcessToken
+    RegCloseKey
+    RegCreateKeyExW
+    RegDeleteValueW
+    RegEnumKeyExW
+    RegEnumValueW
+    RegOpenKeyExW
+    RegOverridePredefKey
+    RegQueryValueExW
+    RegSetValueExW
+    SetNamedSecurityInfoW
+    SetSecurityDescriptorControl
+    SetSecurityDescriptorDacl
+    SetSecurityDescriptorSacl

@@ -63,7 +63,10 @@ def normalise(path):
 
     changed = 0
 
-    # --- COFF header TimeDateStamp -----------------------------------------
+    # --- COFF header Machine & TimeDateStamp --------------------------------
+    machine = _u16(b, pe + 4)
+    if machine not in (0x8664, 0xAA64):
+        raise ValueError("unsupported PE machine 0x%04X (expected AMD64 0x8664 or ARM64 0xAA64)" % machine)
     if _u32(b, pe + 8) != 0:
         struct.pack_into("<I", b, pe + 8, 0)
         changed += 1
@@ -208,7 +211,7 @@ def normalise(path):
             struct.pack_into("<III", b, e + 16, 0, 0, 0)
             changed += 1
 
-    if not cet_ok:
+    if machine == 0x8664 and not cet_ok:
         raise ValueError("missing or disabled CETCOMPAT in IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS")
 
     return _save(path, b, changed)

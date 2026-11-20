@@ -7,6 +7,15 @@ in [docs/RELEASES.md](docs/RELEASES.md).
 
 ## [Unreleased]
 
+### Added (Unreleased)
+
+- **Native Windows on ARM (ARM64) executable (`bin/vordr-arm64.exe`, [docs/ARM64.md](docs/ARM64.md)).** Pure AArch64 assembly build (zero C, zero CRT) combining hand-written ARMv8 Cryptography Extensions (`AESE`/`AESMC`, `PMULL`/`PMULL2`, `SHA256*`, `SHA1*`), NEON (`BLAKE2b`, `Argon2id`), `BCryptGenRandom` + ARMv8.5 `RNDRRS` entropy mixing, ARM64 `cpu_gate` / `ff_trap` (`BRK #0xF003`), pointer authentication (`PACIBSP`/`AUTIBSP`), and `LOAD_CONFIG.DependentLoadFlags = 0x0800` in `src/arm64/*.S` with deterministic COFF-to-AArch64 translation (`tools/a64/xlat.py`, `build_arm64.cmd`) so application logic stays single-source with x64. Verified byte-reproducible (`tools/verify_repro.ps1`) and end-to-end under ARM64 emulation (`tests/arm64/test_*.py`), including cross-architecture `.vordr` vault interoperability with x64 fixtures and `tests/verify_vault.py`.
+- **Universal x64 + ARM64 MSI (`tools/make_msi.ps1`, `tools/verify_msi.ps1`).** Single per-machine MSI embedding both `vordr.exe` (`0x8664`) and `vordr-arm64.exe` (`0xAA64`) and automatically deploying the local system's native executable to `%ProgramFiles%\Vordr\vordr.exe` with zero custom actions via `AppSearch` + `RegLocator` (`HOST_NATIVE_ARCH`).
+
+### Fixed (Unreleased)
+
+- **Latent x64 flag-liveness and stack-alignment hazards (`src/gpu.asm`, `src/gui.asm`, `src/theme.asm`).** Surfaced by `tools/a64/xlat.py` static analysis: added explicit `test` instructions before conditional jumps following multi-bit shifts (`src/gui.asm`) and `imul` (`src/gpu.asm`), and removed an 8-byte stack misalignment around `theme_glass_alpha` (`src/theme.asm`).
+
 ## [0.8.1] - 2026-11-20
 
 ### Added in 0.8.1

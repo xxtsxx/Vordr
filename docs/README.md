@@ -10,6 +10,7 @@ exact git tags.
 
 - [Why Vordr earns trust](TRUST.md): architectural rationale, lifecycle trust boundaries, defense-in-depth controls, runnable verification proof, and honest limits.
 - [Architecture](ARCHITECTURE.md): module design, why each trust boundary is structured this way, unlock/save state machines, cryptography, and runtime hardening.
+- [Windows on ARM (ARM64)](ARM64.md): pure-assembly AArch64 port (`vordr-arm64.exe`), ARMv8 Cryptography Extensions and NEON primitives, internal ABI, emulation tests, and universal MSI deployment.
 - [Assurance and verification](ASSURANCE.md): the six-stage automated gate, independent vault and crypto verifiers, 10 static analyzers, fuzz/regression probes, and explicit test limits.
 - [Visual verification map](assurance.html): self-contained offline HTML overview of how the six verification stages and trust boundaries fit together.
 - [Secret memory](SECRETS.md): `VirtualLock` static/dynamic buffer inventory, zeroing lifecycles, clipboard/preview containment, and constant-time comparison paths.

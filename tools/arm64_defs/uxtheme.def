@@ -1,0 +1,3 @@
+LIBRARY UxTheme.dll
+EXPORTS
+    SetWindowTheme

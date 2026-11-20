@@ -934,10 +934,10 @@ theme_aa_rrect proc frame
 tar_chk_gtag:
     cmp     ecx, 66h                            ; GLASS_FILL_TAG >> 24 -> scheme-aware glass alpha
     jne     tar_set_fa
-    push    rax
+    mov     dword ptr [rbp-128], eax
     call    theme_glass_alpha
     mov     ecx, eax
-    pop     rax
+    mov     eax, dword ptr [rbp-128]
 tar_set_fa:
     mov     dword ptr [rbp-128], ecx            ; fillAlpha (1..255)
     and     eax, 00FFFFFFh

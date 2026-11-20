@@ -1,0 +1,4 @@
+LIBRARY COMDLG32.dll
+EXPORTS
+    GetOpenFileNameW
+    GetSaveFileNameW

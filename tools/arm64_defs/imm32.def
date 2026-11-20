@@ -1,0 +1,3 @@
+LIBRARY IMM32.dll
+EXPORTS
+    ImmAssociateContext

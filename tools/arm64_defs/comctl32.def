@@ -1,0 +1,5 @@
+LIBRARY COMCTL32.dll
+EXPORTS
+    DefSubclassProc @413 NONAME
+    InitCommonControlsEx
+    SetWindowSubclass @410 NONAME

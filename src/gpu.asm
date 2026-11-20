@@ -1083,6 +1083,7 @@ ges_dispatch:
     jz      ges_unmap
     mov     ecx, dword ptr [rbp-16]
     imul    ecx, dword ptr [rbp-20]
+    test    ecx, ecx
     jz      ges_unmap
 ges_cp_qw:
     mov     rax, qword ptr [r8]

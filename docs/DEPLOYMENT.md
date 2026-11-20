@@ -7,9 +7,14 @@ A portable installation does not require machine policy.
 
 ## Installation and upgrades
 
-The MSI installs for all users in `%ProgramFiles%\Vordr`. It can register an
-all-users Start Menu shortcut, the `.vordr` file association, and only the policy
-values explicitly supplied at installation. Installation requires elevation;
+The universal MSI installs for all users in `%ProgramFiles%\Vordr`. It carries
+both the native x64 (`vordr.exe`) and native ARM64 (`vordr-arm64.exe`) binaries
+and automatically installs the host's native executable as `%ProgramFiles%\Vordr\vordr.exe`
+with zero custom actions (using `AppSearch` + `RegLocator` against
+`HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment\PROCESSOR_ARCHITECTURE`
+into `HOST_NATIVE_ARCH`, see [Windows on ARM](ARM64.md#universal-msi-deployment)). It
+can register an all-users Start Menu shortcut, the `.vordr` file association, and only
+the policy values explicitly supplied at installation. Installation requires elevation;
 the application manifest uses `asInvoker`, so running Vordr does not itself
 request elevation.
 

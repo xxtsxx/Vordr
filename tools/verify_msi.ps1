@@ -49,6 +49,7 @@ if ([string]::IsNullOrWhiteSpace($Msi)) {
 $Msi = (Resolve-Path $Msi).Path
 Write-Host ("msi package     : {0}" -f $Msi)
 $installer = New-Object -ComObject WindowsInstaller.Installer
+$installer.UILevel = 2                          # msiUILevelNone: never block on modal error UI
 $db = $installer.OpenDatabase($Msi, 0)          # msiOpenDatabaseModeReadOnly
 
 function Rows([string]$sql, [int]$cols) {
@@ -199,9 +200,59 @@ if ($assocRows.Count) {
     Write-Host "costing the association opt-out:"
     $off = Cost @{ "VORDR_NOASSOC" = "1" }
     if ($off["FileAssoc"] -eq $LOCAL) { Bad "VORDR_NOASSOC=1 still registers the association" }
-    if ($off["VordrExe"] -ne $LOCAL)  { Bad "VORDR_NOASSOC=1 also suppresses the exe" }
-    if ($fail -eq $before) { Write-Host "  VORDR_NOASSOC=1 drops the association and nothing else - ok" }
+    if ($off["VordrExe"] -ne $LOCAL)  { Bad "VORDR_NOASSOC=1 also suppresses the x64 exe" }
+    $offArm = Cost @{ "VORDR_NOASSOC" = "1"; "HOST_NATIVE_ARCH" = "ARM64" }
+    if ($offArm["FileAssoc"] -eq $LOCAL)     { Bad "VORDR_NOASSOC=1 on ARM64 still registers the association" }
+    if ($offArm["VordrExeArm64"] -ne $LOCAL) { Bad "VORDR_NOASSOC=1 on ARM64 also suppresses the ARM64 exe" }
+    if ($fail -eq $before) { Write-Host "  VORDR_NOASSOC=1 drops the association and nothing else (x64 + ARM64) - ok" }
 }
+
+# --- 2a. universal x64 + ARM64 architecture selection -----------------------
+Write-Host ""
+$before = $fail
+Write-Host "universal architecture selection (x64 + ARM64):"
+if ($secure -notcontains "HOST_NATIVE_ARCH") {
+    Bad "HOST_NATIVE_ARCH is missing from SecureCustomProperties - ARM64 selection would be dropped on elevation"
+}
+$appSearch = Rows "SELECT ``Property``,``Signature_`` FROM ``AppSearch``" 2
+$regLoc    = Rows "SELECT ``Signature_``,``Root``,``Key``,``Name``,``Type`` FROM ``RegLocator``" 5
+$asMatch   = @($appSearch | Where-Object { $_[0] -eq "HOST_NATIVE_ARCH" -and $_[1] -eq "SigHostArch" })
+if ($asMatch.Count -ne 1) { Bad "AppSearch lacks HOST_NATIVE_ARCH -> SigHostArch" }
+$rlMatch   = @($regLoc | Where-Object { $_[0] -eq "SigHostArch" })
+if ($rlMatch.Count -ne 1) { Bad "RegLocator lacks SigHostArch" }
+else {
+    $rl = $rlMatch[0]
+    if ([int]$rl[1] -ne 2) { Bad "SigHostArch Root is $($rl[1]), expected 2 (HKLM)" }
+    if ($rl[2] -ne "SYSTEM\CurrentControlSet\Control\Session Manager\Environment") { Bad "SigHostArch Key is '$($rl[2])'" }
+    if ($rl[3] -ne "PROCESSOR_ARCHITECTURE") { Bad "SigHostArch Name is '$($rl[3])'" }
+    if ([int]$rl[4] -ne 18) { Bad "SigHostArch Type is $($rl[4]), expected 18 (raw+64bit)" }
+}
+foreach ($exeComp in @("VordrExe", "VordrExeArm64")) {
+    $ec = $byName[$exeComp]
+    if (-not $ec) { Bad "missing executable component $exeComp" }
+    else {
+        if (-not ([int]$ec[2] -band 256)) { Bad "$exeComp is not marked 64-bit (Attributes=$($ec[2]))" }
+        if ([int]$ec[2] -band 4)          { Bad "$exeComp has RegistryKeyPath set instead of File KeyPath" }
+        if (-not $inFeature[$exeComp])    { Bad "$exeComp is not in any feature" }
+    }
+}
+$cDef   = Cost @{}
+$cAmd64 = Cost @{ "HOST_NATIVE_ARCH" = "AMD64" }
+$cArm64 = Cost @{ "HOST_NATIVE_ARCH" = "ARM64" }
+$cArmLo = Cost @{ "HOST_NATIVE_ARCH" = "arm64" }
+if ($cDef["VordrExe"] -ne $LOCAL -or $cDef["VordrExeArm64"] -eq $LOCAL) {
+    Bad "default (unset HOST_NATIVE_ARCH) did not exclusively select VordrExe"
+}
+if ($cAmd64["VordrExe"] -ne $LOCAL -or $cAmd64["VordrExeArm64"] -eq $LOCAL) {
+    Bad "HOST_NATIVE_ARCH=AMD64 did not exclusively select VordrExe"
+}
+if ($cArm64["VordrExeArm64"] -ne $LOCAL -or $cArm64["VordrExe"] -eq $LOCAL) {
+    Bad "HOST_NATIVE_ARCH=ARM64 did not exclusively select VordrExeArm64"
+}
+if ($cArmLo["VordrExeArm64"] -ne $LOCAL -or $cArmLo["VordrExe"] -eq $LOCAL) {
+    Bad "HOST_NATIVE_ARCH=arm64 (lowercase) did not exclusively select VordrExeArm64"
+}
+if ($fail -eq $before) { Write-Host "  AppSearch/RegLocator + mutually exclusive x64/ARM64 costing - ok" }
 
 # --- 2b. payload structure (ported from Myrkr's verifier) --------------------
 # Each of these produces a package that builds, verifies its policy wiring, and
@@ -210,9 +261,13 @@ Write-Host ""
 $before = $fail
 $pvAll  = Rows "SELECT ``Value`` FROM ``Property`` WHERE ``Property``='ProductVersion'" 1
 $pvNow  = $pvAll[0][0]
-$files  = Rows "SELECT ``File``,``Component_``,``Version``,``Sequence`` FROM ``File``" 4
+$files  = Rows "SELECT ``File``,``Component_``,``Version``,``Sequence``,``FileName`` FROM ``File``" 5
 $regKeys  = @($reg   | ForEach-Object { $_[0] })
 $fileKeys = @($files | ForEach-Object { $_[0] })
+if ($files.Count -ne 2) { Bad "expected 2 File rows (x64 + ARM64), found $($files.Count)" }
+foreach ($f in $files) {
+    if ($f[4] -ne "vordr.exe") { Bad "File $($f[0]) installs as '$($f[4])', expected 'vordr.exe'" }
+}
 # KeyPath names the row Windows Installer uses to decide whether the component is
 # installed.  With RegistryKeyPath (0x4) it must be a Registry row, otherwise a
 # File row; a dangling one fails the install with error 2715.  The 0x4 bit alone
@@ -243,10 +298,50 @@ else {
     else {
         $streams = Rows "SELECT ``Name`` FROM ``_Streams``" 1
         $snames  = @($streams | ForEach-Object { $_[0] })
-        if ($snames -notcontains $cabName.Substring(1)) { Bad "cabinet stream '$($cabName.Substring(1))' is not embedded in the package" }
+        $streamKey = $cabName.Substring(1)
+        if ($snames -notcontains $streamKey) { Bad "cabinet stream '$streamKey' is not embedded in the package" }
+        else {
+            # Extract embedded CAB and verify PE Machine of both embedded payloads.
+            $tmpCabDir = Join-Path $env:TEMP ("vordrmsiverify_" + [guid]::NewGuid().ToString("N"))
+            New-Item -ItemType Directory -Path $tmpCabDir | Out-Null
+            try {
+                $cabOut = Join-Path $tmpCabDir $streamKey
+                $sv = $db.OpenView("SELECT ``Data`` FROM ``_Streams`` WHERE ``Name``='$streamKey'")
+                $null = $sv.Execute()
+                $sr = $sv.Fetch()
+                $sz = $sr.DataSize(1)
+                $fs = [System.IO.File]::Create($cabOut)
+                try {
+                    $rem = $sz
+                    while ($rem -gt 0) {
+                        $chunk = [Math]::Min($rem, 65536)
+                        $str = $sr.ReadStream(1, $chunk, 1)  # msiReadStreamBytes (raw 0x00..0xFF per char)
+                        $bytes = [System.Text.Encoding]::GetEncoding(28591).GetBytes($str)
+                        $fs.Write($bytes, 0, $bytes.Length)
+                        $rem -= $bytes.Length
+                    }
+                } finally { $fs.Close() }
+                $null = $sv.Close()
+                $null = & expand.exe $cabOut -F:* $tmpCabDir 2>&1
+                foreach ($pair in @(@("vordr_x64.exe", 0x8664), @("vordr_arm64.exe", 0xAA64))) {
+                    $ep = Join-Path $tmpCabDir $pair[0]
+                    if (-not (Test-Path $ep)) { Bad "cab is missing $($pair[0])" }
+                    else {
+                        $b = [System.IO.File]::ReadAllBytes($ep)
+                        $pe = [BitConverter]::ToInt32($b, 0x3C)
+                        $mach = [BitConverter]::ToUInt16($b, $pe + 4)
+                        if ($mach -ne $pair[1]) {
+                            Bad ("cab member {0} has PE Machine 0x{1:X4}, expected 0x{2:X4}" -f $pair[0], $mach, $pair[1])
+                        }
+                    }
+                }
+            } finally {
+                Remove-Item $tmpCabDir -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
     }
 }
-if ($fail -eq $before) { Write-Host ("payload         : {0} file(s), KeyPaths resolve, versions match {1}, cab embedded - ok" -f $files.Count, $pvNow) }
+if ($fail -eq $before) { Write-Host ("payload         : {0} file(s) (0x8664 + 0xAA64), KeyPaths resolve, versions match {1}, cab embedded - ok" -f $files.Count, $pvNow) }
 
 # --- 3. the upgrade rows + downgrade block ----------------------------------
 # Attributes is a bitfield whose Inclusive bits are 0x100/0x200, not 0x1/0x2.
@@ -331,6 +426,16 @@ if (-not $seqMap.ContainsKey("RemoveExistingProducts")) {
 $uiRows   = Rows "SELECT ``Action``,``Sequence`` FROM ``InstallUISequence``" 2
 $uiNames  = @($uiRows | ForEach-Object { $_[0] })
 $uiMap    = @{}; foreach ($ur in $uiRows) { $uiMap[$ur[0]] = [int]$ur[1] }
+if (-not $seqMap.ContainsKey("AppSearch") -or -not $uiMap.ContainsKey("AppSearch")) {
+    Bad "AppSearch must be sequenced in both InstallExecuteSequence and InstallUISequence for HOST_NATIVE_ARCH detection"
+} else {
+    if ($seqMap["AppSearch"] -ge $seqMap["CostInitialize"]) {
+        Bad "InstallExecuteSequence runs AppSearch ($($seqMap['AppSearch'])) after CostInitialize ($($seqMap['CostInitialize']))"
+    }
+    if ($uiMap["AppSearch"] -ge $uiMap["CostInitialize"]) {
+        Bad "InstallUISequence runs AppSearch ($($uiMap['AppSearch'])) after CostInitialize ($($uiMap['CostInitialize']))"
+    }
+}
 foreach ($a in @("FindRelatedProducts","AppSearch","LaunchConditions","CCPSearch","RMCCPSearch")) {
     if (($names -contains $a) -and ($uiNames -notcontains $a)) {
         Bad "$a is in InstallExecuteSequence but not InstallUISequence - the server skips it as 'already done on client side', so it never runs on a UI install"
@@ -342,13 +447,17 @@ if (($uiMap.ContainsKey("FindRelatedProducts")) -and ($uiMap.ContainsKey("Launch
     }
 }
 
-# What this package would actually displace on THIS machine.  Informational -
-# it depends on machine state, not on the package - but it is the check that
-# would have caught the bug above the moment it was tested twice.
+# What this package would actually displace and select on THIS machine.
 $probe = $installer.OpenPackage($Msi, 1)
-$null  = $probe.DoAction("FindRelatedProducts")
+$appRc = $probe.DoAction("AppSearch")
+$hostArch = $probe.Property("HOST_NATIVE_ARCH")
+$frpRc = $probe.DoAction("FindRelatedProducts")
 $found = $probe.Property("OLDERVERSIONBEINGUPGRADED")
 [void][Runtime.InteropServices.Marshal]::ReleaseComObject($probe)
+if ($appRc -ne 1) { Bad "AppSearch failed on this machine (return value $appRc - check Signature/RegLocator tables)" }
+elseif ([string]::IsNullOrEmpty($hostArch)) { Bad "AppSearch did not populate HOST_NATIVE_ARCH on this machine" }
+else { Write-Host ("  host arch     : {0} (live AppSearch -> {1})" -f $hostArch, $(if ($hostArch -ieq "ARM64") { "VordrExeArm64" } else { "VordrExe" })) }
+if ($frpRc -ne 1) { Bad "FindRelatedProducts failed on this machine (return value $frpRc)" }
 if ($found) { Write-Host ("  would replace : {0}" -f $found) }
 else        { Write-Host  "  would replace : nothing currently installed matches" }
 

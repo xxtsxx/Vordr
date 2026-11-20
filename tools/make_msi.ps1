@@ -1,5 +1,6 @@
 <#
-    make_msi.ps1 - build a per-user MSI around bin\vordr.exe.
+    make_msi.ps1 - build a per-machine universal MSI (x64 + ARM64) around
+                   bin\vordr.exe and bin\vordr-arm64.exe.
 
     No third-party toolchain: the MSI database is authored directly through the
     WindowsInstaller COM automation, and the payload is packed with makecab.
@@ -57,12 +58,13 @@
     the single source of truth - the MSI cannot drift from the binary it wraps.
 
     Usage:  powershell -ExecutionPolicy Bypass -File tools\make_msi.ps1
-            [-Exe bin\vordr.exe] [-OutDir bin]
+            [-Exe bin\vordr.exe] [-Arm64Exe bin\vordr-arm64.exe] [-OutDir bin]
 #>
 [CmdletBinding()]
 param(
-    [string]$Exe    = "bin\vordr.exe",
-    [string]$OutDir = "bin"
+    [string]$Exe      = "bin\vordr.exe",
+    [string]$Arm64Exe = "bin\vordr-arm64.exe",
+    [string]$OutDir   = "bin"
 )
 
 $ErrorActionPreference = "Stop"
@@ -71,8 +73,9 @@ $ErrorActionPreference = "Stop"
 # recognise and replace an older install instead of sitting beside it.
 # ProductCode is regenerated per build, which is what tells Windows the payload
 # differs (required for RemoveExistingProducts to do its job).
-$UpgradeCode  = "{6A1D0C7E-9E2F-4F1B-9C2A-7E5B0D3A8F41}"
-$ComponentGuid= "{2F8B5A31-4C6D-4E7A-8B90-1D3E5F7A9C24}"
+$UpgradeCode        = "{6A1D0C7E-9E2F-4F1B-9C2A-7E5B0D3A8F41}"
+$ComponentGuid      = "{2F8B5A31-4C6D-4E7A-8B90-1D3E5F7A9C24}"
+$Arm64ComponentGuid = "{8E4C7D29-61B3-4F0A-9A5E-3C1B8D4F2E71}"
 $Manufacturer = "Thomas Smistad"
 $ProductName  = "Vordr"
 $InstallDir   = "Vordr"
@@ -123,20 +126,17 @@ function Resolve-Full([string]$p) {
     if ([System.IO.Path]::IsPathRooted($p)) { $p } else { Join-Path (Get-Location) $p }
 }
 
-$exePath = Resolve-Full $Exe
-if (-not (Test-Path $exePath)) { throw "not found: $exePath  (build first: build.cmd release)" }
+$exePath   = Resolve-Full $Exe
+$arm64Path = Resolve-Full $Arm64Exe
+if (-not (Test-Path $exePath))   { throw "not found: $exePath  (build first: build.cmd release)" }
+if (-not (Test-Path $arm64Path)) { throw "not found: $arm64Path  (build first: build_arm64.cmd release)" }
 
-# --- refuse to wrap anything but a release binary ----------------------------
+# --- refuse to wrap anything but normalised release binaries -----------------
 # The gate's roundtrip stage leaves a PROBE_IO build in bin\, and that build
 # exposes the path-taking diagnostic verbs.  Shipping one inside an installer
 # would hand every user a binary that takes a vault path on the command line.
 # Nothing about the file says which build it is - same name, same version
-# resource - so ask it: a release refuses a path verb and touches no file.
-#
-# Start-Process -Wait, not the call operator: vordr.exe is a GUI-subsystem
-# binary, and PowerShell's & does not wait for one.  The first version of this
-# guard read $LASTEXITCODE from a process that had not finished and cheerfully
-# packaged the PROBE_IO build it was written to catch.
+# resource - so ask the x64 binary directly, and statically inspect both PEs.
 $probe = Join-Path $env:TEMP ("vordrguard_" + [guid]::NewGuid().ToString("N") + ".vault")
 $run = Start-Process -FilePath $exePath -ArgumentList @("seedtest", $probe) `
                      -Wait -PassThru -WindowStyle Hidden
@@ -145,84 +145,100 @@ if (Test-Path $probe) { Remove-Item $probe -Force; $tookIt = $true }
 if ($tookIt) {
     throw "$exePath accepts path-taking verbs - that is a PROBE_IO build, not a release. Run build.cmd release (or strict) and package that."
 }
-# Reject non-release (un-normalised, nohw, dbg, probeio, or guishow) binaries:
-#   1. Scan for the VORDR_NON_RELEASE_BUILD sentinel emitted whenever DBG_TRACE,
-#      PROBE_IO, or DBG_SHOW is defined (catches guishow even if normalised).
-#   2. Require COFF TimeDateStamp == 0 (written by pe_normalise.py in 'build.cmd release').
-#   3. Require IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS (type 20, /CETCOMPAT) present
-#      and all other debug payloads zeroed by pe_normalise.py.
-$peBytes = [System.IO.File]::ReadAllBytes($exePath)
-$sentinel = [System.Text.Encoding]::ASCII.GetBytes("VORDR_NON_RELEASE_BUILD")
-$si = 0
-$maxSi = $peBytes.Length - $sentinel.Length
-while (($si = [Array]::IndexOf($peBytes, $sentinel[0], $si)) -ge 0 -and $si -le $maxSi) {
-    $match = $true
-    for ($sj = 1; $sj -lt $sentinel.Length; $sj++) {
-        if ($peBytes[$si + $sj] -ne $sentinel[$sj]) { $match = $false; break }
+
+function Assert-ReleasePe([string]$Path, [uint16]$ExpectMachine, [bool]$RequireCet) {
+    $peBytes = [System.IO.File]::ReadAllBytes($Path)
+    $sentinel = [System.Text.Encoding]::ASCII.GetBytes("VORDR_NON_RELEASE_BUILD")
+    $si = 0
+    $maxSi = $peBytes.Length - $sentinel.Length
+    while (($si = [Array]::IndexOf($peBytes, $sentinel[0], $si)) -ge 0 -and $si -le $maxSi) {
+        $match = $true
+        for ($sj = 1; $sj -lt $sentinel.Length; $sj++) {
+            if ($peBytes[$si + $sj] -ne $sentinel[$sj]) { $match = $false; break }
+        }
+        if ($match) {
+            throw "$Path contains VORDR_NON_RELEASE_BUILD (dbg/probeio/guishow build) - never package non-release builds."
+        }
+        $si++
     }
-    if ($match) {
-        throw "$exePath contains VORDR_NON_RELEASE_BUILD (dbg/probeio/guishow build) - never package non-release builds. Run 'build.cmd release strict' first."
+    $peOff   = [BitConverter]::ToInt32($peBytes, 0x3C)
+    $machine = [BitConverter]::ToUInt16($peBytes, $peOff + 4)
+    if ($machine -ne $ExpectMachine) {
+        throw ("{0} has PE Machine 0x{1:X4}, expected 0x{2:X4}" -f $Path, $machine, $ExpectMachine)
     }
-    $si++
-}
-$peOff   = [BitConverter]::ToInt32($peBytes, 0x3C)
-$coffTs  = [BitConverter]::ToInt32($peBytes, $peOff + 8)
-if ($coffTs -ne 0) {
-    throw "$exePath has non-zero COFF TimeDateStamp (0x$($coffTs.ToString('X8'))) - not a normalised 'build.cmd release' binary."
-}
-$nSect   = [BitConverter]::ToUInt16($peBytes, $peOff + 6)
-$optSize = [BitConverter]::ToUInt16($peBytes, $peOff + 20)
-$optOff  = $peOff + 24
-$ddOff   = $optOff + 112                  # PE32+ DataDirectory[0]
-$sectOff = $optOff + $optSize
-$dbgRva  = [BitConverter]::ToInt32($peBytes, $ddOff + 6 * 8)
-$dbgSz   = [BitConverter]::ToInt32($peBytes, $ddOff + 6 * 8 + 4)
-$hasCet  = $false
-if ($dbgRva -ne 0 -and $dbgSz -ge 28) {
-    $dbgFileOff = -1
-    for ($si = 0; $si -lt $nSect; $si++) {
-        $s = $sectOff + $si * 40
-        $va = [BitConverter]::ToUInt32($peBytes, $s + 12)
-        $vsz = [BitConverter]::ToUInt32($peBytes, $s + 8)
-        $raw = [BitConverter]::ToUInt32($peBytes, $s + 20)
-        $rsz = [BitConverter]::ToUInt32($peBytes, $s + 16)
-        $span = if ($vsz -gt 0 -and $vsz -lt $rsz) { $vsz } else { $rsz }
-        if ($dbgRva -ge $va -and $dbgRva -lt ($va + $span)) {
-            $dbgFileOff = [int]($raw + ($dbgRva - $va))
-            break
+    $coffTs  = [BitConverter]::ToInt32($peBytes, $peOff + 8)
+    if ($coffTs -ne 0) {
+        throw "$Path has non-zero COFF TimeDateStamp (0x$($coffTs.ToString('X8'))) - not a normalised release binary."
+    }
+    $nSect   = [BitConverter]::ToUInt16($peBytes, $peOff + 6)
+    $optSize = [BitConverter]::ToUInt16($peBytes, $peOff + 20)
+    $optOff  = $peOff + 24
+    $dllChar = [BitConverter]::ToUInt16($peBytes, $optOff + 70)
+    if (($dllChar -band 0x0160) -ne 0x0160) {
+        throw ("{0} DllCharacteristics 0x{1:X4} lacks HIGH_ENTROPY_VA|DYNAMIC_BASE|NX_COMPAT" -f $Path, $dllChar)
+    }
+    $ddOff   = $optOff + 112                  # PE32+ DataDirectory[0]
+    $sectOff = $optOff + $optSize
+    $dbgRva  = [BitConverter]::ToInt32($peBytes, $ddOff + 6 * 8)
+    $dbgSz   = [BitConverter]::ToInt32($peBytes, $ddOff + 6 * 8 + 4)
+    $hasCet  = $false
+    if ($dbgRva -ne 0 -and $dbgSz -ge 28) {
+        $dbgFileOff = -1
+        for ($si = 0; $si -lt $nSect; $si++) {
+            $s = $sectOff + $si * 40
+            $va = [BitConverter]::ToUInt32($peBytes, $s + 12)
+            $vsz = [BitConverter]::ToUInt32($peBytes, $s + 8)
+            $raw = [BitConverter]::ToUInt32($peBytes, $s + 20)
+            $rsz = [BitConverter]::ToUInt32($peBytes, $s + 16)
+            $span = if ($vsz -gt 0 -and $vsz -lt $rsz) { $vsz } else { $rsz }
+            if ($dbgRva -ge $va -and $dbgRva -lt ($va + $span)) {
+                $dbgFileOff = [int]($raw + ($dbgRva - $va))
+                break
+            }
+        }
+        if ($dbgFileOff -ge 0) {
+            for ($di = 0; $di -lt [int]($dbgSz / 28); $di++) {
+                $de = $dbgFileOff + $di * 28
+                $dtype = [BitConverter]::ToUInt32($peBytes, $de + 12)
+                if ($dtype -eq 20) { $hasCet = $true }
+            }
         }
     }
-    if ($dbgFileOff -ge 0) {
-        for ($di = 0; $di -lt [int]($dbgSz / 28); $di++) {
-            $de = $dbgFileOff + $di * 28
-            $dtype = [BitConverter]::ToUInt32($peBytes, $de + 12)
-            if ($dtype -eq 20) { $hasCet = $true }
-        }
+    if ($RequireCet -and -not $hasCet) {
+        throw "$Path lacks IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS (/CETCOMPAT) - never package a 'nohw' build."
     }
-}
-if (-not $hasCet) {
-    throw "$exePath lacks IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS (/CETCOMPAT) - never package a 'nohw' build."
 }
 
-# --- version comes from the binary, never typed twice ------------------------
-$vi = (Get-Item $exePath).VersionInfo
-$fv = $vi.FileVersion
+Assert-ReleasePe -Path $exePath   -ExpectMachine 0x8664 -RequireCet $true
+Assert-ReleasePe -Path $arm64Path -ExpectMachine 0xAA64 -RequireCet $false
+
+# --- version comes from the binaries, never typed twice ----------------------
+$vi    = (Get-Item $exePath).VersionInfo
+$viArm = (Get-Item $arm64Path).VersionInfo
+$fv    = $vi.FileVersion
 if (-not $fv) { throw "$exePath has no version resource" }
+if ($viArm.FileVersion -ne $fv) {
+    throw ("version mismatch: x64 is {0}, arm64 is {1} - rebuild both from the same commit" -f $fv, $viArm.FileVersion)
+}
 $parts = ($fv -split '[.,]') | ForEach-Object { [int]$_ }
 # MSI ProductVersion is max three fields; the 4th is ignored by Windows Installer
 $productVersion = "{0}.{1}.{2}" -f $parts[0], $parts[1], $parts[2]
-Write-Host ("  exe            : {0}" -f $exePath)
-Write-Host ("  FileVersion    : {0}  ->  MSI ProductVersion {1}" -f $fv, $productVersion)
+Write-Host ("  x64 exe        : {0}" -f $exePath)
+Write-Host ("  arm64 exe      : {0}" -f $arm64Path)
+Write-Host ("  FileVersion    : {0}  ->  MSI ProductVersion {1} (universal x64 + ARM64)" -f $fv, $productVersion)
 
 $outMsi = Join-Path (Resolve-Full $OutDir) ("vordr-{0}.msi" -f $productVersion)
 if (Test-Path $outMsi) { Remove-Item $outMsi -Force }
 
-# --- pack the payload into a cab --------------------------------------------
-# MSI stores files in a cabinet; the File table's key must match the cab member.
+# --- pack both payloads into a single cab ------------------------------------
+# MSI stores files in a cabinet; each File table key matches its cab member.
+# Both components install to [INSTALLDIR]vordr.exe under mutually exclusive
+# conditions driven by HOST_NATIVE_ARCH (AppSearch + RegLocator).
 $work = Join-Path $env:TEMP ("vordrmsi_" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $work | Out-Null
 try {
-    Copy-Item $exePath (Join-Path $work "vordr.exe")
+    Copy-Item $exePath   (Join-Path $work "vordr_x64.exe")
+    Copy-Item $arm64Path (Join-Path $work "vordr_arm64.exe")
     $ddf = Join-Path $work "make.ddf"
 @"
 .OPTION EXPLICIT
@@ -235,7 +251,8 @@ try {
 .Set ReservePerCabinetSize=0
 .Set InfFileName=$work\setup.inf
 .Set RptFileName=$work\setup.rpt
-"$work\vordr.exe" vordr.exe
+"$work\vordr_x64.exe" vordr_x64.exe
+"$work\vordr_arm64.exe" vordr_arm64.exe
 "@ | Out-File -FilePath $ddf -Encoding ascii
     # makecab drops setup.inf / setup.rpt in the CURRENT directory unless told
     # otherwise - that put build litter in the repo root.  Both are redirected
@@ -280,6 +297,11 @@ try {
     Exec "CREATE TABLE ``LaunchCondition`` (``Condition`` CHAR(255) NOT NULL, ``Description`` CHAR(255) NOT NULL PRIMARY KEY ``Condition``)"
     Exec "CREATE TABLE ``Shortcut`` (``Shortcut`` CHAR(72) NOT NULL, ``Directory_`` CHAR(72) NOT NULL, ``Name`` CHAR(128) NOT NULL, ``Component_`` CHAR(72) NOT NULL, ``Target`` CHAR(72) NOT NULL, ``Arguments`` CHAR(255), ``Description`` CHAR(255), ``Hotkey`` SHORT, ``Icon_`` CHAR(72), ``IconIndex`` SHORT, ``ShowCmd`` SHORT, ``WkDir`` CHAR(72) PRIMARY KEY ``Shortcut``)"
     Exec "CREATE TABLE ``Registry`` (``Registry`` CHAR(72) NOT NULL, ``Root`` SHORT NOT NULL, ``Key`` CHAR(255) NOT NULL, ``Name`` CHAR(255), ``Value`` CHAR(0), ``Component_`` CHAR(72) NOT NULL PRIMARY KEY ``Registry``)"
+    Exec "CREATE TABLE ``AppSearch`` (``Property`` CHAR(72) NOT NULL, ``Signature_`` CHAR(72) NOT NULL PRIMARY KEY ``Property``, ``Signature_``)"
+    Exec "CREATE TABLE ``RegLocator`` (``Signature_`` CHAR(72) NOT NULL, ``Root`` SHORT NOT NULL, ``Key`` CHAR(255) NOT NULL, ``Name`` CHAR(255), ``Type`` SHORT PRIMARY KEY ``Signature_``)"
+    # AppSearch always queries the Signature table even for raw RegLocator lookups;
+    # omitting this empty table fails real installs with MSI error 2228.
+    Exec "CREATE TABLE ``Signature`` (``Signature`` CHAR(72) NOT NULL, ``FileName`` CHAR(255) NOT NULL, ``MinVersion`` CHAR(20), ``MaxVersion`` CHAR(20), ``MinSize`` LONG, ``MaxSize`` LONG, ``MinDate`` LONG, ``MaxDate`` LONG, ``Languages`` CHAR(255) PRIMARY KEY ``Signature``)"
     # NO RemoveFile table.  MSI removes a component's own files on uninstall
     # automatically; RemoveFile exists to delete things the installer did NOT
     # install, which for a password manager is how you would delete someone's
@@ -308,23 +330,38 @@ try {
         # Public properties reach the elevated half of a per-machine install only
         # if they are listed here.  Miss one and it silently has no effect - the
         # property is set, the component condition still evaluates false.
-        "SecureCustomProperties" = (@("OLDERVERSIONBEINGUPGRADED", "NEWERVERSIONDETECTED", $AssocProp) + ($Policies | ForEach-Object { $_.Prop })) -join ";"
+        "SecureCustomProperties" = (@("OLDERVERSIONBEINGUPGRADED", "NEWERVERSIONDETECTED", "HOST_NATIVE_ARCH", $AssocProp) + ($Policies | ForEach-Object { $_.Prop })) -join ";"
     }
     foreach ($k in $props.Keys) {
         $v = $props[$k] -replace "'", "''"
         Exec "INSERT INTO ``Property`` (``Property``,``Value``) VALUES ('$k','$v')"
     }
 
+    # --- native architecture detection (zero custom actions) -----------------
+    # Reads HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment\
+    # PROCESSOR_ARCHITECTURE (64-bit view, raw value: Type = 18 = 2|16).  That
+    # value has no WOW64 redirection and is "ARM64" on Windows on ARM vs "AMD64"
+    # on x64 Windows.  VordrExe and VordrExeArm64 are mutually exclusive under
+    # HOST_NATIVE_ARCH so every machine receives its native binary at
+    # %ProgramFiles%\Vordr\vordr.exe.
+    Exec "INSERT INTO ``RegLocator`` (``Signature_``,``Root``,``Key``,``Name``,``Type``) VALUES ('SigHostArch',2,'SYSTEM\CurrentControlSet\Control\Session Manager\Environment','PROCESSOR_ARCHITECTURE',18)"
+    Exec "INSERT INTO ``AppSearch`` (``Property``,``Signature_``) VALUES ('HOST_NATIVE_ARCH','SigHostArch')"
+
     Exec "INSERT INTO ``Directory`` (``Directory``,``Directory_Parent``,``DefaultDir``) VALUES ('TARGETDIR','','SourceDir')"
     Exec "INSERT INTO ``Directory`` (``Directory``,``Directory_Parent``,``DefaultDir``) VALUES ('ProgramFiles64Folder','TARGETDIR','.')"
     Exec "INSERT INTO ``Directory`` (``Directory``,``Directory_Parent``,``DefaultDir``) VALUES ('INSTALLDIR','ProgramFiles64Folder','$InstallDir')"
     Exec "INSERT INTO ``Directory`` (``Directory``,``Directory_Parent``,``DefaultDir``) VALUES ('ProgramMenuFolder','TARGETDIR','.')"
 
-    # Component attributes 0 = per-machine-style file component; msidbComponentAttributes
-    # 4 (RegistryKeyPath) is NOT used - the exe itself is the key path.
-    Exec "INSERT INTO ``Component`` (``Component``,``ComponentId``,``Directory_``,``Attributes``,``Condition``,``KeyPath``) VALUES ('VordrExe','$ComponentGuid','INSTALLDIR',0,'','vordr.exe')"
+    # Component attributes 256 = msidbComponentAttributes64bit; bit 4
+    # (RegistryKeyPath) is clear so each component's exe File row is its key path.
+    # Mutually exclusive conditions ensure only one binary lands at
+    # [INSTALLDIR]vordr.exe (x64 default when HOST_NATIVE_ARCH is unset/AMD64,
+    # ARM64 when HOST_NATIVE_ARCH is "ARM64").
+    Exec "INSERT INTO ``Component`` (``Component``,``ComponentId``,``Directory_``,``Attributes``,``Condition``,``KeyPath``) VALUES ('VordrExe','$ComponentGuid','INSTALLDIR',256,'NOT (HOST_NATIVE_ARCH ~= `"ARM64`")','vordr_x64.exe')"
+    Exec "INSERT INTO ``Component`` (``Component``,``ComponentId``,``Directory_``,``Attributes``,``Condition``,``KeyPath``) VALUES ('VordrExeArm64','$Arm64ComponentGuid','INSTALLDIR',256,'HOST_NATIVE_ARCH ~= `"ARM64`"','vordr_arm64.exe')"
     Exec "INSERT INTO ``Feature`` (``Feature``,``Feature_Parent``,``Title``,``Description``,``Display``,``Level``,``Directory_``,``Attributes``) VALUES ('Main','','Vordr','Vordr password manager',1,1,'INSTALLDIR',0)"
     Exec "INSERT INTO ``FeatureComponents`` (``Feature_``,``Component_``) VALUES ('Main','VordrExe')"
+    Exec "INSERT INTO ``FeatureComponents`` (``Feature_``,``Component_``) VALUES ('Main','VordrExeArm64')"
 
     # --- one component per policy value --------------------------------------
     # Attributes 4 = the registry row is the key path; 256 = write to the 64-bit
@@ -397,11 +434,14 @@ try {
     Exec ("INSERT INTO ``Registry`` (``Registry``,``Root``,``Key``,``Name``,``Component_``) VALUES ('RegAssocClean',2,'{0}\{1}','-','{2}')" -f $ClassesKey, $ProgId, $AssocComp)
     Write-Host ("  file assoc     : .vordr -> {0} (skip with {1}=1)" -f $ProgId, $AssocProp)
 
-    $size = (Get-Item $exePath).Length
-    Exec "INSERT INTO ``File`` (``File``,``Component_``,``FileName``,``FileSize``,``Version``,``Language``,``Attributes``,``Sequence``) VALUES ('vordr.exe','VordrExe','vordr.exe',$size,'$fv','1033',512,1)"
-    Exec "INSERT INTO ``Media`` (``DiskId``,``LastSequence``,``DiskPrompt``,``Cabinet``,``VolumeLabel``,``Source``) VALUES (1,1,'','#vordr.cab','','')"
+    $sizeX64   = (Get-Item $exePath).Length
+    $sizeArm64 = (Get-Item $arm64Path).Length
+    Exec "INSERT INTO ``File`` (``File``,``Component_``,``FileName``,``FileSize``,``Version``,``Language``,``Attributes``,``Sequence``) VALUES ('vordr_x64.exe','VordrExe','vordr.exe',$sizeX64,'$fv','1033',512,1)"
+    Exec "INSERT INTO ``File`` (``File``,``Component_``,``FileName``,``FileSize``,``Version``,``Language``,``Attributes``,``Sequence``) VALUES ('vordr_arm64.exe','VordrExeArm64','vordr.exe',$sizeArm64,'$fv','1033',512,2)"
+    Exec "INSERT INTO ``Media`` (``DiskId``,``LastSequence``,``DiskPrompt``,``Cabinet``,``VolumeLabel``,``Source``) VALUES (1,2,'','#vordr.cab','','')"
 
     Exec "INSERT INTO ``Shortcut`` (``Shortcut``,``Directory_``,``Name``,``Component_``,``Target``,``Arguments``,``Description``,``ShowCmd``,``WkDir``) VALUES ('VordrSC','ProgramMenuFolder','Vordr','VordrExe','[INSTALLDIR]vordr.exe','','Vordr password manager',1,'INSTALLDIR')"
+    Exec "INSERT INTO ``Shortcut`` (``Shortcut``,``Directory_``,``Name``,``Component_``,``Target``,``Arguments``,``Description``,``ShowCmd``,``WkDir``) VALUES ('VordrSCArm64','ProgramMenuFolder','Vordr','VordrExeArm64','[INSTALLDIR]vordr.exe','','Vordr password manager',1,'INSTALLDIR')"
 
     # Upgrade: replace an existing install rather than sitting beside it, and
     # refuse to downgrade when a strictly newer version is already installed.
@@ -444,6 +484,7 @@ try {
     # FindRelatedProducts MUST precede LaunchConditions so NEWERVERSIONDETECTED
     # is populated before the downgrade guard evaluates.
     $clientSide = @(
+        @("AppSearch",             "",   50),
         @("FindRelatedProducts",   "",  100),
         @("LaunchConditions",      "",  200)
     )
@@ -534,16 +575,12 @@ try {
         }
     }
     if ($secure -notcontains $AssocProp) { throw "$AssocProp is missing from SecureCustomProperties - the opt-out would be ignored" }
-    if ($AssocGuid -in ($Policies | ForEach-Object { $_.Guid }) -or $AssocGuid -eq $ComponentGuid) {
-        throw "the file-association component reuses another component's GUID"
-    }
-    $dupGuid = $Policies | Group-Object { $_.Guid } | Where-Object { $_.Count -gt 1 }
-    if ($dupGuid) { throw ("component GUID reused by: " + ($dupGuid[0].Group.Comp -join ", ")) }
+    if ($secure -notcontains "HOST_NATIVE_ARCH") { throw "HOST_NATIVE_ARCH is missing from SecureCustomProperties - ARM64 selection would be dropped on elevation" }
+    $allGuids = @($ComponentGuid, $Arm64ComponentGuid, $AssocGuid) + @($Policies | ForEach-Object { $_.Guid })
+    $dupAll = $allGuids | Group-Object | Where-Object { $_.Count -gt 1 }
+    if ($dupAll) { throw ("component GUID reused: " + ($dupAll[0].Name)) }
     $dupComp = $Policies | Group-Object { $_.Comp } | Where-Object { $_.Count -gt 1 }
     if ($dupComp) { throw ("component name reused: " + $dupComp[0].Name) }
-    if ($ComponentGuid -in ($Policies | ForEach-Object { $_.Guid })) {
-        throw "a policy component reuses the exe's component GUID"
-    }
     foreach ($a in @("WriteRegistryValues","RemoveRegistryValues")) {
         if ($names -notcontains $a) { throw "$a is missing - the Registry table would never be processed" }
     }
@@ -574,8 +611,8 @@ try {
     SetSI 3  "Vordr password manager"               # subject
     SetSI 4  $Manufacturer                          # author
     SetSI 5  "Installer,MSI,Database"               # keywords
-    SetSI 6  "Per-machine install of Vordr $productVersion"
-    SetSI 7  "x64;1033"                             # template: 64-bit package
+    SetSI 6  "Per-machine universal (x64 + ARM64) install of Vordr $productVersion"
+    SetSI 7  "x64;1033"                             # template: 64-bit package (runs natively on x64 and Windows 11 on ARM)
     SetSI 9  ("{" + [guid]::NewGuid().ToString().ToUpper() + "}")   # package code
     SetSI 14 200                                    # min installer version
     SetSI 15 2                                      # word count: source is compressed
@@ -606,7 +643,8 @@ try {
     Write-Host ("  ProductCode    : {0}" -f $productCode)
     Write-Host ("  UpgradeCode    : {0}  (never change this)" -f $UpgradeCode)
     Write-Host ""
-    Write-Host "  installs   %ProgramFiles%\$InstallDir\vordr.exe + an all-users Start Menu shortcut"
+    Write-Host "  installs   %ProgramFiles%\$InstallDir\vordr.exe (native x64 or ARM64) + all-users Start Menu shortcut"
+    Write-Host "  arch       auto-selected via AppSearch/RegLocator on HKLM\...\Environment\PROCESSOR_ARCHITECTURE"
     Write-Host "  scope      per-machine: elevation required, binary read-only to standard users"
     Write-Host "  owns       that file, the shortcut, and any policy value named below"
     Write-Host "  uninstall  removes exactly those; the vault and HKCU settings are untouched"

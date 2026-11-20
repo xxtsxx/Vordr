@@ -5690,6 +5690,7 @@ tcf_direct_dib:
     mov     eax, dword ptr [g_tile_dib_sz]
     imul    eax, eax
     shl     eax, 2
+    test    eax, eax
     jle     tcf_dib_dc
     mov     rcx, qword ptr [g_tile_dib_bits]
     mov     edx, eax
@@ -5950,6 +5951,7 @@ gli_hv_mix:
     jz      gli_hv_done
     imul    r8d, 72
     shr     r8d, 8
+    test    r8d, r8d
     jle     gli_hv_done
     mov     dword ptr [rbp-88], r8d
     mov     eax, dword ptr [rbp-56]
@@ -17442,6 +17444,7 @@ cph_ovl:
     mov     edx, dword ptr [g_comp_caph]
     imul    rax, rdx
     shl     rax, 2
+    test    rax, rax
     jle     cph_done
     mov     rcx, qword ptr [g_comp_bits]
     mov     rdx, rax
@@ -18917,6 +18920,7 @@ gce_grow:
     mov     edx, dword ptr [g_comp_caph]
     imul    rax, rdx
     shl     rax, 2
+    test    rax, rax
     jle     gce_grow_del
     mov     qword ptr [rbp-32], rax
     mov     rcx, qword ptr [g_comp_bits]
@@ -18970,6 +18974,7 @@ gce_mkdib:
     mov     dword ptr [g_comp_caph], edx
     imul    rax, rdx
     shl     rax, 2
+    test    rax, rax
     jle     @F
     WINCALL VirtualLock, qword ptr [g_comp_bits], rax
 @@: mov     eax, 1
@@ -18998,6 +19003,7 @@ gui_comp_flush proc frame
     mov     edx, dword ptr [g_comp_caph]
     imul    rax, rdx
     shl     rax, 2
+    test    rax, rax
     jle     gcf_del
     mov     qword ptr [rbp-24], rax
     mov     rcx, qword ptr [g_comp_bits]

@@ -4,18 +4,20 @@
 
 ## Install and create a vault
 
-Vordr runs on Windows x64. Its CPU gate requires AES-NI, PCLMULQDQ, SSE4.1, and
-SHA-NI; AVX2 and RDSEED are optional. The default password derivation allocates
-512 MiB in addition to the application's other memory.
+Vordr runs natively on Windows x64 and Windows on ARM (ARM64). On x64, its CPU
+gate requires AES-NI, PCLMULQDQ, SSE4.1, and SHA-NI (AVX2 and RDSEED are optional).
+On ARM64, its CPU gate requires ARMv8 Cryptography Extensions (`AESE`/`AESMC`,
+`PMULL`, `SHA256*`, `SHA1*`; ARMv8.5 `RNDRRS` is mixed in automatically when
+`FEAT_RNG` is available). The default password derivation allocates 512 MiB in
+addition to the application's other memory.
 
 Install from the WinGet community source, or choose a download from
 [Releases](https://github.com/xxtsxx/Vordr/releases). See
 [executable verification](RELEASES.md#verify-a-download) for checking the build.
 
-- **WinGet:** run the command below to download and install the published MSI.
-- **Portable executable:** run `vordr.exe` from a folder you control.
-- **MSI:** installs for all users in `%ProgramFiles%\Vordr` and requires elevation.
-  Vordr itself runs with the launching user's privileges.
+- **WinGet:** run the command below to download and install the published universal MSI.
+- **Portable executable:** run `vordr.exe` (x64) or `vordr-arm64.exe` (ARM64) from a folder you control.
+- **MSI:** a single universal installer that carries both x64 and ARM64 binaries, automatically deploys the native executable to `%ProgramFiles%\Vordr\vordr.exe`, and requires elevation. Vordr itself runs with the launching user's privileges.
 
 ```powershell
 winget install --id ThomasSmistad.Vordr --exact --source winget
