@@ -14,9 +14,9 @@ OPTION CASEMAP:NONE
 
 extern wstart:proc                      ; the PE entry point (/entry:wstart)
 
-; GuardFlags: CF_INSTRUMENTED (100h) | CF_FUNCTION_TABLE_PRESENT (400h),
-; table stride bits (F0000000h) = 0 -> 4 bytes per entry (plain RVA list).
-GUARD_FLAGS_VALUE equ 00000500h
+; GuardFlags: 0 while /guard:cf is disabled (see build.cmd; CET is carried via
+; the IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS record, not GuardFlags).
+GUARD_FLAGS_VALUE equ 00000000h
 
 .code
 
@@ -50,6 +50,7 @@ gfids_table label dword
     dd imagerel wstart
 GFIDS_COUNT equ 1
 
+align 8                                 ; AUD-23: IMAGE_LOAD_CONFIG_DIRECTORY64 requires 8-byte alignment
 public _load_config_used
 _load_config_used label byte
     dd 140h                         ; Size (full modern struct, 320 bytes)

@@ -1395,11 +1395,14 @@ endif
     je      @F
     WINCALL VirtualUnlock, qword ptr [g_lastblk], 1024
 @@:
-    mov     rcx, qword ptr [g_arena]
+    xor     ecx, ecx
+    xchg    qword ptr [g_arena], rcx    ; AUD-10: clear g_arena BEFORE VirtualFree unmaps pages
+    test    rcx, rcx
+    jz      @F
     xor     edx, edx
     mov     r8d, MEM_RELEASE
     call    VirtualFree
-    mov     qword ptr [g_arena], 0
+@@:
 
     pxor    xmm0, xmm0
     pxor    xmm1, xmm1

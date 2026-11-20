@@ -79,14 +79,15 @@
 #define IDC_V_MTOUTS   266
 #define IDC_V_MTHEME 240
 #define IDC_V_MTHEMEL 241
-#define IDC_V_MANIM 281
-#define IDC_V_MANIML 282
 #define IDC_V_MPINLENL 283
 #define IDC_V_MPINLEN 284
 #define IDC_V_MPINTRIVL 285
 #define IDC_V_MPINTRIV 286
 #define IDC_V_MTPMTRIESL 287
 #define IDC_V_MTPMTRIES 288
+#define IDC_V_MBKD     289
+#define IDC_V_MBKDL    290
+#define IDC_V_TOAST    296
 #define IDC_V_MHOTKL 275
 #define IDC_V_MHOTK  276
 #define DLG_HOTKEY   790
@@ -115,6 +116,7 @@
 #define IDC_XP_WARN  723
 #define IDC_XP_PWL   724
 #define IDC_XP_PW2L  725
+#define IDC_XP_CLSPILLS 726
 #define DLG_IMPPW    730
 #define DLG_PWREMIND 795
 #define DLG_SETTINGS 796
@@ -134,6 +136,7 @@
 #define IDC_C_INFO   406
 #define IDC_C_LOGO   407
 #define IDC_C_WELCOME 408
+#define IDC_C_CLSPILLS 409
 #define DLG_MSG      600
 #define IDC_M_TEXT   601
 #define IDC_M_OK     602
@@ -200,6 +203,7 @@ FONT 9, "Segoe UI"
     PUSHBUTTON "Cancel", IDC_V_CANCEL, 362, 292, 54, 14, BS_OWNERDRAW
     PUSHBUTTON "Save", IDC_V_SAVE, 420, 292, 54, 14, BS_OWNERDRAW
     CONTROL "", IDC_V_COLORPW, "Static", SS_OWNERDRAW | WS_CHILD, 222, 100, 196, 12
+    CONTROL "", IDC_V_TOAST, "Static", SS_OWNERDRAW | WS_CHILD | NOT WS_VISIBLE, 392, 334, 86, 14
 }
 
 DLG_SETTINGS DIALOGEX 0, 0, 484, 350
@@ -209,7 +213,7 @@ FONT 9, "Segoe UI"
 
     LTEXT "Settings", IDC_V_MTITLE, 30, 8, 200, 14
 
-    LTEXT "Password & PIN policy", IDC_V_MPOLL, 30, 26, 360, 10
+    LTEXT "Password && PIN policy", IDC_V_MPOLL, 30, 26, 360, 10
     LTEXT "Minimum password length:", IDC_V_MLENL, 44, 38, 120, 10
     EDITTEXT IDC_V_MLEN, 170, 38, 36, 11, ES_NUMBER | ES_AUTOHSCROLL | NOT WS_BORDER , 0
     LTEXT "Minimum character types (1-4):", IDC_V_MCLSL, 44, 51, 120, 10
@@ -255,11 +259,11 @@ FONT 9, "Segoe UI"
     ; A plausible-looking placeholder ("Dark") hid that call failing for a whole refactor.
     PUSHBUTTON "", IDC_V_MTHEME, 130, 261, 96, 14, BS_OWNERDRAW
 
-    LTEXT "Animations", IDC_V_MANIML, 30, 281, 90, 10
-    PUSHBUTTON "", IDC_V_MANIM, 130, 279, 96, 14, BS_OWNERDRAW
+    LTEXT "Backdrop", IDC_V_MBKDL, 30, 281, 90, 10
+    PUSHBUTTON "", IDC_V_MBKD, 130, 279, 96, 14, BS_OWNERDRAW
 
-    PUSHBUTTON "Import secrets...", IDC_V_MIMPORT, 30, 304, 110, 14, BS_OWNERDRAW
-    PUSHBUTTON "Export secrets...", IDC_V_MEXPORT, 30, 322, 110, 14, BS_OWNERDRAW
+    PUSHBUTTON "Import secrets...", IDC_V_MIMPORT, 30, 302, 110, 14, BS_OWNERDRAW
+    PUSHBUTTON "Export secrets...", IDC_V_MEXPORT, 30, 319, 110, 14, BS_OWNERDRAW
 }
 
 DLG_CREATE DIALOGEX 0, 0, 300, 292
@@ -272,6 +276,7 @@ BEGIN
     EDITTEXT        IDC_C_PW, 24, 222, 212, 11, ES_PASSWORD | ES_AUTOHSCROLL | NOT WS_BORDER, 0
     PUSHBUTTON      "i", IDC_C_INFO, 242, 221, 14, 14, BS_OWNERDRAW | NOT WS_TABSTOP
     EDITTEXT        IDC_C_PW2, 24, 240, 212, 11, ES_PASSWORD | ES_AUTOHSCROLL | NOT WS_BORDER, 0
+    CONTROL         "", IDC_C_CLSPILLS, "Static", SS_OWNERDRAW | WS_CHILD | WS_VISIBLE, 24, 266, 140, 14
     PUSHBUTTON      "Create", IDOK, 210, 264, 54, 18, BS_OWNERDRAW
 END
 
@@ -283,6 +288,7 @@ BEGIN
     LTEXT "This writes the selected entries (including passwords and TOTP secrets) into a new encrypted .vordr vault, protected only by the password you choose below. Store it safely and delete it when done.", IDC_XP_WARN, 16, 12, 232, 40, 0
     EDITTEXT IDC_XP_PW, 16, 60, 232, 12, ES_PASSWORD | ES_AUTOHSCROLL | NOT WS_BORDER, 0
     EDITTEXT IDC_XP_PW2, 16, 80, 232, 12, ES_PASSWORD | ES_AUTOHSCROLL | NOT WS_BORDER, 0
+    CONTROL "", IDC_XP_CLSPILLS, "Static", SS_OWNERDRAW | WS_CHILD | WS_VISIBLE, 16, 106, 110, 14
     PUSHBUTTON "Export", IDOK, 134, 104, 54, 18, BS_OWNERDRAW
     PUSHBUTTON "Cancel", IDCANCEL, 194, 104, 54, 18, BS_OWNERDRAW
 END
@@ -382,7 +388,7 @@ FONT 9, "Segoe UI"
 BEGIN
     EDITTEXT   IDC_PG_OUT, 16, 16, 196, 16, ES_AUTOHSCROLL | ES_READONLY | NOT WS_BORDER, 0
     PUSHBUTTON "Regen", IDC_PG_REGEN, 216, 16, 28, 16, BS_OWNERDRAW
-    LTEXT      "", IDC_PG_BITS, 16, 36, 228, 10
+    CONTROL    "", IDC_PG_BITS, "Static", SS_OWNERDRAW | WS_CHILD | WS_VISIBLE, 16, 36, 228, 12
     LTEXT      "Length", IDC_PG_LENL, 16, 54, 34, 10
     CONTROL    "", IDC_PG_LEN, "msctls_trackbar32", 0x50000000, 52, 50, 158, 18
     LTEXT      "16", IDC_PG_LENVAL, 216, 54, 28, 10
@@ -474,8 +480,8 @@ BEGIN
 END
 
 1 VERSIONINFO
- FILEVERSION    0,2,4,0
- PRODUCTVERSION 0,2,4,0
+ FILEVERSION    0,8,1,0
+ PRODUCTVERSION 0,8,1,0
  FILEFLAGSMASK  0x3fL
  FILEFLAGS      0x0L
  FILEOS         0x40004L            /* VOS_NT_WINDOWS32 */
@@ -488,12 +494,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "Thomas Smistad"
             VALUE "FileDescription",  "Vordr password manager https://github.com/xxtsxx/vordr"
-            VALUE "FileVersion",      "0.2.4.0"
+            VALUE "FileVersion",      "0.8.1.0"
             VALUE "InternalName",     "vordr"
             VALUE "LegalCopyright",   "Copyright (C) 2026 Thomas Smistad"
             VALUE "OriginalFilename", "vordr.exe"
             VALUE "ProductName",      "Vordr"
-            VALUE "ProductVersion",   "0.2.4.0"
+            VALUE "ProductVersion",   "0.8.1.0"
         END
     END
     BLOCK "VarFileInfo"

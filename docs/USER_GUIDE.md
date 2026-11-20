@@ -115,14 +115,28 @@ appears when you point at their right edge: drag it, click above or below it to
 move a page, or use the mouse wheel. An entry's fields scroll a whole
 card at a time, and tabbing to a field that is off screen brings it into view.
 
-Vordr animates a little: the selection slides between entries, an entry fades
-into the next one, and rows and buttons fade their highlight in and out.
-**Settings > Animations** chooses: *Follow Windows* (the default - Windows' own
-switch in **Settings > Accessibility > Visual effects > Animation effects**),
-*Always*, or *Never*. Without animation every change is instant; nothing else
-differs. An administrator can fix the choice with the `ui_anim` policy value
-(0 follow Windows, 1 always, 2 never). Each entry's tile shows the first letter of its title, unless the
-title names a known service or you picked an icon for it.
+Vordr animates a little when Windows' own **Animation effects** setting is on:
+the selection slides between entries, an entry cross-fades into the next one,
+focus underlines expand from center, toggle pills slide, and rows and buttons
+fade their highlight in and out (an administrator can override this with the
+`ui_anim` policy value: `0` follow Windows, `1` always, `2` never).
+**Settings > Color scheme** cycles through fourteen color palettes (*Light*,
+*Sepia*, *Nord*, *Midnight*, *Commodore*, *Amethyst*, *Emerald*, *Sapphire*,
+*Gruvbox*, *Catppuccin*, *Tokyo Night*, *Rose Pine*, *Solarized*, *OLED Black*)
+plus *Follow Windows* (`ui_scheme`: `0..13` for the palettes, `8` default, `14`
+to switch automatically between your last-chosen light and dark palettes when
+Windows toggles Light/Dark mode). **Settings > Backdrop** cycles the main window
+surface across seven static GPU-computed procedural styles (*Cut planes*,
+*Low-poly neon*, *Corner mosaic*, *Optical arcs*, *Crystal rim*, *Guardian
+sigil*, *Cipher rings*) plus *Flat* (enforceable via `ui_backdrop`: `0..6` for
+the procedural styles, `7` for flat). Each backdrop is rendered once into a
+cached bitmap when the window size, color scheme, or backdrop choice changes,
+using zero GPU or CPU during normal interaction. On the Home overview, a
+circular health ring summarizes vault password hygiene and clicking the *Weak*,
+*Reused*, or *Ageing* stat cards filters the entry list directly (click
+*Secrets* or the active card again to show all entries). Each entry's tile shows
+a softened gradient monogram of its title unless the title names a known service
+or you picked an icon for it.
 
 ## Locking, screen capture, and the clipboard
 

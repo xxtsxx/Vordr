@@ -36,6 +36,9 @@ extern reg_hash_name:proc
 extern path_longify:proc
 extern file_path_allowed:proc
 extern file_validate_handle:proc
+extern GetFileInformationByHandle:proc
+extern gui_build_user_dacl:proc
+externdef g_tmp_sd:byte
 
 externdef g_cfg_loglevel:dword
 externdef g_cfg_logfile:qword
@@ -209,9 +212,10 @@ log_putw endp
 ; Vordr directory if needed).  Refuses reparse points and non-disk handles.
 ; -----------------------------------------------------------------------------
 log_open proc frame
-    FRAME_PROLOG 144
+    FRAME_PROLOG 224
     ; [rbp-24]=saved cursor  [rbp-32]=path ptr  [rbp-40]=handle
-    ; [rbp-48]=token handle  [rbp-56]=cchProfile
+    ; [rbp-48]=token handle  [rbp-56]=cchProfile  [rbp-88..-65]=SECURITY_ATTRIBUTES(24B)
+    ; [rbp-152..-101]=BY_HANDLE_FILE_INFORMATION(52B)  [rbp-160]=pSA
     mov     rax, qword ptr [g_cfg_logfile]
     test    rax, rax
     jz      lo_default
@@ -252,7 +256,20 @@ lo_phave:
     call    log_wapp                            ; append "\Vordr"
     mov     word ptr [rax], 0
     mov     qword ptr [rbp-24], rax
-    WINCALL CreateDirectoryW, addr g_logpath, 0 ; ignore result (may exist)
+    ; AUD-26: protect %LOCALAPPDATA%\Vordr with owner+SYSTEM inheritable DACL
+    mov     ecx, 10000000h                      ; GENERIC_ALL
+    mov     edx, 3                              ; OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+    xor     r8d, r8d
+    call    gui_build_user_dacl
+    xor     r9d, r9d
+    test    eax, eax
+    jz      @F
+    mov     dword ptr [rbp-88], 24
+    lea     rax, [g_tmp_sd]
+    mov     qword ptr [rbp-80], rax
+    mov     dword ptr [rbp-72], 0
+    lea     r9, [rbp-88]
+@@: WINCALL CreateDirectoryW, addr g_logpath, r9 ; ignore result (may exist)
     mov     rcx, qword ptr [rbp-24]
     lea     rdx, [w_logname]
     call    log_wapp                            ; append "\vordr.log"
@@ -269,7 +286,20 @@ lo_open:
     call    file_path_allowed
     test    eax, eax
     jz      lo_fail
-    WINCALL CreateFileW, qword ptr [rbp-32], FILE_APPEND_DATA, FILE_SHARE_RW, 0, \
+    mov     qword ptr [rbp-160], 0
+    mov     ecx, 10000000h                      ; GENERIC_ALL
+    xor     edx, edx
+    xor     r8d, r8d
+    call    gui_build_user_dacl
+    test    eax, eax
+    jz      @F
+    mov     dword ptr [rbp-88], 24
+    lea     rax, [g_tmp_sd]
+    mov     qword ptr [rbp-80], rax
+    mov     dword ptr [rbp-72], 0
+    lea     rax, [rbp-88]
+    mov     qword ptr [rbp-160], rax
+@@: WINCALL CreateFileW, qword ptr [rbp-32], FILE_APPEND_DATA, FILE_SHARE_RW, qword ptr [rbp-160], \
             OPEN_ALWAYS, <FILE_ATTR_NORMAL or FILE_FLAG_OPEN_RP>, 0
     cmp     rax, INVALID
     je      lo_fail
@@ -278,6 +308,12 @@ lo_open:
     call    file_validate_handle
     test    eax, eax
     jz      lo_badtype
+    ; AUD-26: reject hardlinked log targets (nNumberOfLinks > 1)
+    WINCALL GetFileInformationByHandle, qword ptr [rbp-40], addr rbp-152
+    test    eax, eax
+    jz      lo_badtype
+    cmp     dword ptr [rbp-152+40], 1
+    ja      lo_badtype
     mov     rax, qword ptr [rbp-40]
     FRAME_EPILOG
     ret

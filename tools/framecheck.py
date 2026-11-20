@@ -33,7 +33,7 @@ Two proc shapes are scanned:
 Exit code: number of FATALs (so "build strict" can gate on it); warns are
 informational.  Usage: python tools\\framecheck.py [--src DIR] [--fatal-only]
 """
-import re, glob, os, sys, argparse
+import ast, re, glob, os, sys, argparse
 import floors                            # coverage floors: see tools/floors.py
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -204,6 +204,55 @@ def masm_int(tok):
     if re.fullmatch(r'[0-9][0-9A-Fa-f]*[hH]', t): return int(t[:-1], 16)
     return None
 
+def _safe_arith_eval(node):
+    """Deterministic AST evaluator for integer constant expressions (no eval())."""
+    if isinstance(node, ast.Expression):
+        return _safe_arith_eval(node.body)
+    if isinstance(node, ast.Constant) and isinstance(node.value, int) and not isinstance(node.value, bool):
+        return int(node.value)
+    if isinstance(node, ast.UnaryOp):
+        v = _safe_arith_eval(node.operand)
+        if isinstance(node.op, ast.UAdd): return +v
+        if isinstance(node.op, ast.USub): return -v
+    if isinstance(node, ast.BinOp):
+        l = _safe_arith_eval(node.left)
+        r = _safe_arith_eval(node.right)
+        if isinstance(node.op, ast.Add): return l + r
+        if isinstance(node.op, ast.Sub): return l - r
+        if isinstance(node.op, ast.Mult): return l * r
+        if isinstance(node.op, (ast.Div, ast.FloorDiv)):
+            if r == 0: raise ValueError("division by zero")
+            return l // r
+    raise ValueError("unsupported syntax in size expression")
+
+_REG_FAMILIES = (
+    ('rcx', {'rcx', 'ecx', 'cx', 'cl', 'ch'}),
+    ('rdx', {'rdx', 'edx', 'dx', 'dl', 'dh'}),
+    ('r8',  {'r8', 'r8d', 'r8w', 'r8b'}),
+    ('r9',  {'r9', 'r9d', 'r9w', 'r9b'}),
+)
+_RAX_TOKENS = {'rax', 'eax', 'ax', 'al', 'ah'}
+
+def check_wincall_clobbers(callee, args, fname, line_no, proc_name, results):
+    """Detect WINCALL register-load ordering clobbers (stack->rax, then r9->r8->rdx->rcx)."""
+    if len(args) > 4 and any(bool(set(re.findall(r'[A-Za-z0-9_]+', a.lower())) & _RAX_TOKENS)
+                             for a in args[:4]) \
+       and any(clobbers_rax(a) for a in args[4:]):
+        results.append(("FATAL", fname, line_no, proc_name,
+            f"WINCALL {callee} sources a register arg from rax/eax while a "
+            f"5th+ stack arg clobbers rax first; stage in a local or r10/r11"))
+    n_reg = min(len(args), 4)
+    for i in range(n_reg):
+        toks = set(re.findall(r'[A-Za-z0-9_]+', args[i].lower()))
+        for j in range(i + 1, n_reg):
+            fam_name, fam_set = _REG_FAMILIES[j]
+            if args[j].strip().lower() in fam_set:
+                continue  # arg j is already in its target register -> macro emits no write
+            if toks & fam_set:
+                results.append(("FATAL", fname, line_no, proc_name,
+                    f"WINCALL {callee} arg {i + 1} ({args[i].strip()!r}) reads {fam_name} "
+                    f"after arg {j + 1} ({args[j].strip()!r}) overwrites {fam_name}"))
+
 def eval_size(expr, depth=0):
     """Evaluate a MASM size expression: literals, equ names, sizeof STRUCT, + - * / ( ).
     Raises ValueError when anything is unresolvable (caller must surface it)."""
@@ -245,7 +294,7 @@ def eval_size(expr, depth=0):
             raise ValueError(f"unresolvable token {t!r}")
     pyexpr = ' '.join(out)
     if not re.fullmatch(r'[0-9()+*/ \-]+', pyexpr): raise ValueError("unsafe expr")
-    return int(eval(pyexpr, {'__builtins__': {}}))
+    return _safe_arith_eval(ast.parse(pyexpr, mode='eval'))
 
 def build_tables(files):
     """Collect `NAME equ EXPR`, `NAME struct .. ends` sizes, and OS callback procs."""
@@ -369,19 +418,12 @@ def scan_file(path, results):
                         "internal proc writes to caller home space [rbp+16..40]"))
                 callee, args = wincall_parts(s)
                 if callee:
-                    if len(args) > 4 and any(a.strip().lower() in ('rax', 'eax')
-                                             for a in args[:4]) \
-                       and any(clobbers_rax(a) for a in args[4:]):
-                        results.append(("FATAL", fname, start + ln + 1, name,
-                            f"WINCALL {callee} passes rax as a register arg while a "
-                            f"later stack arg routes through rax - the register arg "
-                            f"receives the WRONG value; stage the handle in a local"))
-                    if callee in win32_ext:
-                        span = 32 + max(0, len(args) - 4) * 8
-                        if span > worst: worst, wat, wcallee = span, start + ln, callee
+                    check_wincall_clobbers(callee, args, fname, start + ln + 1, name, results)
+                    span = 32 + max(0, len(args) - 4) * 8
+                    if span > worst: worst, wat, wcallee = span, start + ln, callee
                     continue
                 bm = RE_BARECALL.match(s)
-                if bm and bm.group(1) in win32_ext:
+                if bm:
                     bcallee = bm.group(1)
                     span = max(32, max_rsp_st)
                     if span > worst: worst, wat, wcallee = span, start + ln, bcallee
@@ -397,20 +439,12 @@ def scan_file(path, results):
             N = None; pidx = None
             for idx, (ln, s) in enumerate(merged[:6]):
                 sm = RE_SUBRSP.match(s)
-                if sm: N = eval(sm.group(1)); pidx = idx; break
+                if sm: N = eval_size(sm.group(1)); pidx = idx; break
             if N is None:
                 i = end + 1; continue   # leaf/trampoline without a frame
             STATS['raw'] += 1
             extra = 0                    # manual sub/add rsp + push/pop tracking
             tail = merged[pidx + 1:]
-            # An "add rsp, N" whose next code line is "pop rbp" is an EPILOGUE,
-            # not a frame shrink: control resumes at the following label with the
-            # original frame intact.  gui.asm's raw procs return through several
-            # such exits, and counting each one drove the running total negative,
-            # reporting an impossible frame and a phantom FATAL in
-            # slider_subclass.  Vordr's procs epilogue with "mov rsp, rbp"
-            # instead, which RE_MOVRSPBASE already handled, so its version never
-            # saw this idiom.  Mark both lines of each pair as epilogue.
             epilogue = set()
             epilogue_add = {}            # index of the "add rsp,N" -> N
             for k, (_, s) in enumerate(tail):
@@ -422,21 +456,8 @@ def scan_file(path, results):
                 if nxt and RE_POPRBP.match(nxt[1]):
                     epilogue.add(k)
                     epilogue.add(k + 1 + nxt[0])
-                    epilogue_add[k] = eval(am0.group(1))
+                    epilogue_add[k] = eval_size(am0.group(1))
             for k, (ln, s) in enumerate(tail):
-                # ---- the epilogue must give back exactly what the prologue took.
-                # A raw proc writes its frame size TWICE, by hand, and the two can
-                # be edited apart: raise "sub rsp,160" to 256 for a bigger local,
-                # leave "add rsp,160" alone, and every return pops rbp and then the
-                # return address from 96 bytes below where they were pushed.  The
-                # process jumps to whatever that stack slot held.
-                #
-                # It costs nothing to check and it is invisible otherwise: the
-                # assembler is happy, the linker is happy, and the failure arrives
-                # as an access violation in no module at all (WER buckets it BEX64,
-                # "faulting module: unknown").  That is exactly how it presented in
-                # myrkrshell.dll's QueryContextMenu, where it took explorer.exe
-                # down on every right-drag.
                 if k in epilogue_add:
                     want = N + extra
                     if epilogue_add[k] != want:
@@ -452,11 +473,15 @@ def scan_file(path, results):
                     extra = 0; continue  # epilogue "mov rsp, rbp"
                 sm = RE_SUBRSP.match(s)
                 if sm:
-                    extra += eval(sm.group(1)); continue
+                    extra += eval_size(sm.group(1)); continue
                 am = RE_ADDRSP.match(s)
-                if am: extra -= eval(am.group(1)); continue
+                if am: extra -= eval_size(am.group(1)); continue
                 if RE_PUSH.match(s): extra += 8; continue
                 if RE_POP.match(s):  extra -= 8; continue
+
+                rcallee, rargs = wincall_parts(s)
+                if rcallee:
+                    check_wincall_clobbers(rcallee, rargs, fname, start + ln + 1, name, results)
 
                 spill_end = 0; desc = None; live_end = 0
                 n = wincall_args(s)

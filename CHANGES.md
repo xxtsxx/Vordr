@@ -7,6 +7,23 @@ in [docs/RELEASES.md](docs/RELEASES.md).
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-11-20
+
+### Added in 0.8.1
+
+- **DirectCompute procedural backdrop engine (`src/gpu.asm`, `cs_5_0`).** Hardware-accelerated D3D11 DirectCompute shader dispatch (`WARP` fallback when no hardware adapter is available) rendering seven curated procedural backdrops (`Cut planes`, `Ambient glow`, `Stained mosaic`, `Brushed alloy`, `Paper grain`, `Neon horizon`, `Topo contours`) plus `Flat`, backed by an SSE2 360-degree palette hue/luminance color-cycling pass (`gpu_color_cycle`) that re-tints pre-rendered backdrop caches in under `5 ms` (`gpukat`).
+- **Expanded palette library and glass surface UI (`src/theme.asm`, `src/gui.asm`).** Fourteen curated color palettes (`0..13`, `Gruvbox` default) plus `Follow Windows` (`14`), paired with semi-transparent glass entry/detail cards, sidebar selection panels, soft ambient drop shadows, a gold-shield title bar header covering the full `0px` top client surface, TOTP radial countdown rings, character-class syntax highlighting in the password generator, and compact single-button scheme/backdrop selectors in Settings.
+- **Unified off-screen window compositor (`gui_present_composite`).** Top-level dialogs composite their backdrop, glass cards, owner-drawn controls, and Win32 child edit/list/combo windows into a single off-screen `DIBSection` via `WM_PRINTCLIENT` and present the completed frame atomically in a single `BitBlt`, eliminating multi-pass GDI tearing and flicker across Settings, Vault, and modal dialogs (`guitest.ps1`).
+
+### Security in 0.8.1
+
+- **Full-application security audit remediation (`AUD-01`–`AUD-30`).**
+  - **Read-only post-init globals and pointer encoding (`src/hardening.asm`, `src/secmem.asm`, `src/gpu.asm`):** Moved startup-resolved system DLL pointers (`webauthn.dll`, `tbs.dll`, `d3d11.dll`, `SetProcessMitigationPolicy`, `RtlGenRandom`) and secret-heap metadata (`sec_base`, `sec_cursor`, `g_ptr_cookie`, `g_tls_sstack`, `g_heap_cookie`) into a dedicated page-aligned `_ROINIT` PE section sealed `PAGE_READONLY` via `VirtualProtect` after startup (`hardening_seal_roinit`), and XOR-encoded dynamic function pointers with a hardware-seeded cookie (`ENCODE_PTR` / `DECODE_PTR`).
+  - **Fail-closed `TPM + PIN` state rotation (`src/tpm.asm`):** Checked `NCryptDeleteKey` (`tpm_delete`) return status on the consumed TPM state slot during Mode 2 (`TPM + PIN`) pre-commit rotation and aborted unlock if key deletion fails, preventing stale-slot rollback if PCP key storage refuses deletion.
+  - **Compositor and GDI secret-pixel hygiene (`src/gui.asm`, `src/hardening.asm`):** Registered `g_comp_bits` for zero-wiping across `vp_lock`, dialog switch/close (`gui_comp_wipe` / `gui_comp_free`), and crash panic (`crash_wipe_comp`), and replaced unguarded screen-DC reads with internal off-screen buffer sampling.
+  - **Parser, vault, and file-I/O hardening (`src/vault.asm`, `src/zipimport.asm`, `src/zipexport.asm`, `src/fileio.asm`, `src/regcfg.asm`, `src/main.asm`, `src/totp.asm`):** Checked 64-bit size arithmetic across vault serialization and ZIP export/import, enforced strict `FILE_TYPE_DISK` / reparse-point checks and canonicalized path bounds across file operations, rejected embedded NULs in `REG_SZ` registry reads, scrubbed temporary buffers on all error exits, and gated CLI `seedtest` / diagnostic probes out of normal operation.
+  - **Build, PE, and static-analysis gates (`tools/framecheck.py`, `tools/deadcode.py`, `tools/pe_normalise.py`, `build.cmd`):** Verified non-overlapping 32-byte x64 shadow home space across all 731 `FRAME_PROLOG` procedures (`framecheck.py --strict`), zero dead symbols in release (`deadcode.py`), and `_ROINIT` section flags in `pe_normalise.py`.
+
 ## [0.2.4] - 2026-11-15
 
 ### Added

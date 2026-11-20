@@ -178,6 +178,12 @@ public hotp
 hotp proc frame
     FRAME_PROLOG 96
     ; [rbp-24]=out  [rbp-40]=counterBE(8)  [rbp-72..rbp-53]=mac(20)
+    test    rcx, rcx
+    jz      hotp_bad
+    test    edx, edx
+    jz      hotp_bad
+    test    r9, r9
+    jz      hotp_bad
     mov     edx, edx                        ; zero-extend 32-bit keylen into rdx
     mov     qword ptr [rbp-24], r9
     mov     rax, r8
@@ -227,6 +233,10 @@ hotp_fmt:
     mov     edx, 40
     call    secure_zero
     mov     eax, 1
+    FRAME_EPILOG
+    ret
+hotp_bad:
+    xor     eax, eax
     FRAME_EPILOG
     ret
 hotp endp
@@ -331,7 +341,13 @@ totp_at endp
 ; ===========================================================================
 public totp_now
 totp_now proc frame
-    FRAME_PROLOG 48
+    FRAME_PROLOG 80
+    test    rcx, rcx
+    jz      tn_bad
+    test    edx, edx
+    jz      tn_bad
+    test    r8, r8
+    jz      tn_bad
     mov     edx, edx
     mov     qword ptr [rbp-24], rcx
     mov     dword ptr [rbp-32], edx
@@ -347,6 +363,10 @@ totp_now proc frame
     call    hotp
     FRAME_EPILOG
     ret
+tn_bad:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
 totp_now endp
 
 ; ===========================================================================
@@ -355,7 +375,9 @@ totp_now endp
 ; ===========================================================================
 public totp_from_b32
 totp_from_b32 proc frame
-    FRAME_PROLOG 48
+    FRAME_PROLOG 64
+    test    r8, r8
+    jz      tfb_bad
     mov     edx, edx
     mov     qword ptr [rbp-24], r8          ; out
     lea     r8, [g_totp_key]
@@ -398,5 +420,35 @@ totp_secs_left proc frame
     FRAME_EPILOG
     ret
 totp_secs_left endp
+
+; ===========================================================================
+; totp_ms_left() -> eax = TOTP_PERIOD*1000 - (unix_ms mod (TOTP_PERIOD*1000)).
+;   Returns 1..30000 ms remaining in the current 30-second TOTP window.
+; ===========================================================================
+public totp_ms_left
+totp_ms_left proc frame
+    FRAME_PROLOG 48
+    lea     rcx, [rbp-24]
+    call    GetSystemTimeAsFileTime
+    mov     rax, qword ptr [rbp-24]
+    mov     rcx, FT_UNIX_EPOCH
+    cmp     rax, rcx
+    jb      tml_pre1970
+    sub     rax, rcx
+    xor     edx, edx
+    mov     rcx, 10000                      ; 100-ns ticks -> milliseconds
+    div     rcx
+    xor     edx, edx
+    mov     rcx, TOTP_PERIOD * 1000
+    div     rcx
+    mov     eax, TOTP_PERIOD * 1000
+    sub     eax, edx
+    FRAME_EPILOG
+    ret
+tml_pre1970:
+    mov     eax, TOTP_PERIOD * 1000
+    FRAME_EPILOG
+    ret
+totp_ms_left endp
 
 end

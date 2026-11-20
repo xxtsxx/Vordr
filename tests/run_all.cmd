@@ -279,6 +279,9 @@ if not "!errorlevel!"=="0" ( echo   tpmkat: FAIL ^(exit !errorlevel!, VDR-10 TPM
 bin\vordr.exe pinkat > "%WORK%\pinkat.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   pinkat: FAIL ^(exit !errorlevel!, PIN length + trivial-pattern grading^) & set RT=FAIL )
 
+bin\vordr.exe gpukat > "%WORK%\gpukat.log" 2>&1
+if not "!errorlevel!"=="0" ( echo   gpukat: FAIL ^(exit !errorlevel!, D3D11 cs_5_0 21.4 backdrop + cache^) & set RT=FAIL )
+
 bin\vordr.exe secdeskkat > "%WORK%\secdeskkat.log" 2>&1
 if not "!errorlevel!"=="0" ( echo   secdeskkat: FAIL ^(exit !errorlevel!, VDR-13 secure-desktop fallback/orphan^) & set RT=FAIL )
 

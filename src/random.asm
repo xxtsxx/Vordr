@@ -15,6 +15,7 @@
 include macros.inc
 
 extern BCryptGenRandom:proc
+extern secure_zero:proc
 
 BCRYPT_USE_SYSTEM_PREFERRED_RNG equ 2
 
@@ -36,7 +37,7 @@ rng_fill proc frame
     ; BCryptGenRandom(hAlgorithm=NULL, pbBuffer, cbBuffer, dwFlags)
     WINCALL BCryptGenRandom, 0, rcx, edx, BCRYPT_USE_SYSTEM_PREFERRED_RNG
     test    eax, eax                    ; NTSTATUS: 0 = STATUS_SUCCESS
-    jnz     rf_fail
+    jnz     rf_wipe_fail
 
     ; ---- defense in depth: XOR-mix RDSEED if available ----------------------
     test    dword ptr [g_cpu_features], CPUF_RDSEED
@@ -50,6 +51,7 @@ rf_mix_loop:
 rf_retry:
     rdseed  rcx
     jc      rf_have_seed
+    pause
     dec     eax
     jnz     rf_retry
     jmp     rf_ok                       ; RDSEED starved: keep OS bytes, still ok
@@ -66,6 +68,7 @@ rf_tail:
 rf_t_retry:
     rdseed  rcx
     jc      rf_t_have
+    pause
     dec     eax
     jnz     rf_t_retry
     jmp     rf_ok
@@ -80,6 +83,10 @@ rf_ok:
     xor     ecx, ecx                    ; scrub last hardware RDSEED qword from rcx
     mov     eax, 1
     jmp     rf_done
+rf_wipe_fail:
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-32]
+    call    secure_zero
 rf_fail:
     xor     ecx, ecx
     xor     eax, eax

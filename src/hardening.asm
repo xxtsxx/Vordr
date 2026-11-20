@@ -17,8 +17,10 @@ extern TlsAlloc:proc                    ; the per-thread shadow stack's slot
 extern TlsSetValue:proc
 extern GetModuleHandleW:proc
 extern rng_fill:proc                    ; random.asm: rcx=buf, rdx=len -> eax=1 ok
-extern print_a:proc                     ; console.asm (cttest probe)
+ifdef DBG_TRACE
+extern print_a:proc                     ; console.asm (cttest / crash breadcrumb)
 extern print_u64:proc
+endif
 extern secmem_panic_wipe:proc           ; secmem.asm: zero every live secret buffer
 extern SetUnhandledExceptionFilter:proc
 extern AddVectoredExceptionHandler:proc
@@ -27,7 +29,11 @@ extern SetDefaultDllDirectories:proc
 extern SetProcessMitigationPolicy:proc
 extern TerminateProcess:proc
 extern GetCurrentProcess:proc
+extern GetCurrentThreadId:proc
+extern Sleep:proc
 extern SwitchDesktop:proc               ; restore the user's desktop before we die
+extern OpenDesktopW:proc
+extern CloseDesktop:proc
 externdef g_secdesk_orig:qword          ; gui.asm: HDESK of the user's own input desktop
 extern HeapSetInformation:proc
 extern GetProcAddress:proc
@@ -50,38 +56,45 @@ PAGE_READWRITE      equ 04h
 PAGE_NOACCESS       equ 01h
 
 ; -----------------------------------------------------------------------------
-; Tagged heap block layout (temporal memory tagging emulation):
+; Tagged heap block layout (guard-page-aligned + header/footer canaries):
 ;
-;   [hdr]  32 bytes : magic "BLPH" | size(8) | tag(8) | front canary(8) | gen(4)
+;   [hdr]  32 bytes : magic "BLPH" | reserved(4) | size(8) | tag(8) | front canary(8)
 ;   [user] size bytes
 ;   [tail] 8 bytes  : rear canary  (= front canary rotated by 1)
-;
-; tag is random per allocation; generation counter is global and bumps on
-; every free, so a stale pointer's stored tag can never match a reused block.
-; Freed blocks are poisoned with 0xDD before release.
+;   [pad]  0..15 B  : 16-byte alignment slack, flush against a trailing
+;                     PAGE_NOACCESS hardware guard page.
 ; -----------------------------------------------------------------------------
 HEAPBLK struct
     magic       dd ?                    ; TM_HEAPBLK
-    gen         dd ?                    ; generation at allocation time
+    reserved    dd ?                    ; alignment pad (0)
     blksize     dq ?                    ; user size in bytes
-    tag         dq ?                    ; random temporal tag
+    tag         dq ?                    ; random per-block tag
     canary      dq ?                    ; front canary
 HEAPBLK ends
 HEAP_TAIL_LEN   equ 8
 
-.data
+; Dedicated 4 KiB-aligned write-once startup section locked PAGE_READONLY in iat_lockdown (AUD-09)
+_ROINIT SEGMENT PAGE READ WRITE 'ROINIT'
 public g_stack_canary
+public g_ptr_cookie
 public g_sstk_tls
 public g_cpu_features
+g_roinit_base label byte
 g_stack_canary  dq 0
+g_ptr_cookie    dq 0
 g_sstk_tls      dd 0                    ; TLS index + 1 (0 = not allocated yet)
-align 8
 g_cpu_features  dd 0
-g_heap_gen      dd 1                    ; global generation counter
+g_img_lo        dq 0                    ; this image's [base, base+SizeOfImage):
+g_img_hi        dq 0                    ;   crash_veh only acts on faults inside it
+ROINIT_LEN      equ $ - g_roinit_base
+_ROINIT ENDS
+
+.data
 public g_gui_active
 g_gui_active    dd 0                    ; 1 once the GUI is up
 public g_in_crash
-g_in_crash      dd 0                    ; atomic re-entrancy latch (lock bts)
+g_in_crash      dd 0                    ; owning crash TID (or 1 in redteam crash_reent)
+align 8
 g_crash_code    dq 0                    ; last exception code (crash breadcrumb)
 g_crash_addr    dq 0                    ; last exception address
 ifdef DBG_TRACE
@@ -94,18 +107,17 @@ g_crash_h       dq 0                    ; breadcrumb file handle
 g_crash_nw      dd 0                    ; WriteFile bytes-written out
 g_crash_dumped  db 0                    ; reentry guard: dump once
 endif
-align 8
-g_img_lo        dq 0                    ; this image's [base, base+SizeOfImage):
-g_img_hi        dq 0                    ;   crash_veh only acts on faults inside it
 align 2
 
 SEM_FAILCRITICALERRORS  equ 1
 SEM_NOGPFAULTERRORBOX   equ 2
 GENERIC_WRITE_          equ 40000000h
-CREATE_NEW_             equ 1
 FILE_FLAG_OPEN_RP       equ 00200000h   ; FILE_FLAG_OPEN_REPARSE_POINT
-FILE_ATTR_REPARSE_PT    equ 00000400h   ; FILE_ATTRIBUTE_REPARSE_POINT
 FILE_TYPE_DISK_         equ 1
+ifdef DBG_TRACE
+CREATE_NEW_             equ 1
+FILE_ATTR_REPARSE_PT    equ 00000400h   ; FILE_ATTRIBUTE_REPARSE_POINT
+endif
 STATUS_ILLEGAL_INST     equ 0C000001Dh
 STATUS_INT_DIV_ZERO     equ 0C0000094h
 STATUS_STACK_OVF        equ 0C00000FDh
@@ -121,6 +133,7 @@ IMG_POL_FLAGS           equ 7           ; NoRemoteImages (1) | NoLowMandatoryLab
 WSTR w_k32_dll,   <kernel32.dll>
 WSTR w_wer_dll,   <wer.dll>
 WSTR w_vordr_exe, <vordr.exe>
+WSTR w_def_desk,  <Default>
 a_wer_flags       db "WerSetFlags", 0
 a_wer_excl        db "WerAddExcludedApplication", 0
 ifdef DBG_TRACE
@@ -245,6 +258,76 @@ sstk_overflow_fail proc
 sstk_overflow_fail endp
 
 ; =============================================================================
+; crash_try_enter() -> eax = 1 if THIS thread acquired the crash latch, 0 if
+;   re-entrant on the SAME thread (or pre-armed g_in_crash == 1).  If ANOTHER
+;   thread already owns the crash latch, parks this thread in Sleep() so the
+;   owning thread finishes secmem_panic_wipe uninterrupted (AUD-10).  RAW frame.
+; =============================================================================
+public crash_try_enter
+crash_try_enter proc
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    sub     rsp, 48
+    WINCALL GetCurrentThreadId
+    test    eax, eax
+    jnz     @F
+    mov     eax, 2
+@@: mov     ecx, eax
+    xor     eax, eax
+    lock cmpxchg dword ptr [g_in_crash], ecx
+    je      cte_won
+    cmp     eax, ecx                            ; recursive fault on owning crash thread?
+    je      cte_reent
+    cmp     eax, 1                              ; redteam crash_reent sentinel?
+    je      cte_reent
+cte_park:
+    WINCALL Sleep, 1000                         ; wait for owning thread to finish panic wipe
+    jmp     cte_park
+cte_reent:
+    xor     eax, eax
+    mov     rsp, rbp
+    pop     rbp
+    ret
+cte_won:
+    mov     eax, 1
+    mov     rsp, rbp
+    pop     rbp
+    ret
+crash_try_enter endp
+
+; crash_restore_desktop() - restore input desktop to g_secdesk_orig, retrying and
+;   falling back to OpenDesktopW(L"Default") so a crash never strands the session
+;   on the private Secure-Unlock desktop (AUD-10).  RAW frame.
+public crash_restore_desktop
+crash_restore_desktop proc
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    sub     rsp, 48
+    mov     rcx, qword ptr [g_secdesk_orig]
+    test    rcx, rcx
+    jz      crd_done
+    WINCALL SwitchDesktop, rcx
+    test    eax, eax
+    jnz     crd_done
+    WINCALL Sleep, 15
+    WINCALL SwitchDesktop, qword ptr [g_secdesk_orig]
+    test    eax, eax
+    jnz     crd_done
+    WINCALL OpenDesktopW, addr w_def_desk, 0, 0, 0100h ; DESKTOP_SWITCHDESKTOP = 0x100
+    test    rax, rax
+    jz      crd_done
+    mov     qword ptr [rbp-16], rax
+    WINCALL SwitchDesktop, rax
+    WINCALL CloseDesktop, qword ptr [rbp-16]
+crd_done:
+    mov     rsp, rbp
+    pop     rbp
+    ret
+crash_restore_desktop endp
+
+; =============================================================================
 ; crash_contain() - the shared crash-containment action: reset shadow stack,
 ;   wipe every live secret buffer, print a dbg breadcrumb, restore desktop if on
 ;   the Secure-Unlock private desktop, and terminate immediately without pumping
@@ -258,10 +341,7 @@ crash_contain proc
     sub     rsp, 64
     call    sstk_reset_current
     call    secmem_panic_wipe                   ; 1. secrets gone BEFORE any Win32 / file I/O
-    cmp     qword ptr [g_secdesk_orig], 0       ; 2. restore user's desktop BEFORE any I/O
-    je      cc_after_desk
-    WINCALL SwitchDesktop, qword ptr [g_secdesk_orig]
-cc_after_desk:
+    call    crash_restore_desktop               ; 2. restore user's desktop BEFORE any I/O
 ifdef DBG_TRACE
     cmp     dword ptr [g_crash_code], STATUS_STACK_OVF
     je      cc_nodump                           ; stack exhausted: skip Win32 file I/O
@@ -317,9 +397,18 @@ crash_veh proc
     cmp     r10, qword ptr [g_img_hi]
     jae     cv_pass
 cv_catch:
-    ; Re-entrancy guard: if we fault INSIDE crash_contain, kill immediately
-    lock bts dword ptr [g_in_crash], 0
-    jc      cv_reent
+    ; Preserve rcx/rax/edx/r10 across crash_try_enter
+    mov     qword ptr [rbp-16], rcx
+    mov     qword ptr [rbp-24], rax
+    mov     dword ptr [rbp-28], edx
+    mov     qword ptr [rbp-40], r10
+    call    crash_try_enter
+    test    eax, eax
+    jz      cv_reent
+    mov     rcx, qword ptr [rbp-16]
+    mov     rax, qword ptr [rbp-24]
+    mov     edx, dword ptr [rbp-28]
+    mov     r10, qword ptr [rbp-40]
     mov     dword ptr [g_crash_code], edx
     mov     qword ptr [g_crash_addr], r10
     cmp     dword ptr [rax+24], 2               ; NumberParameters >= 2?
@@ -430,8 +519,11 @@ crash_filter proc
     mov     rbp, rsp
     and     rsp, -16
     sub     rsp, 64
-    lock bts dword ptr [g_in_crash], 0
-    jc      cf_reent
+    mov     qword ptr [rbp-16], rcx
+    call    crash_try_enter
+    test    eax, eax
+    jz      cf_reent
+    mov     rcx, qword ptr [rbp-16]
     mov     rax, qword ptr [rcx]
     mov     r10d, dword ptr [rax]
     mov     dword ptr [g_crash_code], r10d
@@ -514,7 +606,11 @@ hardening_init proc frame
 
     ; ---- lock dynamic DLL search path + process/heap mitigation policies ----
     WINCALL HeapSetInformation, 0, 1, 0, 0      ; HeapEnableTerminationOnCorruption
+    test    eax, eax
+    jz      hi_fail
     WINCALL SetDefaultDllDirectories, LOAD_LIB_SYS32
+    test    eax, eax
+    jz      hi_fail
     mov     dword ptr [rbp-24], 1
     WINCALL SetProcessMitigationPolicy, MITIG_EXT_DISABLE, addr rbp-24, 4
     mov     dword ptr [rbp-24], IMG_POL_FLAGS
@@ -530,27 +626,39 @@ hardening_init proc frame
     test    eax, eax
     jz      hi_fail
 
-    ; ---- seed stack canary: CSPRNG xor rdtsc, never zero --------------------
+    ; ---- seed stack canary + pointer cookie: CSPRNG xor rdtsc, never zero ---
     ; IMPORTANT: rng_fill is itself canary-protected and reads g_stack_canary
     ; in its epilog, so we must NOT let it write g_stack_canary directly.
-    ; Fill a local seed buffer, then publish the canary only after it returns.
-    lea     rcx, [rbp-24]               ; local seed (8 bytes)
-    mov     edx, 8
+    ; Fill a 16-byte local seed buffer, publish g_stack_canary & g_ptr_cookie,
+    ; then wipe the stack seed before returning (AUD-09, AUD-26).
+    lea     rcx, [rbp-32]               ; local 16-byte seed ([rbp-32..-17])
+    mov     edx, 16
     call    rng_fill
     test    eax, eax
     jz      hi_fail
     rdtsc
     shl     rdx, 32
     or      rax, rdx
-    xor     rax, qword ptr [rbp-24]
+    mov     rcx, rax
+    xor     rax, qword ptr [rbp-32]
     test    rax, rax
     jnz     @F
     mov     rax, 0A5A5A5A55A5A5A5Ah     ; never-zero fallback
-@@:
-    mov     qword ptr [g_stack_canary], rax
+@@: mov     qword ptr [g_stack_canary], rax
+    rol     rcx, 17
+    xor     rcx, qword ptr [rbp-24]
+    test    rcx, rcx
+    jnz     @F
+    mov     rcx, 05A5A5A5AA5A5A5A5h
+@@: mov     qword ptr [g_ptr_cookie], rcx
+    mov     qword ptr [rbp-32], 0
+    mov     qword ptr [rbp-24], 0
+    mfence
     mov     eax, 1
     jmp     hi_done
 hi_fail:
+    mov     qword ptr [rbp-32], 0
+    mov     qword ptr [rbp-24], 0
     xor     eax, eax
 hi_done:
     mov     rsp, rbp
@@ -560,9 +668,9 @@ hardening_init endp
 
 ; =============================================================================
 ; iat_lockdown - "full RELRO" equivalent: walk our own PE header, find the
-; IAT data directory and VirtualProtect it PAGE_READONLY.  Call after all
-; initialization (imports are bound by the loader before we run, so this is
-; safe immediately).  Returns eax=1 ok / 0 fail (non-fatal; caller may warn).
+; IAT data directory and VirtualProtect it PAGE_READONLY, and lock the _ROINIT
+; startup security globals PAGE_READONLY as well (AUD-09).
+; Returns eax=1 ok / 0 fail.
 ; =============================================================================
 public iat_lockdown
 iat_lockdown proc frame
@@ -598,6 +706,10 @@ iat_lockdown proc frame
 
     ; IAT VA in r10+rax, size already in rdx
     WINCALL VirtualProtect, addr r10+rax, rdx, PAGE_READONLY, addr rbp-16
+    test    eax, eax
+    jz      il_fail
+    ; Lock write-once _ROINIT page (canary, pointer cookie, shadow-stack TLS, img bounds)
+    WINCALL VirtualProtect, addr g_roinit_base, ROINIT_LEN, PAGE_READONLY, addr rbp-16
     test    eax, eax
     jz      il_fail
     mov     eax, 1
@@ -668,45 +780,63 @@ ct_memcmp endp
 
 ; =============================================================================
 ; tagged_alloc(rcx = user size) -> rax = user pointer, or 0 on failure
-; VirtualAlloc-backed (no RWX, page-granular, OS guards) with header/footer
-; canaries and a random temporal tag.
+; VirtualAlloc-backed with header/footer canaries AND placed flush (within 16B
+; alignment) against a trailing PAGE_NOACCESS hardware guard page (AUD-22).
 ; =============================================================================
 public tagged_alloc
 tagged_alloc proc frame
-    FRAME_PROLOG 64
-    ; locals: [rbp-24] user size, [rbp-32] block ptr
+    FRAME_PROLOG 96
+    ; locals: [rbp-24] user size, [rbp-32] region base, [rbp-40] hdr ptr,
+    ;         [rbp-48] rw_pages, [rbp-56] oldprot
 
     mov     qword ptr [rbp-24], rcx
-    ; total = sizeof header + size + tail, overflow-checked
+    ; span = (sizeof HEAPBLK + size + HEAP_TAIL_LEN + 15) & -16, overflow-checked
     mov     rax, rcx
-    CHECK_ADD_OVF rax, (sizeof HEAPBLK) + HEAP_TAIL_LEN
+    CHECK_ADD_OVF rax, (sizeof HEAPBLK) + HEAP_TAIL_LEN + 15
+    and     rax, -16
+    mov     r8, rax                             ; r8 = span (multiple of 16, >= 48)
+    CHECK_ADD_OVF rax, 0FFFh
+    and     rax, -1000h                         ; rw_pages (multiple of 4096, >= span)
+    mov     qword ptr [rbp-48], rax
+    mov     rdx, rax
+    sub     rdx, r8                             ; pad = rw_pages - span (0 <= pad <= 0FF0h)
+    mov     qword ptr [rbp-40], rdx             ; temp: pad
+    CHECK_ADD_OVF rax, 1000h                    ; + 1 trailing guard page
     WINCALL VirtualAlloc, 0, rax, <MEM_RESERVE or MEM_COMMIT>, PAGE_READWRITE
     test    rax, rax
     jz      ta_fail
-    mov     qword ptr [rbp-32], rax
+    mov     qword ptr [rbp-32], rax             ; region base
+    mov     rcx, rax
+    add     rcx, qword ptr [rbp-48]             ; guard page VA = base + rw_pages
+    WINCALL VirtualProtect, rcx, 1000h, PAGE_NOACCESS, addr rbp-56
+    test    eax, eax
+    jz      ta_fail_free
+
+    mov     rax, qword ptr [rbp-32]
+    add     rax, qword ptr [rbp-40]             ; hdr = region_base + pad (in first page)
+    mov     qword ptr [rbp-40], rax
 
     ; ---- fill header --------------------------------------------------------
     mov     dword ptr [rax].HEAPBLK.magic, TM_HEAPBLK
-    mov     ecx, dword ptr [g_heap_gen]
-    mov     dword ptr [rax].HEAPBLK.gen, ecx
+    mov     dword ptr [rax].HEAPBLK.reserved, 0
     mov     rcx, qword ptr [rbp-24]
     mov     qword ptr [rax].HEAPBLK.blksize, rcx
 
-    lea     rcx, [rax].HEAPBLK.tag      ; random temporal tag (8 bytes)
+    lea     rcx, [rax].HEAPBLK.tag              ; random per-block tag (8 bytes)
     mov     edx, 8
     call    rng_fill
     test    eax, eax
     jz      ta_fail_free
 
-    mov     rax, qword ptr [rbp-32]
+    mov     rax, qword ptr [rbp-40]
     mov     r10, qword ptr [rax].HEAPBLK.tag
-    mov     qword ptr [rax].HEAPBLK.canary, r10     ; front canary = tag
+    mov     qword ptr [rax].HEAPBLK.canary, r10 ; front canary = tag
     rol     r10, 1
-    mov     rcx, qword ptr [rax].HEAPBLK.blksize    ; rear canary = rol(tag,1)
+    mov     rcx, qword ptr [rax].HEAPBLK.blksize ; rear canary = rol(tag,1)
     lea     r11, [rax + sizeof HEAPBLK]
     mov     qword ptr [r11+rcx], r10
 
-    lea     rax, [rax + sizeof HEAPBLK]             ; -> user pointer
+    lea     rax, [rax + sizeof HEAPBLK]         ; -> 16-byte-aligned user pointer
     jmp     ta_done
 ta_fail_free:
     WINCALL VirtualFree, qword ptr [rbp-32], 0, MEM_RELEASE
@@ -720,7 +850,7 @@ tagged_alloc endp
 ; =============================================================================
 ; tagged_check(rcx = user ptr) - validate a live block, fastfail on violation.
 ; Catches: type confusion, buffer overflow into header, rear-canary smash,
-; use-after-free (poisoned/stale generation).
+; double-free (wiped magic).
 ; =============================================================================
 public tagged_check
 tagged_check proc
@@ -740,7 +870,7 @@ tagged_check endp
 
 ; =============================================================================
 ; tagged_free(rcx = user ptr) - verify header/rear canaries, wipe user + header
-;   bytes, bump g_heap_gen, and release via VirtualFree.  NULL is a safe no-op.
+;   bytes, and release the underlying VirtualAlloc reservation.  NULL is a no-op.
 ; =============================================================================
 public tagged_free
 tagged_free proc frame
@@ -751,20 +881,22 @@ tagged_free proc frame
     call    tagged_check                        ; traps on overflow/corrupt/double-free
     mov     rcx, qword ptr [rbp-24]
     lea     rax, [rcx - sizeof HEAPBLK]
-    mov     qword ptr [rbp-32], rax
+    mov     qword ptr [rbp-32], rax             ; hdr ptr
     mov     rdx, qword ptr [rax].HEAPBLK.blksize
     add     rdx, HEAP_TAIL_LEN
     call    secure_zero                         ; wipe user bytes + rear canary
     mov     rcx, qword ptr [rbp-32]
     mov     edx, sizeof HEAPBLK
     call    secure_zero                         ; clear TM_HEAPBLK + tags
-    inc     dword ptr [g_heap_gen]
-    WINCALL VirtualFree, qword ptr [rbp-32], 0, MEM_RELEASE
+    mov     rcx, qword ptr [rbp-32]
+    and     rcx, -1000h                         ; region_base (0 <= pad <= 0FF0h < 1000h)
+    WINCALL VirtualFree, rcx, 0, MEM_RELEASE
 tf_done:
     FRAME_EPILOG
     ret
 tagged_free endp
 
+ifdef DBG_TRACE
 ; =============================================================================
 ; cmd_cttest (dbg probe) - coarse constant-time check for ct_memcmp: time 10k
 ;   4 KiB compares with the difference at the FIRST byte, then at the LAST
@@ -880,5 +1012,6 @@ ctt_bad:
     FRAME_EPILOG
     ret
 cmd_cttest endp
+endif ; DBG_TRACE
 
 end

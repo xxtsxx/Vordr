@@ -28,7 +28,10 @@ extern gui_anim_apply:proc
 externdef g_vaulthwnd:qword
 
 public anim_set, anim_get, anim_active, anim_tick, anim_reset, anim_settings
-public g_anim_on, g_anim_tmr, g_anim, g_anim_force, g_anim_pref
+public g_anim_on, g_anim_tmr, g_anim, g_anim_pref
+ifdef PROBE_IO
+public g_anim_force
+endif
 
 ANIM_MS             equ 15              ; ~60 Hz; USER timers round to the system tick
 SPI_GETCLIENTAREAANIMATION equ 1042h
@@ -45,8 +48,10 @@ AS_DUR              equ 24              ; duration, ms
 align 8
 g_anim_on   dd 1                        ; Windows' animation switch (anim_settings)
 g_anim_tmr  dd 0                        ; ANIM_TIMER is armed on g_vaulthwnd
+ifdef PROBE_IO
 g_anim_force dd 0                       ; test builds only (VORDR_TEST_ANIM, gui_test_hooks):
                                         ;   1 = on, 2 = off, whatever Windows says
+endif
 g_anim_pref dd 0                        ; the user's Settings > Animations (ui_anim):
                                         ;   0 = follow Windows, 1 = always, 2 = never
 align 8
@@ -66,6 +71,7 @@ endm
 ;   Windows without the setting) leaves animation on.
 anim_settings proc frame
     FRAME_PROLOG 48
+ifdef PROBE_IO
     mov     eax, dword ptr [g_anim_force]
     test    eax, eax
     jz      ast_query
@@ -75,6 +81,7 @@ anim_settings proc frame
     mov     dword ptr [g_anim_on], ecx
     jmp     ast_ret
 ast_query:
+endif
     mov     eax, dword ptr [g_anim_pref]         ; the user's own choice, unless it is
     test    eax, eax                             ;   "follow Windows"
     jz      ast_spi

@@ -101,25 +101,70 @@ def kind_of(directive):
     return KIND_MAP.get(d, "data")   # label / db / dw / dd / dq / real* -> data
 
 
-def scan(paths):
+RE_IFDEF = re.compile(r'^\s*(ifdef|ifndef)\s+(' + IDENT + r')\b', re.I)
+RE_IFOTHER = re.compile(r'^\s*(if|ife|ifb|ifnb|ifidn|ifidni|ifdif|ifdifi)\b', re.I)
+RE_ELSE = re.compile(r'^\s*else\b', re.I)
+RE_ENDIF = re.compile(r'^\s*endif\b', re.I)
+RE_LPAD = re.compile(r'^\s*LANDING_PAD\b')
+
+
+def iter_lines(path, defines=None):
+    """Yield (lineno, stripped_line) from path; when defines is a set, evaluate
+    ifdef/ifndef/else/endif conditional assembly blocks (keeping macro IF/IFB arms)."""
+    stack = []  # list of (kind: 'ifdef'|'macro_if', parent_active: bool, cur_active: bool)
+    fname = os.path.basename(path)
+    for n, raw in enumerate(open(path, encoding='latin-1'), 1):
+        s = strip_line(raw.rstrip('\n'))
+        if defines is not None:
+            m_ifd = RE_IFDEF.match(s)
+            if m_ifd:
+                p_act = stack[-1][2] if stack else True
+                cond = (m_ifd.group(2) in defines)
+                if m_ifd.group(1).lower() == 'ifndef':
+                    cond = not cond
+                stack.append(('ifdef', p_act, p_act and cond))
+                continue
+            if RE_IFOTHER.match(s):
+                p_act = stack[-1][2] if stack else True
+                stack.append(('macro_if', p_act, p_act))
+                continue
+            if RE_ELSE.match(s):
+                if not stack:
+                    raise ValueError(f"{fname}:{n}: unmatched else")
+                kind, p_act, c_act = stack[-1]
+                if kind == 'ifdef':
+                    stack[-1] = (kind, p_act, p_act and (not c_act))
+                continue
+            if RE_ENDIF.match(s):
+                if not stack:
+                    raise ValueError(f"{fname}:{n}: unmatched endif")
+                stack.pop()
+                continue
+            if stack and not stack[-1][2]:
+                continue
+        yield n, s
+    if defines is not None and stack:
+        raise ValueError(f"{fname}: unclosed conditional block at EOF")
+
+
+def scan(paths, defines=None):
     defs = {}        # name -> (file, lineno, kind)
     refs = set()     # every identifier used anywhere
+    lpads = 0        # LANDING_PAD macro invocations in .asm sources
     for path in paths:
         fname = os.path.basename(path)
+        is_asm = fname.lower().endswith('.asm')
         in_struct = False
-        for n, raw in enumerate(open(path, encoding='latin-1'), 1):
-            s = strip_line(raw.rstrip('\n'))
+        for n, s in iter_lines(path, defines):
             if not s.strip():
                 continue
+            if is_asm and RE_LPAD.match(s):
+                lpads += 1
             if in_struct:
-                # inside a STRUCT/UNION: fields are layout, not symbols.  Watch
-                # only for the matching "<name> ends".
                 if RE_STRUCT_END.match(s):
                     in_struct = False
                 continue
             if RE_STRUCT_OPEN.match(s):
-                # the struct/union type name itself is a real symbol; record it
-                # and enter skip mode for the body.
                 nm = RE_TOKEN.match(s.strip()).group(0)
                 defs.setdefault(nm, (fname, n, "data"))
                 in_struct = True
@@ -128,7 +173,6 @@ def scan(paths):
                 continue           # public/extern/externdef: declaration, not use
             me = RE_ENDP.match(s)
             if me:
-                # count tokens after the proc name (usually none), never the name
                 refs.update(RE_TOKEN.findall(s[me.end(1):]))
                 continue
             m = RE_DEF.match(s)
@@ -137,16 +181,12 @@ def scan(paths):
                 kind = kind_of(directive)
                 if kind == "equ" and RE_RCID.match(name):
                     kind = "rcid"
-                # first definition wins; keep its location for the report
                 defs.setdefault(name, (fname, n, kind))
-                # the rest of the def line can still reference other symbols
-                # (equ RHS, label type, dd initialiser) - count those, but not
-                # the symbol being defined (its leading token).
                 rest = s[m.end(1):]
                 refs.update(RE_TOKEN.findall(rest))
             else:
                 refs.update(RE_TOKEN.findall(s))
-    return defs, refs
+    return defs, refs, lpads
 
 
 def main():
@@ -161,7 +201,7 @@ def main():
     inc = os.path.join(args.src, "macros.inc")     # macros reference symbols
     if os.path.exists(inc):                        # (FRAME_PROLOG/FASTFAIL) that
         paths.append(inc)                          # look dead without it
-    defs, refs = scan(paths)
+    defs, refs, _ = scan(paths, defines=None)
 
     dead = []
     for name, (fname, line, kind) in sorted(defs.items(), key=lambda kv: (kv[1][0], kv[1][1])):
@@ -186,9 +226,26 @@ def main():
                 advisory += 1
         print(f"[{label}] {fname}:{line} {name}{tag}")
 
+    # Release-preprocessor audit (AUD-08): verify 0 dead release symbols and
+    # exact release LANDING_PAD surface (2 = cmd_selftest + cmd_katreport).
+    rel_defs, rel_refs, rel_lpads = scan(paths, defines=set())
+    rel_dead = 0
+    for name, (fname, line, kind) in sorted(rel_defs.items(), key=lambda kv: (kv[1][0], kv[1][1])):
+        if name in rel_refs or name in ALLOWLIST:
+            continue
+        if args.only and kind != args.only:
+            continue
+        if kind in GATED:
+            rel_dead += 1
+            print(f"[release dead {kind}] {fname}:{line} {name}")
+    if not args.only and rel_lpads != 2:
+        print(f"[release surface] expected 2 LANDING_PAD targets in release, got {rel_lpads}")
+        gated += 1
+    gated += rel_dead
+
     n_def = len(defs)
     extra = f", {advisory} advisory rcid" if advisory else ""
-    print(f"deadcode: {gated} dead / {n_def} symbols{extra} "
+    print(f"deadcode: {gated} dead / {n_def} symbols{extra}, release_lpads={rel_lpads} "
           f"({'clean' if gated == 0 else 'DEAD CODE PRESENT'})")
     gated += floors.check("deadcode", {"symbols": n_def})
     sys.exit(min(gated, 255))

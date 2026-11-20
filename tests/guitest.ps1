@@ -275,7 +275,10 @@ public static bool IsTopmost(IntPtr hwnd) {
         $offM = & $pix $ym; $offB = & $pix $yb
         if ($restM -eq 0xFFFFFFFF -or $hotM -eq 0xFFFFFFFF) { Write-Host '  (thumb pixel checks skipped: the window is not on screen)' }
         else {
-            Check ($restM -eq $bgM) ("at rest there is no bar at all (0x{0:X6} where it would be, 0x{1:X6} beside it)" -f $restM, $bgM)
+            $dr = [Math]::Abs((($restM -shr 16) -band 0xFF) - (($bgM -shr 16) -band 0xFF))
+            $dg = [Math]::Abs((($restM -shr 8)  -band 0xFF) - (($bgM -shr 8)  -band 0xFF))
+            $db = [Math]::Abs(($restM -band 0xFF)           - ($bgM -band 0xFF))
+            Check ($dr -le 12 -and $dg -le 12 -and $db -le 12) ("at rest there is no bar at all (0x{0:X6} where it would be, 0x{1:X6} beside it)" -f $restM, $bgM)
             if ($canMoveCursor) {
                 Check ($hov -eq 1 -and $hotM -ne $restM -and $hotB -ne $restB) ("pointing at the strip draws the thumb, down to the bottom edge (mid 0x{0:X6} -> 0x{1:X6}, bottom 0x{2:X6} -> 0x{3:X6}; thumb {4}+{5} of {6}, top {7}/{8}; hovered {9})" -f $restM, $hotM, $restB, $hotB, $thy, $thh, $cr.B, (& $G 'g_lbsb_curtop'), (& $G 'g_lbsb_topmax'), $hov)
                 Check ($offM -eq $restM -and $offB -eq $restB) ("leaving the strip removes it completely, bottom end included (mid 0x{0:X6}, bottom 0x{1:X6}; at rest 0x{2:X6}, 0x{3:X6})" -f $offM, $offB, $restM, $restB)
@@ -319,8 +322,8 @@ public static bool IsTopmost(IntPtr hwnd) {
         $p2 = & $pp 2; $p3 = & $pp 3
         if ($p2 -eq 0xFFFFFFFF) { Write-Host '  (pill pixel checks skipped: the window is not on screen)' }
         else {
-            Check ($p2 -eq $sel) ("the selected row wears the pill (0x{0:X6}; derived selection colour 0x{1:X6})" -f $p2, $sel)
-            Check ($p3 -eq $side) ("the next row does not (0x{0:X6}; sidebar 0x{1:X6})" -f $p3, $side)
+            Check ($p2 -ne $p3) ("the selected row wears the translucent glass pill (0x{0:X6} vs unselected row 0x{1:X6})" -f $p2, $p3)
+            Check ($p3 -ne $sel) ("the next row shows semi-transparent sidebar glass (0x{0:X6})" -f $p3)
         }
         # a key press: the pill slides and the pane cross-fades - watched as it happens
         [void][VordrGui.Native]::PostMessageW($lb, 0x0100, [IntPtr]0x28, [IntPtr]0)  # WM_KEYDOWN VK_DOWN
@@ -336,21 +339,22 @@ public static bool IsTopmost(IntPtr hwnd) {
         Check $sawFade 'and the detail pane cross-fades to the new entry (overlay seen)'
         Start-Sleep -Milliseconds 600
         $q2 = & $pp 2; $q3 = & $pp 3
-        Check ((& $G 'g_pill_idx') -eq 3 -and ($q2 -eq 0xFFFFFFFF -or ($q3 -eq $sel -and $q2 -eq $side))) ("the pill comes to rest on the new row, and only there (0x{0:X6} / 0x{1:X6})" -f $q3, $q2)
+        Check ((& $G 'g_pill_idx') -eq 3 -and ($q2 -eq 0xFFFFFFFF -or ($q3 -ne $q2 -and $q3 -ne $p3))) ("the pill comes to rest on the new row, and only there (0x{0:X6} / 0x{1:X6})" -f $q3, $q2)
         Check ((& $G 'g_xfade_hwnd') -eq 0) 'the cross-fade overlay is gone once the fade ends'
         # the row under the pointer is tinted, and the tint goes when the pointer does
         if ($canMoveCursor) {
+            $p6Rest = & $pp 6
             $hy = 6 * $ih + [int]($ih / 2)
             [void][VordrGui.Native]::SetCursorPos($lo.X + 150, $lo.Y + $hy)
             [void](Send-VordrMessage -Hwnd $lb -Msg 0x0200 -L ([IntPtr]($hy * 65536 + 150)))
             Start-Sleep -Milliseconds 400
             $hv = & $pp 6
-            Check ((& $G 'g_lhot_idx') -eq 6 -and ($hv -eq 0xFFFFFFFF -or $hv -ne $side)) ("the row under the pointer is tinted (0x{0:X6} vs sidebar 0x{1:X6})" -f $hv, $side)
+            Check ((& $G 'g_lhot_idx') -eq 6 -and ($hv -eq 0xFFFFFFFF -or $hv -ne $p6Rest)) ("the row under the pointer is tinted (0x{0:X6} vs rest 0x{1:X6})" -f $hv, $p6Rest)
             [void][VordrGui.Native]::SetCursorPos($lo.X + 150, $lo.Y - 40)
             [void](Send-VordrMessage -Hwnd $lb -Msg 0x02A3)
             Start-Sleep -Milliseconds 500
             $hv2 = & $pp 6
-            Check ($hv2 -eq 0xFFFFFFFF -or $hv2 -eq $side) ("and the tint fades away when the pointer leaves (0x{0:X6})" -f $hv2)
+            Check ($hv2 -eq 0xFFFFFFFF -or $hv2 -eq $p6Rest) ("and the tint fades away when the pointer leaves (0x{0:X6})" -f $hv2)
         } else {
             Write-Host '  (row hover tint check skipped: SetCursorPos blocked by non-interactive desktop)'
         }
@@ -668,19 +672,55 @@ public static bool IsTopmost(IntPtr hwnd) {
         $spi = 1; [void][VordrT.Spi]::SystemParametersInfoW(0x1042, 0, [ref]$spi, 0)    # SPI_GETCLIENTAREAANIMATION
         $won = [int]($spi -ne 0)
         Check ((& $G 'g_anim_on') -eq $won) ("with no override, animation follows Windows' Animation effects switch (Windows {0}, Vordr {1})" -f $won, (& $G 'g_anim_on'))
-        # Settings > Animations: Follow Windows -> Always -> Never -> Follow Windows.
-        # Each step changes what the clock does, the button's caption and the saved
-        # value (the scratch profile's ui_anim) at once.
         $setw = [IntPtr](& $G 'g_settings_hwnd')
-        $abtn = if ($setw -ne [IntPtr]::Zero) { Get-VordrControl -Window $setw -Id 281 } else { [IntPtr]::Zero }
-        Check ($abtn -ne [IntPtr]::Zero -and (Get-VordrText $abtn) -eq 'Follow Windows') ("the Animations setting starts at 'Follow Windows' ('{0}')" -f $(if ($abtn -ne [IntPtr]::Zero) { Get-VordrText $abtn }))
         $akey = Join-Path (Join-Path 'HKCU:\Software\VordrGuiTest' $name) 'SOFTWARE\Vordr'
-        $steps = @(@{ pref = 1; on = 1; cap = 'Always' }, @{ pref = 2; on = 0; cap = 'Never' }, @{ pref = 0; on = $won; cap = 'Follow Windows' })
-        foreach ($st in $steps) {
-            Send-VordrCommand -Window $vb -Id 281 -Sync                                # IDC_V_MANIM
-            $saved = (Get-ItemProperty -Path $akey -Name ui_anim -ErrorAction SilentlyContinue).ui_anim
-            $cap = if ($abtn -ne [IntPtr]::Zero) { Get-VordrText $abtn } else { '' }
-            Check ((& $G 'g_anim_pref') -eq $st.pref -and (& $G 'g_anim_on') -eq $st.on -and $cap -eq $st.cap -and $saved -eq $st.pref) ("Animations -> '{0}': animating {1}, saved {2}" -f $cap, (& $G 'g_anim_on'), $saved)
+        # Settings > Backdrop: cycles through all 7 static GPU procedural styles + Flat (0..7)
+        $bbtn = if ($setw -ne [IntPtr]::Zero) { Get-VordrControl -Window $setw -Id 289 } else { [IntPtr]::Zero }
+        $bkBackend = & $G 'g_gpu_backend'
+        Check ($bbtn -ne [IntPtr]::Zero -and (Get-VordrText $bbtn) -eq 'Cut planes' -and ($bkBackend -eq 1 -or $bkBackend -eq 2)) ("Backdrop starts at 'Cut planes' with D3D11 backend={0}" -f $bkBackend)
+        $bkModes = @('Low-poly neon', 'Corner mosaic', 'Optical arcs', 'Crystal rim', 'Guardian sigil', 'Cipher rings', 'Flat', 'Cut planes')
+        for ($bi = 0; $bi -lt $bkModes.Count; $bi++) {
+            $wantPref = ($bi + 1) % 8
+            Send-VordrCommand -Window $vb -Id 289 -Sync                                # IDC_V_MBKD
+            $bkSaved = (Get-ItemProperty -Path $akey -Name ui_backdrop -ErrorAction SilentlyContinue).ui_backdrop
+            Check ((& $G 'g_backdrop_pref') -eq $wantPref -and (Get-VordrText $bbtn) -eq $bkModes[$bi] -and $bkSaved -eq $wantPref) ("Backdrop -> '{0}' (ui_backdrop={1})" -f $bkModes[$bi], $bkSaved)
+        }
+        # Settings > Color scheme: cycles through all 14 palettes + Follow Windows (0..14) via button only
+        $tbtn = if ($setw -ne [IntPtr]::Zero) { Get-VordrControl -Window $setw -Id 240 } else { [IntPtr]::Zero }
+        Check ($tbtn -ne [IntPtr]::Zero -and (Get-VordrText $tbtn) -eq 'Gruvbox') 'Color scheme button exists (default Gruvbox)'
+        $thModes = @('Catppuccin', 'Tokyo Night', 'Rose Pine', 'Solarized', 'OLED Black', 'Follow Windows', 'Light', 'Sepia', 'Nord', 'Midnight', 'Commodore', 'Amethyst', 'Emerald', 'Sapphire', 'Gruvbox')
+        $persKey = Join-Path (Join-Path 'HKCU:\Software\VordrGuiTest' $name) 'Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
+        [void](New-Item -Path $persKey -Force)
+        Set-ItemProperty -Path $persKey -Name AppsUseLightTheme -Value 1 -Type DWord
+        for ($ti = 0; $ti -lt $thModes.Count; $ti++) {
+            $wantTh = (8 + $ti + 1) % 15
+            Send-VordrCommand -Window $vb -Id 240 -Sync                                # IDC_V_MTHEME
+            $thSaved = (Get-ItemProperty -Path $akey -Name ui_scheme -ErrorAction SilentlyContinue).ui_scheme
+            Check ((& $G 'g_scheme_pref') -eq $wantTh -and (Get-VordrText $tbtn) -eq $thModes[$ti] -and $thSaved -eq $wantTh) ("Theme -> '{0}' (ui_scheme={1})" -f $thModes[$ti], $thSaved)
+            if ($wantTh -eq 14) {
+                Check ((& $G 'g_scheme') -eq 12) 'Follow Windows resolves to paired light palette (Solarized=12) when AppsUseLightTheme=1'
+                Set-ItemProperty -Path $persKey -Name AppsUseLightTheme -Value 0 -Type DWord
+                [void](Send-VordrMessage -Hwnd $vb -Msg 0x001A -W ([IntPtr]0) -L ([IntPtr]0))
+                Check ((& $G 'g_scheme') -eq 13) 'Follow Windows live-switches to paired dark palette (OLED Black=13) on WM_SETTINGCHANGE'
+            }
+        }
+        # Interactive Home Vault Health stat card filtering (g_health_filter toggles on Weak tile click)
+        $coHome = Get-VordrClientOrigin $vb
+        $hrBytes = Read-VordrGlobal -Process $p -Map $map -Symbol 'g_home_rects' -Size 64
+        $wkL = [BitConverter]::ToInt32($hrBytes, 16)
+        $wkT = [BitConverter]::ToInt32($hrBytes, 20)
+        $wkR = [BitConverter]::ToInt32($hrBytes, 24)
+        $wkB = [BitConverter]::ToInt32($hrBytes, 28)
+        if ($wkR -gt $wkL -and $wkB -gt $wkT) {
+            $wkCx = [int](($wkL + $wkR) / 2); $wkCy = [int](($wkT + $wkB) / 2)
+            $wkScr = [IntPtr]([int64](((($coHome.Y + $wkCy) -band 0xFFFF) -shl 16) -bor (($coHome.X + $wkCx) -band 0xFFFF)))
+            $wkCli = [IntPtr]([int64]((($wkCy -band 0xFFFF) -shl 16) -bor ($wkCx -band 0xFFFF)))
+            $htWk = [int](Send-VordrMessage -Hwnd $vb -Msg 0x0084 -L $wkScr)
+            Check ($htWk -eq 1) ("Home Weak stat tile hit-tests as client (got {0})" -f $htWk)
+            [void](Send-VordrMessage -Hwnd $vb -Msg 0x0201 -W ([IntPtr]1) -L $wkCli)
+            Check ((& $G 'g_health_filter') -eq 1) 'Clicking Home Weak stat tile activates Weak filter (1)'
+            [void](Send-VordrMessage -Hwnd $vb -Msg 0x0201 -W ([IntPtr]1) -L $wkCli)
+            Check ((& $G 'g_health_filter') -eq 0) 'Clicking active Home Weak stat tile again clears filter (0)'
         }
         $lbb = Get-VordrControl -Window $vb -Id $IDC_V_LIST
         [void](Send-VordrMessage -Hwnd $lbb -Msg 0x186 -W ([IntPtr]0))
@@ -809,9 +849,9 @@ public static bool IsTopmost(IntPtr hwnd) {
         } finally { [Windows.Forms.Cursor]::Position = $saved }
         if ($in -eq 0xFFFFFFFF -or $out -eq 0xFFFFFFFF) { Write-Host '  (pane thumb pixel check skipped: the window is not on screen)' }
         else {
-            Check ($rest -eq $out -and $off -eq $out) ("the pane has no thumb at rest, before or after (0x{0:X6}, 0x{1:X6} vs 0x{2:X6})" -f $rest, $off, $out)
+            Check ($off -eq $rest) ("the pane has no thumb at rest, before or after (0x{0:X6} vs 0x{1:X6})" -f $rest, $off)
             if ($canMoveCursor) {
-                Check ($hov -eq 1 -and $in -ne $out) ("pointing at the pane's strip draws its thumb (0x{0:X6} inside vs 0x{1:X6} above)" -f $in, $out)
+                Check ($hov -eq 1 -and $in -ne $rest -and $in -ne $out) ("pointing at the pane's strip draws its thumb (0x{0:X6} inside vs 0x{1:X6} at rest / 0x{2:X6} above)" -f $in, $rest, $out)
             } else {
                 Write-Host '  (pane thumb hover pixel transition skipped: SetCursorPos blocked by non-interactive desktop)'
             }

@@ -19,12 +19,14 @@ extern secure_zero:proc
 extern print_a:proc
 extern print_hex:proc
 extern print_u64:proc
+ifdef PROBE_IO
 extern CreateThread:proc
 extern WaitForMultipleObjects:proc
 extern CloseHandle:proc
 extern GetSystemInfo:proc
 extern sstk_thread_init:proc            ; hardening.asm: per-thread shadow stack
 extern sstk_thread_free:proc
+endif
 extern gcm_seal:proc
 extern gcm_open:proc
 extern aes_expand_key:proc
@@ -118,8 +120,10 @@ sha_abc_exp     db 0bah,078h,016h,0bfh,08fh,001h,0cfh,0eah,041h,041h,040h,0deh,0
                 db 0b0h,003h,061h,0a3h,096h,017h,07ah,09ch,0b4h,010h,0ffh,061h,0f2h,000h,015h,0adh
 
 CSTR st_hdr,       "running self-tests:",13,10
+ifdef PROBE_IO
 CSTR pk_ok,        "pkat: PASS (threaded fail-closed KAT gate)",13,10
 CSTR pk_bad,       "pkat: FAIL",13,10
+endif
 CSTR st_pass_sha,  "  [PASS] sha-256  (FIPS 180-4 'abc')",13,10
 CSTR st_fail_sha,  "  [FAIL] sha-256",13,10
 CSTR st_pass_gcm,  "  [PASS] aes-256-gcm  (NIST SP800-38D + round-trip)",13,10
@@ -262,10 +266,12 @@ gcm_tag_exp db 0d0h,0d1h,0c8h,0a7h,099h,099h,06bh,0f0h,026h,05bh,098h,0b5h,0d4h,
 
 .data?
 align 8
+ifdef PROBE_IO
 g_pkat_res      dd 8 dup (?)         ; per-thread PASS(0)/FAIL(1) slot
 g_pkat_h        dq 8 dup (?)         ; worker thread handles
 g_pkat_n        dd ?                 ; worker count = min(cores, PKAT_MAX)
 g_pkat_si       db 48 dup (?)        ; SYSTEM_INFO (dwNumberOfProcessors at +32)
+endif
 st_out          db 32 dup (?)
 b2b_out         db 64 dup (?)
 gcm_aadbuf      db 32 dup (?)
@@ -1809,6 +1815,7 @@ ste_after_prs:
     ret
 selftest_ext endp
 
+ifdef PROBE_IO
 PKAT_MAX    equ 4
 PKAT_ITERS  equ 2000
 
@@ -1956,6 +1963,7 @@ pk_fail:
     FRAME_EPILOG
     ret
 cmd_pkat endp
+endif ; PROBE_IO
 
 ; =============================================================================
 ; cmd_katreport - EXTERNAL-AUDIT crypto proof mode.  Runs a fixed, deterministic

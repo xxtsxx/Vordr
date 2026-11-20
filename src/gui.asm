@@ -91,6 +91,7 @@ extern vault_pw_due:proc                ; C9: is the master-password reminder du
 extern vault_pw_check:proc              ;   and does this password open this vault?
 extern vault_pwverify_set:proc          ;   stamp it once confirmed
 extern vault_health:proc                ; E6: {weak,reused,old,total} analysis
+externdef g_health_flags:byte           ; per-entry health mask (1=weak, 2=reused, 4=old)
 extern vault_title_at:proc
 extern vault_field_at:proc
 extern vault_entry_health_status:proc   ; E6/R6: per-entry health dot (2=weak, 1=stale, 0=ok)
@@ -125,6 +126,8 @@ extern mem_alloc:proc
 extern mem_free:proc
 extern read_file:proc
 extern path_longify:proc                ; \\?\-prefix a path Win32 would refuse
+extern file_path_allowed:proc           ; canonical UNC / device / remote-drive gate (fileio.asm)
+extern file_validate_handle:proc        ; FILE_TYPE_DISK + non-reparse handle gate (fileio.asm)
 extern cfg_in_set:proc                  ; the ONLY way to set g_cfg_in
 extern write_file:proc
 extern ze_compose:proc                  ; encrypted-ZIP export composer (zipexport.asm)
@@ -152,6 +155,7 @@ externdef g_field_list:qword
 externdef g_field_n:dword
 extern totp_from_b32:proc
 extern totp_secs_left:proc
+extern totp_ms_left:proc
 extern vault_tpm_remember:proc
 extern vault_tpm_enroll_pin:proc
 extern vault_tpm_enroll_hello:proc
@@ -289,7 +293,9 @@ extern SendMessageW:proc
 extern PostMessageW:proc
 extern AlphaBlend:proc                   ; the entry list's drawn scrollbar thumb
 extern CreateRoundRectRgn:proc
-extern SelectClipRgn:proc
+extern SetViewportOrgEx:proc
+extern GetWindowDC:proc
+extern ShowCaret:proc
 extern CreateCompatibleDC:proc
 extern CreateCompatibleBitmap:proc
 extern BeginPaint:proc                   ; the drawn-scrollbar lists paint double-buffered
@@ -298,7 +304,7 @@ extern ReleaseDC:proc
 extern IsIconic:proc
 extern ClientToScreen:proc
 extern UpdateLayeredWindow:proc
-extern SetDCBrushColor:proc
+extern SetLayeredWindowAttributes:proc
 extern IntersectClipRect:proc
 extern ExcludeClipRect:proc
 extern IsCharAlphaNumericW:proc
@@ -311,11 +317,18 @@ extern anim_reset:proc
 extern anim_settings:proc
 extern g_anim_pref:dword
 extern col_mix:proc                      ; theme.asm
+extern theme_glass_tint:proc
+extern g_br_bg:qword
+extern g_br_panel:qword
+extern g_br_side:qword
 extern g_col_hover:dword
 extern g_col_rowhov:dword
 extern g_col_sel:dword
 extern EndPaint:proc
 extern BitBlt:proc
+extern PatBlt:proc
+extern VirtualLock:proc
+extern VirtualUnlock:proc
 extern DeleteDC:proc
 extern SetPixel:proc
 extern SetCapture:proc
@@ -372,7 +385,44 @@ extern theme_drawitem:proc
 extern theme_toggle:proc
 extern theme_toggle_labeled:proc
 extern theme_progressbar:proc
+extern theme_aa_rrect:proc
+extern theme_drop_shadow:proc
+extern theme_aa_arc:proc
+extern col_darken:proc
+extern g_col_spec:dword
+extern g_col_border:dword
+extern schemes:dword
 extern g_font_totp:qword
+extern g_pen_bd:qword
+externdef g_uline_anim_hwnd:qword
+externdef g_uline_seg_ctl:dword
+externdef g_uline_seg_lvl:dword
+externdef g_tog_anim_hwnd:qword
+externdef g_copy_btn_hwnd:qword
+extern CreateDIBSection:proc
+extern GdiFlush:proc
+extern RegOpenKeyExW:proc
+extern RegQueryValueExW:proc
+extern RegCloseKey:proc
+extern gpu_active:proc
+extern gpu_paint_bg:proc
+extern gpu_fill_child_bg:proc
+extern gpu_fill_glass_child:proc
+extern gpu_fill_side_glass_child:proc
+extern gpu_set_vault_seed:proc
+extern DrawIconEx:proc
+extern GetCurrentObject:proc
+externdef g_backdrop_pref:dword
+externdef g_backdrop_lock:dword
+externdef g_gpu_backend:dword
+externdef g_gpu_time_ms:dword
+externdef g_hdr:byte
+VH_SALT         equ 20
+AMBIENT_TIMER   equ 10
+AMBIENT_MS      equ 80
+GLASS_FILL_TAG  equ 66000000h
+DI_NORMAL_      equ 3
+OBJ_FONT_       equ 6
 ; --- system-tray / message-loop imports ---------------------------------------
 extern Shell_NotifyIconW:proc
 extern RegisterClassW:proc
@@ -442,7 +492,11 @@ IDCANCEL            equ 2
 WM_CLOSE            equ 10h
 WM_CANCELMODE_      equ 1Fh
 WM_TIMER            equ 113h
+EM_GETMODIFY_       equ 0B8h
 EM_EMPTYUNDOBUFFER_ equ 0CDh
+EM_GETLIMITTEXT_    equ 0D5h
+PATBLT_BLACK_       equ 00000042h
+LVM_DELETEALLITEMS_ equ 1009h
 QS_ALLINPUT_        equ 04FFh
 GW_ENABLEDPOPUP_    equ 6
 TOKEN_QUERY_        equ 8
@@ -490,7 +544,6 @@ WM_SETREDRAW_       equ 0Bh
 RDW_INVALIDATE_     equ 1
 RDW_UPDATENOW_      equ 100h
 SRCCOPY_            equ 0CC0020h
-DC_BRUSH_           equ 18
 LB_ITEMFROMPOINT_   equ 1A9h
 WM_SETTINGCHANGE_   equ 1Ah
 ULW_ALPHA_          equ 2
@@ -508,9 +561,11 @@ TILE_X              equ 11                ; px: the row's icon tile, right of th
 TILE_CACHE          equ 64                ; pre-rendered icon tiles kept (direct-mapped)
 TILE_KEY            equ 00FF00FFh         ; their transparent colour: no tile or glyph is
                                           ;   magenta (a tile that were bypasses the cache)
+ifdef PROBE_IO
 IDC_TEST_FLAGS      equ 7F00h             ; test builds: WM_COMMAND lParam -> g_test_flags
 TF_NOEXCL           equ 1                 ;   paint the background under the edits again
 TF_NOTILECACHE      equ 2                 ;   draw every tile directly
+endif
 LVM_MSG_FIRST       equ 1000h
 LVM_MSG_LAST        equ 10FFh
 WM_NCCALCSIZE_      equ 083h
@@ -651,11 +706,13 @@ EN_SETFOCUS         equ 100h
 EN_KILLFOCUS        equ 200h
 CLIP_TIMER          equ 1                  ; timer id for clipboard auto-clear
 TOTP_TIMER          equ 2                  ; timer id for live auth-code refresh
-TOTP_MS             equ 1000               ; recompute the code once a second
+TOTP_MS             equ 100                ; smooth 10 Hz countdown ring + bar refresh (#3)
+TOTP_WINDOW_MS      equ 30000              ; 30 s TOTP period in milliseconds
 SEARCH_TIMER        equ 3                  ; timer id for debounced search-as-you-type
 SEARCH_MS           equ 300                ; refilter only after 0.3 s of no keystrokes
 IDLE_TIMER          equ 4                  ; timer id for the auto-lock idle poll
 IDLE_POLL_MS        equ 30000              ; check system idle time every 30 s
+TOAST_TIMER         equ 9                  ; one-shot 1.3s toast hide when g_anim_on == 0 (#2)
 WM_WTSSESSION_CHANGE equ 02B1h             ; session notification (Win+L etc.)
 WM_DROPFILES         equ 0233h             ; Explorer file drop (drag-and-drop attach)
 WTS_SESSION_LOCK    equ 7                  ; wparam: the workstation locked
@@ -751,14 +808,15 @@ IDC_V_MNOPREV    equ 264              ; disable-attachment-preview toggle
 IDC_V_MNOPREVINFO equ 265            ; "Disable attachment preview" info (i)
 IDC_V_MTHEME equ 240                  ; color-scheme cycle button (settings)
 IDC_V_MTHEMEL equ 241                 ; "Color scheme" label
-IDC_V_MANIM  equ 281                  ; animations cycle button (settings)
-IDC_V_MANIML equ 282                  ; "Animations" label
 IDC_V_MPINLENL equ 283                ; "Minimum PIN length:" label
 IDC_V_MPINLEN  equ 284                ; minimum PIN length edit
 IDC_V_MPINTRIVL equ 285               ; "Reject trivial PINs" label
 IDC_V_MPINTRIV equ 286                ; reject-trivial-PINs toggle
 IDC_V_MTPMTRIESL equ 287              ; "TPM PIN max attempts:" label
 IDC_V_MTPMTRIES equ 288               ; TPM PIN max attempts edit
+IDC_V_MBKD    equ 289                 ; backdrop style cycle button (settings)
+IDC_V_MBKDL   equ 290                 ; "Backdrop" label
+IDC_V_TOAST   equ 296                 ; clipboard copy toast + countdown pill (#2)
 IDC_V_COLORPW equ 244                 ; overlay: colored revealed secret (owner-draw)
 IDC_V_MEXPORT equ 245                 ; "Export secrets..." button (.vaultz archive)
 IDC_V_MIMPORT equ 246                 ; "Import..." button (Vordr .vaultz archives)
@@ -796,6 +854,7 @@ IDC_XP_PW2   equ 722
 IDC_XP_WARN  equ 723
 IDC_XP_PWL   equ 724
 IDC_XP_PW2L  equ 725
+IDC_XP_CLSPILLS equ 726               ; export password live class pills (#16)
 DLG_IMPPW    equ 730                  ; import-password prompt (single field)
 DLG_PIN_SET  equ 710                  ; TPM + PIN enrollment modal
 IDC_PS_INFO  equ 711
@@ -844,6 +903,7 @@ IDC_C_PW2    equ 403
 IDC_C_INFO   equ 406                  ; (i) password-requirements callout
 IDC_C_LOGO   equ 407                  ; large Vordr icon (welcome screen)
 IDC_C_WELCOME equ 408                 ; welcome text
+IDC_C_CLSPILLS equ 409                ; create password live class pills (#16)
 DLG_MSG      equ 600                  ; Fluent message box (replaces MessageBoxW)
 IDC_M_TEXT   equ 601
 IDC_M_OK     equ 602
@@ -862,6 +922,7 @@ DT_IMGFLAGS  equ 25h                  ; DT_CENTER|DT_VCENTER|DT_SINGLELINE
 
 OFN_OVERWRITEPROMPT equ 2
 OFN_HIDEREADONLY    equ 4
+OFN_NOCHANGEDIR     equ 8
 OFN_PATHMUSTEXIST   equ 800h
 OFN_FILEMUSTEXIST   equ 1000h
 OFN_EXPLORER        equ 80000h
@@ -1118,7 +1179,11 @@ WSTR s_pwshort,     <Password is too short for the current policy.>
 WSTR s_pwclasses,   <Password needs more character types (lowercase / uppercase / number / symbol).>
 WSTR t_noprevinfo,  <Disable attachment preview>
 WSTR m_noprevinfo,  <Disable preview of attachments so it never opens in another app. Opening would decrypt the file to a temp folder where its plaintext can linger for other software to read, and may be left behind.>
+WSTR s_ro_badpath,  <The vault file passed to --ro could not be opened or is not a valid local Vordr vault.>
+WSTR s_ro_already,  <Vordr is already running. Close the active Vordr session from the system tray before opening a vault in read-only (--ro) mode.>
+ifdef PROBE_IO
 WSTR wtmptest_name, <vordr_tmptest.bin>       ; gui_tmptest scratch (headless probe)
+endif
 WSTR wt_newentry,   <New entry>
 WSTR cue_search,    <Search>
 WSTR sel_cap_imp,   <Vordr - Select entries to import>
@@ -1347,6 +1412,7 @@ wb_star label word
     dw 0E734h, 0                                 ; FavoriteStar (MSAA name for the fav button)
 fav_one label word
     dw '1', 0                                    ; VF_FAV marker value
+ifdef PROBE_IO
 pht_lbl db 'Password'                            ; gui_phtest scratch (headless probe)
 pht_old db 'oldpw'
 align 2
@@ -1357,6 +1423,7 @@ pht_stayu   db 'stays'
 align 2
 pht_loginw  dw 'L','o','g','i','n', 0
 pht_staysw  dw 's','t','a','y','s', 0
+endif
     even                                         ; wb_gen MUST be word-aligned: an odd
 wb_gen label word                                ; caption addr fails CreateWindowExW (998)
     dw 0E72Ch, 0                                 ; Refresh (generate password)
@@ -1369,18 +1436,45 @@ sn_amethyst dw 'A','m','e','t','h','y','s','t',0
 sn_emerald dw 'E','m','e','r','a','l','d',0
 sn_sapphire dw 'S','a','p','p','h','i','r','e',0
 sn_gruvbox dw 'G','r','u','v','b','o','x',0
-an_follow dw 'F','o','l','l','o','w',' ','W','i','n','d','o','w','s',0
-an_always dw 'A','l','w','a','y','s',0
-an_never dw 'N','e','v','e','r',0
+sn_catppuccin dw 'C','a','t','p','p','u','c','c','i','n',0
+sn_tokyonight dw 'T','o','k','y','o',' ','N','i','g','h','t',0
+sn_rosepine dw 'R','o','s','e',' ','P','i','n','e',0
+sn_solarized dw 'S','o','l','a','r','i','z','e','d',0
+sn_oled dw 'O','L','E','D',' ','B','l','a','c','k',0
+sn_followos dw 'F','o','l','l','o','w',' ','W','i','n','d','o','w','s',0
+bk_planes dw 'C','u','t',' ','p','l','a','n','e','s',0
+bk_neon   dw 'L','o','w','-','p','o','l','y',' ','n','e','o','n',0
+bk_mosaic dw 'C','o','r','n','e','r',' ','m','o','s','a','i','c',0
+bk_arcs   dw 'O','p','t','i','c','a','l',' ','a','r','c','s',0
+bk_cryst  dw 'C','r','y','s','t','a','l',' ','r','i','m',0
+bk_sigil  dw 'G','u','a','r','d','i','a','n',' ','s','i','g','i','l',0
+bk_cipher dw 'C','i','p','h','e','r',' ','r','i','n','g','s',0
+bk_flat   dw 'F','l','a','t',0
+WSTR s_toast_copied, <Copied>
+WSTR s_toast_s,      <s>
+WSTR s_empty_srch1,  <No matching secrets>
+WSTR s_empty_srch2,  <Esc to clear - Ctrl+N new>
+WSTR s_empty_flt1,   <No secrets in this filter>
+WSTR s_empty_flt2,   <Click active stat card to show all>
+WSTR s_empty_trsh1,  <Trash is empty>
+WSTR s_empty_trsh2,  <Deleted items purge after 30 days>
+WSTR h_flt_hint,     <Filter active - click stat card again to show all>
+WSTR reg_pers_key,   <Software\Microsoft\Windows\CurrentVersion\Themes\Personalize>
+WSTR reg_light_val,  <AppsUseLightTheme>
+WSTR pref_pair_light,<ui_pair_light>
+WSTR pref_pair_dark, <ui_pair_dark>
+even
+gl_srch_empty dw 0E721h, 0
+gl_trsh_empty dw 0E74Dh, 0
 align 8
-anim_names dq an_follow, an_always, an_never        ; by g_anim_pref
-scheme_names dq sn_light,sn_sepia,sn_nord,sn_midnight,sn_commodore,sn_amethyst,sn_emerald,sn_sapphire,sn_gruvbox
-SCHEME_COUNT equ 9                    ; mirrors theme.asm - SAME NAME on purpose, so
-                                      ;   constcheck gates the pair.  It was
-                                      ;   SCHEME_COUNT, which no check could
-                                      ;   relate to theme.asm's SCHEME_COUNT: the
-                                      ;   ANCHOR_N / MAX_SEL failure shape, waiting.
-GUI_SCHEME_GRUVBOX equ 8               ; default scheme (index into schemes[])
+bkd_names  dq bk_planes, bk_neon, bk_mosaic, bk_arcs, bk_cryst, bk_sigil, bk_cipher, bk_flat
+scheme_names dq sn_light,sn_sepia,sn_nord,sn_midnight,sn_commodore,sn_amethyst,sn_emerald,sn_sapphire,sn_gruvbox,sn_catppuccin,sn_tokyonight,sn_rosepine,sn_solarized,sn_oled,sn_followos
+SCHEME_COUNT equ 14                   ; mirrors theme.asm - SAME NAME on purpose, so
+                                      ;   constcheck gates the pair.
+SCHEME_FOLLOW_OS equ 14               ; 15th choice: Follow Windows light/dark (#10)
+SCHEME_CHOICES   equ 15               ; 0..13 concrete palettes + 14 Follow Windows
+GUI_SCHEME_GRUVBOX equ 8              ; default scheme (index into schemes[])
+GUI_SCHEME_SOLARIZED equ 12           ; default paired light scheme for Follow Windows
 layout_gaps  dd 7, 3, 14                          ; inter-card gap (DLU) per layout
 lay_band     dd 14, 0, 18                         ; label band: card(top) vs 0=flat(left)
 lay_itemh    dd 42, 30, 58                         ; list-item pixel height (index 0 used)
@@ -1389,6 +1483,7 @@ pref_loglevel dw 'L','o','g','L','e','v','e','l',0   ; C5: HKCU audit-log verbos
 pref_reqhello dw 'T','p','m','R','e','q','u','i','r','e','H','e','l','l','o',0  ; C4
 pref_layout dw 'u','i','_','l','a','y','o','u','t',0
 pref_anim dw 'u','i','_','a','n','i','m',0          ; 0 follow Windows, 1 always, 2 never
+pref_backdrop dw 'u','i','_','b','a','c','k','d','r','o','p',0  ; 0 cut planes (21.4), 1 flat
 pref_hotkey dw 'u','i','_','h','o','t','k','e','y',0   ; (mods << 16) | vk; 0 = built-in default
 WSTR hk_plus, < + >
 WSTR hk_shift, <Shift>
@@ -1399,6 +1494,9 @@ WSTR hk_none, <(none)>
 WSTR hk_press, <Press keys...>
 WSTR hk_taken, <That combination is already in use by another program.  Vordr kept its previous hotkey.>
 WSTR hk_ttl, <Summon hotkey>
+WSTR w_vordr_caps, <VORDR>
+WSTR w_brand_font, <Segoe UI>
+w_brand_sep dw ' ', 0B7h, ' ', ' ', 0
 align 8
 align 4
 ; class accent colors (index 0 upper / 2 digit / 3 symbol; lowercase uses g_col_text)
@@ -1555,6 +1653,7 @@ g_anchor_def label dword
     dd IDC_V_REMOVE,   ANCH_BOTTOM
     dd IDC_V_HEADER,   ANCH_STRETCHW
     dd IDC_V_TITLE,    ANCH_STRETCHW
+    dd IDC_V_TOAST,    ANCH_RIGHT or ANCH_BOTTOM
 ; the entry list (sidebar_layout) and the command controls (gui_cmd_dock_layout)
 ; are NOT delta-anchored - they are laid out from the live client rect.
 ;
@@ -1616,6 +1715,7 @@ preview_exts label word
 dos_devs label word
     dw 'c','o','n',0,  'p','r','n',0,  'a','u','x',0,  'n','u','l',0
     dw 'c','l','o','c','k','$',0
+    dw 'c','o','n','i','n','$',0,  'c','o','n','o','u','t','$',0
     dw 'c','o','m','1',0,  'c','o','m','2',0,  'c','o','m','3',0
     dw 'c','o','m','4',0,  'c','o','m','5',0,  'c','o','m','6',0
     dw 'c','o','m','7',0,  'c','o','m','8',0,  'c','o','m','9',0
@@ -1767,8 +1867,8 @@ g_setrows label byte
     dd IDC_V_MTHEME,  SK_BTN            ; gated by policy; gui_save_prefs persists it
     dq 0,                  0,            g_scheme_lock
     dd 0,             0
-    dd IDC_V_MANIM,   SK_BTN            ; ditto
-    dq 0,                  0,            g_anim_lock
+    dd IDC_V_MBKD,    SK_BTN            ; GPU backdrop / flat cycle button
+    dq 0,                  0,            g_backdrop_lock
     dd 0,             0
 g_setrows_end label byte
 
@@ -1832,6 +1932,7 @@ g_imppath      dw MAX_PATH_CHARS dup (?)  ; private import source path (isolated
 public g_openfile_set
 g_openfile_set dd ?                   ; 1 = an import is pending for the open vault
 g_imp_preset   dd ?                   ; 1 = gui_import must use g_imppath as-is
+g_ro_badpath   dd ?                   ; 1 = --ro <path> failed validation (refuse fallback)
 align 8
 g_cds          db 24 dup (?)          ; COPYDATASTRUCT {dwData, cbData, pad, lpData}
 g_exedir    dw MAX_PATH_CHARS dup (?)  ; folder holding vordr.exe
@@ -1949,7 +2050,9 @@ g_lbsb_painting dd ?                  ; inside lbsb_wmpaint's WM_PRINTCLIENT
 g_freeze_depth dd ?                   ; gui_freeze nesting (vp_init zeroes)
 g_freeze_on   dd ?                    ; the outermost freeze really suspended painting
 g_pill_lastv  dd ?                    ; pill content y last repainted (narrow repaints)
+ifdef PROBE_IO
 g_test_flags  dd ?                    ; TF_* (only a test build can set them)
+endif
 g_excl_par    dq ?                    ; erase_excl_cb / uline_cb context
 g_excl_hdc    dq ?
 align 8
@@ -1985,7 +2088,9 @@ public g_vaulthwnd
 g_vaulthwnd dq ?                      ; the open DLG_VAULT window (0 when not shown)
 g_open_dlg_hwnd dq ?                  ; open pre-vault dialog on Default desktop (0 when none)
 g_last_peer_pid dd ?                  ; verified peer vordr.exe PID (from gui_hwnd_is_self)
+ifdef PROBE_IO
 g_lp_active dd ?                      ; 1 while gui_layout_probe runs offscreen checks
+endif
 align 2
 public g_search_w
 g_search_w  dw 512 dup (?)            ; current search query (wide, upper-cased)
@@ -2007,6 +2112,8 @@ g_xlpwlen   dd ?                   ; export password length in bytes
 public g_pwbuf, g_pw2buf, g_secret_w, g_e_totp, g_totp_b32
 public g_conv_w, g_valblob, g_lblblob, g_tilefiles, g_tileblob, g_imgstageref
 public g_readpw, g_phon_w, g_genout, g_genout_w, g_xlpw, g_xlpw2, g_match_w, g_sub_w
+public g_times_w, g_urlbuf, g_urlbuf2, g_cmpbuf, g_phdate, g_imgfn_w, g_rlabel, g_grouptxt
+public g_tmp_sd, g_comp_bits, g_comp_capw, g_comp_caph, g_comp_wbuf
 ; ^ every buffer that holds a field value, a password or an AttachRef key: secmem.asm
 ;   pins them at startup and wipes them on a crash (sec_regions)
 g_pwbuf     dw 1024 dup (?)        ; password field (wide; wiped after use)
@@ -2031,8 +2138,6 @@ g_phon_w    dw 6144 dup (?)          ; phonetic spelling text (wiped on close)
 g_urlbuf    dw 1024 dup (?)          ; URL read from a URL field for click-to-open
 g_urlbuf2   dw 1040 dup (?)          ; URL with an https:// scheme prepended if bare
 g_menuinfo  db 40 dup (?)            ; MENUINFO scratch for themed popup menus
-align 8
-g_url_origproc dq ?                  ; original EDIT wndproc (URL fields subclassed for hand cursor)
 ; --- modular field-row model (runtime detail form) ---
 g_fields      db MAXROWS*DESCSZ dup (?)   ; row descriptors
 g_field_count dd ?                        ; live row count
@@ -2079,6 +2184,7 @@ g_subfont     dq ?                         ; list entry subtitle (regular, dim)
 g_titlefont   dq ?                         ; detail-header title (large semibold)
 g_chevfont    dq ?                         ; small Fluent icons for flat reorder chevrons
 g_monofont    dq ?                         ; monospace font for the colored password readout
+g_rowmonofont dq ?                         ; -14 Consolas for inline secret & pwgen readout (#20)
 g_phonfont    dq ?                         ; small monospace font for the phonetic columns
 g_symfont     dq ?                         ; Segoe UI Symbol - the recycle glyph in recover mode
 g_sub_w       dw 512 dup (?)               ; subtitle scratch (wide)
@@ -2187,6 +2293,54 @@ g_sweep_dir  dw TEMP_PATHW dup (?)     ; %TEMP%\VordrPreview-* scratch
 g_sweep_sub  dw TEMP_PATHW dup (?)     ; %TEMP%\VordrPreview-<hex>\* scratch
 align 8
 g_ofn       OPENFILENAMEW <>
+public g_scheme_pref, g_pair_light, g_pair_dark, g_health_filter, g_home_rects
+g_scheme_pref     dd ?                 ; 0..13 concrete scheme or 14 = Follow Windows (#10)
+g_pair_light      dd ?                 ; paired light palette (0, 1, or 12)
+g_pair_dark       dd ?                 ; paired dark palette (2..11 or 13)
+g_totp_ms         dd ?                 ; 1..30000 ms remaining in TOTP window (#3)
+g_totp_prev0      dd ?                 ; first wchar of previous TOTP code (#3 rollover)
+g_xfade_mode      dd ?                 ; 0=detail pane, 1=below TBAR_H, 2=full client
+g_xfade_base_x    dd ?                 ; screen x of layered transition snapshot
+g_xfade_base_y    dd ?                 ; screen y of layered transition snapshot
+g_xfade_dx        dd ?                 ; horizontal settle offset (px)
+g_xfade_dy        dd ?                 ; vertical settle offset (px)
+align 8
+g_dim_hwnd        dq ?                 ; modal backdrop scrim owned by g_trayhwnd (#5)
+g_last_pw_clsmask dd ?                 ; 4-bit U|L|D|S mask from gui_pw_metrics_wide (#16)
+g_health_filter   dd ?                 ; Home filter: 0=all, 1=weak, 2=reused, 3=ageing (#17)
+g_home_tile_idx   dd ?                 ; current tile index 0..3 during gui_draw_home
+g_home_rects      dd 16 dup (?)        ; 4 RECTs {Secrets, Weak, Reused, Ageing} (#17)
+g_copy_end_tick   dd ?                 ; GetTickCount deadline for clipboard toast (#2)
+g_copy_dur_ms     dd ?                 ; total clipboard duration in ms (#2)
+align 2
+g_toast_w         dw 32 dup (?)        ; "Copied . 18s" formatted toast label (#2)
+align 8
+g_tile_dib_dc     dq ?                 ; persistent ARGB32 scratch DC for AA monogram tiles (#18)
+g_tile_dib_bmp    dq ?
+g_tile_dib_old    dq ?
+g_tile_dib_bits   dq ?
+g_tile_dib_sz     dd ?
+g_gpu_t0          dd ?
+align 8
+g_brand_icon      dq ?
+g_brand_font      dq ?
+g_dib_orighdc     dq ?
+g_dib_memdc       dq ?
+g_dib_membmp      dq ?
+g_dib_oldbmp      dq ?
+g_dib_oldfnt      dq ?
+public g_comp_hdc
+g_comp_hdc        dq ?
+g_comp_bmp        dq ?
+g_comp_old        dq ?
+g_comp_bits       dq ?
+g_comp_capw       dd ?
+g_comp_caph       dd ?
+public g_in_comp
+g_in_comp         dd ?
+align 2
+g_comp_wbuf       dw 260 dup (?)
+align 4
 
 .code
 
@@ -2260,34 +2414,75 @@ gui_status endp
 ;   multi-hundred-ms 16K glyph shaping and HeapReAlloc relocation of short secrets),
 ;   flush undo, reset to empty, flush undo, and wipe g_scrub_w (VDR2-04).
 gui_hwnd_scrub proc frame
-    FRAME_PROLOG 64
+    FRAME_PROLOG 80
     test    rcx, rcx
     jz      ghsc_done
     mov     qword ptr [rbp-24], rcx
     WINCALL SendMessageW, qword ptr [rbp-24], EM_EMPTYUNDOBUFFER_, 0, 0
     WINCALL SendMessageW, qword ptr [rbp-24], WM_GETTEXTLENGTH_, 0, 0
-    cmp     eax, 0
-    jle     ghsc_done
+    test    eax, eax
+    jg      ghsc_havelen
+    ; Empty text: check whether user modified+backspaced or control is ES_PASSWORD (20h)
+    WINCALL SendMessageW, qword ptr [rbp-24], EM_GETMODIFY_, 0, 0
+    test    eax, eax
+    jnz     ghsc_zero_mod
+    WINCALL GetWindowLongPtrW, qword ptr [rbp-24], GWL_STYLE_
+    test    eax, 20h
+    jz      ghsc_done
+ghsc_zero_mod:
+    xor     eax, eax
+ghsc_havelen:
     cmp     eax, CONVW_MAX - 1
     jbe     @F
     mov     eax, CONVW_MAX - 1
-@@: mov     dword ptr [rbp-28], eax
+@@: mov     dword ptr [rbp-28], eax             ; live length
+    ; Compute capacity scrub target: full EM_LIMITTEXT for password/short boxes (<=1024),
+    ; or max(len, 64) for large fields so backspaced tails are wiped without 16K shaping.
+    WINCALL SendMessageW, qword ptr [rbp-24], EM_GETLIMITTEXT_, 0, 0
+    mov     edx, 64
+    test    eax, eax
+    jle     ghsc_cap_picked
+    cmp     eax, 1024
+    ja      ghsc_cap_picked
+    mov     edx, eax
+ghsc_cap_picked:
+    mov     eax, dword ptr [rbp-28]
+    cmp     edx, eax
+    jae     @F
+    mov     edx, eax
+@@: cmp     edx, CONVW_MAX - 1
+    jbe     @F
+    mov     edx, CONVW_MAX - 1
+@@: mov     dword ptr [rbp-32], edx             ; capacity target
     lea     r10, [g_scrub_w]
     xor     ecx, ecx
 ghsc_fill:
     mov     word ptr [r10+rcx*2], 'X'
     inc     ecx
-    cmp     ecx, eax
+    cmp     ecx, edx
     jb      ghsc_fill
     mov     word ptr [r10+rcx*2], 0
     inc     dword ptr [g_in_scrub]
+    ; Step 1: exact-length overwrite first so any subsequent growth never leaves old bytes
+    mov     ecx, dword ptr [rbp-28]
+    test    ecx, ecx
+    jle     ghsc_step2
+    cmp     ecx, dword ptr [rbp-32]
+    je      ghsc_step2
+    lea     r10, [g_scrub_w]
+    mov     word ptr [r10+rcx*2], 0
+    WINCALL SendMessageW, qword ptr [rbp-24], WM_SETTEXT_, 0, addr g_scrub_w
+    mov     ecx, dword ptr [rbp-28]
+    lea     r10, [g_scrub_w]
+    mov     word ptr [r10+rcx*2], 'X'
+ghsc_step2:
     WINCALL SendMessageW, qword ptr [rbp-24], WM_SETTEXT_, 0, addr g_scrub_w
     WINCALL SendMessageW, qword ptr [rbp-24], EM_EMPTYUNDOBUFFER_, 0, 0
     WINCALL SendMessageW, qword ptr [rbp-24], WM_SETTEXT_, 0, addr g_empty_w
     WINCALL SendMessageW, qword ptr [rbp-24], EM_EMPTYUNDOBUFFER_, 0, 0
     dec     dword ptr [g_in_scrub]
     lea     rcx, [g_scrub_w]
-    mov     edx, dword ptr [rbp-28]
+    mov     edx, dword ptr [rbp-32]
     inc     edx
     shl     edx, 1
     call    secure_zero
@@ -2349,8 +2544,10 @@ gui_window_init_top proc frame
     je      gwit_post
     WINCALL SetFocus, qword ptr [rbp-32]
 gwit_post:
+ifdef PROBE_IO
     cmp     dword ptr [g_lp_active], 0
     jne     gwit_ret
+endif
     WINCALL PostMessageW, qword ptr [rbp-24], WM_VORDR_RAISE, qword ptr [rbp-32], 0
 gwit_ret:
     xor     eax, eax
@@ -2364,8 +2561,10 @@ gui_window_raise proc frame
     FRAME_PROLOG 96
     mov     qword ptr [rbp-24], rcx              ; hdlg
     mov     qword ptr [rbp-32], rdx              ; hfocus
+ifdef PROBE_IO
     cmp     dword ptr [g_lp_active], 0
     jne     gwr_lp
+endif
     WINCALL GetLastActivePopup, qword ptr [rbp-24]
     test    rax, rax
     jz      gwr_self
@@ -2582,90 +2781,40 @@ gui_unlock endp
 ;   text rather than printing them - so a failure that only the user can reproduce
 ;   had no way to carry its Win32 error back to us.  That is what turned one I/O
 ;   error into two rounds of guesswork.
-; gui_vault_file_ok(rcx = wide path) -> eax = 1 if that file starts with VAULT_MAGIC.
-;   The extension decides nothing: a shell association can hand us any path, and a
-;   ".vordr" that is not a vault must never reach the importer.  Opened read-only
-;   with full sharing, four bytes read, closed - it is a gate, not a load.
-; gui_path_is_local(rcx = wide path) -> eax = 1 if local path (or AllowUncVault=1),
-;   0 if UNC / device namespace path (\\server\share, //server/share, \\?\UNC\..., \\.\...).
-public gui_path_is_local
-gui_path_is_local proc frame
-    FRAME_PROLOG 48
-    test    rcx, rcx
-    jz      gpil_no
-    movzx   eax, word ptr [rcx]
-    test    eax, eax
-    jz      gpil_no
-    cmp     eax, '\'
-    je      gpil_s1
-    cmp     eax, '/'
-    jne     gpil_yes
-gpil_s1:
-    movzx   eax, word ptr [rcx+2]
-    cmp     eax, '\'
-    je      gpil_s2
-    cmp     eax, '/'
-    jne     gpil_yes
-gpil_s2:
-    ; Starts with two slashes.  Permit \\?\<Drive>:\... (extended-length local drive).
-    cmp     word ptr [rcx+4], '?'
-    jne     gpil_unc
-    movzx   eax, word ptr [rcx+6]
-    cmp     eax, '\'
-    je      gpil_qsep
-    cmp     eax, '/'
-    jne     gpil_unc
-gpil_qsep:
-    movzx   eax, word ptr [rcx+8]
-    or      eax, 20h
-    sub     eax, 'a'
-    cmp     eax, 25
-    ja      gpil_unc
-    cmp     word ptr [rcx+10], ':'
-    jne     gpil_unc
-    movzx   eax, word ptr [rcx+12]
-    cmp     eax, '\'
-    je      gpil_yes
-    cmp     eax, '/'
-    je      gpil_yes
-gpil_unc:
-    WINCALL cfg_get_dword_hklm, addr wv_allowunc, 0
-    test    eax, eax
-    jz      gpil_no
-gpil_yes:
-    mov     eax, 1
-    FRAME_EPILOG
-    ret
-gpil_no:
-    xor     eax, eax
-    FRAME_EPILOG
-    ret
-gui_path_is_local endp
-
+; gui_vault_file_ok(rcx = wide path) -> eax = 1 if that file is an allowed local
+;   disk file (no UNC/SMB/WebDAV/device/reparse) starting with VAULT_MAGIC.
 gui_vault_file_ok proc frame
     FRAME_PROLOG 96
+    test    rcx, rcx
+    jz      gvfo_no
+    cmp     word ptr [rcx], 0
+    je      gvfo_no
     mov     qword ptr [rbp-24], rcx
     mov     dword ptr [rbp-32], 0                ; magic lands here
     mov     qword ptr [rbp-40], 0                ; bytes read
-    call    gui_path_is_local                    ; VDR-07: block UNC / SMB NTLM coercion
+    ; Check raw path first (catches relative-to-network-drive + canonical UNC),
+    ; then longify and validate the opened handle (FILE_TYPE_DISK + non-reparse).
+    call    file_path_allowed
     test    eax, eax
     jz      gvfo_no
-    ; the shell can hand us a path longer than Win32 accepts unprefixed
     mov     rcx, qword ptr [rbp-24]
     lea     rdx, [g_vfok_io]                    ; its own scratch: validating a file
     mov     r8d, MAX_PATH_CHARS + 16            ;   must not disturb the open vault's
     call    path_longify                        ;   path
     mov     qword ptr [rbp-24], rax
-    WINCALL GetFileAttributesW, qword ptr [rbp-24]
-    cmp     eax, -1
-    je      gvfo_no
-    test    eax, 10h                             ; FILE_ATTRIBUTE_DIRECTORY
-    jnz     gvfo_no
+    mov     rcx, rax
+    call    file_path_allowed
+    test    eax, eax
+    jz      gvfo_no
     WINCALL CreateFileW, qword ptr [rbp-24], GENERIC_READ, FILE_SHARE_RWD, 0, \
-            OPEN_EXISTING, FILE_ATTR_NORMAL, 0
+            OPEN_EXISTING, <FILE_ATTR_NORMAL or 00200000h>, 0
     cmp     rax, -1
     je      gvfo_no
     mov     qword ptr [rbp-48], rax
+    mov     rcx, rax
+    call    file_validate_handle
+    test    eax, eax
+    jz      gvfo_close_no
     WINCALL ReadFile, qword ptr [rbp-48], addr rbp-32, 4, addr rbp-40, 0
     mov     dword ptr [rbp-56], eax
     WINCALL CloseHandle, qword ptr [rbp-48]
@@ -2678,6 +2827,8 @@ gui_vault_file_ok proc frame
     mov     eax, 1
     FRAME_EPILOG
     ret
+gvfo_close_no:
+    WINCALL CloseHandle, qword ptr [rbp-48]
 gvfo_no:
     xor     eax, eax
     FRAME_EPILOG
@@ -2731,6 +2882,7 @@ public gui_shell_arg
 gui_shell_arg proc frame
     FRAME_PROLOG 48
     mov     word ptr [g_ro_vpath], 0
+    mov     dword ptr [g_ro_badpath], 0
     cmp     dword ptr [g_readonly], 0
     jne     gsa2_ro
     cmp     dword ptr [g_argc], 2
@@ -2748,11 +2900,11 @@ gsa2_ro:
     lea     r10, [g_argv]
     mov     rcx, qword ptr [r10+16]               ; argv[2] after --ro
     test    rcx, rcx
-    jz      gsa2_no
+    jz      gsa2_ro_bad
     mov     qword ptr [rbp-24], rcx
     call    gui_vault_file_ok
     test    eax, eax
-    jz      gsa2_no
+    jz      gsa2_ro_bad
     lea     r10, [g_ro_vpath]
     mov     r11, qword ptr [rbp-24]
     xor     r8d, r8d
@@ -2765,6 +2917,8 @@ gsa2_rocpy:
     cmp     r8d, MAX_PATH_CHARS-2
     jb      gsa2_rocpy
     mov     word ptr [r10], 0
+gsa2_ro_bad:
+    mov     dword ptr [g_ro_badpath], 1
     jmp     gsa2_no
 gsa2_rook:
     mov     eax, 1
@@ -2823,6 +2977,7 @@ gui_hwnd_is_self endp
 ; gui_build_user_dacl(ecx = user_mask, edx = ace_flags, r8d = add_medium_sacl)
 ;   -> eax = 1 ok (g_tmp_sd populated with protected DACL for TokenUser + SYSTEM,
 ;   plus optional Medium-IL NO_WRITE_UP SACL), 0 on failure.
+public gui_build_user_dacl
 gui_build_user_dacl proc frame
     FRAME_PROLOG 112
     mov     dword ptr [rbp-24], ecx
@@ -3206,7 +3361,7 @@ home_num endp
 ;   in the accent colour only when g_home_alert is set, so the plain totals never
 ;   shout and a genuine finding stands out.
 home_tile proc frame
-    FRAME_PROLOG 192                     ; RoundRect spills 7 args, DrawTextW 5
+    FRAME_PROLOG 288                     ; theme_aa_rrect / theme_drop_shadow spill <= 80B; locals <= rbp-164
     mov     qword ptr [rbp-24], rcx
     mov     qword ptr [rbp-32], rdx
     mov     dword ptr [rbp-40], r8d
@@ -3220,19 +3375,49 @@ home_tile proc frame
     mov     dword ptr [rbp-96], eax
     mov     eax, dword ptr [r10+12]
     mov     dword ptr [rbp-100], eax
-    WINCALL CreateSolidBrush, dword ptr [g_col_panel]
-    mov     qword ptr [rbp-56], rax
-    WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-56]
-    mov     qword ptr [rbp-64], rax
-    WINCALL GetStockObject, 8            ; NULL_PEN
-    mov     qword ptr [rbp-72], rax
-    WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-72]
-    mov     qword ptr [rbp-80], rax
-    WINCALL RoundRect, qword ptr [rbp-24], dword ptr [rbp-88], dword ptr [rbp-92], \
-            dword ptr [rbp-96], dword ptr [rbp-100], HOME_R, HOME_R
-    WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-64]
-    WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-80]
-    WINCALL DeleteObject, qword ptr [rbp-56]
+    ; Record tile hit-test rect in g_home_rects[g_home_tile_idx] (#17)
+    mov     ecx, dword ptr [g_home_tile_idx]
+    and     ecx, 3
+    shl     ecx, 4
+    lea     r11, [g_home_rects]
+    add     r11, rcx
+    mov     eax, dword ptr [rbp-88]
+    mov     dword ptr [r11+0], eax
+    mov     eax, dword ptr [rbp-92]
+    mov     dword ptr [r11+4], eax
+    mov     eax, dword ptr [rbp-96]
+    mov     dword ptr [r11+8], eax
+    mov     eax, dword ptr [rbp-100]
+    mov     dword ptr [r11+12], eax
+    ; Soft translucent drop-shadow (#13)
+    WINCALL theme_drop_shadow, qword ptr [rbp-24], dword ptr [rbp-88], dword ptr [rbp-92], \
+            dword ptr [rbp-96], dword ptr [rbp-100], HOME_R
+    ; Active filter highlight when g_health_filter matches this tile (1..3) (#17)
+    mov     eax, dword ptr [g_col_panel]
+    mov     dword ptr [rbp-144], eax            ; topCol
+    mov     dword ptr [rbp-148], eax            ; botCol
+    mov     eax, dword ptr [g_col_border]
+    mov     dword ptr [rbp-152], eax            ; borderCol
+    mov     eax, dword ptr [g_health_filter]
+    test    eax, eax
+    jz      ht_draw_card
+    cmp     eax, dword ptr [g_home_tile_idx]
+    jne     ht_draw_card
+    mov     eax, dword ptr [g_col_accent]
+    mov     dword ptr [rbp-152], eax            ; active accent border
+    mov     ecx, dword ptr [g_col_panel]
+    mov     edx, eax
+    mov     r8d, 36
+    call    col_mix
+    mov     dword ptr [rbp-144], eax            ; subtle top accent tint
+ht_draw_card:
+    mov     eax, dword ptr [rbp-144]
+    or      eax, GLASS_FILL_TAG
+    mov     dword ptr [rbp-144], eax            ; 40% semi-transparent glass stat card
+    WINCALL theme_aa_rrect, qword ptr [rbp-24], dword ptr [rbp-88], dword ptr [rbp-92], \
+            dword ptr [rbp-96], dword ptr [rbp-100], <HOME_R / 2>, \
+            dword ptr [rbp-144], dword ptr [rbp-148], dword ptr [rbp-152], dword ptr [g_col_spec]
+ht_text:
     WINCALL SetBkMode, qword ptr [rbp-24], 1          ; TRANSPARENT
     mov     eax, dword ptr [g_col_text]
     cmp     dword ptr [g_home_alert], 0
@@ -3279,7 +3464,7 @@ home_tile endp
 ;   is genuinely idle.
 public gui_draw_home
 gui_draw_home proc frame
-    FRAME_PROLOG 288
+    FRAME_PROLOG 352
     mov     qword ptr [rbp-24], rcx
     mov     qword ptr [rbp-32], rdx
     cmp     dword ptr [g_cur_idx], 0             ; an entry is showing -> cards own the pane
@@ -3320,12 +3505,87 @@ gdh_have:
     mov     eax, dword ptr [rbp-108]
     mov     dword ptr [rbp-156], eax
     mov     eax, dword ptr [rbp-112]
+    sub     eax, 40
     mov     dword ptr [rbp-152], eax
     mov     eax, dword ptr [rbp-156]
     add     eax, 32
     mov     dword ptr [rbp-148], eax
     WINCALL DrawTextW, qword ptr [rbp-24], addr h_title, -1, addr rbp-160, DT_NAMEFLAGS
     WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-120]
+    ; ---- 4x AA Vault Health Donut Ring on header right (#17) ----------------
+    mov     eax, dword ptr [rbp-112]
+    sub     eax, 34
+    mov     dword ptr [rbp-244], eax             ; ringL = paneR - 34
+    WINCALL theme_aa_arc, qword ptr [rbp-24], dword ptr [rbp-244], dword ptr [rbp-108], \
+            32, 5, 0, 1024, dword ptr [g_col_frame]
+    cmp     dword ptr [g_home_stats+12], 0
+    jle     gdh_donut_done
+    mov     dword ptr [rbp-248], 1024            ; sweepMax
+    mov     ecx, ANIM_DONUT
+    call    anim_active
+    test    eax, eax
+    jz      @F
+    mov     ecx, ANIM_DONUT
+    call    anim_get
+    mov     dword ptr [rbp-248], eax
+@@: mov     r8d, dword ptr [g_home_stats+12]     ; total
+    mov     ecx, dword ptr [g_home_stats+0]      ; weak
+    add     ecx, dword ptr [g_home_stats+4]      ; + reused
+    add     ecx, dword ptr [g_home_stats+8]      ; + old
+    cmp     ecx, r8d
+    jbe     @F
+    mov     ecx, r8d
+@@: mov     eax, r8d
+    sub     eax, ecx                             ; healthyCnt
+    mov     dword ptr [rbp-252], eax
+    imul    eax, dword ptr [rbp-248]
+    xor     edx, edx
+    div     r8d
+    mov     dword ptr [rbp-256], eax             ; a1 (healthy end)
+    test    eax, eax
+    jle     gdh_dn_old
+    WINCALL theme_aa_arc, qword ptr [rbp-24], dword ptr [rbp-244], dword ptr [rbp-108], \
+            32, 5, 0, dword ptr [rbp-256], CLR_BAR_DGREEN
+gdh_dn_old:
+    mov     eax, dword ptr [rbp-252]
+    add     eax, dword ptr [g_home_stats+8]      ; healthy + old
+    mov     r8d, dword ptr [g_home_stats+12]
+    cmp     eax, r8d
+    jbe     @F
+    mov     eax, r8d
+@@: imul    eax, dword ptr [rbp-248]
+    xor     edx, edx
+    div     r8d
+    mov     dword ptr [rbp-260], eax             ; a2
+    cmp     eax, dword ptr [rbp-256]
+    jle     gdh_dn_reu
+    WINCALL theme_aa_arc, qword ptr [rbp-24], dword ptr [rbp-244], dword ptr [rbp-108], \
+            32, 5, dword ptr [rbp-256], dword ptr [rbp-260], 002EB2F6h
+gdh_dn_reu:
+    mov     eax, dword ptr [rbp-252]
+    add     eax, dword ptr [g_home_stats+8]
+    add     eax, dword ptr [g_home_stats+4]      ; healthy + old + reused
+    mov     r8d, dword ptr [g_home_stats+12]
+    cmp     eax, r8d
+    jbe     @F
+    mov     eax, r8d
+@@: imul    eax, dword ptr [rbp-248]
+    xor     edx, edx
+    div     r8d
+    mov     dword ptr [rbp-264], eax             ; a3
+    cmp     eax, dword ptr [rbp-260]
+    jle     gdh_dn_wk
+    WINCALL theme_aa_arc, qword ptr [rbp-24], dword ptr [rbp-244], dword ptr [rbp-108], \
+            32, 5, dword ptr [rbp-260], dword ptr [rbp-264], 003C7DFFh
+gdh_dn_wk:
+    cmp     dword ptr [g_home_stats+0], 0
+    jle     gdh_donut_done
+    mov     eax, dword ptr [rbp-248]
+    cmp     eax, dword ptr [rbp-264]
+    jle     gdh_donut_done
+    WINCALL theme_aa_arc, qword ptr [rbp-24], dword ptr [rbp-244], dword ptr [rbp-108], \
+            32, 5, dword ptr [rbp-264], dword ptr [rbp-248], 003B3BEFh
+gdh_donut_done:
     mov     eax, dword ptr [rbp-112]             ; tileW = (paneW - gap) / 2
     sub     eax, dword ptr [rbp-104]
     sub     eax, HOME_GAP
@@ -3335,6 +3595,7 @@ gdh_have:
     add     eax, 14
     mov     dword ptr [rbp-140], eax
     ; ---- row 1 : total | weak ---------------------------------------------
+    mov     dword ptr [g_home_tile_idx], 0
     mov     dword ptr [g_home_alert], 0
     mov     eax, dword ptr [rbp-104]
     mov     dword ptr [rbp-192], eax
@@ -3351,6 +3612,7 @@ gdh_have:
     mov     r8d, dword ptr [g_home_stats+12]
     lea     r9, [h_secrets]
     call    home_tile
+    mov     dword ptr [g_home_tile_idx], 1
     mov     dword ptr [g_home_alert], 1
     mov     eax, dword ptr [rbp-184]
     add     eax, HOME_GAP
@@ -3363,6 +3625,7 @@ gdh_have:
     lea     r9, [h_weak]
     call    home_tile
     ; ---- row 2 : reused | ageing ------------------------------------------
+    mov     dword ptr [g_home_tile_idx], 2
     mov     eax, dword ptr [rbp-104]
     mov     dword ptr [rbp-192], eax
     add     eax, dword ptr [rbp-144]
@@ -3378,6 +3641,7 @@ gdh_have:
     mov     r8d, dword ptr [g_home_stats+4]
     lea     r9, [h_reused]
     call    home_tile
+    mov     dword ptr [g_home_tile_idx], 3
     mov     eax, dword ptr [rbp-184]
     add     eax, HOME_GAP
     mov     dword ptr [rbp-192], eax
@@ -3438,7 +3702,12 @@ gdh_have:
     mov     qword ptr [rbp-168], rax
     jmp     gdh_vdraw
 gdh_vpick:
-    mov     eax, dword ptr [g_home_stats+0]
+    cmp     dword ptr [g_health_filter], 0
+    je      @F
+    WINCALL SetTextColor, qword ptr [rbp-24], dword ptr [g_col_accent]
+    lea     rax, [h_flt_hint]
+    jmp     gdh_vset
+@@: mov     eax, dword ptr [g_home_stats+0]
     add     eax, dword ptr [g_home_stats+4]
     add     eax, dword ptr [g_home_stats+8]
     test    eax, eax
@@ -3493,6 +3762,118 @@ gdh_ret:
     FRAME_EPILOG
     ret
 gui_draw_home endp
+
+; gui_home_tilehit(rcx = hdlg, rdx = screen POINT lParam) -> eax = 1 if cursor is
+;   inside one of the 4 Home stat cards while the Home dashboard is visible (#17).
+gui_home_tilehit proc frame
+    FRAME_PROLOG 64
+    cmp     dword ptr [g_cur_idx], 0
+    jge     ghth_no
+    cmp     dword ptr [g_menu_open], 0
+    jne     ghth_no
+    cmp     dword ptr [g_trash_view], 0
+    jne     ghth_no
+    cmp     dword ptr [g_home_valid], 0
+    je      ghth_no
+    movsx   eax, dx
+    mov     dword ptr [rbp-32], eax
+    mov     r8, rdx
+    sar     r8, 16
+    movsx   eax, r8w
+    mov     dword ptr [rbp-28], eax
+    WINCALL ScreenToClient, rcx, addr rbp-32
+    mov     ecx, dword ptr [rbp-32]              ; client x
+    mov     edx, dword ptr [rbp-28]              ; client y
+    xor     r8d, r8d                             ; i = 0..3
+    lea     r10, [g_home_rects]
+ghth_lp:
+    cmp     ecx, dword ptr [r10+0]
+    jl      ghth_nx
+    cmp     ecx, dword ptr [r10+8]
+    jge     ghth_nx
+    cmp     edx, dword ptr [r10+4]
+    jl      ghth_nx
+    cmp     edx, dword ptr [r10+12]
+    jl      ghth_yes
+ghth_nx:
+    add     r10, 16
+    inc     r8d
+    cmp     r8d, 4
+    jb      ghth_lp
+ghth_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+ghth_yes:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gui_home_tilehit endp
+
+; gui_home_lbdown(rcx = hdlg, rdx = client POINT lParam) -> eax = 1 if handled (#17).
+;   Clicking Secrets/Weak/Reused/Ageing filters IDC_V_LIST (clicking again clears).
+gui_home_lbdown proc frame
+    FRAME_PROLOG 96
+    cmp     dword ptr [g_cur_idx], 0
+    jge     ghlb_no
+    cmp     dword ptr [g_menu_open], 0
+    jne     ghlb_no
+    cmp     dword ptr [g_trash_view], 0
+    jne     ghlb_no
+    cmp     dword ptr [g_home_valid], 0
+    je      ghlb_no
+    mov     qword ptr [rbp-24], rcx
+    movsx   ecx, dx                              ; client x
+    mov     r8, rdx
+    sar     r8, 16
+    movsx   edx, r8w                             ; client y
+    xor     eax, eax
+    lea     r10, [g_home_rects]
+ghlb_lp:
+    cmp     ecx, dword ptr [r10+0]
+    jl      ghlb_nx
+    cmp     ecx, dword ptr [r10+8]
+    jge     ghlb_nx
+    cmp     edx, dword ptr [r10+4]
+    jl      ghlb_nx
+    cmp     edx, dword ptr [r10+12]
+    jl      ghlb_hit
+ghlb_nx:
+    add     r10, 16
+    inc     eax
+    cmp     eax, 4
+    jb      ghlb_lp
+ghlb_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+ghlb_hit:
+    ; eax = 0 (Secrets -> clear), 1 (Weak), 2 (Reused), 3 (Ageing)
+    test    eax, eax
+    jz      ghlb_set
+    cmp     eax, dword ptr [g_health_filter]
+    jne     ghlb_set
+    xor     eax, eax                             ; toggle off when clicking active card
+ghlb_set:
+    mov     dword ptr [g_health_filter], eax
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_poplist
+    ; Repaint detail pane so active border & hint update without touching child controls
+    WINCALL GetClientRect, qword ptr [rbp-24], addr rbp-48
+    mov     dword ptr [rbp-64], 210
+    mov     dword ptr [rbp-60], 0
+    mov     dword ptr [rbp-56], 210
+    mov     dword ptr [rbp-52], 8
+    WINCALL MapDialogRect, qword ptr [rbp-24], addr rbp-64
+    mov     eax, dword ptr [rbp-40]
+    mov     dword ptr [rbp-56], eax
+    mov     eax, dword ptr [rbp-36]
+    mov     dword ptr [rbp-52], eax
+    WINCALL InvalidateRect, qword ptr [rbp-24], addr rbp-64, 1
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gui_home_lbdown endp
 
 gui_num_msg proc frame
     FRAME_PROLOG 96                          ; [rbp-80] = digit scratch (no calls inside)
@@ -3845,7 +4226,7 @@ gui_tpm_err_msg endp
 ;   Evaluates password strength directly from a wide scratch buffer WITHOUT touching
 ;   g_cfg_pass or g_cfg_passlen, and wipes the caller's wide buffer before returning.
 gui_pw_metrics_wide proc frame
-    FRAME_PROLOG 48
+    FRAME_PROLOG 64
     ; [rbp-16]=src [rbp-20]=wlen [rbp-24]=cp [rbp-28]=u8bytes [rbp-32]=mask [rbp-36]=bad
     test    rcx, rcx
     jz      gpmw_zero
@@ -3939,6 +4320,7 @@ gpmw_end:
     cmp     dword ptr [rbp-28], MAX_PASSWORD_BYTES
     ja      gpmw_zero
     mov     ecx, dword ptr [rbp-32]
+    mov     dword ptr [g_last_pw_clsmask], ecx
     xor     edx, edx
     test    ecx, 1
     jz      @F
@@ -3955,6 +4337,7 @@ gpmw_end:
 @@: FRAME_EPILOG
     ret
 gpmw_zero:
+    mov     dword ptr [g_last_pw_clsmask], 0
     xor     eax, eax
     xor     edx, edx
     FRAME_EPILOG
@@ -4011,7 +4394,7 @@ gui_set_winicon endp
 ;   the unlock screen is the one people check before typing a master password.
 public gui_storage_parts
 gui_storage_parts proc frame
-    FRAME_PROLOG 64
+    FRAME_PROLOG 80
     mov     qword ptr [rbp-24], rcx           ; *out glyph
     mov     qword ptr [rbp-32], rdx           ; *out label
     lea     rcx, [g_vpath]                    ; classify: 0 OneDrive / 1 Documents / 2 other
@@ -4151,7 +4534,7 @@ gui_pick_vault proc frame
     mov     qword ptr [r10].OPENFILENAMEW.lpstrFile, rax
     mov     dword ptr [r10].OPENFILENAMEW.nMaxFile, MAX_PATH_CHARS
     mov     dword ptr [r10].OPENFILENAMEW.nFilterIndex, 1
-    mov     dword ptr [r10].OPENFILENAMEW.Flags, OFN_PATHMUSTEXIST or OFN_HIDEREADONLY or OFN_EXPLORER
+    mov     dword ptr [r10].OPENFILENAMEW.Flags, OFN_PATHMUSTEXIST or OFN_HIDEREADONLY or OFN_EXPLORER or OFN_NOCHANGEDIR
     call    gui_vault_initdir                 ; never let comdlg32 fall back to the CWD
     test    rax, rax                          ;   (= the program folder) when the vault's
     jz      @F                                ;   own folder is missing
@@ -4245,9 +4628,6 @@ up_tdraw_def:
     mov     rcx, r9
     call    theme_drawitem
     jmp     up_ret
-up_tunh:
-    xor     eax, eax
-    jmp     up_ret
 up_raise:
     WINCALL GetDlgItem, qword ptr [rbp-8], IDC_U_PW
     mov     rcx, qword ptr [rbp-8]
@@ -4333,15 +4713,10 @@ up_cmd:
     jmp     up_ret
 up_ronly:
     xor     dword ptr [g_readonly], 1
-    sub     rsp, 48
     mov     rcx, qword ptr [rbp-8]
     mov     edx, IDC_U_RONLY
-    call    GetDlgItem
-    mov     rcx, rax
-    xor     edx, edx
-    mov     r8d, 1
-    call    InvalidateRect
-    add     rsp, 48
+    mov     r8d, dword ptr [g_readonly]
+    call    gui_toggle_kick
     WINCALL GetDlgItem, qword ptr [rbp-8], IDC_U_PW
     test    rax, rax
     jz      @F
@@ -4358,7 +4733,10 @@ up_pickvault:
 @@: mov     eax, 1
     jmp     up_ret
 up_refocus:
-    sub     rsp, 32
+    cmp     r10d, EN_SETFOCUS
+    jne     @F
+    call    gui_uline_kick
+@@: sub     rsp, 32
     mov     rcx, qword ptr [rbp-8]
     xor     edx, edx
     mov     r8d, 1
@@ -4438,6 +4816,15 @@ pi_frozen:
     jz      pi_nofold
     WINCALL CharUpperBuffW, addr g_search_w, dword ptr [rbp-56]
 pi_nofold:
+    ; Ensure g_health_flags is fresh when a Home stat filter is active (#17)
+    cmp     dword ptr [g_health_filter], 0
+    je      pi_hready
+    cmp     dword ptr [g_home_valid], 0
+    jne     pi_hready
+    lea     rcx, [g_home_stats]
+    call    vault_health
+    mov     dword ptr [g_home_valid], 1
+pi_hready:
     call    vault_count
     mov     dword ptr [rbp-32], eax              ; count
     ; pre-allocate the listbox's internal item storage so a 5000-entry bulk fill
@@ -4460,6 +4847,25 @@ pi_loop:
     call    gui_entry_is_deleted
     cmp     eax, dword ptr [g_trash_view]
     jne     pi_next
+    ; Home stat-card health filter (1=weak->bit0, 2=reused->bit1, 3=ageing->bit2) (#17)
+    cmp     dword ptr [g_trash_view], 0
+    jne     pi_no_hflt
+    mov     ecx, dword ptr [g_health_filter]
+    test    ecx, ecx
+    jz      pi_no_hflt
+    cmp     dword ptr [rbp-64], IDC_V_LIST
+    jne     pi_no_hflt
+    mov     eax, dword ptr [rbp-40]
+    cmp     eax, SCORE_CAP
+    jae     pi_next
+    dec     ecx                                  ; 0, 1, 2
+    mov     edx, 1
+    shl     edx, cl                              ; 1, 2, 4
+    lea     r10, [g_health_flags]
+    movzx   eax, byte ptr [r10+rax]
+    test    eax, edx
+    jz      pi_next
+pi_no_hflt:
     cmp     dword ptr [rbp-56], 0               ; empty query -> show everything
     je      pi_show
     mov     ecx, dword ptr [rbp-40]
@@ -4587,6 +4993,11 @@ gui_make_listfonts proc frame
     lea     r8, [f_mono]
     call    mk_font
     mov     qword ptr [g_monofont], rax
+    mov     ecx, -14
+    mov     edx, 600
+    lea     r8, [f_mono]
+    call    mk_font
+    mov     qword ptr [g_rowmonofont], rax
     mov     ecx, -12
     mov     edx, 400
     lea     r8, [f_mono]
@@ -5124,24 +5535,25 @@ gui_entry_subtitle endp
 ;   A list repaint used to set a font and run DrawTextW for every row, every frame
 ;   of an animation.
 gui_draw_tile proc frame
-    FRAME_PROLOG 192
+    FRAME_PROLOG 240                             ; AlphaBlend takes 11 args (88B spill); locals <= rbp-128
     mov     qword ptr [rbp-24], rcx
     mov     dword ptr [rbp-28], edx
     mov     dword ptr [rbp-32], r8d
     mov     dword ptr [rbp-36], r9d
+    mov     ecx, r9d
+    test    ecx, ecx
+    jle     gdtc_ret
+    cmp     ecx, 255
+    ja      gdtc_direct
+ifdef PROBE_IO
     test    dword ptr [g_test_flags], TF_NOTILECACHE
     jnz     gdtc_direct
+endif
     mov     eax, dword ptr [g_tilecolor]
     and     eax, 0FFFFFFh
     cmp     eax, TILE_KEY
     je      gdtc_direct
-    mov     ecx, dword ptr [rbp-36]
-    test    ecx, ecx
-    jle     gdtc_direct
-    cmp     ecx, 255
-    ja      gdtc_direct
     ; key = colour | glyph << 24 | size << 40 | valid
-    mov     eax, eax                             ; (zero-extend the colour)
     movzx   ecx, word ptr [g_glyph_w]
     shl     rcx, 24
     or      rax, rcx
@@ -5165,17 +5577,17 @@ gui_draw_tile proc frame
     mov     rcx, qword ptr [rbp-48]
     cmp     qword ptr [r10+rax*8], rcx
     je      gdtc_hit
-    ; a miss: render it into the slot
+    ; a miss: render into a 32-bit premultiplied ARGB DIB section for AlphaBlend (#18)
     cmp     qword ptr [tc_dc], 0
     jne     gdtc_havedc
-    WINCALL CreateCompatibleDC, qword ptr [rbp-24]
+    WINCALL CreateCompatibleDC, 0
     mov     qword ptr [tc_dc], rax
     test    rax, rax
     jz      gdtc_direct
 gdtc_havedc:
     mov     eax, dword ptr [rbp-52]
     lea     r10, [tc_key]
-    mov     qword ptr [r10+rax*8], 0             ; invalid until it is drawn
+    mov     qword ptr [r10+rax*8], 0
     lea     r10, [tc_bmp]
     mov     rcx, qword ptr [r10+rax*8]
     mov     qword ptr [r10+rax*8], 0
@@ -5183,7 +5595,19 @@ gdtc_havedc:
     jz      gdtc_newbmp
     WINCALL DeleteObject, rcx
 gdtc_newbmp:
-    WINCALL CreateCompatibleBitmap, qword ptr [rbp-24], dword ptr [rbp-36], dword ptr [rbp-36]
+    ; BITMAPINFOHEADER at [rbp-128 .. rbp-88] (40 bytes)
+    lea     rcx, [rbp-128]
+    mov     edx, 40
+    call    secure_zero
+    mov     dword ptr [rbp-128], 40              ; biSize
+    mov     eax, dword ptr [rbp-36]
+    mov     dword ptr [rbp-124], eax             ; biWidth = size
+    neg     eax
+    mov     dword ptr [rbp-120], eax             ; biHeight = -size (top-down)
+    mov     word ptr [rbp-116], 1                ; biPlanes = 1
+    mov     word ptr [rbp-114], 32               ; biBitCount = 32
+    mov     qword ptr [rbp-80], 0                ; bits out
+    WINCALL CreateDIBSection, qword ptr [tc_dc], addr rbp-128, 0, addr rbp-80, 0, 0
     test    rax, rax
     jz      gdtc_direct
     mov     qword ptr [rbp-64], rax
@@ -5191,21 +5615,12 @@ gdtc_newbmp:
     lea     r10, [tc_bmp]
     mov     qword ptr [r10+rcx*8], rax
     WINCALL SelectObject, qword ptr [tc_dc], qword ptr [rbp-64]
-    mov     qword ptr [rbp-72], rax              ; the DC's own 1x1 bitmap
-    mov     dword ptr [rbp-96], 0                ; RECT {0, 0, size, size}
-    mov     dword ptr [rbp-92], 0
-    mov     eax, dword ptr [rbp-36]
-    mov     dword ptr [rbp-88], eax
-    mov     dword ptr [rbp-84], eax
-    WINCALL GetStockObject, DC_BRUSH_
-    mov     qword ptr [rbp-80], rax
-    WINCALL SetDCBrushColor, qword ptr [tc_dc], TILE_KEY
-    WINCALL FillRect, qword ptr [tc_dc], addr rbp-96, qword ptr [rbp-80]
+    mov     qword ptr [rbp-72], rax
     mov     rcx, qword ptr [tc_dc]
-    xor     edx, edx
-    xor     r8d, r8d
+    mov     rdx, qword ptr [rbp-80]
+    mov     r8d, dword ptr [rbp-36]
     mov     r9d, dword ptr [rbp-36]
-    call    tile_render
+    call    tile_render_dib
     WINCALL SelectObject, qword ptr [tc_dc], qword ptr [rbp-72]
     mov     eax, dword ptr [rbp-52]
     lea     r10, [tc_key]
@@ -5218,10 +5633,11 @@ gdtc_hit:
     mov     qword ptr [rbp-64], rcx
     WINCALL SelectObject, qword ptr [tc_dc], qword ptr [rbp-64]
     mov     qword ptr [rbp-72], rax
-    WINCALL TransparentBlt, qword ptr [rbp-24], dword ptr [rbp-28], dword ptr [rbp-32], \
+    WINCALL AlphaBlend, qword ptr [rbp-24], dword ptr [rbp-28], dword ptr [rbp-32], \
             dword ptr [rbp-36], dword ptr [rbp-36], qword ptr [tc_dc], 0, 0, \
-            dword ptr [rbp-36], dword ptr [rbp-36], TILE_KEY
+            dword ptr [rbp-36], dword ptr [rbp-36], 01FF0000h
     WINCALL SelectObject, qword ptr [tc_dc], qword ptr [rbp-72]
+gdtc_ret:
     FRAME_EPILOG
     ret
 gdtc_direct:
@@ -5234,10 +5650,10 @@ gdtc_direct:
     ret
 gui_draw_tile endp
 
-; tile_cache_flush - drop every cached tile (at lock: they carry the first letters
-;   of entry titles).
+; tile_cache_flush - scrub and drop every cached tile + direct scratch DIB (at lock:
+;   they carry the first letters of entry titles).
 tile_cache_flush proc frame
-    FRAME_PROLOG 48
+    FRAME_PROLOG 80
     mov     dword ptr [rbp-24], 0
 tcf_lp:
     mov     eax, dword ptr [rbp-24]
@@ -5250,7 +5666,15 @@ tcf_lp:
     mov     qword ptr [r10+rax*8], 0
     test    rcx, rcx
     jz      tcf_next
-    WINCALL DeleteObject, rcx
+    mov     qword ptr [rbp-32], rcx
+    cmp     qword ptr [tc_dc], 0
+    je      tcf_del_bmp
+    WINCALL SelectObject, qword ptr [tc_dc], rcx
+    mov     qword ptr [rbp-40], rax
+    WINCALL PatBlt, qword ptr [tc_dc], 0, 0, 256, 256, PATBLT_BLACK_
+    WINCALL SelectObject, qword ptr [tc_dc], qword ptr [rbp-40]
+tcf_del_bmp:
+    WINCALL DeleteObject, qword ptr [rbp-32]
 tcf_next:
     inc     dword ptr [rbp-24]
     jmp     tcf_lp
@@ -5258,58 +5682,206 @@ tcf_dc:
     mov     rcx, qword ptr [tc_dc]
     mov     qword ptr [tc_dc], 0
     test    rcx, rcx
-    jz      tcf_ret
+    jz      tcf_direct_dib
     WINCALL DeleteDC, rcx
+tcf_direct_dib:
+    cmp     qword ptr [g_tile_dib_bits], 0
+    je      tcf_dib_dc
+    mov     eax, dword ptr [g_tile_dib_sz]
+    imul    eax, eax
+    shl     eax, 2
+    jle     tcf_dib_dc
+    mov     rcx, qword ptr [g_tile_dib_bits]
+    mov     edx, eax
+    call    secure_zero
+tcf_dib_dc:
+    cmp     qword ptr [g_tile_dib_dc], 0
+    je      tcf_ret
+    cmp     qword ptr [g_tile_dib_old], 0
+    je      @F
+    WINCALL SelectObject, qword ptr [g_tile_dib_dc], qword ptr [g_tile_dib_old]
+    mov     qword ptr [g_tile_dib_old], 0
+@@: mov     rcx, qword ptr [g_tile_dib_bmp]
+    mov     qword ptr [g_tile_dib_bmp], 0
+    test    rcx, rcx
+    jz      @F
+    WINCALL DeleteObject, rcx
+@@: mov     rcx, qword ptr [g_tile_dib_dc]
+    mov     qword ptr [g_tile_dib_dc], 0
+    WINCALL DeleteDC, rcx
+    mov     qword ptr [g_tile_dib_bits], 0
+    mov     dword ptr [g_tile_dib_sz], 0
 tcf_ret:
     FRAME_EPILOG
     ret
 tile_cache_flush endp
 
-; tile_render(rcx=hdc, edx=x, r8d=y, r9d=size) - draw one tile (what gui_draw_tile
-;   used to do directly).
-tile_render proc frame
-    FRAME_PROLOG 160
-    mov     qword ptr [rbp-24], rcx
-    mov     dword ptr [rbp-32], edx
-    mov     dword ptr [rbp-40], r8d
-    mov     dword ptr [rbp-48], r9d
-    mov     eax, edx
-    add     eax, r9d
-    mov     dword ptr [rbp-56], eax             ; x2
-    mov     eax, r8d
-    add     eax, r9d
-    mov     dword ptr [rbp-64], eax             ; y2
-    WINCALL GetStockObject, DC_BRUSH_           ; the DC's own brush: nothing is
-    WINCALL SelectObject, qword ptr [rbp-24], rax   ;   created per tile
-    mov     qword ptr [rbp-80], rax             ; old brush
-    WINCALL SetDCBrushColor, qword ptr [rbp-24], dword ptr [g_tilecolor]
-    WINCALL GetStockObject, 8                   ; NULL_PEN
-    WINCALL SelectObject, qword ptr [rbp-24], rax
-    mov     qword ptr [rbp-88], rax             ; old pen
-    WINCALL RoundRect, qword ptr [rbp-24], dword ptr [rbp-32], dword ptr [rbp-40], \
-            dword ptr [rbp-56], dword ptr [rbp-64], 10, 10
-    WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-80]   ; restore brush
-    WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-88]   ; restore pen
-    ; glyph: Fluent icons live at U+E000 and up; below that it is a monogram letter
+; tile_render_dib(rcx=hdcMem, rdx=bitsPtr, r8d=stridePx, r9d=size) - render AA
+;   softened vertical gradient + inner glass rim + white glyph into premultiplied
+;   ARGB32 DIB (#18).
+tile_render_dib proc frame
+    FRAME_PROLOG 224
+    mov     qword ptr [rbp-24], rcx             ; hdcMem
+    mov     qword ptr [rbp-32], rdx             ; bitsPtr
+    mov     dword ptr [rbp-36], r8d             ; stridePx
+    mov     dword ptr [rbp-40], r9d             ; size
+    ; Zero [0..size, 0..size] in bitsPtr so outer corners stay 100% transparent
+    xor     r10d, r10d                          ; iy
+trd_zero_y:
+    cmp     r10d, r9d
+    jae     trd_zero_done
+    mov     eax, r10d
+    imul    eax, r8d
+    lea     r11, [rdx + rax*4]
+    xor     ecx, ecx
+trd_zero_x:
+    cmp     ecx, r9d
+    jae     trd_zero_nx
+    mov     dword ptr [r11 + rcx*4], 0
+    inc     ecx
+    jmp     trd_zero_x
+trd_zero_nx:
+    inc     r10d
+    jmp     trd_zero_y
+trd_zero_done:
+    ; Compute topCol (+18% white), botCol (-12% dark), rimCol (+15% white), specCol (+38% white)
+    mov     ecx, dword ptr [g_tilecolor]
+    mov     edx, 00FFFFFFh
+    mov     r8d, 46
+    call    col_mix
+    mov     dword ptr [rbp-44], eax             ; topCol
+    mov     ecx, dword ptr [g_tilecolor]
+    mov     edx, 224
+    call    col_darken
+    mov     dword ptr [rbp-48], eax             ; botCol
+    mov     ecx, dword ptr [g_tilecolor]
+    mov     edx, 00FFFFFFh
+    mov     r8d, 38
+    call    col_mix
+    mov     dword ptr [rbp-52], eax             ; rimCol
+    mov     ecx, dword ptr [g_tilecolor]
+    mov     edx, 00FFFFFFh
+    mov     r8d, 96
+    call    col_mix
+    mov     dword ptr [rbp-56], eax             ; specCol
+    WINCALL theme_aa_rrect, qword ptr [rbp-24], 0, 0, \
+            dword ptr [rbp-40], dword ptr [rbp-40], 5, \
+            dword ptr [rbp-44], dword ptr [rbp-48], dword ptr [rbp-52], dword ptr [rbp-56]
+    ; Draw white centered glyph
     mov     rax, qword ptr [g_iconfont]
     cmp     word ptr [g_glyph_w], 0E000h
-    jae     gdt_font
+    jae     trd_font
     mov     rax, qword ptr [g_tilefont]
-gdt_font:
+trd_font:
     WINCALL SelectObject, qword ptr [rbp-24], rax
-    mov     qword ptr [rbp-80], rax             ; old font
+    mov     qword ptr [rbp-64], rax             ; old font
     WINCALL SetTextColor, qword ptr [rbp-24], 00FFFFFFh
     WINCALL SetBkMode, qword ptr [rbp-24], 1
-    mov     eax, dword ptr [rbp-32]
-    mov     dword ptr [rbp-104], eax            ; rect L
+    mov     dword ptr [rbp-88], 0
+    mov     dword ptr [rbp-84], 0
     mov     eax, dword ptr [rbp-40]
-    mov     dword ptr [rbp-100], eax            ; rect T
-    mov     eax, dword ptr [rbp-56]
-    mov     dword ptr [rbp-96], eax             ; rect R
-    mov     eax, dword ptr [rbp-64]
-    mov     dword ptr [rbp-92], eax             ; rect B
-    WINCALL DrawTextW, qword ptr [rbp-24], addr g_glyph_w, -1, addr rbp-104, DT_IMGFLAGS
-    WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-80]   ; restore font
+    mov     dword ptr [rbp-80], eax
+    mov     dword ptr [rbp-76], eax
+    WINCALL DrawTextW, qword ptr [rbp-24], addr g_glyph_w, -1, addr rbp-88, DT_IMGFLAGS
+    WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-64]
+    call    GdiFlush
+    ; Restore alpha=255 on interior pixels touched by GDI DrawTextW (which zeros alpha)
+    mov     rdx, qword ptr [rbp-32]
+    mov     r8d, dword ptr [rbp-36]
+    mov     r9d, dword ptr [rbp-40]
+    xor     r10d, r10d
+trd_fix_y:
+    cmp     r10d, r9d
+    jae     trd_done
+    mov     eax, r10d
+    imul    eax, r8d
+    lea     r11, [rdx + rax*4]
+    xor     ecx, ecx
+trd_fix_x:
+    cmp     ecx, r9d
+    jae     trd_fix_nx
+    mov     eax, dword ptr [r11 + rcx*4]
+    test    eax, 0FF000000h
+    jnz     @F
+    test    eax, 00FFFFFFh
+    jz      @F
+    or      eax, 0FF000000h
+    mov     dword ptr [r11 + rcx*4], eax
+@@: inc     ecx
+    jmp     trd_fix_x
+trd_fix_nx:
+    inc     r10d
+    jmp     trd_fix_y
+trd_done:
+    FRAME_EPILOG
+    ret
+tile_render_dib endp
+
+; tile_render(rcx=hdc, edx=x, r8d=y, r9d=size) - uncached path (TF_NOTILECACHE or
+;   oversize): uses persistent g_tile_dib_dc + AlphaBlend so cached and uncached
+;   paths produce 100% bit-identical pixels.
+tile_render proc frame
+    FRAME_PROLOG 240
+    mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [rbp-28], edx
+    mov     dword ptr [rbp-32], r8d
+    mov     dword ptr [rbp-36], r9d
+    cmp     r9d, 0
+    jle     tr_ret
+    cmp     qword ptr [g_tile_dib_dc], 0
+    jne     tr_chk_sz
+    WINCALL CreateCompatibleDC, 0
+    mov     qword ptr [g_tile_dib_dc], rax
+    test    rax, rax
+    jz      tr_ret
+tr_chk_sz:
+    mov     eax, dword ptr [rbp-36]
+    cmp     eax, dword ptr [g_tile_dib_sz]
+    jle     tr_have_dib
+    cmp     eax, 64
+    jae     @F
+    mov     eax, 64
+@@: mov     dword ptr [rbp-40], eax             ; allocSz
+    cmp     qword ptr [g_tile_dib_old], 0
+    je      @F
+    WINCALL SelectObject, qword ptr [g_tile_dib_dc], qword ptr [g_tile_dib_old]
+    mov     qword ptr [g_tile_dib_old], 0
+@@: mov     rcx, qword ptr [g_tile_dib_bmp]
+    mov     qword ptr [g_tile_dib_bmp], 0
+    test    rcx, rcx
+    jz      @F
+    WINCALL DeleteObject, rcx
+@@: lea     rcx, [rbp-120]
+    mov     edx, 40
+    call    secure_zero
+    mov     dword ptr [rbp-120], 40
+    mov     eax, dword ptr [rbp-40]
+    mov     dword ptr [rbp-116], eax
+    neg     eax
+    mov     dword ptr [rbp-112], eax
+    mov     word ptr [rbp-108], 1
+    mov     word ptr [rbp-106], 32
+    mov     qword ptr [rbp-64], 0
+    WINCALL CreateDIBSection, qword ptr [g_tile_dib_dc], addr rbp-120, 0, addr rbp-64, 0, 0
+    test    rax, rax
+    jz      tr_ret
+    mov     qword ptr [g_tile_dib_bmp], rax
+    mov     rcx, qword ptr [rbp-64]
+    mov     qword ptr [g_tile_dib_bits], rcx
+    mov     ecx, dword ptr [rbp-40]
+    mov     dword ptr [g_tile_dib_sz], ecx
+    WINCALL SelectObject, qword ptr [g_tile_dib_dc], rax
+    mov     qword ptr [g_tile_dib_old], rax
+tr_have_dib:
+    mov     rcx, qword ptr [g_tile_dib_dc]
+    mov     rdx, qword ptr [g_tile_dib_bits]
+    mov     r8d, dword ptr [g_tile_dib_sz]
+    mov     r9d, dword ptr [rbp-36]
+    call    tile_render_dib
+    WINCALL AlphaBlend, qword ptr [rbp-24], dword ptr [rbp-28], dword ptr [rbp-32], \
+            dword ptr [rbp-36], dword ptr [rbp-36], qword ptr [g_tile_dib_dc], 0, 0, \
+            dword ptr [rbp-36], dword ptr [rbp-36], 01FF0000h
+tr_ret:
     FRAME_EPILOG
     ret
 tile_render endp
@@ -5374,16 +5946,21 @@ gli_hv_old:
     call    anim_get
     mov     r8d, eax
 gli_hv_mix:
-    mov     ecx, dword ptr [g_col_side]
-    mov     edx, dword ptr [g_col_rowhov]
-    call    col_mix
-    mov     dword ptr [rbp-88], eax
-    WINCALL GetStockObject, DC_BRUSH_
-    mov     qword ptr [rbp-96], rax
-    WINCALL SetDCBrushColor, qword ptr [rbp-32], dword ptr [rbp-88]
-    mov     r10, qword ptr [rbp-24]
-    lea     rdx, [r10+40]
-    WINCALL FillRect, qword ptr [rbp-32], rdx, qword ptr [rbp-96]
+    test    r8d, r8d
+    jz      gli_hv_done
+    imul    r8d, 72
+    shr     r8d, 8
+    jle     gli_hv_done
+    mov     dword ptr [rbp-88], r8d
+    mov     eax, dword ptr [rbp-56]
+    sub     eax, dword ptr [rbp-40]
+    mov     dword ptr [rbp-136], eax
+    mov     eax, dword ptr [rbp-64]
+    sub     eax, dword ptr [rbp-48]
+    mov     dword ptr [rbp-140], eax
+    WINCALL theme_glass_tint, qword ptr [rbp-32], dword ptr [rbp-40], dword ptr [rbp-48], \
+            dword ptr [rbp-136], dword ptr [rbp-140], dword ptr [g_col_rowhov], dword ptr [rbp-88]
+gli_hv_done:
     ; The selection pill (Fluent): a rounded tinted fill and a short accent bar.
     ; At rest it marks the selected row; while it slides (ANIM_PILL, the pill's
     ; content y) each row it crosses draws its part, clipped to the row - together
@@ -5420,11 +5997,6 @@ gli_pill_at:
     mov     dword ptr [rbp-116], eax
     WINCALL IntersectClipRect, qword ptr [rbp-32], dword ptr [rbp-40], dword ptr [rbp-48], \
             dword ptr [rbp-56], dword ptr [rbp-64]
-    WINCALL GetStockObject, 8                   ; NULL_PEN
-    WINCALL SelectObject, qword ptr [rbp-32], rax
-    WINCALL GetStockObject, DC_BRUSH_
-    WINCALL SelectObject, qword ptr [rbp-32], rax
-    WINCALL SetDCBrushColor, qword ptr [rbp-32], dword ptr [g_col_sel]
     mov     eax, dword ptr [rbp-40]
     add     eax, PILL_INSET
     mov     dword ptr [rbp-124], eax            ; left
@@ -5436,9 +6008,12 @@ gli_pill_at:
     sub     eax, 2
     mov     dword ptr [rbp-128], eax            ; bottom
     add     dword ptr [rbp-112], 2              ; top
-    WINCALL RoundRect, qword ptr [rbp-32], dword ptr [rbp-124], dword ptr [rbp-112], \
-            dword ptr [rbp-108], dword ptr [rbp-128], 10, 10
-    WINCALL SetDCBrushColor, qword ptr [rbp-32], dword ptr [g_col_accent]
+    mov     eax, dword ptr [g_col_sel]
+    or      eax, 0B4000000h                     ; ~71% translucent Fluent selection pill
+    mov     dword ptr [rbp-136], eax
+    WINCALL theme_aa_rrect, qword ptr [rbp-32], dword ptr [rbp-124], dword ptr [rbp-112], \
+            dword ptr [rbp-108], dword ptr [rbp-128], 5, \
+            dword ptr [rbp-136], dword ptr [g_col_sel], -1, -1
     mov     eax, dword ptr [rbp-112]            ; the bar: 3 x 16, centred on the left
     add     eax, dword ptr [rbp-128]
     sar     eax, 1
@@ -5450,8 +6025,9 @@ gli_pill_at:
     mov     eax, dword ptr [rbp-124]
     add     eax, 3
     mov     dword ptr [rbp-108], eax
-    WINCALL RoundRect, qword ptr [rbp-32], dword ptr [rbp-124], dword ptr [rbp-112], \
-            dword ptr [rbp-108], dword ptr [rbp-128], 3, 3
+    WINCALL theme_aa_rrect, qword ptr [rbp-32], dword ptr [rbp-124], dword ptr [rbp-112], \
+            dword ptr [rbp-108], dword ptr [rbp-128], 2, \
+            dword ptr [g_col_accent], dword ptr [g_col_accent], -1, -1
     WINCALL RestoreDC, qword ptr [rbp-32], dword ptr [rbp-116]
 gli_nopill:
     ; icon tile (L+TILE_X, T+5, 34)
@@ -5621,13 +6197,21 @@ gui_draw_header proc frame
     mov     dword ptr [rbp-56], eax            ; R
     mov     eax, dword ptr [r10+52]
     mov     dword ptr [rbp-64], eax            ; B
-    ; background fill (dialog base color #202020)
+    ; background fill (GPU 21.4 slice when active, else dialog base color)
+    mov     r10, qword ptr [rbp-24]
+    mov     rcx, qword ptr [rbp-32]
+    mov     rdx, qword ptr [r10+24]
+    lea     r8, [r10+40]
+    call    gpu_fill_child_bg
+    test    eax, eax
+    jnz     gdh_bg_done
     WINCALL CreateSolidBrush, dword ptr [g_col_bg]
     mov     qword ptr [rbp-72], rax
     mov     r10, qword ptr [rbp-24]
     lea     rdx, [r10+40]
     WINCALL FillRect, qword ptr [rbp-32], rdx, qword ptr [rbp-72]
     WINCALL DeleteObject, qword ptr [rbp-72]
+gdh_bg_done:
     ; nothing selected -> leave the header blank
     cmp     dword ptr [g_cur_idx], 0
     jl      gdh_done
@@ -5914,20 +6498,31 @@ gui_draw_sbadge proc frame
     mov     eax, dword ptr [r10+52]
     mov     dword ptr [rbp-64], eax            ; B
     ; clear behind the pill to the row's own background so nothing lingers: the
-    ; panel colour in card layouts (the badge sits inside a tile), else the dialog bg
-    mov     eax, dword ptr [g_col_bg]
+    ; 40% glass card slice in card layouts, else the dialog bg
     mov     r11d, dword ptr [g_layout]
     lea     r10, [lay_band]
     cmp     dword ptr [r10+r11*4], 0
-    je      @F
+    je      gds_bg_flat
+    mov     r10, qword ptr [rbp-24]
+    mov     rcx, qword ptr [rbp-32]
+    mov     rdx, qword ptr [r10+24]
+    lea     r8, [r10+40]
+    call    gpu_fill_glass_child
+    test    eax, eax
+    jnz     gds_bg_done
     mov     eax, dword ptr [g_col_panel]
-@@: mov     dword ptr [rbp-80], eax
+    jmp     gds_bg_solid
+gds_bg_flat:
+    mov     eax, dword ptr [g_col_bg]
+gds_bg_solid:
+    mov     dword ptr [rbp-80], eax
     WINCALL CreateSolidBrush, dword ptr [rbp-80]
     mov     qword ptr [rbp-72], rax
     mov     r10, qword ptr [rbp-24]
     lea     rdx, [r10+40]
     WINCALL FillRect, qword ptr [rbp-32], rdx, qword ptr [rbp-72]
     WINCALL DeleteObject, qword ptr [rbp-72]
+gds_bg_done:
     ; row index from ctl id -> FD_PWLEVEL
     mov     r10, qword ptr [rbp-24]
     mov     eax, dword ptr [r10+4]             ; CtlID
@@ -5956,19 +6551,14 @@ gui_draw_sbadge proc frame
 gds_have:
     mov     qword ptr [rbp-88], r8             ; caption ptr
     mov     dword ptr [rbp-96], ecx            ; color
-    ; pill
-    WINCALL CreateSolidBrush, dword ptr [rbp-96]
-    mov     qword ptr [rbp-104], rax
-    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-104]
-    mov     qword ptr [rbp-112], rax           ; old brush
-    WINCALL GetStockObject, 8                  ; NULL_PEN
-    WINCALL SelectObject, qword ptr [rbp-32], rax
-    mov     qword ptr [rbp-120], rax           ; old pen
-    WINCALL RoundRect, qword ptr [rbp-32], dword ptr [rbp-40], dword ptr [rbp-48], \
-            dword ptr [rbp-56], dword ptr [rbp-64], 8, 8
-    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-112]
-    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-120]
-    WINCALL DeleteObject, qword ptr [rbp-104]
+    ; AA rounded pill (#15)
+    mov     edx, 00FFFFFFh
+    mov     r8d, 28
+    call    col_mix
+    mov     dword ptr [rbp-104], eax           ; topCol
+    WINCALL theme_aa_rrect, qword ptr [rbp-32], dword ptr [rbp-40], dword ptr [rbp-48], \
+            dword ptr [rbp-56], dword ptr [rbp-64], 4, \
+            dword ptr [rbp-104], dword ptr [rbp-96], -1, -1
     ; caption (subfont, white, centered)
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_subfont]
     mov     qword ptr [rbp-112], rax           ; old font
@@ -5993,7 +6583,7 @@ gui_draw_sbadge endp
 ;   chip shows an 'x' delete hotspot (TAG_XW px) on its right.  Chip height =
 ;   clientH / count, matching gui_tag_hit's inverse mapping.
 gui_draw_taglist proc frame
-    FRAME_PROLOG 224
+    FRAME_PROLOG 272
     mov     qword ptr [rbp-24], rcx
     mov     r10, rcx
     mov     rax, qword ptr [r10+32]
@@ -6006,22 +6596,31 @@ gui_draw_taglist proc frame
     mov     dword ptr [rbp-56], eax            ; R
     mov     eax, dword ptr [r10+52]
     mov     dword ptr [rbp-64], eax            ; B
-    ; clear behind the tile to the row's own background: the panel colour in
-    ; card layouts (the tile sits inside a card, like the sbadge/chevron), else
-    ; the dialog bg - previously always dialog bg, which left a dark well in cards
-    mov     eax, dword ptr [g_col_bg]
+    ; clear behind the tile to the row's own background: 40% glass slice in card layouts
     mov     r11d, dword ptr [g_layout]
     lea     r10, [lay_band]
     cmp     dword ptr [r10+r11*4], 0
-    je      @F
+    je      gtl_bg_flat
+    mov     r10, qword ptr [rbp-24]
+    mov     rcx, qword ptr [rbp-32]
+    mov     rdx, qword ptr [r10+24]
+    lea     r8, [r10+40]
+    call    gpu_fill_glass_child
+    test    eax, eax
+    jnz     gtl_bg_done
     mov     eax, dword ptr [g_col_panel]
-@@: mov     dword ptr [rbp-160], eax
+    jmp     gtl_bg_solid
+gtl_bg_flat:
+    mov     eax, dword ptr [g_col_bg]
+gtl_bg_solid:
+    mov     dword ptr [rbp-160], eax
     WINCALL CreateSolidBrush, dword ptr [rbp-160]
     mov     qword ptr [rbp-112], rax
     mov     r10, qword ptr [rbp-24]
     lea     rdx, [r10+40]
     WINCALL FillRect, qword ptr [rbp-32], rdx, qword ptr [rbp-112]
     WINCALL DeleteObject, qword ptr [rbp-112]
+gtl_bg_done:
     mov     eax, dword ptr [g_tilefile_n]
     mov     dword ptr [rbp-72], eax
     test    eax, eax
@@ -6049,19 +6648,10 @@ gtl_loop:
     mov     eax, dword ptr [rbp-56]           ; chip right = R - 2
     sub     eax, 2
     mov     dword ptr [rbp-152], eax
-    ; rounded chip fill (dedicated file-badge colour), NULL pen
-    WINCALL CreateSolidBrush, dword ptr [g_col_filebadge]
-    mov     qword ptr [rbp-128], rax
-    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-128]
-    mov     qword ptr [rbp-136], rax          ; old brush
-    WINCALL GetStockObject, 8                 ; NULL_PEN
-    WINCALL SelectObject, qword ptr [rbp-32], rax
-    mov     qword ptr [rbp-144], rax          ; old pen
-    WINCALL RoundRect, qword ptr [rbp-32], dword ptr [rbp-40], dword ptr [rbp-96], \
-            dword ptr [rbp-152], dword ptr [rbp-104], 8, 8
-    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-136]
-    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-144]
-    WINCALL DeleteObject, qword ptr [rbp-128]
+    ; AA rounded chip fill with top-lit rim (#13, #15)
+    WINCALL theme_aa_rrect, qword ptr [rbp-32], dword ptr [rbp-40], dword ptr [rbp-96], \
+            dword ptr [rbp-152], dword ptr [rbp-104], 4, \
+            dword ptr [g_col_filebadge], dword ptr [g_col_filebadge], dword ptr [g_col_border], dword ptr [g_col_spec]
     ; filename (left, vcenter, ellipsized) padded, leaving room for the x
     WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_text]
     mov     eax, dword ptr [rbp-40]
@@ -6106,40 +6696,15 @@ gui_draw_taglist endp
 ; gui_draw_field_cards(rcx=hdc, rdx=hdlg) - fill a COL_PANEL rounded card behind
 ;   every field row (label+value edits already paint COL_PANEL, so they blend).
 gui_draw_field_cards proc frame
-    FRAME_PROLOG 208                       ; >= 208: at 160 the GetClientRect output
-                                           ;   at [rbp-160] sat in that call's OWN
-                                           ;   home space (rsp+16), so user32 homed
-                                           ;   nonvolatiles over it and restored them
-                                           ;   from the rect.  This also lifts it clear
-                                           ;   of the 7-arg RoundRect spill below, so
-                                           ;   safety no longer rests on the local
-                                           ;   being dead by then.
+    FRAME_PROLOG 256                       ; >= 256 so 10-arg theme_aa_rrect spill (80B) clears [rbp-160]
     mov     qword ptr [rbp-24], rcx            ; hdc
     mov     qword ptr [rbp-32], rdx            ; hdlg
-    cmp     dword ptr [g_menu_open], 0         ; SETTINGS.md predicted this guard could go
-    jne     gfc_ret                            ;   with the overlay.  It cannot: DLG_VAULT
-                                               ;   has no WS_CLIPCHILDREN, so WM_ERASEBKGND
-                                               ;   still paints the region the settings
-                                               ;   child occupies.  Steady state hides it,
-                                               ;   but a drag-resize erases the parent
-                                               ;   before the child repaints and the cards
-                                               ;   flash through - the tearing class we
-                                               ;   already hit on the title strip.  Adding
-                                               ;   WS_CLIPCHILDREN would fix it properly and
-                                               ;   is too broad a change for a cleanup: any
-                                               ;   child relying on the parent's backdrop
-                                               ;   showing through would break.
+    cmp     dword ptr [g_menu_open], 0
+    jne     gfc_ret
     mov     eax, dword ptr [g_layout]          ; flat (Compact) layout draws no cards
     lea     r10, [lay_band]
     cmp     dword ptr [r10+rax*4], 0
     je      gfc_ret
-    WINCALL CreateSolidBrush, dword ptr [g_col_panel]   ; card fill (active scheme)
-    mov     qword ptr [rbp-40], rax
-    WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-40]
-    mov     qword ptr [rbp-48], rax            ; old brush
-    WINCALL GetStockObject, 8                  ; NULL_PEN
-    WINCALL SelectObject, qword ptr [rbp-24], rax
-    mov     qword ptr [rbp-56], rax            ; old pen
     WINCALL GetClientRect, qword ptr [rbp-32], addr rbp-160   ; elastic: widen cards by dW
     mov     eax, dword ptr [rbp-152]           ; client right = width (left is 0)
     sub     eax, dword ptr [g_base_cx]         ; dW = width - base (matches gui_stretch_rows)
@@ -6159,23 +6724,26 @@ gfc_lp:
     cmp     ecx, VF_SPACER                     ; a blank gap is the only row with no card;
     je      gfc_next                           ;   a heading gets one like any other tile
     mov     eax, dword ptr [r10+FD_Y]
-    mov     dword ptr [rbp-104], eax           ; row top in DLU: r10 is volatile and the
-    mov     dword ptr [rbp-84], eax            ;   heading text below is painted after two
-    add     eax, dword ptr [r10+FD_H]          ;   WINCALLs have clobbered it
+    mov     dword ptr [rbp-104], eax           ; row top in DLU
+    mov     dword ptr [rbp-84], eax
+    add     eax, dword ptr [r10+FD_H]
     mov     dword ptr [rbp-76], eax            ; B
     mov     dword ptr [rbp-88], 214            ; L (156 + VDX_DLU)
     mov     dword ptr [rbp-80], 472            ; R (414 + VDX_DLU)
     WINCALL MapDialogRect, qword ptr [rbp-32], addr rbp-88
     mov     eax, dword ptr [rbp-112]           ; stretch the card to the widened pane
     add     dword ptr [rbp-80], eax
-    WINCALL RoundRect, qword ptr [rbp-24], dword ptr [rbp-88], dword ptr [rbp-84], \
-            dword ptr [rbp-80], dword ptr [rbp-76], 10, 10
+    ; 9px cast drop-shadow + 40% glass SDF AA card with 1px top-lit specular border
+    WINCALL theme_drop_shadow, qword ptr [rbp-24], dword ptr [rbp-88], dword ptr [rbp-84], \
+            dword ptr [rbp-80], dword ptr [rbp-76], 7
+    mov     eax, dword ptr [g_col_panel]
+    or      eax, GLASS_FILL_TAG
+    mov     dword ptr [rbp-116], eax            ; 40% glass colTop
+    WINCALL theme_aa_rrect, qword ptr [rbp-24], dword ptr [rbp-88], dword ptr [rbp-84], \
+            dword ptr [rbp-80], dword ptr [rbp-76], 7, \
+            dword ptr [rbp-116], dword ptr [g_col_panel], dword ptr [g_col_border], dword ptr [g_col_spec]
     cmp     dword ptr [rbp-100], VF_GROUP      ; a heading also paints its title on the card
     jne     gfc_next
-    ; Edit mode shows the title EDIT instead, so painting here would double up with it.
-    ; No hairline rule any more either: the card is the separation, and the rule on top
-    ; of the edit read as two lines at different heights with the painted one jutting
-    ; out past the edit's right edge.
     cmp     dword ptr [g_editmode], 0
     jne     gfc_next
     mov     ecx, dword ptr [rbp-64]            ; the heading's title control
@@ -6185,27 +6753,20 @@ gfc_lp:
     WINCALL SetBkMode, qword ptr [rbp-24], 1   ; TRANSPARENT
     WINCALL SetTextColor, qword ptr [rbp-24], dword ptr [g_col_textdim]
     mov     eax, dword ptr [rbp-104]
-    add     eax, 3                             ; the label band: identical to where every
-    mov     dword ptr [rbp-84], eax            ;   other tile puts its label, and to where
-    add     eax, 10                            ;   the title edit sits in edit mode
+    add     eax, 3
+    mov     dword ptr [rbp-84], eax
+    add     eax, 10
     mov     dword ptr [rbp-76], eax            ; B
-    ; L = the card content column, so the title lines up with the label of every tile
-    ; above and below it.  gui_rows_layout passes a bare 176 for those, but move_ctl
-    ; adds VDX_DLU itself; this path maps the rect directly, so the shift has to be
-    ; written out or the heading lands 58 DLU left - i.e. painted under the sidebar.
     mov     dword ptr [rbp-88], 176 + VDX_DLU  ; L
     mov     dword ptr [rbp-80], 460            ; R
     WINCALL MapDialogRect, qword ptr [rbp-32], addr rbp-88
-    mov     eax, dword ptr [rbp-112]           ; stretch heading text room to the widened pane
+    mov     eax, dword ptr [rbp-112]
     add     dword ptr [rbp-80], eax
     WINCALL DrawTextW, qword ptr [rbp-24], addr g_grouptxt, -1, addr rbp-88, DT_NAMEFLAGS
 gfc_next:
     inc     dword ptr [rbp-64]
     jmp     gfc_lp
 gfc_done:
-    WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-48]   ; restore brush
-    WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-56]   ; restore pen
-    WINCALL DeleteObject, qword ptr [rbp-40]
 gfc_ret:
     FRAME_EPILOG
     ret
@@ -6706,14 +7267,23 @@ gui_draw_flatchevron proc frame
     mov     r10, rcx
     mov     rax, qword ptr [r10+32]
     mov     qword ptr [rbp-32], rax            ; hdc
-    ; chevrons sit inside the tile in card layouts -> blend with the panel;
+    ; chevrons sit inside the tile in card layouts -> blend with 40% glass slice;
     ; flat (Compact) has no card -> blend with the dialog background
-    mov     eax, dword ptr [g_col_bg]
     mov     r11d, dword ptr [g_layout]
     lea     r10, [lay_band]
     cmp     dword ptr [r10+r11*4], 0
-    je      gfv_bgok
+    je      gfv_bgflat
+    mov     r10, qword ptr [rbp-24]
+    mov     rcx, qword ptr [rbp-32]
+    mov     rdx, qword ptr [r10+24]
+    lea     r8, [r10+40]
+    call    gpu_fill_glass_child
+    test    eax, eax
+    jnz     gfv_bgdone
     mov     eax, dword ptr [g_col_panel]
+    jmp     gfv_bgok
+gfv_bgflat:
+    mov     eax, dword ptr [g_col_bg]
 gfv_bgok:
     WINCALL CreateSolidBrush, eax
     mov     qword ptr [rbp-40], rax
@@ -6721,6 +7291,7 @@ gfv_bgok:
     lea     rdx, [r10+40]
     WINCALL FillRect, qword ptr [rbp-32], rdx, qword ptr [rbp-40]
     WINCALL DeleteObject, qword ptr [rbp-40]
+gfv_bgdone:
     mov     r10, qword ptr [rbp-24]
     mov     eax, dword ptr [r10+4]             ; ctl id -> slot
     sub     eax, IDC_DYN_BASE
@@ -7455,7 +8026,7 @@ gui_totp_refresh proc frame
     lea     r8, [g_totp_code_w]
     mov     r9d, 15
     call    gui_towide
-    ; show the code grouped "nnn nnn" (display only; g_totp_code_w stays 6 digits)
+    ; show the code grouped "nnn . nnn" (#20; g_totp_code_w stays 6 bare digits)
     movzx   eax, word ptr [g_totp_code_w]
     mov     word ptr [g_totp_disp_w], ax
     movzx   eax, word ptr [g_totp_code_w+2]
@@ -7463,20 +8034,32 @@ gui_totp_refresh proc frame
     movzx   eax, word ptr [g_totp_code_w+4]
     mov     word ptr [g_totp_disp_w+4], ax
     mov     word ptr [g_totp_disp_w+6], ' '
+    mov     word ptr [g_totp_disp_w+8], 00B7h
+    mov     word ptr [g_totp_disp_w+10], ' '
     movzx   eax, word ptr [g_totp_code_w+6]
-    mov     word ptr [g_totp_disp_w+8], ax
-    movzx   eax, word ptr [g_totp_code_w+8]
-    mov     word ptr [g_totp_disp_w+10], ax
-    movzx   eax, word ptr [g_totp_code_w+10]
     mov     word ptr [g_totp_disp_w+12], ax
-    mov     word ptr [g_totp_disp_w+14], 0
+    movzx   eax, word ptr [g_totp_code_w+8]
+    mov     word ptr [g_totp_disp_w+14], ax
+    movzx   eax, word ptr [g_totp_code_w+10]
+    mov     word ptr [g_totp_disp_w+16], ax
+    mov     word ptr [g_totp_disp_w+18], 0
+    ; Only call SetWindowTextW when the 6-digit code changes (prevents 10Hz text flicker)
+    mov     eax, dword ptr [g_totp_code6]
+    xor     eax, dword ptr [g_totp_code6+2]
+    cmp     eax, dword ptr [g_totp_prev0]
+    je      gtr_ring
+    mov     dword ptr [g_totp_prev0], eax
     WINCALL SetWindowTextW, qword ptr [g_totp_codehwnd], addr g_totp_disp_w
+gtr_ring:
     call    totp_secs_left                  ; eax = seconds left (1..30)
     mov     dword ptr [g_totp_secs], eax
-    WINCALL InvalidateRect, qword ptr [g_totp_barhwnd], 0, 1
+    call    totp_ms_left                    ; eax = ms left (1..30000) (#3)
+    mov     dword ptr [g_totp_ms], eax
+    WINCALL InvalidateRect, qword ptr [g_totp_barhwnd], 0, 0
     FRAME_EPILOG
     ret
 gtr_bad:
+    mov     dword ptr [g_totp_prev0], 0
     WINCALL SetWindowTextW, qword ptr [g_totp_codehwnd], 0
 gtr_done:
     FRAME_EPILOG
@@ -7622,11 +8205,18 @@ gc_cpd:
     mov     dword ptr [g_clip_retries], 0
     WINCALL KillTimer, qword ptr [rbp-40], CLIP_TIMER     ; cancel any prior
     mov     eax, dword ptr [g_clip_secs]        ; 0 = never auto-clear
+    mov     dword ptr [g_copy_dur_ms], 0
     test    eax, eax
-    jz      gc_done
+    jz      gc_toast
     imul    eax, eax, 1000                      ; seconds -> ms
+    mov     dword ptr [g_copy_dur_ms], eax
     mov     r10d, eax                           ; stage off the arg regs (r9 is arg4)
     WINCALL SetTimer, qword ptr [rbp-40], CLIP_TIMER, r10d, 0
+    call    GetTickCount
+    add     eax, dword ptr [g_copy_dur_ms]
+    mov     dword ptr [g_copy_end_tick], eax
+gc_toast:
+    call    gui_toast_start
     jmp     gc_done
 gc_empty_close_wipe:
     WINCALL EmptyClipboard
@@ -7680,10 +8270,160 @@ gcc_busy:
 gcc_keep:
     mov     dword ptr [g_clip_seq], 0
     mov     dword ptr [g_clip_retries], 0
+    call    gui_toast_hide
 gcc_done:
     FRAME_EPILOG
     ret
 gui_clipclear endp
+
+; gui_toast_start() - show the bottom-right "Copied . Xs" pill + kick ANIM_COPY (#2).
+gui_toast_start proc frame
+    FRAME_PROLOG 80
+    cmp     qword ptr [g_vaulthwnd], 0
+    je      gts_done
+    cmp     dword ptr [g_menu_open], 0
+    jne     gts_done
+    WINCALL KillTimer, qword ptr [g_vaulthwnd], TOAST_TIMER
+    WINCALL GetDlgItem, qword ptr [g_vaulthwnd], IDC_V_TOAST
+    mov     qword ptr [rbp-24], rax
+    test    rax, rax
+    jz      gts_anim
+    WINCALL SetWindowPos, rax, 0, 0, 0, 0, 0, 53h ; TOP|NOMOVE|NOSIZE|NOACTIVATE|SHOWWINDOW
+    WINCALL InvalidateRect, qword ptr [rbp-24], 0, 0
+gts_anim:
+    mov     ecx, ANIM_COPY
+    mov     edx, 1024
+    xor     r8d, r8d
+    call    anim_set
+    cmp     dword ptr [g_anim_on], 0
+    je      gts_noanim
+    mov     ecx, ANIM_COPY
+    xor     edx, edx
+    mov     r8d, 1300                            ; finite 1.3s pill + checkmark morph
+    call    anim_set
+    jmp     gts_done
+gts_noanim:
+    WINCALL SetTimer, qword ptr [g_vaulthwnd], TOAST_TIMER, 1300, 0
+gts_done:
+    FRAME_EPILOG
+    ret
+gui_toast_start endp
+
+; gui_toast_hide() - hide IDC_V_TOAST and clear g_copy_btn_hwnd (#2).
+gui_toast_hide proc frame
+    FRAME_PROLOG 48
+    mov     rcx, qword ptr [g_copy_btn_hwnd]
+    mov     qword ptr [g_copy_btn_hwnd], 0
+    test    rcx, rcx
+    jz      @F
+    WINCALL InvalidateRect, rcx, 0, 0
+@@: cmp     qword ptr [g_vaulthwnd], 0
+    je      gth3_done
+    WINCALL KillTimer, qword ptr [g_vaulthwnd], TOAST_TIMER
+    WINCALL GetDlgItem, qword ptr [g_vaulthwnd], IDC_V_TOAST
+    test    rax, rax
+    jz      gth3_done
+    WINCALL ShowWindow, rax, SW_HIDE
+gth3_done:
+    FRAME_EPILOG
+    ret
+gui_toast_hide endp
+
+; gui_draw_toast(rcx = lpdis) - draw the rounded "Copied . Xs" pill + countdown bar (#2).
+gui_draw_toast proc frame
+    FRAME_PROLOG 224
+    mov     qword ptr [rbp-24], rcx
+    mov     r10, rcx
+    mov     rax, qword ptr [r10+32]
+    mov     qword ptr [rbp-32], rax              ; hdc
+    mov     rax, qword ptr [r10+24]
+    mov     qword ptr [rbp-40], rax              ; hctl
+    mov     eax, dword ptr [r10+40]
+    mov     dword ptr [rbp-64], eax              ; L
+    mov     eax, dword ptr [r10+44]
+    mov     dword ptr [rbp-60], eax              ; T
+    mov     eax, dword ptr [r10+48]
+    mov     dword ptr [rbp-56], eax              ; R
+    mov     eax, dword ptr [r10+52]
+    mov     dword ptr [rbp-52], eax              ; B
+    ; Paint GPU or flat backdrop under pill corners
+    mov     rcx, qword ptr [rbp-32]
+    mov     rdx, qword ptr [rbp-40]
+    lea     r8, [rbp-64]
+    call    gpu_fill_child_bg
+    test    eax, eax
+    jnz     @F
+    WINCALL CreateSolidBrush, dword ptr [g_col_bg]
+    mov     qword ptr [rbp-48], rax
+    WINCALL FillRect, qword ptr [rbp-32], addr rbp-64, rax
+    WINCALL DeleteObject, qword ptr [rbp-48]
+@@: WINCALL theme_aa_rrect, qword ptr [rbp-32], dword ptr [rbp-64], dword ptr [rbp-60], \
+            dword ptr [rbp-56], dword ptr [rbp-52], 6, \
+            dword ptr [g_col_panel], dword ptr [g_col_panel], CLR_BAR_DGREEN, dword ptr [g_col_spec]
+    ; Shrinking emerald progress bar along bottom inside pill
+    mov     ecx, ANIM_COPY
+    call    anim_get
+    test    eax, eax
+    jle     gdt_txt
+    mov     edx, dword ptr [rbp-56]
+    sub     edx, dword ptr [rbp-64]
+    sub     edx, 12
+    jle     gdt_txt
+    imul    edx, eax
+    sar     edx, 10
+    cmp     edx, 2
+    jl      gdt_txt
+    mov     ecx, dword ptr [rbp-64]
+    add     ecx, 6
+    add     edx, ecx
+    mov     r8d, dword ptr [rbp-52]
+    sub     r8d, 3
+    mov     r9d, dword ptr [rbp-52]
+    sub     r9d, 1
+    WINCALL theme_aa_rrect, qword ptr [rbp-32], ecx, r8d, edx, r9d, 1, \
+            CLR_BAR_DGREEN, CLR_BAR_DGREEN, -1, -1
+gdt_txt:
+    ; Compose "Copied" or "Copied . 20s"
+    lea     rcx, [g_toast_w]
+    lea     rdx, [s_toast_copied]
+    call    gui_w_appendz
+    cmp     dword ptr [g_copy_dur_ms], 0
+    jle     gdt_term
+    mov     qword ptr [rbp-72], rax
+    call    GetTickCount
+    mov     edx, dword ptr [g_copy_end_tick]
+    sub     edx, eax
+    jle     gdt_term_restore
+    add     edx, 999
+    mov     eax, edx
+    xor     edx, edx
+    mov     ecx, 1000
+    div     ecx                                  ; seconds remaining
+    mov     dword ptr [rbp-76], eax
+    mov     rcx, qword ptr [rbp-72]
+    lea     rdx, [s_stor_sep]
+    call    gui_w_appendz
+    mov     rcx, rax
+    mov     edx, dword ptr [rbp-76]
+    call    gui_uint_w
+    mov     rcx, rax
+    lea     rdx, [s_toast_s]
+    call    gui_w_appendz
+    jmp     gdt_term
+gdt_term_restore:
+    mov     rax, qword ptr [rbp-72]
+gdt_term:
+    mov     word ptr [rax], 0
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_subfont]
+    mov     qword ptr [rbp-88], rax
+    WINCALL SetBkMode, qword ptr [rbp-32], 1
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_text]
+    WINCALL DrawTextW, qword ptr [rbp-32], addr g_toast_w, -1, addr rbp-64, DT_IMGFLAGS
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-88]
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gui_draw_toast endp
 
 ; gui_gather(rcx = hdlg) - read Title + every row into the ordered descriptor
 ;   array g_field_list[] (g_field_n) that vault_build_entry consumes.  Values go
@@ -7879,7 +8619,7 @@ gui_gather endp
 ;   built into g_tileblob).  Order is preserved; other fields copy through unchanged.
 ;   Called by gui_commit only - the reorder path keeps the tile as one placeholder.
 gui_tile_expand proc frame
-    FRAME_PROLOG 64
+    FRAME_PROLOG 80
     mov     dword ptr [rbp-24], 0               ; src
     mov     dword ptr [rbp-32], 0               ; dst
 gte_src:
@@ -8113,6 +8853,7 @@ gpc_adddone:
     ret
 gui_pwhist_capture endp
 
+ifdef PROBE_IO
 ; gui_phtest() -> eax = g_pwhist_n after a synthetic capture (headless probe).
 ;   Seeds one original secret ("Password"="oldpw") + a new secret field "newpw",
 ;   runs gui_pwhist_capture; a working capture returns 1.
@@ -8204,6 +8945,7 @@ pht_e80:
     FRAME_EPILOG
     ret
 gui_phtest endp
+endif
 
 
 ; gui_pwhist_emit() - append every g_pwhist entry to g_field_list as a reserved
@@ -8212,7 +8954,7 @@ gui_phtest endp
 ;   consumes it.  The action trails the strings so records written before it
 ;   existed still parse (a short record reads back as PWHA_CHANGED).
 gui_pwhist_emit proc frame
-    FRAME_PROLOG 48
+    FRAME_PROLOG 64
     mov     dword ptr [rbp-24], 0            ; i
 gpe_loop:
     mov     eax, dword ptr [rbp-24]
@@ -8350,6 +9092,13 @@ gui_commit proc frame
     mov     dword ptr [g_dirty], 1           ; suppress refresh during nested error dialogs
     cmp     dword ptr [g_cur_idx], 0
     jl      gco_done                          ; nothing selected
+    call    vault_count
+    cmp     dword ptr [g_cur_idx], eax
+    jae     gco_done
+    mov     ecx, dword ptr [g_cur_idx]
+    call    vault_is_system
+    test    eax, eax
+    jnz     gco_done
     ; external-change guard: warn before overwriting a file another program or
     ; instance rewrote since we loaded it (checked before touching any state).
     call    vault_ext_changed
@@ -8357,6 +9106,8 @@ gui_commit proc frame
     jz      gco_noext
     mov     rcx, qword ptr [rbp-24]           ; C8: reload-safe - the file changed under
     call    gui_reload_safe                   ; us; reload + inform, never clobber
+    test    eax, eax
+    jz      gco_reloaded
     jmp     gco_done
 gco_noext:
     mov     rcx, qword ptr [rbp-24]
@@ -8426,12 +9177,12 @@ gco_reseal:
     mov     edx, MAX_PWHIST*PWHIST_ENTRY
     call    secure_zero
     mov     qword ptr [g_edit_history], 0
-    mov     rcx, qword ptr [rbp-40]
-    mov     rdx, VAULT_BODY_MAX
-    call    secmem_free
-    mov     qword ptr [rbp-40], 0
+    xor     ecx, ecx
+    xchg    qword ptr [rbp-40], rcx
     mov     qword ptr [g_edit_backup], 0
     mov     qword ptr [g_edit_backup_len], 0
+    mov     rdx, VAULT_BODY_MAX
+    call    secmem_free
     mov     rcx, qword ptr [rbp-24]
     call    gui_poplist
     call    vault_last_user                     ; NOT count-1: a vault that gained its system
@@ -8467,6 +9218,10 @@ gco_resealerr:
     je      gco_busy
     WINCALL gui_msgbox, qword ptr [rbp-24], addr s_resealfail, addr t_err, \
             <MB_YESNO or MB_ICONWARNING>
+    cmp     qword ptr [g_body_ptr], 0
+    je      gco_done
+    cmp     qword ptr [g_edit_backup], 0
+    je      gco_done
     cmp     eax, IDYES                          ; Yes -> retry the write (file may be unlocked now)
     je      gco_reseal
     jmp     gco_done
@@ -8476,14 +9231,22 @@ gco_reload:
     call    gco_rollback
     mov     rcx, qword ptr [rbp-24]
     call    gui_reload_safe
+    test    eax, eax
+    jz      gco_reloaded
     jmp     gco_done
 gco_busy:
     WINCALL gui_msgbox, qword ptr [rbp-24], addr s_busy, addr t_exttitle, <MB_OK or MB_ICONWARNING>
 gco_done:
     mov     rcx, rbp
     call    gco_rollback
+    cmp     qword ptr [g_body_ptr], 0
+    je      gco_reloaded
     mov     dword ptr [g_dirty], 1
     mov     eax, 1                           ; failure: retain rows and edit mode
+    FRAME_EPILOG
+    ret
+gco_reloaded:
+    mov     eax, 1                           ; reloaded or locked: do not re-enter view rebuild
     FRAME_EPILOG
     ret
 gco_success:
@@ -8503,6 +9266,10 @@ gco_rollback proc frame
     mov     qword ptr [rbp-24], rcx
     cmp     qword ptr [rcx-40], 0
     je      gcrb_done
+    cmp     qword ptr [g_edit_backup], 0
+    je      gcrb_clear_only
+    cmp     qword ptr [g_body_ptr], 0
+    je      gcrb_clear_only
     lea     rcx, [g_pwhist]
     mov     rdx, qword ptr [g_edit_history]
     mov     r8d, MAX_PWHIST*PWHIST_ENTRY
@@ -8515,8 +9282,6 @@ gco_rollback proc frame
     call    secure_zero
     mov     qword ptr [g_edit_history], 0
     mov     rcx, qword ptr [g_body_ptr]
-    mov     rdx, VAULT_BODY_MAX
-    call    secmem_free
     mov     r10, qword ptr [rbp-24]
     mov     rax, qword ptr [r10-40]
     mov     qword ptr [g_body_ptr], rax
@@ -8525,14 +9290,49 @@ gco_rollback proc frame
     mov     qword ptr [r10-40], 0
     mov     qword ptr [g_edit_backup], 0
     mov     qword ptr [g_edit_backup_len], 0
+    mov     rdx, VAULT_BODY_MAX
+    call    secmem_free
+    FRAME_EPILOG
+    ret
+gcrb_clear_only:
+    mov     r10, qword ptr [rbp-24]
+    mov     qword ptr [r10-40], 0
+    mov     qword ptr [g_edit_history], 0
+    mov     qword ptr [g_edit_backup], 0
+    mov     qword ptr [g_edit_backup_len], 0
 gcrb_done:
     FRAME_EPILOG
     ret
 gco_rollback endp
 
-; gui_reload_safe(rcx = hdlg) - C8: the vault changed on disk under us; reload it
-;   (vault_reload, existing key - no re-KDF), refresh the list, and tell the user
-;   to re-apply their unsaved change.  Never overwrites the other writer's save.
+; gui_reset_after_reload(rcx = hdlg) - clear any stale selection/edit/TOTP state
+;   after vault_reload replaces the live body in memory (AUD-05).
+gui_reset_after_reload proc frame
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-24], rcx
+    WINCALL KillTimer, qword ptr [rbp-24], TOTP_TIMER
+    mov     dword ptr [g_totp_on], 0
+    mov     dword ptr [g_cur_idx], -1
+    mov     dword ptr [g_dirty], 0
+    mov     dword ptr [g_new_pending], 0
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_colorpw_hide
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_rows_clear
+    mov     rcx, qword ptr [rbp-24]
+    xor     edx, edx
+    call    gui_set_editmode
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_poplist
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_detail_clear
+    FRAME_EPILOG
+    ret
+gui_reset_after_reload endp
+
+; gui_reload_safe(rcx = hdlg) -> eax = 0 reloaded / 1 failed - C8: the vault changed
+;   on disk under us; reload it (vault_reload, existing key - no re-KDF), reset stale
+;   selection/edit state, refresh the list, and tell the user.
 gui_reload_safe proc frame
     FRAME_PROLOG 64
     mov     qword ptr [rbp-24], rcx
@@ -8542,12 +9342,16 @@ gui_reload_safe proc frame
     test    eax, eax
     jnz     grs_fail
     mov     rcx, qword ptr [rbp-24]
-    call    gui_poplist
+    call    gui_reset_after_reload
     WINCALL gui_msgbox, qword ptr [rbp-24], addr s_reloaded, addr t_reloaded, \
             <MB_OK or MB_ICONINFORMATION>
+    cmp     qword ptr [g_body_ptr], 0
+    je      grs_ok
     mov     rcx, qword ptr [rbp-24]
     mov     edx, dword ptr [rbp-32]
     call    gui_rb_warn
+grs_ok:
+    xor     eax, eax
     FRAME_EPILOG
     ret
 grs_fail:
@@ -8555,6 +9359,7 @@ grs_fail:
     ; but nothing was saved either, and "reloaded" would be untrue.
     WINCALL gui_msgbox, qword ptr [rbp-24], addr s_reloadfail, addr t_err, \
             <MB_OK or MB_ICONWARNING>
+    mov     eax, 1
     FRAME_EPILOG
     ret
 gui_reload_safe endp
@@ -8598,7 +9403,7 @@ gui_check_refresh proc frame
     test    eax, eax
     jnz     gcr2_done                          ; reload failed -> the open vault is kept
     mov     rcx, qword ptr [rbp-24]            ;   as it was; the next poll tries again
-    call    gui_poplist
+    call    gui_reset_after_reload
     mov     rcx, qword ptr [rbp-24]
     mov     edx, dword ptr [rbp-32]
     call    gui_rb_warn
@@ -8847,10 +9652,468 @@ row_mk proc frame
     mov     eax, dword ptr [rbp-40]
     mov     r11, qword ptr [rbp-64]
     mov     qword ptr [r10 + FD_HANDLES + rax*8], r11
-    mov     rax, r11
+    test    r11, r11
+    jz      rmk_done
+    lea     rax, [cls_edit]
+    cmp     qword ptr [rbp-48], rax
+    jne     rmk_done
+    WINCALL SetWindowSubclass, r11, addr glass_edit_subclass, 2, 0
+rmk_done:
+    mov     rax, qword ptr [rbp-64]
     FRAME_EPILOG
     ret
 row_mk endp
+
+; =============================================================================
+; glass_edit_subclass - double-buffered 40% glass Edit control renderer.
+;   Swallows WM_ERASEBKGND and renders WM_PAINT offscreen over gpu_fill_glass_child
+;   via WM_PRINTCLIENT + single atomic BitBlt so ClearType, selection highlights,
+;   wrapping Notes, and password bullets stay crisp and flicker-free over GPU art.
+; =============================================================================
+glass_edit_subclass proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 256
+    mov     qword ptr [rbp-8], rcx               ; hwnd
+    mov     dword ptr [rbp-16], edx              ; msg
+    mov     qword ptr [rbp-24], r8               ; wParam
+    mov     qword ptr [rbp-32], r9               ; lParam
+    cmp     edx, WM_ERASEBKGND
+    je      ges_erase
+    cmp     edx, WM_PAINT
+    je      ges_paint
+
+    WINCALL DefSubclassProc, rcx, rdx, r8, r9
+    mov     qword ptr [rbp-40], rax              ; save return value
+
+    ; Schedule clean double-buffered repaint after any in-place edit/selection update
+    mov     edx, dword ptr [rbp-16]
+    cmp     edx, WM_CHAR_
+    je      ges_inval
+    cmp     edx, WM_KEYDOWN_
+    je      ges_inval
+    cmp     edx, 101h                            ; WM_KEYUP
+    je      ges_inval
+    cmp     edx, 300h                            ; WM_CUT
+    jb      ges_chk_sel
+    cmp     edx, 304h                            ; ..WM_UNDO (incl WM_PASTE=302h, WM_CLEAR=303h)
+    jbe     ges_inval
+ges_chk_sel:
+    cmp     edx, 0Ch                             ; WM_SETTEXT
+    je      ges_inval
+    cmp     edx, 0B1h                            ; EM_SETSEL
+    je      ges_inval
+    cmp     edx, 0CCh                            ; EM_SETPASSWORDCHAR
+    je      ges_inval
+    cmp     edx, 0CFh                            ; EM_SETREADONLY
+    je      ges_inval
+    cmp     edx, 07h                             ; WM_SETFOCUS
+    je      ges_inval
+    cmp     edx, 08h                             ; WM_KILLFOCUS
+    je      ges_inval
+    cmp     edx, 0Ah                             ; WM_ENABLE
+    je      ges_inval
+    cmp     edx, 201h                            ; WM_LBUTTONDOWN
+    je      ges_inval
+    cmp     edx, 202h                            ; WM_LBUTTONUP
+    je      ges_inval
+    cmp     edx, 203h                            ; WM_LBUTTONDBLCLK
+    je      ges_inval
+    cmp     edx, 114h                            ; WM_HSCROLL
+    je      ges_inval
+    cmp     edx, 115h                            ; WM_VSCROLL
+    je      ges_inval
+    cmp     edx, 20Ah                            ; WM_MOUSEWHEEL
+    je      ges_inval
+    cmp     edx, 200h                            ; WM_MOUSEMOVE (only while drag-selecting)
+    jne     ges_ret_val
+    test    qword ptr [rbp-24], 1                ; MK_LBUTTON
+    jz      ges_ret_val
+ges_inval:
+    WINCALL InvalidateRect, qword ptr [rbp-8], 0, 0
+ges_ret_val:
+    mov     rax, qword ptr [rbp-40]
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+ges_erase:
+    mov     eax, 1
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+ges_paint:
+    WINCALL BeginPaint, qword ptr [rbp-8], addr rbp-160
+    mov     qword ptr [rbp-48], rax              ; paintDC
+    test    rax, rax
+    jz      ges_p_done
+    WINCALL GetClientRect, qword ptr [rbp-8], addr rbp-88
+    cmp     dword ptr [rbp-80], 0
+    jle     ges_p_end
+    cmp     dword ptr [rbp-76], 0
+    jle     ges_p_end
+
+    WINCALL CreateCompatibleDC, qword ptr [rbp-48]
+    mov     qword ptr [rbp-56], rax              ; memDC
+    test    rax, rax
+    jz      ges_p_end
+    WINCALL CreateCompatibleBitmap, qword ptr [rbp-48], dword ptr [rbp-80], dword ptr [rbp-76]
+    mov     qword ptr [rbp-64], rax              ; memBmp
+    test    rax, rax
+    jz      ges_p_deldc
+    WINCALL SelectObject, qword ptr [rbp-56], qword ptr [rbp-64]
+    mov     qword ptr [rbp-72], rax              ; oldBmp
+
+    WINCALL GetDlgCtrlID, qword ptr [rbp-8]
+    cmp     eax, IDC_V_SEARCH
+    je      ges_p_side
+    mov     rcx, qword ptr [rbp-56]
+    mov     rdx, qword ptr [rbp-8]
+    lea     r8, [rbp-88]
+    call    gpu_fill_glass_child
+    test    eax, eax
+    jnz     ges_p_prt
+    WINCALL FillRect, qword ptr [rbp-56], addr rbp-88, qword ptr [g_br_panel]
+    jmp     ges_p_prt
+ges_p_side:
+    mov     rcx, qword ptr [rbp-56]
+    mov     rdx, qword ptr [rbp-8]
+    lea     r8, [rbp-88]
+    call    gpu_fill_side_glass_child
+    test    eax, eax
+    jnz     ges_p_prt
+    WINCALL FillRect, qword ptr [rbp-56], addr rbp-88, qword ptr [g_br_side]
+ges_p_prt:
+    WINCALL DefSubclassProc, qword ptr [rbp-8], WM_PRINTCLIENT_, qword ptr [rbp-56], PRF_CLIENT_
+    WINCALL BitBlt, qword ptr [rbp-48], 0, 0, dword ptr [rbp-80], dword ptr [rbp-76], \
+            qword ptr [rbp-56], 0, 0, SRCCOPY_
+    WINCALL PatBlt, qword ptr [rbp-56], 0, 0, dword ptr [rbp-80], dword ptr [rbp-76], PATBLT_BLACK_
+
+    WINCALL SelectObject, qword ptr [rbp-56], qword ptr [rbp-72]
+    WINCALL DeleteObject, qword ptr [rbp-64]
+ges_p_deldc:
+    WINCALL DeleteDC, qword ptr [rbp-56]
+ges_p_end:
+    WINCALL EndPaint, qword ptr [rbp-8], addr rbp-160
+ges_p_done:
+    xor     eax, eax
+    mov     rsp, rbp
+    pop     rbp
+    ret
+glass_edit_subclass endp
+
+; vault_nc_subclass - reclaims Windows 11's 7px WS_THICKFRAME top non-client border
+;   so client y=0 starts at the very top pixel of the rounded window and GPU backdrops
+;   cover 100% of the visible window surface.
+vault_nc_subclass proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 64
+    cmp     edx, WM_NCCALCSIZE_
+    jne     vncs_def
+    test    r8, r8
+    jz      vncs_def
+    mov     qword ptr [rbp-8], rcx              ; hwnd
+    mov     qword ptr [rbp-16], r9              ; NCCALCSIZE_PARAMS*
+    mov     eax, dword ptr [r9+4]
+    mov     dword ptr [rbp-24], eax             ; origTop
+    WINCALL DefSubclassProc, rcx, rdx, r8, r9
+    mov     qword ptr [rbp-32], rax
+    WINCALL IsZoomed, qword ptr [rbp-8]
+    test    eax, eax
+    jnz     @F                                  ; maximized: keep DefWindowProc work-area top
+    mov     r9, qword ptr [rbp-16]
+    mov     eax, dword ptr [rbp-24]
+    mov     dword ptr [r9+4], eax               ; restore top -> 0px top non-client bar
+@@: mov     rax, qword ptr [rbp-32]
+    mov     rsp, rbp
+    pop     rbp
+    ret
+vncs_def:
+    WINCALL DefSubclassProc, rcx, rdx, r8, r9
+    mov     rsp, rbp
+    pop     rbp
+    ret
+vault_nc_subclass endp
+
+; glass_static_subclass - double-buffered Static label renderer on DLG_SETTINGS
+;   and DLG_VAULT so text labels never flicker during interactive repaints.
+glass_static_subclass proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 256
+    mov     qword ptr [rbp-8], rcx
+    cmp     edx, WM_ERASEBKGND
+    je      gss_erase
+    cmp     edx, WM_PAINT
+    je      gss_paint
+    WINCALL DefSubclassProc, rcx, rdx, r8, r9
+    mov     rsp, rbp
+    pop     rbp
+    ret
+gss_erase:
+    mov     eax, 1
+    mov     rsp, rbp
+    pop     rbp
+    ret
+gss_paint:
+    WINCALL BeginPaint, qword ptr [rbp-8], addr rbp-160
+    mov     qword ptr [rbp-24], rax              ; paintDC
+    test    rax, rax
+    jz      gss_done
+    WINCALL GetClientRect, qword ptr [rbp-8], addr rbp-88
+    cmp     dword ptr [rbp-80], 0
+    jle     gss_end
+    cmp     dword ptr [rbp-76], 0
+    jle     gss_end
+    WINCALL CreateCompatibleDC, qword ptr [rbp-24]
+    mov     qword ptr [rbp-32], rax              ; memDC
+    test    rax, rax
+    jz      gss_end
+    WINCALL CreateCompatibleBitmap, qword ptr [rbp-24], dword ptr [rbp-80], dword ptr [rbp-76]
+    mov     qword ptr [rbp-40], rax              ; memBmp
+    test    rax, rax
+    jz      gss_deldc
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-40]
+    mov     qword ptr [rbp-48], rax              ; oldBmp
+
+    WINCALL GetDlgCtrlID, qword ptr [rbp-8]
+    cmp     eax, IDC_DYN_BASE
+    jb      gss_bg_plain
+    mov     rcx, qword ptr [rbp-32]
+    mov     rdx, qword ptr [rbp-8]
+    lea     r8, [rbp-88]
+    call    gpu_fill_glass_child
+    test    eax, eax
+    jnz     gss_draw_txt
+gss_bg_plain:
+    mov     rcx, qword ptr [rbp-32]
+    mov     rdx, qword ptr [rbp-8]
+    lea     r8, [rbp-88]
+    call    gpu_fill_child_bg
+    test    eax, eax
+    jnz     gss_draw_txt
+    WINCALL FillRect, qword ptr [rbp-32], addr rbp-88, qword ptr [g_br_bg]
+
+gss_draw_txt:
+    WINCALL SendMessageW, qword ptr [rbp-8], WM_GETFONT, 0, 0
+    test    rax, rax
+    jnz     @F
+    mov     rax, qword ptr [g_dlgfont]
+@@: WINCALL SelectObject, qword ptr [rbp-32], rax
+    mov     qword ptr [rbp-56], rax              ; oldFont
+    WINCALL SetBkMode, qword ptr [rbp-32], 1
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_text]
+    mov     word ptr [g_comp_wbuf], 0
+    WINCALL SendMessageW, qword ptr [rbp-8], 0Dh, 255, addr g_comp_wbuf
+    test    eax, eax
+    jle     gss_txt_done
+    WINCALL GetWindowLongPtrW, qword ptr [rbp-8], GWL_STYLE_
+    xor     r9d, r9d
+    test    eax, 80h                             ; SS_NOPREFIX
+    jz      @F
+    or      r9d, 800h                            ; DT_NOPREFIX
+@@: test    eax, 200h                            ; SS_CENTERIMAGE
+    jz      @F
+    or      r9d, 25h                             ; DT_CENTER | DT_VCENTER | DT_SINGLELINE
+@@: and     eax, 3
+    cmp     eax, 1                               ; SS_CENTER
+    jne     @F
+    or      r9d, 1
+@@: cmp     eax, 2                               ; SS_RIGHT
+    jne     @F
+    or      r9d, 2
+@@: WINCALL DrawTextW, qword ptr [rbp-32], addr g_comp_wbuf, -1, addr rbp-88, r9d
+gss_txt_done:
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-56]
+    WINCALL BitBlt, qword ptr [rbp-24], 0, 0, dword ptr [rbp-80], dword ptr [rbp-76], \
+            qword ptr [rbp-32], 0, 0, SRCCOPY_
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-48]
+    WINCALL DeleteObject, qword ptr [rbp-40]
+gss_deldc:
+    WINCALL DeleteDC, qword ptr [rbp-32]
+gss_end:
+    WINCALL EndPaint, qword ptr [rbp-8], addr rbp-160
+gss_done:
+    xor     eax, eax
+    mov     rsp, rbp
+    pop     rbp
+    ret
+glass_static_subclass endp
+
+subclass_set_stat_cb proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 96
+    mov     qword ptr [rbp-8], rcx
+    WINCALL GetParent, rcx
+    cmp     rax, qword ptr [g_settings_hwnd]
+    jne     sssc_ret
+    WINCALL GetClassNameW, qword ptr [rbp-8], addr rbp-48, 16
+    cmp     word ptr [rbp-48], 'S'
+    jne     sssc_ret
+    WINCALL GetWindowLongPtrW, qword ptr [rbp-8], GWL_STYLE_
+    and     eax, 1Fh
+    cmp     eax, 0Dh                             ; skip SS_OWNERDRAW
+    je      sssc_ret
+    WINCALL SetWindowSubclass, qword ptr [rbp-8], addr glass_static_subclass, 4, 0
+sssc_ret:
+    mov     eax, 1
+    mov     rsp, rbp
+    pop     rbp
+    ret
+subclass_set_stat_cb endp
+
+; gui_subclass_settings_edits() - attach glass subclasses to numeric Edits & Static labels on DLG_SETTINGS.
+gui_subclass_settings_edits proc frame
+    FRAME_PROLOG 64
+    cmp     qword ptr [g_settings_hwnd], 0
+    je      gsse_done
+    WINCALL EnumChildWindows, qword ptr [g_settings_hwnd], addr subclass_set_stat_cb, 0
+    lea     rax, [g_setrows]
+    mov     qword ptr [rbp-24], rax
+gsse_lp:
+    lea     rax, [g_setrows_end]
+    cmp     qword ptr [rbp-24], rax
+    jae     gsse_done
+    mov     r11, qword ptr [rbp-24]
+    cmp     dword ptr [r11+SR_KIND], SK_NUM
+    jne     gsse_next
+    mov     eax, dword ptr [r11+SR_ID]
+    mov     dword ptr [rbp-32], eax
+    WINCALL GetDlgItem, qword ptr [g_settings_hwnd], dword ptr [rbp-32]
+    test    rax, rax
+    jz      gsse_next
+    WINCALL SetWindowSubclass, rax, addr glass_edit_subclass, 2, 0
+gsse_next:
+    add     qword ptr [rbp-24], SR_SIZE
+    jmp     gsse_lp
+gsse_done:
+    FRAME_EPILOG
+    ret
+gui_subclass_settings_edits endp
+
+; =============================================================================
+; gui_draw_brand_hdr(rcx = hdc, rdx = hdlg) - Layout B Sidebar Brand Header:
+;   Vordr shield icon + wide-tracked "VORDR" wordmark + " · <vault>" subtitle
+;   centered in the 0..TBAR_H strip directly above the sidebar card.
+; =============================================================================
+public gui_draw_brand_hdr
+gui_draw_brand_hdr proc frame
+    FRAME_PROLOG 256
+    mov     qword ptr [rbp-16], rcx              ; hdc
+    mov     qword ptr [rbp-24], rdx              ; hdlg
+    mov     rcx, rdx
+    lea     rdx, [rbp-48]                        ; sidebar rect {L, T, R, B}
+    call    sidebar_rect
+    mov     eax, dword ptr [rbp-40]              ; sideR
+    cmp     eax, dword ptr [rbp-48]
+    jle     gdbh_ret
+
+    ; Lazy-load 18x18 Vordr shield icon & semibold brand font (cached for process lifetime)
+    cmp     qword ptr [g_brand_icon], 0
+    jne     @F
+    WINCALL LoadImageW, qword ptr [g_hinst], 1, 1, 18, 18, 0
+    mov     qword ptr [g_brand_icon], rax
+@@: cmp     qword ptr [g_brand_font], 0
+    jne     @F
+    mov     ecx, -13
+    mov     edx, 600
+    lea     r8, [w_brand_font]
+    call    mk_font
+    mov     qword ptr [g_brand_font], rax
+@@: call    gui_make_listfonts
+
+    mov     eax, dword ptr [rbp-48]
+    add     eax, 2
+    mov     dword ptr [rbp-52], eax              ; iconX = sideL + 2
+    cmp     qword ptr [g_brand_icon], 0
+    je      gdbh_word
+    WINCALL DrawIconEx, qword ptr [rbp-16], dword ptr [rbp-52], 8, \
+            qword ptr [g_brand_icon], 18, 18, 0, 0, DI_NORMAL_
+
+gdbh_word:
+    WINCALL SetBkMode, qword ptr [rbp-16], 1     ; TRANSPARENT
+    WINCALL SetTextColor, qword ptr [rbp-16], dword ptr [g_col_text]
+    WINCALL SelectObject, qword ptr [rbp-16], qword ptr [g_brand_font]
+    mov     qword ptr [rbp-64], rax              ; saved old font
+
+    WINCALL GetTextExtentPoint32W, qword ptr [rbp-16], addr w_vordr_caps, 1, addr rbp-80
+    mov     eax, 18
+    sub     eax, dword ptr [rbp-76]              ; 18 - charH
+    sar     eax, 1
+    add     eax, 8
+    mov     dword ptr [rbp-84], eax              ; textY aligned with 18px shield
+
+    mov     eax, dword ptr [rbp-48]
+    add     eax, 26
+    mov     dword ptr [rbp-88], eax              ; curX = sideL + 26
+    mov     dword ptr [rbp-92], 0                ; i = 0..4
+gdbh_ch_lp:
+    mov     eax, dword ptr [rbp-92]
+    cmp     eax, 5
+    jae     gdbh_sub
+    lea     r10, [w_vordr_caps]
+    movzx   ecx, word ptr [r10 + rax*2]
+    mov     dword ptr [rbp-96], ecx
+    WINCALL GetTextExtentPoint32W, qword ptr [rbp-16], addr rbp-96, 1, addr rbp-80
+    WINCALL TextOutW, qword ptr [rbp-16], dword ptr [rbp-88], dword ptr [rbp-84], addr rbp-96, 1
+    mov     eax, dword ptr [rbp-80]
+    add     eax, 2                               ; +2px crisp geometric tracking
+    add     dword ptr [rbp-88], eax
+    inc     dword ptr [rbp-92]
+    jmp     gdbh_ch_lp
+
+gdbh_sub:
+    cmp     word ptr [g_vpath], 0
+    je      gdbh_restore
+    ; Locate vault basename in g_vpath (after last '\' or '/')
+    lea     r10, [g_vpath]
+    mov     r11, r10
+gdbh_scan:
+    movzx   eax, word ptr [r10]
+    test    eax, eax
+    jz      gdbh_gotbase
+    cmp     eax, '\'
+    je      gdbh_sep
+    cmp     eax, '/'
+    jne     gdbh_snext
+gdbh_sep:
+    lea     r11, [r10+2]
+gdbh_snext:
+    add     r10, 2
+    jmp     gdbh_scan
+gdbh_gotbase:
+    cmp     word ptr [r11], 0
+    je      gdbh_restore
+    mov     qword ptr [rbp-104], r11             ; basename ptr
+
+    WINCALL SelectObject, qword ptr [rbp-16], qword ptr [g_subfont]
+    WINCALL SetTextColor, qword ptr [rbp-16], dword ptr [g_col_textdim]
+    WINCALL GetTextExtentPoint32W, qword ptr [rbp-16], addr w_brand_sep, 4, addr rbp-80
+
+    mov     eax, dword ptr [rbp-88]
+    add     eax, 4
+    mov     dword ptr [rbp-128], eax             ; rc.L
+    mov     dword ptr [rbp-124], 8               ; rc.T
+    mov     ecx, dword ptr [rbp-40]
+    mov     dword ptr [rbp-120], ecx             ; rc.R = sideR
+    mov     dword ptr [rbp-116], 26              ; rc.B
+    sub     ecx, eax
+    cmp     ecx, 28
+    jl      gdbh_restore
+    WINCALL DrawTextW, qword ptr [rbp-16], addr w_brand_sep, -1, addr rbp-128, 824h
+    mov     eax, dword ptr [rbp-80]
+    add     dword ptr [rbp-128], eax
+    WINCALL DrawTextW, qword ptr [rbp-16], qword ptr [rbp-104], -1, addr rbp-128, 8824h
+
+gdbh_restore:
+    WINCALL SelectObject, qword ptr [rbp-16], qword ptr [rbp-64]
+gdbh_ret:
+    FRAME_EPILOG
+    ret
+gui_draw_brand_hdr endp
 
 ; =============================================================================
 ; Ghost buttons - frameless glyph-only controls (see docs/REDESIGN_PLAN.md 1.2).
@@ -9029,6 +10292,10 @@ ghost_tip_create proc frame
             CW_USEDEFAULT_, CW_USEDEFAULT_, CW_USEDEFAULT_, CW_USEDEFAULT_, \
             qword ptr [rbp-24], 0, qword ptr [g_hinst], 0
     mov     qword ptr [g_tooltip], rax
+    test    rax, rax
+    jz      gtc_done
+    mov     rcx, rax
+    call    gui_protect_hwnd
     WINCALL SendMessageW, qword ptr [g_tooltip], TTM_SETMAXTIPW_, 0, 300
 gtc_done:
     FRAME_EPILOG
@@ -9920,37 +11187,24 @@ lbsb_paint proc frame
     mov     ecx, 255
     xor     edx, edx
     div     ecx
-    shl     eax, 16                              ; BLENDFUNCTION.SourceConstantAlpha
-    mov     dword ptr [rbp-68], eax              ;   (BlendOp AC_SRC_OVER = 0)
+    test    eax, eax
+    jz      lp_ret
+    shl     eax, 24
+    or      eax, dword ptr [g_col_textdim]
+    mov     dword ptr [rbp-68], eax              ; (alpha << 24) | g_col_textdim
     mov     eax, LBSB_W_HOT
-    mov     dword ptr [rbp-32], eax              ; width
     mov     ecx, dword ptr [g_lbsb_w]
     sub     ecx, LBSB_INSET
     sub     ecx, eax
-    mov     dword ptr [rbp-40], ecx              ; x
+    mov     dword ptr [rbp-40], ecx              ; L
     add     ecx, eax
-    inc     ecx
-    mov     dword ptr [rbp-56], ecx              ; region right (exclusive + 1)
+    mov     dword ptr [rbp-56], ecx              ; R
     mov     eax, dword ptr [g_lbsb_thy]
     add     eax, dword ptr [g_lbsb_thh]
-    inc     eax
-    mov     dword ptr [rbp-60], eax              ; region bottom
-    mov     rcx, qword ptr [rbp-48]              ; the scheme's dim text colour: light
-    call    lbsb_source                          ;   on dark schemes, dark on light ones
-    test    rax, rax
-    jz      lp_ret
-lp_draw:
-    WINCALL CreateRoundRectRgn, dword ptr [rbp-40], dword ptr [g_lbsb_thy], dword ptr [rbp-56], \
-            dword ptr [rbp-60], LBSB_RADIUS*2, LBSB_RADIUS*2
-    mov     qword ptr [rbp-64], rax
-    test    rax, rax
-    jz      lp_ret
-    WINCALL SelectClipRgn, qword ptr [rbp-48], qword ptr [rbp-64]
-    WINCALL AlphaBlend, qword ptr [rbp-48], dword ptr [rbp-40], dword ptr [g_lbsb_thy], \
-            dword ptr [rbp-32], dword ptr [g_lbsb_thh], qword ptr [g_lbsb_sdc], 0, 0, 1, 1, \
-            dword ptr [rbp-68]
-    WINCALL SelectClipRgn, qword ptr [rbp-48], 0
-    WINCALL DeleteObject, qword ptr [rbp-64]
+    mov     dword ptr [rbp-60], eax              ; B
+    WINCALL theme_aa_rrect, qword ptr [rbp-48], dword ptr [rbp-40], dword ptr [g_lbsb_thy], \
+            dword ptr [rbp-56], dword ptr [rbp-60], LBSB_RADIUS*2, \
+            dword ptr [rbp-68], dword ptr [g_col_textdim], -1, -1
 lp_ret:
     FRAME_EPILOG
     ret
@@ -9989,9 +11243,15 @@ lbsb_wmpaint proc frame
     jz      lwp_direct
     WINCALL SelectObject, qword ptr [rbp-40], qword ptr [rbp-48]
     mov     qword ptr [rbp-56], rax
-    ; ---- background: what the list's own erase would have used --------------
+    ; ---- background: semi-transparent sidebar glass on DLG_VAULT, else theme brush --
     cmp     dword ptr [g_lbsb_kind], 0
     jne     lwp_lvbk
+    mov     rcx, qword ptr [rbp-40]
+    mov     rdx, qword ptr [rbp-24]
+    lea     r8, [rbp-96]
+    call    gpu_fill_side_glass_child
+    test    eax, eax
+    jnz     lwp_rows
     WINCALL GetParent, qword ptr [rbp-24]
     mov     qword ptr [rbp-64], rax
     WINCALL SendMessageW, qword ptr [rbp-64], WM_CTLCOLORLISTBOX, qword ptr [rbp-40], \
@@ -10016,6 +11276,9 @@ lwp_rows:
     WINCALL DefSubclassProc, qword ptr [rbp-24], WM_PRINTCLIENT_, qword ptr [rbp-40], PRF_CLIENT_
     call    vault_index_end
     mov     dword ptr [g_lbsb_painting], 0
+    mov     rcx, qword ptr [rbp-24]
+    mov     rdx, qword ptr [rbp-40]
+    call    lbsb_empty_watermark
     mov     rcx, qword ptr [rbp-24]
     mov     rdx, qword ptr [rbp-40]
     call    lbsb_paint
@@ -10046,6 +11309,89 @@ lwp_ret:
     FRAME_EPILOG
     ret
 lbsb_wmpaint endp
+
+; lbsb_empty_watermark(rcx = list, rdx = hdc) - draw Fluent watermark + shortcut
+;   hint when IDC_V_LIST is empty due to search, health filter, or trash (#19).
+lbsb_empty_watermark proc frame
+    FRAME_PROLOG 128
+    cmp     dword ptr [g_lbsb_kind], 0
+    jne     lew_ret
+    mov     qword ptr [rbp-24], rcx
+    mov     qword ptr [rbp-32], rdx
+    WINCALL SendMessageW, qword ptr [rbp-24], LB_GETCOUNT, 0, 0
+    test    eax, eax
+    jnz     lew_ret
+    ; Choose glyph + title + hint depending on trash / filter / search
+    cmp     dword ptr [g_trash_view], 0
+    je      lew_chk_flt
+    lea     rax, [gl_trsh_empty]
+    mov     qword ptr [rbp-40], rax
+    lea     rax, [s_empty_trsh1]
+    mov     qword ptr [rbp-48], rax
+    lea     rax, [s_empty_trsh2]
+    mov     qword ptr [rbp-56], rax
+    jmp     lew_draw
+lew_chk_flt:
+    cmp     dword ptr [g_health_filter], 0
+    je      lew_chk_srch
+    lea     rax, [gl_srch_empty]
+    mov     qword ptr [rbp-40], rax
+    lea     rax, [s_empty_flt1]
+    mov     qword ptr [rbp-48], rax
+    lea     rax, [s_empty_flt2]
+    mov     qword ptr [rbp-56], rax
+    jmp     lew_draw
+lew_chk_srch:
+    cmp     dword ptr [g_search_len], 0
+    je      lew_ret
+    lea     rax, [gl_srch_empty]
+    mov     qword ptr [rbp-40], rax
+    lea     rax, [s_empty_srch1]
+    mov     qword ptr [rbp-48], rax
+    lea     rax, [s_empty_srch2]
+    mov     qword ptr [rbp-56], rax
+lew_draw:
+    WINCALL GetClientRect, qword ptr [rbp-24], addr rbp-80
+    mov     eax, dword ptr [rbp-68]              ; H
+    cmp     eax, 96
+    jl      lew_ret
+    sar     eax, 1
+    sub     eax, 36
+    mov     dword ptr [rbp-88], eax              ; baseY
+    WINCALL SetBkMode, qword ptr [rbp-32], 1
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_textdim]
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_iconfont]
+    mov     qword ptr [rbp-64], rax
+    mov     dword ptr [rbp-104], 8
+    mov     eax, dword ptr [rbp-88]
+    mov     dword ptr [rbp-100], eax
+    mov     ecx, dword ptr [rbp-72]
+    sub     ecx, 8
+    mov     dword ptr [rbp-96], ecx
+    add     eax, 28
+    mov     dword ptr [rbp-92], eax
+    WINCALL DrawTextW, qword ptr [rbp-32], qword ptr [rbp-40], -1, addr rbp-104, DT_IMGFLAGS
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_cardfont]
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_text]
+    mov     eax, dword ptr [rbp-92]
+    add     eax, 4
+    mov     dword ptr [rbp-100], eax
+    add     eax, 20
+    mov     dword ptr [rbp-92], eax
+    WINCALL DrawTextW, qword ptr [rbp-32], qword ptr [rbp-48], -1, addr rbp-104, DT_IMGFLAGS
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_subfont]
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_textdim]
+    mov     eax, dword ptr [rbp-92]
+    add     eax, 2
+    mov     dword ptr [rbp-100], eax
+    add     eax, 18
+    mov     dword ptr [rbp-92], eax
+    WINCALL DrawTextW, qword ptr [rbp-32], qword ptr [rbp-56], -1, addr rbp-104, DT_IMGFLAGS
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-64]
+lew_ret:
+    FRAME_EPILOG
+    ret
+lbsb_empty_watermark endp
 
 ; lbsb_strip_inval(rcx = list) - repaint just the strip the thumb lives in.
 lbsb_strip_inval proc frame
@@ -10306,8 +11652,13 @@ lbsb_wheel endp
 ; gui_anim_apply(ecx = slot) - a slot's value changed: repaint what shows it.
 public gui_anim_apply
 gui_anim_apply proc frame
-    FRAME_PROLOG 64
+    FRAME_PROLOG 96
     mov     dword ptr [rbp-24], ecx
+    ; ANIM_ULINE and ANIM_TOG also work on standalone dialogs when g_vaulthwnd == 0
+    cmp     ecx, ANIM_ULINE
+    je      gaa_uline
+    cmp     ecx, ANIM_TOG
+    je      gaa_tog
     cmp     qword ptr [g_vaulthwnd], 0
     je      gaa_ret
     cmp     ecx, ANIM_LBSB
@@ -10326,6 +11677,103 @@ gui_anim_apply proc frame
     je      gaa_ghot
     cmp     ecx, ANIM_GOLD
     je      gaa_gold
+    cmp     ecx, ANIM_DONUT
+    je      gaa_donut
+    cmp     ecx, ANIM_FAVPOP
+    je      gaa_favpop
+    cmp     ecx, ANIM_COPY
+    je      gaa_copy
+    jmp     gaa_ret
+gaa_uline:
+    mov     rcx, qword ptr [g_uline_anim_hwnd]
+    test    rcx, rcx
+    jz      gaa_ret
+    mov     qword ptr [rbp-32], rcx
+    WINCALL GetParent, rcx
+    test    rax, rax
+    jz      gaa_ul_clr
+    mov     qword ptr [rbp-40], rax
+    WINCALL GetWindowRect, qword ptr [rbp-32], addr rbp-64
+    WINCALL MapWindowPoints, 0, qword ptr [rbp-40], addr rbp-64, 2
+    mov     eax, dword ptr [rbp-52]              ; B -> strip {L, B, R, B + 3}
+    mov     dword ptr [rbp-60], eax
+    add     eax, 3
+    mov     dword ptr [rbp-52], eax
+    WINCALL InvalidateRect, qword ptr [rbp-40], addr rbp-64, 1
+gaa_ul_clr:
+    mov     ecx, ANIM_ULINE
+    call    anim_active
+    test    eax, eax
+    jnz     gaa_ret
+    mov     qword ptr [g_uline_anim_hwnd], 0
+    jmp     gaa_ret
+gaa_tog:
+    mov     rcx, qword ptr [g_tog_anim_hwnd]
+    test    rcx, rcx
+    jz      gaa_ret
+    WINCALL InvalidateRect, rcx, 0, 0
+    mov     ecx, ANIM_TOG
+    call    anim_active
+    test    eax, eax
+    jnz     gaa_ret
+    mov     qword ptr [g_tog_anim_hwnd], 0
+    jmp     gaa_ret
+gaa_donut:
+    cmp     dword ptr [g_cur_idx], 0
+    jge     gaa_ret
+    cmp     dword ptr [g_menu_open], 0
+    jne     gaa_ret
+    cmp     dword ptr [g_trash_view], 0
+    jne     gaa_ret
+    mov     rcx, qword ptr [g_vaulthwnd]
+    lea     rdx, [rbp-64]
+    call    sidebar_rect
+    WINCALL GetClientRect, qword ptr [g_vaulthwnd], addr rbp-80
+    mov     eax, dword ptr [rbp-72]
+    sub     eax, HOME_PAD
+    mov     dword ptr [rbp-56], eax              ; R = paneR
+    sub     eax, 36
+    mov     dword ptr [rbp-64], eax              ; L = paneR - 36
+    mov     eax, dword ptr [rbp-60]
+    add     eax, HOME_PAD
+    mov     dword ptr [rbp-60], eax              ; T = paneT
+    add     eax, 34
+    mov     dword ptr [rbp-52], eax              ; B = paneT + 34
+    WINCALL InvalidateRect, qword ptr [g_vaulthwnd], addr rbp-64, 1
+    jmp     gaa_ret
+gaa_favpop:
+    WINCALL GetDlgItem, qword ptr [g_vaulthwnd], IDC_V_FAV
+    test    rax, rax
+    jz      gaa_ret
+    WINCALL InvalidateRect, rax, 0, 0
+    jmp     gaa_ret
+gaa_copy:
+    mov     rcx, qword ptr [g_copy_btn_hwnd]
+    test    rcx, rcx
+    jz      gaa_cp_toast
+    mov     qword ptr [rbp-32], rcx
+    mov     ecx, ANIM_COPY
+    call    anim_get
+    cmp     eax, 220
+    jg      @F
+    mov     qword ptr [g_copy_btn_hwnd], 0       ; restore normal copy icon after ~950ms
+@@: WINCALL InvalidateRect, qword ptr [rbp-32], 0, 0
+gaa_cp_toast:
+    WINCALL GetDlgItem, qword ptr [g_vaulthwnd], IDC_V_TOAST
+    test    rax, rax
+    jz      gaa_ret
+    mov     qword ptr [rbp-40], rax
+    mov     ecx, ANIM_COPY
+    call    anim_active
+    test    eax, eax
+    jnz     @F
+    mov     ecx, ANIM_COPY
+    call    anim_get
+    test    eax, eax
+    jnz     @F
+    call    gui_toast_hide
+    jmp     gaa_ret
+@@: WINCALL InvalidateRect, qword ptr [rbp-40], 0, 0
     jmp     gaa_ret
 gaa_lbsb:
     mov     rcx, qword ptr [g_lbsb_hwnd]
@@ -10680,8 +12128,26 @@ gui_xfade_drop endp
 ;   UpdateLayeredWindow has taken the bits, and the window goes when the fade
 ;   ends (or with its owner, at a lock).
 gui_xfade_begin proc frame
+    FRAME_PROLOG 48
+    xor     edx, edx                             ; mode 0 = detail pane
+    xor     r8d, r8d                             ; dx = 0
+    xor     r9d, r9d                             ; dy = 0 (clean cross-fade, no vertical shift)
+    call    gui_xfade_begin_ex
+    FRAME_EPILOG
+    ret
+gui_xfade_begin endp
+
+; gui_xfade_begin_ex(rcx=hdlg, edx=mode, r8d=dx, r9d=dy) - snapshot region into
+;   click-through ULW_ALPHA layered window (#5, #7, #8, #19):
+;     mode 0: detail pane (DLU x=210..R, y=TBAR_H..B)
+;     mode 1: content below title strip (x=0..R, y=TBAR_H..B)
+;     mode 2: full client area (x=0..R, y=0..B)
+gui_xfade_begin_ex proc frame
     FRAME_PROLOG 256
     mov     qword ptr [rbp-24], rcx
+    mov     dword ptr [g_xfade_mode], edx
+    mov     dword ptr [g_xfade_dx], r8d
+    mov     dword ptr [g_xfade_dy], r9d
     call    gui_xfade_drop
     cmp     dword ptr [g_anim_on], 0
     je      gxb_ret
@@ -10692,23 +12158,40 @@ gui_xfade_begin proc frame
     test    eax, eax
     jnz     gxb_ret
     WINCALL GetClientRect, qword ptr [rbp-24], addr rbp-64
-    mov     dword ptr [rbp-80], 210              ; the detail pane starts at DLU x 210
-    mov     dword ptr [rbp-76], 0                ;   (as gui_inval_detail)
+    cmp     dword ptr [g_xfade_mode], 0
+    jne     gxb_nonpane
+    mov     dword ptr [rbp-80], 210
+    mov     dword ptr [rbp-76], 0
     mov     dword ptr [rbp-72], 210
     mov     dword ptr [rbp-68], 8
     WINCALL MapDialogRect, qword ptr [rbp-24], addr rbp-80
+    mov     ecx, dword ptr [rbp-80]              ; srcX = paneL
+    mov     edx, TBAR_H                          ; srcY = TBAR_H (never cover title strip)
+    jmp     gxb_rect
+gxb_nonpane:
+    xor     ecx, ecx                             ; srcX = 0
+    xor     edx, edx                             ; srcY = 0
+    cmp     dword ptr [g_xfade_mode], 1
+    jne     gxb_rect
+    mov     edx, TBAR_H                          ; mode 1: below TBAR_H
+gxb_rect:
+    mov     dword ptr [rbp-80], ecx              ; srcX
+    mov     dword ptr [rbp-76], edx              ; srcY
     mov     eax, dword ptr [rbp-56]
-    sub     eax, dword ptr [rbp-80]
+    sub     eax, ecx
     jle     gxb_ret
     mov     dword ptr [rbp-88], eax              ; SIZE.cx
     mov     eax, dword ptr [rbp-52]
-    test    eax, eax
+    sub     eax, edx
     jle     gxb_ret
     mov     dword ptr [rbp-84], eax              ; SIZE.cy
-    mov     eax, dword ptr [rbp-80]
-    mov     dword ptr [rbp-96], eax              ; POINT: the pane's corner, on screen
-    mov     dword ptr [rbp-92], 0
+    mov     dword ptr [rbp-96], ecx              ; POINT: corner on screen
+    mov     dword ptr [rbp-92], edx
     WINCALL ClientToScreen, qword ptr [rbp-24], addr rbp-96
+    mov     eax, dword ptr [rbp-96]
+    mov     dword ptr [g_xfade_base_x], eax
+    mov     eax, dword ptr [rbp-92]
+    mov     dword ptr [g_xfade_base_y], eax
     mov     qword ptr [rbp-112], 0               ; memory DC
     mov     qword ptr [rbp-120], 0               ;   and its bitmap
     WINCALL GetDC, qword ptr [rbp-24]
@@ -10726,7 +12209,7 @@ gui_xfade_begin proc frame
     WINCALL SelectObject, qword ptr [rbp-112], qword ptr [rbp-120]
     mov     qword ptr [rbp-128], rax
     WINCALL BitBlt, qword ptr [rbp-112], 0, 0, dword ptr [rbp-88], dword ptr [rbp-84], \
-            qword ptr [rbp-104], dword ptr [rbp-80], 0, SRCCOPY_
+            qword ptr [rbp-104], dword ptr [rbp-80], dword ptr [rbp-76], SRCCOPY_
     WINCALL CreateWindowExW, XF_EXSTYLE, addr cls_static, 0, WS_POPUP, \
             dword ptr [rbp-96], dword ptr [rbp-92], dword ptr [rbp-88], dword ptr [rbp-84], \
             qword ptr [rbp-24], 0, qword ptr [g_hinst], 0
@@ -10748,6 +12231,7 @@ gui_xfade_begin proc frame
 gxb_kill:
     WINCALL DestroyWindow, qword ptr [rbp-136]
 gxb_unsel:
+    WINCALL PatBlt, qword ptr [rbp-112], 0, 0, dword ptr [rbp-88], dword ptr [rbp-84], PATBLT_BLACK_
     WINCALL SelectObject, qword ptr [rbp-112], qword ptr [rbp-128]
 gxb_rel:
     cmp     qword ptr [rbp-120], 0
@@ -10762,10 +12246,10 @@ gxb_nodc:
 gxb_ret:
     FRAME_EPILOG
     ret
-gui_xfade_begin endp
+gui_xfade_begin_ex endp
 
-; gui_xfade_go(rcx = hdlg) - the new entry is laid out: paint it now (under the
-;   overlay), then fade the overlay away.
+; gui_xfade_go(rcx = hdlg) - the new state is laid out: paint it now (under the
+;   overlay), then fade (+ optional subtle pptDst glide) the overlay away.
 gui_xfade_go proc frame
     FRAME_PROLOG 48
     mov     qword ptr [rbp-24], rcx
@@ -10779,15 +12263,18 @@ gui_xfade_go proc frame
     mov     ecx, ANIM_XFADE
     xor     edx, edx
     mov     r8d, XFADE_MS
-    call    anim_set
+    cmp     dword ptr [g_xfade_mode], 1
+    jne     @F
+    mov     r8d, 120                             ; crisp 120ms slide-over for Settings (#5)
+@@: call    anim_set
 gxg_ret:
     FRAME_EPILOG
     ret
 gui_xfade_go endp
 
-; gui_xfade_step - ANIM_XFADE moved: the overlay's alpha follows; at 0, it goes.
+; gui_xfade_step - ANIM_XFADE moved: update overlay alpha and optional pptDst settle (#5, #8).
 gui_xfade_step proc frame
-    FRAME_PROLOG 112
+    FRAME_PROLOG 128
     cmp     qword ptr [g_xfade_hwnd], 0
     je      gxs_ret
     mov     ecx, ANIM_XFADE
@@ -10802,14 +12289,82 @@ gui_xfade_step proc frame
     call    gui_xfade_drop
     jmp     gxs_ret
 gxs_show:
-    mov     eax, dword ptr [rbp-24]
+    mov     ecx, 255
+    sub     ecx, eax                             ; progress 0..255
+    mov     edx, dword ptr [g_xfade_dx]
+    imul    edx, ecx
+    sar     edx, 8
+    add     edx, dword ptr [g_xfade_base_x]
+    mov     dword ptr [rbp-40], edx              ; pptDst.x
+    mov     edx, dword ptr [g_xfade_dy]
+    imul    edx, ecx
+    sar     edx, 8
+    add     edx, dword ptr [g_xfade_base_y]
+    mov     dword ptr [rbp-36], edx              ; pptDst.y
     shl     eax, 16
     mov     dword ptr [rbp-28], eax              ; BLENDFUNCTION, alpha only
-    WINCALL UpdateLayeredWindow, qword ptr [g_xfade_hwnd], 0, 0, 0, 0, 0, 0, addr rbp-28, ULW_ALPHA_
+    WINCALL UpdateLayeredWindow, qword ptr [g_xfade_hwnd], 0, addr rbp-40, 0, 0, 0, 0, addr rbp-28, ULW_ALPHA_
 gxs_ret:
     FRAME_EPILOG
     ret
 gui_xfade_step endp
+
+; gui_modal_dim_begin(rcx = owner) / gui_modal_dim_end() - soft 30% dark scrim over
+;   DLG_VAULT behind modal dialogs (#5).  Owned by g_trayhwnd (NOT g_vaulthwnd) so
+;   modal window enumeration on g_vaulthwnd sees only the real modal dialog.
+gui_modal_dim_begin proc frame
+    FRAME_PROLOG 192
+    mov     qword ptr [rbp-24], rcx
+    mov     rax, qword ptr [g_vaulthwnd]
+    test    rax, rax
+    jz      gmd_ret
+    cmp     rax, qword ptr [rbp-24]
+    jne     gmd_ret
+    call    gui_xfade_drop
+    call    gui_modal_dim_end
+    WINCALL IsWindowVisible, qword ptr [g_vaulthwnd]
+    test    eax, eax
+    jz      gmd_ret
+    WINCALL IsIconic, qword ptr [g_vaulthwnd]
+    test    eax, eax
+    jnz     gmd_ret
+    WINCALL GetWindowRect, qword ptr [g_vaulthwnd], addr rbp-48
+    mov     r8d, dword ptr [rbp-40]
+    sub     r8d, dword ptr [rbp-48]              ; W = R - L
+    jle     gmd_ret
+    mov     dword ptr [rbp-52], r8d
+    mov     r9d, dword ptr [rbp-36]
+    sub     r9d, dword ptr [rbp-44]              ; H = B - T
+    jle     gmd_ret
+    mov     dword ptr [rbp-56], r9d
+    WINCALL CreateWindowExW, <XF_EXSTYLE or 8>, addr cls_static, 0, <WS_POPUP or 4>, \
+            dword ptr [rbp-48], dword ptr [rbp-44], dword ptr [rbp-52], dword ptr [rbp-56], \
+            qword ptr [g_trayhwnd], 0, qword ptr [g_hinst], 0
+    test    rax, rax
+    jz      gmd_ret
+    mov     qword ptr [g_dim_hwnd], rax
+    mov     rcx, rax
+    call    gui_protect_hwnd
+    WINCALL SetLayeredWindowAttributes, qword ptr [g_dim_hwnd], 0, 76, 2
+    WINCALL ShowWindow, qword ptr [g_dim_hwnd], SW_SHOWNOACTIVATE_
+    WINCALL SetWindowPos, qword ptr [g_dim_hwnd], HWND_TOPMOST_, 0, 0, 0, 0, \
+            <SWP_NOMOVE_ or SWP_NOSIZE_ or SWP_NOACTIVATE_>
+gmd_ret:
+    FRAME_EPILOG
+    ret
+gui_modal_dim_begin endp
+
+gui_modal_dim_end proc frame
+    FRAME_PROLOG 32
+    mov     rcx, qword ptr [g_dim_hwnd]
+    test    rcx, rcx
+    jz      gmde_ret
+    mov     qword ptr [g_dim_hwnd], 0
+    WINCALL DestroyWindow, rcx
+gmde_ret:
+    FRAME_EPILOG
+    ret
+gui_modal_dim_end endp
 
 ; gui_inval_underlines(rcx = hdlg) - repaint the strip under each edit that has a
 ;   Fluent underline (frame_cb: the vault's own edits, not the rows').  A focus
@@ -10833,16 +12388,35 @@ uline_cb proc
     WINCALL GetParent, rcx
     cmp     rax, qword ptr [g_excl_par]
     jne     ulc_ret
+    WINCALL IsWindowVisible, qword ptr [rbp-24]
+    test    eax, eax
+    jz      ulc_ret
     WINCALL GetClassNameW, qword ptr [rbp-24], addr rbp-64, 16
     cmp     word ptr [rbp-64], 'E'
     jne     ulc_ret
     cmp     word ptr [rbp-62], 'd'
     jne     ulc_ret
     WINCALL GetDlgCtrlID, qword ptr [rbp-24]
-    cmp     eax, IDC_DYN_BASE                    ; row edits have no underline
+    cmp     eax, IDC_DYN_BASE                    ; row edits sit on field cards
     jae     ulc_ret
+    mov     dword ptr [rbp-28], eax
     WINCALL GetWindowRect, qword ptr [rbp-24], addr rbp-88
     WINCALL MapWindowPoints, 0, qword ptr [g_excl_par], addr rbp-88, 2
+    mov     rax, qword ptr [g_excl_par]
+    cmp     rax, qword ptr [g_settings_hwnd]
+    je      ulc_glass
+    cmp     rax, qword ptr [g_vaulthwnd]
+    jne     ulc_strip
+    cmp     dword ptr [rbp-28], IDC_V_SEARCH
+    je      ulc_strip
+ulc_glass:
+    sub     dword ptr [rbp-88], 5
+    sub     dword ptr [rbp-84], 3
+    add     dword ptr [rbp-80], 5
+    add     dword ptr [rbp-76], 3
+    WINCALL InvalidateRect, qword ptr [g_excl_par], addr rbp-88, 1
+    jmp     ulc_ret
+ulc_strip:
     mov     eax, dword ptr [rbp-76]              ; the strip: {L, B, R, B + 3}
     mov     dword ptr [rbp-84], eax
     add     eax, 3
@@ -10855,8 +12429,9 @@ ulc_ret:
     ret
 uline_cb endp
 
-; erase_excl_cb(rcx = hwnd, rdx = 0) -> 1 - leave a visible edit (a direct child of
-;   g_excl_par) out of the background paint going on in g_excl_hdc.
+; erase_excl_cb(rcx = hwnd, rdx = 0) -> 1 - exclude every visible direct child of
+;   g_excl_par (DLG_VAULT) from g_excl_hdc so background/ambient blits never flash
+;   over buttons, headers, badges, or edits.
 erase_excl_cb proc
     push    rbp
     mov     rbp, rsp
@@ -10868,11 +12443,6 @@ erase_excl_cb proc
     WINCALL IsWindowVisible, qword ptr [rbp-24]
     test    eax, eax
     jz      eec_ret
-    WINCALL GetClassNameW, qword ptr [rbp-24], addr rbp-64, 16
-    cmp     word ptr [rbp-64], 'E'
-    jne     eec_ret
-    cmp     word ptr [rbp-62], 'd'
-    jne     eec_ret
     WINCALL GetWindowRect, qword ptr [rbp-24], addr rbp-88
     WINCALL MapWindowPoints, 0, qword ptr [g_excl_par], addr rbp-88, 2
     WINCALL ExcludeClipRect, qword ptr [g_excl_hdc], dword ptr [rbp-88], dword ptr [rbp-84], \
@@ -10944,8 +12514,10 @@ geb_buf:
     ; ...and so do the edit boxes: theme_ctlcolor hands every one an opaque brush the
     ; colour of the card under it.  Painting the card there first showed the boxes
     ; empty for a frame on every full repaint, before their text came back.
+ifdef PROBE_IO
     test    dword ptr [g_test_flags], TF_NOEXCL
     jnz     geb_buf2
+endif
     mov     rax, qword ptr [rbp-24]
     mov     qword ptr [g_excl_hdc], rax
     mov     rax, qword ptr [rbp-32]
@@ -10971,6 +12543,7 @@ geb_buf2:
     call    gui_erase_into
     WINCALL BitBlt, qword ptr [rbp-24], 0, 0, dword ptr [rbp-72], dword ptr [rbp-68], \
             qword ptr [rbp-40], 0, 0, SRCCOPY_
+    WINCALL PatBlt, qword ptr [rbp-40], 0, 0, dword ptr [rbp-72], dword ptr [rbp-68], PATBLT_BLACK_
     WINCALL SelectObject, qword ptr [rbp-40], qword ptr [rbp-120]
     jmp     geb_free
 geb_direct:                                      ; no buffer (GDI exhausted): as before
@@ -10997,10 +12570,11 @@ gui_erase_buffered endp
 ;   tells a glyph from a letter by exactly that boundary.
 gui_entry_monogram proc frame
     FRAME_PROLOG 224
+    mov     dword ptr [rbp-48], 0
     lea     rdx, [rbp-32]
     call    vault_title_at                       ; rax = UTF-8, [rbp-32] = length
     test    rax, rax
-    jz      gem_none
+    jz      gem_out
     mov     rcx, rax
     mov     edx, dword ptr [rbp-32]
     cmp     edx, 60                              ; the first few words are plenty, and
@@ -11014,10 +12588,10 @@ gem_conv:
 gem_lp:
     mov     ecx, dword ptr [rbp-36]
     cmp     ecx, 63
-    jae     gem_none
+    jae     gem_wipe
     movzx   eax, word ptr [rbp+rcx*2-200]
     test    eax, eax
-    jz      gem_none
+    jz      gem_wipe
     inc     dword ptr [rbp-36]
     cmp     eax, 0D800h
     jae     gem_lp
@@ -11030,11 +12604,16 @@ gem_lp:
     WINCALL CharUpperBuffW, addr rbp-44, 1
     movzx   eax, word ptr [rbp-44]
     cmp     eax, 0D800h
-    jae     gem_none
-    FRAME_EPILOG
-    ret
-gem_none:
-    xor     eax, eax
+    jae     gem_wipe
+    mov     dword ptr [rbp-48], eax
+gem_wipe:
+    mov     dword ptr [rbp-40], 0
+    mov     dword ptr [rbp-44], 0
+    lea     rcx, [rbp-200]
+    mov     edx, 128
+    call    secure_zero
+gem_out:
+    mov     eax, dword ptr [rbp-48]
     FRAME_EPILOG
     ret
 gui_entry_monogram endp
@@ -11647,7 +13226,10 @@ gra_totp:
     GHOSTIFY gt_reveal
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_TCODE, addr cls_static, 0, \
             SS_LEFTNOWORDWRAP_
-    WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_TBAR, addr cls_static, 0, \
+    test    rax, rax
+    jz      @F
+    WINCALL SendMessageW, rax, WM_SETFONT, qword ptr [g_font_totp], 0
+@@: WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_TBAR, addr cls_static, 0, \
             SS_OWNERDRAW_
     WINCALL row_mk, qword ptr [rbp-24], dword ptr [rbp-40], DS_COPY, addr cls_button, addr wb_copy, \
             BS_OWNERDRAW_
@@ -11827,7 +13409,7 @@ tf_remove endp
 
 ; tf_find_row() -> eax = row index of the attachments tile (VF_FILE/VF_IMAGE) or -1.
 tf_find_row proc frame
-    FRAME_PROLOG 32
+    FRAME_PROLOG 48
     mov     dword ptr [rbp-24], 0
 tff_l:
     mov     eax, dword ptr [rbp-24]
@@ -11920,7 +13502,7 @@ gui_wcpy_bounded endp
 ;   unlabelled legacy shapes).  Never reads past valptr + vallen even if a
 ;   corrupt/forged field omits NUL terminators; stages strings in pinned g_pwhblob.
 gsd_parse_pwhist proc frame
-    FRAME_PROLOG 64
+    FRAME_PROLOG 80
     cmp     edx, 10                             ; need 8B filetime + >=1 wchar
     jb      gpph_done
     mov     r10, rcx                            ; valptr
@@ -12021,7 +13603,7 @@ gsd_parse_pwhist endp
 ;            r9d = PWHA_* action) - add a history entry; when full, drop the
 ;   oldest so the most recent are kept.
 pwh_append proc frame
-    FRAME_PROLOG 64
+    FRAME_PROLOG 80
     mov     qword ptr [rbp-24], rcx
     mov     qword ptr [rbp-32], rdx
     mov     qword ptr [rbp-56], r8
@@ -12194,12 +13776,12 @@ img_pick proc frame
     cmp     dword ptr [rbp-32], 0
     jne     ip_save
     mov     word ptr [g_imgpath], 0             ; open: start from an empty pick
-    mov     dword ptr [r10].OPENFILENAMEW.Flags, OFN_FILEMUSTEXIST or OFN_PATHMUSTEXIST or OFN_HIDEREADONLY or OFN_EXPLORER
+    mov     dword ptr [r10].OPENFILENAMEW.Flags, OFN_FILEMUSTEXIST or OFN_PATHMUSTEXIST or OFN_HIDEREADONLY or OFN_EXPLORER or OFN_NOCHANGEDIR
     WINCALL GetOpenFileNameW, addr g_ofn
     FRAME_EPILOG
     ret
 ip_save:
-    mov     dword ptr [r10].OPENFILENAMEW.Flags, OFN_OVERWRITEPROMPT or OFN_PATHMUSTEXIST or OFN_HIDEREADONLY or OFN_EXPLORER
+    mov     dword ptr [r10].OPENFILENAMEW.Flags, OFN_OVERWRITEPROMPT or OFN_PATHMUSTEXIST or OFN_HIDEREADONLY or OFN_EXPLORER or OFN_NOCHANGEDIR
     WINCALL GetSaveFileNameW, addr g_ofn
     FRAME_EPILOG
     ret
@@ -12219,7 +13801,7 @@ img_pick endp
 ;     6. Caps at 119 chars while preserving an extension of <= 32 chars.
 public gui_sanitize_attname
 gui_sanitize_attname proc frame
-    FRAME_PROLOG 64
+    FRAME_PROLOG 80
     mov     qword ptr [rbp-24], rcx             ; raw_wide
     mov     qword ptr [rbp-32], rdx             ; out_wide120
     test    rcx, rcx
@@ -12434,6 +14016,12 @@ gsa_default:
     lea     rdx, [name_default_att]
     call    gui_wcpy_capped
 gsa_done:
+    lea     rcx, [g_san_tmp]
+    mov     edx, 260*2
+    call    secure_zero
+    lea     rcx, [g_san_stem]
+    mov     edx, 40*2
+    call    secure_zero
     FRAME_EPILOG
     ret
 gui_sanitize_attname endp
@@ -12726,7 +14314,7 @@ gtp_loop:
     lea     r10, [g_tempfiles]
     add     r10, rax
     mov     qword ptr [rbp-48], r10                    ; &entry (path @ +0)
-    WINCALL CreateFileW, r10, GENERIC_WRITE_, 0, 0, OPEN_EXISTING_, FILE_ATTR_NORMAL_, 0
+    WINCALL CreateFileW, r10, GENERIC_WRITE_, 0, 0, OPEN_EXISTING_, <FILE_ATTR_NORMAL_ or 00200000h>, 0
     cmp     rax, -1
     je      gtp_openfail
     mov     qword ptr [rbp-32], rax
@@ -12924,6 +14512,7 @@ gtss_ret:
     ret
 gui_temp_sweep_stale endp
 
+ifdef PROBE_IO
 ; gui_tmptest() -> eax = 0 pass / 1 fail (headless probe for the secure temp
 ;   lifecycle). Checks unique directories, exclusive-create collision refusal,
 ;   partial cleanup with a held viewer handle, and successful later retry.
@@ -13052,6 +14641,7 @@ gtt2_cleanup:
     FRAME_EPILOG
     ret
 gui_tmptest endp
+endif
 
 ; gui_ext_can_preview(rcx = wide filename) -> eax = 1 if the basename carries a
 ;   safe-preview allowlisted extension (preview_exts: txt, png, jpg, jpeg, gif,
@@ -13060,7 +14650,7 @@ gui_tmptest endp
 ;   stem before the extension, and compares case-insensitively.
 public gui_ext_can_preview
 gui_ext_can_preview proc frame
-    FRAME_PROLOG 48
+    FRAME_PROLOG 64
     test    rcx, rcx
     jz      gxp_no
     mov     qword ptr [rbp-24], rcx            ; name
@@ -13187,11 +14777,19 @@ gui_same_file proc frame
     mov     r8d, MAX_PATH_CHARS + 16
     call    path_longify
     mov     qword ptr [rbp-64], rax
+    mov     rcx, rax
+    call    file_path_allowed
+    test    eax, eax
+    jz      gsf2_done
     mov     rcx, qword ptr [rbp-24]
     lea     rdx, [g_gsf_b]
     mov     r8d, MAX_PATH_CHARS + 16
     call    path_longify
     mov     qword ptr [rbp-72], rax
+    mov     rcx, rax
+    call    file_path_allowed
+    test    eax, eax
+    jz      gsf2_done
     WINCALL CreateFileW, qword ptr [rbp-64], 80h, 7, 0, OPEN_EXISTING_, 02000000h, 0
     cmp     rax, -1                             ; 80h = FILE_READ_ATTRIBUTES, share all,
     je      gsf2_done                           ;   BACKUP_SEMANTICS
@@ -13326,7 +14924,7 @@ gui_motw endp
 ;   user pick where to save it (Save As).  Used for all non-previewable types so
 ;   Vordr writes the file (marked with MOTW where supported) without executing it.
 gui_tag_saveas proc frame
-    FRAME_PROLOG 64
+    FRAME_PROLOG 80
     mov     qword ptr [rbp-24], rcx           ; hdlg
     mov     dword ptr [rbp-32], edx           ; index
     cmp     edx, dword ptr [g_tilefile_n]
@@ -13514,7 +15112,10 @@ gui_tile_add_cur proc frame
     call    read_file
     test    eax, eax
     jnz     gtac_no
-    lea     rcx, [g_imgpath]
+    cmp     qword ptr [g_imgbuflen], 0
+    je      @F
+    WINCALL VirtualLock, qword ptr [g_imgbuf], qword ptr [g_imgbuflen]
+@@: lea     rcx, [g_imgpath]
     call    gui_basename                            ; -> g_imgfn_w
     mov     rcx, qword ptr [g_imgbuf]
     mov     rdx, qword ptr [g_imgbuflen]
@@ -13529,7 +15130,10 @@ gui_tile_add_cur proc frame
     test    eax, eax
     jnz     gtac_free_no
     mov     dword ptr [g_dirty], 1
-    mov     rcx, qword ptr [g_imgbuf]
+    cmp     qword ptr [g_imgbuflen], 0
+    je      @F
+    WINCALL VirtualUnlock, qword ptr [g_imgbuf], qword ptr [g_imgbuflen]
+@@: mov     rcx, qword ptr [g_imgbuf]
     mov     rdx, qword ptr [g_imgbuflen]
     call    mem_free
     mov     qword ptr [g_imgbuf], 0
@@ -13537,7 +15141,10 @@ gui_tile_add_cur proc frame
     FRAME_EPILOG
     ret
 gtac_free_no:
-    mov     rcx, qword ptr [g_imgbuf]
+    cmp     qword ptr [g_imgbuflen], 0
+    je      @F
+    WINCALL VirtualUnlock, qword ptr [g_imgbuf], qword ptr [g_imgbuflen]
+@@: mov     rcx, qword ptr [g_imgbuf]
     mov     rdx, qword ptr [g_imgbuflen]
     call    mem_free
     mov     qword ptr [g_imgbuf], 0
@@ -13756,7 +15363,7 @@ grl_row:
     mov     dword ptr [rbp-48], 11               ; valH
     cmp     eax, VF_NOTES
     jne     grl_chkblock
-    mov     dword ptr [rbp-44], 54
+    mov     dword ptr [rbp-44], 56               ; 14 band + 40 edit + 2 bottom inset (matches 27 = 14 + 11 + 2)
     mov     dword ptr [rbp-48], 40
     jmp     grl_setyh
 grl_chkblock:
@@ -13877,7 +15484,7 @@ grl_chksecw:
     cmp     dword ptr [r10+FD_KIND], VF_PIN
     jne     grl_chktotpw
 grl_issecw:
-    mov     dword ptr [rbp-76], 118             ; card secret/PIN: stop before the badge (x=300)
+    mov     dword ptr [rbp-76], 164             ; card secret/PIN: stop before reveal (x=344)
     cmp     dword ptr [rbp-68], 0
     jne     grl_valpos
     mov     dword ptr [rbp-76], 130             ; flat secret/PIN
@@ -13949,7 +15556,7 @@ grl_copytotp:
     add     r9d, 4
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 12, 12
 grl_copydone:
-    ; totp code (206, y+off, 110, 11) + bar (206, y+off+11, 110, 2)
+    ; totp code (176, y+off, 84, 11) + circular ring & smooth pill bar (264, y+off, 92, 11) (#3, #20)
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_TCODE*8]
@@ -13960,11 +15567,10 @@ grl_copydone:
     mov     rcx, qword ptr [rbp-24]
     mov     r10, qword ptr [rbp-32]
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_TBAR*8]
-    mov     r8d, 176
+    mov     r8d, 264
     mov     r9d, dword ptr [rbp-60]
     add     r9d, dword ptr [rbp-56]
-    add     r9d, 11
-    WINCALL move_ctl, rcx, rdx, r8d, r9d, 84, 3
+    WINCALL move_ctl, rcx, rdx, r8d, r9d, 92, 11
     ; reorder chevrons: stacked in the left gutter (edit mode), flat glyphs;
     ; delete stays as a button in the card's top-right corner
     mov     eax, dword ptr [rbp-44]              ; card mid = top + H/2
@@ -14015,7 +15621,7 @@ grl_issecb:
     mov     rdx, qword ptr [r10+FD_HANDLES+DS_SBADGE*8]
     mov     r8d, 300                             ; view mode: left of the reveal/copy cluster
     mov     r9d, dword ptr [rbp-40]
-    add     r9d, 4
+    add     r9d, 3
     WINCALL move_ctl, rcx, rdx, r8d, r9d, 40, 11
     mov     eax, dword ptr [rbp-52]           ; edit=SW_SHOW, view=SW_HIDE
     xor     eax, SW_SHOW                      ; badge shows in view (opposite)
@@ -14437,7 +16043,7 @@ url_editproc proc
     mov     eax, 1                              ; TRUE -> halt default cursor handling
     jmp     uep_ret
 uep_pass:
-    WINCALL CallWindowProcW, qword ptr [g_url_origproc], qword ptr [rbp-8], \
+    WINCALL DefSubclassProc, qword ptr [rbp-8], \
             qword ptr [rbp-16], qword ptr [rbp-24], qword ptr [rbp-32]
 uep_ret:
     mov     rsp, rbp
@@ -14446,7 +16052,7 @@ uep_ret:
 url_editproc endp
 
 ; gui_subclass_urls(rcx=hdlg) - subclass every VF_URL row's value edit with
-;   url_editproc (freshly-built controls, so idempotent per row rebuild).
+;   url_editproc via SetWindowSubclass (chains cleanly with glass_edit_subclass).
 gui_subclass_urls proc frame
     FRAME_PROLOG 48
     mov     dword ptr [rbp-24], 0               ; row
@@ -14463,8 +16069,7 @@ gsu_l:
     call    gui_row_handle                      ; -> rax = value control hwnd
     test    rax, rax
     jz      gsu_next
-    WINCALL SetWindowLongPtrW, rax, GWLP_WNDPROC, addr url_editproc
-    mov     qword ptr [g_url_origproc], rax     ; original EDIT proc (same for all)
+    WINCALL SetWindowSubclass, rax, addr url_editproc, 1, 0
 gsu_next:
     inc     dword ptr [rbp-24]
     jmp     gsu_l
@@ -14604,6 +16209,8 @@ gui_row_copy proc frame
     imul    eax, eax, DESCSZ
     lea     r10, [g_fields]
     add     r10, rax
+    mov     rcx, qword ptr [r10+FD_HANDLES+DS_COPY*8]
+    mov     qword ptr [g_copy_btn_hwnd], rcx     ; morph clicked copy glyph -> emerald checkmark (#2)
     cmp     dword ptr [r10+FD_KIND], VF_TOTP
     jne     grc_value
     mov     rcx, qword ptr [rbp-24]
@@ -14620,7 +16227,11 @@ grc_value:
     lea     rdx, [g_secret_w]
     call    gui_copy
 grc_done:
-    FRAME_EPILOG
+    mov     rcx, qword ptr [g_copy_btn_hwnd]
+    test    rcx, rcx
+    jz      @F
+    WINCALL InvalidateRect, rcx, 0, 0
+@@: FRAME_EPILOG
     ret
 gui_row_copy endp
 
@@ -14693,6 +16304,7 @@ gat_next:
 gat_done:
     cmp     dword ptr [g_totp_on], 0
     je      gat_ret
+    mov     dword ptr [g_totp_prev0], 0          ; new DS_TCODE hwnd: always populate text
     mov     rcx, qword ptr [rbp-24]
     call    gui_totp_refresh
     WINCALL SetTimer, qword ptr [rbp-24], TOTP_TIMER, TOTP_MS, 0
@@ -14887,6 +16499,13 @@ gui_row_moveup proc frame
     cmp     edx, 0
     jle     grmu_done
     mov     rcx, qword ptr [rbp-24]
+    xor     edx, edx
+    xor     r8d, r8d
+    mov     r9d, -3                              ; smooth upward reorder settle (#8)
+    call    gui_xfade_begin_ex
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_freeze
+    mov     rcx, qword ptr [rbp-24]
     call    gui_gather
     mov     eax, dword ptr [rbp-32]             ; list[row] <-> list[row+1]
     imul    eax, eax, 24
@@ -14896,6 +16515,10 @@ gui_row_moveup proc frame
     call    swap24
     mov     rcx, qword ptr [rbp-24]
     call    gui_rebuild_rows
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_thaw
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_xfade_go
     mov     dword ptr [g_dirty], 1
 grmu_done:
     FRAME_EPILOG
@@ -14912,6 +16535,13 @@ gui_row_movedown proc frame
     cmp     edx, eax
     jge     grmd_done
     mov     rcx, qword ptr [rbp-24]
+    xor     edx, edx
+    xor     r8d, r8d
+    mov     r9d, 3                               ; smooth downward reorder settle (#8)
+    call    gui_xfade_begin_ex
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_freeze
+    mov     rcx, qword ptr [rbp-24]
     call    gui_gather
     mov     eax, dword ptr [rbp-32]             ; list[row+1] <-> list[row+2]
     inc     eax
@@ -14922,6 +16552,10 @@ gui_row_movedown proc frame
     call    swap24
     mov     rcx, qword ptr [rbp-24]
     call    gui_rebuild_rows
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_thaw
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_xfade_go
     mov     dword ptr [g_dirty], 1
 grmd_done:
     FRAME_EPILOG
@@ -14930,9 +16564,16 @@ gui_row_movedown endp
 
 ; gui_row_delete(rcx=hdlg, edx=row) - remove a dynamic row.
 gui_row_delete proc frame
-    FRAME_PROLOG 48
+    FRAME_PROLOG 64
     mov     qword ptr [rbp-24], rcx
     mov     dword ptr [rbp-32], edx
+    mov     rcx, qword ptr [rbp-24]
+    xor     edx, edx
+    xor     r8d, r8d
+    mov     r9d, -3
+    call    gui_xfade_begin_ex
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_freeze
     mov     rcx, qword ptr [rbp-24]
     call    gui_gather
     ; shift list[k+1] -> list[k] for k = row+1 .. g_field_n-2
@@ -14962,6 +16603,10 @@ grd_shifted:
     dec     dword ptr [g_field_n]
     mov     rcx, qword ptr [rbp-24]
     call    gui_rebuild_rows
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_thaw
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_xfade_go
     mov     dword ptr [g_dirty], 1
     FRAME_EPILOG
     ret
@@ -15433,7 +17078,7 @@ gui_wapp_lc endp
 ; gui_phon_word(ecx = char, rdx = dst wide) - write the char's phonetic word
 ;   (NUL-terminated; "CAP-" prefix for uppercase; digit + symbol names) to dst.
 gui_phon_word proc frame
-    FRAME_PROLOG 48
+    FRAME_PROLOG 64
     mov     dword ptr [rbp-24], ecx           ; char
     mov     qword ptr [rbp-32], rdx           ; dst
     cmp     ecx, 'A'
@@ -15700,23 +17345,34 @@ gui_draw_rowcolor proc frame
     mov     r10, rcx
     mov     rax, qword ptr [r10+32]
     mov     qword ptr [rbp-32], rax           ; hdc
+    mov     rcx, rax
+    mov     rdx, qword ptr [r10+24]
+    lea     r8, [r10+40]
+    call    gpu_fill_glass_child
+    test    eax, eax
+    jnz     drc_bg_done
     WINCALL CreateSolidBrush, dword ptr [g_col_panel]
     mov     qword ptr [rbp-40], rax
     mov     r10, qword ptr [rbp-24]
     lea     rdx, [r10+40]
     WINCALL FillRect, qword ptr [rbp-32], rdx, qword ptr [rbp-40]
     WINCALL DeleteObject, qword ptr [rbp-40]
+drc_bg_done:
     cmp     dword ptr [g_colorpw_row], 0
     jl      drc_done
     mov     ecx, dword ptr [g_colorpw_row]    ; fetch the plaintext
     mov     edx, DS_VALUE
     call    dynid
     WINCALL GetDlgItemTextW, qword ptr [g_vaulthwnd], eax, addr g_rowpw_w, 256
-    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_dlgfont]
+    call    gui_make_listfonts                  ; ensure -14 Consolas g_rowmonofont exists (#20)
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_rowmonofont]
     mov     qword ptr [rbp-48], rax           ; old font
     WINCALL SetBkMode, qword ptr [rbp-32], 1
     WINCALL GetTextExtentPoint32W, qword ptr [rbp-32], addr pr_zero, 1, addr rbp-88
     mov     r10, qword ptr [rbp-24]           ; y = vertically centered in the rect
+    mov     eax, dword ptr [r10+48]
+    sub     eax, dword ptr [r10+40]
+    mov     dword ptr [rbp-68], eax           ; boxW
     mov     eax, dword ptr [r10+52]
     sub     eax, dword ptr [r10+44]
     sub     eax, dword ptr [rbp-84]
@@ -15736,14 +17392,20 @@ drc_loop:
     call    gui_class_color
     WINCALL SetTextColor, qword ptr [rbp-32], eax
     WINCALL GetTextExtentPoint32W, qword ptr [rbp-32], addr rbp-100, 1, addr rbp-88
+    mov     eax, dword ptr [rbp-56]
+    add     eax, dword ptr [rbp-88]
+    cmp     eax, dword ptr [rbp-68]
+    jg      drc_end                           ; never slice a character in half at right edge
     WINCALL TextOutW, qword ptr [rbp-32], dword ptr [rbp-56], dword ptr [rbp-60], \
             addr rbp-100, 1
     mov     eax, dword ptr [rbp-88]
+    inc     eax                               ; +1px tabular monospace tracking (#20)
     add     dword ptr [rbp-56], eax
     inc     dword ptr [rbp-64]
     cmp     dword ptr [rbp-64], 256
     jb      drc_loop
 drc_end:
+    mov     dword ptr [rbp-100], 0
     WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-48]
 drc_done:
     FRAME_EPILOG
@@ -15753,7 +17415,7 @@ gui_draw_rowcolor endp
 ; gui_colorpw_hide(rcx=hdlg) - hide the colour overlay + restore the value edit.
 gui_colorpw_hide proc frame
     FRAME_PROLOG 48
-    mov     qword ptr [rbp-16], rcx
+    mov     qword ptr [rbp-24], rcx
     cmp     dword ptr [g_colorpw_row], 0
     jl      cph_ovl
     mov     ecx, dword ptr [g_colorpw_row]    ; re-show the value edit we hid
@@ -15764,17 +17426,27 @@ gui_colorpw_hide proc frame
     call    ShowWindow
 cph_ovl:
     mov     dword ptr [g_colorpw_row], -1
-    mov     rcx, qword ptr [rbp-16]
+    mov     rcx, qword ptr [rbp-24]
     mov     edx, IDC_V_COLORPW
     call    GetDlgItem
     mov     rcx, rax
     xor     edx, edx
     call    ShowWindow
-    ; wipe the revealed-secret copy so cleartext never lingers past the overlay
-    ; (matches the wipe discipline used for every other secret buffer)
+    ; wipe the revealed-secret copy + any composite DIB pixels so cleartext never lingers
     lea     rcx, [g_rowpw_w]
     mov     edx, 512*2
     call    secure_zero
+    cmp     qword ptr [g_comp_bits], 0
+    je      cph_done
+    mov     eax, dword ptr [g_comp_capw]
+    mov     edx, dword ptr [g_comp_caph]
+    imul    rax, rdx
+    shl     rax, 2
+    jle     cph_done
+    mov     rcx, qword ptr [g_comp_bits]
+    mov     rdx, rax
+    call    secure_zero
+cph_done:
     FRAME_EPILOG
     ret
 gui_colorpw_hide endp
@@ -15972,20 +17644,216 @@ grp_done:
     ret
 gui_read_password endp
 
-; gui_apply_scheme(rcx=hdlg) - apply g_scheme: rebuild theme brushes, update the
-;   settings button caption, and repaint the whole window + children.
+; gui_os_is_light() -> eax = 1 if Windows AppsUseLightTheme != 0 else 0 (#10).
+gui_os_is_light proc frame
+    FRAME_PROLOG 80
+    mov     qword ptr [rbp-24], 0                ; hKey
+    WINCALL RegOpenKeyExW, 80000001h, addr reg_pers_key, 0, 20019h, addr rbp-24
+    test    eax, eax
+    jnz     goil_dark
+    mov     dword ptr [rbp-32], 0                ; val
+    mov     dword ptr [rbp-36], 4                ; cb
+    WINCALL RegQueryValueExW, qword ptr [rbp-24], addr reg_light_val, 0, 0, addr rbp-32, addr rbp-36
+    mov     dword ptr [rbp-40], eax
+    WINCALL RegCloseKey, qword ptr [rbp-24]
+    cmp     dword ptr [rbp-40], 0
+    jne     goil_dark
+    xor     eax, eax
+    cmp     dword ptr [rbp-32], 0
+    setne   al
+    FRAME_EPILOG
+    ret
+goil_dark:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gui_os_is_light endp
+
+; gui_resolve_scheme() - resolve g_scheme_pref (0..13 concrete, 14 = Follow Windows)
+;   into g_scheme (0..13), updating g_pair_light / g_pair_dark on concrete picks (#10).
+gui_resolve_scheme proc frame
+    FRAME_PROLOG 32
+    mov     eax, dword ptr [g_scheme_pref]
+    cmp     eax, SCHEME_COUNT
+    jae     grs_follow
+    mov     dword ptr [g_scheme], eax
+    imul    ecx, eax, 15                         ; SCHEME_DW = 15 dwords per row
+    lea     r10, [schemes]
+    cmp     dword ptr [r10 + rcx*4 + 11*4], 0    ; schemes[idx].dark
+    jne     grs_set_dark
+    mov     dword ptr [g_pair_light], eax
+    FRAME_EPILOG
+    ret
+grs_set_dark:
+    mov     dword ptr [g_pair_dark], eax
+    FRAME_EPILOG
+    ret
+grs_follow:
+    call    gui_os_is_light
+    mov     ecx, dword ptr [g_pair_dark]
+    test    eax, eax
+    jz      @F
+    mov     ecx, dword ptr [g_pair_light]
+@@: cmp     ecx, SCHEME_COUNT
+    jb      @F
+    mov     ecx, GUI_SCHEME_GRUVBOX
+@@: mov     dword ptr [g_scheme], ecx
+    FRAME_EPILOG
+    ret
+gui_resolve_scheme endp
+
+; gui_uline_kick() - trigger 120ms center-out focus underline expansion (#1).
+gui_uline_kick proc frame
+    FRAME_PROLOG 32
+    call    GetFocus
+    mov     qword ptr [g_uline_anim_hwnd], rax
+    test    rax, rax
+    jz      guk_ret
+    mov     ecx, ANIM_ULINE
+    xor     edx, edx
+    xor     r8d, r8d
+    call    anim_set
+    mov     ecx, ANIM_ULINE
+    mov     edx, 1024
+    mov     r8d, 120
+    call    anim_set
+guk_ret:
+    FRAME_EPILOG
+    ret
+gui_uline_kick endp
+
+; gui_toggle_kick(rcx=parent, edx=ctlId, r8d=newState) - slide pill thumb (#4).
+gui_toggle_kick proc frame
+    FRAME_PROLOG 48
+    mov     dword ptr [rbp-24], r8d
+    call    GetDlgItem
+    test    rax, rax
+    jz      gtk_ret
+    mov     qword ptr [rbp-32], rax
+    mov     qword ptr [g_tog_anim_hwnd], rax
+    mov     edx, 1024
+    cmp     dword ptr [rbp-24], 0
+    je      @F
+    xor     edx, edx
+@@: mov     ecx, ANIM_TOG
+    xor     r8d, r8d
+    call    anim_set
+    mov     edx, 0
+    cmp     dword ptr [rbp-24], 0
+    je      @F
+    mov     edx, 1024
+@@: mov     ecx, ANIM_TOG
+    mov     r8d, 120
+    call    anim_set
+    WINCALL InvalidateRect, qword ptr [rbp-32], 0, 0
+gtk_ret:
+    FRAME_EPILOG
+    ret
+gui_toggle_kick endp
+
+; gui_draw_clspills(rcx = lpdis) - draw 4 syntax-colored ABC / abc / 123 / !@#
+;   character-class pills for DLG_CREATE and DLG_XLPW (#16).
+gui_draw_clspills proc frame
+    FRAME_PROLOG 224
+    mov     qword ptr [rbp-24], rcx
+    mov     r10, rcx
+    mov     rax, qword ptr [r10+32]
+    mov     qword ptr [rbp-32], rax              ; hdc
+    mov     eax, dword ptr [r10+40]
+    mov     dword ptr [rbp-64], eax              ; L
+    mov     eax, dword ptr [r10+44]
+    mov     dword ptr [rbp-60], eax              ; T
+    mov     eax, dword ptr [r10+48]
+    mov     dword ptr [rbp-56], eax              ; R
+    mov     eax, dword ptr [r10+52]
+    mov     dword ptr [rbp-52], eax              ; B
+    WINCALL CreateSolidBrush, dword ptr [g_col_bg]
+    mov     qword ptr [rbp-40], rax
+    WINCALL FillRect, qword ptr [rbp-32], addr rbp-64, rax
+    WINCALL DeleteObject, qword ptr [rbp-40]
+    call    gui_make_listfonts
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_phonfont]
+    mov     qword ptr [rbp-48], rax
+    WINCALL SetBkMode, qword ptr [rbp-32], 1
+    mov     eax, dword ptr [rbp-56]
+    sub     eax, dword ptr [rbp-64]
+    sub     eax, 12
+    sar     eax, 2                               ; pillW = (W - 12) / 4
+    cmp     eax, 18
+    jl      gdcp_rest
+    mov     dword ptr [rbp-68], eax
+    mov     dword ptr [rbp-72], 0                ; i = 0..3
+gdcp_lp:
+    mov     ecx, dword ptr [rbp-72]
+    cmp     ecx, 4
+    jae     gdcp_rest
+    mov     eax, dword ptr [rbp-68]
+    add     eax, 4
+    imul    eax, ecx
+    add     eax, dword ptr [rbp-64]
+    mov     dword ptr [rbp-80], eax              ; pL
+    add     eax, dword ptr [rbp-68]
+    mov     dword ptr [rbp-84], eax              ; pR
+    ; Class bit: i=0 -> 1(U), i=1 -> 2(L), i=2 -> 4(D), i=3 -> 8(S)
+    mov     edx, 1
+    shl     edx, cl
+    test    dword ptr [g_last_pw_clsmask], edx
+    jz      gdcp_off
+    mov     ecx, dword ptr [rbp-72]
+    call    gui_class_color
+    mov     dword ptr [rbp-88], eax              ; active class color
+    mov     ecx, dword ptr [g_col_panel]
+    mov     edx, eax
+    mov     r8d, 44
+    call    col_mix
+    mov     dword ptr [rbp-92], eax              ; tinted fill
+    WINCALL theme_aa_rrect, qword ptr [rbp-32], dword ptr [rbp-80], dword ptr [rbp-60], \
+            dword ptr [rbp-84], dword ptr [rbp-52], 4, \
+            dword ptr [rbp-92], dword ptr [rbp-92], dword ptr [rbp-88], -1
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [rbp-88]
+    jmp     gdcp_txt
+gdcp_off:
+    WINCALL theme_aa_rrect, qword ptr [rbp-32], dword ptr [rbp-80], dword ptr [rbp-60], \
+            dword ptr [rbp-84], dword ptr [rbp-52], 4, \
+            dword ptr [g_col_bg], dword ptr [g_col_bg], dword ptr [g_col_frame], -1
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_textdim]
+gdcp_txt:
+    mov     eax, dword ptr [rbp-80]
+    mov     dword ptr [rbp-112], eax
+    mov     eax, dword ptr [rbp-60]
+    mov     dword ptr [rbp-108], eax
+    mov     eax, dword ptr [rbp-84]
+    mov     dword ptr [rbp-104], eax
+    mov     eax, dword ptr [rbp-52]
+    mov     dword ptr [rbp-100], eax
+    mov     ecx, dword ptr [rbp-72]
+    lea     r10, [lg_ptrs]
+    mov     rdx, qword ptr [r10 + rcx*8]
+    WINCALL DrawTextW, qword ptr [rbp-32], rdx, -1, addr rbp-112, DT_IMGFLAGS
+    inc     dword ptr [rbp-72]
+    jmp     gdcp_lp
+gdcp_rest:
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-48]
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gui_draw_clspills endp
+
+; gui_apply_scheme(rcx=hdlg) - resolve + apply g_scheme_pref, rebuild theme brushes,
+;   update IDC_V_MTHEME + IDC_V_MSWATCH, and repaint the whole window + children.
 gui_apply_scheme proc frame
     FRAME_PROLOG 48
     mov     qword ptr [rbp-24], rcx
+    call    gui_resolve_scheme
     mov     ecx, dword ptr [g_scheme]
     call    theme_set_scheme
-    mov     eax, dword ptr [g_scheme]
-    lea     r10, [scheme_names]
+    mov     eax, dword ptr [g_scheme_pref]
+    cmp     eax, SCHEME_CHOICES
+    jb      @F
+    mov     eax, GUI_SCHEME_GRUVBOX
+@@: lea     r10, [scheme_names]
     mov     rax, qword ptr [r10+rax*8]
     mov     qword ptr [rbp-32], rax
-    ; the button lives in the settings CHILD, not in rcx's dialog: addressing the vault
-    ; here silently found nothing and left the rc template's placeholder caption showing,
-    ; so every scheme read "Dark" while the colours themselves cycled correctly.
     WINCALL SetDlgItemTextW, qword ptr [g_settings_hwnd], IDC_V_MTHEME, qword ptr [rbp-32]
     mov     rcx, qword ptr [rbp-24]              ; title bar + backdrop material follow the scheme
     call    theme_dwm_apply
@@ -16024,25 +17892,30 @@ gui_apply_layout endp
 ; gui_save_prefs() - persist the UI scheme + layout to HKCU\Software\Vordr.
 gui_save_prefs proc frame
     FRAME_PROLOG 48
-    WINCALL cfg_set_dword_hkcu, addr pref_scheme, dword ptr [g_scheme]
+    WINCALL cfg_set_dword_hkcu, addr pref_scheme, dword ptr [g_scheme_pref]
+    WINCALL cfg_set_dword_hkcu, addr pref_pair_light, dword ptr [g_pair_light]
+    WINCALL cfg_set_dword_hkcu, addr pref_pair_dark, dword ptr [g_pair_dark]
     WINCALL cfg_set_dword_hkcu, addr pref_layout, dword ptr [g_layout]
     WINCALL cfg_set_dword_hkcu, addr pref_anim, dword ptr [g_anim_pref]
+    WINCALL cfg_set_dword_hkcu, addr pref_backdrop, dword ptr [g_backdrop_pref]
     FRAME_EPILOG
     ret
 gui_save_prefs endp
 
-; gui_anim_label() - show the animations choice on its settings button.  No hwnd
-;   argument, like gui_hotkey_label: the button exists only in the settings child.
-gui_anim_label proc frame
+; gui_backdrop_label() - show the active backdrop mode on IDC_V_MBKD.
+gui_backdrop_label proc frame
     FRAME_PROLOG 48
-    mov     eax, dword ptr [g_anim_pref]
-    lea     r10, [anim_names]
+    mov     eax, dword ptr [g_backdrop_pref]
+    cmp     eax, BACKDROP_COUNT
+    jb      @F
+    xor     eax, eax
+@@: lea     r10, [bkd_names]
     mov     rax, qword ptr [r10+rax*8]
     mov     qword ptr [rbp-24], rax
-    WINCALL SetDlgItemTextW, qword ptr [g_settings_hwnd], IDC_V_MANIM, qword ptr [rbp-24]
+    WINCALL SetDlgItemTextW, qword ptr [g_settings_hwnd], IDC_V_MBKD, qword ptr [rbp-24]
     FRAME_EPILOG
     ret
-gui_anim_label endp
+gui_backdrop_label endp
 
 ; gui_tpm_label() - show the active TPM Unlock mode caption on IDC_V_MTPM.
 gui_tpm_label proc frame
@@ -16059,18 +17932,35 @@ gui_tpm_label endp
 
 ; gui_load_prefs() - load the persisted UI scheme + layout (clamped to range).
 gui_load_prefs proc frame
-    FRAME_PROLOG 48
-    WINCALL cfg_get_dword, addr pref_scheme, GUI_SCHEME_GRUVBOX, addr g_scheme_lock
-    cmp     eax, SCHEME_COUNT               ; clamp out-of-range to the default
+    FRAME_PROLOG 64
+    mov     dword ptr [rbp-24], 0
+    WINCALL cfg_get_dword, addr pref_pair_light, GUI_SCHEME_SOLARIZED, addr rbp-24
+    cmp     eax, SCHEME_COUNT
+    jb      @F
+    mov     eax, GUI_SCHEME_SOLARIZED
+@@: mov     dword ptr [g_pair_light], eax
+    WINCALL cfg_get_dword, addr pref_pair_dark, GUI_SCHEME_GRUVBOX, addr rbp-24
+    cmp     eax, SCHEME_COUNT
     jb      @F
     mov     eax, GUI_SCHEME_GRUVBOX
-@@: mov     dword ptr [g_scheme], eax
+@@: mov     dword ptr [g_pair_dark], eax
+    WINCALL cfg_get_dword, addr pref_scheme, GUI_SCHEME_GRUVBOX, addr g_scheme_lock
+    cmp     eax, SCHEME_CHOICES             ; 0..13 concrete palettes + 14 Follow Windows
+    jb      @F
+    mov     eax, GUI_SCHEME_GRUVBOX
+@@: mov     dword ptr [g_scheme_pref], eax
+    call    gui_resolve_scheme
     mov     dword ptr [g_layout], 0             ; Comfortable is the only layout
     WINCALL cfg_get_dword, addr pref_anim, 0, addr g_anim_lock   ; Settings > Animations
     cmp     eax, 2                              ; (HKLM > HKCU > follow Windows)
     jbe     @F
     xor     eax, eax                            ; out of range: follow Windows
 @@: mov     dword ptr [g_anim_pref], eax
+    WINCALL cfg_get_dword, addr pref_backdrop, 0, addr g_backdrop_lock ; Settings > Backdrop
+    cmp     eax, BACKDROP_COUNT                 ; 0..7 GPU styles, 8 = Flat
+    jb      @F
+    xor     eax, eax
+@@: mov     dword ptr [g_backdrop_pref], eax
     ; C5: audit-log verbosity (HKLM > HKCU > 0/off), so GUI security events are
     ; logged when the operator enables it (0..4; see log.asm LOG_* levels)
     WINCALL cfg_get_dword, addr pref_loglevel, 0, addr g_loglvl_lock
@@ -16317,6 +18207,7 @@ pt_ret:
     ret
 gui_purge_trash endp
 
+ifdef PROBE_IO
 .const
 tr_hex_upper db "0123456789ABCDEF"
 tr_hex_lower db "0123456789abcdef"
@@ -16360,6 +18251,7 @@ tr_fail:
     FRAME_EPILOG
     ret
 gui_trtest endp
+endif
 
 ; gui_update_fav_glyph(rcx=hdlg) - set the header button glyph.  In recover mode
 ;   the favorite (star) button becomes a recycle (â™») button that restores the
@@ -16438,6 +18330,7 @@ gui_enter_trash endp
 gui_leave_trash proc frame
     FRAME_PROLOG 48
     mov     qword ptr [rbp-24], rcx
+    WINCALL KillTimer, qword ptr [rbp-24], TOTP_TIMER
     mov     dword ptr [g_trash_view], 0
     mov     dword ptr [g_cur_idx], -1
     mov     dword ptr [g_totp_on], 0
@@ -16463,6 +18356,7 @@ gui_leave_trash endp
 gui_detail_clear proc frame
     FRAME_PROLOG 48
     mov     qword ptr [rbp-24], rcx
+    call    gui_colorpw_hide
     WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_V_TITLE, 0
     mov     rcx, qword ptr [rbp-24]
     mov     edx, IDC_V_HEADER
@@ -16774,7 +18668,8 @@ stp_col:
 stp_erase:
     mov     rcx, r8
     mov     rdx, qword ptr [rbp-8]
-    call    theme_erase
+    call    gui_erase_settings_buffered
+    mov     eax, 1
     jmp     stp_ret
 stp_paint:
     mov     rcx, qword ptr [rbp-8]
@@ -16795,6 +18690,693 @@ stp_ret:
     pop     rbp
     ret
 settings_proc endp
+
+; erase_set_excl_cb(rcx = hwnd, rdx = 0) -> 1 - exclude ALL visible direct children
+;   on DLG_SETTINGS (Edit, Button, and Static) so background blits never flash text.
+erase_set_excl_cb proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 144
+    mov     qword ptr [rbp-24], rcx
+    WINCALL GetParent, rcx
+    cmp     rax, qword ptr [g_excl_par]
+    jne     esec_ret
+    WINCALL IsWindowVisible, qword ptr [rbp-24]
+    test    eax, eax
+    jz      esec_ret
+    WINCALL GetWindowRect, qword ptr [rbp-24], addr rbp-88
+    WINCALL MapWindowPoints, 0, qword ptr [g_excl_par], addr rbp-88, 2
+    WINCALL ExcludeClipRect, qword ptr [g_excl_hdc], dword ptr [rbp-88], dword ptr [rbp-84], \
+            dword ptr [rbp-80], dword ptr [rbp-76]
+esec_ret:
+    mov     eax, 1
+    mov     rsp, rbp
+    pop     rbp
+    ret
+erase_set_excl_cb endp
+
+; gui_erase_settings_buffered(rcx = hdc, rdx = hwnd_settings) - flicker-free
+;   offscreen WM_ERASEBKGND for DLG_SETTINGS over GPU backdrops + glass boxes.
+gui_erase_settings_buffered proc frame
+    FRAME_PROLOG 208
+    mov     qword ptr [rbp-24], rcx              ; hdc
+    mov     qword ptr [rbp-32], rdx              ; hwnd
+    WINCALL GetClientRect, qword ptr [rbp-32], addr rbp-80
+    test    eax, eax
+    jz      gesb_direct
+    cmp     dword ptr [rbp-72], 0
+    jle     gesb_direct
+    cmp     dword ptr [rbp-68], 0
+    jle     gesb_direct
+
+    mov     rax, qword ptr [rbp-24]
+    mov     qword ptr [g_excl_hdc], rax
+    mov     rax, qword ptr [rbp-32]
+    mov     qword ptr [g_excl_par], rax
+    WINCALL EnumChildWindows, qword ptr [rbp-32], addr erase_set_excl_cb, 0
+
+    WINCALL CreateCompatibleDC, qword ptr [rbp-24]
+    mov     qword ptr [rbp-40], rax
+    test    rax, rax
+    jz      gesb_direct
+    WINCALL CreateCompatibleBitmap, qword ptr [rbp-24], dword ptr [rbp-72], dword ptr [rbp-68]
+    mov     qword ptr [rbp-48], rax
+    test    rax, rax
+    jz      gesb_deldc
+    WINCALL SelectObject, qword ptr [rbp-40], qword ptr [rbp-48]
+    mov     qword ptr [rbp-56], rax
+
+    mov     rcx, qword ptr [rbp-40]
+    mov     rdx, qword ptr [rbp-32]
+    call    theme_erase
+    WINCALL BitBlt, qword ptr [rbp-24], 0, 0, dword ptr [rbp-72], dword ptr [rbp-68], \
+            qword ptr [rbp-40], 0, 0, SRCCOPY_
+    WINCALL PatBlt, qword ptr [rbp-40], 0, 0, dword ptr [rbp-72], dword ptr [rbp-68], PATBLT_BLACK_
+
+    WINCALL SelectObject, qword ptr [rbp-40], qword ptr [rbp-56]
+    WINCALL DeleteObject, qword ptr [rbp-48]
+gesb_deldc:
+    WINCALL DeleteDC, qword ptr [rbp-40]
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+
+gesb_direct:
+    mov     rcx, qword ptr [rbp-24]
+    mov     rdx, qword ptr [rbp-32]
+    call    theme_erase
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gui_erase_settings_buffered endp
+
+; gui_drawitem_begin(rcx = lpdis) / gui_drawitem_end(rcx = lpdis) - atomic
+;   offscreen double-buffering for all ODT_BUTTON / ODT_STATIC WM_DRAWITEM paints.
+gui_drawitem_begin proc frame
+    FRAME_PROLOG 128
+    cmp     dword ptr [g_in_comp], 0
+    jne     gdib_ret
+    cmp     qword ptr [g_dib_orighdc], 0
+    jne     gdib_ret
+    mov     qword ptr [rbp-16], rcx
+    mov     rax, qword ptr [rcx+32]
+    test    rax, rax
+    jz      gdib_ret
+    mov     qword ptr [rbp-24], rax              ; origHDC
+    mov     edx, dword ptr [rcx+48]              ; R
+    cmp     edx, 0
+    jle     gdib_ret
+    mov     dword ptr [rbp-28], edx
+    mov     r8d, dword ptr [rcx+52]              ; B
+    cmp     r8d, 0
+    jle     gdib_ret
+    mov     dword ptr [rbp-32], r8d
+
+    WINCALL CreateCompatibleDC, qword ptr [rbp-24]
+    test    rax, rax
+    jz      gdib_ret
+    mov     qword ptr [g_dib_memdc], rax
+    WINCALL CreateCompatibleBitmap, qword ptr [rbp-24], dword ptr [rbp-28], dword ptr [rbp-32]
+    test    rax, rax
+    jz      gdib_fail_dc
+    mov     qword ptr [g_dib_membmp], rax
+    WINCALL SelectObject, qword ptr [g_dib_memdc], rax
+    mov     qword ptr [g_dib_oldbmp], rax
+    WINCALL GetCurrentObject, qword ptr [rbp-24], OBJ_FONT_
+    WINCALL SelectObject, qword ptr [g_dib_memdc], rax
+    mov     qword ptr [g_dib_oldfnt], rax
+
+    mov     rax, qword ptr [rbp-24]
+    mov     qword ptr [g_dib_orighdc], rax
+    mov     rcx, qword ptr [rbp-16]
+    mov     rax, qword ptr [g_dib_memdc]
+    mov     qword ptr [rcx+32], rax
+    jmp     gdib_ret
+
+gdib_fail_dc:
+    WINCALL DeleteDC, qword ptr [g_dib_memdc]
+    mov     qword ptr [g_dib_memdc], 0
+gdib_ret:
+    FRAME_EPILOG
+    ret
+gui_drawitem_begin endp
+
+gui_drawitem_end proc frame
+    FRAME_PROLOG 192
+    cmp     dword ptr [g_in_comp], 0
+    jne     gdie_ret
+    cmp     qword ptr [g_dib_orighdc], 0
+    je      gdie_ret
+    mov     r10, rcx
+    mov     rax, qword ptr [g_dib_orighdc]
+    mov     qword ptr [r10+32], rax
+    mov     qword ptr [rbp-16], rax              ; origHDC
+    mov     ecx, dword ptr [r10+40]
+    mov     dword ptr [rbp-20], ecx              ; L
+    mov     edx, dword ptr [r10+44]
+    mov     dword ptr [rbp-24], edx              ; T
+    mov     r8d, dword ptr [r10+48]
+    sub     r8d, ecx
+    jle     gdie_clean
+    mov     dword ptr [rbp-28], r8d              ; W
+    mov     r9d, dword ptr [r10+52]
+    sub     r9d, edx
+    jle     gdie_clean
+    mov     dword ptr [rbp-32], r9d              ; H
+
+    WINCALL BitBlt, qword ptr [rbp-16], dword ptr [rbp-20], dword ptr [rbp-24], \
+            dword ptr [rbp-28], dword ptr [rbp-32], qword ptr [g_dib_memdc], \
+            dword ptr [rbp-20], dword ptr [rbp-24], SRCCOPY_
+    WINCALL PatBlt, qword ptr [g_dib_memdc], dword ptr [rbp-20], dword ptr [rbp-24], \
+            dword ptr [rbp-28], dword ptr [rbp-32], PATBLT_BLACK_
+
+gdie_clean:
+    WINCALL SelectObject, qword ptr [g_dib_memdc], qword ptr [g_dib_oldfnt]
+    WINCALL SelectObject, qword ptr [g_dib_memdc], qword ptr [g_dib_oldbmp]
+    WINCALL DeleteObject, qword ptr [g_dib_membmp]
+    WINCALL DeleteDC, qword ptr [g_dib_memdc]
+    mov     qword ptr [g_dib_orighdc], 0
+    mov     qword ptr [g_dib_memdc], 0
+    mov     qword ptr [g_dib_membmp], 0
+gdie_ret:
+    FRAME_EPILOG
+    ret
+gui_drawitem_end endp
+
+; =============================================================================
+; Unified Full-Window Atomic Off-Screen Compositor (gui_present_composite)
+; -----------------------------------------------------------------------------
+; Renders the entire active window (GPU backdrop + cards/sidebar/frames + EVERY
+; visible child control on either DLG_VAULT or DLG_SETTINGS) into one persistent
+; 32-bit DIB (g_comp_hdc) at the exact same g_gpu_time_ms, and presents the
+; completed frame in ONE single BitBlt via GetWindowDC — eliminating all
+; background-vs-control desynchronization, mid-pass restarts, and flicker.
+; =============================================================================
+gui_comp_ensure proc frame
+    FRAME_PROLOG 160
+    cmp     ecx, 1
+    jge     @F
+    mov     ecx, 1
+@@: cmp     ecx, 16384
+    jle     @F
+    mov     ecx, 16384
+@@: cmp     edx, 1
+    jge     @F
+    mov     edx, 1
+@@: cmp     edx, 16384
+    jle     @F
+    mov     edx, 16384
+@@: mov     dword ptr [rbp-16], ecx             ; reqW
+    mov     dword ptr [rbp-20], edx             ; reqH
+    cmp     qword ptr [g_comp_hdc], 0
+    je      gce_alloc
+    cmp     qword ptr [g_comp_bmp], 0
+    je      gce_mkdib
+    cmp     qword ptr [g_comp_bits], 0
+    je      gce_grow
+    cmp     ecx, dword ptr [g_comp_capw]
+    jg      gce_grow
+    cmp     edx, dword ptr [g_comp_caph]
+    jg      gce_grow
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gce_grow:
+    mov     eax, dword ptr [g_comp_capw]
+    cmp     dword ptr [rbp-16], eax
+    jge     @F
+    mov     dword ptr [rbp-16], eax
+@@: mov     eax, dword ptr [g_comp_caph]
+    cmp     dword ptr [rbp-20], eax
+    jge     @F
+    mov     dword ptr [rbp-20], eax
+@@: ; Scrub and unlock the old composite DIB pixels before releasing the section (AUD-04)
+    cmp     qword ptr [g_comp_bits], 0
+    je      gce_grow_del
+    mov     eax, dword ptr [g_comp_capw]
+    mov     edx, dword ptr [g_comp_caph]
+    imul    rax, rdx
+    shl     rax, 2
+    jle     gce_grow_del
+    mov     qword ptr [rbp-32], rax
+    mov     rcx, qword ptr [g_comp_bits]
+    mov     rdx, rax
+    call    secure_zero
+    WINCALL VirtualUnlock, qword ptr [g_comp_bits], qword ptr [rbp-32]
+gce_grow_del:
+    mov     qword ptr [g_comp_bits], 0
+    mov     dword ptr [g_comp_capw], 0
+    mov     dword ptr [g_comp_caph], 0
+    cmp     qword ptr [g_comp_bmp], 0
+    je      gce_mkdib
+    WINCALL SelectObject, qword ptr [g_comp_hdc], qword ptr [g_comp_old]
+    WINCALL DeleteObject, qword ptr [g_comp_bmp]
+    mov     qword ptr [g_comp_bmp], 0
+    mov     qword ptr [g_comp_old], 0
+    jmp     gce_mkdib
+gce_alloc:
+    WINCALL CreateCompatibleDC, 0
+    test    rax, rax
+    jz      gce_fail
+    mov     qword ptr [g_comp_hdc], rax
+gce_mkdib:
+    mov     qword ptr [g_comp_bits], 0
+    mov     dword ptr [g_comp_capw], 0
+    mov     dword ptr [g_comp_caph], 0
+    lea     r10, [rbp-72]
+    xor     eax, eax
+    mov     dword ptr [r10+0], 40               ; biSize
+    mov     ecx, dword ptr [rbp-16]
+    mov     dword ptr [r10+4], ecx              ; biWidth
+    mov     edx, dword ptr [rbp-20]
+    neg     edx
+    mov     dword ptr [r10+8], edx              ; biHeight (top-down)
+    mov     dword ptr [r10+12], 00200001h       ; biPlanes=1, biBitCount=32
+    mov     dword ptr [r10+16], eax
+    mov     dword ptr [r10+20], eax
+    mov     qword ptr [r10+24], rax
+    mov     qword ptr [r10+32], rax
+    WINCALL CreateDIBSection, qword ptr [g_comp_hdc], addr rbp-72, 0, addr g_comp_bits, 0, 0
+    test    rax, rax
+    jz      gce_fail
+    cmp     qword ptr [g_comp_bits], 0
+    je      gce_fail_bmp
+    mov     qword ptr [g_comp_bmp], rax
+    WINCALL SelectObject, qword ptr [g_comp_hdc], rax
+    mov     qword ptr [g_comp_old], rax
+    mov     eax, dword ptr [rbp-16]
+    mov     dword ptr [g_comp_capw], eax
+    mov     edx, dword ptr [rbp-20]
+    mov     dword ptr [g_comp_caph], edx
+    imul    rax, rdx
+    shl     rax, 2
+    jle     @F
+    WINCALL VirtualLock, qword ptr [g_comp_bits], rax
+@@: mov     eax, 1
+    FRAME_EPILOG
+    ret
+gce_fail_bmp:
+    WINCALL DeleteObject, rax
+gce_fail:
+    mov     qword ptr [g_comp_bits], 0
+    mov     dword ptr [g_comp_capw], 0
+    mov     dword ptr [g_comp_caph], 0
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gui_comp_ensure endp
+
+; gui_comp_flush() - scrub and release the off-screen composite DIB + scratch text on lock.
+gui_comp_flush proc frame
+    FRAME_PROLOG 64
+    lea     rcx, [g_comp_wbuf]
+    mov     edx, 260*2
+    call    secure_zero
+    cmp     qword ptr [g_comp_bits], 0
+    je      gcf_del
+    mov     eax, dword ptr [g_comp_capw]
+    mov     edx, dword ptr [g_comp_caph]
+    imul    rax, rdx
+    shl     rax, 2
+    jle     gcf_del
+    mov     qword ptr [rbp-24], rax
+    mov     rcx, qword ptr [g_comp_bits]
+    mov     rdx, rax
+    call    secure_zero
+    WINCALL VirtualUnlock, qword ptr [g_comp_bits], qword ptr [rbp-24]
+gcf_del:
+    cmp     qword ptr [g_comp_bmp], 0
+    je      gcf_dc
+    cmp     qword ptr [g_comp_hdc], 0
+    je      @F
+    WINCALL SelectObject, qword ptr [g_comp_hdc], qword ptr [g_comp_old]
+@@: WINCALL DeleteObject, qword ptr [g_comp_bmp]
+    mov     qword ptr [g_comp_bmp], 0
+gcf_dc:
+    cmp     qword ptr [g_comp_hdc], 0
+    je      gcf_zero
+    WINCALL DeleteDC, qword ptr [g_comp_hdc]
+    mov     qword ptr [g_comp_hdc], 0
+gcf_zero:
+    mov     qword ptr [g_comp_bits], 0
+    mov     qword ptr [g_comp_old], 0
+    mov     dword ptr [g_comp_capw], 0
+    mov     dword ptr [g_comp_caph], 0
+    mov     dword ptr [g_in_comp], 0
+    FRAME_EPILOG
+    ret
+gui_comp_flush endp
+
+comp_draw_hwnd proc frame
+    FRAME_PROLOG 256
+    test    rcx, rcx
+    jz      cdh_ret
+    mov     qword ptr [rbp-16], rcx             ; child hwnd
+    WINCALL IsWindowVisible, rcx
+    test    eax, eax
+    jz      cdh_ret
+
+    ; Child rect in g_vaulthwnd client coordinates -> [rbp-48..rbp-33] {L,T,R,B}
+    WINCALL GetWindowRect, qword ptr [rbp-16], addr rbp-48
+    WINCALL MapWindowPoints, 0, qword ptr [g_vaulthwnd], addr rbp-48, 2
+    mov     eax, dword ptr [rbp-40]
+    sub     eax, dword ptr [rbp-48]
+    jle     cdh_ret
+    mov     dword ptr [rbp-52], eax             ; cw
+    mov     eax, dword ptr [rbp-36]
+    sub     eax, dword ptr [rbp-44]
+    jle     cdh_ret
+    mov     dword ptr [rbp-56], eax             ; ch
+
+    WINCALL SaveDC, qword ptr [g_comp_hdc]
+    mov     dword ptr [rbp-60], eax             ; savedDC
+    WINCALL IntersectClipRect, qword ptr [g_comp_hdc], dword ptr [rbp-48], dword ptr [rbp-44], \
+            dword ptr [rbp-40], dword ptr [rbp-36]
+    WINCALL SetViewportOrgEx, qword ptr [g_comp_hdc], dword ptr [rbp-48], dword ptr [rbp-44], 0
+
+    WINCALL GetClassNameW, qword ptr [rbp-16], addr rbp-96, 16
+    movzx   eax, word ptr [rbp-96]
+    cmp     eax, 'L'
+    je      cdh_list
+    cmp     eax, 'E'
+    je      cdh_edit
+    cmp     eax, 'B'
+    je      cdh_btn
+    cmp     eax, 'S'
+    je      cdh_stat
+    jmp     cdh_rest
+
+cdh_list:
+    mov     dword ptr [g_lbsb_kind], 0
+    mov     dword ptr [g_lbsb_painting], 1
+    call    vault_index_begin
+    WINCALL SendMessageW, qword ptr [rbp-16], WM_PRINTCLIENT_, qword ptr [g_comp_hdc], PRF_CLIENT_
+    call    vault_index_end
+    mov     dword ptr [g_lbsb_painting], 0
+    mov     rcx, qword ptr [rbp-16]
+    mov     rdx, qword ptr [g_comp_hdc]
+    call    lbsb_empty_watermark
+    mov     rcx, qword ptr [rbp-16]
+    mov     rdx, qword ptr [g_comp_hdc]
+    call    lbsb_paint
+    jmp     cdh_rest
+
+cdh_edit:
+    WINCALL SendMessageW, qword ptr [rbp-16], WM_PRINTCLIENT_, qword ptr [g_comp_hdc], PRF_CLIENT_
+    jmp     cdh_rest
+
+cdh_btn:
+    mov     dword ptr [rbp-64], 4               ; ODT_BUTTON
+    WINCALL SendMessageW, qword ptr [rbp-16], 0F2h, 0, 0   ; BM_GETSTATE
+    xor     ecx, ecx
+    test    eax, 4                              ; BST_PUSHED
+    setnz   cl
+    mov     dword ptr [rbp-68], ecx             ; ODS_SELECTED (1) if pushed
+    jmp     cdh_odraw
+
+cdh_stat:
+    WINCALL GetWindowLongPtrW, qword ptr [rbp-16], GWL_STYLE_
+    mov     dword ptr [rbp-72], eax
+    and     eax, 1Fh
+    cmp     eax, 0Dh                            ; SS_OWNERDRAW
+    jne     cdh_stat_txt
+    mov     dword ptr [rbp-64], 5               ; ODT_STATIC
+    mov     dword ptr [rbp-68], 0
+    jmp     cdh_odraw
+
+cdh_stat_txt:
+    WINCALL SendMessageW, qword ptr [rbp-16], WM_GETFONT, 0, 0
+    test    rax, rax
+    jnz     @F
+    mov     rax, qword ptr [g_dlgfont]
+@@: WINCALL SelectObject, qword ptr [g_comp_hdc], rax
+    mov     qword ptr [rbp-80], rax
+    WINCALL SetBkMode, qword ptr [g_comp_hdc], 1
+    WINCALL SetTextColor, qword ptr [g_comp_hdc], dword ptr [g_col_text]
+    mov     word ptr [g_comp_wbuf], 0
+    WINCALL SendMessageW, qword ptr [rbp-16], 0Dh, 255, addr g_comp_wbuf
+    test    eax, eax
+    jle     cdh_st_done
+    mov     dword ptr [rbp-160], 0
+    mov     dword ptr [rbp-156], 0
+    mov     eax, dword ptr [rbp-52]
+    mov     dword ptr [rbp-152], eax
+    mov     eax, dword ptr [rbp-56]
+    mov     dword ptr [rbp-148], eax
+    mov     eax, dword ptr [rbp-72]
+    xor     r9d, r9d
+    test    eax, 80h                            ; SS_NOPREFIX
+    jz      @F
+    or      r9d, 800h                           ; DT_NOPREFIX
+@@: test    eax, 200h                           ; SS_CENTERIMAGE
+    jz      @F
+    or      r9d, 25h                            ; DT_CENTER | DT_VCENTER | DT_SINGLELINE
+@@: and     eax, 3
+    cmp     eax, 1                              ; SS_CENTER
+    jne     @F
+    or      r9d, 1
+@@: cmp     eax, 2                              ; SS_RIGHT
+    jne     @F
+    or      r9d, 2
+@@: WINCALL DrawTextW, qword ptr [g_comp_hdc], addr g_comp_wbuf, -1, addr rbp-160, r9d
+    lea     rcx, [g_comp_wbuf]
+    mov     edx, 260*2
+    call    secure_zero
+cdh_st_done:
+    WINCALL SelectObject, qword ptr [g_comp_hdc], qword ptr [rbp-80]
+    jmp     cdh_rest
+
+cdh_odraw:
+    WINCALL SendMessageW, qword ptr [rbp-16], WM_GETFONT, 0, 0
+    test    rax, rax
+    jnz     @F
+    mov     rax, qword ptr [g_dlgfont]
+@@: WINCALL SelectObject, qword ptr [g_comp_hdc], rax
+    mov     qword ptr [rbp-80], rax
+    WINCALL GetDlgCtrlID, qword ptr [rbp-16]
+    mov     dword ptr [rbp-76], eax             ; ctlID
+    WINCALL IsWindowEnabled, qword ptr [rbp-16]
+    mov     ecx, dword ptr [rbp-68]
+    test    eax, eax
+    jnz     @F
+    or      ecx, 4                              ; ODS_DISABLED
+@@: lea     r10, [rbp-160]                      ; 64-byte DRAWITEMSTRUCT
+    mov     eax, dword ptr [rbp-64]
+    mov     dword ptr [r10+0], eax              ; CtlType
+    mov     eax, dword ptr [rbp-76]
+    mov     dword ptr [r10+4], eax              ; CtlID
+    mov     dword ptr [r10+8], 0                ; itemID
+    mov     dword ptr [r10+12], 1               ; itemAction = ODA_DRAWENTIRE
+    mov     dword ptr [r10+16], ecx             ; itemState
+    mov     dword ptr [r10+20], 0
+    mov     rax, qword ptr [rbp-16]
+    mov     qword ptr [r10+24], rax             ; hwndItem
+    mov     rax, qword ptr [g_comp_hdc]
+    mov     qword ptr [r10+32], rax             ; hDC
+    mov     dword ptr [r10+40], 0               ; rcItem.left
+    mov     dword ptr [r10+44], 0               ; rcItem.top
+    mov     eax, dword ptr [rbp-52]
+    mov     dword ptr [r10+48], eax             ; rcItem.right
+    mov     eax, dword ptr [rbp-56]
+    mov     dword ptr [r10+52], eax             ; rcItem.bottom
+    mov     qword ptr [r10+56], 0               ; itemData
+    WINCALL SendMessageW, qword ptr [g_vaulthwnd], WM_DRAWITEM, dword ptr [rbp-76], addr rbp-160
+    WINCALL SelectObject, qword ptr [g_comp_hdc], qword ptr [rbp-80]
+
+cdh_rest:
+    WINCALL RestoreDC, qword ptr [g_comp_hdc], dword ptr [rbp-60]
+cdh_ret:
+    FRAME_EPILOG
+    ret
+comp_draw_hwnd endp
+
+comp_child_cb proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 64
+    mov     qword ptr [rbp-8], rcx
+    cmp     rcx, qword ptr [g_settings_hwnd]
+    je      cccb_ret
+    WINCALL GetParent, rcx
+    cmp     rax, qword ptr [g_excl_par]
+    jne     cccb_ret
+    mov     rcx, qword ptr [rbp-8]
+    call    comp_draw_hwnd
+cccb_ret:
+    mov     eax, 1
+    mov     rsp, rbp
+    pop     rbp
+    ret
+comp_child_cb endp
+
+gui_present_composite proc frame
+    FRAME_PROLOG 224
+    mov     qword ptr [rbp-16], rcx             ; hdlg
+    cmp     qword ptr [g_dim_hwnd], 0
+    jne     gpc_ret
+    WINCALL IsWindowEnabled, qword ptr [rbp-16]
+    test    eax, eax
+    jz      gpc_ret
+    WINCALL GetLastActivePopup, qword ptr [rbp-16]
+    cmp     rax, qword ptr [rbp-16]
+    jne     gpc_ret
+    WINCALL GetKeyState, 1                      ; pause while mouse dragging / selecting
+    test    ax, ax
+    js      gpc_ret
+
+    WINCALL GetClientRect, qword ptr [rbp-16], addr rbp-48
+    mov     ecx, dword ptr [rbp-40]
+    mov     edx, dword ptr [rbp-36]
+    cmp     ecx, 0
+    jle     gpc_ret
+    cmp     edx, 0
+    jle     gpc_ret
+    mov     dword ptr [rbp-52], ecx             ; clientW
+    mov     dword ptr [rbp-56], edx             ; clientH
+    call    gui_comp_ensure
+    test    eax, eax
+    jz      gpc_ret
+
+    WINCALL SetViewportOrgEx, qword ptr [g_comp_hdc], 0, 0, 0
+
+    cmp     dword ptr [g_menu_open], 0
+    jne     gpc_settings
+
+    ; ---- Vault View: compose background + glass cards + all visible children ----
+    mov     rcx, qword ptr [g_comp_hdc]
+    mov     rdx, qword ptr [rbp-16]
+    call    gui_erase_into
+    mov     dword ptr [g_in_comp], 1
+    mov     rax, qword ptr [rbp-16]
+    mov     qword ptr [g_excl_par], rax
+    WINCALL EnumChildWindows, qword ptr [rbp-16], addr comp_child_cb, 0
+    mov     dword ptr [g_in_comp], 0
+    jmp     gpc_blit
+
+gpc_settings:
+    ; ---- Settings View: compose full backdrop + header + glass edits + all 38 controls ----
+    mov     rcx, qword ptr [g_comp_hdc]
+    mov     rdx, qword ptr [rbp-16]
+    call    gpu_paint_bg
+    test    eax, eax
+    jnz     @F
+    WINCALL FillRect, qword ptr [g_comp_hdc], addr rbp-48, qword ptr [g_br_bg]
+@@: mov     rcx, qword ptr [g_comp_hdc]
+    mov     rdx, qword ptr [rbp-16]
+    call    gui_draw_brand_hdr
+
+    cmp     qword ptr [g_settings_hwnd], 0
+    je      gpc_set_btns
+    WINCALL SaveDC, qword ptr [g_comp_hdc]
+    mov     dword ptr [rbp-60], eax
+    WINCALL IntersectClipRect, qword ptr [g_comp_hdc], 0, TBAR_H, \
+            dword ptr [rbp-52], dword ptr [rbp-56]
+    WINCALL SetViewportOrgEx, qword ptr [g_comp_hdc], 0, TBAR_H, 0
+    mov     rcx, qword ptr [g_comp_hdc]
+    mov     rdx, qword ptr [g_settings_hwnd]
+    call    theme_erase
+    WINCALL RestoreDC, qword ptr [g_comp_hdc], dword ptr [rbp-60]
+
+    mov     dword ptr [g_in_comp], 1
+    mov     rax, qword ptr [g_settings_hwnd]
+    mov     qword ptr [g_excl_par], rax
+    WINCALL EnumChildWindows, qword ptr [g_settings_hwnd], addr comp_child_cb, 0
+    WINCALL GetDlgItem, qword ptr [rbp-16], IDC_T_CLOSE
+    mov     rcx, rax
+    call    comp_draw_hwnd
+    WINCALL GetDlgItem, qword ptr [rbp-16], IDC_T_SET
+    mov     rcx, rax
+    call    comp_draw_hwnd
+    mov     dword ptr [g_in_comp], 0
+    jmp     gpc_blit
+
+gpc_set_btns:
+    mov     dword ptr [g_in_comp], 1
+    WINCALL GetDlgItem, qword ptr [rbp-16], IDC_T_CLOSE
+    mov     rcx, rax
+    call    comp_draw_hwnd
+    mov     dword ptr [g_in_comp], 0
+
+gpc_blit:
+    ; Preserve active Edit caret across the single whole-window BitBlt
+    mov     qword ptr [rbp-72], 0
+    call    GetFocus
+    test    rax, rax
+    jz      gpc_do_blt
+    mov     qword ptr [rbp-64], rax
+    WINCALL GetClassNameW, rax, addr rbp-96, 16
+    cmp     word ptr [rbp-96], 'E'
+    jne     gpc_do_blt
+    WINCALL GetWindowLongPtrW, qword ptr [rbp-64], GWL_STYLE_
+    test    eax, 800h                           ; ES_READONLY -> caret stays hidden
+    jnz     gpc_do_blt
+    mov     rax, qword ptr [rbp-64]
+    mov     qword ptr [rbp-72], rax
+    WINCALL HideCaret, rax
+
+gpc_do_blt:
+    WINCALL GetWindowRect, qword ptr [rbp-16], addr rbp-96
+    mov     qword ptr [rbp-80], 0
+    WINCALL ClientToScreen, qword ptr [rbp-16], addr rbp-80
+    mov     eax, dword ptr [rbp-80]
+    sub     eax, dword ptr [rbp-96]
+    mov     dword ptr [rbp-80], eax             ; dx = clientOrigin.X - winRect.L
+    mov     eax, dword ptr [rbp-76]
+    sub     eax, dword ptr [rbp-92]
+    mov     dword ptr [rbp-76], eax             ; dy = clientOrigin.Y - winRect.T
+
+    WINCALL GetWindowDC, qword ptr [rbp-16]
+    test    rax, rax
+    jz      gpc_caret_on
+    mov     qword ptr [rbp-64], rax
+    WINCALL BitBlt, qword ptr [rbp-64], dword ptr [rbp-80], dword ptr [rbp-76], \
+            dword ptr [rbp-52], dword ptr [rbp-56], qword ptr [g_comp_hdc], 0, 0, SRCCOPY_
+    WINCALL ReleaseDC, qword ptr [rbp-16], qword ptr [rbp-64]
+
+gpc_caret_on:
+    cmp     qword ptr [rbp-72], 0
+    je      gpc_ret
+    WINCALL ShowCaret, qword ptr [rbp-72]
+gpc_ret:
+    FRAME_EPILOG
+    ret
+gui_present_composite endp
+
+; gui_ambient_tick(rcx = hdlg) - 12.5 FPS hardware-GPU chromatic color cycling.
+;   Composes the entire window off-screen and presents in ONE atomic BitBlt.
+gui_ambient_tick proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-16], rcx
+ifdef PROBE_IO
+    cmp     dword ptr [g_testmode], 0            ; deterministic pixel checks in guitest
+    jne     gamb_ret
+endif
+    cmp     dword ptr [g_backdrop_pref], BACKDROP_FLAT
+    jae     gamb_ret
+    cmp     qword ptr [g_xfade_hwnd], 0
+    jne     gamb_ret
+    WINCALL IsWindowVisible, qword ptr [rbp-16]
+    test    eax, eax
+    jz      gamb_ret
+    WINCALL IsIconic, qword ptr [rbp-16]
+    test    eax, eax
+    jz      gamb_vis_ok
+    call    gui_comp_flush
+    jmp     gamb_ret
+gamb_vis_ok:
+    call    gpu_active
+    test    eax, eax
+    jz      gamb_ret
+
+    WINCALL GetTickCount
+    sub     eax, dword ptr [g_gpu_t0]
+    mov     dword ptr [g_gpu_time_ms], eax
+    mov     rcx, qword ptr [rbp-16]
+    call    gui_present_composite
+gamb_ret:
+    FRAME_EPILOG
+    ret
+gui_ambient_tick endp
 
 ; gui_clip_cb(rcx = child hwnd, rdx = lparam) -> BOOL - add WS_CLIPSIBLINGS.
 ;   Z-order alone is not enough.  Without WS_CLIPSIBLINGS a control still paints over the
@@ -16978,6 +19560,12 @@ gui_settings_store endp
 gui_menu_open proc frame
     FRAME_PROLOG 48
     mov     qword ptr [rbp-24], rcx           ; the VAULT window
+    call    gui_toast_hide
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, 1                            ; mode 1: below TBAR_H
+    xor     r8d, r8d                          ; dx = 0 (clean cross-fade)
+    xor     r9d, r9d
+    call    gui_xfade_begin_ex
     call    gui_refresh_hello                 ; keep Windows Hello availability fresh
     mov     rcx, qword ptr [rbp-24]           ; drop the revealed-secret overlay FIRST: it
     call    gui_colorpw_hide                  ;   re-shows the plaintext value edit
@@ -16988,10 +19576,12 @@ gui_menu_open proc frame
     WINCALL ShowWindow, qword ptr [g_settings_hwnd], SW_SHOW
     call    gui_settings_populate             ; every row: value + HKLM gating
     call    gui_hotkey_label                  ; show the live summon combo on its button
-    call    gui_anim_label                    ; ... and the animations choice on its own
+    call    gui_backdrop_label                ; ... and the GPU backdrop mode
     call    gui_tpm_label                     ; ... and the TPM Unlock mode caption
     mov     dword ptr [g_menu_open], 1
     WINCALL RedrawWindow, qword ptr [rbp-24], 0, 0, 0185h  ; INVALIDATE|ERASE|ALLCHILDREN|UPDATENOW
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_xfade_go
     FRAME_EPILOG
     ret
 gui_menu_open endp
@@ -17001,6 +19591,11 @@ gui_menu_close proc frame
     FRAME_PROLOG 48
     mov     qword ptr [rbp-24], rcx
     call    gui_menu_save                    ; save all settings on leaving the screen
+    mov     rcx, qword ptr [rbp-24]
+    mov     edx, 1                            ; mode 1: below TBAR_H
+    xor     r8d, r8d                          ; dx = 0 (clean cross-fade)
+    xor     r9d, r9d
+    call    gui_xfade_begin_ex
     WINCALL ShowWindow, qword ptr [g_settings_hwnd], SW_HIDE   ; one hwnd, not 35 ids
     mov     rcx, qword ptr [rbp-24]           ; restore edit-mode state
     mov     edx, dword ptr [g_editmode]
@@ -17008,13 +19603,15 @@ gui_menu_close proc frame
     mov     dword ptr [g_menu_open], 0
     call    gui_vault_focus_default           ; focus search box in view mode
     WINCALL RedrawWindow, qword ptr [rbp-24], 0, 0, 0185h
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_xfade_go
     FRAME_EPILOG
     ret
 gui_menu_close endp
 
 ; gui_menu_toggle(rcx=hdlg) - open or close the settings overlay.
 gui_menu_toggle proc frame
-    FRAME_PROLOG 32
+    FRAME_PROLOG 48
     mov     qword ptr [rbp-24], rcx
     cmp     dword ptr [g_menu_open], 0
     jne     mtg_close
@@ -17171,6 +19768,23 @@ frame_hittest proc frame
     jl      fht_no
     cmp     eax, dword ptr [rbp-52]
     jge     fht_no
+    ; Top 5px resize strip (reclaimed from WS_THICKFRAME by vault_nc_subclass),
+    ; leaving the right-hand Close button clickable.
+    cmp     eax, 5
+    jge     fht_cap
+    mov     ecx, dword ptr [rbp-56]
+    sub     ecx, CAPBTN_W
+    cmp     dword ptr [rbp-40], ecx
+    jge     fht_cap
+    mov     r8d, 12                             ; HTTOP
+    cmp     dword ptr [rbp-40], 8
+    jge     @F
+    mov     r8d, 13                             ; HTTOPLEFT
+@@: WINCALL SetWindowLongPtrW, qword ptr [rbp-24], DWLP_MSGRESULT_, r8
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+fht_cap:
     WINCALL SetWindowLongPtrW, qword ptr [rbp-24], DWLP_MSGRESULT_, HTCAPTION
     mov     eax, 1
     FRAME_EPILOG
@@ -17345,7 +19959,7 @@ vault_proc proc
     cmp     rdx, WM_COMMAND
     je      vp_cmd
     cmp     rdx, WM_CLOSE
-    je      vp_close
+    je      vp_lock_req
     cmp     rdx, WM_TIMER
     je      vp_timer_clip
     cmp     rdx, WM_SETTINGCHANGE_
@@ -17418,9 +20032,15 @@ vp_dwheel:
     jz      vp_unhandled
     jmp     vp_handled
 vp_dlbdown:
+    mov     qword ptr [rbp-40], r9
     mov     rcx, qword ptr [rbp-8]
     mov     rdx, r9
     call    gui_dsb_lbdown
+    test    eax, eax
+    jnz     vp_handled
+    mov     rcx, qword ptr [rbp-8]
+    mov     rdx, qword ptr [rbp-40]
+    call    gui_home_lbdown
     test    eax, eax
     jz      vp_unhandled
     jmp     vp_handled
@@ -17461,9 +20081,7 @@ vp_dcapchg:
     call    gui_dsb_inval
     jmp     vp_unhandled
 vp_nchit:
-    ; The detail pane's thumb strip is empty client area, which frame_hittest would
-    ; call caption - a press there moved the WINDOW and no mouse message ever
-    ; reached the thumb.  Claim it as client first.
+    ; Claim the detail pane's thumb strip and Home stat tiles as HTCLIENT first.
     mov     qword ptr [rbp-40], r9
     mov     rcx, qword ptr [rbp-8]
     mov     rdx, r9
@@ -17471,6 +20089,12 @@ vp_nchit:
     mov     r9, qword ptr [rbp-40]
     test    eax, eax
     jnz     vp_nchit_def                     ; default hit test -> HTCLIENT
+    mov     rcx, qword ptr [rbp-8]
+    mov     rdx, r9
+    call    gui_home_tilehit
+    mov     r9, qword ptr [rbp-40]
+    test    eax, eax
+    jnz     vp_nchit_def
     mov     rcx, qword ptr [rbp-8]           ; custom frame: drag the empty title strip
     call    frame_hittest                    ;   (r9 = lParam screen point)
     test    eax, eax
@@ -17574,6 +20198,14 @@ vp_tdraw:
     cmp     dword ptr [r10+0], 1              ; ODT_MENU -> themed owner-draw menu item
     je      vp_tdraw_menu
     mov     eax, dword ptr [r10+4]            ; DRAWITEMSTRUCT.CtlID
+    cmp     eax, IDC_V_LIST                   ; single-vault entry-card painter (buffered in lbsb_wmpaint)
+    je      vp_tdraw_list
+    mov     qword ptr [rbp-40], r9
+    mov     rcx, r9
+    call    gui_drawitem_begin
+    mov     r9, qword ptr [rbp-40]
+    mov     r10, r9
+    mov     eax, dword ptr [r10+4]
     cmp     eax, IDC_V_MPINTRIV               ; reject-trivial-PINs Fluent pill toggle
     je      vp_tdraw_tpintriv
     cmp     eax, IDC_V_MNOHIST               ; the two privacy pill toggles
@@ -17586,14 +20218,14 @@ vp_tdraw:
     je      vp_tdraw_twlk
     cmp     eax, IDC_V_MNOPREV               ; disable-attachment-preview toggle
     je      vp_tdraw_tnoprev
-    cmp     eax, IDC_V_LIST                   ; single-vault entry-card painter
-    je      vp_tdraw_list
     cmp     eax, IDC_V_HEADER                 ; detail-pane header (tile + title)
     je      vp_tdraw_header
     cmp     eax, IDC_V_ICON                   ; edit-mode icon tile before the title
     je      vp_tdraw_icon
     cmp     eax, IDC_V_COLORPW                ; revealed-secret colour overlay
     je      vp_tdraw_colorpw
+    cmp     eax, IDC_V_TOAST                  ; clipboard copy pill + countdown (#2)
+    je      vp_tdraw_toast
     cmp     eax, IDC_DYN_BASE                 ; a runtime row's TOTP drain bar?
     jb      vp_tdraw_def
     mov     edx, eax
@@ -17613,72 +20245,74 @@ vp_tdraw:
 vp_tdraw_header:
     mov     rcx, r9
     call    gui_draw_header
-    mov     eax, 1
-    jmp     vp_ret
+    jmp     vp_tdraw_done
 vp_tdraw_icon:
     mov     rcx, r9
     call    gui_draw_iconbtn
-    mov     eax, 1
-    jmp     vp_ret
+    jmp     vp_tdraw_done
 vp_tdraw_colorpw:
     mov     rcx, r9
     call    gui_draw_rowcolor
-    mov     eax, 1
-    jmp     vp_ret
+    jmp     vp_tdraw_done
+vp_tdraw_toast:
+    mov     rcx, r9
+    call    gui_draw_toast
+    jmp     vp_tdraw_done
 vp_tdraw_sbadge:
     mov     rcx, r9
     call    gui_draw_sbadge
-    mov     eax, 1
-    jmp     vp_ret
+    jmp     vp_tdraw_done
 vp_tdraw_taglist:
     mov     rcx, r9
     call    gui_draw_taglist
-    mov     eax, 1
-    jmp     vp_ret
+    jmp     vp_tdraw_done
 vp_tdraw_chev:
     mov     rcx, r9
     call    gui_draw_flatchevron
-    mov     eax, 1
-    jmp     vp_ret
+    jmp     vp_tdraw_done
 vp_tdraw_tpintriv:
     mov     rcx, r9
     mov     edx, dword ptr [g_cfg_pinnotriv]
     call    theme_toggle
-    jmp     vp_ret
+    jmp     vp_tdraw_done
 vp_tdraw_tnohist:
     mov     rcx, r9
     mov     edx, dword ptr [g_no_history]
     call    theme_toggle
-    jmp     vp_ret
+    jmp     vp_tdraw_done
 vp_tdraw_tnophon:
     mov     rcx, r9
     mov     edx, dword ptr [g_no_phonetic]
     call    theme_toggle
-    jmp     vp_ret
+    jmp     vp_tdraw_done
 vp_tdraw_tsecd:
     mov     rcx, r9
     mov     edx, dword ptr [g_secunlock]
     call    theme_toggle
-    jmp     vp_ret
+    jmp     vp_tdraw_done
 vp_tdraw_twlk:
     mov     rcx, r9
     mov     edx, dword ptr [g_winlock]
     call    theme_toggle
-    jmp     vp_ret
+    jmp     vp_tdraw_done
 vp_tdraw_tnoprev:
     mov     rcx, r9
     mov     edx, dword ptr [g_nopreview]
     call    theme_toggle
-    jmp     vp_ret
+    jmp     vp_tdraw_done
 vp_tdraw_totp:
     mov     rcx, r9
-    mov     edx, dword ptr [g_totp_secs]
-    mov     r8d, IDC_V_TOTP_WINDOW
+    mov     edx, dword ptr [g_totp_ms]
+    mov     r8d, TOTP_WINDOW_MS
     call    theme_progressbar
-    jmp     vp_ret
+    jmp     vp_tdraw_done
 vp_tdraw_def:
     mov     rcx, r9
     call    theme_drawitem
+vp_tdraw_done:
+    mov     rcx, qword ptr [rbp-40]
+    call    gui_drawitem_end
+    mov     eax, 1
     jmp     vp_ret
 vp_timer_clip:
     cmp     r8d, CLIP_TIMER
@@ -17691,12 +20325,33 @@ vp_timer_clip:
     je      vp_t_idle
     cmp     r8d, ANIM_TIMER
     je      vp_t_anim
+    cmp     r8d, TOAST_TIMER
+    je      vp_t_toast
+    cmp     r8d, AMBIENT_TIMER
+    je      vp_t_ambient
     jmp     vp_unhandled
+vp_t_ambient:
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_ambient_tick
+    jmp     vp_handled
+vp_t_toast:
+    call    gui_toast_hide
+    jmp     vp_handled
 vp_t_anim:
     call    anim_tick
     jmp     vp_handled
-vp_setting:                                   ; Windows' animation switch may have moved
+vp_setting:                                   ; Windows' animation or light/dark switch moved
     call    anim_settings
+    cmp     dword ptr [g_scheme_pref], SCHEME_FOLLOW_OS
+    jne     vp_unhandled
+    mov     eax, dword ptr [g_scheme]
+    mov     dword ptr [rbp-32], eax
+    call    gui_resolve_scheme
+    mov     eax, dword ptr [g_scheme]
+    cmp     eax, dword ptr [rbp-32]
+    je      vp_unhandled
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_apply_scheme
     jmp     vp_unhandled
 vp_wts:
     cmp     r8d, WTS_SESSION_LOCK             ; only the lock event matters
@@ -17777,6 +20432,12 @@ vp_init:
     mov     qword ptr [g_ghot_hwnd], 0
     mov     qword ptr [g_gold_hwnd], 0
     mov     qword ptr [g_xfade_hwnd], 0
+    mov     qword ptr [g_uline_anim_hwnd], 0
+    mov     qword ptr [g_tog_anim_hwnd], 0
+    mov     qword ptr [g_copy_btn_hwnd], 0
+    mov     dword ptr [g_uline_seg_ctl], 0
+    mov     dword ptr [g_health_filter], 0
+    mov     dword ptr [g_totp_prev0], 0
     WINCALL GetFileAttributesW, addr g_vpath  ; C8.5: a read-only vault FILE forces
     cmp     eax, -1                           ; read-only mode (it can't be written anyway)
     je      @F
@@ -17811,8 +20472,11 @@ vp_init:
     mov     dword ptr [g_menu_open], 0
     WINCALL CreateDialogParamW, qword ptr [g_hinst], DLG_SETTINGS, qword ptr [rbp-8],             addr settings_proc, 0             ; the settings screen, created hidden
     mov     qword ptr [g_settings_hwnd], rax
-    call    gui_anim_label                   ; never a blank caption, even before it opens
+    call    gui_subclass_settings_edits      ; 40% glass double-buffering on numeric edits
+    call    gui_backdrop_label               ; initialize GPU backdrop mode button caption
     call    gui_tpm_label                    ; ... same for the TPM Unlock mode button
+    lea     rcx, [g_hdr + VH_SALT]           ; deterministic per-vault backdrop seed
+    call    gpu_set_vault_seed
     mov     rcx, qword ptr [rbp-8]           ; every child must clip its siblings, or they
     call    gui_clip_children                ;   repaint straight over the settings child
     WINCALL SetDlgItemTextW, qword ptr [rbp-8], IDC_V_ADD, addr wb_add
@@ -17877,8 +20541,13 @@ vp_init:
     call    ghost_attach
     WINCALL GetDlgItem, qword ptr [rbp-8], IDC_V_LIST    ; type-to-search: keystrokes on
     WINCALL SetWindowSubclass, rax, addr search_type_subclass, 0, 0   ;  the list -> search box
-    WINCALL GetDlgItem, qword ptr [rbp-8], IDC_V_SEARCH  ; Ctrl+shortcuts + Down -> list
+    WINCALL GetDlgItem, qword ptr [rbp-8], IDC_V_SEARCH  ; Ctrl+shortcuts + Down -> list + glass
+    mov     qword ptr [rbp-32], rax
     WINCALL SetWindowSubclass, rax, addr search_box_subclass, 0, 0
+    WINCALL SetWindowSubclass, qword ptr [rbp-32], addr glass_edit_subclass, 2, 0
+    WINCALL GetDlgItem, qword ptr [rbp-8], IDC_V_TITLE   ; glass double-buffering on title edit
+    WINCALL SetWindowSubclass, rax, addr glass_edit_subclass, 2, 0
+    WINCALL SetWindowSubclass, qword ptr [rbp-8], addr vault_nc_subclass, 3, 0
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_V_SEARCH, EM_SETCUEBANNER, 1, addr cue_search
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_V_SEARCH, EM_LIMITTEXT, SRCH_MAXCH, 0
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_V_TITLE, EM_LIMITTEXT, CONVW_MAX-1, 0
@@ -17907,10 +20576,16 @@ vp_init:
     ; auto-lock: Win+L notifications (gated by g_winlock on receipt) + idle poll
     WINCALL WTSRegisterSessionNotification, qword ptr [rbp-8], 0  ; NOTIFY_FOR_THIS_SESSION
     WINCALL SetTimer, qword ptr [rbp-8], IDLE_TIMER, IDLE_POLL_MS, 0  ; poll: auto-lock + C8.4 refresh
+    mov     dword ptr [g_gpu_time_ms], 0
+    WINCALL GetTickCount
+    mov     dword ptr [g_gpu_t0], eax
+    WINCALL SetTimer, qword ptr [rbp-8], AMBIENT_TIMER, AMBIENT_MS, 0
     mov     rcx, qword ptr [rbp-8]            ; custom frame: shift content below the strip,
     call    frame_shift                       ;   grow to preserve size, then build the strip
     mov     rcx, qword ptr [rbp-8]
     call    frame_grow
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_settings_size
     mov     rcx, qword ptr [rbp-8]
     call    frame_build
     mov     rcx, qword ptr [rbp-8]            ; record control rects for responsive resize
@@ -17919,6 +20594,15 @@ vp_init:
     call    gui_cmd_dock_layout
     mov     rcx, qword ptr [rbp-8]            ; fit the entry list inside the sidebar frame
     call    sidebar_layout
+    ; Sweep the Home Vault Health donut ring on open (#17)
+    mov     ecx, ANIM_DONUT
+    xor     edx, edx
+    xor     r8d, r8d
+    call    anim_set
+    mov     ecx, ANIM_DONUT
+    mov     edx, 1024
+    mov     r8d, 220
+    call    anim_set
     WINCALL GetDlgItem, qword ptr [rbp-8], IDC_V_SEARCH
     mov     rcx, qword ptr [rbp-8]            ; topmost + foreground + initial focus on search
     mov     rdx, rax
@@ -17975,7 +20659,7 @@ vp_cmd_disp:
     jmp     vp_dyn                            ;   ...) must never fire a row button action
 vp_cmd_fixed:
     cmp     eax, IDC_T_CLOSE                  ; custom caption button (only Close remains)
-    je      vp_close
+    je      vp_lock_req
     cmp     eax, IDC_T_NEW                    ; title-bar control dock
     je      vp_add
     cmp     eax, IDC_T_GEN
@@ -18010,8 +20694,8 @@ vp_cmd_fixed:
     je      vp_lock_req
     cmp     eax, IDC_V_MTHEME
     je      vp_theme
-    cmp     eax, IDC_V_MANIM
-    je      vp_animpref
+    cmp     eax, IDC_V_MBKD
+    je      vp_backdrop
     cmp     eax, IDC_V_MHOTK
     je      vp_hotkey
     cmp     eax, IDC_V_MEXPORT
@@ -18051,7 +20735,7 @@ vp_cmd_fixed:
 vp_esc:
     cmp     dword ptr [g_new_pending], 0     ; Escape on a just-added placeholder
     jne     ve_discard_new                   ;   discards it rather than locking
-    jmp     vp_lock
+    jmp     vp_lock_req
 vp_mtpm:
     cmp     dword ptr [g_tpm_present], 0       ; disabled with no TPM hardware
     je      vp_handled
@@ -18089,8 +20773,10 @@ vp_mpintriv:
     mov     eax, dword ptr [g_cfg_pinnotriv]
     xor     eax, 1
     mov     dword ptr [g_cfg_pinnotriv], eax
-    mov     ecx, IDC_V_MPINTRIV
-    call    gui_inval_setting
+    mov     rcx, qword ptr [g_settings_hwnd]
+    mov     edx, IDC_V_MPINTRIV
+    mov     r8d, eax
+    call    gui_toggle_kick
     jmp     vp_handled
 vp_mwlk:
     cmp     dword ptr [g_winlock_lock], 0     ; HKLM-locked -> ignore the click
@@ -18098,8 +20784,10 @@ vp_mwlk:
     mov     eax, dword ptr [g_winlock]
     xor     eax, 1
     mov     dword ptr [g_winlock], eax
-    mov     ecx, IDC_V_MWLK                ; repaint the toggle in the settings child
-    call    gui_inval_setting
+    mov     rcx, qword ptr [g_settings_hwnd]
+    mov     edx, IDC_V_MWLK
+    mov     r8d, eax
+    call    gui_toggle_kick
     jmp     vp_handled
 vp_mnoprev:
     cmp     dword ptr [g_nopreview_lock], 0   ; HKLM-locked -> ignore the click
@@ -18107,8 +20795,10 @@ vp_mnoprev:
     mov     eax, dword ptr [g_nopreview]
     xor     eax, 1
     mov     dword ptr [g_nopreview], eax
-    mov     ecx, IDC_V_MNOPREV                ; repaint the toggle in the settings child
-    call    gui_inval_setting
+    mov     rcx, qword ptr [g_settings_hwnd]
+    mov     edx, IDC_V_MNOPREV
+    mov     r8d, eax
+    call    gui_toggle_kick
     jmp     vp_handled
 vp_mnohist:
     cmp     dword ptr [g_nohist_lock], 0      ; HKLM-locked -> ignore the click
@@ -18116,8 +20806,10 @@ vp_mnohist:
     mov     eax, dword ptr [g_no_history]
     xor     eax, 1
     mov     dword ptr [g_no_history], eax
-    mov     ecx, IDC_V_MNOHIST                ; repaint the toggle in the settings child
-    call    gui_inval_setting
+    mov     rcx, qword ptr [g_settings_hwnd]
+    mov     edx, IDC_V_MNOHIST
+    mov     r8d, eax
+    call    gui_toggle_kick
     jmp     vp_handled
 vp_mnophon:
     cmp     dword ptr [g_nophon_lock], 0
@@ -18125,8 +20817,10 @@ vp_mnophon:
     mov     eax, dword ptr [g_no_phonetic]
     xor     eax, 1
     mov     dword ptr [g_no_phonetic], eax
-    mov     ecx, IDC_V_MNOPHON                ; repaint the toggle in the settings child
-    call    gui_inval_setting
+    mov     rcx, qword ptr [g_settings_hwnd]
+    mov     edx, IDC_V_MNOPHON
+    mov     r8d, eax
+    call    gui_toggle_kick
     jmp     vp_handled
 vp_msecd:
     cmp     dword ptr [g_secunlock_lock], 0    ; HKLM-locked -> ignore the click
@@ -18134,8 +20828,10 @@ vp_msecd:
     mov     eax, dword ptr [g_secunlock]
     xor     eax, 1
     mov     dword ptr [g_secunlock], eax
-    mov     ecx, IDC_V_MSECD                ; repaint the toggle in the settings child
-    call    gui_inval_setting
+    mov     rcx, qword ptr [g_settings_hwnd]
+    mov     edx, IDC_V_MSECD
+    mov     r8d, eax
+    call    gui_toggle_kick
     jmp     vp_handled
 vp_msecinfo:
     WINCALL gui_msgbox, qword ptr [rbp-8], addr m_msecinfo, addr t_msecinfo, \
@@ -18173,7 +20869,14 @@ vp_search_now:
     jmp     vp_handled
 vp_focusin:
     cmp     eax, IDC_DYN_BASE                   ; a row's control took the focus (Tab):
-    jb      vpf_noscroll                        ;   bring its card on screen
+    jae     vpf_scroll                          ;   bring its card on screen
+    mov     dword ptr [rbp-16], eax
+    mov     qword ptr [rbp-40], r9
+    call    gui_uline_kick                      ; 120ms center-out underline (#1)
+    mov     r9, qword ptr [rbp-40]
+    mov     eax, dword ptr [rbp-16]
+    jmp     vpf_noscroll
+vpf_scroll:
     mov     dword ptr [rbp-16], eax
     mov     qword ptr [rbp-40], r9
     sub     eax, IDC_DYN_BASE
@@ -18231,26 +20934,49 @@ vp_menu:
     call    gui_menu_toggle
     jmp     vp_handled
 vp_theme:
-    mov     eax, dword ptr [g_scheme]            ; cycle color scheme
+    cmp     dword ptr [g_scheme_lock], 0
+    jne     vp_handled
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, 2                               ; full-client cross-fade (#7)
+    xor     r8d, r8d
+    xor     r9d, r9d
+    call    gui_xfade_begin_ex
+    mov     eax, dword ptr [g_scheme_pref]       ; cycle 14 palettes + Follow Windows
     inc     eax
-    cmp     eax, SCHEME_COUNT
+    cmp     eax, SCHEME_CHOICES
     jb      @F
     xor     eax, eax
-@@: mov     dword ptr [g_scheme], eax
+@@: mov     dword ptr [g_scheme_pref], eax
     mov     rcx, qword ptr [rbp-8]
     call    gui_apply_scheme
     call    gui_save_prefs
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_xfade_go
     jmp     vp_handled
-vp_animpref:
-    mov     eax, dword ptr [g_anim_pref]         ; Follow Windows -> Always -> Never
+vp_backdrop:
+    cmp     dword ptr [g_backdrop_lock], 0
+    jne     vp_handled
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, 2                               ; smooth backdrop cross-fade (#7, #21)
+    xor     r8d, r8d
+    xor     r9d, r9d
+    call    gui_xfade_begin_ex
+    mov     eax, dword ptr [g_backdrop_pref]     ; cycle 14 GPU backdrops + Mica + Flat (0..15)
     inc     eax
-    cmp     eax, 3
+    cmp     eax, BACKDROP_COUNT
     jb      @F
     xor     eax, eax
-@@: mov     dword ptr [g_anim_pref], eax
-    call    anim_settings                        ; takes effect at once
-    call    gui_anim_label
+@@: mov     dword ptr [g_backdrop_pref], eax
+    cmp     eax, BACKDROP_FLAT
+    jb      @F
+    call    gui_comp_flush
+@@: call    gui_backdrop_label
     call    gui_save_prefs
+    mov     rcx, qword ptr [rbp-8]
+    call    theme_dwm_apply
+    WINCALL RedrawWindow, qword ptr [rbp-8], 0, 0, 0185h
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_xfade_go
     jmp     vp_handled
 vp_hotkey:
     mov     rcx, qword ptr [rbp-8]               ; capture + rebind the summon hotkey
@@ -18277,7 +21003,12 @@ vp_ovfl:                                        ; menu opens even with no entry 
 vp_iconpick:
     cmp     dword ptr [g_cur_idx], 0             ; only with an entry shown (edit mode only)
     jl      vp_handled
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_modal_dim_begin
     WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_ICON, qword ptr [rbp-8], addr icon_proc, 0
+    mov     dword ptr [rbp-20], eax
+    call    gui_modal_dim_end
+    mov     eax, dword ptr [rbp-20]
     cmp     qword ptr [g_body_ptr], 0            ; vault locked while dialog was open?
     je      vp_handled
     cmp     eax, 1
@@ -18312,7 +21043,18 @@ vp_fav_toggle:
     mov     eax, dword ptr [g_fav_state]         ; toggle favorite
     xor     eax, 1
     mov     dword ptr [g_fav_state], eax
-    mov     rcx, qword ptr [rbp-8]
+    test    eax, eax
+    jz      @F
+    ; Scale-pop gold favorite star (#18)
+    mov     ecx, ANIM_FAVPOP
+    mov     edx, 1024
+    xor     r8d, r8d
+    call    anim_set
+    mov     ecx, ANIM_FAVPOP
+    xor     edx, edx
+    mov     r8d, 160
+    call    anim_set
+@@: mov     rcx, qword ptr [rbp-8]
     call    gui_update_fav_glyph
     mov     rcx, qword ptr [rbp-8]               ; persist immediately
     call    gui_commit
@@ -18440,7 +21182,10 @@ vpd_gen_pw:
     mov     dword ptr [g_pg_style], 0
     mov     dword ptr [g_pg_opt], PWCLASS_U or PWCLASS_L or PWCLASS_D
 vpd_gen_open:
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_modal_dim_begin
     WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_PWGEN, qword ptr [rbp-8], addr pwgen_proc, 0
+    call    gui_modal_dim_end
     jmp     vp_handled
 vpd_reveal:
     mov     edx, eax
@@ -18470,7 +21215,10 @@ vp_gen_standalone:
     mov     dword ptr [g_pg_len], 16
     mov     dword ptr [g_pg_style], 0
     mov     dword ptr [g_pg_opt], PWCLASS_U or PWCLASS_L or PWCLASS_D
-@@: WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_PWGEN, qword ptr [rbp-8], addr pwgen_proc, 0
+@@: mov     rcx, qword ptr [rbp-8]
+    call    gui_modal_dim_begin
+    WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_PWGEN, qword ptr [rbp-8], addr pwgen_proc, 0
+    call    gui_modal_dim_end
     jmp     vp_handled
 vp_add:
     cmp     dword ptr [g_readonly], 0           ; E9: no new entry in read-only mode
@@ -18644,6 +21392,8 @@ vp_remove:
     WINCALL gui_msgbox, qword ptr [rbp-8], addr t_trash, addr t_err, <MB_YESNO or MB_ICONQUESTION>
     cmp     qword ptr [g_body_ptr], 0
     je      vp_handled
+    cmp     dword ptr [g_cur_idx], 0
+    jl      vp_handled
     cmp     eax, IDYES
     jne     vp_handled
     mov     dword ptr [g_deleted_state], 1   ; soft-delete: mark VF_DELETED + reseal
@@ -18657,6 +21407,8 @@ vpr_forever:
     WINCALL gui_msgbox, qword ptr [rbp-8], addr t_delforever, addr t_err, <MB_YESNO or MB_ICONWARNING>
     cmp     qword ptr [g_body_ptr], 0
     je      vp_handled
+    cmp     dword ptr [g_cur_idx], 0
+    jl      vp_handled
     cmp     eax, IDYES
     jne     vp_handled
     mov     ecx, dword ptr [g_cur_idx]
@@ -18687,12 +21439,8 @@ vp_done:
     call    gui_leave_trash
     jmp     vp_handled
 vp_lock_req:
-    ; Idle, workstation lock, the hotkey, Ctrl+L.  When one of our modal dialogs or
-    ; message boxes is up, locking from inside its loop leaves it on screen - showing
-    ; whatever it shows - until someone answers it, and the code that opened it then
-    ; carries on against a vault that is going away.  End them (as Cancel), let their
-    ; loops unwind, and run the lock from the vault window's own loop.  Bounded: a
-    ; dialog that will not close does not hold the lock off.
+    call    gui_modal_dim_end
+    call    gui_xfade_drop
     call    gui_end_modals
     test    eax, eax
     jz      vp_lock
@@ -18703,6 +21451,8 @@ vp_lock_req:
     jmp     vp_handled
 vp_lock:
 vp_close:
+    call    gui_modal_dim_end
+    call    gui_xfade_drop
     mov     dword ptr [g_lock_tries], 0
     cmp     dword ptr [g_menu_open], 0       ; closing while settings open -> save
     je      vp_lock_dirty
@@ -18723,6 +21473,10 @@ vp_lock_go:
     mov     rcx, qword ptr [rbp-8]
     mov     edx, IDLE_TIMER                 ; stop the auto-lock poll
     call    KillTimer
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, AMBIENT_TIMER              ; stop calm ambient GPU backdrop timer
+    call    KillTimer
+    mov     dword ptr [g_gpu_time_ms], 0
     mov     rcx, qword ptr [rbp-8]          ; window is going away
     call    WTSUnRegisterSessionNotification
     add     rsp, 32
@@ -18752,7 +21506,14 @@ vp_lock_go:
     ; Cryptographic lock happens IMMEDIATELY here - even if a stubborn OS/shell modal
     ; (e.g. GetOpenFileNameW) keeps DialogBoxParamW on the call stack briefly.
     call    vault_lock
+    lea     rcx, [g_health_flags]
+    mov     edx, SCORE_CAP
+    call    secure_zero
+    mov     dword ptr [g_health_filter], 0
+    xor     ecx, ecx
+    call    gpu_set_vault_seed
     call    tile_cache_flush
+    call    gui_comp_flush
     call    secmem_wipe_statics
     mov     dword ptr [g_tilefile_n], 0
     mov     dword ptr [g_pwhist_n], 0
@@ -18948,8 +21709,16 @@ lp_tpm_done:
     jz      @F
     mov     eax, 1
 @@: mov     dword ptr [g_allow_unc], eax
-    ; AllowScreenCapture: HKLM > HKCU > default 0 (0 = WDA_EXCLUDEFROMCAPTURE active) (VDR2-05)
+    ; AllowScreenCapture: strictly HKLM-only in production (0/1; default 0 = WDA_EXCLUDEFROMCAPTURE) (AUD-17)
+ifdef PROBE_IO
+    cmp     dword ptr [g_testmode], 0
+    je      lp_sccap_hklm
     WINCALL cfg_get_dword, addr wv_allowsccap, 0, 0
+    jmp     lp_sccap_set
+lp_sccap_hklm:
+endif
+    WINCALL cfg_get_dword_hklm, addr wv_allowsccap, 0
+lp_sccap_set:
     test    eax, eax
     jz      @F
     mov     eax, 1
@@ -19401,16 +22170,20 @@ ps_done:
     mov     rcx, rax
     mov     edx, dword ptr [rbp-48]
     call    EnableWindow
-    ; strength/match integrated into the field underlines (like the export dialog)
+    ; strength/match integrated into 4-segment meter + class pills (#16)
     mov     dword ptr [g_uline_ctl], IDC_C_PW
     cmp     dword ptr [rbp-56], 0            ; empty field -> default accent underline
     jne     cs_pwdef
+    mov     dword ptr [g_uline_seg_ctl], IDC_C_PW
     mov     eax, dword ptr [g_pw_level]      ; contiguous red/amber/lgreen/dgreen
+    mov     dword ptr [g_uline_seg_lvl], eax
     lea     r10, [g_br_red]
     mov     rax, qword ptr [r10+rax*8]
     mov     qword ptr [g_uline_br], rax
     jmp     cs_confirm
 cs_pwdef:
+    mov     dword ptr [g_uline_seg_ctl], 0
+    mov     dword ptr [g_last_pw_clsmask], 0
     mov     qword ptr [g_uline_br], 0
 cs_confirm:
     mov     dword ptr [g_uline_ctl2], IDC_C_PW2
@@ -19497,12 +22270,16 @@ xs_setpw:
     mov     dword ptr [g_uline_ctl], IDC_XP_PW
     cmp     dword ptr [rbp-32], 0               ; empty field -> default accent underline
     je      xs_pwdef
+    mov     dword ptr [g_uline_seg_ctl], IDC_XP_PW
     mov     eax, dword ptr [rbp-44]
+    mov     dword ptr [g_uline_seg_lvl], eax
     lea     r10, [g_br_red]                     ; contiguous red/amber/lgreen/dgreen
     mov     rax, qword ptr [r10+rax*8]
     mov     qword ptr [g_uline_br], rax
     jmp     xs_confirm
 xs_pwdef:
+    mov     dword ptr [g_uline_seg_ctl], 0
+    mov     dword ptr [g_last_pw_clsmask], 0
     mov     qword ptr [g_uline_br], 0
 xs_confirm:
     mov     dword ptr [g_uline_ctl2], IDC_XP_PW2
@@ -19630,7 +22407,7 @@ gui_show_info endp
 create_proc proc
     push    rbp
     mov     rbp, rsp
-    sub     rsp, 64
+    sub     rsp, 96
     mov     qword ptr [rbp-8], rcx
     cmp     rdx, WM_INITDIALOG
     je      cp_init
@@ -19677,13 +22454,21 @@ cp_terase:
     call    theme_erase
     jmp     cp_ret
 cp_tdraw:
+    mov     r10, r9
+    cmp     dword ptr [r10+4], IDC_C_CLSPILLS
+    jne     @F
     mov     rcx, r9
+    call    gui_draw_clspills
+    jmp     cp_ret
+@@: mov     rcx, r9
     call    theme_drawitem
     jmp     cp_ret
 cp_tunh:
     xor     eax, eax
     jmp     cp_ret
 cp_destroy:
+    mov     dword ptr [g_uline_seg_ctl], 0
+    mov     dword ptr [g_last_pw_clsmask], 0
     mov     rcx, qword ptr [rbp-8]
     mov     edx, IDC_C_PW
     call    gui_edit_scrub
@@ -19759,7 +22544,10 @@ cp_ignore:
     xor     eax, eax
     jmp     cp_ret
 cp_refocus:
-    sub     rsp, 32
+    cmp     r10d, EN_SETFOCUS
+    jne     @F
+    call    gui_uline_kick
+@@: sub     rsp, 32
     mov     rcx, qword ptr [rbp-8]
     xor     edx, edx
     mov     r8d, 1
@@ -20129,6 +22917,8 @@ select_proc proc
     je      sel_raise
     cmp     rdx, WM_COMMAND
     je      sel_cmd
+    cmp     rdx, WM_DESTROY
+    je      sel_destroy
     cmp     rdx, WM_CTLCOLORSTATIC
     je      sel_col
     cmp     rdx, WM_CTLCOLOREDIT
@@ -20260,6 +23050,16 @@ sel_lbsb_reset:
     mov     dword ptr [g_lbsb_track], 0
     mov     dword ptr [g_lbsb_top], -1           ; and repaint its strip on the next paint
     jmp     sel_handled
+sel_destroy:
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_SEL_SEARCH
+    call    gui_edit_scrub
+    WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_SEL_LIST, LVM_DELETEALLITEMS_, 0, 0
+    lea     rcx, [g_lvi]
+    mov     edx, 96
+    call    secure_zero
+    xor     eax, eax
+    jmp     sel_ret
 sel_handled:
     mov     eax, 1
 sel_ret:
@@ -21258,7 +24058,7 @@ gui_show_health endp
 ; ===========================================================================
 public gui_seclock_warn
 gui_seclock_warn proc frame
-    FRAME_PROLOG 32
+    FRAME_PROLOG 48
     mov     qword ptr [rbp-24], rcx
     lea     rcx, [g_lockmsg]
     lea     rdx, [s_nolock]
@@ -21331,7 +24131,8 @@ gim_ask:
     lea     r8, [g_imppath + (MAX_PATH_CHARS-1)*2]
     call    gui_wstrcpy
 gim_havefile:
-    mov     qword ptr [g_rf_cap], 0F0000000h    ; = ZE_MAXCAP: the lengths below are 32-bit
+    mov     rax, 0F1001000h                     ; ATT_TOTAL_MAX + VAULT_BODY_MAX + 4 KiB
+    mov     qword ptr [g_rf_cap], rax
     lea     rcx, [g_imppath]
     lea     rdx, [rbp-32]                       ; *raw
     lea     r8, [rbp-40]                        ; *rawlen
@@ -21343,11 +24144,13 @@ gim_havefile:
 gim_read_ok:
     ; ---- a .vordr vault?  decided by MAGIC, never by the extension --------------
     mov     r10, qword ptr [rbp-32]
-    cmp     dword ptr [rbp-40], 8
+    cmp     qword ptr [rbp-40], 8
     jb      gim_notvordr
     cmp     dword ptr [r10], VAULT_MAGIC
     je      gim_vault
-    ; ---- else require a Vordr encrypted zip (PK + WinZip-AES method 99) ----
+    ; ---- else require a Vordr encrypted zip (PK + WinZip-AES method 99, <= ZE_MAXCAP) ----
+    cmp     qword ptr [rbp-40], 0F0000000h
+    ja      gim_notvordr
     mov     r10, qword ptr [rbp-32]             ; raw
     cmp     dword ptr [rbp-40], 10
     jb      gim_notvordr
@@ -21697,6 +24500,8 @@ pgr_sld:
     mov     r9d, 258
     call    gui_towide
     WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_PG_OUT, addr g_genout_w
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_PG_OUT
+    WINCALL InvalidateRect, rax, 0, 0
 pgr_bits:
     mov     ecx, dword ptr [g_pg_bits]
     lea     rdx, [g_pg_tmpw]
@@ -21706,6 +24511,8 @@ pgr_bits:
     lea     r8, [g_pg_tmpw + (128-1)*2]       ; last slot the NUL may occupy
     call    gui_wstrcpy
     WINCALL SetDlgItemTextW, qword ptr [rbp-24], IDC_PG_BITS, addr g_pg_tmpw
+    WINCALL GetDlgItem, qword ptr [rbp-24], IDC_PG_BITS
+    WINCALL InvalidateRect, rax, 0, 0
     FRAME_EPILOG
     ret
 gui_pg_regen endp
@@ -21769,6 +24576,177 @@ pga_done:
     ret
 gui_pg_apply endp
 
+; gui_draw_pgbits(rcx = lpdis) - draw entropy label + 4-segment strength pills in DLG_PWGEN (#16).
+gui_draw_pgbits proc frame
+    FRAME_PROLOG 224
+    mov     qword ptr [rbp-24], rcx
+    mov     r10, rcx
+    mov     rax, qword ptr [r10+32]
+    mov     qword ptr [rbp-32], rax              ; hdc
+    mov     eax, dword ptr [r10+40]
+    mov     dword ptr [rbp-64], eax              ; L
+    mov     eax, dword ptr [r10+44]
+    mov     dword ptr [rbp-60], eax              ; T
+    mov     eax, dword ptr [r10+48]
+    mov     dword ptr [rbp-56], eax              ; R
+    mov     eax, dword ptr [r10+52]
+    mov     dword ptr [rbp-52], eax              ; B
+    WINCALL CreateSolidBrush, dword ptr [g_col_bg]
+    mov     qword ptr [rbp-40], rax
+    WINCALL FillRect, qword ptr [rbp-32], addr rbp-64, rax
+    WINCALL DeleteObject, qword ptr [rbp-40]
+    call    gui_make_listfonts
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [g_subfont]
+    mov     qword ptr [rbp-48], rax
+    WINCALL SetBkMode, qword ptr [rbp-32], 1
+    WINCALL SetTextColor, qword ptr [rbp-32], dword ptr [g_col_textdim]
+    ; Left 60% = "<N> bits of entropy"
+    mov     eax, dword ptr [rbp-64]
+    mov     dword ptr [rbp-80], eax
+    mov     eax, dword ptr [rbp-60]
+    mov     dword ptr [rbp-76], eax
+    mov     eax, dword ptr [rbp-56]
+    sub     eax, 84
+    mov     dword ptr [rbp-72], eax
+    mov     eax, dword ptr [rbp-52]
+    mov     dword ptr [rbp-68], eax
+    WINCALL DrawTextW, qword ptr [rbp-32], addr g_pg_tmpw, -1, addr rbp-80, DT_NAMEFLAGS
+    ; Right 80px = 4 anti-aliased strength segments keyed on g_pg_bits (<45, <65, <90, >=90)
+    mov     eax, dword ptr [g_pg_bits]
+    xor     ecx, ecx                             ; lvl 0..3 -> 1..4 lit segments
+    mov     edx, CLR_BAR_RED
+    cmp     eax, 45
+    jb      gdpb_lvl
+    mov     ecx, 1
+    mov     edx, CLR_BAR_AMBER
+    cmp     eax, 65
+    jb      gdpb_lvl
+    mov     ecx, 2
+    mov     edx, CLR_BAR_LGREEN
+    cmp     eax, 90
+    jb      gdpb_lvl
+    mov     ecx, 3
+    mov     edx, CLR_BAR_DGREEN
+gdpb_lvl:
+    inc     ecx                                  ; 1..4 lit segments
+    cmp     dword ptr [g_pg_bits], 0
+    jne     @F
+    xor     ecx, ecx
+@@: mov     dword ptr [rbp-84], ecx              ; litCnt
+    mov     dword ptr [rbp-88], edx              ; litCol
+    mov     eax, dword ptr [rbp-60]
+    add     eax, dword ptr [rbp-52]
+    sar     eax, 1
+    sub     eax, 2
+    mov     dword ptr [rbp-92], eax              ; segT
+    add     eax, 4
+    mov     dword ptr [rbp-96], eax              ; segB
+    mov     dword ptr [rbp-100], 0               ; i = 0..3
+gdpb_lp:
+    mov     ecx, dword ptr [rbp-100]
+    cmp     ecx, 4
+    jae     gdpb_rest
+    mov     eax, dword ptr [rbp-56]
+    sub     eax, 80
+    imul    edx, ecx, 20
+    add     eax, edx
+    mov     dword ptr [rbp-104], eax             ; sL
+    add     eax, 17                              ; sR (3px gap)
+    mov     dword ptr [rbp-108], eax
+    mov     r9d, dword ptr [g_col_frame]
+    cmp     ecx, dword ptr [rbp-84]
+    jae     @F
+    mov     r9d, dword ptr [rbp-88]
+@@: mov     dword ptr [rbp-112], r9d
+    WINCALL theme_aa_rrect, qword ptr [rbp-32], dword ptr [rbp-104], dword ptr [rbp-92], \
+            dword ptr [rbp-108], dword ptr [rbp-96], 2, dword ptr [rbp-112], dword ptr [rbp-112], -1, -1
+    inc     dword ptr [rbp-100]
+    jmp     gdpb_lp
+gdpb_rest:
+    WINCALL SelectObject, qword ptr [rbp-32], qword ptr [rbp-48]
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gui_draw_pgbits endp
+
+; pgout_subclass(rcx=hwnd, edx=msg, r8=wParam, r9=lParam) - syntax-colored Consolas
+;   rendering on IDC_PG_OUT in DLG_PWGEN (#20), delegating all non-paint messages.
+pgout_subclass proc
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 224
+    cmp     edx, WM_PAINT
+    je      pgs_paint
+    mov     qword ptr [rbp-16], rcx
+    mov     dword ptr [rbp-24], edx
+    mov     rax, qword ptr [rbp+48]
+    mov     qword ptr [rsp+32], rax
+    mov     rax, qword ptr [rbp+56]
+    mov     qword ptr [rsp+40], rax
+    call    DefSubclassProc
+    cmp     dword ptr [rbp-24], 7                ; WM_SETFOCUS -> hide Segoe UI caret
+    jne     pgs_def_ret
+    mov     qword ptr [rbp-32], rax
+    WINCALL HideCaret, qword ptr [rbp-16]
+    mov     rax, qword ptr [rbp-32]
+pgs_def_ret:
+    mov     rsp, rbp
+    pop     rbp
+    ret
+pgs_paint:
+    mov     qword ptr [rbp-16], rcx
+    WINCALL BeginPaint, rcx, addr rbp-112
+    mov     qword ptr [rbp-24], rax              ; hdc
+    test    rax, rax
+    jz      pgs_done
+    WINCALL GetClientRect, qword ptr [rbp-16], addr rbp-128
+    WINCALL CreateSolidBrush, dword ptr [g_col_panel]
+    mov     qword ptr [rbp-32], rax
+    WINCALL FillRect, qword ptr [rbp-24], addr rbp-128, rax
+    WINCALL DeleteObject, qword ptr [rbp-32]
+    call    gui_make_listfonts
+    WINCALL SelectObject, qword ptr [rbp-24], qword ptr [g_rowmonofont]
+    mov     qword ptr [rbp-40], rax
+    WINCALL SetBkMode, qword ptr [rbp-24], 1
+    WINCALL GetTextExtentPoint32W, qword ptr [rbp-24], addr pr_zero, 1, addr rbp-144
+    mov     eax, dword ptr [rbp-116]             ; clientB
+    sub     eax, dword ptr [rbp-140]             ; - charH
+    sar     eax, 1
+    mov     dword ptr [rbp-148], eax             ; y
+    mov     dword ptr [rbp-152], 4               ; x
+    mov     dword ptr [rbp-156], 0               ; i
+pgs_lp:
+    mov     eax, dword ptr [rbp-156]
+    lea     r10, [g_genout_w]
+    movzx   ecx, word ptr [r10 + rax*2]
+    test    ecx, ecx
+    jz      pgs_end
+    mov     dword ptr [rbp-160], ecx
+    call    gui_pw_class
+    mov     ecx, eax
+    call    gui_class_color
+    WINCALL SetTextColor, qword ptr [rbp-24], eax
+    WINCALL GetTextExtentPoint32W, qword ptr [rbp-24], addr rbp-160, 1, addr rbp-144
+    WINCALL TextOutW, qword ptr [rbp-24], dword ptr [rbp-152], dword ptr [rbp-148], addr rbp-160, 1
+    mov     eax, dword ptr [rbp-144]
+    inc     eax                                  ; +1px tabular tracking (#20)
+    add     dword ptr [rbp-152], eax
+    mov     ecx, dword ptr [rbp-120]             ; clientR
+    cmp     dword ptr [rbp-152], ecx
+    jae     pgs_end
+    inc     dword ptr [rbp-156]
+    cmp     dword ptr [rbp-156], 256
+    jb      pgs_lp
+pgs_end:
+    WINCALL SelectObject, qword ptr [rbp-24], qword ptr [rbp-40]
+    WINCALL EndPaint, qword ptr [rbp-16], addr rbp-112
+pgs_done:
+    xor     eax, eax
+    mov     rsp, rbp
+    pop     rbp
+    ret
+pgout_subclass endp
+
 ; =============================================================================
 ; pwgen_proc - DLG_PWGEN dialog procedure (password generator window).
 ; =============================================================================
@@ -21823,6 +24801,8 @@ pp_erase:
 pp_draw:
     mov     r10, r9
     mov     eax, dword ptr [r10+4]             ; DRAWITEMSTRUCT.CtlID
+    cmp     eax, IDC_PG_BITS
+    je      pp_d_bits
     cmp     eax, IDC_PG_UP
     je      pp_d_up
     cmp     eax, IDC_PG_LO
@@ -21833,6 +24813,10 @@ pp_draw:
     je      pp_d_sy
     mov     rcx, r9
     call    theme_drawitem
+    jmp     pp_ret
+pp_d_bits:
+    mov     rcx, r9
+    call    gui_draw_pgbits
     jmp     pp_ret
 pp_d_up:
     mov     edx, PWCLASS_U
@@ -21866,6 +24850,8 @@ pp_init_lbl:
     mov     rcx, qword ptr [rbp-8]
     mov     edx, IDC_PG_OUT
     call    gui_edit_noime
+    WINCALL GetDlgItem, qword ptr [rbp-8], IDC_PG_OUT
+    WINCALL SetWindowSubclass, rax, addr pgout_subclass, 0, 0
     mov     rcx, qword ptr [rbp-8]
     call    gui_pg_sync
     mov     rcx, qword ptr [rbp-8]
@@ -21918,15 +24904,35 @@ pp_style:
     jmp     pp_syncgen
 pp_tup:
     xor     dword ptr [g_pg_opt], PWCLASS_U
+    mov     r8d, dword ptr [g_pg_opt]
+    and     r8d, PWCLASS_U
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_PG_UP
+    call    gui_toggle_kick
     jmp     pp_syncgen
 pp_tlo:
     xor     dword ptr [g_pg_opt], PWCLASS_L
+    mov     r8d, dword ptr [g_pg_opt]
+    and     r8d, PWCLASS_L
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_PG_LO
+    call    gui_toggle_kick
     jmp     pp_syncgen
 pp_tdi:
     xor     dword ptr [g_pg_opt], PWCLASS_D
+    mov     r8d, dword ptr [g_pg_opt]
+    and     r8d, PWCLASS_D
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_PG_DI
+    call    gui_toggle_kick
     jmp     pp_syncgen
 pp_tsy:
     xor     dword ptr [g_pg_opt], PWCLASS_S
+    mov     r8d, dword ptr [g_pg_opt]
+    and     r8d, PWCLASS_S
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, IDC_PG_SY
+    call    gui_toggle_kick
 pp_syncgen:
     mov     rcx, qword ptr [rbp-8]
     call    gui_pg_sync
@@ -22117,12 +25123,17 @@ xpp_raise:
     call    gui_window_raise
     jmp     xpp_ret
 xpp_destroy:
+    mov     dword ptr [g_uline_seg_ctl], 0
+    mov     dword ptr [g_last_pw_clsmask], 0
     mov     rcx, qword ptr [rbp-8]
     mov     edx, IDC_XP_PW
     call    gui_edit_scrub
     mov     rcx, qword ptr [rbp-8]
     mov     edx, IDC_XP_PW2
     call    gui_edit_scrub
+    lea     rcx, [g_xlpw2]
+    mov     edx, 512
+    call    secure_zero
     mov     rax, qword ptr [rbp-8]
     cmp     qword ptr [g_secdesk_hwnd], rax
     jne     @F
@@ -22142,7 +25153,13 @@ xpp_erase:
     call    theme_erase
     jmp     xpp_ret
 xpp_draw:
+    mov     r10, r9
+    cmp     dword ptr [r10+4], IDC_XP_CLSPILLS
+    jne     @F
     mov     rcx, r9
+    call    gui_draw_clspills
+    jmp     xpp_ret
+@@: mov     rcx, r9
     call    theme_drawitem
     jmp     xpp_ret
 xpp_unh:
@@ -22204,7 +25221,10 @@ xpp_cmd:
     xor     eax, eax
     jmp     xpp_ret
 xpp_refocus:
-    WINCALL InvalidateRect, qword ptr [rbp-8], 0, 1
+    cmp     r10d, EN_SETFOCUS
+    jne     @F
+    call    gui_uline_kick
+@@: WINCALL InvalidateRect, qword ptr [rbp-8], 0, 1
     mov     eax, 1
     jmp     xpp_ret
 xpp_pwchg:
@@ -22234,10 +25254,10 @@ xpp_ok:
     jz      xpp_polok
     cmp     eax, 1
     jne     xpp_polfew
-    WINCALL MessageBoxW, qword ptr [rbp-8], addr s_pwshort, addr xp_mm_title, 030h
+    WINCALL gui_msgbox, qword ptr [rbp-8], addr s_pwshort, addr xp_mm_title, 030h
     jmp     xpp_retry_focus
 xpp_polfew:
-    WINCALL MessageBoxW, qword ptr [rbp-8], addr s_pwclasses, addr xp_mm_title, 030h
+    WINCALL gui_msgbox, qword ptr [rbp-8], addr s_pwclasses, addr xp_mm_title, 030h
     jmp     xpp_retry_focus
 xpp_polok:
     mov     eax, dword ptr [rbp-16]
@@ -22261,11 +25281,19 @@ xpp_polok:
     mov     eax, 1
     jmp     xpp_ret
 xpp_empty:
-    WINCALL MessageBoxW, qword ptr [rbp-8], addr xp_mm_empty, addr xp_mm_title, 030h
+    WINCALL gui_msgbox, qword ptr [rbp-8], addr xp_mm_empty, addr xp_mm_title, 030h
     jmp     xpp_retry_focus
 xpp_mismatch:
-    WINCALL MessageBoxW, qword ptr [rbp-8], addr xp_mm_mismatch, addr xp_mm_title, 030h
+    WINCALL gui_msgbox, qword ptr [rbp-8], addr xp_mm_mismatch, addr xp_mm_title, 030h
 xpp_retry_focus:
+    lea     rcx, [g_xlpw]
+    mov     edx, 512
+    call    secure_zero
+    lea     rcx, [g_xlpw2]
+    mov     edx, 512
+    call    secure_zero
+    cmp     dword ptr [g_secdesk_orphan], 0
+    jne     xpp_cancel
     WINCALL SendDlgItemMessageW, qword ptr [rbp-8], IDC_XP_PW, EM_SETSEL, 0, -1
     WINCALL GetDlgItem, qword ptr [rbp-8], IDC_XP_PW
     WINCALL SetFocus, rax
@@ -22427,6 +25455,7 @@ rmp_ok:
 rmp_bad:
     WINCALL gui_msgbox, qword ptr [rbp-8], addr rm_wrong, addr rm_title, \
             <MB_OK or MB_ICONWARNING>
+    jmp     rmp_again
 rmp_again:
     mov     rcx, qword ptr [rbp-8]
     mov     edx, IDC_RM_PW
@@ -22569,9 +25598,6 @@ ipp_draw:
     mov     rcx, r9
     call    theme_drawitem
     jmp     ipp_ret
-ipp_unh:
-    xor     eax, eax
-    jmp     ipp_ret
 ipp_init:
     cmp     qword ptr [g_secdesk_hd], 0
     je      @F
@@ -22616,7 +25642,9 @@ ipp_ok:
     mov     eax, 1
     jmp     ipp_ret
 ipp_empty:
-    WINCALL MessageBoxW, qword ptr [rbp-8], addr imp_pw_empty, addr imp_pw_title, 030h
+    WINCALL gui_msgbox, qword ptr [rbp-8], addr imp_pw_empty, addr imp_pw_title, 030h
+    cmp     dword ptr [g_secdesk_orphan], 0
+    jne     ipp_cancel
     WINCALL GetDlgItem, qword ptr [rbp-8], IDC_XP_PW
     WINCALL SetFocus, rax
     mov     eax, 1
@@ -22943,9 +25971,11 @@ endif
     lea     r8, [g_vault_lock]
     call    reg_load_vault                  ; HKLM>HKCU registered path, if any
     mov     dword ptr [rbp-24], eax
-    cmp     dword ptr [g_vault_lock], 0     ; HKLM vault lock wins over --ro <path>
+    test    eax, eax
+    jz      @F
+    cmp     dword ptr [g_vault_lock], 0     ; valid HKLM vault lock wins over --ro <path>
     jne     grv_havepath
-    cmp     word ptr [g_ro_vpath], 0
+@@: cmp     word ptr [g_ro_vpath], 0
     je      grv_chk_reg
     lea     rcx, [g_vpath]
     lea     rdx, [g_ro_vpath]
@@ -22955,6 +25985,8 @@ endif
 grv_chk_reg:
     cmp     dword ptr [rbp-24], 0
     jne     grv_havepath
+    cmp     dword ptr [g_readonly], 0       ; --ro must never create a new vault (AUD-21)
+    jne     grv_none
     ; nothing in the registry -> fall back to the default Documents\vault.vordr
     lea     rcx, [g_vpath]
     mov     edx, MAX_PATH_CHARS             ; g_vpath's declared size
@@ -22975,7 +26007,13 @@ grv_havepath:
     FRAME_EPILOG
     ret
 grv_create:
+    cmp     dword ptr [g_readonly], 0        ; --ro on a missing file stays in open/pick mode
+    jne     grv_ro_missing
     mov     dword ptr [g_create], 1          ; no file -> create + set-password
+    FRAME_EPILOG
+    ret
+grv_ro_missing:
+    mov     dword ptr [g_create], 0
     FRAME_EPILOG
     ret
 grv_none:
@@ -23091,12 +26129,15 @@ gps_status_set:
     mov     dword ptr [g_uline_ctl], IDC_PS_PIN
     cmp     dword ptr [rbp-32], 0
     je      gps_ul1_def
+    mov     dword ptr [g_uline_seg_ctl], IDC_PS_PIN
     mov     eax, dword ptr [rbp-48]
+    mov     dword ptr [g_uline_seg_lvl], eax
     lea     r10, [g_br_red]
     mov     rax, qword ptr [r10+rax*8]
     mov     qword ptr [g_uline_br], rax
     jmp     gps_ul2
 gps_ul1_def:
+    mov     dword ptr [g_uline_seg_ctl], 0
     mov     qword ptr [g_uline_br], 0
 gps_ul2:
     mov     dword ptr [g_uline_ctl2], IDC_PS_PIN2
@@ -23157,6 +26198,7 @@ psp_raise:
     call    gui_window_raise
     jmp     psp_ret
 psp_destroy:
+    mov     dword ptr [g_uline_seg_ctl], 0
     mov     rcx, qword ptr [rbp-8]
     mov     edx, IDC_PS_PIN
     call    gui_edit_scrub
@@ -23248,7 +26290,10 @@ psp_cmd:
     xor     eax, eax
     jmp     psp_ret
 psp_refocus:
-    WINCALL InvalidateRect, qword ptr [rbp-8], 0, 1
+    cmp     r10d, EN_SETFOCUS
+    jne     @F
+    call    gui_uline_kick
+@@: WINCALL InvalidateRect, qword ptr [rbp-8], 0, 1
     mov     eax, 1
     jmp     psp_ret
 psp_chg:
@@ -23519,7 +26564,10 @@ pup_cmd:
     xor     eax, eax
     jmp     pup_ret
 pup_refocus:
-    WINCALL InvalidateRect, qword ptr [rbp-8], 0, 1
+    cmp     r10d, EN_SETFOCUS
+    jne     @F
+    call    gui_uline_kick
+@@: WINCALL InvalidateRect, qword ptr [rbp-8], 0, 1
     mov     eax, 1
     jmp     pup_ret
 pup_mpw:
@@ -23766,8 +26814,9 @@ sdt_fail:
     mov     qword ptr [g_secdesk_res], -2
     jmp     sdt_done
 sdt_run:
-    WINCALL DialogBoxParamW, qword ptr [g_hinst], dword ptr [g_secdesk_dlg], 0, \
-            qword ptr [g_secdesk_proc], 0
+    mov     r9, qword ptr [g_secdesk_proc]
+    xor     r9, qword ptr [g_ptr_cookie]
+    WINCALL DialogBoxParamW, qword ptr [g_hinst], dword ptr [g_secdesk_dlg], 0, r9, 0
     cmp     rax, -1
     jne     @F
     mov     rax, -2                              ; Win32 dialog-creation failure -> gss_fallback
@@ -23791,12 +26840,20 @@ secdesk_thread proc
     mov     rbp, rsp                             ; regardless of the OS thread-entry rsp
     and     rsp, -16                             ; (a bad assumption here misaligned the crypto
     sub     rsp, 32                              ;  in secdesk_body -> corruption/faults)
-    call    sstk_thread_init                     ; 0 = runs canary-only: still correct
+    call    sstk_thread_init                     ; AUD-26: fail closed to fallback gate if OOM
+    test    eax, eax
+    jz      sdt_nosstk
     call    GetCurrentThreadId                   ; publish before the desktop switch: a fault
     mov     dword ptr [g_secdesk_tid], eax       ;   from here on is on the private desktop
     call    secdesk_body
     mov     dword ptr [g_secdesk_tid], 0         ; back on the caller's desktop from here
     call    sstk_thread_free                     ; every framed call has returned
+    mov     rsp, rbp
+    pop     rbp
+    xor     eax, eax
+    ret
+sdt_nosstk:
+    mov     qword ptr [g_secdesk_res], -2
     mov     rsp, rbp
     pop     rbp
     xor     eax, eax
@@ -23810,6 +26867,7 @@ public gui_secdesk_show
 gui_secdesk_show proc frame
     FRAME_PROLOG 128                             ; locals -24..-56 clear of 6-arg WINCALL spill
     mov     dword ptr [g_secdesk_dlg], ecx
+    xor     rdx, qword ptr [g_ptr_cookie]
     mov     qword ptr [g_secdesk_proc], rdx
     mov     qword ptr [g_secdesk_res], 0
     mov     qword ptr [g_secdesk_hd], 0
@@ -23904,20 +26962,33 @@ gss_pump_mark:
     mov     rcx, qword ptr [g_secdesk_hwnd]
     test    rcx, rcx
     jz      gss_chk_timeout
-    WINCALL PostMessageW, rcx, WM_COMMAND, IDCANCEL, 0
+    WINCALL GetLastActivePopup, rcx
+    test    rax, rax
+    jz      @F
+    cmp     rax, qword ptr [g_secdesk_hwnd]
+    je      @F
+    WINCALL PostMessageW, rax, WM_CLOSE, 0, 0
+@@: WINCALL PostMessageW, qword ptr [g_secdesk_hwnd], WM_COMMAND, IDCANCEL, 0
 gss_chk_timeout:
     WINCALL GetTickCount
     sub     eax, dword ptr [rbp-32]
     cmp     eax, SECDESK_MAX_MS
     jb      gss_wait
     ; Wedged.  Flag orphan BEFORE restoring desktop, post IDCANCEL to dismiss the
-    ; dialog if it created one, and abandon the worker handles safely.
+    ; dialog (and any nested popup) if it created one, and abandon worker handles safely.
     mov     dword ptr [g_secdesk_orphan], 1
     mov     rcx, qword ptr [g_secdesk_hwnd]
     test    rcx, rcx
+    jz      gss_to_restore
+    WINCALL GetLastActivePopup, rcx
+    test    rax, rax
     jz      @F
-    WINCALL PostMessageW, rcx, WM_COMMAND, IDCANCEL, 0
-@@: call    secdesk_restore
+    cmp     rax, qword ptr [g_secdesk_hwnd]
+    je      @F
+    WINCALL PostMessageW, rax, WM_CLOSE, 0, 0
+@@: WINCALL PostMessageW, qword ptr [g_secdesk_hwnd], WM_COMMAND, IDCANCEL, 0
+gss_to_restore:
+    call    secdesk_restore
     mov     qword ptr [g_secdesk_res], 0         ; treat as cancelled
     mov     qword ptr [g_secdesk_hd], 0          ; skip the closes in gss_cleanup
     mov     qword ptr [g_secdesk_orig], 0
@@ -23960,8 +27031,9 @@ gss_fb_ask:
     cmp     qword ptr [g_body_ptr], 0
     je      gss_fb_deny
 gss_fb_run:
-    WINCALL DialogBoxParamW, qword ptr [g_hinst], dword ptr [g_secdesk_dlg], 0, \
-            qword ptr [g_secdesk_proc], 0
+    mov     r9, qword ptr [g_secdesk_proc]
+    xor     r9, qword ptr [g_ptr_cookie]
+    WINCALL DialogBoxParamW, qword ptr [g_hinst], dword ptr [g_secdesk_dlg], 0, r9, 0
     mov     qword ptr [g_secdesk_res], rax
     jmp     gss_ret
 gss_fb_deny:
@@ -24194,6 +27266,7 @@ go_vault:
     WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_VAULT, qword ptr [rbp-24], addr vault_proc, 0
     call    vault_lock                      ; wipe body + key, minimise to tray
     call    tile_cache_flush                ; the cached tiles carry title first letters
+    call    gui_comp_flush                  ; scrub off-screen composite DIB + scratch text
     ; ...and every static buffer that held this vault's plaintext: password history
     ; and originals, the display/commit scratch, the attachment tile's AttachRefs
     ; (each carries its file key).  vault_lock wipes only the body and the key.
@@ -24915,7 +27988,7 @@ twp_toggle:
     xor     eax, eax
     jmp     twp_ret
 twp_toggle_close:
-    WINCALL PostMessageW, qword ptr [g_vaulthwnd], WM_COMMAND, IDCANCEL, 0
+    WINCALL PostMessageW, qword ptr [g_vaulthwnd], WM_COMMAND, IDC_V_LOCK, 0
     xor     eax, eax
     jmp     twp_ret
 twp_hotkey:
@@ -24977,6 +28050,7 @@ twp_endsession:
     cmp     qword ptr [rbp-24], 0
     je      twp_endsession_ret
     call    gui_clipclear
+    call    gui_comp_flush
     call    secmem_panic_wipe
     call    gui_temp_purge
 twp_endsession_ret:
@@ -25000,7 +28074,7 @@ tray_wndproc endp
 ;   flags low nibble == MB_YESNO gives Yes/No, otherwise a single OK button.
 ; =============================================================================
 gui_msgbox proc frame
-    FRAME_PROLOG 48
+    FRAME_PROLOG 80
 ifdef PROBE_IO
     cmp     dword ptr [g_sp_active], 0
     je      gmb_normal
@@ -25015,7 +28089,16 @@ endif
     mov     qword ptr [g_msg_text], rdx
     mov     qword ptr [g_msg_title], r8
     mov     dword ptr [g_msg_flags], r9d
+    call    gui_modal_dim_begin
     WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_MSG, qword ptr [rbp-24], addr msg_proc, 0
+    mov     dword ptr [rbp-32], eax
+    mov     rcx, qword ptr [rbp-24]
+    test    rcx, rcx
+    jz      @F
+    cmp     rcx, qword ptr [g_vaulthwnd]
+    jne     @F
+    call    gui_modal_dim_end
+@@: mov     eax, dword ptr [rbp-32]
     FRAME_EPILOG
     ret
 gui_msgbox endp
@@ -26899,11 +29982,19 @@ endif
     mov     eax, 1
 @@: mov     dword ptr [g_allow_unc], eax
     call    gui_shell_arg                   ; a .vordr from the shell association?
-    call    gui_create_singleton_mutex
+    cmp     dword ptr [g_ro_badpath], 0
+    je      @F
+    WINCALL MessageBoxW, 0, addr s_ro_badpath, addr t_err, <MB_OK or MB_ICONERROR>
+    WINCALL ExitProcess, EXIT_IO
+@@: call    gui_create_singleton_mutex
     call    GetLastError
     cmp     eax, 183                        ; ERROR_ALREADY_EXISTS
     jne     ws_gui_go
-    ; Already running.  Verify any candidate window actually belongs to this exact
+    cmp     dword ptr [g_readonly], 0       ; AUD-21: never silently hand --ro off to writable peer
+    je      @F
+    WINCALL MessageBoxW, 0, addr s_ro_already, addr t_err, <MB_OK or MB_ICONINFORMATION>
+    WINCALL ExitProcess, EXIT_BUSY
+@@: ; Already running.  Verify any candidate window actually belongs to this exact
     ; vordr.exe binary (gui_hwnd_is_self) so a spoofed window title/class cannot
     ; intercept WM_COPYDATA or suppress startup (VDR2-10).
     cmp     dword ptr [g_openfile_set], 0

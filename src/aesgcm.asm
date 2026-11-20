@@ -774,12 +774,14 @@ aes_expand_key endp
 public aes_ecb_block
 aes_ecb_block proc frame
     FRAME_PROLOG 32
-    cmp     r8, 10
+    mov     r8d, r8d                         ; zero-extend 32-bit Nr cleanly
+    cmp     r8d, 10
     je      aeb_go
-    cmp     r8, 12
+    cmp     r8d, 12
     je      aeb_go
-    cmp     r8, 14
-    jne     aeb_out
+    cmp     r8d, 14
+    je      aeb_go
+    FASTFAIL FF_BOUNDS
 aeb_go:
     movdqu  xmm0, xmmword ptr [rdx]
     movdqu  xmm1, xmmword ptr [rcx]
@@ -826,7 +828,7 @@ aes_ctr_xor proc frame
     mov     qword ptr [rbp-32], rdx
     mov     qword ptr [rbp-40], r8
     mov     qword ptr [rbp-48], r9
-    mov     rax, qword ptr [rbp+48]
+    mov     eax, dword ptr [rbp+48]
     mov     qword ptr [rbp-56], rax
 acx_loop:
     cmp     qword ptr [rbp-40], 0

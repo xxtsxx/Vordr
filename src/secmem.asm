@@ -28,11 +28,13 @@ extern secure_zero:proc
 extern GetCurrentProcess:proc
 extern SetProcessWorkingSetSizeEx:proc
 extern GetLastError:proc
+ifdef PROBE_IO
 extern rng_fill:proc
 extern VirtualQuery:proc
 extern K32QueryWorkingSetEx:proc        ; lktest: read back each page's Locked bit
 extern print_a:proc
 externdef g_cfg_passlen:dword
+endif
 
 ; the fixed static secret buffers, locked once at startup by sec_lock_statics
 externdef g_cfg_pass:byte           ; master password (main.asm)
@@ -98,6 +100,27 @@ externdef g_tpm_sec:byte            ; TPM+PIN / TPM+Hello secret material (vault
 externdef g_tpm_dk:byte             ; Argon2id(PIN) 64-byte output (vault.asm)
 externdef g_tpm_cand:byte           ; Transient 32-byte wrap/state key (vault.asm)
 externdef g_tpm_pin_u8:byte         ; UTF-8 PIN staging buffer (vault.asm)
+externdef g_tpm_pt64:byte           ; TPM OAEP 64-byte plaintext staging (tpm.asm)
+externdef g_tpm_prf32:byte          ; WebAuthn hmac-secret 32-byte PRF output (tpm.asm)
+externdef g_tpm_cand_out:byte       ; TPM+Hello pre-MAC 32-byte candidate (tpm.asm)
+externdef g_zi_wname:byte           ; ZIP import wide attachment name scratch (zipimport.asm)
+externdef g_zi_sha_hex:byte         ; ZIP import SHA-256 hex scratch (zipimport.asm)
+externdef g_zi_sha_exp:byte         ; ZIP import expected SHA-256 (zipimport.asm)
+externdef g_zi_sha_act:byte         ; ZIP import actual SHA-256 (zipimport.asm)
+externdef g_zj_sha:byte             ; ZIP export attachment SHA-256 (zipexport.asm)
+externdef g_zj_shahex:byte          ; ZIP export attachment SHA-256 hex (zipexport.asm)
+externdef g_comp_wbuf:byte          ; Off-screen compositor text scratch (gui.asm)
+externdef g_comp_bits:qword         ; Off-screen compositor DIB pixels (gui.asm)
+externdef g_comp_capw:dword         ; Off-screen compositor width (gui.asm)
+externdef g_comp_caph:dword         ; Off-screen compositor height (gui.asm)
+externdef g_rlabel:byte             ; Detail row label scratch (gui.asm)
+externdef g_grouptxt:byte           ; Group heading scratch (gui.asm)
+externdef g_cmpbuf:byte             ; Sort comparison title scratch (gui.asm)
+externdef g_imgfn_w:byte            ; Attachment filename scratch (gui.asm)
+externdef g_urlbuf:byte             ; URL launch scratch (gui.asm)
+externdef g_urlbuf2:byte            ; URL scheme-prepended scratch (gui.asm)
+externdef g_times_w:byte            ; Timestamp line scratch (gui.asm)
+externdef g_phdate:byte             ; Password history date scratch (gui.asm)
 
 ; Sizes of the buffers above, mirrored from the modules that allocate them -
 ; constcheck fails the build if any of these drifts from its original.
@@ -224,6 +247,24 @@ sec_regions label qword
     dq  g_tpm_dk,       64
     dq  g_tpm_cand,     32
     dq  g_tpm_pin_u8,   256
+    dq  g_tpm_pt64,     64
+    dq  g_tpm_prf32,    32
+    dq  g_tpm_cand_out, 32
+    dq  g_zi_wname,     260*2
+    dq  g_zi_sha_hex,   128
+    dq  g_zi_sha_exp,   32
+    dq  g_zi_sha_act,   32
+    dq  g_zj_sha,       32
+    dq  g_zj_shahex,    64
+    dq  g_comp_wbuf,    260*2
+    dq  g_rlabel,       128*2
+    dq  g_grouptxt,     128*2
+    dq  g_cmpbuf,       256
+    dq  g_imgfn_w,      200*2
+    dq  g_urlbuf,       1024*2
+    dq  g_urlbuf2,      1040*2
+    dq  g_times_w,      128*2
+    dq  g_phdate,       40*2
 sec_regions_end label qword
 
 .code
@@ -239,8 +280,9 @@ sra_lp:
     shl     rax, 4
     cmp     qword ptr [r10+rax], 0
     jne     sra_next
+    mov     qword ptr [r10+rax+8], rdx          ; AUD-10: publish size BEFORE base
+    mfence
     mov     qword ptr [r10+rax], rcx
-    mov     qword ptr [r10+rax+8], rdx
     mov     eax, 1
     ret
 sra_next:
@@ -251,33 +293,33 @@ sra_full:
     ret
 secreg_add endp
 
-; secreg_take(rcx = base) -> rax = stored_len (0 if absent), entry cleared.  Leaf.
-secreg_take proc
+; secreg_find(rcx = base, rdx = *out_slot) -> rax = stored_len (0 if absent).  Leaf.
+secreg_find proc
     test    rcx, rcx
-    jz      srt_absent
+    jz      srf_absent
     lea     r10, [g_secreg]
     xor     r8d, r8d
-srt_lp:
+srf_lp:
     cmp     r8d, SECREG_CAP
-    jae     srt_absent
+    jae     srf_absent
     mov     r9, r8
     shl     r9, 4
     cmp     qword ptr [r10+r9], rcx
-    jne     srt_next
+    jne     srf_next
+    lea     rax, [r10+r9]
+    mov     qword ptr [rdx], rax
     mov     rax, qword ptr [r10+r9+8]
-    mov     qword ptr [r10+r9], 0
-    mov     qword ptr [r10+r9+8], 0
     test    rax, rax
     jnz     @F
     mov     eax, 1
 @@: ret
-srt_next:
+srf_next:
     inc     r8d
-    jmp     srt_lp
-srt_absent:
+    jmp     srf_lp
+srf_absent:
     xor     eax, eax
     ret
-secreg_take endp
+secreg_find endp
 
 ; =============================================================================
 ; sec_lock(rcx = ptr, rdx = len) -> eax = nonzero if the region is now locked.
@@ -290,8 +332,10 @@ sec_lock proc frame
     FRAME_PROLOG 48
     mov     qword ptr [rbp-24], rcx
     mov     qword ptr [rbp-32], rdx
-    cmp     dword ptr [g_force_lockfail], 0     ; C3 test hook: force a lock failure
+ifdef PROBE_IO
+    cmp     dword ptr [g_force_lockfail], 0     ; C3 test hook: force a lock failure (PROBE_IO only)
     jne     sl_failed_hook
+endif
     WINCALL VirtualLock, qword ptr [rbp-24], qword ptr [rbp-32]
     test    eax, eax
     jnz     sl_done
@@ -313,11 +357,13 @@ sl_failed:
     xor     eax, eax
     FRAME_EPILOG
     ret
+ifdef PROBE_IO
 sl_failed_hook:
     mov     dword ptr [g_seclock_failed], 1     ; forced failure (test) - no real errno
     xor     eax, eax
     FRAME_EPILOG
     ret
+endif
 sl_done:
     mov     eax, 1                              ; locked
     FRAME_EPILOG
@@ -486,9 +532,20 @@ spw_history:
 spw_a2:
     mov     rcx, qword ptr [g_arena]            ; active Argon2id arena, if mid-KDF
     test    rcx, rcx
-    jz      spw_done
+    jz      spw_comp
     mov     rdx, qword ptr [g_mb]
     shl     rdx, 10
+    call    secure_zero
+spw_comp:
+    mov     rcx, qword ptr [g_comp_bits]        ; AUD-04: wipe off-screen compositor DIB pixels
+    test    rcx, rcx
+    jz      spw_done
+    mov     eax, dword ptr [g_comp_capw]
+    mov     edx, dword ptr [g_comp_caph]
+    imul    rax, rdx                            ; 64-bit pixel count
+    shl     rax, 2                              ; 64-bit byte count
+    jz      spw_done
+    mov     rdx, rax
     call    secure_zero
 spw_done:
     FRAME_EPILOG
@@ -554,22 +611,26 @@ secmem_alloc endp
 
 public secmem_free
 secmem_free proc frame
-    FRAME_PROLOG 48
-    ; locals: [rbp-24] ptr, [rbp-32] authoritative page-rounded len
+    FRAME_PROLOG 64
+    ; locals: [rbp-24] ptr, [rbp-32] authoritative page-rounded len, [rbp-40] slot ptr
     mov     qword ptr [rbp-24], rcx
     test    rcx, rcx
     jz      sf_done
 
     mov     rcx, qword ptr [rbp-24]
-    call    secreg_take
+    lea     rdx, [rbp-40]
+    call    secreg_find
     test    rax, rax
     jz      sf_done
-    ; Always wipe and unlock the authoritative registered allocation span (never
-    ; max(stored, caller), which would overrun the VirtualAlloc region on bad rdx).
+    ; Wipe BEFORE clearing g_secreg slot, then clear slot BEFORE VirtualFree unmaps (AUD-10)
     mov     qword ptr [rbp-32], rax
     mov     rcx, qword ptr [rbp-24]
     mov     rdx, rax
     call    secure_zero
+    mov     r10, qword ptr [rbp-40]
+    mov     qword ptr [r10], 0
+    mov     qword ptr [r10+8], 0
+    mfence
 
     WINCALL VirtualUnlock, qword ptr [rbp-24], qword ptr [rbp-32]
     WINCALL VirtualFree, qword ptr [rbp-24], 0, MEM_RELEASE
@@ -585,19 +646,24 @@ secmem_free endp
 align 8
 g_secreg         dq (SECREG_CAP * 2) dup (?) ; live secmem {base, size} pairs
 g_secreg_pending dq ?                        ; in-flight secmem_alloc request size
+ifdef PROBE_IO
 secscan_ref db 16 dup (?)               ; runtime-random reference sentinel
 align 8
 ss_mbi      db 48 dup (?)               ; MEMORY_BASIC_INFORMATION (static: no stack use)
 ss_wsx      dq 2 dup (?)                ; PSAPI_WORKING_SET_EX_INFORMATION (lktest)
+endif
 align 4
 public g_seclock_failed
 g_seclock_failed dd ?                    ; C3: set if any VirtualLock failed (pageable secret)
+ifdef PROBE_IO
 public g_force_lockfail
-g_force_lockfail dd ?                    ; C3: test hook - force sec_lock to fail
+g_force_lockfail dd ?                    ; C3: test hook - force sec_lock to fail (PROBE_IO only)
+endif
 public g_lockerr_vl, g_lockerr_wss
 g_lockerr_vl  dd ?                       ; Win32 err from the FIRST failed VirtualLock (0=none)
 g_lockerr_wss dd ?                       ; Win32 err from SetProcessWorkingSetSize (0=ok)
 
+ifdef PROBE_IO
 .code
 CSTR ss_pass, "secscan: PASS (sentinel found before wipe, absent after)",13,10
 CSTR ss_res,  "secscan: FAIL (sentinel survived the wipe)",13,10
@@ -856,5 +922,6 @@ sfd_fail:
     FRAME_EPILOG
     ret
 cmd_secfreedup endp
+endif ; PROBE_IO
 
 end

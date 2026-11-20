@@ -217,7 +217,7 @@ blake2b_compress endp
 ; =============================================================================
 public blake2b_update
 blake2b_update proc frame
-    FRAME_PROLOG 48
+    FRAME_PROLOG 64
     mov     qword ptr [rbp-24], rcx     ; ctx
     mov     qword ptr [rbp-32], rdx     ; data
     mov     qword ptr [rbp-40], r8      ; len

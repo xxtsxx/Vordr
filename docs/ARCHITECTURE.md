@@ -202,7 +202,7 @@ must not be described as Windows CFG.
 
 | Files under `src/` | Responsibility |
 |---|---|
-| `main.asm`, `gui.asm` | CPU/startup gates, CLI dispatch, windows, dialogs, tray |
+| `main.asm`, `gui.asm` | CPU/startup gates, CLI dispatch, windows, dialogs, full-window off-screen compositor (`gui_present_composite`), tray |
 | `macros.inc` | Shared constants, structures, and calling/hardening macros |
 | `hardening.asm`, `loadcfg.asm` | Runtime checks, heap, exception handling, PE load configuration |
 | `secmem.asm` | Locked secret allocations, tracked frees, selected panic wipes |
@@ -212,8 +212,9 @@ must not be described as Windows CFG.
 | `totp.asm`, `pwgen.asm` | One-time codes, password generation and policy |
 | `tpm.asm`, `regcfg.asm` | TPM wrapping, registry precedence, paths, rollback history |
 | `zipexport.asm`, `zipimport.asm` | AES ZIP and JSON interoperability |
-| `theme.asm` | Color schemes and painting; interaction shades derived per scheme (`col_mix`) |
+| `theme.asm` | 14 color schemes + perceived-luminance contrast, `rep stosd`-accelerated SSE2 SDF rounded rects, scheme-tuned semi-transparent glass cards & sidebar, soft cast drop-shadows, pill toggles, radial TOTP progress |
 | `anim.asm` | The animation clock: eased value slots driven by one timer that runs only while something moves, off when Windows' "Animation effects" is |
+| `gpu.asm` | Direct3D 11 DirectCompute (`cs_5_0`) procedural backdrops (7 static-basis styles dispatched once via `d3d11.dll` + `< 1 ms` SSE2 360° Rodrigues chromatic color cycling, plus flat mode) cached in a 32-bit DIB |
 | `fileio.asm`, `console.asm`, `log.asm` | File access, diagnostic output, logging |
 | `selftest.asm`, `redteam.asm`, `bench.asm` | Self-tests, fault injection, benchmarks |
 

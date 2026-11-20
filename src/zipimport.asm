@@ -20,8 +20,6 @@ extern mem_alloc:proc
 extern mem_free:proc
 extern secmem_alloc:proc                ; the per-entry arena holds every imported value
 extern secmem_free:proc                 ;   as plaintext: locked, like the vault body
-extern VirtualLock:proc                 ; best-effort pin of the raw archive, which the
-extern VirtualUnlock:proc               ;   decrypt runs over IN PLACE
 extern secure_zero:proc
 extern pbkdf2_ae:proc                    ; PBKDF2-HMAC-SHA1 1000 iters -> g_ae_dk
 extern aes_expand_key:proc
@@ -33,13 +31,16 @@ extern MultiByteToWideChar:proc
 extern WideCharToMultiByte:proc
 extern attach_reset_pending:proc
 extern attach_stage:proc
+extern gui_sanitize_attname:proc        ; AUD-20: canonicalize untrusted attachment filenames on import
 extern vault_build_entry:proc
 extern vault_entry_len:proc             ; walking a decrypted .vordr import source
 extern entry_field_ptr:proc             ;   (pointer-based: it is NOT the live body)
 extern entry_has_field:proc
+ifdef PROBE_IO
 extern print_a:proc
 extern print_u64:proc
 extern fuzz_seed:proc                   ; G7: reproducible/logged fuzzer seed (main.asm)
+endif
 externdef g_ae_dk:byte
 externdef g_body_ptr:qword
 externdef g_body_len:qword
@@ -68,16 +69,17 @@ MEMREC      equ 32                        ; {nameptr8, namelen4, _4, dataptr8, u
 
 .data?
 align 8
+ifdef PROBE_IO
 g_zfz_rng   dq ?                          ; fuzzzip xorshift64 state (dbg/test only)
+endif
 g_zi_end    dq ?                          ; raw end
-g_zi_raw    dq ?                          ; the archive being staged (pinned while held)
-g_zi_rawlen dq ?
-g_zi_rawlk  dd ?                          ; 1 = VirtualLock on it succeeded
+g_zi_raw    dq ?                          ; the archive being staged
 g_zi_pwptr  dq ?                          ; UTF-8 pw ptr (= g_zi_u8pw)
 g_zi_pwlen  dd ?
 ZI_PWCAP    equ 1024                      ; 254 wide chars can be 762 UTF-8 bytes; the
 ZI_NBUF     equ 1024                      ; decoded attachment "name" capacity
-public g_zi_u8pw, g_zi_sbuf, g_zi_nbuf, g_zi_ref ; pinned + crash-wiped by secmem.asm
+public g_zi_u8pw, g_zi_sbuf, g_zi_nbuf, g_zi_wname, g_zi_ref ; pinned + crash-wiped by secmem.asm
+public g_zi_sha_hex, g_zi_sha_exp, g_zi_sha_act
 public g_zi_rk, g_zi_tbuf, g_zi_err, g_zi_p, g_zi_jend
 g_zi_jcap   dq ?                          ; secmem byte capacity of g_zi_jptr (0 = none)
 g_zi_err    dd ?                          ; sticky JSON/UTF-8 decode error flag
@@ -104,6 +106,7 @@ g_zi_alabel dq ?                          ; zi_addattach: label wide (0/none)
 g_zi_anamen dd ?                          ; decoded "name" length; 0 = predates the key
 g_zi_nbuf   db ZI_NBUF dup (?)            ; decoded "name" (kept apart from g_zi_sbuf,
                                           ;   which still holds the value/path)
+g_zi_wname  dw 260 dup (?)                ; wide scratch before gui_sanitize_attname
 g_zi_has_sha dd ?                         ; 1 = attachment field carries "sha256"
 g_zi_sha_hex db 128 dup (?)               ; decoded "sha256" hex string
 g_zi_sha_exp db 32 dup (?)                ; expected SHA-256(plaintext)
@@ -142,6 +145,7 @@ zl_value    db ',"value":'
 zl_name     db ',"name":'                  ; optional, attachments only (see zi_addattach)
 zl_sha256   db ',"sha256":'                ; optional, attachments only: SHA-256(plaintext)
 
+ifdef PROBE_IO
 ; --- fuzzzip fixture: a minimal WinZip-AES STORED archive for vordr.json with
 ; LFH (usize=256, csize=284), Central Directory (67B at +335), and EOCD (22B).
 align 4
@@ -192,6 +196,7 @@ CSTR zfz_m2, " iters  "
 CSTR zfz_m3, " scanned  "
 CSTR zfz_m4, " rejected  0 crashes",13,10
 CSTR zfz_thin, "fuzzzip: FAIL - almost nothing got past the scan, so the parser was barely exercised: the fixture no longer looks like a member zi_scan accepts",13,10
+endif
 
 .code
 
@@ -382,6 +387,8 @@ zs_ae_chk:
     ja      zs_unsup
     cmp     word ptr [rax+2], 7
     jb      zs_unsup
+    cmp     word ptr [rax+6], 4541h             ; AUD-20: vendor ID must be "AE" (0x4541)
+    jne     zs_unsup
     cmp     byte ptr [rax+8], 3                 ; AES-256
     jne     zs_unsup
     cmp     word ptr [rax+9], 0                 ; stored inside AES
@@ -658,9 +665,11 @@ zjl_no:
 zj_lit endp
 
 ; zj_num() -> eax = parsed unsigned integer at g_zi_p (advances past digits).  Leaf.
+;   AUD-20: requires >= 1 ASCII digit and rejects 32-bit overflow (sets g_zi_err = 1).
 zj_num proc
     mov     r10, qword ptr [g_zi_p]
     xor     eax, eax
+    xor     r9d, r9d                            ; digit count
 zjn_lp:
     cmp     r10, qword ptr [g_zi_jend]
     jae     zjn_done
@@ -669,13 +678,37 @@ zjn_lp:
     jb      zjn_done
     cmp     r8d, '9'
     ja      zjn_done
-    imul    eax, eax, 10
+    imul    rax, rax, 10
     sub     r8d, '0'
-    add     eax, r8d
+    add     rax, r8
+    mov     ecx, 0FFFFFFFFh
+    cmp     rax, rcx
+    ja      zjn_ovf
+    inc     r9d
     inc     r10
     jmp     zjn_lp
+zjn_ovf:
+    mov     dword ptr [g_zi_err], 1
+    inc     r10
+zjn_drain:
+    cmp     r10, qword ptr [g_zi_jend]
+    jae     zjn_bad_ret
+    movzx   r8d, byte ptr [r10]
+    cmp     r8d, '0'
+    jb      zjn_bad_ret
+    cmp     r8d, '9'
+    ja      zjn_bad_ret
+    inc     r10
+    jmp     zjn_drain
 zjn_done:
+    test    r9d, r9d
+    jz      zjn_bad_ret
     mov     qword ptr [g_zi_p], r10
+    ret
+zjn_bad_ret:
+    mov     dword ptr [g_zi_err], 1
+    mov     qword ptr [g_zi_p], r10
+    xor     eax, eax
     ret
 zj_num endp
 
@@ -1192,24 +1225,39 @@ za_cpref:
     inc     ecx
     cmp     ecx, ARF_SIZE
     jb      za_cpref
-    ; append the filename as wide (convert), directly after AttachRef
-    ; wide dst = blob + 4 + 68
+    ; append the filename as wide (convert + AUD-20 sanitize via gui_sanitize_attname),
+    ; directly after AttachRef.  wide dst = blob + 4 + 68 (room for up to 256 wchars).
     mov     r10, qword ptr [rbp-80]
     lea     r10, [r10+4+ARF_SIZE]
     mov     qword ptr [rbp-40], r10             ; wide dst
     cmp     dword ptr [rbp-68], 0
     je      za_fnempty
     WINCALL MultiByteToWideChar, CP_UTF8_, 8, qword ptr [rbp-64], dword ptr [rbp-68], \
-            qword ptr [rbp-40], 255
+            addr g_zi_wname, 255
     test    eax, eax
     jz      za_arena_err
     jmp     za_fnterm
 za_fnempty:
     xor     eax, eax
 za_fnterm:
-    ; NUL-terminate the wide filename
-    mov     r10, qword ptr [rbp-40]
+    lea     r10, [g_zi_wname]
     mov     word ptr [r10+rax*2], 0
+    mov     rcx, r10
+    mov     rdx, qword ptr [rbp-40]
+    call    gui_sanitize_attname
+    lea     rcx, [g_zi_wname]
+    mov     edx, 260 * 2
+    call    secure_zero
+    mov     r10, qword ptr [rbp-40]
+    xor     eax, eax
+za_fnwlen:
+    cmp     word ptr [r10+rax*2], 0
+    je      za_fnwdone
+    inc     eax
+    cmp     eax, 255
+    jb      za_fnwlen
+    mov     word ptr [r10+rax*2], 0
+za_fnwdone:
     inc     eax                                 ; wchars incl NUL
     lea     eax, [eax*2]                        ; filename bytes
     ; rawlen = ARF_SIZE + filename bytes
@@ -1496,6 +1544,8 @@ zij_f0:
     test    eax, eax
     jz      zij_bad
     call    zj_num
+    cmp     dword ptr [g_zi_err], 0
+    jne     zij_done
     call    zi_type_ok                          ; untrusted: only plain user kinds pass
     mov     dword ptr [rbp-28], eax             ; type
     lea     rcx, [zl_label]                     ; ,"label":
@@ -1650,7 +1700,33 @@ zij_fend:
     je      zij_eadv
     mov     eax, dword ptr [rbp-24]
     test    eax, eax
-    jz      zij_eadv
+    jz      zij_bad                             ; AUD-20: selected entry with zero fields -> reject
+    cmp     qword ptr [g_field_list+0], VF_TITLE ; AUD-20: field 0 must be plain VF_TITLE
+    jne     zij_bad
+    ; Verify field[0].value matches the staged wide title shown in the checklist (unless arena-truncated)
+    mov     ecx, dword ptr [g_zi_e]
+    cmp     ecx, ZI_MAXENT
+    jae     zij_tit_verified
+    lea     r8, [g_zi_titles]
+    mov     r8, qword ptr [r8+rcx*8]
+    test    r8, r8
+    jz      zij_tit_verified
+    lea     r9, [zi_empty_w]
+    cmp     r8, r9
+    je      zij_tit_verified
+    mov     r10, qword ptr [g_field_list+16]
+    test    r10, r10
+    jz      zij_bad
+zij_tit_cmp:
+    mov     cx, word ptr [r8]
+    cmp     cx, word ptr [r10]
+    jne     zij_bad
+    test    cx, cx
+    jz      zij_tit_verified
+    add     r8, 2
+    add     r10, 2
+    jmp     zij_tit_cmp
+zij_tit_verified:
     mov     dword ptr [g_field_n], eax
     call    vault_build_entry
     test    eax, eax
@@ -1716,6 +1792,9 @@ zfw_jclr:
     lea     rcx, [g_zi_nbuf]
     mov     edx, ZI_NBUF
     call    secure_zero
+    lea     rcx, [g_zi_wname]
+    mov     edx, 260 * 2
+    call    secure_zero
     lea     rcx, [g_zi_tbuf]
     mov     edx, ZI_TBUF
     call    secure_zero
@@ -1745,11 +1824,9 @@ zfw_jclr:
     mov     edx, 32
     call    secure_zero
     mov     dword ptr [g_zi_has_sha], 0
-    cmp     dword ptr [g_zi_rawlk], 0           ; release the pin on the archive (the
-    je      zfw_done                            ;   caller wipes and frees it)
-    mov     dword ptr [g_zi_rawlk], 0
-    WINCALL VirtualUnlock, qword ptr [g_zi_raw], qword ptr [g_zi_rawlen]
-zfw_done:
+    lea     rcx, [g_zi_hide]                    ; AUD-12: reset .vordr hide flags so subsequent
+    mov     edx, ZI_MAXENT                      ;   .zip imports never drop legitimate entries
+    call    secure_zero
     FRAME_EPILOG
     ret
 zi_free_wipe endp
@@ -1773,7 +1850,6 @@ zi_stage proc frame
     mov     dword ptr [g_zi_jlen], 0
     mov     qword ptr [g_zi_jcap], 0
     mov     qword ptr [g_zi_arena], 0
-    mov     dword ptr [g_zi_rawlk], 0
     ; wide pw -> UTF-8 g_zi_u8pw (stage count in r9d: WINCALL rax-clobber footgun)
     shr     r9d, 1                              ; wide chars
     mov     dword ptr [rbp-32], r9d
@@ -1788,18 +1864,14 @@ zi_stage proc frame
     mov     dword ptr [rbp-40], -3
     jmp     zs_fail
 zs_pwok:
+    lea     rcx, [g_zi_hide]                    ; AUD-12: clear any stale .vordr hide flags
+    mov     edx, ZI_MAXENT
+    call    secure_zero
     lea     rax, [g_zi_u8pw]
     mov     qword ptr [g_zi_pwptr], rax
     mov     rax, qword ptr [rbp-24]
-    mov     qword ptr [g_zi_raw], rax
-    mov     eax, dword ptr [rbp-28]
-    mov     qword ptr [g_zi_rawlen], rax
-    mov     dword ptr [g_zi_rawlk], 0
-    WINCALL VirtualLock, qword ptr [g_zi_raw], qword ptr [g_zi_rawlen]
-    test    eax, eax
-    jz      @F
-    mov     dword ptr [g_zi_rawlk], 1
-@@:
+    mov     qword ptr [g_zi_raw], rax           ; AUD-13: ciphertext archive stays pageable;
+                                                ;   zi_decrypt allocates secmem out-of-place
     ; allocate the per-entry arena
     mov     rcx, ZI_ARENA
     call    secmem_alloc
@@ -1928,6 +2000,7 @@ zi_abort proc frame
     ret
 zi_abort endp
 
+ifdef PROBE_IO
 ; zfz_rand() -> rax = next xorshift64 value (updates g_zfz_rng).  Leaf; rcx dead.
 zfz_rand proc
     mov     rax, qword ptr [g_zfz_rng]
@@ -2291,5 +2364,6 @@ jfz_oom:
     FRAME_EPILOG
     ret
 cmd_jfuzz endp
+endif
 
 end

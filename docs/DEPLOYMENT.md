@@ -17,9 +17,9 @@ Run these Command Prompt examples in an elevated shell, replacing the filename
 with the package being deployed:
 
 ```bat
-msiexec /i vordr-0.2.4.msi /qn
-msiexec /i vordr-0.2.4.msi /qn VORDR_SECUREUNLOCK=1 VORDR_PWMINLEN=16
-msiexec /x vordr-0.2.4.msi /qn
+msiexec /i vordr-0.8.1.msi /qn
+msiexec /i vordr-0.8.1.msi /qn VORDR_SECUREUNLOCK=1 VORDR_PWMINLEN=16
+msiexec /x vordr-0.8.1.msi /qn
 ```
 
 The package replaces related versions from `0.0.0` through its own version, inclusive,
@@ -108,7 +108,7 @@ no valid setting exists; the installer does not write defaults automatically.
 | `VORDR_NOPHONETIC` | `NoPhonetic` | 0/1 | 0 | disable the phonetic secret reader |
 | `VORDR_NOPREVIEW` | `NoPreview` | 0/1 | 0 | attachments download only, never previewed via another app |
 | `VORDR_LOGLEVEL` | `LogLevel` | 0–4 | 0 | audit-log verbosity, 0 = off |
-| `VORDR_UISCHEME` | `ui_scheme` | 0–8 | 8 | force a colour scheme (8 is the default) |
+| `VORDR_UISCHEME` | `ui_scheme` | 0–14 | 8 | force a colour scheme (`8` = Gruvbox default, `14` = Follow Windows) |
 | `VORDR_ALLOWUNCVAULT` | `AllowUncVault` | 0/1 | 0 | `HKLM`-only: allow UNC/SMB paths (`\\server\share\...`) for vaults, imports/exports, and logs |
 | `VORDR_ALLOWSCREENCAPTURE` | `AllowScreenCapture` | 0/1 | 0 | allow screenshots and screen sharing of Vordr windows (disables `SetWindowDisplayAffinity`) |
 
@@ -146,7 +146,8 @@ also clamps direct registry edits:
 | `IdleLockMin` | 1440 | 0 is valid: no idle lock |
 | `PwVerifyDays` | 3650 | 0 is valid: no reminder |
 | `LogLevel` | **0** — off, not 4 | 0 is valid: off |
-| `ui_scheme` | **8** — the default | — |
+| `ui_scheme` | **8** — the default (`Gruvbox`); `0..13` palettes, `14` follow Windows | — |
+| `ui_backdrop` | **0** — the default (`Cut planes`); `0..6` GPU styles, `7` flat | — |
 | `ui_anim` | **0** — follow Windows | 0 is valid: follow Windows |
 | `TpmUnlockMode` / `TpmMinMode` | **0** — off / no floor | 0 is valid: off |
 | `TpmPinMaxAttempts` | 20 | **3** — the default, not 1 |
@@ -171,7 +172,7 @@ timeouts, session locking, and download-only attachments. Omitted settings
 remain user-configurable.
 
 ```bat
-msiexec /i vordr-0.2.4.msi /qn ^
+msiexec /i vordr-0.8.1.msi /qn ^
   VORDR_PWMINLEN=16 VORDR_PWMINCLASSES=4 ^
   VORDR_SECUREUNLOCK=1 VORDR_CLIPSECONDS=10 VORDR_IDLELOCKMIN=5 ^
   VORDR_LOCKONWINLOCK=1 VORDR_NOPREVIEW=1 VORDR_LOGLEVEL=2
@@ -276,7 +277,7 @@ the Explorer session rather than assuming the registry write failed.
 From the repository root:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\verify_msi.ps1 -Msi bin\vordr-0.2.4.msi
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\verify_msi.ps1 -Msi bin\vordr-0.8.1.msi
 ```
 
 The verifier reads MSI tables and evaluates component costing without installing.

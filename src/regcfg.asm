@@ -34,6 +34,8 @@ extern GetFinalPathNameByHandleW:proc
 extern GetFullPathNameW:proc            ; reg_hash_name: one key per FILE, not per spelling
 extern CharUpperBuffW:proc
 extern path_longify:proc
+extern file_path_allowed:proc
+extern file_validate_handle:proc
 
 REG_SZ          equ 1
 REG_EXPAND_SZ   equ 2
@@ -46,6 +48,7 @@ CSIDL_PERSONAL  equ 5
 OPEN_EXISTING   equ 3
 FILE_SHARE_RWD      equ 7
 FILE_FLAG_BACKUP_SEM equ 02000000h
+FILE_FLAG_OPEN_RP    equ 00200000h
 ; "\Vordr" (6) + "\vault.vordr" (12) + NUL, and the filename tail on its own.
 ; Both appends are bounded against the caller's capacity using these.
 CDV_MIN_CHARS   equ 280        ; MAX_PATH (260) + the tail + slack
@@ -255,17 +258,27 @@ public reg_hash_name
 reg_hash_name proc frame
     FRAME_PROLOG 96
     mov     qword ptr [rbp-24], rcx
-    ; 1) Try handle-based canonicalisation (GetFinalPathNameByHandleW) so 8.3 short
-    ;    names, directory junctions, symlinks, "\\.\", and case variants all map to
-    ;    the exact same registry hash when the file exists.
+    ; 1) Try handle-based canonicalisation (GetFinalPathNameByHandleW) ONLY when
+    ;    file_path_allowed permits opening the path (never touch SMB/WebDAV/devices
+    ;    when AllowUncVault == 0) and without traversing final reparse points.
     lea     rdx, [g_reg_lpath]
     mov     r8d, REG_NORM_CCH
     call    path_longify
-    WINCALL CreateFileW, rax, 0, FILE_SHARE_RWD, 0, OPEN_EXISTING, FILE_FLAG_BACKUP_SEM, 0
+    mov     qword ptr [rbp-32], rax
+    mov     rcx, rax
+    call    file_path_allowed
+    test    eax, eax
+    jz      rhn2_lex
+    WINCALL CreateFileW, qword ptr [rbp-32], 0, FILE_SHARE_RWD, 0, OPEN_EXISTING, \
+            <FILE_FLAG_BACKUP_SEM or FILE_FLAG_OPEN_RP>, 0
     cmp     rax, -1
     je      rhn2_lex
     mov     qword ptr [rbp-40], rax
-    WINCALL GetFinalPathNameByHandleW, rax, addr g_reg_tmp, REG_NORM_CCH, 0
+    mov     rcx, rax
+    call    file_validate_handle
+    test    eax, eax
+    jz      rhn2_close_lex
+    WINCALL GetFinalPathNameByHandleW, qword ptr [rbp-40], addr g_reg_tmp, REG_NORM_CCH, 0
     mov     dword ptr [rbp-48], eax
     WINCALL CloseHandle, qword ptr [rbp-40]
     mov     eax, dword ptr [rbp-48]
@@ -279,6 +292,8 @@ reg_hash_name proc frame
     test    eax, eax
     jz      rhn2_lex
     jmp     rhn2_upper
+rhn2_close_lex:
+    WINCALL CloseHandle, qword ptr [rbp-40]
 rhn2_lex:
     ; 2) File does not exist yet: strip "\\?\" / "\\.\" / "UNC\" and normalise lexically.
     mov     rcx, qword ptr [rbp-24]
@@ -724,6 +739,9 @@ qsz_cpy:
     jb      qsz_cpy
     jmp     qsz_bad
 qsz_ok:
+    mov     r10, qword ptr [rbp-32]
+    cmp     word ptr [r10], 0
+    je      qsz_bad
     mov     eax, 1
     FRAME_EPILOG
     ret
@@ -799,7 +817,7 @@ reg_query_dw endp
 ; ===========================================================================
 public cfg_get_dword
 cfg_get_dword proc frame
-    FRAME_PROLOG 48
+    FRAME_PROLOG 64
     mov     qword ptr [rbp-24], rcx          ; value name
     mov     dword ptr [rbp-32], edx          ; default
     mov     qword ptr [rbp-40], r8           ; *locked
@@ -948,7 +966,11 @@ rlv_hkcu_q:
     shl     r9d, 1
     call    reg_query_sz
     cmp     eax, 1
-    je      rlv_yes
+    jne     rlv_no
+    mov     rcx, qword ptr [rbp-24]
+    call    file_path_allowed
+    test    eax, eax
+    jnz     rlv_yes
 rlv_no:
     cmp     dword ptr [rbp-32], 1
     jb      @F
@@ -1456,6 +1478,7 @@ reg_ctr_get proc frame
     ret
 reg_ctr_get endp
 
+ifdef PROBE_IO
 public reg_ctr_del
 reg_ctr_del proc frame
     FRAME_PROLOG 64
@@ -1485,6 +1508,7 @@ rco_done:
     FRAME_EPILOG
     ret
 rcd_one endp
+endif
 
 ; ===========================================================================
 ; cmd_polkat - VDR-09 + VDR-23 registry policy & cfg_in_set ABI KAT.
@@ -1499,6 +1523,7 @@ rcd_one endp
 ;        default (15) with *locked == 1 and NEVER consults HKCU (99)!
 ;     4) cfg_in_set preserves caller's r8 across path normalisation (VDR-23).
 ; ===========================================================================
+ifdef PROBE_IO
 extern cfg_in_set:proc
 extern print_a:proc
 
@@ -1766,5 +1791,6 @@ plk_fail:
     FRAME_EPILOG
     ret
 cmd_polkat endp
+endif
 
 end

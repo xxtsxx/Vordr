@@ -82,6 +82,21 @@ def normalise(path):
     nddir = _u32(b, ddir - 4)
     sect = opt + optsize
 
+    # --- PE hardening invariants (AUD-08 / AUD-23) --------------------------
+    dll_chars = _u16(b, opt + 70)
+    if (dll_chars & 0x0160) != 0x0160:
+        raise ValueError("PE DllCharacteristics 0x%04X missing HIGH_ENTROPY_VA|DYNAMIC_BASE|NX_COMPAT (0x0160)"
+                         % dll_chars)
+    for i in range(nsections):
+        s = sect + i * 40
+        schars = _u32(b, s + 36)
+        if (schars & 0xA0000000) == 0xA0000000:
+            sname = bytes(b[s:s + 8]).rstrip(b"\0").decode("ascii", "replace")
+            raise ValueError("W^X violation: section %r is both writable and executable (0x%08X)"
+                             % (sname, schars))
+    if b"VORDR_NON_RELEASE_BUILD" in b:
+        raise ValueError("VORDR_NON_RELEASE_BUILD sentinel found in release PE image")
+
     def rva_to_off(rva):
         for i in range(nsections):
             s = sect + i * 40
@@ -114,6 +129,8 @@ def normalise(path):
     if lcfg_rva == 0 or lcfg_size < 0x50:
         raise ValueError("missing or truncated LOAD_CONFIG directory (rva=0x%X, size=0x%X)"
                          % (lcfg_rva, lcfg_size))
+    if (lcfg_rva & 7) != 0:
+        raise ValueError("LOAD_CONFIG RVA 0x%X is not 8-byte aligned (AUD-23)" % lcfg_rva)
     lcfg_off = rva_to_off(lcfg_rva)
     if lcfg_off is None or lcfg_off + 0x50 > len(b):
         raise ValueError("LOAD_CONFIG RVA 0x%X is outside mapped sections" % lcfg_rva)
@@ -166,6 +183,7 @@ def normalise(path):
     # chase each record type as it turns up, the rule is inverted - clear
     # everything, preserve the one that means something.
     EX_DLLCHARACTERISTICS = 20
+    cet_ok = False
     for i in range(dbg_size // 28):
         e = off + i * 28
         if e + 28 > len(b):
@@ -174,14 +192,24 @@ def normalise(path):
             struct.pack_into("<I", b, e + 4, 0)
             changed += 1
         if _u32(b, e + 12) == EX_DLLCHARACTERISTICS:
+            cet_sz, cet_ptr = _u32(b, e + 16), _u32(b, e + 24)
+            if cet_ptr and cet_sz >= 4 and cet_ptr + 4 <= len(b):
+                if (_u32(b, cet_ptr) & 0x0001) != 0:
+                    cet_ok = True
             continue                          # CET lives here - leave it alone
-        raw_sz, raw_ptr = _u32(b, e + 16), _u32(b, e + 24)
+        raw_sz, raw_rva, raw_ptr = _u32(b, e + 16), _u32(b, e + 20), _u32(b, e + 24)
         if raw_ptr and raw_sz:
             if raw_ptr + raw_sz > len(b):
                 raise ValueError("debug payload runs past the end of the file")
             if b[raw_ptr:raw_ptr + raw_sz] != bytearray(raw_sz):
                 b[raw_ptr:raw_ptr + raw_sz] = bytearray(raw_sz)
                 changed += 1
+        if raw_sz != 0 or raw_rva != 0 or raw_ptr != 0:
+            struct.pack_into("<III", b, e + 16, 0, 0, 0)
+            changed += 1
+
+    if not cet_ok:
+        raise ValueError("missing or disabled CETCOMPAT in IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS")
 
     return _save(path, b, changed)
 

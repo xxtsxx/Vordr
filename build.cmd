@@ -67,6 +67,7 @@ if "%REPRO%"=="1" (
         echo build: "release" cannot be combined with "nohw" ^(CET must remain enabled^)
         goto :failed
     )
+    set STRICT=1
 )
 
 rem ---------------------------------------------------------------------------
@@ -83,7 +84,7 @@ rem The security mitigations (CET, DEP, ASLR, highentropyVA) are orthogonal
 rem link flags and stay on in release builds.
 rem ---------------------------------------------------------------------------
 set REPROFLAGS=
-if "%REPRO%"=="1" set REPROFLAGS=/Brepro /pdbaltpath:vordr.pdb
+if "%REPRO%"=="1" set REPROFLAGS=/Brepro /pdbaltpath:vordr.pdb /OPT:REF
 
 rem ---------------------------------------------------------------------------
 rem framecheck: static scan for WINCALL stack-arg spills that overflow a proc's
@@ -103,7 +104,7 @@ rem the IDC_V_HEADER "dip" class) gate the same way: any finding fails a strict
 rem build.
 rem ---------------------------------------------------------------------------
 set ASMFLAGS=/c /nologo /W3 /Zi %ASMEXTRA%
-set SOURCES=main console hardening random loadcfg sha256 sha1 aesgcm blake2b argon2 fileio secmem vault totp tpm regcfg pwgen bench log selftest redteam theme anim zipexport zipimport gui
+set SOURCES=main console hardening random loadcfg sha256 sha1 aesgcm blake2b argon2 fileio secmem vault totp tpm regcfg pwgen bench log selftest redteam theme anim gpu zipexport zipimport gui
 
 where python >nul 2>nul
 if errorlevel 1 (
@@ -156,7 +157,7 @@ link /nologo /subsystem:windows /entry:wstart /nodefaultlib /incremental:no ^
      %GUARDFLAGS% %REPROFLAGS% /debug /pdb:bin\vordr.pdb /map:bin\vordr.map ^
      /manifest:embed /manifestinput:vordr.manifest /manifestuac:no ^
      /libpath:"%SDKLIB%" ^
-     /out:bin\vordr.exe obj\main.obj obj\console.obj obj\hardening.obj obj\random.obj obj\loadcfg.obj obj\sha256.obj obj\sha1.obj obj\aesgcm.obj obj\blake2b.obj obj\argon2.obj obj\fileio.obj obj\secmem.obj obj\vault.obj obj\totp.obj obj\tpm.obj obj\regcfg.obj obj\pwgen.obj obj\bench.obj obj\log.obj obj\selftest.obj obj\redteam.obj obj\theme.obj obj\anim.obj obj\zipexport.obj obj\zipimport.obj obj\gui.obj obj\vordr.res ^
+     /out:bin\vordr.exe obj\main.obj obj\console.obj obj\hardening.obj obj\random.obj obj\loadcfg.obj obj\sha256.obj obj\sha1.obj obj\aesgcm.obj obj\blake2b.obj obj\argon2.obj obj\fileio.obj obj\secmem.obj obj\vault.obj obj\totp.obj obj\tpm.obj obj\regcfg.obj obj\pwgen.obj obj\bench.obj obj\log.obj obj\selftest.obj obj\redteam.obj obj\theme.obj obj\anim.obj obj\gpu.obj obj\zipexport.obj obj\zipimport.obj obj\gui.obj obj\vordr.res ^
      kernel32.lib bcrypt.lib user32.lib gdi32.lib msimg32.lib dwmapi.lib dxgi.lib comctl32.lib uxtheme.lib advapi32.lib comdlg32.lib ncrypt.lib shell32.lib wtsapi32.lib imm32.lib userenv.lib
 if errorlevel 1 goto :failed
 

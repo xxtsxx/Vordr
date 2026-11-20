@@ -268,7 +268,7 @@ log2x1000 endp
 ;   (0 on failure).  Appends n uniform chars and adds n*log2(len) to pw_entropy.
 ; ---------------------------------------------------------------------------
 draw_chars proc frame
-    FRAME_PROLOG 64
+    FRAME_PROLOG 96
     mov     qword ptr [rbp-24], rcx            ; dst cursor
     mov     dword ptr [rbp-32], edx            ; n
     mov     qword ptr [rbp-40], r8             ; alphabet
@@ -514,15 +514,23 @@ pex_phrase_word:
     call    rand_idx
     cmp     eax, -1
     je      pex_fail
-    imul    eax, eax, WL_STRIDE                 ; &wl_words[idx]
     lea     r10, [wl_words]
-    add     r10, rax
+    xor     r8d, r8d
+    xor     ecx, ecx
+pex_wl_scan:
+    mov     rdx, qword ptr [r10+rcx*8]
+    cmp     ecx, eax
+    cmove   r8, rdx
+    inc     ecx
+    cmp     ecx, WL_COUNT
+    jb      pex_wl_scan
     mov     dword ptr [rbp-64], 0               ; char j
 pex_word_cp:
     mov     eax, dword ptr [rbp-64]
     cmp     eax, WL_STRIDE
     jae     pex_word_done
-    movzx   ecx, byte ptr [r10+rax]
+    movzx   ecx, r8b
+    shr     r8, 8
     test    ecx, ecx
     jz      pex_word_done
     ; capitalize first letter of each word if requested
@@ -544,6 +552,7 @@ pex_word_put:
     inc     dword ptr [rbp-64]
     jmp     pex_word_cp
 pex_word_done:
+    xor     r8d, r8d
     add     dword ptr [pw_entropy], 11000       ; 2,048-word list -> 11 bits/word
     inc     dword ptr [rbp-56]
     jmp     pex_phrase_lp

@@ -28,6 +28,7 @@ extern NCryptDecrypt:proc
 extern NCryptDeleteKey:proc
 extern NCryptFreeObject:proc
 extern LoadLibraryExW:proc
+extern FreeLibrary:proc
 extern GetProcAddress:proc
 extern GetForegroundWindow:proc
 extern GetDesktopWindow:proc
@@ -174,9 +175,13 @@ g_tpm_key   dq ?                        ; NCRYPT_KEY_HANDLE
 g_tpm_cbres dd ?                        ; bytes produced by encrypt/decrypt
 align 8
 public g_tpm_oaep, g_tpm_label, g_tpm_sha_ctx
-g_tpm_oaep    db 24 dup (?)             ; BCRYPT_OAEP_PADDING_INFO
-g_tpm_label   db 32 dup (?)             ; SHA-256("Vordr-TPM-v2" || vault_salt || reqhello)
-g_tpm_sha_ctx db 128 dup (?)            ; SHA256_CTX scratch (108 bytes used)
+public g_tpm_pt64, g_tpm_prf32, g_tpm_cand_out
+g_tpm_oaep     db 24 dup (?)            ; BCRYPT_OAEP_PADDING_INFO
+g_tpm_label    db 32 dup (?)            ; SHA-256("Vordr-TPM-v2" || vault_salt || reqhello)
+g_tpm_sha_ctx  db 128 dup (?)           ; SHA256_CTX scratch (108 bytes used)
+g_tpm_pt64     db 64 dup (?)            ; locked OAEP plaintext staging (in32 || inner_tag32)
+g_tpm_prf32    db 32 dup (?)            ; locked WebAuthn hmac-secret output staging
+g_tpm_cand_out db 32 dup (?)            ; locked Hello candidate secret staging
 
 ; Cached webauthn.dll module + resolved entry points (process lifetime)
 align 8
@@ -651,6 +656,14 @@ endif
     mov     qword ptr [g_tpm_prov], 0
     mov     qword ptr [g_tpm_key], 0
     mov     dword ptr [g_tpm_cbres], 0
+    test    rcx, rcx
+    jz      ts_fail
+    test    rdx, rdx
+    jz      ts_fail
+    test    r8, r8
+    jz      ts_fail
+    cmp     r9d, 256
+    jb      ts_fail
     WINCALL NCryptOpenStorageProvider, addr g_tpm_prov, addr tpm_prov, 0
     test    eax, eax
     jnz     ts_rec_fail
@@ -696,7 +709,7 @@ ts_finalize:
     xor     ecx, ecx
     call    tpm_build_oaep
     mov     r10, qword ptr [rbp-32]
-    lea     r11, [rbp-128]
+    lea     r11, [g_tpm_pt64]
     xor     ecx, ecx
 ts_cpk:
     mov     al, byte ptr [r10+rcx]
@@ -707,7 +720,7 @@ ts_cpk:
     lea     rcx, [g_tpm_sha_ctx]
     call    sha256_init
     lea     rcx, [g_tpm_sha_ctx]
-    lea     rdx, [rbp-128]
+    lea     rdx, [g_tpm_pt64]
     mov     r8d, 32
     call    sha256_update
     lea     rcx, [g_tpm_sha_ctx]
@@ -715,17 +728,16 @@ ts_cpk:
     mov     r8d, 32
     call    sha256_update
     lea     rcx, [g_tpm_sha_ctx]
-    lea     rdx, [rbp-96]
+    lea     rdx, [g_tpm_pt64+32]
     call    sha256_final
-    lea     r10, [rbp-128]
-    WINCALL NCryptEncrypt, qword ptr [g_tpm_key], r10, 64, \
+    WINCALL NCryptEncrypt, qword ptr [g_tpm_key], addr g_tpm_pt64, 64, \
             addr g_tpm_oaep, qword ptr [rbp-40], dword ptr [rbp-48], \
             addr g_tpm_cbres, dword ptr [rbp-64]
     mov     dword ptr [rbp-52], eax
     test    eax, eax
     jz      @F
     mov     dword ptr [g_tpm_last_err], eax
-@@: lea     rcx, [rbp-128]
+@@: lea     rcx, [g_tpm_pt64]
     mov     edx, 64
     call    secure_zero
     lea     rcx, [g_tpm_sha_ctx]
@@ -798,9 +810,20 @@ endif
     mov     qword ptr [g_tpm_prov], 0
     mov     qword ptr [g_tpm_key], 0
     mov     dword ptr [g_tpm_cbres], 0
-    lea     rcx, [rbp-160]
-    mov     edx, 96
+    lea     rcx, [g_tpm_pt64]
+    mov     edx, 64
     call    secure_zero
+    lea     rcx, [rbp-160]
+    mov     edx, 32
+    call    secure_zero
+    cmp     qword ptr [rbp-24], 0
+    je      tu_fail
+    cmp     qword ptr [rbp-32], 0
+    je      tu_fail
+    cmp     dword ptr [rbp-40], 256
+    jne     tu_fail
+    cmp     qword ptr [rbp-48], 0
+    je      tu_fail
     WINCALL NCryptOpenStorageProvider, addr g_tpm_prov, addr tpm_prov, 0
     test    eax, eax
     jnz     tu_rec_fail
@@ -825,9 +848,8 @@ tu_dec:
     call    tpm_compute_label
     xor     ecx, ecx
     call    tpm_build_oaep
-    lea     r10, [rbp-128]
     WINCALL NCryptDecrypt, qword ptr [g_tpm_key], qword ptr [rbp-32], dword ptr [rbp-40], \
-            addr g_tpm_oaep, r10, 64, \
+            addr g_tpm_oaep, addr g_tpm_pt64, 64, \
             addr g_tpm_cbres, dword ptr [rbp-64]
     test    eax, eax
     jnz     tu_rec_freekey
@@ -836,7 +858,7 @@ tu_dec:
     lea     rcx, [g_tpm_sha_ctx]
     call    sha256_init
     lea     rcx, [g_tpm_sha_ctx]
-    lea     rdx, [rbp-128]
+    lea     rdx, [g_tpm_pt64]
     mov     r8d, 32
     call    sha256_update
     lea     rcx, [g_tpm_sha_ctx]
@@ -847,15 +869,13 @@ tu_dec:
     lea     rdx, [rbp-160]
     call    sha256_final
     lea     rcx, [rbp-160]
-    lea     rdx, [rbp-96]
+    lea     rdx, [g_tpm_pt64+32]
     mov     r8d, 32
     call    ct_memcmp
     test    eax, eax
     jnz     tu_freekey
     mov     r11, qword ptr [rbp-48]
-    test    r11, r11
-    jz      tu_freekey
-    lea     r10, [rbp-128]
+    lea     r10, [g_tpm_pt64]
     xor     ecx, ecx
 tu_cpout:
     mov     al, byte ptr [r10+rcx]
@@ -863,8 +883,11 @@ tu_cpout:
     inc     ecx
     cmp     ecx, 32
     jb      tu_cpout
+    lea     rcx, [g_tpm_pt64]
+    mov     edx, 64
+    call    secure_zero
     lea     rcx, [rbp-160]
-    mov     edx, 96
+    mov     edx, 32
     call    secure_zero
     lea     rcx, [g_tpm_sha_ctx]
     mov     edx, 128
@@ -895,8 +918,11 @@ tu_rec_fail:
     mov     dword ptr [g_tpm_last_err], eax
 tu_fail:
     mov     qword ptr [g_tpm_prov], 0
+    lea     rcx, [g_tpm_pt64]
+    mov     edx, 64
+    call    secure_zero
     lea     rcx, [rbp-160]
-    mov     edx, 96
+    mov     edx, 32
     call    secure_zero
     lea     rcx, [g_tpm_sha_ctx]
     mov     edx, 128
@@ -1008,42 +1034,64 @@ wal_do:
     mov     qword ptr [wa_hmod], rax
     WINCALL GetProcAddress, qword ptr [wa_hmod], addr wa_n_ver
     test    rax, rax
-    jz      wal_no
+    jz      wal_free_no
+    mov     r10, qword ptr [g_ptr_cookie]
+    xor     rax, r10
     mov     qword ptr [wa_fn_ver], rax
     WINCALL GetProcAddress, qword ptr [wa_hmod], addr wa_n_avail
     test    rax, rax
-    jz      wal_no
+    jz      wal_free_no
+    xor     rax, qword ptr [g_ptr_cookie]
     mov     qword ptr [wa_fn_avail], rax
     WINCALL GetProcAddress, qword ptr [wa_hmod], addr wa_n_make
     test    rax, rax
-    jz      wal_no
+    jz      wal_free_no
+    xor     rax, qword ptr [g_ptr_cookie]
     mov     qword ptr [wa_fn_makecred], rax
     WINCALL GetProcAddress, qword ptr [wa_hmod], addr wa_n_get
     test    rax, rax
-    jz      wal_no
+    jz      wal_free_no
+    xor     rax, qword ptr [g_ptr_cookie]
     mov     qword ptr [wa_fn_getass], rax
     WINCALL GetProcAddress, qword ptr [wa_hmod], addr wa_n_freeatt
     test    rax, rax
-    jz      wal_no
+    jz      wal_free_no
+    xor     rax, qword ptr [g_ptr_cookie]
     mov     qword ptr [wa_fn_freeatt], rax
     WINCALL GetProcAddress, qword ptr [wa_hmod], addr wa_n_freeass
     test    rax, rax
-    jz      wal_no
+    jz      wal_free_no
+    xor     rax, qword ptr [g_ptr_cookie]
     mov     qword ptr [wa_fn_freeass], rax
     WINCALL GetProcAddress, qword ptr [wa_hmod], addr wa_n_delcred
-    mov     qword ptr [wa_fn_delcred], rax
+    test    rax, rax
+    jz      @F
+    xor     rax, qword ptr [g_ptr_cookie]
+@@: mov     qword ptr [wa_fn_delcred], rax
     WINCALL GetProcAddress, qword ptr [wa_hmod], addr wa_n_getlist
-    mov     qword ptr [wa_fn_getlist], rax
+    test    rax, rax
+    jz      @F
+    xor     rax, qword ptr [g_ptr_cookie]
+@@: mov     qword ptr [wa_fn_getlist], rax
     WINCALL GetProcAddress, qword ptr [wa_hmod], addr wa_n_freelist
-    mov     qword ptr [wa_fn_freelist], rax
+    test    rax, rax
+    jz      @F
+    xor     rax, qword ptr [g_ptr_cookie]
+@@: mov     qword ptr [wa_fn_freelist], rax
     mov     rax, qword ptr [wa_fn_ver]
+    xor     rax, qword ptr [g_ptr_cookie]
     call    rax
     mov     dword ptr [wa_api_ver], eax
     cmp     eax, 4
-    jb      wal_no
+    jb      wal_free_no
     mov     eax, 1
     FRAME_EPILOG
     ret
+wal_free_no:
+    cmp     qword ptr [wa_hmod], 0
+    je      wal_no
+    WINCALL FreeLibrary, qword ptr [wa_hmod]
+    mov     qword ptr [wa_hmod], 0
 wal_no:
     mov     dword ptr [wa_api_ver], 0
     xor     eax, eax
@@ -1064,6 +1112,7 @@ wa_probe_winhello_aaguid proc frame
     xor     ecx, ecx                            ; pGetAuthenticatorListOptions = NULL
     lea     rdx, [rbp-16]
     mov     rax, qword ptr [wa_fn_getlist]
+    xor     rax, qword ptr [g_ptr_cookie]
     call    rax
     test    eax, eax
     jnz     wpa_na
@@ -1103,6 +1152,7 @@ wpa_nx:
 wpa_found:
     mov     rcx, qword ptr [rbp-16]
     mov     rax, qword ptr [wa_fn_freelist]
+    xor     rax, qword ptr [g_ptr_cookie]
     call    rax
     mov     eax, 1
     FRAME_EPILOG
@@ -1110,6 +1160,7 @@ wpa_found:
 wpa_notfound:
     mov     rcx, qword ptr [rbp-16]
     mov     rax, qword ptr [wa_fn_freelist]
+    xor     rax, qword ptr [g_ptr_cookie]
     call    rax
     xor     eax, eax
     FRAME_EPILOG
@@ -1117,6 +1168,7 @@ wpa_notfound:
 wpa_free_na:
     mov     rcx, qword ptr [rbp-16]
     mov     rax, qword ptr [wa_fn_freelist]
+    xor     rax, qword ptr [g_ptr_cookie]
     call    rax
 wpa_na:
     mov     eax, -1
@@ -1134,6 +1186,7 @@ tpm_hello_available proc frame
     mov     dword ptr [rbp-16], 0               ; bAvailable
     lea     rcx, [rbp-16]
     mov     rax, qword ptr [wa_fn_avail]
+    xor     rax, qword ptr [g_ptr_cookie]
     call    rax
     test    eax, eax
     jnz     tha_no
@@ -1339,6 +1392,7 @@ wgpa_call:
     lea     rax, [rbp-48]
     mov     qword ptr [rsp+32], rax
     mov     rax, qword ptr [wa_fn_getass]
+    xor     rax, qword ptr [g_ptr_cookie]
     call    rax
     test    eax, eax
     jz      wgpa_got
@@ -1367,8 +1421,12 @@ wgpa_cp:
     inc     ecx
     cmp     ecx, 32
     jb      wgpa_cp
+    mov     rcx, r10                            ; scrub webauthn.dll heap pbFirst[32] before freeing!
+    mov     edx, 32
+    call    secure_zero
     mov     rcx, qword ptr [rbp-48]
     mov     rax, qword ptr [wa_fn_freeass]
+    xor     rax, qword ptr [g_ptr_cookie]
     call    rax
     mov     eax, 1
     FRAME_EPILOG
@@ -1377,6 +1435,7 @@ wgpa_cp:
 wgpa_free_fail:
     mov     rcx, qword ptr [rbp-48]
     mov     rax, qword ptr [wa_fn_freeass]
+    xor     rax, qword ptr [g_ptr_cookie]
     call    rax
 wgpa_fail:
     xor     eax, eax
@@ -1400,9 +1459,16 @@ tpm_hello_seal proc frame
     mov     qword ptr [rbp-24], rdx
     mov     dword ptr [rbp-32], r8d
     mov     qword ptr [rbp-48], 0
+    lea     rcx, [g_tpm_prf32]
+    mov     edx, 32
+    call    secure_zero
     lea     rcx, [rbp-192]
     mov     edx, 128
     call    secure_zero
+    cmp     qword ptr [rbp-16], 0
+    je      ths_fail
+    cmp     qword ptr [rbp-24], 0
+    je      ths_fail
     cmp     dword ptr [rbp-32], WHLO_HDR_LEN + 1
     jb      ths_fail
     call    tpm_hello_available
@@ -1506,6 +1572,7 @@ ths_setver:
     lea     rax, [rbp-48]
     mov     qword ptr [rsp+48], rax
     mov     rax, qword ptr [wa_fn_makecred]
+    xor     rax, qword ptr [g_ptr_cookie]
     call    rax
     test    eax, eax
     jz      ths_made
@@ -1551,7 +1618,7 @@ ths_cpcred:
     mov     rdx, qword ptr [r11+8]              ; pbFirst
     test    rdx, rdx
     jz      ths_need_assert
-    lea     r8, [rbp-160]
+    lea     r8, [g_tpm_prf32]
     xor     ecx, ecx
 ths_cpprf:
     mov     al, byte ptr [rdx+rcx]
@@ -1559,8 +1626,12 @@ ths_cpprf:
     inc     ecx
     cmp     ecx, 32
     jb      ths_cpprf
+    mov     rcx, rdx                            ; scrub webauthn.dll heap pbFirst[32] before freeing!
+    mov     edx, 32
+    call    secure_zero
     mov     rcx, qword ptr [rbp-48]
     mov     rax, qword ptr [wa_fn_freeatt]
+    xor     rax, qword ptr [g_ptr_cookie]
     call    rax
     mov     qword ptr [rbp-48], 0
     jmp     ths_have_prf
@@ -1569,13 +1640,14 @@ ths_need_assert:
     ; Free attestation, then evaluate PRF via WebAuthNAuthenticatorGetAssertion
     mov     rcx, qword ptr [rbp-48]
     mov     rax, qword ptr [wa_fn_freeatt]
+    xor     rax, qword ptr [g_ptr_cookie]
     call    rax
     mov     qword ptr [rbp-48], 0
     mov     rcx, qword ptr [rbp-24]
     add     rcx, WHLO_HDR_LEN
     mov     edx, dword ptr [rbp-36]
     lea     r8, [rbp-128]
-    lea     r9, [rbp-160]
+    lea     r9, [g_tpm_prf32]
     call    wa_get_prf_assertion
     test    eax, eax
     jnz     ths_have_prf
@@ -1586,6 +1658,7 @@ ths_need_assert:
     mov     rdx, qword ptr [rbp-24]
     add     rdx, WHLO_HDR_LEN
     mov     rax, qword ptr [wa_fn_delcred]
+    xor     rax, qword ptr [g_ptr_cookie]
     call    rax
     jmp     ths_fail
 
@@ -1594,10 +1667,13 @@ ths_have_prf:
     lea     rcx, [rbp-96]
     lea     rdx, [rbp-128]
     call    wa_compute_hmac_in
-    lea     rcx, [rbp-160]
+    lea     rcx, [g_tpm_prf32]
     mov     rdx, qword ptr [rbp-16]
     lea     r8, [rbp-192]
     call    wa_derive_hello_mats
+    lea     rcx, [g_tpm_prf32]
+    mov     edx, 32
+    call    secure_zero
 
     mov     r10, qword ptr [rbp-24]
     mov     dword ptr [r10+0], WHLO_MAGIC
@@ -1631,9 +1707,13 @@ ths_cptag:
 ths_free_fail:
     mov     rcx, qword ptr [rbp-48]
     mov     rax, qword ptr [wa_fn_freeatt]
+    xor     rax, qword ptr [g_ptr_cookie]
     call    rax
 ths_fail:
     call    wa_wipe_structs
+    lea     rcx, [g_tpm_prf32]
+    mov     edx, 32
+    call    secure_zero
     lea     rcx, [rbp-192]
     mov     edx, 128
     call    secure_zero
@@ -1699,20 +1779,23 @@ tpm_hello_unseal proc frame
     add     rcx, WHLO_HDR_LEN                   ; cred_id
     mov     edx, dword ptr [rbp-28]             ; cred_len
     lea     r8, [rbp-96]                        ; hmac_in[32]
-    lea     r9, [rbp-128]                       ; prf_out[32]
+    lea     r9, [g_tpm_prf32]                   ; prf_out[32]
     call    wa_get_prf_assertion
     test    eax, eax
     jz      thu_fail
 
-    ; Recompute g_tpm_label and derive candidate out32 + verify_tag[24]
+    ; Recompute g_tpm_label and stage candidate into g_tpm_cand_out + verify_tag[24]
     mov     r10, qword ptr [rbp-16]
     lea     rcx, [r10+8]
     lea     rdx, [rbp-96]
     call    wa_compute_hmac_in
-    lea     rcx, [rbp-128]
-    mov     rdx, qword ptr [rbp-40]
+    lea     rcx, [g_tpm_prf32]
+    lea     rdx, [g_tpm_cand_out]
     lea     r8, [rbp-160]
     call    wa_derive_hello_mats
+    lea     rcx, [g_tpm_prf32]
+    mov     edx, 32
+    call    secure_zero
 
     mov     r10, qword ptr [rbp-16]
     lea     rcx, [rbp-160]
@@ -1722,6 +1805,19 @@ tpm_hello_unseal proc frame
     test    eax, eax
     jnz     thu_fail
 
+    mov     r11, qword ptr [rbp-40]
+    lea     r10, [g_tpm_cand_out]
+    xor     ecx, ecx
+thu_cpout:
+    mov     al, byte ptr [r10+rcx]
+    mov     byte ptr [r11+rcx], al
+    inc     ecx
+    cmp     ecx, 32
+    jb      thu_cpout
+
+    lea     rcx, [g_tpm_cand_out]
+    mov     edx, 32
+    call    secure_zero
     call    wa_wipe_structs
     lea     rcx, [rbp-160]
     mov     edx, 96
@@ -1731,6 +1827,12 @@ tpm_hello_unseal proc frame
     ret
 
 thu_fail:
+    lea     rcx, [g_tpm_prf32]
+    mov     edx, 32
+    call    secure_zero
+    lea     rcx, [g_tpm_cand_out]
+    mov     edx, 32
+    call    secure_zero
     call    wa_wipe_structs
     lea     rcx, [rbp-160]
     mov     edx, 96
@@ -1776,6 +1878,7 @@ tpm_hello_delete proc frame
     mov     rdx, qword ptr [rbp-16]
     add     rdx, WHLO_HDR_LEN
     mov     rax, qword ptr [wa_fn_delcred]
+    xor     rax, qword ptr [g_ptr_cookie]
     call    rax
     xor     ecx, ecx
     test    eax, eax
@@ -2097,21 +2200,29 @@ tbs_load proc frame
     mov     qword ptr [tbs_hmod], rax
     WINCALL GetProcAddress, qword ptr [tbs_hmod], addr tbs_n_create
     test    rax, rax
-    jz      tbsl_fail
+    jz      tbsl_free_fail
+    xor     rax, qword ptr [g_ptr_cookie]
     mov     qword ptr [tbs_fn_create], rax
     WINCALL GetProcAddress, qword ptr [tbs_hmod], addr tbs_n_submit
     test    rax, rax
-    jz      tbsl_fail
+    jz      tbsl_free_fail
+    xor     rax, qword ptr [g_ptr_cookie]
     mov     qword ptr [tbs_fn_submit], rax
     WINCALL GetProcAddress, qword ptr [tbs_hmod], addr tbs_n_close
     test    rax, rax
-    jz      tbsl_fail
+    jz      tbsl_free_fail
+    xor     rax, qword ptr [g_ptr_cookie]
     mov     qword ptr [tbs_fn_close], rax
     mov     dword ptr [tbs_init_done], 1
 tbsl_ok:
     mov     eax, 1
     FRAME_EPILOG
     ret
+tbsl_free_fail:
+    cmp     qword ptr [tbs_hmod], 0
+    je      tbsl_fail
+    WINCALL FreeLibrary, qword ptr [tbs_hmod]
+    mov     qword ptr [tbs_hmod], 0
 tbsl_fail:
     mov     dword ptr [tbs_init_done], -1
 tbsl_no:
@@ -2320,6 +2431,7 @@ tcq_try_hw:
     lea     rcx, [rbp-464]
     lea     rdx, [rbp-456]
     mov     rax, qword ptr [tbs_fn_create]
+    xor     rax, qword ptr [g_ptr_cookie]
     sub     rsp, 32
     call    rax
     add     rsp, 32
@@ -2337,11 +2449,13 @@ tcq_try_hw:
     lea     rax, [rbp-468]
     mov     qword ptr [rsp+48], rax
     mov     rax, qword ptr [tbs_fn_submit]
+    xor     rax, qword ptr [g_ptr_cookie]
     call    rax
     add     rsp, 64
     mov     dword ptr [rbp-108], eax            ; save submit rc
     mov     rcx, qword ptr [rbp-456]
     mov     rax, qword ptr [tbs_fn_close]
+    xor     rax, qword ptr [g_ptr_cookie]
     sub     rsp, 32
     call    rax
     add     rsp, 32
@@ -2407,13 +2521,17 @@ tcq_hw_eval:
     test    r8d, r8d
     jnz     @F
     mov     r8d, 600                            ; 10m default if firmware reports 0
-@@: lea     eax, [r8 + 59]
+@@: lea     rax, [r8 + 59]                      ; 64-bit prevents wrap when interval_sec == 0xFFFFFFFF
     xor     edx, edx
     mov     r9d, 60
-    div     r9d
-    test    eax, eax
+    div     r9
+    test    rax, rax
     jnz     @F
     mov     eax, 1
+@@: mov     edx, 07FFFFFFFh
+    cmp     rax, rdx
+    jbe     @F
+    mov     rax, rdx
 @@: mov     dword ptr [r10+4], eax              ; win_mins (per-decrement heal interval)
     mov     eax, ecx
     imul    rax, r8                             ; total_sec = steps * interval_sec
@@ -2421,9 +2539,13 @@ tcq_hw_eval:
     xor     edx, edx
     mov     r9d, 60
     div     r9
-    test    eax, eax
+    test    rax, rax
     jnz     @F
     mov     eax, 1
+@@: mov     edx, 07FFFFFFFh
+    cmp     rax, rdx
+    jbe     @F
+    mov     rax, rdx
 @@: mov     dword ptr [r10+8], eax              ; rem_mins
     mov     eax, 2
     FRAME_EPILOG
@@ -2449,6 +2571,7 @@ tpm_cooldown_query endp
 ; cmd_tpmkat - VDR-10 OAEP v2 label domain/salt/reqhello binding KAT +
 ;   live PCP / mock-PCP Mode 2 anti-replay, 3-strike revocation & reseal KAT.
 ; ===========================================================================
+ifdef PROBE_IO
 extern print_a:proc
 
 .data
@@ -2742,6 +2865,7 @@ tpk_fail:
     FRAME_EPILOG
     ret
 cmd_tpmkat endp
+endif
 
 ; ===========================================================================
 ; cmd_tpmtest (dbg builds only) - headless seal/unseal round-trip on this

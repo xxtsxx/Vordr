@@ -30,8 +30,13 @@ extern FlushFileBuffers:proc
 extern GetDiskFreeSpaceExW:proc
 extern GetFullPathNameW:proc            ; a relative long path must be resolved first
 extern GetCurrentDirectoryW:proc        ; ...and measured against what it resolves to
+extern GetDriveTypeW:proc               ; reject mapped network drives when AllowUncVault=0
+extern GetFileAttributesW:proc          ; reject reparse points on rename target
 extern tagged_alloc:proc
 extern tagged_free:proc
+extern gui_build_user_dacl:proc
+externdef g_tmp_sd:byte
+externdef g_vault_lock:dword
 
 MOVEFILE_REPLACE_EXISTING equ 1
 MOVEFILE_WRITE_THROUGH    equ 8
@@ -83,88 +88,143 @@ rf_path     dw (MAX_PATH_CHARS + 16) dup (?)   ; read_file's Win32-form path
 wf_path     dw (MAX_PATH_CHARS + 16) dup (?)   ; write_file's, kept separate so a
                                                ;   read during a write cannot share it
 fv_final    dw (MAX_PATH_CHARS + 16) dup (?)   ; GetFinalPathNameByHandleW scratch
+fpa_full    dw (MAX_PATH_CHARS + 16) dup (?)   ; GetFullPathNameW pre-open canonicalization
 align 8
 fv_bhfi     db 64 dup (?)                      ; BY_HANDLE_FILE_INFORMATION (52 bytes)
 
 .code
 
-; =============================================================================
-; file_path_allowed(rcx = wide path) -> eax = 1 allowed / 0 refused.
-;   Pre-CreateFileW gate: blocks Win32 device namespace (\\.\, \\?\GLOBALROOT)
-;   unconditionally and blocks UNC paths (\\server\..., \\?\UNC\...) before any
-;   SMB/WebDAV NTLM handshake can occur unless HKLM AllowUncVault != 0.
-; =============================================================================
-public file_path_allowed
-file_path_allowed proc
+; fpa_lexical_ok(rcx = wide path) -> eax = 1 lexically allowed / 0 refused.
+fpa_lexical_ok proc
     test    rcx, rcx
-    jz      fpa_no
+    jz      fpal_no
     cmp     word ptr [rcx], 0
-    je      fpa_no
+    je      fpal_no
     movzx   eax, word ptr [rcx]
     cmp     ax, 5Ch
-    je      fpa_bs1
+    je      fpal_bs1
     cmp     ax, '/'
-    jne     fpa_ok
-fpa_bs1:
+    jne     fpal_ok
+fpal_bs1:
     movzx   eax, word ptr [rcx+2]
     cmp     ax, 5Ch
-    je      fpa_bs2
+    je      fpal_bs2
     cmp     ax, '/'
-    jne     fpa_ok
-fpa_bs2:
+    jne     fpal_ok
+fpal_bs2:
     ; starts with "\\" or "//"
     movzx   eax, word ptr [rcx+4]
     cmp     ax, '.'
-    je      fpa_no                              ; "\\.\" device namespace -> refuse
+    je      fpal_no                             ; "\\.\" device namespace -> refuse ALWAYS
     cmp     ax, '?'
-    jne     fpa_unc                             ; "\\server\..." -> check g_allow_unc
+    jne     fpal_unc                            ; "\\server\..." -> check g_allow_unc
     movzx   eax, word ptr [rcx+6]
     cmp     ax, 5Ch
-    je      fpa_qbody
+    je      fpal_qbody
     cmp     ax, '/'
-    jne     fpa_no
-fpa_qbody:
+    jne     fpal_no
+fpal_qbody:
     ; "\\?\" prefix: allow "\\?\X:\..." local drive; check "\\?\UNC\..."; refuse others
     movzx   eax, word ptr [rcx+8]
     or      ax, 20h
     cmp     ax, 'a'
-    jb      fpa_no
+    jb      fpal_no
     cmp     ax, 'z'
-    ja      fpa_no
+    ja      fpal_no
     cmp     word ptr [rcx+10], ':'
-    je      fpa_qdrive
+    je      fpal_qdrive
     ; check "UNC\"
     cmp     ax, 'u'
-    jne     fpa_no                              ; e.g. "\\?\GLOBALROOT\..." -> refuse
+    jne     fpal_no                             ; e.g. "\\?\GLOBALROOT\..." -> refuse ALWAYS
     movzx   eax, word ptr [rcx+10]
     or      ax, 20h
     cmp     ax, 'n'
-    jne     fpa_no
+    jne     fpal_no
     movzx   eax, word ptr [rcx+12]
     or      ax, 20h
     cmp     ax, 'c'
-    jne     fpa_no
+    jne     fpal_no
     movzx   eax, word ptr [rcx+14]
     cmp     ax, 5Ch
-    je      fpa_unc
+    je      fpal_unc
     cmp     ax, '/'
-    je      fpa_unc
-    jmp     fpa_no
-fpa_qdrive:
+    je      fpal_unc
+    jmp     fpal_no
+fpal_qdrive:
     movzx   eax, word ptr [rcx+12]
     cmp     ax, 5Ch
-    je      fpa_ok
+    je      fpal_ok
     cmp     ax, '/'
-    je      fpa_ok
-    jmp     fpa_no
-fpa_unc:
+    je      fpal_ok
+    jmp     fpal_no
+fpal_unc:
     cmp     dword ptr [g_allow_unc], 0
+    je      fpal_no
+fpal_ok:
+    mov     eax, 1
+    ret
+fpal_no:
+    xor     eax, eax
+    ret
+fpa_lexical_ok endp
+
+; =============================================================================
+; file_path_allowed(rcx = wide path) -> eax = 1 allowed / 0 refused.
+;   Pre-CreateFileW gate: blocks Win32 device namespace (\\.\, \\?\GLOBALROOT)
+;   unconditionally, resolves relative/drive-relative paths in user mode via
+;   GetFullPathNameW, and blocks UNC + mapped remote drives (DRIVE_REMOTE = 4)
+;   before any SMB/WebDAV NTLM handshake can occur unless HKLM AllowUncVault != 0.
+; =============================================================================
+public file_path_allowed
+file_path_allowed proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx
+    call    fpa_lexical_ok
+    test    eax, eax
+    jz      fpa_no
+    cmp     dword ptr [g_allow_unc], 0
+    jne     fpa_ok
+    mov     r10, qword ptr [rbp-24]
+    cmp     word ptr [r10], 5Ch
+    jne     fpa_resolve
+    cmp     word ptr [r10+2], 5Ch
+    jne     fpa_resolve
+    cmp     word ptr [r10+4], '?'
+    jne     fpa_resolve
+    ; Already "\\?\X:\..." -> verify X:\ is not a mapped remote network drive
+    movzx   eax, word ptr [r10+8]
+    jmp     fpa_chk_drv
+
+fpa_resolve:
+    WINCALL GetFullPathNameW, qword ptr [rbp-24], <MAX_PATH_CHARS + 16>, addr fpa_full, 0
+    test    eax, eax
+    jz      fpa_no
+    cmp     eax, MAX_PATH_CHARS + 16
+    jae     fpa_no
+    lea     rcx, [fpa_full]
+    call    fpa_lexical_ok
+    test    eax, eax
+    jz      fpa_no
+    lea     r10, [fpa_full]
+    cmp     word ptr [r10+2], ':'
+    jne     fpa_no                              ; under AllowUncVault=0 must resolve to X:\...
+    movzx   eax, word ptr [r10]
+
+fpa_chk_drv:
+    mov     word ptr [rbp-16], ax               ; "X"
+    mov     word ptr [rbp-14], ':'
+    mov     word ptr [rbp-12], 5Ch              ; "\"
+    mov     word ptr [rbp-10], 0
+    WINCALL GetDriveTypeW, addr rbp-16
+    cmp     eax, 4                              ; DRIVE_REMOTE
     je      fpa_no
 fpa_ok:
     mov     eax, 1
+    FRAME_EPILOG
     ret
 fpa_no:
     xor     eax, eax
+    FRAME_EPILOG
     ret
 file_path_allowed endp
 
@@ -371,13 +431,87 @@ rf_done:
 read_file endp
 
 ; =============================================================================
+; read_file_head80(rcx = wpath, rdx = out80, r8 = *outsize) -> eax (0 / EXIT_IO)
+;   Reads ONLY the 80-byte vault header + GetFileSizeEx (zero heap allocation)
+;   under the exact same file_path_allowed + FILE_FLAG_OPEN_RP + file_validate_handle
+;   gate as read_file, eliminating multi-GiB pre-auth reads in vault_preload and
+;   vault_ext_changed.
+; =============================================================================
+public read_file_head80
+read_file_head80 proc frame
+    FRAME_PROLOG 128
+    mov     qword ptr [rbp-24], rdx           ; out80
+    mov     qword ptr [rbp-32], r8            ; *outsize
+    test    rdx, rdx
+    jz      rfh_io
+    test    r8, r8
+    jz      rfh_io
+    lea     rdx, [rf_path]
+    mov     r8d, MAX_PATH_CHARS + 16
+    call    path_longify
+    mov     qword ptr [rbp-40], rax
+    mov     rcx, rax
+    call    file_path_allowed
+    test    eax, eax
+    jz      rfh_denied
+    WINCALL CreateFileW, qword ptr [rbp-40], GENERIC_READ, FILE_SHARE_RWD, 0, OPEN_EXISTING, \
+            <FILE_ATTR_NORMAL or FILE_FLAG_OPEN_RP>, 0
+    cmp     rax, -1
+    je      rfh_io_err
+    mov     qword ptr [rbp-48], rax           ; hFile
+    mov     rcx, rax
+    call    file_validate_handle
+    test    eax, eax
+    jz      rfh_badtype
+    WINCALL GetFileSizeEx, qword ptr [rbp-48], addr rbp-56
+    test    eax, eax
+    jz      rfh_close_io
+    cmp     qword ptr [rbp-56], 80
+    jb      rfh_close_io
+    mov     dword ptr [rbp-60], 0
+    WINCALL ReadFile, qword ptr [rbp-48], qword ptr [rbp-24], 80, addr rbp-60, 0
+    mov     dword ptr [rbp-64], eax
+    WINCALL CloseHandle, qword ptr [rbp-48]
+    cmp     dword ptr [rbp-64], 0
+    je      rfh_io
+    cmp     dword ptr [rbp-60], 80
+    jne     rfh_io
+    mov     rax, qword ptr [rbp-32]
+    mov     rcx, qword ptr [rbp-56]
+    mov     qword ptr [rax], rcx
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+rfh_badtype:
+    mov     dword ptr [g_io_err], 5
+rfh_close_io:
+    WINCALL CloseHandle, qword ptr [rbp-48]
+rfh_io:
+    mov     eax, EXIT_IO
+    FRAME_EPILOG
+    ret
+rfh_io_err:
+    call    GetLastError
+    mov     dword ptr [g_io_err], eax
+    mov     eax, EXIT_IO
+    FRAME_EPILOG
+    ret
+rfh_denied:
+    mov     dword ptr [g_io_err], 5
+    mov     eax, EXIT_IO
+    FRAME_EPILOG
+    ret
+read_file_head80 endp
+
+; =============================================================================
 ; write_file(rcx = wpath, rdx = buf, r8 = size) -> eax
 ; =============================================================================
 public write_file
 write_file proc frame
-    FRAME_PROLOG 128
+    FRAME_PROLOG 176
     mov     dword ptr [g_wf_created], 0
     ; [rbp-24]=buf [rbp-32]=size [rbp-40]=handle [rbp-48]=cursor [rbp-56]=remaining
+    ; [rbp-64]=disp/nw [rbp-72]=wpath [rbp-104..-81]=SECURITY_ATTRIBUTES [rbp-112]=pSA
     mov     qword ptr [rbp-24], rdx           ; stash the buffer and size first - they
     mov     qword ptr [rbp-32], r8            ;   are in path_longify's argument
                                               ;   registers
@@ -397,9 +531,28 @@ write_file proc frame
     call    file_path_allowed
     test    eax, eax
     jz      wf_denied
+    ; AUD-25: apply explicit owner+SYSTEM DACL on personal vaults, .bak0, and exports
+    ; (existing vaults replaced via ReplaceFileW preserve their target ACL; HKLM-locked
+    ; shared vaults inherit parent folder ACL on initial creation).
+    mov     qword ptr [rbp-112], 0
+    cmp     dword ptr [g_vault_lock], 0
+    jne     wf_open
+    mov     ecx, 10000000h                      ; GENERIC_ALL
+    xor     edx, edx
+    xor     r8d, r8d
+    call    gui_build_user_dacl
+    test    eax, eax
+    jz      wf_open
+    mov     dword ptr [rbp-104], 24
+    lea     rax, [g_tmp_sd]
+    mov     qword ptr [rbp-96], rax
+    mov     dword ptr [rbp-88], 0
+    lea     rax, [rbp-104]
+    mov     qword ptr [rbp-112], rax
+wf_open:
     mov     rcx, qword ptr [rbp-72]
     mov     r10d, dword ptr [rbp-64]
-    WINCALL CreateFileW, rcx, GENERIC_WRITE, 0, 0, r10d, <FILE_ATTR_NORMAL or FILE_FLAG_OPEN_RP>, 0
+    WINCALL CreateFileW, rcx, GENERIC_WRITE, 0, qword ptr [rbp-112], r10d, <FILE_ATTR_NORMAL or FILE_FLAG_OPEN_RP>, 0
     cmp     rax, -1
     je      wf_io
     mov     qword ptr [rbp-40], rax
@@ -516,6 +669,12 @@ file_rename proc frame
     mov     r8d, MAX_PATH_CHARS + 16
     call    path_longify
     mov     qword ptr [rbp-32], rax
+    WINCALL GetFileAttributesW, qword ptr [rbp-32]
+    cmp     eax, -1
+    je      frn_attr_ok
+    test    eax, 400h                           ; refuse replacing a symlink / reparse target
+    jnz     frn_io
+frn_attr_ok:
     mov     dword ptr [rbp-40], 0               ; attempt count
 frn_try:
     ; Prefer ReplaceFileW(to, from, NULL, REPLACEFILE_WRITE_THROUGH, 0, 0) so an
@@ -689,6 +848,10 @@ path_longify proc frame
     mov     qword ptr [rbp-24], rcx           ; src
     mov     qword ptr [rbp-32], rdx           ; dst
     mov     dword ptr [rbp-40], r8d           ; cap
+    test    rcx, rcx
+    jz      pl_asis
+    test    rdx, rdx
+    jz      pl_asis
     cmp     r8d, PATH_MIN_CAP                 ; too small to build anything in:
     jb      pl_asis                           ;   hand the path back untouched
     ; ---- length -----------------------------------------------------------

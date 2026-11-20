@@ -8,6 +8,8 @@
 
 include macros.inc
 
+ifdef PROBE_IO
+
 extern QueryPerformanceCounter:proc
 extern QueryPerformanceFrequency:proc
 extern mem_alloc:proc
@@ -269,5 +271,7 @@ b_oomexit:
     FRAME_EPILOG
     ret
 do_bench endp
+
+endif
 
 end

@@ -22,7 +22,9 @@ extern hmac_sha1:proc
 extern sha256_hash:proc
 extern rng_fill:proc
 extern mem_alloc:proc
+ifdef PROBE_IO
 extern print_a:proc
+endif
 extern mem_free:proc
 extern secmem_alloc:proc                 ; vordr.json is every exported secret in clear
 extern secmem_free:proc
@@ -84,6 +86,7 @@ public pbkdf2_ae
 public g_ae_dk, g_pb_u, g_pb_un, g_pb_t
 pbkdf2_ae proc frame
     FRAME_PROLOG 96
+    BOUND_CHECK r9d, 29
     mov     qword ptr [rbp-24], rcx             ; pw
     mov     dword ptr [rbp-32], edx             ; pwlen
     mov     qword ptr [rbp-40], r8              ; salt
@@ -573,6 +576,7 @@ g_json      dq 4 dup (?)             ; {ptr,len,cap,grow=0} - secmem, fixed capa
 ZE_PWCAP    equ 1024
 ZE_EXT_MAX  equ 12                   ; max ".ext" kept in a ZIP member name (dot + 11)
 public g_ze_u8pw, g_ze_rk, g_zj_fld, g_zj_fn ; pinned + crash-wiped by secmem.asm
+public g_zj_sha, g_zj_shahex
 g_ze_u8pw   db ZE_PWCAP dup (?)      ; wide->UTF-8 export password scratch
 g_zj_fld    db 40 dup (?)            ; vault_field_get out struct
 g_zj_fn     db 512 dup (?)           ; attachment filename (UTF-8)
@@ -1464,6 +1468,7 @@ bpd_emit:
     ret
 buf_pu32dec endp
 
+ifdef PROBE_IO
 ; =============================================================================
 ; cmd_zexcap - regression for the central-directory capacity guard.  g_ze_cd holds
 ;   only ZE_MAXFILE 24-byte records; without a bound, a vault with >= ZE_MAXFILE
@@ -1888,5 +1893,6 @@ zxs_fail:
     FRAME_EPILOG
     ret
 cmd_zexselkat endp
+endif
 
 end

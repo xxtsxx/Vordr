@@ -52,6 +52,9 @@ externdef g_zi_hide:byte                ;   rows the checklist must not show
 externdef g_zi_stg_n:dword              ;   staged row count
 extern secmem_free:proc
 extern read_file:proc
+extern read_file_head80:proc
+extern file_path_allowed:proc
+extern file_validate_handle:proc
 extern path_io:proc                     ; the vault path in the form Win32 accepts
 extern cfg_in_set:proc                  ; the ONLY way to set g_cfg_in
 extern write_file:proc
@@ -61,6 +64,10 @@ extern CopyFileW:proc
 extern DeleteFileW:proc
 extern Sleep:proc                       ; back-off between contended temp-write tries
 externdef g_io_err:dword                ; Win32 reason from the last failed write
+externdef g_rf_cap:qword                ; one-shot read_file size cap (fileio)
+externdef g_edit_backup:qword           ; gui.asm: parked edit-transaction body
+externdef g_edit_backup_len:qword
+externdef g_edit_history:qword
 extern CreateFileW:proc                 ; C8: <vault>.lock write coordination
 extern CloseHandle:proc
 externdef g_wf_disp:dword               ; C7: one-shot write_file disposition (fileio)
@@ -68,8 +75,10 @@ extern mem_alloc:proc
 extern mem_free:proc
 extern print_a:proc
 extern print_err:proc
+ifdef PROBE_IO
 extern print_u64:proc
 extern fuzz_seed:proc                   ; G7: reproducible/logged fuzzer seed (main.asm)
+endif
 extern WideCharToMultiByte:proc
 extern GetSystemTimeAsFileTime:proc
 extern GetFileAttributesW:proc
@@ -84,7 +93,9 @@ extern reg_prune_all:proc               ; C6: drop legacy path-named reg values
 externdef g_readonly:dword              ; E9: read-only mode flag (owned by gui.asm)
 extern reg_ctr_set:proc
 extern reg_ctr_get:proc
+ifdef PROBE_IO
 extern reg_ctr_del:proc
+endif
 extern GetNamedSecurityInfoW:proc
 extern GetSecurityDescriptorControl:proc
 extern SetNamedSecurityInfoW:proc
@@ -108,6 +119,8 @@ externdef g_cfg_pinminlen:dword
 externdef g_cfg_pinnotriv:dword
 
 CP_UTF8         equ 65001
+FILE_FLAG_OPEN_RP equ 00200000h
+VAULT_FILE_MAX  equ ATT_TOTAL_MAX + VAULT_BODY_MAX + 4096
 
 ; ARGON2REQ / GCMREQ mirror the definitions in argon2.asm / aesgcm.asm
 ARGON2REQ struct
@@ -205,6 +218,7 @@ align 4
 kat_img      dd 7                              ; {u32 len, raw bytes} for VFL_RAW
 kat_img_b    db 089h,'P','N','G',000h,001h,0FFh   ; binary incl NUL + high byte
 kat_exp_img  db 089h,'P','N','G',000h,001h,0FFh
+ifdef PROBE_IO
 ; --- vfuzz fixture: one valid two-field entry the parser fuzzer mutates ------
 align 4
 vfz_fix label byte
@@ -227,8 +241,10 @@ CSTR vfz_m2, " iters  "
 CSTR vfz_m3, " parsed  "
 CSTR vfz_m4, " rejected  0 crashes",13,10
 bk_pw       db "vordrtest", 0
+endif
 fmac_domain db "vordr-file-mac-v1"          ; MAC domain-separation prefix
 FMAC_DOMLEN equ 17
+ifdef PROBE_IO
 ffk_seedpw  db "vordrtest",0                            ; export-KAT seed vault password (9)
 vxk_exppw   db "exportpw2",0                             ; vaultexportkat: export vault password (9)
 CSTR vxk_ok,  "vaultexportkat: PASS (export round-trips ids; re-merge idempotent)",13,10
@@ -258,18 +274,23 @@ CSTR af_ok,  "attfuzz: PASS (attach_index_build survived the mutations)",13,10
 CSTR af_bad, "attfuzz: FAIL",13,10
 CSTR xc_ok,  "xctest: PASS (external header change detected)",13,10
 CSTR xc_bad, "xctest: FAIL",13,10
+endif
 CSTR e_io,      "error: cannot read/write the vault file",13,10
 CSTR e_oom,     "error: out of memory",13,10
 CSTR m_created, "vault created.",13,10
 
 .data?
 align 8
+HFLG_CAP    equ 8192
+public g_health_flags
+g_health_flags db HFLG_CAP dup (?)      ; per-entry health mask (1=weak, 2=reused, 4=old)
 g_eidx      dq ?                        ; vault_index_begin: one entry pointer per entry
 g_eidx_body dq ?                        ;   built from this body,
 g_eidx_blen dq ?                        ;   of this length
 g_eidx_cap  dd ?                        ; entries the array holds
 g_eidx_n    dd ?                        ; entries indexed (0 = no index in use)
 g_eidx_dep  dd ?                        ; begin/end nesting
+ifdef PROBE_IO
 align 2
 ; convcap's scratch output buffer - written by every caller before it is read,
 ; so it needs no initial contents.  In .data it was 4 KB of zeros in the image;
@@ -281,6 +302,8 @@ align 16
 g_vx_ids    db 16*16 dup (?)           ; vaultexportkat: snapshot of source entry ids
 align 8
 g_vfz_rng   dq ?                       ; vfuzz xorshift64 state (dbg/test only)
+endif
+align 8
 g_kat_body  db 512 dup (?)             ; scratch body for the field-serialization KAT
 public g_vkey, g_sha32, g_hdr
 g_vkey      db 32 dup (?)
@@ -312,6 +335,7 @@ g_merge_sel dd ?                            ; 1 = fed_merge honours g_sel (GUI i
 g_seal_noadopt dd ?                         ; 1 = this seal writes a DIFFERENT vault, so
                                             ;   vault_seal_write must not adopt the image
                                             ;   it just wrote as the live one
+g_in_foreign   dd ?                         ; 1 = inside vault_open_foreign (skip rollback ratchet)
 align 8
 g_xs_hdr    db VH_TOTAL dup (?)             ; parked live header
 align 2
@@ -379,11 +403,13 @@ g_ts        dq ?                ; GetSystemTimeAsFileTime scratch
 g_sys_ver   db ?                ; VF_SYSTEM value byte (schema version) - write scratch
 align 8
 g_sys_ft    dq ?                ; VF_SYS_PWVERIFY value staging - write scratch
+ifdef PROBE_IO
 seed_title_w dw 80 dup (?)      ; seedtest scratch: entry field strings (wide)
 seed_user_w  dw 96 dup (?)
 seed_url_w   dw 96 dup (?)
 seed_pass_a  db 40 dup (?)
 seed_pass_w  dw 40 dup (?)
+endif
 public g_carry_created
 g_carry_created dq ?            ; if !=0, vault_build_entry uses it as `created`
                                ; (one-shot; lets a GUI edit preserve the orig date)
@@ -595,8 +621,8 @@ TPM_PIN_BLOB_SZ equ 680
 
 ; tpm_kn_slot_build(ecx = slot 0|1) - build L"Vordr-<16hex>-S0" / L"-S1" in g_tpm_kn_s.
 tpm_kn_slot_build proc frame
-    FRAME_PROLOG 32
-    mov     dword ptr [rbp-24], ecx
+    FRAME_PROLOG 48
+    mov     dword ptr [rbp-16], ecx
     call    tpm_kn_build
     lea     r10, [g_tpm_kn]
     lea     r11, [g_tpm_kn_s]
@@ -612,7 +638,7 @@ tks_cp:
 tks_tail:
     mov     word ptr [r11+r8*2+0], '-'
     mov     word ptr [r11+r8*2+2], 'S'
-    mov     eax, dword ptr [rbp-24]
+    mov     eax, dword ptr [rbp-16]
     and     eax, 1
     add     eax, '0'
     mov     word ptr [r11+r8*2+4], ax
@@ -649,9 +675,9 @@ tpm_wipe_scratch endp
 
 ; tpm_del_slots_silent() - delete S0 and S1 state keys silently.
 tpm_del_slots_silent proc frame
-    FRAME_PROLOG 32
+    FRAME_PROLOG 48
     mov     eax, dword ptr [g_tpm_reqhello]
-    mov     dword ptr [rbp-24], eax
+    mov     dword ptr [rbp-16], eax
     mov     dword ptr [g_tpm_reqhello], 0
     xor     ecx, ecx
     call    tpm_kn_slot_build
@@ -661,7 +687,7 @@ tpm_del_slots_silent proc frame
     call    tpm_kn_slot_build
     lea     rcx, [g_tpm_kn_s]
     call    tpm_delete
-    mov     eax, dword ptr [rbp-24]
+    mov     eax, dword ptr [rbp-16]
     mov     dword ptr [g_tpm_reqhello], eax
     FRAME_EPILOG
     ret
@@ -726,7 +752,7 @@ tpm_del_stashed_hello endp
 ;   Argon2id(g_tpm_pin_u8[0..g_tpm_pin_u8len], salt = ST_SALT[32]) -> g_tpm_dk[64],
 ;   and wipes g_tpm_pin_u8.
 tpm_pin_stretch proc frame
-    FRAME_PROLOG 32
+    FRAME_PROLOG 48
     mov     eax, dword ptr [g_tpm_pin_u8len]
     test    eax, eax
     jz      tps_bad
@@ -755,12 +781,12 @@ tpm_pin_stretch proc frame
     mov     qword ptr [r10].ARGON2REQ.outp, rcx
     lea     rcx, [g_areq]
     call    argon2id_hash
-    mov     dword ptr [rbp-24], eax
+    mov     dword ptr [rbp-16], eax
     lea     rcx, [g_tpm_pin_u8]
     mov     edx, 256
     call    secure_zero
     mov     dword ptr [g_tpm_pin_u8len], 0
-    cmp     dword ptr [rbp-24], 0
+    cmp     dword ptr [rbp-16], 0
     jne     tps_bad
     mov     eax, 1
     FRAME_EPILOG
@@ -1126,6 +1152,8 @@ vk_derive_tpm_pin proc frame
     call    tpm_kn_slot_build
     lea     rcx, [g_tpm_kn_s]
     call    tpm_delete
+    test    eax, eax
+    jz      vdtp_failclosed                     ; AUD-01: refuse PIN check if old slot key locked!
 
     ; 5) Stretch entered PIN + unseal machine PCP secret + unwrap g_vkey
     call    tpm_pin_stretch
@@ -1657,7 +1685,7 @@ vault_tpm_enroll_hello endp
 ; ===========================================================================
 public vault_tpm_forget
 vault_tpm_forget proc frame
-    FRAME_PROLOG 32
+    FRAME_PROLOG 48
     ; [rbp-16]=saved reqhello [rbp-20]=old_hello_len
     call    tpm_stash_prev_hello
     mov     dword ptr [rbp-20], eax
@@ -1821,7 +1849,7 @@ vault_copy_dacl endp
 ;   sound MAC; the domain string separates it from any other use of the key.
 ; ===========================================================================
 vault_file_mac proc frame
-    FRAME_PROLOG 48
+    FRAME_PROLOG 64
     mov     qword ptr [rbp-24], rcx             ; data
     mov     qword ptr [rbp-32], rdx             ; len
     mov     qword ptr [rbp-40], r8              ; out
@@ -1874,20 +1902,18 @@ vault_ext_snapshot endp
 ; ===========================================================================
 public vault_ext_changed
 vault_ext_changed proc frame
-    FRAME_PROLOG 64
-    ; [rbp-24]=buf [rbp-32]=size [rbp-40]=compare result
+    FRAME_PROLOG 160
+    ; [rbp-24]=size [rbp-32]=compare result [rbp-112..-33]=hdr80
     mov     rcx, qword ptr [g_cfg_in]
-    lea     rdx, [rbp-24]
-    lea     r8, [rbp-32]
-    call    read_file
+    lea     rdx, [rbp-112]
+    lea     r8, [rbp-24]
+    call    read_file_head80
     test    eax, eax
     jnz     vxc_changed                         ; unreadable/moved -> treat as changed
-    mov     rax, qword ptr [rbp-32]
+    mov     rax, qword ptr [rbp-24]
     cmp     rax, qword ptr [g_ext_size]
-    jne     vxc_free_changed
-    cmp     rax, VH_TOTAL
-    jb      vxc_free_changed
-    mov     rcx, qword ptr [rbp-24]             ; hash the current header
+    jne     vxc_changed
+    lea     rcx, [rbp-112]                      ; hash the current 80-byte header
     mov     rdx, VH_TOTAL
     lea     r8, [g_fmac_out]                    ; scratch (32 bytes)
     mov     r9, 32
@@ -1896,19 +1922,11 @@ vault_ext_changed proc frame
     lea     rdx, [g_ext_hash]
     mov     r8, 32
     call    ct_memcmp                           ; 0 = header unchanged
-    mov     dword ptr [rbp-40], eax
-    mov     rcx, qword ptr [rbp-24]
-    mov     rdx, qword ptr [rbp-32]
-    call    mem_free
-    cmp     dword ptr [rbp-40], 0
-    jne     vxc_changed
+    test    eax, eax
+    jnz     vxc_changed
     xor     eax, eax
     FRAME_EPILOG
     ret
-vxc_free_changed:
-    mov     rcx, qword ptr [rbp-24]
-    mov     rdx, qword ptr [rbp-32]
-    call    mem_free
 vxc_changed:
     mov     eax, 1
     FRAME_EPILOG
@@ -1992,9 +2010,23 @@ vault_rotate_backups proc frame
     jz      vrb_done
     ; Stage live vault -> .bak0 BEFORE touching .bak1..3; only rotate after file_rename succeeds!
     WINCALL DeleteFileW, addr g_bak_a
+    cmp     dword ptr [g_seal_noadopt], 0
+    jne     vrb_copy
+    cmp     qword ptr [g_filebuf], 0
+    je      vrb_copy
+    mov     dword ptr [g_wf_disp], 1            ; CREATE_NEW + FILE_FLAG_OPEN_RP via write_file
+    lea     rcx, [g_bak_a]
+    mov     rdx, qword ptr [g_filebuf]
+    mov     r8, qword ptr [g_filesize]
+    call    write_file
+    test    eax, eax
+    jz      vrb_dacl
+    jmp     vrb_done
+vrb_copy:
     WINCALL CopyFileW, qword ptr [rbp-48], addr g_bak_a, 1
     test    eax, eax
     jz      vrb_done
+vrb_dacl:
     mov     rcx, qword ptr [rbp-48]
     lea     rdx, [g_bak_a]
     call    vault_copy_dacl
@@ -2171,6 +2203,23 @@ vsw_emit_att:
 vsw_write:
     ; --- full-file MAC + anti-rollback trailer ------------------
     ; layout at offset base: [u64 counter][32 MAC over image+counter][u32 magic]
+    mov     rax, qword ptr [g_save_counter]
+    mov     qword ptr [rbp-56], rax             ; save previous counter for error rollback
+    cmp     dword ptr [g_seal_noadopt], 0
+    jne     vsw_inc_ctr
+    mov     rcx, qword ptr [g_cfg_in]
+    lea     rdx, [g_ctr_io]
+    mov     r8d, 8
+    call    reg_ctr_get
+    cmp     eax, 8
+    jne     vsw_inc_ctr
+    mov     rax, qword ptr [g_ctr_io]
+    cmp     rax, -1
+    je      vsw_inc_ctr
+    cmp     rax, qword ptr [g_save_counter]
+    jbe     vsw_inc_ctr
+    mov     qword ptr [g_save_counter], rax     ; supersede mirror after user-accepted rollback
+vsw_inc_ctr:
     inc     qword ptr [g_save_counter]          ; monotonic: this save's number
     mov     r10, qword ptr [g_outbuf]
     add     r10, qword ptr [rbp-40]             ; -> trailer start (= base offset)
@@ -2220,14 +2269,13 @@ vsw_pdone:
     mov     word ptr [r11+r8*2], 'p'
     inc     r8
     mov     word ptr [r11+r8*2], 0
-    ; write the image to the temp file.  C7: delete any stale/pre-planted temp,
-    ; then create it exclusively (CREATE_NEW) so a re-planted symlink at that name
-    ; is refused rather than silently followed.
-    ; Retry the delete+create pair, not just the rename below.  A vault in a synced
-    ; folder (OneDrive) is routinely held open by the sync client: the DeleteFileW
-    ; then fails, the exclusive CREATE_NEW that follows fails with ERROR_FILE_EXISTS,
-    ; and nothing retried it - which is what surfaced as "Could not create the vault"
-    ; on a machine with 110 GB free and an idle disk.  Same cadence as file_rename.
+    ; Refuse to overwrite if g_cfg_in itself is a planted symlink / reparse point
+    mov     rcx, qword ptr [g_cfg_in]
+    call    path_io
+    mov     rcx, rax
+    call    bak_not_reparse
+    test    eax, eax
+    jz      vsw_io_dec
     mov     dword ptr [rbp-48], 0                ; attempt count
 vsw_wtry:
     WINCALL DeleteFileW, addr g_tmppath
@@ -2324,12 +2372,14 @@ vsw_swap:
 vsw_rename_fail:
     call    vault_abort_backup
     WINCALL DeleteFileW, addr g_tmppath
-    dec     qword ptr [g_save_counter]
+    mov     rax, qword ptr [rbp-56]
+    mov     qword ptr [g_save_counter], rax
     jmp     vsw_free
 vsw_io_cleanup:
     WINCALL DeleteFileW, addr g_tmppath
 vsw_io_dec:
-    dec     qword ptr [g_save_counter]
+    mov     rax, qword ptr [rbp-56]
+    mov     qword ptr [g_save_counter], rax
 vsw_io:
     mov     dword ptr [rbp-24], EXIT_IO
 vsw_free:
@@ -2365,6 +2415,8 @@ vault_unlock proc frame
     ; secure desktop (vault_preload)
     cmp     dword ptr [g_preloaded], 0
     jne     vu_haveimage
+    mov     eax, VAULT_FILE_MAX
+    mov     qword ptr [g_rf_cap], rax
     mov     rcx, qword ptr [g_cfg_in]
     lea     rdx, [g_filebuf]
     lea     r8, [g_filesize]
@@ -2574,6 +2626,20 @@ vu_gcm_ok:
     call    attach_index_build
     mov     rcx, qword ptr [g_filesize]         ; snapshot for external-change detection
     call    vault_ext_snapshot
+    ; Ratchet HKCU rollback high-water mark on authenticated primary unlock (AUD-14)
+    cmp     dword ptr [g_in_foreign], 0
+    jne     vu_done_ok
+    cmp     dword ptr [g_rollback], 0
+    jne     vu_done_ok
+    cmp     qword ptr [g_fmac_len], 0
+    je      vu_done_ok
+    mov     rax, qword ptr [g_save_counter]
+    mov     qword ptr [g_ctr_io], rax
+    mov     rcx, qword ptr [g_cfg_in]
+    lea     rdx, [g_ctr_io]
+    mov     r8d, 8
+    call    reg_ctr_set
+vu_done_ok:
     xor     eax, eax
     FRAME_EPILOG
     ret
@@ -2647,12 +2713,40 @@ vault_unlock endp
 ; =============================================================================
 public vault_preload
 vault_preload proc frame
-    FRAME_PROLOG 48
+    FRAME_PROLOG 160
     mov     dword ptr [g_preloaded], 0
     cmp     qword ptr [g_filebuf], 0
     jne     vpl_skip
     cmp     qword ptr [g_cfg_in], 0
     je      vpl_skip
+    ; Pre-validate 80-byte header + size cap before committing a full-file allocation
+    mov     rcx, qword ptr [g_cfg_in]
+    lea     rdx, [rbp-112]
+    lea     r8, [rbp-24]
+    call    read_file_head80
+    test    eax, eax
+    jnz     vpl_ret
+    mov     eax, VAULT_FILE_MAX
+    cmp     qword ptr [rbp-24], rax
+    ja      vpl_bad
+    cmp     dword ptr [rbp-112 + 0], VAULT_MAGIC
+    jne     vpl_bad
+    cmp     dword ptr [rbp-112 + 4], VAULT_VERSION
+    jne     vpl_bad
+    cmp     dword ptr [rbp-112 + VH_LANES], 1
+    jne     vpl_bad
+    mov     ecx, dword ptr [rbp-112 + VH_T]
+    cmp     ecx, 1
+    jb      vpl_bad
+    cmp     ecx, 16
+    ja      vpl_bad
+    mov     ecx, dword ptr [rbp-112 + VH_M]
+    cmp     ecx, 8
+    jb      vpl_bad
+    cmp     ecx, 4194304
+    ja      vpl_bad
+    mov     eax, VAULT_FILE_MAX
+    mov     qword ptr [g_rf_cap], rax
     mov     rcx, qword ptr [g_cfg_in]
     lea     rdx, [g_filebuf]
     lea     r8, [g_filesize]
@@ -2663,6 +2757,10 @@ vault_preload proc frame
 vpl_skip:
     xor     eax, eax
 vpl_ret:
+    FRAME_EPILOG
+    ret
+vpl_bad:
+    mov     eax, EXIT_CORRUPT
     FRAME_EPILOG
     ret
 vault_preload endp
@@ -2705,12 +2803,23 @@ vault_lock proc frame
     call    mem_free
     mov     qword ptr [g_eidx], 0
     mov     dword ptr [g_eidx_cap], 0
-    mov     rcx, qword ptr [g_body_ptr]
-    test    rcx, rcx
-    jz      vl_key
+    xor     eax, eax
+    xchg    qword ptr [g_body_ptr], rax         ; null BEFORE free (AUD-10)
+    test    rax, rax
+    jz      vl_editbk
+    mov     rcx, rax
     mov     rdx, VAULT_BODY_MAX
     call    secmem_free
-    mov     qword ptr [g_body_ptr], 0
+vl_editbk:
+    mov     qword ptr [g_edit_backup_len], 0
+    mov     qword ptr [g_edit_history], 0
+    xor     eax, eax
+    xchg    qword ptr [g_edit_backup], rax      ; AUD-02: free any parked edit-transaction body
+    test    rax, rax
+    jz      vl_key
+    mov     rcx, rax
+    mov     rdx, VAULT_BODY_MAX
+    call    secmem_free
 vl_key:
     call    attach_reset                        ; free pending attachment plaintext
     mov     rcx, qword ptr [g_filebuf]           ; free the resident file image
@@ -2961,6 +3070,7 @@ di_oom:
     ret
 do_init endp
 
+ifdef PROBE_IO
 ; ===========================================================================
 ; seedtest: bulk-create a fresh vault full of realistic entries (perf/search
 ;   testing).  do_seed(ecx = count).  Uses g_cfg_in/pass/t/m already set up.
@@ -3282,6 +3392,7 @@ ag_oom:
     FRAME_EPILOG
     ret
 do_attgen endp
+endif ; PROBE_IO
 
 
 
@@ -3434,6 +3545,14 @@ vbv_kind:
     je      vbv_atref
     cmp     eax, VF_PWHIST
     je      vbv_pwhist
+    cmp     eax, VF_SYSTEM
+    je      vbv_sys_unlbl
+    cmp     eax, VF_SYS_PWVERIFY
+    je      vbv_sys_unlbl
+    jmp     vbv_fadv
+vbv_sys_unlbl:
+    test    r9d, VF_LABELED
+    jnz     vbv_bad
     jmp     vbv_fadv
 vbv_atref:
     cmp     r11, ARF_SIZE
@@ -3509,6 +3628,7 @@ vbv_bad:
     ret
 vault_body_validate endp
 
+ifdef PROBE_IO
 ; vfz_rand() -> rax = next xorshift64 value (updates g_vfz_rng).  Leaf; rcx dead.
 vfz_rand proc
     mov     rax, qword ptr [g_vfz_rng]
@@ -3698,6 +3818,7 @@ vfz_oom:
     FRAME_EPILOG
     ret
 cmd_vfuzz endp
+endif ; PROBE_IO
 
 ; ===========================================================================
 ; copy_bytes(rcx=dst, rdx=src, r8d=len) - byte copy using volatile regs only.  Leaf.
@@ -3714,6 +3835,8 @@ cpb_lp:
 cpb_done:
     ret
 copy_bytes endp
+
+ifdef PROBE_IO
 
 ; ===========================================================================
 ; cmd_kdfparam - regression for the PRE-AUTH KDF-parameter DoS guard.  A crafted
@@ -5931,6 +6054,7 @@ xc_fail:
     FRAME_EPILOG
     ret
 cmd_xctest endp
+endif ; PROBE_IO
 
 
 ; ===========================================================================
@@ -6361,20 +6485,35 @@ lka_cpd:
     mov     word ptr [r11+6], 'c'
     mov     word ptr [r11+8], 'k'
     mov     word ptr [r11+10], 0
+    lea     rcx, [g_lock_path]
+    call    file_path_allowed
+    test    eax, eax
+    jz      lka_busy
     ; Share read (1 = FILE_SHARE_READ) so cloud sync/backup indexers do not fail
     ; mid-scan while write exclusion (no FILE_SHARE_WRITE/DELETE) still holds.
-    WINCALL CreateFileW, addr g_lock_path, LK_GENERIC_WRITE, 1, 0, LK_CREATE_NEW, LK_DELONCLOSE, 0
+    WINCALL CreateFileW, addr g_lock_path, LK_GENERIC_WRITE, 1, 0, LK_CREATE_NEW, \
+            <LK_DELONCLOSE or FILE_FLAG_OPEN_RP>, 0
     cmp     rax, -1
-    jne     lka_got
+    jne     lka_val
     WINCALL DeleteFileW, addr g_lock_path       ; reclaim an orphan (fails if live-held)
-    WINCALL CreateFileW, addr g_lock_path, LK_GENERIC_WRITE, 1, 0, LK_CREATE_NEW, LK_DELONCLOSE, 0
+    WINCALL CreateFileW, addr g_lock_path, LK_GENERIC_WRITE, 1, 0, LK_CREATE_NEW, \
+            <LK_DELONCLOSE or FILE_FLAG_OPEN_RP>, 0
     cmp     rax, -1
     je      lka_busy
+lka_val:
+    mov     qword ptr [rbp-24], rax
+    mov     rcx, rax
+    call    file_validate_handle
+    test    eax, eax
+    jz      lka_bad_h
+    mov     rax, qword ptr [rbp-24]
 lka_got:
     mov     qword ptr [g_lock_h], rax
     mov     eax, 1
     FRAME_EPILOG
     ret
+lka_bad_h:
+    WINCALL CloseHandle, qword ptr [rbp-24]
 lka_busy:
     xor     eax, eax                            ; failed - leave g_lock_h untouched
     FRAME_EPILOG                                ; (never clobber an already-held handle)
@@ -6532,6 +6671,10 @@ ffbi_loop:
     cmp     eax, dword ptr [rbp-28]
     jae     ffbi_none
     mov     ecx, eax
+    call    vault_is_system
+    test    eax, eax
+    jnz     ffbi_next
+    mov     ecx, dword ptr [rbp-32]
     call    vault_entry_ptr
     mov     rcx, rax
     mov     rdx, qword ptr [rbp-24]
@@ -6539,6 +6682,7 @@ ffbi_loop:
     call    ct_memcmp
     test    eax, eax
     jz      ffbi_found
+ffbi_next:
     inc     dword ptr [rbp-32]
     jmp     ffbi_loop
 ffbi_found:
@@ -6556,7 +6700,7 @@ fed_find_by_id endp
 ;   attachment's own key/nonce/id) travels, so the blob can be carried into the new
 ;   file.  Same signature as entry_copy_filtered.
 entry_copy_full proc frame
-    FRAME_PROLOG 48
+    FRAME_PROLOG 64
     mov     qword ptr [rbp-24], rdx           ; dst
     mov     qword ptr [rbp-32], rcx           ; src
     call    vault_entry_len                   ; rcx = src -> rax = len
@@ -6581,6 +6725,7 @@ entry_copy_full endp
 ;     key, so it still decrypts under the new vault).  The caller must NOT lock the
 ;     source first (its attachment image must stay resident); fed_export frees the
 ;     old body itself.  Either way this clobbers the live header/key/body.
+ifdef PROBE_IO
 public fed_export
 fed_export proc frame
     FRAME_PROLOG 96                            ; locals -24..-72 all above the callee shadow
@@ -6701,6 +6846,7 @@ fx_oom:
     FRAME_EPILOG
     ret
 fed_export endp
+endif
 
 ; ===========================================================================
 ; vault_export_sel(rcx = target path wide) -> eax = 0 / EXIT_*.
@@ -6725,7 +6871,11 @@ fed_export endp
 ; Copy the path too: cfg_in_set can overwrite the storage behind g_cfg_in.
 vault_park_path proc
     lea     rax, [g_xs_path]
-    xor     r8d, r8d
+    test    rdx, rdx
+    jnz     @F
+    mov     word ptr [rax], 0
+    ret
+@@: xor     r8d, r8d
 vpp_copy:
     mov     cx, word ptr [rdx+r8*2]
     mov     word ptr [rax+r8*2], cx
@@ -6971,6 +7121,14 @@ vault_open_foreign proc frame
     mov     rax, qword ptr [g_vof_len]
     mov     qword ptr [g_vof_len], 0
     mov     qword ptr [rbp-160], rax
+    cmp     r8d, MAX_PASSWORD_BYTES
+    ja      vof_badargs
+    test    rcx, rcx
+    jz      vof_badargs
+    test    rdx, rdx
+    jz      vof_badargs
+    test    r9, r9
+    jz      vof_badargs
     mov     rax, qword ptr [g_body_ptr]
     mov     qword ptr [rbp-56], rax
     mov     rax, qword ptr [g_body_len]
@@ -7021,8 +7179,14 @@ vault_open_foreign proc frame
     call    cfg_in_set
     lea     rcx, [g_cfg_pass]
     mov     rdx, qword ptr [rbp-32]
+    cmp     rcx, rdx
+    je      vof_pw_ready
     mov     r8d, dword ptr [rbp-40]
     call    copy_bytes
+    lea     rcx, [g_cfg_pass]
+    mov     eax, dword ptr [rbp-40]
+    mov     byte ptr [rcx+rax], 0
+vof_pw_ready:
     mov     eax, dword ptr [rbp-40]
     mov     dword ptr [g_cfg_passlen], eax
     mov     dword ptr [g_use_tpm], 0            ; a foreign vault is never TPM-enrolled here
@@ -7040,7 +7204,9 @@ vof_diskread:
     mov     qword ptr [g_filebuf], 0
     mov     dword ptr [g_preloaded], 0
 vof_call_unlock:
+    mov     dword ptr [g_in_foreign], 1
     call    vault_unlock
+    mov     dword ptr [g_in_foreign], 0
     mov     dword ptr [g_preloaded], 0          ; vof_restore/vof_failed owns & frees g_filebuf
     mov     dword ptr [rbp-136], eax
     test    eax, eax
@@ -7119,6 +7285,15 @@ vof_restore:
     mov     eax, dword ptr [rbp-144]
     mov     dword ptr [g_preloaded], eax
     mov     eax, dword ptr [rbp-136]
+    FRAME_EPILOG
+    ret
+vof_badargs:
+    mov     rcx, qword ptr [rbp-152]
+    test    rcx, rcx
+    jz      @F
+    mov     rdx, qword ptr [rbp-160]
+    call    mem_free
+@@: mov     eax, EXIT_USAGE
     FRAME_EPILOG
     ret
 vault_open_foreign endp
@@ -7883,6 +8058,9 @@ vault_health proc frame
     mov     dword ptr [rbp-72], 0
     mov     dword ptr [rbp-80], 0
     mov     qword ptr [rbp-32], 0
+    lea     rcx, [g_health_flags]
+    mov     edx, HFLG_CAP
+    call    secure_zero
     call    vault_count
     mov     dword ptr [rbp-24], eax
     call    vault_user_count
@@ -8042,6 +8220,11 @@ vh_entry_fin:
     cmp     dword ptr [rbp-128], 0
     je      @F
     inc     dword ptr [rbp-64]                  ; weak++
+    mov     eax, dword ptr [rbp-56]
+    cmp     eax, HFLG_CAP
+    jae     @F
+    lea     r10, [g_health_flags]
+    or      byte ptr [r10+rax], 1
 @@: mov     ecx, dword ptr [rbp-56]
     call    vault_entry_ptr
     test    rax, rax
@@ -8053,6 +8236,11 @@ vh_entry_fin:
     cmp     rdx, r8
     jbe     vh_next
     inc     dword ptr [rbp-72]                  ; old++
+    mov     eax, dword ptr [rbp-56]
+    cmp     eax, HFLG_CAP
+    jae     vh_next
+    lea     r10, [g_health_flags]
+    or      byte ptr [r10+rax], 4
 vh_next:
     inc     dword ptr [rbp-56]
     jmp     vh_loop
@@ -8100,6 +8288,10 @@ vh_db:
     jne     vh_db_next
     inc     dword ptr [rbp-80]                  ; entry ei is reused
     mov     dword ptr [rbp-132], edx
+    cmp     edx, HFLG_CAP
+    jae     vh_da_next
+    lea     r10, [g_health_flags]
+    or      byte ptr [r10+rdx], 2
     jmp     vh_da_next
 vh_db_next:
     inc     dword ptr [rbp-136]
@@ -8237,6 +8429,7 @@ vault_entry_health_status endp
 ; cmd_pinkat - Known-answer test for pin_eval (UTF-8 codepoints, zero char-class
 ;   requirements, configurable minlen, and trivial-pattern rejection).
 ; ===========================================================================
+ifdef PROBE_IO
 .data
 CSTR pnk_ok,  "pinkat: PASS (PIN length, UTF-8 scalar count, no-class rule, trivial patterns)",13,10
 CSTR pnk_bad, "pinkat: FAIL",13,10
@@ -8556,6 +8749,7 @@ hk_fail_rest:
     FRAME_EPILOG
     ret
 cmd_healthkat endp
+endif ; PROBE_IO
 
 
 ; ===========================================================================
@@ -8847,7 +9041,7 @@ vault_is_system endp
 ;   One linear pass over the body (vault_entry_len per entry), so callers never pay
 ;   vault_entry_ptr's rescan.  -> eax.
 sys_walk proc frame
-    FRAME_PROLOG 64
+    FRAME_PROLOG 80
     ; [rbp-24]=mode [rbp-32]=cursor [rbp-40]=i [rbp-48]=total [rbp-56]=result
     mov     qword ptr [rbp-24], rcx
     mov     r10, qword ptr [g_body_ptr]
@@ -8942,9 +9136,12 @@ sfp_loop:
     je      sfp_none
     mov     r10, qword ptr [rbp-32]
     movzx   eax, word ptr [r10]
+    test    eax, VF_LABELED
+    jnz     sfp_skip
     and     eax, VF_KINDMASK
     cmp     eax, dword ptr [rbp-24]
     je      sfp_hit
+sfp_skip:
     mov     eax, dword ptr [r10+2]              ; field len
     add     r10, 6
     add     r10, rax
@@ -9198,14 +9395,24 @@ vault_pw_check proc frame
     ; eax and dropped it - dead code that read as an intended restore.)
     mov     qword ptr [rbp-24], rcx
     mov     dword ptr [rbp-32], edx
+    test    rcx, rcx
+    jz      vpc_badargs
+    cmp     edx, MAX_PASSWORD_BYTES
+    ja      vpc_badargs
     lea     rcx, [g_xs_vkey]                    ; park the live key
     lea     rdx, [g_vkey]
     mov     r8d, 32
     call    copy_bytes
     lea     rcx, [g_cfg_pass]                   ; vk_derive reads g_cfg_pass
     mov     rdx, qword ptr [rbp-24]
+    cmp     rcx, rdx
+    je      vpc_pw_ready
     mov     r8d, dword ptr [rbp-32]
     call    copy_bytes
+    lea     rcx, [g_cfg_pass]
+    mov     eax, dword ptr [rbp-32]
+    mov     byte ptr [rcx+rax], 0
+vpc_pw_ready:
     mov     eax, dword ptr [rbp-32]
     mov     dword ptr [g_cfg_passlen], eax
     call    vk_derive
@@ -9232,6 +9439,10 @@ vpc_restore:
     call    secure_zero
     mov     dword ptr [g_cfg_passlen], 0        ; the buffer is wiped, so 0 is the truth
     mov     eax, dword ptr [rbp-48]
+    FRAME_EPILOG
+    ret
+vpc_badargs:
+    xor     eax, eax
     FRAME_EPILOG
     ret
 vault_pw_check endp
@@ -9337,6 +9548,8 @@ vault_build_entry proc frame
     mov     qword ptr [rbp-64], rax             ;   the whole entry goes, body untouched
     cmp     dword ptr [g_field_n], 0
     je      vbe_fail
+    cmp     qword ptr [g_field_list+0], VF_TITLE ; AUD-20: field 0 must be plain VF_TITLE (never VFL_RAW)
+    jne     vbe_fail
     mov     r10, qword ptr [g_field_list+16]    ; field 0 value wide
     test    r10, r10
     jz      vbe_fail
@@ -10205,6 +10418,7 @@ attach_selftest endp
 ;   let an import silently destroy saved attachments (9ee91da) while the probe
 ;   still reported success.
 ; ===========================================================================
+ifdef PROBE_IO
 public zi_att_verify
 zi_att_verify proc frame
     FRAME_PROLOG 96
@@ -10279,6 +10493,7 @@ zav_done:
     FRAME_EPILOG
     ret
 zi_att_verify endp
+endif
 
 ; ===========================================================================
 ; cmd_convcap - regression for the silent field-destruction bug.
@@ -10293,6 +10508,7 @@ zi_att_verify endp
 ;   even if every character is a 3-byte one.  Revert conv_w2u's cw_fail and the
 ;   third assert FAILS (exit 1).
 ; ===========================================================================
+ifdef PROBE_IO
 .data
 CSTR cvc_ok,  "convcap: PASS (overflow is distinguishable from empty; cap covers the UI limit)",13,10
 CSTR cvc_bad, "convcap: FAIL (an over-long value would be stored as an EMPTY field)",13,10
@@ -10844,7 +11060,6 @@ vck_fail:
     ret
 cmd_vattcolkat endp
 
-ifdef PROBE_IO
 ; ===========================================================================
 ; vault_tpm_pin_kat() -> eax = 0 (PASS) / 1 (FAIL).
 ;   Headless Mode 2 (TPM + PIN) anti-replay, 3-strike revocation & disk lifecycle KAT.

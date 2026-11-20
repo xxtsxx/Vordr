@@ -41,7 +41,9 @@ FF_HEAP_TAG         equ 0F002h     ; temporal heap tag / canary violation
 FF_TYPE_MAGIC       equ 0F003h     ; struct type-magic mismatch
 FF_BOUNDS           equ 0F004h     ; bounds check failed
 FF_OVERFLOW         equ 0F005h     ; integer overflow in size arithmetic
+ifdef DBG_TRACE
 FF_IAT_RO           equ 01A70h     ; redteam iat: the IAT write was refused (exit only)
+endif
 
 ; ---------------------------------------------------------------------------
 ; CPU feature flag bits kept in g_cpu_features (set once in cpu_gate)
@@ -707,6 +709,7 @@ endm
 ; Globals owned by hardening.asm, referenced by the frame macros everywhere
 ; ---------------------------------------------------------------------------
 externdef g_stack_canary:qword
+externdef g_ptr_cookie:qword            ; read-only pointer-encoding cookie (.roinit)
 externdef g_sstk_tls:dword              ; TLS index + 1 of the per-thread shadow stack
 externdef g_cpu_features:dword
 externdef sstk_overflow_fail:near
@@ -715,15 +718,23 @@ externdef ff_trap:near                  ; central fail handler (main.asm)
 ; ---------------------------------------------------------------------------
 ; Animation slots (anim.asm drives them; gui_anim_apply repaints for each)
 ; ---------------------------------------------------------------------------
-ANIM_SLOTS          equ 8
+ANIM_SLOTS          equ 13
 ANIM_TIMER          equ 6               ; WM_TIMER id on the vault window
 ANIM_LBSB           equ 0               ; list thumb alpha 0..255
 ANIM_DSB            equ 1               ; detail-pane thumb alpha 0..255
 ANIM_PILL           equ 2               ; selection pill, content y in px
 ANIM_LHOT           equ 3               ; hovered list row, tint 0..255
 ANIM_LOLD           equ 4               ; row the pointer just left, fading out
-ANIM_XFADE          equ 5               ; detail cross-fade overlay alpha
+ANIM_XFADE          equ 5               ; detail / theme / settings cross-fade overlay alpha
 ANIM_GHOT           equ 6               ; hovered ghost button's halo 0..255
 ANIM_GOLD           equ 7               ; ghost button just left, fading out
+ANIM_ULINE          equ 8               ; focused Edit center-out underline 0..1024
+ANIM_TOG            equ 9               ; pill toggle switch slide 0..1024
+ANIM_DONUT          equ 10              ; Home Vault-Health donut sweep 0..1024
+ANIM_FAVPOP         equ 11              ; header Favorite star pop 0..1024
+ANIM_COPY           equ 12              ; copy checkmark + countdown pill 0..1024
+
+BACKDROP_COUNT      equ 8               ; 0..6 GPU procedural styles, 7 = Flat
+BACKDROP_FLAT       equ 7
 externdef anim_set:near, anim_get:near, anim_active:near
 externdef g_anim_on:dword, g_anim_tmr:dword

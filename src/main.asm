@@ -15,16 +15,17 @@ extern GetCurrentProcess:proc
 extern WideCharToMultiByte:proc
 extern GetStdHandle:proc
 extern WriteFile:proc
-extern SwitchDesktop:proc
 
+ifdef PROBE_IO
 STD_OUTPUT_HANDLE_   equ -11
+endif
 
 
 extern secure_zero:proc
 extern secmem_panic_wipe:proc           ; secmem.asm: zero every live secret buffer
 extern sstk_reset_current:proc          ; hardening.asm: empty this thread's shadow stack
-externdef g_in_crash:dword              ; hardening.asm: atomic crash re-entrancy latch
-externdef g_secdesk_orig:qword          ; gui.asm: caller's desktop while secure desktop is active
+extern crash_try_enter:proc             ; hardening.asm: per-TID crash latch (AUD-10)
+extern crash_restore_desktop:proc       ; hardening.asm: retry + Default desktop fallback
 extern run_selftest:proc
 extern log_result:proc
 externdef g_readonly:dword              ; E9: read-only launch flag (owned by gui.asm)
@@ -70,6 +71,7 @@ extern cmd_attovfkat:proc               ; VDR-02 attachment u64/cap overflow KAT
 extern cmd_vattcolkat:proc              ; VDR-19 real-GCM VATT tag-collision KAT (vault.asm)
 extern cmd_polkat:proc                  ; VDR-09/VDR-23 registry policy + cfg_in_set KAT (regcfg.asm)
 extern cmd_tpmkat:proc                  ; VDR-10 TPM OAEP v2 label + cleanup KAT (tpm.asm)
+extern cmd_gpukat:proc                  ; D3D11 DirectCompute 21.4 backdrop KAT (gpu.asm)
 extern cmd_pkat:proc                    ; parallel fail-closed KAT gate (selftest.asm)
 extern read_file:proc
 extern pwgen_ex:proc                    ; styled password generator (pwgen.asm)
@@ -148,7 +150,9 @@ public g_cfg_pass, g_positionals, g_poscount
 public g_argv
 g_argv          dq MAX_ARGS dup (?)
 g_argbuf        dw ARGBUF_CHARS dup (?)
+ifdef PROBE_IO
 g_gen_buf       db 160 dup (?)           ; genpw: sample output buffer
+endif
 g_cfg_pass      db MAX_PASSWORD_BYTES+1 dup (?)
 g_positionals   dq MAX_ARGS dup (?)  ; -> UTF-16 positional argument strings
 g_poscount      dq ?                 ; number of positionals
@@ -173,8 +177,10 @@ msg_usage label byte
     db 13,10
     db "  Every launch runs the self-test gate first and fails closed on mismatch.",13,10
 msg_usage_len equ $ - msg_usage
+ifdef PROBE_IO
 CSTR fs_seedlabel, "fuzz seed: "       ; G7: precedes the decimal seed on stdout
 fs_nl db 13,10
+endif
 CSTR msg_badnum,   "error: numeric argument out of range",13,10
 ifdef PROBE_IO
 CSTR msg_seedn_ok,  "seeded the requested test entries.  unlock the vault with password: vordrtest",13,10
@@ -262,6 +268,7 @@ WSTR w_vattcolkat, <vattcolkat>
 WSTR w_polkat,   <polkat>
 WSTR w_tpmkat,   <tpmkat>
 WSTR w_pinkat,   <pinkat>
+WSTR w_gpukat,   <gpukat>
 ifdef DBG_TRACE
 WSTR w_securedesk, <securedesk>
 endif
@@ -353,6 +360,7 @@ ifdef PROBE_IO
     CMDENT { w_polkat,    cmd_polkat,    0, 0 }   ; VDR-09/VDR-23 registry policy + cfg_in_set KAT
     CMDENT { w_tpmkat,    cmd_tpmkat,    0, 0 }   ; VDR-10 TPM OAEP v2 label + cleanup KAT
     CMDENT { w_pinkat,    cmd_pinkat,    0, 0 }   ; PIN strength & trivial-pattern KAT
+    CMDENT { w_gpukat,    cmd_gpukat,    0, 0 }   ; D3D11 DirectCompute 21.4 backdrop KAT
     CMDENT { w_pkat,      cmd_pkat,      0, 0 }   ; parallel fail-closed KAT gate
     CMDENT { w_trtest,    cmd_trtest,    0, 0 }   ; trash timestamp/threshold KAT
 else
@@ -399,6 +407,7 @@ else
     CMDENT { w_polkat,    0, 0, 0 }
     CMDENT { w_tpmkat,    0, 0, 0 }
     CMDENT { w_pinkat,    0, 0, 0 }
+    CMDENT { w_gpukat,    0, 0, 0 }
     CMDENT { w_pkat,      0, 0, 0 }
     CMDENT { w_trtest,    0, 0, 0 }
 endif
@@ -449,16 +458,13 @@ ifdef DBG_TRACE
     and     rsp, -16                    ; realign (we never return from here)
     sub     rsp, 32                     ; shadow space for calls
     ; Prevent re-entrant traps inside secmem_panic_wipe / dbg_putc / ExitProcess
-    ; from looping forever, and wipe secrets BEFORE printing or calling ExitProcess.
-    lock bts dword ptr [g_in_crash], 0
-    jc      ff_dbg_reent
+    ; from looping forever, park concurrent faulting threads, and wipe secrets first.
+    call    crash_try_enter
+    test    eax, eax
+    jz      ff_dbg_reent
     call    sstk_reset_current
     call    secmem_panic_wipe
-    mov     rcx, qword ptr [g_secdesk_orig]
-    test    rcx, rcx
-    jz      @F
-    WINCALL SwitchDesktop, rcx
-@@:
+    call    crash_restore_desktop
     mov     al, 'F'
     call    dbg_putc
     mov     al, 'F'
@@ -506,15 +512,12 @@ endif
     mov     r15d, ecx
     and     rsp, -16
     sub     rsp, 32
-    lock bts dword ptr [g_in_crash], 0
-    jc      ff_rel_reent
+    call    crash_try_enter
+    test    eax, eax
+    jz      ff_rel_reent
     call    sstk_reset_current          ; this thread's - another thread's is not ours
     call    secmem_panic_wipe
-    mov     rcx, qword ptr [g_secdesk_orig]
-    test    rcx, rcx
-    jz      ff_rel_fastfail
-    WINCALL SwitchDesktop, rcx
-ff_rel_fastfail:
+    call    crash_restore_desktop
 ff_rel_reent:
     mov     ecx, r15d
     int     29h                         ; release: real fast-fail
@@ -640,7 +643,7 @@ wstr_eq endp
 ; none=0 error=1 warning=2 full=3 debug=4
 ; =============================================================================
 parse_loglevel proc frame
-    FRAME_PROLOG 32
+    FRAME_PROLOG 48
     mov     qword ptr [rbp-24], rcx
     mov     rcx, qword ptr [rbp-24]
     lea     rdx, [w_lvl_none]
@@ -729,6 +732,7 @@ wstr_to_u32 endp
 ;   nightly crash reproduces deterministically with `--seed N`.  The 32-bit
 ;   value is expanded to a nonzero 64-bit state via a splitmix multiply.
 ; =============================================================================
+ifdef PROBE_IO
 public fuzz_seed
 fuzz_seed proc frame
     FRAME_PROLOG 48
@@ -758,6 +762,7 @@ fs_log:
     FRAME_EPILOG
     ret
 fuzz_seed endp
+endif
 
 ; =============================================================================
 ; parse_cmdline - tokenize GetCommandLineW into g_argv/g_argc using the
@@ -1657,7 +1662,7 @@ CSTR fzt_bad,  "fztest: FAIL",13,10
 ;   [rbp-24] holds score(GM,GMAIL) while the ordering comparison runs.
 LANDING_PAD
 cmd_fztest proc frame
-    FRAME_PROLOG 32
+    FRAME_PROLOG 48
     lea     rcx, [fz_gm]                    ; match: "GM" in "GMAIL"
     lea     rdx, [fz_gmail]
     call    fuzzy_score

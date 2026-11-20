@@ -100,7 +100,7 @@ $Policies = @(
     @{ Prop="VORDR_ALLOWUNCVAULT";       Value="AllowUncVault";       Comp="PolAllowUnc";     Guid="{C4829E51-3D74-4A8B-9162-5E1B0F47A3C9}"; Range="0/1";     Default="0";   Doc="allow opening vault files over UNC/network shares (HKLM-only)" }
     @{ Prop="VORDR_ALLOWSCREENCAPTURE";  Value="AllowScreenCapture";  Comp="PolAllowCap";     Guid="{6D3A14B8-79E2-4F55-8A1C-34B8E92D71F0}"; Range="0/1";     Default="0";   Doc="allow screen capture of Vordr windows (0 = WDA_EXCLUDEFROMCAPTURE)" }
     @{ Prop="VORDR_LOGLEVEL";            Value="LogLevel";            Comp="PolLogLevel";     Guid="{A3BD3F2C-326F-4749-A57E-A78D1EC4AC0E}"; Range="0-4";     Default="0";   Doc="audit-log verbosity, 0 = off" }
-    @{ Prop="VORDR_UISCHEME";            Value="ui_scheme";           Comp="PolUiScheme";     Guid="{9B70EE1D-7B67-44A0-8C02-06B7BD8F982F}"; Range="0-8";     Default="8";   Doc="force a colour scheme (8 = the default)" }
+    @{ Prop="VORDR_UISCHEME";            Value="ui_scheme";           Comp="PolUiScheme";     Guid="{9B70EE1D-7B67-44A0-8C02-06B7BD8F982F}"; Range="0-14";    Default="8";   Doc="force a colour scheme (8 = Gruvbox default, 14 = Follow Windows)" }
 )
 # NOT exposed via MSI property: HKLM "vault".  Administrators who configure a
 # per-machine vault path via Group Policy can use safe per-user prefixes

@@ -62,7 +62,7 @@ CHECKS = [
      'check_docs: WARNING - documentation errors above; build continues. Use "build strict" to gate.'),
 ]
 
-HASH_EXTS = {".asm", ".inc", ".rc", ".manifest", ".py", ".md", ".html"}
+HASH_EXTS = {".asm", ".inc", ".hlsl", ".rc", ".manifest", ".py", ".md", ".html"}
 SKIP_DIRS = {".git", "bin", "obj", "__pycache__", ".agents"}
 
 
