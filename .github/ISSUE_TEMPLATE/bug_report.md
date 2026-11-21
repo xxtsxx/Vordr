@@ -18,7 +18,7 @@ assignees: ''
 
 **Steps to reproduce with synthetic data**
 
-**Vordr version** (exe → Properties → Details) and **Windows version**:
+**Vordr version** (exe → Properties → Details), **architecture** (x64 or ARM64), and **Windows version**:
 
 **Installation method** (portable executable or MSI):
 

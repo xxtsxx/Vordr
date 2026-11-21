@@ -13,12 +13,16 @@ It uses the same body encryption, validation, and serialization as user entries.
 
 | Field | Tag | Value |
 |---|---|---|
-| `VF_SYSTEM` | 17 | One-byte schema version, currently 1; must be first |
-| `VF_SYS_PWVERIFY` | 18 | Last master-password verification time as u64 FILETIME |
+| `VF_SYSTEM` | 17 | Unlabelled one-byte schema version, currently 1; must be `field[0]`, at most one per vault |
+| `VF_SYS_PWVERIFY` | 18 | Unlabelled last master-password verification time as u64 FILETIME; valid only inside the `VF_SYSTEM` entry |
 | Retired grace-period field | 19 | Reserved; do not reuse |
 
-Unknown system fields must survive save/reload. Do not treat tag 19 as free:
-an earlier reminder design used it, and old files can contain it.
+`vault_body_validate` rejects any vault body where `VF_SYSTEM` carries `VF_LABELED`,
+appears past `field[0]`, or appears in more than one entry, and rejects `VF_SYS_PWVERIFY`
+whenever it is labelled or appears outside the `VF_SYSTEM` entry. Entry copy helpers,
+native/ZIP exports, and ZIP imports strip system fields unconditionally. Unknown system
+fields inside the system entry survive save/reload. Do not treat tag 19 as free: an
+earlier reminder design used it, and old files can contain it.
 
 This additive record encoding did not require another container-version bump.
 The current reader still enforces the container version separately.

@@ -1,4 +1,22 @@
-# Vordr
+<p align="center">
+  <img src="logo/vordr.svg" alt="Vordr guardian shield logo" width="112" height="112">
+</p>
+
+<h1 id="vordr" align="center">Vordr</h1>
+
+<p align="center">
+  Windows x64 &amp; Windows on ARM · Offline-only · Zero third-party libraries · Byte-for-byte reproducible
+</p>
+
+<p align="center">
+  <a href="#get-started-in-two-minutes">Get started</a> ·
+  <a href="#screenshots">Screenshots</a> ·
+  <a href="docs/TRUST.md">Why Vordr earns trust</a> ·
+  <a href="docs/USER_GUIDE.md">User guide</a> ·
+  <a href="docs/DEPLOYMENT.md">Deployment</a>
+</p>
+
+---
 
 **A quiet, completely offline home for your passwords, two-factor codes, notes, and sensitive files on Windows.**
 
@@ -6,15 +24,17 @@ The name comes from Old Norse *vörðr*—watchman or guardian.
 
 Most password managers ask you to create an online account, pay a recurring subscription, and trust a remote cloud service—along with a huge stack of third-party software—with the keys to your digital life. **Vordr is built for people who want the opposite**: a fast, dependable vault that stays 100% on your own computer, under your own control.
 
-```mermaid
-flowchart LR
-    You["You + Master Password"] --> App["Vordr App (~300 KB Windows app)"]
-    App <--> Vault["Your .vordr File (Passwords, 2FA, Notes & Files)"]
-    Vault --> Backup["Your Own Backups (USB drive, NAS, or folder)"]
+<br>
 
-    Cloud["Cloud Accounts · Subscriptions · Telemetry"]
-    App -.-x|"Never connects"| Cloud
-```
+<p align="center">
+  <img src="docs/screenshots/vault-entry.png" alt="Vordr main vault window showing glass entry cards, syntax-colored password, and live 2FA countdown ring" width="820">
+</p>
+
+<p align="center">
+  <em>Midnight palette with Cut planes backdrop — glass entry cards, syntax-colored passwords, and live two-factor codes (synthetic demo vault).</em>
+</p>
+
+<br>
 
 ---
 
@@ -27,17 +47,7 @@ flowchart LR
 
 ---
 
-## How everyday use works
-
-```mermaid
-flowchart LR
-    S1["1. Install — WinGet or portable .exe"] --> S2["2. Create Vault — Pick a master password"]
-    S2 --> S3["3. Use Daily — Logins, 2FA, notes & files"]
-    S3 --> S4["4. Stay Protected — Auto-clear & auto-lock"]
-    S4 --> S5["5. Back Up — Copy .vordr to a safe drive"]
-```
-
-### Get started in two minutes
+## Get started in two minutes
 
 Install with Windows Package Manager (installs for all users on your PC and asks for administrator approval):
 
@@ -45,7 +55,7 @@ Install with Windows Package Manager (installs for all users on your PC and asks
 winget install --id ThomasSmistad.Vordr --exact --source winget
 ```
 
-Prefer no installer? Download the standalone `vordr.exe` from **[Releases](https://github.com/xxtsxx/Vordr/releases)** and run it from any folder you own ([how to check your download](docs/RELEASES.md#verify-a-download)).
+Prefer no installer? Download the standalone `vordr.exe` (x64) or `vordr-arm64.exe` (Windows on ARM) from **[Releases](https://github.com/xxtsxx/Vordr/releases)** and run it from any folder you own ([how to check your download](docs/RELEASES.md#verify-a-download)). The single universal MSI installer automatically deploys the native binary for your PC.
 
 1. **Open Vordr** from the Windows notification area (system tray) and create your vault.
 2. **Choose a strong, memorable master password** and store a written copy somewhere physically safe—because Vordr has no server, nobody can reset a forgotten password for you.
@@ -66,12 +76,25 @@ See the [update guide](docs/USER_GUIDE.md#updates) for portable copies and manag
 | Everyday need | How Vordr handles it |
 |---|---|
 | **Logins, PINs & custom records** | Store usernames, passwords, dedicated PIN codes (checked with PIN-specific length and pattern rules rather than password rules), website links, notes, custom-labeled fields, favorites, custom icons, field change history, Vault Health checks, and a Trash view. |
-| **Two-factor codes (2FA)** | Built-in TOTP code generator with a live countdown bar, right alongside your login. |
+| **Two-factor codes (2FA)** | Built-in TOTP code generator with a live radial countdown ring, right alongside your login. |
 | **Private files & images** | Attach sensitive PDFs, recovery codes, photos, or text files directly inside an entry—encrypted inside the same `.vordr` file. |
 | **Strong password & PIN generator** | Create random passwords, multi-word passphrases, pronounceable strings, non-trivial PINs, or hex keys in one click. |
 | **Automatic tidy-up** | Clears copied secrets from the clipboard after 20 seconds, hides Vordr windows from ordinary screenshots and screen-sharing by default, locks automatically when you step away or lock Windows, and can prompt for your master password on an isolated Windows desktop. |
 | **Configurable hardware shortcut** | On PCs with a TPM chip, keep TPM unlock off, unlock silently on that PC, pair the TPM with a Vordr PIN (which automatically revokes the shortcut after repeated wrong tries), or pair the TPM with Windows Hello (face, fingerprint, or Hello PIN)—with a gentle 30-day reminder so your master password stays fresh. |
-| **Easy import, export & IT policy** | Share selected entries as a separate `.vordr` file or an encrypted `.zip` archive; organizations can deploy via MSI and lock settings through Windows Registry policy. |
+| **Clean, adaptable look** | Choose from 14 color palettes (or Follow Windows light/dark mode) and subtle procedural backdrops—or flat surfaces—with flicker-free rendering. |
+| **Easy import, export & IT policy** | Share selected entries as a separate `.vordr` file or an encrypted `.zip` archive; organizations can roll out one universal x64/ARM64 MSI and lock settings through Windows Registry policy. |
+
+---
+
+## Screenshots
+
+Choose from **14 color palettes** (plus *Follow Windows* light/dark switching) and **7 procedural backdrops** (plus *Flat*), all rendered cleanly offline without flicker:
+
+| Gruvbox (default) · Low-poly neon | Sapphire · Corner mosaic |
+| :---: | :---: |
+| ![Vordr in Gruvbox palette with Low-poly neon backdrop](docs/screenshots/theme-gruvbox.png) | ![Vordr in Sapphire palette with Corner mosaic backdrop](docs/screenshots/theme-mosaic.png) |
+| **Edit mode · Inline generator & 2FA** | **Settings · Security, TPM & themes** |
+| ![Vordr edit mode showing field controls and inline password generator](docs/screenshots/edit-entry.png) | ![Vordr Settings screen in Catppuccin palette with Guardian sigil backdrop](docs/screenshots/settings.png) |
 
 ---
 
@@ -109,4 +132,11 @@ Released under the [MIT License](LICENSE.txt).
 
 ## AI-assisted development
 
-Vordr is developed using AI. Anthropic Opus 4.8-5.5, Fable 5-5.1, Moonshot Kimi K3, ChatGPT 6 Astra, and Google Gemini 4 Carbon have all contributed to the code, quality, and security—backed by deterministic builds, independent reference verifiers, and automated test gates on every change.
+Vordr is developed using AI, with the following models contributing to its code, quality, and security—backed by deterministic builds, independent reference verifiers, and automated test gates on every change:
+
+- Anthropic Opus 4.8-5.5
+- Fable 5-5.1
+- Moonshot Kimi K3
+- ChatGPT 6 Astra
+- Google Gemini 4 Carbon
+- Google Gemini 4 Neon

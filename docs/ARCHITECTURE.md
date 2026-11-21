@@ -4,11 +4,13 @@
 
 ## System overview
 
-Vordr is structured as a single-binary native Win64 application with zero external
-runtime dependencies (`System32` imports only, no CRT, no network client, no auto-updater).
-Keeping the entire runtime inside 26 auditable assembly modules eliminates third-party
-library supply-chain risk, garbage-collected plaintext copies, and unexpected outbound
-connections.
+Vordr ships as standalone native assembly executables for both Windows x64 (`vordr.exe`)
+and Windows on ARM (`vordr-arm64.exe`, see [ARM64](ARM64.md)) with zero external runtime
+dependencies (15 static `System32` import libraries, 4 dynamic `System32` DLLs loaded
+exclusively via `LOAD_LIBRARY_SEARCH_SYSTEM32`, no CRT, no network client, no auto-updater).
+Keeping the entire runtime inside 27 auditable MASM modules (`src/*.asm`) plus 5
+hand-written AArch64 ISA modules (`src/arm64/*.S`) eliminates third-party library
+supply-chain risk, garbage-collected plaintext copies, and unexpected outbound connections.
 
 One active vault context exists in memory at a time: `gui.asm` drives user interaction
 and desktop/clipboard boundaries, while `vault.asm` owns container authentication,
@@ -103,38 +105,44 @@ conflict. Nearby rotating backups are not an independent backup.
 | TOTP | HMAC-SHA-1, base32 keys, HOTP/TOTP |
 | ZIP interoperability | WinZip AE-2: PBKDF2-HMAC-SHA1, AES-256-CTR, truncated HMAC-SHA1, plus per-attachment `SHA-256` plaintext digests inside `vordr.json` |
 | Passphrase generation | Unbiased 16-bit draws across an embedded `2,048`-word list (`11` bits/word, `6..24` words) |
-| Randomness | `BCryptGenRandom`, supplemented by RDSEED across 8-byte lanes and `1..7`-byte tails when available |
-| TPM convenience (Modes 1–3) | Non-exportable RSA-2048 OAEP (SHA-256, `NCRYPT_ALLOW_DECRYPT_FLAG`) wrapping a 64-byte context-bound payload `secret32 \|\| SHA-256(secret32 \|\| label32)` (`label32 = SHA-256("Vordr-TPM-v2" \|\| vault_salt \|\| LE32(mode))`) in Microsoft Platform Crypto Provider, plus `S0`/`S1` pre-commit state-key rotation + `SmartCardPin` + `Argon2id` (`64 MiB`, `t=2`) in `TPM + PIN` (`Mode 2`) and `Microsoft Passport Key Storage Provider` NGC dual-key wrapping in `TPM + Hello` (`Mode 3`) |
+| Randomness | `BCryptGenRandom`, supplemented by `RDSEED` (x64) or ARMv8.5 `RNDRRS` (ARM64 when all online cores advertise `FEAT_RNG`) across 8-byte lanes and `1..7`-byte tails |
+| TPM convenience (Modes 1–3) | Non-exportable RSA-2048 OAEP (SHA-256, `NCRYPT_ALLOW_DECRYPT_FLAG`) wrapping a 64-byte context-bound payload `secret32 \|\| SHA-256(secret32 \|\| label32)` (`label32 = SHA-256("Vordr-TPM-v2" \|\| vault_salt \|\| LE32(mode))`) in Microsoft Platform Crypto Provider, plus `S0`/`S1` pre-commit state-key rotation + `Argon2id` (`64 MiB`, `t=2`) in `TPM + PIN` (`Mode 2`) and Windows Hello FIDO2 `PRF` (`hmac-secret` via `webauthn.dll`, `WHLO` v1) dual-key wrapping in `TPM + Hello` (`Mode 3`) |
 
-These are in-repository implementations of published primitives, verified at startup by
-23 known-answer suites and cross-checked against Python stdlib and published NIST/RFC
-vectors (`tests/verify_crypto.py`, `tests/verify_vault.py`). The file MAC uses an
-explicit domain-prefixed `BLAKE2b-256` construction rather than BLAKE2's parameter-block
-keyed mode; see [the exact format](formats.md#file-authentication-trailer).
+These are in-repository implementations of published primitives (AES-NI/PCLMULQDQ/SHA-NI/SSE2/AVX2
+on x64; ARMv8 Cryptography Extensions `AESE`/`AESMC`/`PMULL`/`SHA256*`/`SHA1*` and NEON
+on ARM64), verified at startup by 23 known-answer suites and cross-checked against Python
+stdlib and published NIST/RFC vectors (`tests/verify_crypto.py`, `tests/verify_vault.py`,
+`tests/arm64/test_*.py`). The file MAC uses an explicit domain-prefixed `BLAKE2b-256`
+construction rather than BLAKE2's parameter-block keyed mode; see
+[the exact format](formats.md#file-authentication-trailer).
 
 TPM key creation requests RSA-2048 (`NCRYPT_OVERWRITE_KEY_FLAG`) restricted to decryption
 only (`NCRYPT_ALLOW_DECRYPT_FLAG`, non-exportable), existing persistent keys are checked
 via `NCryptGetProperty("Length")` so keys shorter than 2048 bits are rejected, and
-unenrollment or revocation deletes all persistent provider keys (`Vordr-<KCV>`, `-S0`,
-`-S1`) via `NCryptDeleteKey`. Because Windows `PCPKSP.dll` silently ignores
-`BCRYPT_OAEP_PADDING_INFO.pbLabel` on hardware TPM keys, Vordr enforces cryptographic
-vault-and-mode binding inside the sealed plaintext itself: `tpm_seal` encrypts
-`secret32 || SHA-256(secret32 || label32)` (64 bytes) and `tpm_unseal` verifies the
-32-byte binding digest in constant time (`ct_memcmp`) before releasing `secret32`,
+unenrollment, revocation, or `vault_tpm_remember` write failure deletes persistent provider
+keys (`Vordr-<KCV>`, `-S0`, `-S1`) via `NCryptDeleteKey`. Because Windows `PCPKSP.dll`
+silently ignores `BCRYPT_OAEP_PADDING_INFO.pbLabel` on hardware TPM keys, Vordr enforces
+cryptographic vault-and-mode binding inside the sealed plaintext itself: `tpm_seal`
+encrypts `secret32 || SHA-256(secret32 || label32)` (64 bytes) and `tpm_unseal` verifies
+the 32-byte binding digest in constant time (`ct_memcmp`) before releasing `secret32`,
 preventing cross-vault or cross-mode blob transplants (`tpmkat`). Legacy raw RSA-OAEP
-blobs are accepted only when `TpmUnlockMode == 1`. Under `TPM + PIN` (`Mode 2`), every
-attempt pre-commits `fails + 1` and `gen + 1` under a freshly created alternate TPM slot
-key (`S{slot ^ 1}`) and deletes `S{slot}` before running `Argon2id` or testing the PIN,
-defeating `HKCU` snapshot replay and revoking TPM enrollment once `fails >= max_tries`.
-Under `TPM + Windows Hello` (`Mode 3`), Vordr resolves the user's NGC decryption key via
-`System32\cryptngc.dll!NgcGetDefaultDecryptionKeyName` and combines both unsealed 32-byte
-halves with `BLAKE2b-256` before opening the AES-256-GCM vault-key envelope.
+blobs are accepted only when `TpmUnlockMode == 1`, and stored envelopes must satisfy
+`blob_mode >= g_tpm_want`. Under `TPM + PIN` (`Mode 2`), every attempt pre-commits
+`fails + 1` and `gen + 1` under a freshly created alternate TPM slot key (`S{slot ^ 1}`)
+and deletes `S{slot}` (aborting unlock fail-closed if `NCryptDeleteKey` fails) before
+running `Argon2id` or testing the PIN, defeating `HKCU` snapshot replay and revoking TPM
+enrollment once `fails >= max_tries`. Under `TPM + Windows Hello` (`Mode 3`), Vordr runs
+Windows Hello FIDO2 `PRF` (`hmac-secret`) unsealing via `System32\webauthn.dll` **before**
+TPM unsealing, validating `UP|UV` flags and credential ID on both seal and unseal,
+scrubbing `pbFirst`, deleting replaced or orphaned platform credentials via
+`WebAuthNDeletePlatformCredential`, and combining both 32-byte halves with `BLAKE2b-256`
+before opening the AES-256-GCM vault-key envelope.
 
 Random generation fails closed if the OS RNG fails or the output pointer is NULL.
-RDSEED is optional, can run out of retries, and mixes into both eight-byte lanes
-and `1..7`-byte trailing bytes when available; the OS output remains the primary
-random source. Random nonces have a nonzero collision probability. The save
-counter is for rollback detection, not nonce generation.
+Hardware entropy (`RDSEED` on x64; `RNDRRS` on ARM64) is optional, can run out of retries,
+and mixes into both eight-byte lanes and `1..7`-byte trailing bytes when available; the OS
+output remains the primary random source. Random nonces have a nonzero collision
+probability. The save counter is for rollback detection, not nonce generation.
 
 New attachments get independent random keys and nonces. Existing attachment
 ciphertext can be copied unchanged into a new image or native export. A pending
@@ -158,10 +166,10 @@ trade-off rather than an equivalent backup format; see the
 | Untrusted file contents | Length/cost caps, reparse/ADS/UNC handle validation (`file_validate_handle`), and authentication before record use | Parsers and crypto remain security-critical code |
 | Concurrent saves | Advisory lock and changed-image check | Sync clients and non-cooperating writers need not honor the lock |
 | Older intact vault | Counter compared with local HKCU history | No trusted global monotonic counter |
-| Unlocked process memory | Selected locked buffers, out-of-line `secmem` metadata, IME-detached edit scrubbing, runtime checks | Not all scratch is locked; no hostile-OS guarantee |
-| Screen & password entry | Default `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` (`AllowScreenCapture`) and DACL-protected private desktop (`SecureUnlock`) | Policy-locked `SecureUnlock` refuses fallback; privileged/kernel observation or physical cameras remain possible |
-| Convenience unlock | TPM wrapping; non-exportable RSA-2048 minimum + inner context digest; fail-closed provider UI policy setup | An alternative unlock route, not a second factor; runtime UI prompt depends on platform provider |
-| Clipboard and previews | Fail-closed exclusion markers, tray-timed clear, safe-preview allowlist, inheritable owner+`SYSTEM` temp ACLs, startup stale-dir sweep | Other applications may copy or retain active plaintext |
+| Unlocked process memory | 85 static `VirtualLock` buffers (`.const`), guard-paged `SRWLOCK`-serialized `secmem` arenas, pinned compositor DIB (`g_comp_bits`), IME-detached edit scrubbing, `_ROINIT` lockdown | Not all scratch is locked; no hostile-OS guarantee |
+| Screen & password entry | Default `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` (`AllowScreenCapture`, `HKLM`-only) and atomically DACL-protected private desktop (`SecureUnlock`, 3-state CAS orphan teardown) | Policy-locked `SecureUnlock` refuses fallback; privileged/kernel observation or physical cameras remain possible |
+| Convenience unlock | TPM wrapping; non-exportable RSA-2048 minimum + inner context digest; Mode 2 pre-commit slot rotation; Mode 3 `webauthn.dll` FIDO2 `PRF` (`UP\|UV`) | An alternative unlock route, not a second factor; runtime UI prompt depends on platform provider |
+| Clipboard and previews | Fail-closed exclusion markers, `WM_COPY`/`WM_CUT` interception, tray-timed clear, 8-extension allowlist, inheritable owner+`SYSTEM` temp ACLs, handle-only stale sweep rejecting hardlinks/junctions | Other applications may copy or retain active plaintext |
 
 Avoid calling the whole application “quantum-proof.” The native vault uses
 symmetric cryptography, while the optional TPM path uses RSA. A hardware-bound
@@ -171,27 +179,45 @@ private key does not turn RSA into a post-quantum algorithm.
 
 Shared macros provide stack canaries, software shadow-stack checks, guarded
 indirect-call landing pads, checked arithmetic, and bounds/type checks. General
-heap allocations (`mem_alloc`/`mem_free`) carry header/footer canaries and
-allocation magic tags (`tagged_alloc`/`tagged_free`). The import table is made
-read-only after startup. Link flags and `loadcfg.asm` enable ASLR, DEP/NX,
-high-entropy address space, CET compatibility where supported, and PE
-`DependentLoadFlags = 0x0800` (`LOAD_LIBRARY_SEARCH_SYSTEM32`), reinforced at
-runtime by `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32)`, safe
-search-path mode, and `SetProcessMitigationPolicy` (`ProcessExtensionPointDisablePolicy`,
-`ProcessStrictHandleCheckPolicy`, `ProcessImageLoadPolicy`, and
-`ProcessDynamicCodePolicy`). Singleton IPC applies an owner+`SYSTEM` DACL plus
-Medium-IL `NO_WRITE_UP` SACL on the named mutex and verifies both sender and
-receiver `WM_COPYDATA` endpoints against the running `vordr.exe` file identity.
+heap allocations (`mem_alloc`/`mem_free`) use `VirtualAlloc` with 32-byte `HEAPBLK`
+headers, front/rear canaries, allocation magic tags (`tagged_alloc`/`tagged_free`), and
+trailing `PAGE_NOACCESS` guard pages. Dynamic function pointers (`d3d11.dll`,
+`webauthn.dll`, `tbs.dll`) and `g_secdesk_proc` are XOR-encoded with hardware-seeded
+`g_ptr_cookie`. After startup, `iat_lockdown` seals both the PE import table and the
+4 KiB-isolated `_ROINIT` section (`g_stack_canary`, `g_ptr_cookie`, `g_sstk_tls`,
+`g_cpu_features`, `g_img_lo`, `g_img_hi`) as `PAGE_READONLY`.
 
-The software shadow stack is per thread: `FRAME_PROLOG` and `FRAME_EPILOG` find
-the calling thread's block through a TLS slot (`sstk_thread_init` gives each
-thread one, between guard pages), and `FRAME_EPILOG` checks the top-of-stack
-slot directly so skipped ancestor frames trap immediately. Threads Windows
-creates on Vordr's behalf, OS-dispatched callbacks (`WndProc`, `DialogProc`,
-`SubclassProc`, `TimerProc`, `EnumWindowsProc`, exception handlers), and any
-code before `hardening_init` use raw stack frames verified by `framecheck.py`.
-Worker threads (`secdesk_thread`, the parallel KAT workers) initialise their own
-block first and free it last.
+Link flags and `loadcfg.asm` (`src/arm64/loadcfg.S` on ARM64) enable ASLR, DEP/NX,
+high-entropy address space, CET compatibility on x64 (`/CETCOMPAT`; ARM64 uses
+`PACIBSP`/`AUTIBSP` pointer authentication and `BRK #0xF003` fast-fail), and PE
+`DependentLoadFlags = 0x0800` (`LOAD_LIBRARY_SEARCH_SYSTEM32`), reinforced at runtime
+by `HeapSetInformation(HeapEnableTerminationOnCorruption)`,
+`SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32)`,
+`SetProcessMitigationPolicy` (`ProcessExtensionPointDisablePolicy` and
+`ProcessImageLoadPolicy` with `NoRemoteImages | NoLowMandatoryLabelImages | PreferSystem32Images`),
+and `WerSetFlags(0x000001E1)` + `WerAddExcludedApplication`.
+
+Legacy `WM_COPYDATA` messages are unconditionally rejected. Single-instance hand-off
+uses a per-SID duplex named pipe (`\\.\pipe\VordrIPC-<16hex>`, `PIPE_REJECT_REMOTE_CLIENTS`,
+protected owner+`SYSTEM` DACL + Medium-IL `NO_WRITE_UP` SACL) with mutual
+`GetNamedPipeClientProcessId`/`GetNamedPipeServerProcessId` + `gui_pid_is_self`
+file-identity verification, bounded 250 ms overlapped I/O, a 1-byte server liveness
+ACK/NACK (`0x06`/`0x15`) closing PID-reuse races, and a bounded drain loop before
+`DisconnectNamedPipe`.
+
+The software shadow stack is per thread (`4,096` entries on both x64 and ARM64):
+`FRAME_PROLOG` and `FRAME_EPILOG` find the calling thread's block through an inline
+TEB TLS slot (`sstk_thread_init` gives each thread one, between `PAGE_NOACCESS` guard
+pages), and `FRAME_EPILOG` checks the top-of-stack slot directly so skipped ancestor
+frames trap immediately. Threads Windows creates on Vordr's behalf, OS-dispatched
+callbacks (`WndProc`, `DialogProc`, `SubclassProc`, `TimerProc`, `EnumWindowsProc`,
+exception handlers), and any code before `hardening_init` use raw stack frames verified
+by `framecheck.py` (and enter through 45 generated ABI thunks on ARM64). Worker threads
+(`secdesk_thread`, the parallel KAT workers) initialise their own block first and free it
+last. Cross-thread Secure Desktop teardown uses per-invocation `g_sd_slots`, a 3-state
+atomic CAS (`0`/`1`/`2`), 200 ms `SECDESK_POLL_TIMER` cancellation, and `lfence`
+(translating to ARM64 `dmb ish`) acquire barriers on every `g_secdesk_orphans == 0`
+consumer path.
 
 These checks detect particular misuse patterns; they do not make assembly
 memory-safe. Windows CFG (`/guard:cf`) is deliberately not enabled because the
@@ -200,23 +226,24 @@ must not be described as Windows CFG.
 
 ## Source map
 
-| Files under `src/` | Responsibility |
+| Files under `src/` and `tools/a64/` | Responsibility |
 |---|---|
-| `main.asm`, `gui.asm` | CPU/startup gates, CLI dispatch, windows, dialogs, full-window off-screen compositor (`gui_present_composite`), tray |
+| `main.asm`, `gui.asm` | CPU/startup gates, CLI dispatch, windows, dialogs, full-window off-screen compositor (`gui_present_composite`), named-pipe IPC, Secure Desktop, tray |
 | `macros.inc` | Shared constants, structures, and calling/hardening macros |
-| `hardening.asm`, `loadcfg.asm` | Runtime checks, heap, exception handling, PE load configuration |
-| `secmem.asm` | Locked secret allocations, tracked frees, selected panic wipes |
-| `random.asm` | OS RNG and optional hardware mixing |
-| `sha256.asm`, `sha1.asm`, `aesgcm.asm`, `blake2b.asm`, `argon2.asm` | Cryptographic primitives |
-| `vault.asm` | Container parsing/writing, records, attachments, native import/export |
-| `totp.asm`, `pwgen.asm` | One-time codes, password generation and policy |
-| `tpm.asm`, `regcfg.asm` | TPM wrapping, registry precedence, paths, rollback history |
-| `zipexport.asm`, `zipimport.asm` | AES ZIP and JSON interoperability |
-| `theme.asm` | 14 color schemes + perceived-luminance contrast, `rep stosd`-accelerated SSE2 SDF rounded rects, scheme-tuned semi-transparent glass cards & sidebar, soft cast drop-shadows, pill toggles, radial TOTP progress |
-| `anim.asm` | The animation clock: eased value slots driven by one timer that runs only while something moves, off when Windows' "Animation effects" is |
-| `gpu.asm` | Direct3D 11 DirectCompute (`cs_5_0`) procedural backdrops (7 static-basis styles dispatched once via `d3d11.dll` + `< 1 ms` SSE2 360° Rodrigues chromatic color cycling, plus flat mode) cached in a 32-bit DIB |
-| `fileio.asm`, `console.asm`, `log.asm` | File access, diagnostic output, logging |
-| `selftest.asm`, `redteam.asm`, `bench.asm` | Self-tests, fault injection, benchmarks |
+| `hardening.asm`, `loadcfg.asm` | Runtime checks, `_ROINIT`, guard-paged heap, exception/WER handling, PE load configuration |
+| `secmem.asm` | 85-entry `.const` `sec_regions`, `VirtualLock` arenas with `PAGE_NOACCESS` guards and `SRWLOCK` registry, panic wipes (including `g_comp_bits`) |
+| `random.asm` | OS RNG (`BCryptGenRandom`) and optional `RDSEED` mixing |
+| `sha256.asm`, `sha1.asm`, `aesgcm.asm`, `blake2b.asm`, `argon2.asm` | x64 cryptographic primitives (AES-NI, PCLMULQDQ, SHA-NI, SSE2/AVX2) |
+| `vault.asm` | Container parsing/writing, records, attachments, native import/export, `VF_SYSTEM` scoping |
+| `totp.asm`, `pwgen.asm` | One-time codes, password/PIN generation, grading, and policy |
+| `tpm.asm`, `regcfg.asm` | TPM 2.0 PCP & `webauthn.dll` Hello wrapping, TBS cooldown diagnostics, registry precedence, paths, rollback history |
+| `zipexport.asm`, `zipimport.asm` | WinZip AE-2 and JSON interoperability with per-attachment `SHA-256` verification |
+| `theme.asm` | 14 color schemes + Follow Windows, perceived-luminance contrast, SSE2 SDF rounded rects, glass cards & sidebar, drop shadows, pill toggles, radial TOTP progress |
+| `anim.asm` | Animation clock: eased value slots driven by one timer while active, honoring Windows' "Animation effects" setting |
+| `gpu.asm`, `gpu_backdrops.inc` | Direct3D 11 DirectCompute (`cs_5_0`) procedural backdrops (7 styles via `d3d11.dll` with WARP fallback + SSE2 360° Rodrigues hue cycling, plus flat mode) cached in a 32-bit DIB |
+| `fileio.asm`, `console.asm`, `log.asm` | Hardened file access (`file_path_allowed` / `file_validate_handle`), diagnostic output, logging |
+| `selftest.asm`, `redteam.asm`, `bench.asm` | 23 startup KAT suites, `katreport`, `dbg`-only fault injection, benchmarks |
+| `src/arm64/*.S`, `src/arm64/frame.inc`, `tools/a64/xlat.py` | Hand-written ARMv8 Crypto/NEON/RNG/CPU-gate/load-config modules (`aesgcm.S`, `sha.S`, `blake2b_argon2.S`, `platform.S`, `loadcfg.S`) and deterministic COFF-to-AArch64 translator for the remaining 24 modules ([ARM64.md](ARM64.md)) |
 
 See [settings ownership](SETTINGS_DESIGN.md) and
 [system-item indexing](SYSITEM_DESIGN.md) before modifying those paths.

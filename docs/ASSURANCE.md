@@ -3,10 +3,11 @@
 [Documentation](README.md) · [Trust overview](TRUST.md) · [Visual guide](assurance.html) · [Secret memory](SECRETS.md)
 
 This reference maps Vordr's security and reliability claims directly to automated
-verifiers, static analyzers, and runtime probes—and states the exact boundary of what
-each check proves. Every tool below runs offline with the Windows x64 toolchain and the
-Python 3 standard library. No independent external third-party audit is recorded in this
-repository.
+verifiers, static analyzers, ARM64 emulation suites, and runtime probes—and states
+the exact boundary of what each check proves. Every tool below runs offline with the
+Windows x64 MSVC/SDK toolchain, LLVM (for ARM64), and Python 3 (stdlib for x64 gates;
+Unicorn for ARM64 emulation). No independent external third-party audit is recorded in
+this repository.
 
 ## Reproduce the checks
 
@@ -51,12 +52,12 @@ flowchart LR
 
 | Stage | Evidence produced | Important limit |
 |---|---|---|
-| Fault injection | Deliberate canary, shadow-stack (top and ancestor-skip), indirect-call, arithmetic, bounds, type, production heap-tag (`mem_alloc`/`mem_free`), crash-reentrancy, DLL System32 load-config, and IAT violations each end or pass with that control's expected result (`tests/redteam.py`); an ordinary access violation is contained (0xC0000409, no crash dialog) with a breadcrumb naming the fault | Checks termination behavior, not all paths; the IAT case shows the slot is read-only at the write, not that `iat_lockdown` alone made it so |
-| Strict build | Ten Python assembly/ABI/resource/doc analyzers (each guarded against silent coverage loss by `tools/floors.py`) plus assembly/link success and PE `LOAD_CONFIG` `DependentLoadFlags == 0x0800` verification (`pe_normalise.py`); `build.cmd strict` fails closed if Python is absent | Pattern-based static analyzers inspect source idioms rather than proving full program semantics |
+| Fault injection | 13 deliberate hardening cases (19 assertions in `tests/redteam.py`): stack canary, TLS shadow-stack (top and ancestor-skip), indirect-call landing pad, arithmetic overflow, bounds, type/heap magic, guard-paged heap-tag (`mem_alloc`/`mem_free`), crash-reentrancy, `System32`-only DLL load (`dllhijack`), and read-only IAT violations each trigger their expected exit code or containment (`0xC0000409`, no crash dialog, 120-byte breadcrumb) | Checks termination behavior, not all paths; the IAT case shows the slot is read-only at the write, not that `iat_lockdown` alone made it so |
+| Strict build | Ten Python assembly/ABI/resource/doc analyzers (9 guarded against silent coverage loss by `tools/floors.py`) plus assembly/link success and PE validation (`pe_normalise.py`: `LOAD_CONFIG.DependentLoadFlags == 0x0800`, 4 KiB-isolated `_ROINIT`, `W^X`, `/CETCOMPAT` bit); `build.cmd strict` fails closed if Python is absent | Pattern-based static analyzers inspect source idioms rather than proving full program semantics |
 | Self-tests | 23 startup known-answer suites pass (also run fail-closed on every normal launch); release binary refuses diagnostic file-writing verbs in the next stage | Fixed vectors verify selected inputs and boundary cases |
-| Round-trip | Serialization, imports/exports, attachments, policy, TPM label binding, SecureUnlock fail-closed policy, locking, parsers, preview cleanup, and persistence probes; an independent reader of the vault format; frozen v0.2.3 vaults; a 91-check isolated GUI instance driven from outside | Synthetic and bounded input space; geometry and GUI tests skip without a desktop |
-| Crypto differential | Output compared with independent Python calculations and published vectors | Functional output checks, not a side-channel proof |
-| Installer | Release-PE validation (`make_msi.ps1`), MSI tables, 16 policy rows, numeric `LaunchCondition` guards, SDDL permissions, downgrade prevention (`NEWERVERSIONDETECTED`), and component costing checked (`verify_msi.ps1`) | Does not install, upgrade, or uninstall the program |
+| Round-trip | 42 `probeio` probes covering serialization, imports/exports, attachments, policy, TPM label binding & anti-replay, PIN grading, GPU backdrops (`gpukat`), SecureUnlock fail-closed policy, locking, parsers (`vfuzz` 100k, `fuzzzip` 100k, `jfuzz` 20k, `attfuzz` 4k), preview cleanup, and persistence; an independent reader of the vault format (`verify_vault.py`); frozen v0.2.3 vaults (`compattest.py`); and 128+ (up to 152) isolated Win32 GUI checks (`guitest.ps1`) | Synthetic and bounded input space; geometry and GUI tests skip without a desktop |
+| Crypto differential | 60 `katreport` lines cross-checked against 58 independent Python recomputations and 25 published FIPS/NIST/RFC vectors (`tests/verify_crypto.py`) | Functional output checks, not a side-channel proof |
+| Installer | Builds `bin\vordr-arm64.exe` and the universal x64+ARM64 MSI (`make_msi.ps1` with `Assert-ReleasePe` validation), then verifies MSI tables, 16 policy rows, live `LaunchConditions` numeric/coercion guards, 5-column `MsiLockPermissionsEx` via `msi.dll`'s runtime SQL query, downgrade prevention (`NEWERVERSIONDETECTED`), embedded x64/ARM64 payloads, and dual-arch component costing (`verify_msi.ps1`) | Does not perform a live OS install, upgrade, or uninstall |
 
 `--quick` skips fault injection. `build.cmd release strict` requires Python and
 fails closed when Python is missing; missing `makecab` or `clang`/LLVM can skip the installer
@@ -130,11 +131,13 @@ rather than the conventional zero-on-success result.
 | Native exchange and metadata | `sysitemkat`, `vexselkat`, `c9kat`, `vimpkat`, `vattcolkat`, `vaultexportkat`, `vaultexpattkat` |
 | ZIP export and attachment binding | `atgen`, `zitest`, `zexcap`, `zexname`, `zexselkat` (selective export filter, `SHA-256` attachment swap rejection, and missing-member atomic rollback) |
 | Policy, PIN grading, TPM, and private desktop | `polkat` (`HKLM` fail-closed types, `HKLM`-only `AllowUncVault`, `ProfileList` path expansion, PIN/TPM mode clamping), `pinkat` (PIN scalar length, no-class rule, trivial patterns), `healthkat` (`VF_SECRET` + `VF_PIN` grading and domain-separated reuse), `tpmkat` (OAEP v2 context binding, `S0`/`S1` pre-commit anti-replay, 3-strike revocation), `secdeskkat` |
-| GUI geometry and failed-edit retry | `layoutkat` (with `savefail` and `guardkat` in the same window) |
-| GUI behaviour from outside | `tests/guitest.ps1` (91 checks): input limits, drawn scrollbars, modal dismissal on lock, legacy `WM_COPYDATA` rejection (second-instance hand-off uses a kernel-authenticated per-SID named pipe), default `GetWindowDisplayAffinity` (`0x11`) screen-capture protection, tray clipboard auto-clear, post-lock secret wipes, GDI leaks |
+| GUI geometry, backdrops & failed-edit retry | `layoutkat` (with `savefail` and `guardkat` across 17 guard cases in the same window), `gpukat` (DirectCompute / WARP backdrop dispatch & SSE2 color cycling) |
+| GUI behaviour from outside | `tests/guitest.ps1` (128+ checks; 146–152 runtime checks on an interactive desktop): input limits, drawn scrollbars, 15 theme palettes, 8 backdrops, modal dismissal on lock, legacy `WM_COPYDATA` rejection (second-instance hand-off uses a kernel-authenticated per-SID duplex named pipe), default `GetWindowDisplayAffinity` (`0x11`) screen-capture protection, tray clipboard auto-clear, post-lock secret wipes, GDI leaks |
 | Vault format, tamper and nonce reuse | `tests/verify_vault.py` |
 | Opening vaults written by a release | `tests/compattest.py` (frozen `tests/fixtures/v023-*.vordr`) |
-| Long-path context restoration | `tests/verify_persistence.py` |
+| Long-path context restoration | `tests/verify_persistence.py` (6 short/long-path & preview-cleanup cases) |
+| ARM64 crypto & 8-stage E2E emulation | `tests/arm64/test_sha.py`, `test_blake2b_argon2.py`, `test_aesgcm.py`, `test_arm64_e2e.py` (Unicorn ARM64 unit KATs, constant-time SHA traces, release `selftest` with `FEAT_RNG=0/1`, fail-closed `cpu_gate`, x64-identical 60-line `katreport`, 22 probeio KATs/fuzzers, and cross-arch `.vordr` vault interoperability) |
+| Dual-arch reproducibility | `tools/verify_repro.ps1` (proves clean builds of both `vordr.exe` and `vordr-arm64.exe` reproduce bit-for-bit and match `bin/SHA256SUMS.txt`) |
 
 `secscan` checks its planted sentinel after a selected wipe path. It does not
 inventory every possible plaintext copy, prove pagefile/hibernation exclusion,

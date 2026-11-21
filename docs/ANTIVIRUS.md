@@ -11,8 +11,9 @@ does not establish that a different file or a new warning is harmless.
 
 1. Keep antivirus protection enabled. Do not add a blanket exclusion.
 2. Confirm the file came from the project's release page.
-3. Compare the executable's SHA-256 with the [published record](RELEASES.md).
-   Treat the MSI as a separate file with its own hash.
+3. Compare the executable's SHA-256 (`vordr.exe` on x64 or `vordr-arm64.exe` on
+   Windows on ARM) with the [published record](RELEASES.md). Treat the universal MSI
+   as a separate file with its own hash.
 4. If the bytes match, review the source or reproduce the tagged build with
    a matching toolchain. A match identifies the file; it does not prove safety.
 5. Submit the flagged public release to the vendor for analysis. Never upload

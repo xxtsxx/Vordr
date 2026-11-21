@@ -144,21 +144,22 @@ or you picked an icon for it.
 
 By default, Vordr clears a copied secret after 20 seconds, hides its windows from
 ordinary screenshots and screen-sharing (`SetWindowDisplayAffinity`), locks after
-10 minutes of system inactivity, and locks when Windows locks. Settings (or
-administrator policy via `AllowScreenCapture` and timeout rules) can adjust these
-choices. To inspect a separate vault without modifying it, launch
+10 minutes of system inactivity, and locks when Windows locks. Settings can adjust
+clipboard and auto-lock timeouts, while `AllowScreenCapture` is an administrator-only
+`HKLM` policy. To inspect a separate vault without modifying it, launch
 `vordr.exe --ro <path\to\vault.vordr>` when the vault path is not locked by `HKLM`
 policy.
 
 Clipboard clearing checks the clipboard sequence number, so it does not erase
-something you copied afterward. Vordr also supplies Windows clipboard exclusion
-formats. These reduce exposure to cooperating Windows features; they do not
-prevent another process from reading the current clipboard.
+something you copied afterward. Both Vordr's Copy buttons and `Ctrl+C`/`Ctrl+X` inside
+secret edit fields route through the same auto-clearing clipboard handler and supply
+Windows clipboard exclusion formats. These reduce exposure to cooperating Windows
+features; they do not prevent another process from reading the current clipboard.
 
-Locking wipes the loaded vault and relevant display buffers, clears Vordr's
-clipboard copy if it still owns it, and attempts preview-file cleanup. Save
-changes and close attachment viewers before exiting. A forced process stop is
-not equivalent to an orderly lock and cleanup.
+Locking discards unsaved Settings changes rather than auto-committing them, wipes the
+loaded vault and display/compositor buffers, clears Vordr's clipboard copy if it still
+owns it, and attempts preview-file cleanup. Save changes and close attachment viewers
+before exiting. A forced process stop is not equivalent to an orderly lock and cleanup.
 
 A lock - from inactivity, Windows locking, the hotkey or Ctrl+L - first closes any
 Vordr dialog or message box that is open, answering it as Cancel, and then locks.
@@ -279,7 +280,7 @@ the registered vault or import anything without the remaining prompts.
 | Symptom | What to check |
 |---|---|
 | No window after launch | Look in the notification area; normal launch starts there |
-| CPU-feature error | Check the required instruction set, including SHA-NI |
+| CPU-feature error | Check the required instruction set: AES-NI, PCLMULQDQ, SSE4.1, and SHA-NI on x64; ARMv8 Cryptography Extensions on ARM64 |
 | Save blocked by another writer or a changed file | Let the other save finish, then reload; do not overwrite either copy blindly |
 | Settings control disabled | An HKLM policy value may be enforcing it |
 | Secret-memory warning | Windows could not pin a static buffer; review memory pressure and machine policy |

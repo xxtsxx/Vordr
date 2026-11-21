@@ -115,7 +115,7 @@ no valid setting exists; the installer does not write defaults automatically.
 | `VORDR_LOGLEVEL` | `LogLevel` | 0–4 | 0 | audit-log verbosity, 0 = off |
 | `VORDR_UISCHEME` | `ui_scheme` | 0–14 | 8 | force a colour scheme (`8` = Gruvbox default, `14` = Follow Windows) |
 | `VORDR_ALLOWUNCVAULT` | `AllowUncVault` | 0/1 | 0 | `HKLM`-only: allow UNC/SMB paths (`\\server\share\...`) for vaults, imports/exports, and logs |
-| `VORDR_ALLOWSCREENCAPTURE` | `AllowScreenCapture` | 0/1 | 0 | allow screenshots and screen sharing of Vordr windows (disables `SetWindowDisplayAffinity`) |
+| `VORDR_ALLOWSCREENCAPTURE` | `AllowScreenCapture` | 0/1 | 0 | `HKLM`-only (production): allow screenshots and screen sharing of Vordr windows (disables `SetWindowDisplayAffinity`) |
 
 `ui_anim` (DWORD under `HKLM\SOFTWARE\Vordr`) fixes Settings > Animations: 0
 follows Windows' "Animation effects" switch (the default), 1 always animates, 2
@@ -129,8 +129,9 @@ controls in the same fail-closed manner):
 - `PinMinLen` (`4..32`, default `6`): minimum scalar length for `VF_PIN` entry fields and `TPM + PIN` enrollment.
 - `PinRejectTrivial` (`0/1`, default `1`): when `1`, blocks saving or enrolling trivial PIN patterns (`000000`, `123456`, `121212`, `123321`); when `0`, allows saving weak PINs in vault entries while still flagging them as Weak in Vault Health.
 
-`AllowUncVault` is evaluated **only** from `HKLM\SOFTWARE\Vordr`; user-writable
-`HKCU` values cannot enable UNC/SMB access (`polkat`). When `AllowUncVault` is `0`
+`AllowUncVault` and `AllowScreenCapture` (in production builds) are evaluated **only**
+from `HKLM\SOFTWARE\Vordr`; user-writable `HKCU` values cannot enable UNC/SMB access
+or disable screen-capture exclusion (`polkat`). When `AllowUncVault` is `0`
 (the default), Vordr blocks `\\server\share\...` and `\\?\UNC\...` paths before
 `CreateFileW` and rejects junctions or mapped drives whose resolved handle path
 (`GetFinalPathNameByHandleW`) points to UNC storage.
@@ -218,8 +219,8 @@ The `vault` value follows HKLM-over-HKCU precedence. It is intentionally not an
 MSI property: one literal path rarely suits every user.
 
 Use `REG_SZ` for a literal local path, or `REG_EXPAND_SZ` with one of the three trusted
-per-user folder prefixes—`%USERPROFILE%\`, `%LOCALAPPDATA%\`, or `%APPDATA%\`—resolved
-directly from `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\<UserSID>\ProfileImagePath`.
+per-user folder prefixes—`%USERPROFILE%\`, `%LOCALAPPDATA%\`, or `%APPDATA%\`—anchored
+via `GetUserProfileDirectoryW` (`HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\<UserSID>\ProfileImagePath`).
 Vordr never calls `ExpandEnvironmentStringsW` or `SHGetFolderPathW` on `HKLM` policy
 values, preventing unprivileged edits to `HKCU\Environment` or
 `HKCU\...\User Shell Folders` from redirecting an administrator-pinned vault path
@@ -241,7 +242,7 @@ Verify the resolved path in the unlock dialog after deployment.
 | Location | Data | Owner |
 |---|---|---|
 | `HKLM\SOFTWARE\Vordr` | Enforced settings and optional vault path | Administrator or MSI |
-| `HKCU\SOFTWARE\Vordr` | Preferences, `vault`, `ui_scheme`, `ui_anim`, `ui_hotkey` | Vordr Settings/path handling |
+| `HKCU\SOFTWARE\Vordr` | Preferences, `vault`, `ui_scheme`, `ui_pair_light`, `ui_pair_dark`, `ui_backdrop`, `ui_anim`, `ui_hotkey` | Vordr Settings/path handling |
 | `HKCU\SOFTWARE\Vordr\TPM-Unlock` | Per-vault wrapped key blobs | Vordr TPM enrollment |
 | `HKCU\SOFTWARE\Vordr\Rollback` | Per-vault save counters | Vordr |
 | `HKLM\SOFTWARE\Classes` | `.vordr` and `Vordr.Vault` registrations | MSI |
@@ -292,8 +293,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\verify_msi.ps1 -Msi bi
 
 The verifier reads MSI tables and evaluates component costing without installing.
 It checks public-property propagation, 64-bit registry components, conditional
-policy writes, quoted file paths, and upgrade configuration. Administrative
-extraction (`msiexec /a`) is not a substitute for these checks.
+policy writes, live `LaunchConditions` numeric/coercion guards (within MSI `S255`
+limits), the 5-column `MsiLockPermissionsEx` table against `msi.dll`'s runtime SQL
+query, dual-architecture (`AMD64`/`ARM64`) costing and embedded PE payloads, quoted
+file paths, and upgrade/downgrade configuration. Administrative extraction
+(`msiexec /a`) is not a substitute for these checks.
 
 In an isolated test machine, also verify:
 

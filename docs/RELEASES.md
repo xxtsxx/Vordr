@@ -61,26 +61,30 @@ uploading a GitHub release alone does not update WinGet.
 
 ## Reproduce an executable
 
-Use a separate clean checkout and the matching MSVC/SDK versions. Build flags
-remove common sources of variation but do not make different toolchains
+Use a separate clean checkout and the matching MSVC/SDK (and LLVM for ARM64) versions.
+Build flags remove common sources of variation but do not make different toolchains
 interchangeable.
 
 ```bat
 git clone --branch v0.2.3 --depth 1 https://github.com/xxtsxx/Vordr.git vordr-v0.2.3-check
 cd vordr-v0.2.3-check
-build.cmd release
+build.cmd release strict
+build_arm64.cmd release
 certutil -hashfile bin\vordr.exe SHA256
+certutil -hashfile bin\vordr-arm64.exe SHA256
 ```
 
-The tag is an example; choose the version being verified. `build.cmd release`
-also writes the hash to `bin\SHA256SUMS.txt`. To check that one machine builds
-the same bytes twice, run `tools\verify_repro.ps1`.
+The tag is an example; choose the version being verified (`v0.2.3` pre-dates the ARM64
+port; `build_arm64.cmd` applies to `0.8.2` and later). Both `build.cmd release` and
+`build_arm64.cmd release` merge their SHA-256 digests into `bin\SHA256SUMS.txt`. To
+check that one machine builds identical bytes twice for both architectures, run
+`powershell -NoProfile -ExecutionPolicy Bypass -File tools\verify_repro.ps1`.
 
 | Step | Purpose |
 |---|---|
 | `/Brepro` | Uses deterministic content-derived build metadata |
-| `/pdbaltpath:vordr.pdb` | Avoids embedding a machine-specific absolute PDB path |
-| `tools\pe_normalise.py` | Verifies `LOAD_CONFIG.DependentLoadFlags == 0x0800` (`LOAD_LIBRARY_SEARCH_SYSTEM32`), zeroes COFF/export/load-config/debug timestamps, and clears variable debug payloads while preserving `IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS` (CET). |
+| `/pdbaltpath:vordr.pdb` *(or `vordr-arm64.pdb`)* | Avoids embedding a machine-specific absolute PDB path |
+| `tools\pe_normalise.py` | Verifies `LOAD_CONFIG.DependentLoadFlags == 0x0800` (`LOAD_LIBRARY_SEARCH_SYSTEM32`), 4 KiB-isolated `_ROINIT`, `W^X`, and x64 CET flags; zeroes COFF/export/load-config/debug timestamps while preserving `IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS` (CET). |
 
 Releases built before normalisation was added (v0.2.3 and earlier) carry those
 stamps, so their published hash cannot be matched by a rebuild directly. Compare
@@ -93,14 +97,16 @@ certutil -hashfile published.exe SHA256
 certutil -hashfile bin\vordr.exe SHA256
 ```
 
-The ASLR, DEP/NX, high-entropy VA, and CET compatibility flags remain enabled.
+ASLR, DEP/NX, high-entropy VA, and (on x64) CET compatibility flags remain enabled.
 Record tool versions alongside hashes when preparing a release.
 
 ## MSI payloads
 
-The MSI is a per-machine wrapper around the executable. It installs into
-`%ProgramFiles%\Vordr`, registers an installed-product identity, and can add
-a shortcut, file association, and administrator-selected policy values.
+The universal MSI is a per-machine wrapper carrying both native x64 (`vordr.exe`) and
+native ARM64 (`vordr-arm64.exe`) executables. It installs the host's native binary into
+`%ProgramFiles%\Vordr\vordr.exe` with zero custom actions (`AppSearch` + `RegLocator`),
+applies `MsiLockPermissionsEx` SDDL rules, registers an installed-product identity, and
+can add a shortcut, `.vordr` file association, and administrator-selected policy values.
 Uninstall does not remove vaults or HKCU user data.
 
 The MSI gets new product/package identifiers when built, so its hash can change

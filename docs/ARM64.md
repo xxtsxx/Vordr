@@ -1,6 +1,6 @@
 # Vordr on Windows on ARM (ARM64)
 
-[Documentation](README.md) · [Architecture](ARCHITECTURE.md) · [Deployment](DEPLOYMENT.md)
+[Documentation](README.md) · [Trust overview](TRUST.md) · [Architecture](ARCHITECTURE.md) · [Deployment](DEPLOYMENT.md)
 
 Vordr ships a native ARM64 executable, `vordr-arm64.exe`, built from the same
 sources as the x64 `vordr.exe`. Both are pure assembly with no C runtime. The
@@ -19,14 +19,16 @@ flowchart LR
 ```
 
 - **One logic source.** Application logic (GUI, vault format, parsers, TPM,
-  policy) is written once in x64 MASM. `tools/a64/xlat.py` reads the assembled,
-  fully macro-expanded x64 objects - instructions, relocations, symbols and
-  source line numbers - and emits equivalent AArch64 assembly, annotated with
-  the original source line for every translated instruction. A change to the x64
-  source therefore reaches the ARM64 build automatically; the two can never
-  drift apart.
+  policy) is written once in x64 MASM. `tools/a64/xlat.py` reads the 24 assembled,
+  fully macro-expanded x64 objects—instructions, relocations, symbols, and
+  source line numbers—and emits equivalent AArch64 assembly (plus 45 Windows
+  callback thunks), annotated with the original source line for every translated
+  instruction, linking the same 15 Windows `System32` import libraries (302 exports
+  via `tools/arm64_defs/*.def`). A change to the x64 source therefore reaches the
+  ARM64 build automatically; the two stay in lockstep.
 - **Hand-written where the ISA matters.** Code built on x86-only instructions
-  is replaced by hand-written AArch64 in `src/arm64/`:
+  is replaced by 5 hand-written AArch64 modules in `src/arm64/` (`aesgcm.S`,
+  `sha.S`, `blake2b_argon2.S`, `platform.S`, `loadcfg.S`, plus `frame.inc`):
   AES-256-GCM on the ARMv8 Cryptography Extensions (`AESE`/`AESMC`, `PMULL`
   GHASH), SHA-256 and SHA-1 on the ARMv8 SHA instructions, BLAKE2b and the
   Argon2 compression function on NEON, the CSPRNG mix (`BCryptGenRandom` plus
@@ -34,11 +36,13 @@ flowchart LR
   feature gate, fail-fast (`ff_trap`), and the debug crash-breadcrumb
   `crash_capture_context` view of `ARM64_NT_CONTEXT` (`src/arm64/platform.S`).
 - **Same mitigations, ARM64 flavour.** Every framed procedure keeps its stack
-  canary and software shadow-stack entry, and additionally signs its return
-  address with pointer authentication (`PACIBSP`/`AUTIBSP`; a no-op on CPUs
-  without `FEAT_PAuth`). `__fastfail` is `BRK #0xF003`. ASLR, high-entropy VA,
-  DEP, the `System32`-only dependent-load flag and the read-only `_ROINIT`
-  section are the same as on x64. Intel CET has no ARM64 equivalent and is x64-only.
+  canary and 4,096-entry guard-paged TLS software shadow-stack check (`A64_SSTK_CAPACITY`),
+  and additionally signs its return address with pointer authentication
+  (`PACIBSP`/`AUTIBSP`; a no-op on CPUs without `FEAT_PAuth`). `__fastfail` is
+  `BRK #0xF003`, and cross-thread acquire fences (`lfence`) translate to `dmb ish`.
+  ASLR, high-entropy VA, DEP, the `System32`-only dependent-load flag, and the
+  4 KiB-isolated read-only `_ROINIT` section match x64. Intel CET has no ARM64
+  equivalent and is x64-only.
 
 ## Internal calling convention
 
@@ -105,5 +109,6 @@ to `%ProgramFiles%\Vordr\vordr.exe` alongside its Start Menu shortcut, with
 explicit `MsiLockPermissionsEx` SDDL rules (`SYSTEM`/`Administrators` full
 control, `Users` read/execute) protecting `INSTALLDIR` and both executables.
 `tools\verify_msi.ps1` verifies costing for both `AMD64` and `ARM64` hosts,
-`MsiLockPermissionsEx` ACL rows, live `LaunchConditions` numeric guards, and
+the 5-column Windows Installer 5.0 `MsiLockPermissionsEx` ACL rows against
+`msi.dll`'s runtime SQL query, live `LaunchConditions` numeric guards, and
 both embedded PE payloads in `vordr.cab`.

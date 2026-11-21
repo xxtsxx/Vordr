@@ -94,35 +94,39 @@ footer { border-top: 1px solid var(--line); padding-top: 24px; margin-top: 48px;
     clean release executable before packaging.</p>
   <ol class="stages">
     <li><span class="step">01 / FAULT INJECTION</span><h3>Verify fail-fast &amp; containment</h3>
-      <p>Trigger stack canary, TLS shadow-stack (top and ancestor-skip), landing-pad,
-      heap-tag, bounds, arithmetic, crash-reentrancy, <code>System32</code> DLL load,
-      and read-only IAT guards via <code>tests\redteam.py</code>.</p></li>
+      <p>Trigger 13 deliberate hardening cases (19 assertions via <code>tests\redteam.py</code>):
+      stack canary, TLS shadow-stack (top and ancestor-skip), landing-pad, guard-paged
+      heap-tag, bounds, overflow, crash-reentrancy, <code>System32</code> DLL load
+      (<code>dllhijack</code>), and read-only IAT guards.</p></li>
     <li><span class="step">02 / STRICT BUILD</span><h3>Enforce static &amp; PE invariants</h3>
       <p>Run ten Python assembly, Win64 ABI, resource, and doc analyzers gated by
       coverage floors (<code>floors.py</code>), link with ASLR/DEP/HEVA/CET, and verify
-      <code>DependentLoadFlags = 0x0800</code> (<code>pe_normalise.py</code>). Fails closed
+      <code>DependentLoadFlags = 0x0800</code>, 4 KiB-isolated <code>_ROINIT</code>,
+      <code>W^X</code>, and CET metadata (<code>pe_normalise.py</code>). Fails closed
       if Python is missing.</p></li>
     <li><span class="step">03 / SELF-TESTS</span><h3>Run 23 startup KAT suites</h3>
       <p>Verify FIPS-197, SP 800-38A/D, RFC 9106 Argon2id, RFC 7693 BLAKE2b, RFC 6238
       TOTP, register/XMM scrubbing, CPU/XCR0 gates, and URL/filename/JSON sanitizers.
-      Every normal launch runs this gate fail-closed.</p></li>
+      Every normal launch runs this gate fail-closed on both x64 and ARM64.</p></li>
     <li><span class="step">04 / ROUND-TRIPS &amp; GUI</span><h3>Exercise formats, fuzzers &amp; UI</h3>
-      <p>Run 35+ container, parser-fuzz, policy, TPM, and persistence probes, a
-      zero-shared-code Python vault reader (<code>verify_vault.py</code>), frozen
-      <code>v0.2.3</code> fixtures, and a 91-check isolated Win32 GUI suite
-      (<code>guitest.ps1</code>).</p></li>
+      <p>Run 42 container, parser-fuzz (<code>vfuzz</code>/<code>fuzzzip</code> 100k),
+      policy, TPM, GPU, and persistence probes, a zero-shared-code Python vault reader
+      (<code>verify_vault.py</code>), frozen <code>v0.2.3</code> fixtures, and 128+
+      (up to 152) isolated Win32 GUI checks (<code>guitest.ps1</code>).</p></li>
     <li><span class="step">05 / CRYPTO DIFFERENTIAL</span><h3>Cross-check 83 vectors</h3>
-      <p>Compare 58 primitive outputs from <code>katreport</code> against independent
-      Python calculations and 25 published FIPS/NIST/RFC test vectors via
-      <code>tests\verify_crypto.py</code>.</p></li>
-    <li><span class="step">06 / INSTALLER</span><h3>Cost &amp; verify the MSI</h3>
-      <p>Build the MSI around the restored release binary and cost its tables via
-      Windows Installer COM: 16 policy rows, numeric <code>LaunchCondition</code> guards,
-      SDDL permissions, and downgrade prevention (<code>NEWERVERSIONDETECTED</code>).</p></li>
+      <p>Compare 60 <code>katreport</code> lines against 58 independent Python
+      calculations and 25 published FIPS/NIST/RFC test vectors via
+      <code>tests\verify_crypto.py</code>—plus four Unicorn-emulated ARM64 crypto and
+      8-stage E2E suites (<code>tests\arm64\test_*.py</code>).</p></li>
+    <li><span class="step">06 / UNIVERSAL MSI</span><h3>Package &amp; cost x64 + ARM64</h3>
+      <p>Build <code>vordr-arm64.exe</code> and the universal MSI around both release
+      binaries (<code>Assert-ReleasePe</code>), verifying 16 policy rows, live numeric
+      <code>LaunchConditions</code>, 5-column <code>MsiLockPermissionsEx</code> SQL,
+      downgrade prevention (<code>NEWERVERSIONDETECTED</code>), and dual-arch costing.</p></li>
   </ol>
   <p class="notice">Strict builds require Python and fail closed without it. Inspect the
-    stage log if <code>makecab.exe</code> or an interactive desktop is unavailable on a
-    headless runner.</p>
+    stage log if <code>makecab.exe</code>, LLVM (<code>clang</code>), or an interactive
+    desktop is unavailable on a headless runner.</p>
 </section>
 <section aria-labelledby="boundaries">
   <h2 id="boundaries">Three lifecycle zones, three explicit boundaries</h2>
@@ -134,13 +138,16 @@ footer { border-top: 1px solid var(--line); padding-top: 24px; margin-top: 48px;
       AES-256-GCM per body and attachment, and full-file BLAKE2b-256 MAC over the
       64-bit save counter.</small></div>
     <span class="arrow" aria-hidden="true">→</span>
-    <div class="zone"><h3>2. Unlocked process</h3><small><code>VirtualLock</code> static
-      table and out-of-line <code>secmem</code> arenas, default screen-capture &amp; IME
-      exclusion, XMM/stack wipes, DACL-isolated private desktop, and modal-closing auto-lock.</small></div>
+    <div class="zone"><h3>2. Unlocked process</h3><small>85 <code>VirtualLock</code> static
+      buffers, guard-paged <code>SRWLOCK</code> <code>secmem</code> arenas, pinned
+      <code>g_comp_bits</code> compositor DIB, read-only <code>_ROINIT</code>, default
+      screen-capture &amp; IME exclusion, vector/stack wipes, 3-state CAS private desktop,
+      per-SID named-pipe IPC, and modal-closing auto-lock.</small></div>
     <span class="arrow" aria-hidden="true">→</span>
     <div class="zone"><h3>3. External OS boundary</h3><small>Fail-closed clipboard markers
       and tray-timed clear, 8-extension preview allowlist, inheritable owner+<code>SYSTEM</code>
-      temp DACL, and fail-closed Mark of the Web.</small></div>
+      temp DACL, handle-only stale sweep rejecting hardlinks/junctions, and fail-closed
+      Mark of the Web.</small></div>
   </div>
   <p><a href="SECRETS.md">Review secret buffer ownership and cleanup boundaries →</a></p>
 </section>
@@ -148,16 +155,16 @@ footer { border-top: 1px solid var(--line); padding-top: 24px; margin-top: 48px;
   <h2 id="interpret">Read passing evidence with scientific precision</h2>
   <div class="columns">
     <article><h3>What the suite demonstrates</h3><ul>
-      <li>Independent Python readers agree byte-for-byte with Vordr's wire format and cryptographic outputs.</li>
+      <li>Independent Python readers agree byte-for-byte with Vordr's wire format and both x64 and ARM64 cryptographic outputs.</li>
       <li>Every deliberate memory, ABI, frame, or loader fault triggers its dedicated fail-fast or containment path.</li>
-      <li>Two clean <code>release strict</code> builds produce identical SHA-256 binaries with ASLR, DEP, HEVA, and CET intact.</li>
-      <li>Policy locks, modal auto-lock, attachment caps, and rollback counters hold under automated CLI and GUI probes.</li>
+      <li>Two clean builds of both <code>vordr.exe</code> and <code>vordr-arm64.exe</code> produce identical SHA-256 binaries with PE mitigations intact.</li>
+      <li>Policy locks, modal auto-lock, attachment caps, named-pipe IPC, and rollback counters hold under automated CLI and GUI probes.</li>
     </ul></article>
     <article><h3>What remains outside automated proof</h3><ul>
       <li>Bounded fuzzing and fixed KATs do not prove safety over all possible inputs.</li>
       <li>User-mode <code>VirtualLock</code> and zeroing cannot block a hostile kernel, admin debugger, or unencrypted hibernation file.</li>
       <li>Functional output vectors do not prove microarchitectural side-channel immunity across all CPUs.</li>
-      <li>COM table costing does not replace live VM upgrade and uninstall testing.</li>
+      <li>COM table costing and ARM64 emulation do not replace live VM/hardware install, upgrade, and WebAuthn testing.</li>
     </ul></article>
   </div>
 </section>
@@ -167,7 +174,8 @@ footer { border-top: 1px solid var(--line); padding-top: 24px; margin-top: 48px;
     processes and overwrites <code>bin\</code>. Run it in a clean checkout or VM with
     synthetic data.</p>
   <pre><code>tests\run_all.cmd
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\verify_repro.ps1</code></pre>
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\verify_repro.ps1
+python tests\arm64\test_arm64_e2e.py</code></pre>
   <p>Record the commit hash, MSVC/SDK versions, full stage logs, and any environment skips.
     <a href="DEVELOPMENT.md">Read the development guide before running the gate.</a></p>
 </section>

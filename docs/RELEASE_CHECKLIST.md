@@ -28,26 +28,30 @@ flowchart LR
 - [ ] Exercise GUI unlock, edit/save/retry, lock, preview cleanup, import/export,
   backup restoration, and policy behavior with synthetic data.
 
-## 2. Produce the executable
+## 2. Produce the executables (x64 + ARM64)
 
 - [ ] Run `powershell -NoProfile -ExecutionPolicy Bypass -File tools\verify_repro.ps1`.
-  It builds `release strict` twice from clean objects and requires identical
-  hashes, intact mitigations (ASLR, DEP, HEVA, CET), and a matching
-  `bin\SHA256SUMS.txt`. Investigate any difference before going on.
+  It builds both `vordr.exe` (`release strict`) and `vordr-arm64.exe` (`release`)
+  twice from clean objects and requires identical hashes, intact mitigations
+  (ASLR, DEP, HEVA, `_ROINIT`, and x64 CET), and a matching `bin\SHA256SUMS.txt`.
+  Investigate any difference before going on.
 - [ ] Optionally repeat in a second clean checkout of the same commit.
-- [ ] Record the source commit, toolchain versions, build command, and SHA-256.
-- [ ] Run `selftest` and the Python crypto verifier against the exact executable
-  being published.
+- [ ] Record the source commit, MSVC/SDK/LLVM toolchain versions, build commands,
+  and SHA-256 hashes for both `vordr.exe` and `vordr-arm64.exe`.
+- [ ] Run `bin\vordr.exe selftest`, `python tests\verify_crypto.py --exe bin\vordr.exe`,
+  and the ARM64 Unicorn crypto/E2E suites (`tests\arm64\test_sha.py`,
+  `test_blake2b_argon2.py`, `test_aesgcm.py`, `test_arm64_e2e.py`) against the
+  exact binaries being published.
 - [ ] Confirm no `dbg`, `probeio`, or `guishow` flags were used.
 
 The gate's normal restored build is not the final reproducible release artifact.
-Build the intended release explicitly before packaging it.
+Build the intended release binaries explicitly before packaging them.
 
-## 3. Package and test the MSI
+## 3. Package and test the universal MSI
 
-The gate includes MSI creation and table/costing verification, but does not
+The gate includes universal MSI creation and table/costing verification, but does not
 perform a real installation. Repeat packaging against the exact final release
-executable, not a stale or diagnostic `bin\vordr.exe`.
+executables (`bin\vordr.exe` and `bin\vordr-arm64.exe`), not stale or diagnostic builds.
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\make_msi.ps1
@@ -56,9 +60,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\verify_msi.ps1 -Msi bi
 
 Replace `X.Y.Z` with the release version.
 
-- [ ] Verify tables, policy components, 64-bit registry view, and upgrade range.
-- [ ] In an isolated VM, install over the previous release and confirm exactly
-  one Vordr entry remains in installed applications.
+- [ ] Verify tables, policy components, 64-bit registry view, 5-column
+  `MsiLockPermissionsEx` SDDL rules, live `LaunchConditions` guards, dual-arch
+  (`AMD64`/`ARM64`) costing, and upgrade/downgrade range.
+- [ ] In isolated x64 and ARM64 test environments, install over the previous release
+  and confirm the native binary is deployed and exactly one Vordr entry remains in
+  installed applications.
 - [ ] Test same-version replacement if repackaging is part of the workflow.
 - [ ] Repeat policy properties on upgrade; verify only requested settings are locked.
 - [ ] Verify the shortcut and quoted `.vordr` association with a path containing spaces.
@@ -129,7 +136,8 @@ were confirmed on 2026-09-14; see [the record](RELEASES.md#winget-publication).
 
 ## 6. Vendor submissions
 
-- [ ] Submit each new public executable and MSI to Microsoft's
+- [ ] Submit each new public executable (`vordr.exe` and `vordr-arm64.exe`) and the
+  universal MSI to Microsoft's
   [file submission portal](https://www.microsoft.com/en-us/wdsi/filesubmission)
   and relevant vendors, using their current process.
 - [ ] Include the exact hashes and any observed detection names.

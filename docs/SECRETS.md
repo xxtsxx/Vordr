@@ -9,18 +9,27 @@ when modifying an allocation or context switch.
 
 ## What locking does
 
-`sec_lock_statics` locks every fixed buffer listed in the `sec_regions` table
-(`secmem.asm`) at startup, from the GUI entry point `wstart`. `sec_ws_grow`
-adjusts the working-set reservation first. A static lock failure is recorded and
-shown as a warning; startup does not universally fail closed. The `lktest` probe
-checks that every listed buffer is actually resident-locked
-(`QueryWorkingSetEx`), not just that the call was made.
+`sec_lock_statics` locks all **85** fixed buffers listed in the `.const` `sec_regions`
+table (`secmem.asm`) at startup, from the GUI entry point `wstart`. `sec_ws_grow`
+adjusts the working-set reservation first (floored at 80 MiB minimum via
+`SetProcessWorkingSetSizeEx` hard-min / soft-max flags). A static lock failure is
+recorded and shown as a warning; startup does not universally fail closed. The `lktest`
+probe checks that every listed buffer is actually resident-locked (`QueryWorkingSetEx`),
+not just that the call was made.
 
-`secmem_alloc` allocates, `VirtualLock`-pins, and registers a dynamic arena with its
-tracking metadata stored out-of-line in `g_secmem_live` (no header bytes placed inside
-or adjacent to the caller's locked pages). It returns failure rather than handing an
-unlocked arena to the caller. `secmem_free` wipes a registered live allocation and
-verifies `VirtualFree(MEM_RELEASE)` before clearing its registry slot.
+`secmem_alloc` allocates a page-rounded arena followed by a trailing 4 KiB
+`PAGE_NOACCESS` guard page, `VirtualLock`-pins the arena, and registers it in the
+out-of-line 1024-slot `g_secreg` registry serialized by an `SRWLOCK` (`g_secreg_lock`;
+no header bytes are placed inside or adjacent to the caller's locked pages). It returns
+failure rather than handing an unlocked arena to the caller. `secmem_free` wipes a
+registered live allocation and verifies `VirtualFree(MEM_RELEASE)` before clearing its
+registry slot.
+
+After startup initialization completes, `iat_lockdown` seals both the PE import table
+and the 4 KiB-isolated `_ROINIT` section (`g_stack_canary`, `g_ptr_cookie`,
+`g_sstk_tls`, `g_cpu_features`, `g_img_lo`, `g_img_hi`) as `PAGE_READONLY`, and
+`crash_install` configures `WerSetFlags(0x000001E1)` plus `WerAddExcludedApplication`
+to exclude heap dumps and crash snapshots from Windows Error Reporting.
 
 Successful [VirtualLock](https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtuallock)
 keeps the specified pages resident and out of ordinary paging while locked.
@@ -58,8 +67,9 @@ code buffers (`g_totp_code6`, `g_totp_code_w`, `g_totp_disp_w`).
 | `g_tilefiles`, `g_tileblob`, `g_imgstageref` | gui | Attachment references, each with its file key | Vault-window close |
 | `g_conv_w`, `g_valblob`, `g_lblblob` | gui | Display and commit scratch: field values and labels | Vault-window close |
 | `g_conv`, `g_convlabel` | vault | UTF-8 field/label scratch | Vault lock and vault-window close |
-| Active vault body | vault via secmem | Decrypted records, including history and attachment references | `secmem_free` |
+| Active vault body (`g_body_ptr`) & foreign import body (`g_foreign_body`) | vault via secmem | Decrypted records, including history and attachment references (plus temporary foreign-import bodies) | `secmem_free` (atomic null-before-free on `g_body_ptr`) |
 | Edit transaction bodies | gui via secmem | Original body and working copy | Success releases original; failure restores original and releases working copy |
+| Off-screen compositor DIB (`g_comp_bits`) | gui via `sec_lock` | Rendered 32-bit window frame (may hold revealed fields during paint) | `gui_comp_flush` zeroes, `VirtualUnlock`s, and clears pointer + `mfence` before `DeleteObject`; also wiped directly in `secmem_panic_wipe` (capped at 64 MiB) |
 
 History buffer sizes use `MAX_PWHIST`, `PWHIST_ENTRY`, `MAX_PWORIG`,
 `PWORIG_STRIDE`, and `PWHBLOB_ENTRY`. Keep their allocation, lock, and wipe
@@ -80,9 +90,9 @@ Not every secret-bearing allocation is managed by `secmem_alloc`.
 | `g_urlbuf`, `g_urlbuf2` | URLs may contain private hosts or tokens; wiped after the launch path, and only explicit `http://` / `https://` schemes are passed to `ShellExecuteW` |
 | ZIP export buffers | Plaintext JSON (in a `secmem` arena), password copies, keys, and archive staging; normal cleanup in `ze_compose`/`ze_free` |
 | ZIP import | The decrypted JSON is in a `secmem` arena; the raw archive is `VirtualLock`ed best-effort while it is parsed |
-| Crypto stack frames and registers | AES-GCM (`gcm_seal`/`gcm_open` including `xmm6`), SHA-256 (`sha256_init`/`update`/`final`), SHA-1, BLAKE2b, HOTP/TOTP (`g_totp_key` 160 B + `totp_now` stack), and password-generation helpers wipe stack scratch and volatile `xmm0..xmm5` registers on return; AES key expansion uses hardware `aeskeygenassist` without table S-boxes |
+| Crypto stack frames and registers | AES-GCM (`gcm_seal`/`gcm_open` including `xmm6`), SHA-256 (`sha256_init`/`update`/`final`), SHA-1, BLAKE2b, HOTP/TOTP (`g_totp_key` 160 B + `totp_now` stack), `ct_memcmp`, and password-generation helpers wipe stack scratch and volatile vector registers (`xmm0..xmm5` / `ymm` on x64; `v0..v31` on ARM64) on return; AES key expansion uses hardware instructions (`aeskeygenassist` on x64; `AESE` on ARM64) without table S-boxes |
 | Attachment staging/open buffers | Plaintext copies are allocated in `secmem` arenas (`attach_stage`, `attach_open`, `gui_tile_view`, `gui_tile_download`) and wiped on teardown |
-| Windows controls and API buffers | Password and secret `EDIT` controls detach IME (`ImmAssociateContext(hwnd, 0)`) on creation and are scrubbed via `gui_edit_scrub` (overwriting `CONVW_MAX - 1` wide chars with `'X'`, `EM_EMPTYUNDOBUFFER`, `EM_SETSEL` + `WM_CLEAR`, and `SetWindowTextW("")`) before teardown, though OS/control internal allocations and clipboard/provider copies can still exist outside application arrays |
+| Windows controls and API buffers | Password and secret `EDIT` controls detach IME (`ImmAssociateContext(hwnd, 0)`) on creation, route `WM_COPY`/`WM_CUT` through `gui_copy` (clipboard exclusion + auto-clear timer), and are scrubbed via `gui_edit_scrub` (overwriting `CONVW_MAX - 1` wide chars with `'X'`, `EM_EMPTYUNDOBUFFER`, `EM_SETSEL` + `WM_CLEAR`, and `SetWindowTextW("")`) before teardown, though OS/control internal allocations and clipboard/provider copies can still exist outside application arrays |
 
 These are implementation limitations, not a claim that sensitive intermediate
 values are harmless. Wiping a working buffer cannot erase a copy already made
@@ -127,15 +137,20 @@ Preview files are created exclusively inside separate random temporary
 directories (`%TEMP%\VordrPreview-<hex>`) protected by an inheritable
 (`OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE`), protected (`SE_DACL_PROTECTED`)
 owner+`SYSTEM` DACL plus `S:(ML;;NW;;;ME)`. At GUI startup, `gui_temp_sweep_stale`
-also overwrites and removes any stale `VordrPreview-*` directories left by a prior
-power cut or forced stop. Attachment filenames are sanitized via
-`gui_sanitize_attname` to strip directory components, drive prefixes, ADS
-`:stream` suffixes, control characters, trailing dots/spaces, and reserved DOS
-device names. `gui_temp_purge` attempts overwrite, flush, deletion, and
-directory removal. Failed cleanup stays tracked; the locked tray retries every
-five seconds. Normal Exit asks the user to close blocked viewers. Forced
-termination or shutdown can leave files behind, and overwrite/delete is not
-guaranteed physical erasure.
+sweeps stale `VordrPreview-*` directories left by a prior power cut or forced stop
+strictly by handle (`gui_sweep_handle_ok`): it opens candidate files exclusively
+(`dwShareMode = 0`) with `FILE_FLAG_OPEN_REPARSE_POINT`, rejects directories, reparse
+points, and NTFS hardlinks (`nNumberOfLinks > 1`), verifies the canonical handle path
+(`GetFinalPathNameByHandleW`) begins with `%TEMP%\VordrPreview-` plus a subdirectory
+separator `\`, clears read-only attributes via `SetFileInformationByHandle`
+(`FileBasicInfo`), overwrites and flushes, and deletes by handle via
+`FileDispositionInfo`. Attachment filenames are sanitized via `gui_sanitize_attname`
+to strip directory components, drive prefixes, ADS `:stream` suffixes, control
+characters, trailing dots/spaces, and reserved DOS device names. `gui_temp_purge`
+attempts overwrite, flush, deletion, and directory removal. Failed cleanup stays
+tracked; the locked tray retries every five seconds. Normal Exit asks the user to
+close blocked viewers. Forced termination or shutdown can leave files behind, and
+overwrite/delete is not guaranteed physical erasure.
 
 Every preview temporary file and downloaded attachment receives a Mark of the
 Web (`Zone.Identifier`, `ZoneId=3`) verified fail-closed by `gui_motw` before

@@ -27,7 +27,8 @@ Run these from the repository root:
 |---|---|
 | `build.cmd` | Normal executable; static checker failures are advisory |
 | `build.cmd strict` | Normal executable; checker nonzero exits fail the build |
-| `build.cmd release strict` | Reproducible build (normalised by `tools\pe_normalise.py`, hash in `bin\SHA256SUMS.txt`) plus strict checks; use for release preparation |
+| `build.cmd release strict` | Reproducible x64 build (normalised by `tools\pe_normalise.py`, hash merged into `bin\SHA256SUMS.txt`) plus strict checks; use for release preparation |
+| `build_arm64.cmd release` | Reproducible native ARM64 build (`bin\vordr-arm64.exe`, normalised by `tools\pe_normalise.py`, hash merged into `bin\SHA256SUMS.txt`); see [ARM64.md](ARM64.md) |
 | `build.cmd probeio strict` | File-writing diagnostic verbs for synthetic tests |
 | `build.cmd dbg strict` | Debug traces and fault injection; includes probe I/O |
 | `build.cmd nohw strict` | Omits CET compatibility; keeps software checks |
@@ -64,11 +65,12 @@ unlock or a request to replace the configured vault.
 
 | Command | What it checks | Needs |
 |---|---|---|
-| `python tests\redteam.py bin\vordr.exe` | Each fault-injection case ends with its own fail-fast code; a plain fault is contained and leaves a breadcrumb | `dbg` build |
+| `python tests\redteam.py bin\vordr.exe` | 13 deliberate fault-injection and hardening cases (19 assertions): fail-fast `0xFADE*` codes, `System32`-only DLL loading (`dllhijack`), and contained `0xC0000409` crash breadcrumbs | `dbg` build |
 | `python tests\verify_vault.py bin\vordr.exe` | An independent reader (own RFC 9106 Argon2id) decrypts real vaults from `docs/formats.md` alone; every region is tamper-checked; nonces differ per save | `probeio` or `dbg` |
 | `python tests\compattest.py bin\vordr.exe` | The frozen v0.2.3 vaults in `tests\fixtures` still open, with the same contents | `probeio` or `dbg` |
-| `tests\guitest.ps1` | A real Vordr window driven from outside (`tests\lib\gui.psm1`): input limits, the drawn scrollbars (entry list, checklist, the detail pane on a `seedbig` vault), lock while a dialog is open, what a lock wipes | `probeio` or `dbg`, an interactive desktop |
-| `tools\verify_repro.ps1` | Two clean `release strict` builds are byte-identical and keep ASLR/DEP/HEVA/CET | Release preparation |
+| `tests\guitest.ps1` | A real Vordr window driven from outside (`tests\lib\gui.psm1`, 128+ checks): input limits, drawn scrollbars, 15 theme palettes, 8 backdrops, `WM_COPYDATA` rejection, screen-capture exclusion, lock while a dialog is open, what a lock wipes | `probeio` or `dbg`, an interactive desktop |
+| `python tests\arm64\test_arm64_e2e.py` *(+ `test_sha.py`, `test_blake2b_argon2.py`, `test_aesgcm.py`)* | Unicorn-emulated ARM64 unit crypto KATs, constant-time SHA traces, release `selftest` (`FEAT_RNG=0/1`), fail-closed `cpu_gate`, x64-identical `katreport`, 22 probeio KATs/fuzzers, and cross-arch `.vordr` vault interop | LLVM (`clang`/`llvm-lib`), Python `unicorn` |
+| `tools\verify_repro.ps1` | Two clean builds of both `vordr.exe` (x64) and `vordr-arm64.exe` (ARM64) are byte-identical, keep mitigations, and match `bin\SHA256SUMS.txt` | Release preparation |
 | `tools\compare.ps1 <test> -Ref <commit>` | The test fails on an older commit and passes on the working tree | git, the toolchain |
 
 Tests keep away from the user's own Vordr. A `probeio`/`dbg` build remaps
@@ -153,8 +155,10 @@ that may contain secrets.
 ## CI and releases
 
 [The build workflow](../.github/workflows/build.yml) runs on pushes, pull requests,
-manual dispatch, and a nightly schedule. It runs the gate, creates a separate
-reproducible executable, and uploads the executable and crypto-check output.
+manual dispatch, and a nightly schedule. It runs the six-stage gate, creates clean
+reproducible x64 (`vordr.exe`) and ARM64 (`vordr-arm64.exe`) release builds, packages
+and verifies the universal MSI, and uploads both `vordr-release` (`vordr.exe`,
+`vordr-arm64.exe`, `vordr-*.msi`, `SHA256SUMS.txt`) and `crypto-proof` artifacts.
 Stage logs are uploaded on failure.
 
 A CI artifact is not automatically a tagged release. Follow the

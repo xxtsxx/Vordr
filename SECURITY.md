@@ -30,31 +30,33 @@ Vordr is a single-maintainer, pre-1.0 project:
 
 ## Scope and trust model
 
-This policy covers the Vordr executable, cryptographic and container implementations,
-ZIP/JSON parsers, registry policy resolution, and build/MSI packaging scripts in this
-repository.
+This policy covers the Vordr x64 and ARM64 executables (`vordr.exe`, `vordr-arm64.exe`),
+cryptographic and container implementations, the ARM64 translator/ISA assembly,
+ZIP/JSON parsers, registry policy resolution, and build/universal-MSI packaging scripts
+in this repository.
 
 Protected assets include master passwords, derived vault and attachment keys, decrypted
-records, TOTP secrets, field history, and attached files. Vordr treats vault files,
-native/ZIP imports, attachment filenames, registry values, `WM_COPYDATA` IPC payloads,
-and command-line arguments as untrusted inputs. Clipboard copies and preview/downloaded
-files intentionally cross into external OS/application boundaries; optional TPM unlock
-additionally relies on local Windows Platform Crypto Provider and TPM 2.0 state.
+records, TOTP secrets, PINs, field history, and attached files. Vordr treats vault files,
+native/ZIP imports, attachment filenames, registry values, named-pipe IPC messages
+(and rejected legacy `WM_COPYDATA` messages), and command-line arguments as untrusted
+inputs. Clipboard copies and preview/downloaded files intentionally cross into external
+OS/application boundaries; optional TPM unlock additionally relies on local Windows
+Platform Crypto Provider, Windows Hello (`webauthn.dll`), and TPM 2.0 state.
 
 ### In scope
 
 - Recovering vault plaintext or key material without the master password through an unintended path.
 - Forging, splicing, or modifying a vault body, attachment section, save counter, or export without detection.
 - Cryptographic or RNG implementation flaws, parameter-validation bypasses, or observable timing leaks on secret comparisons/key schedules.
-- Memory-safety or Win64 ABI violations reachable via files, archives, attachments, IPC, registry data, or CLI arguments.
-- Secret residue persisting past lock/close in application buffers, temporary preview files, clipboard timers, or crash handlers.
+- Memory-safety or x64/ARM64 ABI violations reachable via files, archives, attachments, IPC, registry data, or CLI arguments.
+- Secret residue persisting past lock/close in application buffers, compositor bitmaps, temporary preview files, clipboard timers, or crash handlers.
 - Bypasses of documented policy controls (`HKLM\SOFTWARE\Vordr` fail-closed locks, read-only mode, `SecureUnlock` policy enforcement, modal auto-lock, or DLL search-order lockdown).
 - Build or installer defects that break reproducibility, silently skip strict verification gates, or permit MSI downgrades/ACL weaknesses.
 
 Evaluate findings against documented prerequisites: deliberate TPM convenience unlock
 is an alternative local key-unwrapping path rather than a password bypass, whereas
-transplanting a TPM blob across vaults or bypassing a locked `TpmRequireHello` /
-`SecureUnlock` policy **is** in scope.
+transplanting a TPM blob across vaults or bypassing a locked `TpmMinMode` /
+`TpmRequireHello` / `SecureUnlock` policy **is** in scope.
 
 ### Out of scope (architectural boundaries)
 
@@ -88,12 +90,15 @@ Because Vordr contains no network updater or telemetry, users apply updates manu
 ## Verification and earned assurance
 
 Every download can be checked against its published SHA-256 in [RELEASES.md](docs/RELEASES.md)
-and rebuilt byte-for-byte from its git tag (`tools\verify_repro.ps1`). The repository
-enforces a six-stage automated gate (`tests\run_all.cmd`): 12 fault-injection and
-containment checks, 10 static source/ABI/resource/doc analyzers plus PE `LOAD_CONFIG`
-verification, 23 startup known-answer suites, 35+ fuzz/round-trip/policy/TPM/GUI probes
-with an independent zero-shared-code vault reader, 83 differential + published crypto
-vectors, and MSI table/costing/downgrade verification.
+and rebuilt byte-for-byte from its git tag (`tools\verify_repro.ps1`, verifying both
+x64 `vordr.exe` and ARM64 `vordr-arm64.exe`). The repository enforces a six-stage
+automated gate (`tests\run_all.cmd`): 13 fault-injection and containment cases,
+10 static source/ABI/resource/doc analyzers plus PE `LOAD_CONFIG`/`_ROINIT`
+verification, 23 startup known-answer suites, 42 fuzz/round-trip/policy/TPM/GPU/desktop
+probes with an independent zero-shared-code vault reader and 128+ isolated GUI checks,
+83 differential + published crypto vectors, and universal x64+ARM64 MSI
+table/costing/`MsiLockPermissionsEx`/downgrade verification—paired with four
+Unicorn-emulated ARM64 crypto and end-to-end test suites (`tests\arm64\test_*.py`).
 
 See [TRUST.md](docs/TRUST.md), [ARCHITECTURE.md](docs/ARCHITECTURE.md), [SECRETS.md](docs/SECRETS.md),
 and [ASSURANCE.md](docs/ASSURANCE.md) for exact coverage and limits. No external third-party

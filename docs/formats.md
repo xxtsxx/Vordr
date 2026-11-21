@@ -109,8 +109,8 @@ when rewriting metadata.
 | 14 | `VF_DELETED` | Trash timestamp, 16 hexadecimal FILETIME characters |
 | 15 | `VF_GROUP` | Section-heading text |
 | 16 | `VF_SPACER` | Blank layout gap |
-| 17 | `VF_SYSTEM` | First-field system marker; one-byte schema version |
-| 18 | `VF_SYS_PWVERIFY` | u64 reminder FILETIME |
+| 17 | `VF_SYSTEM` | Unlabelled first-field (`field[0]`) system marker; one-byte schema version (at most one system entry per vault) |
+| 18 | `VF_SYS_PWVERIFY` | Unlabelled u64 reminder FILETIME (valid only inside the `VF_SYSTEM` entry) |
 | 19 | Retired | Earlier grace-period field; do not reuse |
 | 20 | `VF_PIN` | PIN / passcode secret (UTF-8; evaluated by `pin_eval` rather than password class rules) |
 
@@ -202,14 +202,15 @@ A version-2 image must have a valid file MAC. Version 1, which could omit the
 trailer, is not accepted. The KCV and GCM tag use constant-time comparisons;
 the full-file MAC is also verified before record data is exposed.
 
-The counter is mirrored per vault under `HKCU\SOFTWARE\Vordr\Rollback`, keyed by the
-canonicalized handle path (`GetFinalPathNameByHandleW`) so alternate path spellings,
-junctions, and casing share one high-water mark (`rbtest`). `reg_ctr_set` enforces
-monotonicity—never overwriting a stored 8-byte counter with a smaller value—and
-`vault_seal_write` refuses to wrap `u64` `-1`. An older file counter raises a rollback
-warning on both password and TPM unlock. Because the mirror resides in user-writable
-local registry state rather than hardware monotonic storage, restoring both the vault
-and `HKCU` (or opening an older copy on a fresh machine) cannot be detected locally.
+The counter is mirrored per vault under `HKCU\SOFTWARE\Vordr\Rollback`, named by the
+32-character lowercase hex `SHA-256` prefix (`[:16]`) of the upper-cased canonicalized
+handle path (`GetFinalPathNameByHandleW`) so alternate path spellings, junctions, and
+casing share one high-water mark (`rbtest`). `reg_ctr_set` enforces monotonicity—never
+overwriting a stored 8-byte counter with a smaller value—and `vault_seal_write` refuses
+to wrap `u64` `-1`. An older file counter raises a rollback warning on both password and
+TPM unlock. Because the mirror resides in user-writable local registry state rather than
+hardware monotonic storage, restoring both the vault and `HKCU` (or opening an older copy
+on a fresh machine) cannot be detected locally.
 
 ## Writes and concurrency
 
@@ -229,11 +230,13 @@ For the transaction and failure flow, see [Architecture](ARCHITECTURE.md#save-an
 ## TPM-Unlock registry envelopes
 
 When TPM convenience unlock is enrolled, `HKCU\SOFTWARE\Vordr\TPM-Unlock` stores a
-`REG_BINARY` envelope named by the canonical vault path (`TPM_BLOB_CAP = 1024` bytes).
-Active envelopes start with magic `VTPM` (`0x4D505456` LE) and `version = 1`; legacy
-raw RSA-OAEP blobs (`256..512` bytes, no `VTPM` prefix) are accepted only when the
-effective `TpmUnlockMode` is `1` (`TPM_MODE_ALONE`). If the stored envelope's `mode`
-differs from the effective policy mode, Vordr skips unsealing and prompts for the
+`REG_BINARY` envelope named by the 32-character lowercase hex `SHA-256` prefix (`[:16]`)
+of the upper-cased canonical vault path (`TPM_BLOB_CAP = 1024` bytes; pre-C6 raw-path
+value names are pruned automatically). Active envelopes start with magic `VTPM`
+(`0x4D505456` LE) and `version = 1`; legacy raw RSA-OAEP blobs (`256..512` bytes, no
+`VTPM` prefix) are accepted only when the effective `TpmUnlockMode` is `1`
+(`TPM_MODE_ALONE`). If the stored envelope's `mode` differs from the effective policy
+mode or violates `blob_mode >= g_tpm_want`, Vordr skips unsealing and prompts for the
 master password.
 
 - **Mode 1 — TPM Alone (`272` bytes)**:
@@ -246,4 +249,4 @@ master password.
   (`main_tpm_ct` silently seals `tpm_secret[32]` under machine PCP key `Vordr-<KCV>`; `Argon2id(pin, pin_salt, t=2, m=65536 KiB, p=1)` yields `k_wrap[32..63]` so `wrap_key = BLAKE2b-256(tpm_secret || k_wrap)` decrypts `enc_vkey` with `AAD = inv_hdr[68]` without tripping OS-wide TPM dictionary-attack lockout.)
 - **Mode 3 — TPM + Windows Hello (`336 + ct_hello_len` bytes, `ct_hello_len` in `65..512`)**:
   `u32 "VTPM" | u16 ver=1 | u8 mode=3 | u8 rsv=0 | u32 rsv2=0 | u32 total_len | u16 ct_tpm_len=256 | u16 ct_hello_len | byte[256] tpm_ct | byte[ct_hello_len] hello_ct | byte[12] gcm_iv | byte[32] enc_vkey | byte[16] gcm_tag`
-  (`tpm_ct` seals `tpm_secret[32]` under PCP `Vordr-<KCV>`; `hello_ct` is a `WHLO` v1 envelope (`u32 "WHLO" | u16 ver=1 | u16 cred_len | byte[24] prf_salt | byte[32] masked_secret | byte[cred_len] cred_id`) backed by a Windows Hello platform FIDO2 `PRF` (`hmac-secret`) credential via `webauthn.dll`; `wrap_key = BLAKE2b-256(tpm_secret || hello_secret)` decrypts `enc_vkey` with `AAD = blob[0..19] || inv_hdr[68]`.)
+  (`tpm_ct` seals `tpm_secret[32]` under PCP `Vordr-<KCV>`; `hello_ct` is a `WHLO` v1 envelope (`u32 "WHLO" | u16 ver=1 | u16 cred_len | byte[24] prf_salt | byte[32] masked_secret | byte[cred_len] cred_id`) backed by a Windows Hello platform FIDO2 `PRF` (`hmac-secret`) credential via `webauthn.dll`, verifying `UP|UV` authenticator flags and credential ID on both seal and unseal, scrubbing `pbFirst`, and deleting replaced or orphaned platform credentials via `WebAuthNDeletePlatformCredential`; `wrap_key = BLAKE2b-256(tpm_secret || hello_secret)` decrypts `enc_vkey` with `AAD = blob[0..19] || inv_hdr[68]`.)
