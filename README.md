@@ -27,11 +27,11 @@ Most password managers ask you to create an online account, pay a recurring subs
 <br>
 
 <p align="center">
-  <img src="docs/screenshots/vault-entry.png" alt="Vordr main vault window showing glass entry cards, syntax-colored password, and live 2FA countdown ring" width="820">
+  <img src="docs/screenshots/vault-entry.png" alt="Vordr main vault window showing glass entry cards, syntax-colored password, and live 2FA countdown bar" width="820">
 </p>
 
 <p align="center">
-  <em>Midnight palette with Cut planes backdrop — glass entry cards, syntax-colored passwords, and live two-factor codes (synthetic demo vault).</em>
+  <em>Gruvbox palette (default) with Cut planes backdrop — glass entry cards, syntax-colored passwords, and live two-factor codes (synthetic demo vault).</em>
 </p>
 
 <br>
@@ -76,7 +76,7 @@ See the [update guide](docs/USER_GUIDE.md#updates) for portable copies and manag
 | Everyday need | How Vordr handles it |
 |---|---|
 | **Logins, PINs & custom records** | Store usernames, passwords, dedicated PIN codes (checked with PIN-specific length and pattern rules rather than password rules), website links, notes, custom-labeled fields, favorites, custom icons, field change history, Vault Health checks, and a Trash view. |
-| **Two-factor codes (2FA)** | Built-in TOTP code generator with a live radial countdown ring, right alongside your login. |
+| **Two-factor codes (2FA)** | Built-in TOTP code generator with a live countdown bar, right alongside your login. |
 | **Private files & images** | Attach sensitive PDFs, recovery codes, photos, or text files directly inside an entry—encrypted inside the same `.vordr` file. |
 | **Strong password & PIN generator** | Create random passwords, multi-word passphrases, pronounceable strings, non-trivial PINs, or hex keys in one click. |
 | **Automatic tidy-up** | Clears copied secrets from the clipboard after 20 seconds, hides Vordr windows from ordinary screenshots and screen-sharing by default, locks automatically when you step away or lock Windows, and can prompt for your master password on an isolated Windows desktop. |
@@ -90,11 +90,11 @@ See the [update guide](docs/USER_GUIDE.md#updates) for portable copies and manag
 
 Choose from **14 color palettes** (plus *Follow Windows* light/dark switching) and **7 procedural backdrops** (plus *Flat*), all rendered cleanly offline without flicker:
 
-| Gruvbox (default) · Low-poly neon | Sapphire · Corner mosaic |
+| Emerald · Low-poly neon | Midnight · Corner mosaic |
 | :---: | :---: |
-| ![Vordr in Gruvbox palette with Low-poly neon backdrop](docs/screenshots/theme-gruvbox.png) | ![Vordr in Sapphire palette with Corner mosaic backdrop](docs/screenshots/theme-mosaic.png) |
-| **Edit mode · Inline generator & 2FA** | **Settings · Security, TPM & themes** |
-| ![Vordr edit mode showing field controls and inline password generator](docs/screenshots/edit-entry.png) | ![Vordr Settings screen in Catppuccin palette with Guardian sigil backdrop](docs/screenshots/settings.png) |
+| ![Vordr in Emerald palette with Low-poly neon backdrop](docs/screenshots/theme-neon.png) | ![Vordr in Midnight palette with Corner mosaic backdrop](docs/screenshots/theme-mosaic.png) |
+| **OLED Black · Crystal rim (Edit mode)** | **Solarized · Guardian sigil (Settings)** |
+| ![Vordr edit mode in OLED Black palette with Crystal rim backdrop showing field controls and inline password generator](docs/screenshots/edit-entry.png) | ![Vordr Settings screen in Solarized palette with Guardian sigil backdrop](docs/screenshots/settings.png) |
 
 ---
 
