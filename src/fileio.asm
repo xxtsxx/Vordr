@@ -35,7 +35,9 @@ extern GetFileAttributesW:proc          ; reject reparse points on rename target
 extern tagged_alloc:proc
 extern tagged_free:proc
 extern gui_build_user_dacl:proc
+extern SetSecurityInfo:proc
 externdef g_tmp_sd:byte
+externdef g_tmp_acl:byte
 externdef g_vault_lock:dword
 
 MOVEFILE_REPLACE_EXISTING equ 1
@@ -65,6 +67,8 @@ g_rf_cap    dq ?                       ; one-shot read_file size cap (0 = none):
                                        ;   past it is refused before anything is allocated
 public g_wf_disp
 g_wf_disp   dd ?                       ; C7: one-shot write_file disposition override
+public g_wf_inherit_acl
+g_wf_inherit_acl dd ?                  ; A3-14: one-shot flag set ONLY for HKLM-locked vault saves
 public g_wf_created
 g_wf_created dd ?                     ; last write_file actually created/opened its file
 align 2                               ;     (0 = CREATE_ALWAYS default; caller sets CREATE_NEW)
@@ -95,35 +99,41 @@ fv_bhfi     db 64 dup (?)                      ; BY_HANDLE_FILE_INFORMATION (52 
 .code
 
 ; fpa_lexical_ok(rcx = wide path) -> eax = 1 lexically allowed / 0 refused.
+;   A3-01 / A3-14: requires exact "\\?\" (never "\\?/" or "//?/"), rejects ".."
+;   segments inside "\\?\" paths, and rejects NTFS ADS ':' colons lexically
+;   before CreateFileW can create/truncate streams or initiate SMB/pipe opens.
 fpa_lexical_ok proc
     test    rcx, rcx
     jz      fpal_no
     cmp     word ptr [rcx], 0
     je      fpal_no
+    xor     r9d, r9d                            ; r9d = 1 iff literal "\\?\" prefix
     movzx   eax, word ptr [rcx]
     cmp     ax, 5Ch
     je      fpal_bs1
     cmp     ax, '/'
-    jne     fpal_ok
+    jne     fpal_scan_ads
 fpal_bs1:
     movzx   eax, word ptr [rcx+2]
     cmp     ax, 5Ch
     je      fpal_bs2
     cmp     ax, '/'
-    jne     fpal_ok
+    jne     fpal_scan_ads
 fpal_bs2:
     ; starts with "\\" or "//"
     movzx   eax, word ptr [rcx+4]
     cmp     ax, '.'
-    je      fpal_no                             ; "\\.\" device namespace -> refuse ALWAYS
+    je      fpal_no                             ; "\\.\" or "//./" device namespace -> refuse ALWAYS
     cmp     ax, '?'
     jne     fpal_unc                            ; "\\server\..." -> check g_allow_unc
-    movzx   eax, word ptr [rcx+6]
-    cmp     ax, 5Ch
-    je      fpal_qbody
-    cmp     ax, '/'
+    ; Exact "\\?\" ONLY (never "\\?/", "//?\", or "//?/") - only literal "\\?\" disables Win32 canonicalization
+    cmp     word ptr [rcx], 5Ch
     jne     fpal_no
-fpal_qbody:
+    cmp     word ptr [rcx+2], 5Ch
+    jne     fpal_no
+    cmp     word ptr [rcx+6], 5Ch
+    jne     fpal_no
+    mov     r9d, 1
     ; "\\?\" prefix: allow "\\?\X:\..." local drive; check "\\?\UNC\..."; refuse others
     movzx   eax, word ptr [rcx+8]
     or      ax, 20h
@@ -144,22 +154,68 @@ fpal_qbody:
     or      ax, 20h
     cmp     ax, 'c'
     jne     fpal_no
-    movzx   eax, word ptr [rcx+14]
-    cmp     ax, 5Ch
-    je      fpal_unc
-    cmp     ax, '/'
-    je      fpal_unc
-    jmp     fpal_no
+    cmp     word ptr [rcx+14], 5Ch
+    jne     fpal_no
+    cmp     dword ptr [g_allow_unc], 0
+    je      fpal_no
+    jmp     fpal_qdotdot
 fpal_qdrive:
-    movzx   eax, word ptr [rcx+12]
-    cmp     ax, 5Ch
-    je      fpal_ok
+    cmp     word ptr [rcx+12], 5Ch
+    jne     fpal_no
+fpal_qdotdot:
+    ; Reject any ".." segment or '/' inside "\\?\" paths
+    lea     r10, [rcx+8]
+fpal_dd_lp:
+    movzx   eax, word ptr [r10]
+    test    ax, ax
+    jz      fpal_scan_ads
     cmp     ax, '/'
-    je      fpal_ok
-    jmp     fpal_no
+    je      fpal_no
+    cmp     ax, 5Ch
+    jne     fpal_dd_nx
+    cmp     word ptr [r10+2], '.'
+    jne     fpal_dd_nx
+    cmp     word ptr [r10+4], '.'
+    jne     fpal_dd_nx
+    movzx   edx, word ptr [r10+6]
+    test    dx, dx
+    jz      fpal_no
+    cmp     dx, 5Ch
+    je      fpal_no
+    cmp     dx, '/'
+    je      fpal_no
+fpal_dd_nx:
+    add     r10, 2
+    jmp     fpal_dd_lp
 fpal_unc:
     cmp     dword ptr [g_allow_unc], 0
     je      fpal_no
+fpal_scan_ads:
+    ; Reject any ':' outside drive colon (index 1 for "X:..." or index 5 for "\\?\X:\...")
+    xor     r8d, r8d
+fpal_ads_lp:
+    movzx   eax, word ptr [rcx + r8*2]
+    test    ax, ax
+    jz      fpal_ok
+    cmp     ax, ':'
+    jne     fpal_ads_nx
+    cmp     r8d, 1
+    jne     fpal_ads_5
+    movzx   edx, word ptr [rcx]
+    or      dx, 20h
+    cmp     dx, 'a'
+    jb      fpal_no
+    cmp     dx, 'z'
+    ja      fpal_no
+    jmp     fpal_ads_nx
+fpal_ads_5:
+    cmp     r8d, 5
+    jne     fpal_no
+    test    r9d, r9d
+    jz      fpal_no
+fpal_ads_nx:
+    inc     r8d
+    jmp     fpal_ads_lp
 fpal_ok:
     mov     eax, 1
     ret
@@ -170,10 +226,11 @@ fpa_lexical_ok endp
 
 ; =============================================================================
 ; file_path_allowed(rcx = wide path) -> eax = 1 allowed / 0 refused.
-;   Pre-CreateFileW gate: blocks Win32 device namespace (\\.\, \\?\GLOBALROOT)
-;   unconditionally, resolves relative/drive-relative paths in user mode via
-;   GetFullPathNameW, and blocks UNC + mapped remote drives (DRIVE_REMOTE = 4)
-;   before any SMB/WebDAV NTLM handshake can occur unless HKLM AllowUncVault != 0.
+;   Pre-CreateFileW gate: blocks Win32 device namespace (\\.\, \\?\GLOBALROOT,
+;   bare DOS devices) and NTFS ADS colons unconditionally, resolves relative /
+;   non-\\?\ paths in user mode via GetFullPathNameW (even when AllowUncVault!=0),
+;   and blocks UNC + mapped remote drives (DRIVE_REMOTE = 4) before any
+;   SMB/WebDAV NTLM handshake can occur unless HKLM AllowUncVault != 0.
 ; =============================================================================
 public file_path_allowed
 file_path_allowed proc frame
@@ -182,8 +239,6 @@ file_path_allowed proc frame
     call    fpa_lexical_ok
     test    eax, eax
     jz      fpa_no
-    cmp     dword ptr [g_allow_unc], 0
-    jne     fpa_ok
     mov     r10, qword ptr [rbp-24]
     cmp     word ptr [r10], 5Ch
     jne     fpa_resolve
@@ -191,7 +246,14 @@ file_path_allowed proc frame
     jne     fpa_resolve
     cmp     word ptr [r10+4], '?'
     jne     fpa_resolve
-    ; Already "\\?\X:\..." -> verify X:\ is not a mapped remote network drive
+    cmp     word ptr [r10+6], 5Ch
+    jne     fpa_no
+    ; Literal "\\?\" path already validated by fpa_lexical_ok
+    cmp     dword ptr [g_allow_unc], 0
+    jne     fpa_ok
+    ; Under AllowUncVault=0, must be "\\?\X:\..." -> verify X:\ is not DRIVE_REMOTE
+    cmp     word ptr [r10+10], ':'
+    jne     fpa_no
     movzx   eax, word ptr [r10+8]
     jmp     fpa_chk_drv
 
@@ -205,6 +267,8 @@ fpa_resolve:
     call    fpa_lexical_ok
     test    eax, eax
     jz      fpa_no
+    cmp     dword ptr [g_allow_unc], 0
+    jne     fpa_ok
     lea     r10, [fpa_full]
     cmp     word ptr [r10+2], ':'
     jne     fpa_no                              ; under AllowUncVault=0 must resolve to X:\...
@@ -531,28 +595,32 @@ write_file proc frame
     call    file_path_allowed
     test    eax, eax
     jz      wf_denied
-    ; AUD-25: apply explicit owner+SYSTEM DACL on personal vaults, .bak0, and exports
-    ; (existing vaults replaced via ReplaceFileW preserve their target ACL; HKLM-locked
-    ; shared vaults inherit parent folder ACL on initial creation).
+    ; AUD-25 / A3-14: apply explicit owner+SYSTEM DACL on personal vaults, .bak0,
+    ; and ALL exports.  Only HKLM-locked shared vault saves (g_wf_inherit_acl=1)
+    ; inherit parent folder ACL; DACL build failure fails closed (never pSA=NULL).
+    mov     eax, dword ptr [g_wf_inherit_acl]
+    mov     dword ptr [g_wf_inherit_acl], 0
     mov     qword ptr [rbp-112], 0
-    cmp     dword ptr [g_vault_lock], 0
-    jne     wf_open
+    mov     edx, GENERIC_WRITE
+    test    eax, eax
+    jnz     wf_open
     mov     ecx, 10000000h                      ; GENERIC_ALL
     xor     edx, edx
     xor     r8d, r8d
     call    gui_build_user_dacl
     test    eax, eax
-    jz      wf_open
+    jz      wf_denied                           ; A3-14: fail closed on DACL build failure
     mov     dword ptr [rbp-104], 24
     lea     rax, [g_tmp_sd]
     mov     qword ptr [rbp-96], rax
     mov     dword ptr [rbp-88], 0
     lea     rax, [rbp-104]
     mov     qword ptr [rbp-112], rax
+    mov     edx, GENERIC_WRITE or 40000h        ; + WRITE_DAC for pre-existing target tightening
 wf_open:
     mov     rcx, qword ptr [rbp-72]
     mov     r10d, dword ptr [rbp-64]
-    WINCALL CreateFileW, rcx, GENERIC_WRITE, 0, qword ptr [rbp-112], r10d, <FILE_ATTR_NORMAL or FILE_FLAG_OPEN_RP>, 0
+    WINCALL CreateFileW, rcx, edx, 0, qword ptr [rbp-112], r10d, <FILE_ATTR_NORMAL or FILE_FLAG_OPEN_RP>, 0
     cmp     rax, -1
     je      wf_io
     mov     qword ptr [rbp-40], rax
@@ -560,6 +628,13 @@ wf_open:
     call    file_validate_handle
     test    eax, eax
     jz      wf_badtype
+    ; Tighten DACL on pre-existing personal export/output handles (CREATE_ALWAYS ignores lpSA on overwrite)
+    cmp     qword ptr [rbp-112], 0
+    je      wf_write
+    cmp     dword ptr [rbp-64], CREATE_ALWAYS
+    jne     wf_write
+    WINCALL SetSecurityInfo, qword ptr [rbp-40], 1, 80000004h, 0, 0, addr g_tmp_acl, 0
+wf_write:
 
     mov     rax, qword ptr [rbp-24]
     mov     dword ptr [g_wf_created], 1
@@ -669,14 +744,24 @@ file_rename proc frame
     mov     r8d, MAX_PATH_CHARS + 16
     call    path_longify
     mov     qword ptr [rbp-32], rax
+    ; A3-15: enforce file_path_allowed on both endpoints before rename
+    mov     rcx, qword ptr [rbp-24]
+    call    file_path_allowed
+    test    eax, eax
+    jz      frn_io
+    mov     rcx, qword ptr [rbp-32]
+    call    file_path_allowed
+    test    eax, eax
+    jz      frn_io
+    mov     dword ptr [rbp-40], 0               ; attempt count
+frn_try:
+    ; A3-15: re-check reparse points on EVERY retry attempt (not only once before Sleep)
     WINCALL GetFileAttributesW, qword ptr [rbp-32]
     cmp     eax, -1
     je      frn_attr_ok
     test    eax, 400h                           ; refuse replacing a symlink / reparse target
     jnz     frn_io
 frn_attr_ok:
-    mov     dword ptr [rbp-40], 0               ; attempt count
-frn_try:
     ; Prefer ReplaceFileW(to, from, NULL, REPLACEFILE_WRITE_THROUGH, 0, 0) so an
     ; existing target's DACLs, owner, encryption attributes, and creation metadata
     ; are preserved across saves; fall back to MoveFileExW when the target does
@@ -864,6 +949,8 @@ pl_len:
     cmp     r8d, MAX_PATH_CHARS
     jb      pl_len
 pl_have:
+    test    r8d, r8d
+    jz      pl_asis                           ; A3-28: empty path -> no OOB read at [r10+2]
     mov     dword ptr [rbp-48], r8d           ; length in chars
     ; ---- classify BEFORE deciding whether it is long ----------------------
     ; The threshold cannot be applied to a relative path's own length: "v.vordr"
@@ -876,7 +963,9 @@ pl_have:
     cmp     word ptr [r10+2], 5Ch
     jne     pl_asis                           ; a lone leading backslash: leave it
     cmp     word ptr [r10+4], '?'
-    je      pl_asis                           ; already prefixed
+    je      pl_asis                           ; already prefixed (or invalid \\?/ caught by gate)
+    cmp     word ptr [r10+4], '.'
+    je      pl_asis                           ; A3-28: "\\.\" device namespace is NOT UNC
     mov     dword ptr [rbp-72], 1             ; kind = UNC
     jmp     pl_measure
 pl_cl_drive:
@@ -983,6 +1072,10 @@ pl_rel:
     jne     pl_rel_drive
     cmp     word ptr [r10+18], 5Ch
     jne     pl_rel_drive
+    cmp     word ptr [r10+20], '.'            ; A3-28: "\\.\<dev>" from GetFullPathNameW is NOT UNC
+    je      pl_asis
+    cmp     word ptr [r10+20], '?'            ; already "\\?\..."
+    je      pl_asis
     ; "\\server\..." sits at char 8; write "\\?\UNC\" over chars 2..9 so the
     ; "server" already at char 10 continues the string.
     mov     word ptr [r10+4],  5Ch
@@ -1025,6 +1118,7 @@ plc_l:
     inc     r8d
     cmp     r8d, MAX_PATH_CHARS
     jb      plc_l
+    mov     word ptr [rcx+r8*2], 0            ; A3-28: always NUL-terminate at cap
 plc_d:
     lea     rax, [rcx+r8*2]
     ret

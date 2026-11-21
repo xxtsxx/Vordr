@@ -123,7 +123,10 @@ def arm_cond(cc, kind):
             raise XlatError(f"carry condition {cc} after inc/dec (CF not modelled)")
         return COND_SUB[cc]
     if kind == "fcmp":
-        m = {"b": "lt", "ae": "ge", "a": "gt", "be": "le", "e": "eq", "ne": "ne",
+        # A3-18: x64 comiss/ucomiss sets ZF=1,PF=1,CF=1 on NaN (ARM64 fcmp sets V=1),
+        # so je/sete is eq|vs and jne/setne is ne&vc (lt/le already include unordered).
+        m = {"b": "lt", "ae": "ge", "a": "gt", "be": "le",
+             "e": ("or", "eq", "vs"), "ne": ("and", "ne", "vc"),
              "p": "vs", "np": "vc"}
         if cc not in m:
             raise XlatError(f"condition {cc} after comiss")
@@ -616,6 +619,9 @@ class Translator:
                 return f"x{t}" if size == 8 else f"w{t}"
             if op.high:
                 t = self.scratch()
+                if size == 8:
+                    self.e(f"{'sbfx' if sx else 'ubfx'} x{t}, x{n}, #8, #8")
+                    return f"x{t}"
                 self.e(f"{'sbfx' if sx else 'ubfx'} w{t}, w{n}, #8, #8")
                 return f"w{t}"
             if op.size == 8:
@@ -938,6 +944,7 @@ class Translator:
             self.e(f".quad {LP_MAGIC:#x}    // LP_MAGIC: DLPV landing pad")
         self.e(".p2align 2")
         has_seh = self.prologue_end is not None
+        self.has_seh = has_seh
         if pub:
             self.e(f".globl {pub}")
         if has_seh:
@@ -996,9 +1003,14 @@ class Translator:
         self.e("stp x6, x7, [sp, #48]")
         self.e(f"bl {self.clabel(key[1])}")
         self.e("mov x0, x8")
-        self.e("mov sp, x29")
+        self.e(".seh_startepilogue")
+        self.e("add sp, sp, #64")
+        self.e(".seh_stackalloc 64")
         self.e("ldp x29, x30, [sp], #16")
+        self.e(".seh_save_fplr_x 16")
         self.e("autibsp")
+        self.e(".seh_pac_sign_lr")
+        self.e(".seh_endepilogue")
         self.e("ret")
         self.e(".seh_endproc")
 
@@ -1199,6 +1211,7 @@ class Translator:
             o0 = ins.ops[0] if ins.ops else None
             is_setup = (mn == "push" and o0.k == "reg") or \
                 (mn == "sub" and o0.k == "reg" and o0.fam == "rsp" and ins.ops[1].k == "imm") or \
+                (mn == "and" and o0.k == "reg" and o0.fam == "rsp" and ins.ops[1].k == "imm") or \
                 (mn == "mov" and o0.k == "reg" and o0.fam == "rbp" and ins.ops[1].k == "reg" and ins.ops[1].fam == "rsp") or \
                 (mn == "lea" and o0.k == "reg" and o0.fam == "rbp" and ins.ops[1].base == "rsp")
             if not is_setup:
@@ -1301,6 +1314,9 @@ class Translator:
     # =====================================================================================
     def translate_ins(self, ins):
         mn = ins.mn
+        # A3-18: never silently drop LOCK on unsupported atomic operations
+        if ins.lock and mn not in ("cmpxchg", "xchg"):
+            raise XlatError(f"unsupported LOCK prefix on {mn}")
         fn = getattr(self, "i_" + mn, None)
         if fn is None:
             if mn.startswith("cmov"):
@@ -1449,6 +1465,7 @@ class Translator:
             self.e(f"ldaxr{sfx} {regw}17, [{t}]")
             self.e(f"stlxr{sfx} w15, {regw}{rr[1:]}, [{t}]")
             self.e(f"cbnz w15, {l1}")
+            self.e("dmb ish")
             self.wr(r, f"{regw}17")
             return
         if a.size == 8 and self.direct(a) and self.direct(b):
@@ -1465,13 +1482,15 @@ class Translator:
         self.wr(b, ("x" if b.size == 8 else "w") + "16")
 
     def _ea_mem(self, m, t):
+        if m.seg not in (None, "ds", "ss", "gs"):
+            raise XlatError(f"segment {m.seg}")
         if m.sym is not None:
             self.e(f"adrp {t}, {self.ref_text(m.sym)}")
             self.e(f"add {t}, {t}, :lo12:{self.ref_text(m.sym)}")
             if m.index:
                 self._add_index(t, m)
         else:
-            self._ea_into(m, t)
+            self._ea_into(m, t, extra_base="x18" if m.seg == "gs" else None)
 
     # -- stack ops ---------------------------------------------------------------------------
     def i_push(self, ins):
@@ -1481,6 +1500,10 @@ class Translator:
         prol = self.in_prologue
         if st0["mode"] == 0:
             # first lowering: sign lr, store it in the x64 return slot [A-8]
+            # A3-18: evaluate [rsp+off] source BEFORE lowering sp
+            pre_val = None
+            if src.k == "mem":
+                pre_val = self.rd(src, 8, sx=True)
             self.e("pacibsp")
             if prol:
                 self.e(".seh_pac_sign_lr")
@@ -1496,16 +1519,25 @@ class Translator:
             self.e("str x30, [sp, #8]")
             if prol:
                 self.e(".seh_save_reg x30, 8")
-            self.push_store(src, 0, prol and src.k == "reg")
+            if pre_val is not None:
+                self.e(f"str {pre_val}, [sp, #0]")
+            else:
+                self.push_store(src, 0, prol and src.k == "reg")
             self.st = st1
             return
+        pre_val = None
+        if src.k == "mem":
+            pre_val = self.rd(src, 8, sx=True)
         grow = st1["s"] - st0["s"]
         if grow:
             self.e(f"sub sp, sp, #{grow}")
             if prol:
                 self.e(f".seh_stackalloc {grow}")
         self.st = st1
-        self.push_store(src, st1["s"] - st1["d"], prol and src.k == "reg")
+        if pre_val is not None:
+            self.e(f"str {pre_val}, [sp, #{st1['s'] - st1['d']}]")
+        else:
+            self.push_store(src, st1["s"] - st1["d"], prol and src.k == "reg")
 
     def push_store(self, src, off, seh):
         if src.k == "reg" and src.size == 8:
@@ -1527,15 +1559,19 @@ class Translator:
         st1 = self.stack_effect(ins, st0)
         d = ins.ops[0]
         off = st0["s"] - st0["d"]
+        shrink = st0["s"] - st1["s"]
         if d.k == "reg" and d.size == 8:
             self.e(f"ldr x{FAM[d.fam]}, [sp, #{off}]")
-        else:
-            self.e(f"ldr x16, [sp, #{off}]")
-            self.wr(d, "x16")
-        shrink = st0["s"] - st1["s"]
+            if shrink:
+                self.e(f"add sp, sp, #{shrink}")
+            self.st = st1
+            return
+        # A3-18: x64 `pop [rsp+disp]` computes destination EA AFTER incrementing rsp by 8
+        self.e(f"ldr x14, [sp, #{off}]")
         if shrink:
             self.e(f"add sp, sp, #{shrink}")
         self.st = st1
+        self.wr(d, "x14")
 
     def stack_sub_add(self, ins):
         st0 = self.st
@@ -1575,6 +1611,8 @@ class Translator:
             while rem:
                 chunk = min(rem & ~0xFFF, 0xFFF000) if rem > 0xFFF else rem
                 self.e(f"add sp, sp, #{chunk:#x}")
+                if prol:
+                    self.e(f".seh_stackalloc {chunk}")
                 rem -= chunk
 
     def stack_mov_rsp(self, ins):
@@ -1622,15 +1660,22 @@ class Translator:
             raise XlatError("ret imm")
         if st["d"] != 8:
             raise XlatError(f"ret with stack depth {st['d']}")
-        self.emit_unwind_to_entry(st)
+        self.emit_unwind_to_entry(st, epilogue=getattr(self, "has_seh", False))
         self.e("ret")
 
-    def emit_unwind_to_entry(self, st):
+    def emit_unwind_to_entry(self, st, epilogue=False):
         if st["mode"] == 1:
             s = st["s"]
+            if epilogue:
+                self.e(".seh_startepilogue")
             self.e(f"ldr x30, [sp, #{s - 8}]")
-            self.sp_delta(-s, False)
+            if epilogue:
+                self.e(f".seh_save_reg x30, {s - 8}")
+            self.sp_delta(-s, epilogue)
             self.e("autibsp")
+            if epilogue:
+                self.e(".seh_pac_sign_lr")
+                self.e(".seh_endepilogue")
 
     # -- calls --------------------------------------------------------------------------------------
     def call_kind(self, ins):
@@ -1676,23 +1721,41 @@ class Translator:
         return False
 
     def api_args(self, ins, name):
-        """number of arguments for an API call site"""
-        n = self.api_arity.get(name) if name else None
-        # scan back in the block for stores to [rsp+32+8k]
+        """number of arguments for an API call site (A3-06: never default to 8)."""
+        if name is not None:
+            if name not in self.api_arity:
+                raise XlatError(f"missing api_arity entry in config.json for {name}")
+            return self.api_arity[name]
+        # Indirect API (COM vtable / GetProcAddress): walk strictly within the current
+        # basic block (stopping at branch merges, calls, jumps, or rsp updates) and clamp
+        # below the frame canary [rbp-8] so we NEVER read the stack canary into x4..x7.
         k_max = -1
-        off = ins.off
-        idx = self.order.index(off)
-        for j in range(idx - 1, max(-1, idx - 60), -1):
-            pi = self.insns[self.order[j]]
-            if pi.mn == "call":
+        max_safe = None
+        if self.st.get("rbp") is not None and self.st["d"] > self.st["rbp"]:
+            max_safe = (self.st["d"] - self.st["rbp"]) - 8
+        cur = ins.off
+        steps = 0
+        while steps < 60:
+            ps = self.preds.get(cur, [])
+            if len(ps) != 1:
+                break
+            prev = ps[0]
+            pi = self.insns[prev]
+            if prev + pi.size != cur:
+                break
+            if pi.mn in ("call", "jmp", "ret") or pi.mn.startswith("j"):
+                break
+            if pi.ops and pi.ops[0].k == "reg" and pi.ops[0].fam == "rsp" and pi.mn in ("add", "sub", "mov", "lea", "and", "push", "pop"):
                 break
             if pi.ops and pi.ops[0].k == "mem" and pi.ops[0].base == "rsp" and not pi.ops[0].index \
                     and pi.mn in ("mov", "movsd", "movq"):
                 dsp = pi.ops[0].disp
                 if dsp >= 32 and (dsp - 32) % 8 == 0:
-                    k_max = max(k_max, (dsp - 32) // 8)
-        site = 4 + k_max + 1 if k_max >= 0 else 0
-        return max(n or 0, site)
+                    if max_safe is None or dsp + 8 <= max_safe:
+                        k_max = max(k_max, (dsp - 32) // 8)
+            cur = prev
+            steps += 1
+        return 4 + k_max + 1 if k_max >= 0 else 4
 
     def sync_call(self):
         st = self.st
@@ -1726,10 +1789,6 @@ class Translator:
             treg = None
             name = tgt
         nargs = self.api_args(ins, name)
-        if nargs == 0 and name is None:
-            nargs = 8  # unknown indirect API: load all four register slots
-        for i in range(4, min(nargs, 8)):
-            pass
         if nargs > 4:
             regs = [4, 5, 6, 7][:max(0, min(nargs, 8) - 4)]
             i = 0
@@ -1872,6 +1931,25 @@ class Translator:
         cc = cond_of(ins.mn)
         d, s = ins.ops
         sz = d.size
+        if sz < 4:
+            # A3-18: preserve upper 48 bits on 16-bit cmov via bfi
+            v = self.rd(s, 4)
+            cur = self.rd(d, 4)
+            c = self.cond(ins, cc)
+            if c == "never":
+                return
+            if c == "always":
+                self.wr(d, v)
+                return
+            if isinstance(c, tuple):
+                self.cset(ins, cc, "w16")
+                self.e("cmp w16, #0")
+                if self.live(ins):
+                    raise XlatError("compound cmov with live flags")
+                c = "ne"
+            self.e(f"csel w16, {v}, {cur}, {c}")
+            self.wr(d, "w16")
+            return
         v = self.rd(s, sz)
         c = self.cond(ins, cc)
         dn = self.regname(d)
@@ -2192,8 +2270,16 @@ class Translator:
                 self.e(f"and w17, w0, #31")
                 self.e(f"{armop}v w16, {a}, w17")
             if live:
-                self.e(f"lsl w17, w16, #{self.small_shift(sz)}")
-                self.e("tst w17, w17")
+                if cnt.k != "imm":
+                    skip_f = self.newlab()
+                    self.e("tst w0, #31")
+                    self.e(f"b.eq {skip_f}")
+                    self.e(f"lsl w17, w16, #{self.small_shift(sz)}")
+                    self.e("tst w17, w17")
+                    self.lab(skip_f)
+                else:
+                    self.e(f"lsl w17, w16, #{self.small_shift(sz)}")
+                    self.e("tst w17, w17")
             self.wr(d, "x16")
             return
         w = "x" if sz == 8 else "w"
@@ -2214,7 +2300,14 @@ class Translator:
             else:
                 self.e(f"{armop} {dv}, {dv}, {w}0")
         if live:
-            self.e(f"tst {dv}, {dv}")
+            if cnt.k != "imm":
+                skip_f = self.newlab()
+                self.e(f"tst w0, #{bits - 1}")
+                self.e(f"b.eq {skip_f}")
+                self.e(f"tst {dv}, {dv}")
+                self.lab(skip_f)
+            else:
+                self.e(f"tst {dv}, {dv}")
         if not self.direct(d):
             self.wr(d, dv)
 
@@ -2292,7 +2385,7 @@ class Translator:
         if s.k != "imm":
             raise XlatError("bts with register bit index")
         sz = d.size
-        bit = s.imm & (8 * max(sz, 4) - 1)
+        bit = s.imm & (8 * sz - 1)
         v = self.rd(d, 8 if sz == 8 else 4)
         if self.live(ins):
             self.e(f"tst {v}, #{1 << bit:#x}")
@@ -2365,19 +2458,28 @@ class Translator:
             self.e("cmp x1, #0")
 
     def rdx_known_zero(self, ins):
-        idx = self.order.index(ins.off)
-        for j in range(idx - 1, max(-1, idx - 40), -1):
-            pi = self.insns[self.order[j]]
-            if self.preds.get(self.order[j + 1]) and len(self.preds[self.order[j + 1]]) > 1:
+        # A3-18: strict CFG single-predecessor walk + require size >= 4 (zero-extends rdx)
+        cur = ins.off
+        steps = 0
+        while steps < 40:
+            ps = self.preds.get(cur, [])
+            if len(ps) != 1:
+                return False
+            prev = ps[0]
+            pi = self.insns[prev]
+            if prev + pi.size != cur:
                 return False
             if pi.mn == "xor" and pi.ops[0].k == "reg" and pi.ops[0].fam == "rdx" and \
-                    pi.ops[1].k == "reg" and pi.ops[1].fam == "rdx":
+                    pi.ops[1].k == "reg" and pi.ops[1].fam == "rdx" and pi.ops[0].size >= 4:
                 return True
             if pi.mn == "mov" and pi.ops[0].k == "reg" and pi.ops[0].fam == "rdx" and \
                     pi.ops[1].k == "imm" and pi.ops[1].imm == 0 and pi.ops[0].size >= 4:
                 return True
-            if any(o.k == "reg" and o.fam == "rdx" for o in pi.ops[:1]) or pi.mn in ("call", "cqo", "cdq", "mul", "imul", "div", "idiv"):
+            if any(o.k == "reg" and o.fam == "rdx" for o in pi.ops[:1]) or \
+                    pi.mn in ("call", "cqo", "cdq", "mul", "imul", "div", "idiv"):
                 return False
+            cur = prev
+            steps += 1
         return False
 
     def i_div(self, ins):
@@ -2385,6 +2487,12 @@ class Translator:
         sz = s.size
         v = self.rd(s, sz)
         if sz == 8:
+            # A3-18: trap divide-by-zero & 128/64 quotient overflow (matches x64 #DE)
+            l_nz = self.newlab()
+            self.e(f"cbnz {v}, {l_nz}")
+            self.e("mov w0, #0xF004")
+            self.e("b ff_trap")
+            self.lab(l_nz)
             if self.rdx_known_zero(ins):
                 self.e(f"udiv x16, x8, {v}")
                 self.e(f"msub x1, x16, {v}, x8")
@@ -2392,13 +2500,18 @@ class Translator:
                 return
             # Full 128-by-64 unsigned division (x1:x8) / v -> x8=quot, x1=rem
             self.e(f"mov x16, {v}")
-            l_slow, l_loop, l_sub, l_next, l_done = (self.newlab() for _ in range(5))
+            l_slow, l_ovok, l_loop, l_sub, l_next, l_done = (self.newlab() for _ in range(6))
             self.e(f"cbnz x1, {l_slow}")
             self.e("udiv x15, x8, x16")
             self.e("msub x1, x15, x16, x8")
             self.e("mov x8, x15")
             self.e(f"b {l_done}")
             self.lab(l_slow)
+            self.e("cmp x1, x16")
+            self.e(f"b.lo {l_ovok}")
+            self.e("mov w0, #0xF004")
+            self.e("b ff_trap")
+            self.lab(l_ovok)
             self.e("mov x11, x1")       # rem
             self.e("mov x12, x8")       # quot shift reg
             self.e("mov w13, #64")
@@ -2421,10 +2534,20 @@ class Translator:
             self.lab(l_done)
             return
         if sz == 4:
+            l_nz, l_ovok = self.newlab(), self.newlab()
+            self.e(f"mov w17, {v}")
+            self.e(f"cbnz w17, {l_nz}")
+            self.e("mov w0, #0xF004")
+            self.e("b ff_trap")
+            self.lab(l_nz)
             self.e("mov w16, w8")
             self.e("bfi x16, x1, #32, #32")
-            self.e(f"mov w17, {v}")
             self.e("udiv x15, x16, x17")
+            self.e("lsr x14, x15, #32")
+            self.e(f"cbz x14, {l_ovok}")
+            self.e("mov w0, #0xF004")
+            self.e("b ff_trap")
+            self.lab(l_ovok)
             self.e("msub x16, x15, x17, x16")
             self.e("mov w8, w15")
             self.e("mov w1, w16")
@@ -2440,15 +2563,39 @@ class Translator:
             prev = self.insns[self.order[idx - 1]] if idx else None
             if not prev or prev.mn != "cqo":
                 raise XlatError("128/64-bit idiv without cqo")
+            l_nz, l_ok = self.newlab(), self.newlab()
+            self.e(f"cbnz {v}, {l_nz}")
+            self.e("mov w0, #0xF004")
+            self.e("b ff_trap")
+            self.lab(l_nz)
+            self.e(f"cmn {v}, #1")
+            self.e(f"b.ne {l_ok}")
+            self.e("movz x17, #0x8000, lsl #48")
+            self.e("cmp x8, x17")
+            self.e(f"b.ne {l_ok}")
+            self.e("mov w0, #0xF004")
+            self.e("b ff_trap")
+            self.lab(l_ok)
             self.e(f"sdiv x16, x8, {v}")
             self.e(f"msub x1, x16, {v}, x8")
             self.e("mov x8, x16")
             return
         if sz == 4:
+            l_nz, l_ovok = self.newlab(), self.newlab()
+            self.e(f"sxtw x17, {v}")
+            self.e(f"cbnz x17, {l_nz}")
+            self.e("mov w0, #0xF004")
+            self.e("b ff_trap")
+            self.lab(l_nz)
             self.e("mov w16, w8")
             self.e("bfi x16, x1, #32, #32")
-            self.e(f"sxtw x17, {v}")
             self.e("sdiv x15, x16, x17")
+            self.e("sxtw x14, w15")
+            self.e("cmp x14, x15")
+            self.e(f"b.eq {l_ovok}")
+            self.e("mov w0, #0xF004")
+            self.e("b ff_trap")
+            self.lab(l_ovok)
             self.e("msub x16, x15, x17, x16")
             self.e("mov w8, w15")
             self.e("mov w1, w16")
@@ -2506,10 +2653,11 @@ class Translator:
         l1, l2, l3 = self.newlab(), self.newlab(), self.newlab()
         self.lab(l1)
         self.e(f"ldaxr {w}17, [{t}]")
-        self.e(f"cmp {w}17, {w}8")
+        self.e(f"cmp {w}8, {w}17")                  # A3-18: x64 cmpxchg sets flags as rax - [mem]
         self.e(f"b.ne {l2}")
         self.e(f"stlxr w15, {rv}, [{t}]")
         self.e(f"cbnz w15, {l1}")
+        self.e("dmb ish")                           # A3-18: full barrier matching x64 LOCK
         self.e(f"b {l3}")
         self.lab(l2)
         self.e("clrex")

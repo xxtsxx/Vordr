@@ -60,16 +60,20 @@ def check(ok, what):
 # ============================================================== build ======
 def build(tmp):
     obj = os.path.join(tmp, "b2a2.obj")
+    stobj = os.path.join(tmp, "stubs.obj")
     dll = os.path.join(tmp, "b2a2.dll")
+    stubs_src = os.path.join(ROOT, "tests", "arm64", "stubs_aesgcm.S")
     subprocess.run([CLANG, "--target=aarch64-pc-windows-msvc", "-march=armv8.2-a+crypto",
                     "-c", SRC, "-o", obj], check=True)
+    subprocess.run([CLANG, "--target=aarch64-pc-windows-msvc", "-march=armv8.2-a+crypto",
+                    "-c", stubs_src, "-o", stobj], check=True)
     script = os.path.join(tmp, "link.cmd")      # a script sidesteps cmd /c quoting
     with open(script, "w") as f:
         f.write("@echo off\r\n"
                 f'call "{MSVC_ENV}" >nul || exit /b 1\r\n'
                 "link /nologo /dll /noentry /machine:arm64 /nodefaultlib "
                 "/export:blake2b_compress /export:argon2_compress "
-                f'/out:"{dll}" "{obj}" || exit /b 1\r\n')
+                f'/out:"{dll}" "{obj}" "{stobj}" || exit /b 1\r\n')
     subprocess.run(["cmd", "/c", script], check=True, stdout=subprocess.DEVNULL)
     return dll
 
@@ -329,8 +333,8 @@ def argon2id_drive(pwd, salt, t, m, p, tag_len, secret=b"", ad=b"",
                     words = [r, l, s, mp, t, y, ctr[0]] + [0] * 121
                     if emu:
                         u.write(inp, blk(words))
-                        hz.call("argon2_compress", addr, zero, inp, 0, below=1040)
-                        hz.call("argon2_compress", addr, zero, addr, 0, below=1040)  # dst == Y
+                        hz.call("argon2_compress", addr, zero, inp, 0, below=1056)
+                        hz.call("argon2_compress", addr, zero, addr, 0, below=1056)  # dst == Y
                         return unblk(u.read(addr, 1024))
                     return G([0] * 128, G([0] * 128, words))
                 if indep and start:
@@ -355,7 +359,7 @@ def argon2id_drive(pwd, salt, t, m, p, tag_len, secret=b"", ad=b"",
                     ref = (st + rel) % q
                     if emu:
                         hz.call("argon2_compress", bp(l, col), bp(l, prev), bp(rl, ref),
-                                1 if r else 0, below=1040)
+                                1 if r else 0, below=1056)
                     else:
                         new = G(B[l][prev], B[rl][ref])
                         B[l][col] = new if r == 0 else [a ^ b for a, b in zip(new, B[l][col])]
@@ -435,7 +439,7 @@ def test_argon2_blocks(hz, rng):
     # selftest.asm block KAT
     x, y = kat_blocks()
     u.write(bufs[0], blk(x)); u.write(bufs[1], blk(y)); u.write(bufs[2], rng.randbytes(1024))
-    hz.call("argon2_compress", bufs[2], bufs[0], bufs[1], 0, below=1040)
+    hz.call("argon2_compress", bufs[2], bufs[0], bufs[1], 0, below=1056)
     out = unblk(u.read(bufs[2], 1024))
     cks = 0
     for w in out:
@@ -469,7 +473,7 @@ def test_argon2_blocks(hz, rng):
         u.write(xp, blk(xs)); u.write(yp, blk(ys))
         if d not in (xp, yp):
             u.write(d, blk(ds))
-        hz.call("argon2_compress", d, xp, yp, wx, below=1040)
+        hz.call("argon2_compress", d, xp, yp, wx, below=1056)
         exp = g_ref(xs, ys, ds if wx else None)
         n += 1
         ok = unblk(u.read(d, 1024)) == exp
@@ -545,8 +549,8 @@ def main():
             hc.cnt[0] = 0
             hc.call(fn, *args, below=below)
             return hc.cnt[0]
-        n0 = count("argon2_compress", c, a, b, 0, below=1040)
-        n1 = count("argon2_compress", c, a, b, 1, below=1040)
+        n0 = count("argon2_compress", c, a, b, 0, below=1056)
+        n1 = count("argon2_compress", c, a, b, 1, below=1056)
         ctx = u.alloc(CTX_SIZE)
         nb = count("blake2b_compress", ctx, ctx + OFF_BUF, M64)
         check(n0 > 1000 and nb > 500, "instruction counter works")

@@ -16,6 +16,7 @@ extern VirtualProtect:proc
 extern TlsAlloc:proc                    ; the per-thread shadow stack's slot
 extern TlsSetValue:proc
 extern GetModuleHandleW:proc
+extern GetModuleFileNameW:proc
 extern rng_fill:proc                    ; random.asm: rcx=buf, rdx=len -> eax=1 ok
 ifdef DBG_TRACE
 extern print_a:proc                     ; console.asm (cttest / crash breadcrumb)
@@ -123,7 +124,7 @@ STATUS_INT_DIV_ZERO     equ 0C0000094h
 STATUS_STACK_OVF        equ 0C00000FDh
 STATUS_HEAP_CORRUPT     equ 0C0000374h
 STATUS_STACK_OVERRUN    equ 0C0000409h
-WER_FLAGS_HARDEN        equ 00000060h   ; WER_FAULT_REPORTING_NO_UI | DISABLE_SNAPSHOT_CRASH
+WER_FLAGS_HARDEN        equ 000001E1h   ; A3-09: NOHEAP|NO_UI|NO_HEAP_ON_QUEUE|DISABLE_SNAPSHOT_CRASH|HANG
 LOAD_LIB_SYS32          equ 0800h       ; LOAD_LIBRARY_SEARCH_SYSTEM32
 MITIG_EXT_DISABLE       equ 7           ; ProcessExtensionPointDisablePolicy
 MITIG_IMG_LOAD          equ 10          ; ProcessImageLoadPolicy
@@ -142,6 +143,10 @@ crash_fname label word
     dw 'v','o','r','d','r','_','c','r','a','s','h','.','b','i','n', 0
 CSTR crash_bc, "crash: unhandled exception - wiping secrets, terminating",13,10
 endif
+
+.data?
+align 2
+ci_modbuf       dw 264 dup (?)          ; A3-09: GetModuleFileNameW basename for WerAddExcludedApplication
 
 .code
 
@@ -419,27 +424,8 @@ cv_catch:
     mov     qword ptr [g_crash_info+8], r10
 cv_noinfo:
 ifdef DBG_TRACE
-    mov     rax, qword ptr [rcx+8]              ; -> CONTEXT
-    mov     r10, qword ptr [rax+78h]
-    mov     qword ptr [g_crash_regs+0], r10     ; rax
-    mov     r10, qword ptr [rax+80h]
-    mov     qword ptr [g_crash_regs+8], r10     ; rcx
-    mov     r10, qword ptr [rax+88h]
-    mov     qword ptr [g_crash_regs+16], r10    ; rdx
-    mov     r10, qword ptr [rax+90h]
-    mov     qword ptr [g_crash_regs+24], r10    ; rbx
-    mov     r10, qword ptr [rax+98h]
-    mov     qword ptr [g_crash_regs+32], r10    ; rsp
-    mov     r10, qword ptr [rax+0A0h]
-    mov     qword ptr [g_crash_regs+40], r10    ; rbp
-    mov     r10, qword ptr [rax+0A8h]
-    mov     qword ptr [g_crash_regs+48], r10    ; rsi
-    mov     r10, qword ptr [rax+0B0h]
-    mov     qword ptr [g_crash_regs+56], r10    ; rdi
-    mov     r10, qword ptr [rax+0F8h]
-    mov     qword ptr [g_crash_regs+64], r10    ; rip
-    mov     r10, qword ptr [rax+0B8h]
-    mov     qword ptr [g_crash_regs+72], r10    ; r8
+    mov     rcx, qword ptr [rcx+8]              ; -> CONTEXT
+    call    crash_capture_context
 endif
     call    crash_contain                       ; wipe + restore desktop + terminate
 cv_reent:
@@ -453,6 +439,37 @@ cv_pass:
     pop     rbp
     ret
 crash_veh endp
+
+ifdef DBG_TRACE
+; A3-18: isolated CONTEXT register snapshot so ARM64 overrides it cleanly in src/arm64/platform.S
+public crash_capture_context, g_crash_regs
+crash_capture_context proc
+    test    rcx, rcx
+    jz      ccc_done
+    mov     r10, qword ptr [rcx+78h]
+    mov     qword ptr [g_crash_regs+0], r10     ; rax
+    mov     r10, qword ptr [rcx+80h]
+    mov     qword ptr [g_crash_regs+8], r10     ; rcx
+    mov     r10, qword ptr [rcx+88h]
+    mov     qword ptr [g_crash_regs+16], r10    ; rdx
+    mov     r10, qword ptr [rcx+90h]
+    mov     qword ptr [g_crash_regs+24], r10    ; rbx
+    mov     r10, qword ptr [rcx+98h]
+    mov     qword ptr [g_crash_regs+32], r10    ; rsp
+    mov     r10, qword ptr [rcx+0A0h]
+    mov     qword ptr [g_crash_regs+40], r10    ; rbp
+    mov     r10, qword ptr [rcx+0A8h]
+    mov     qword ptr [g_crash_regs+48], r10    ; rsi
+    mov     r10, qword ptr [rcx+0B0h]
+    mov     qword ptr [g_crash_regs+56], r10    ; rdi
+    mov     r10, qword ptr [rcx+0F8h]
+    mov     qword ptr [g_crash_regs+64], r10    ; rip
+    mov     r10, qword ptr [rcx+0B8h]
+    mov     qword ptr [g_crash_regs+72], r10    ; r8
+ccc_done:
+    ret
+crash_capture_context endp
+endif
 
 ifdef DBG_TRACE
 ; crash_dump() - dbg-only crash breadcrumb: %TEMP%\vordr_crash.bin, run AFTER
@@ -549,7 +566,7 @@ crash_filter endp
 ; =============================================================================
 public crash_install
 crash_install proc frame
-    FRAME_PROLOG 64
+    FRAME_PROLOG 80
     WINCALL GetModuleHandleW, 0                 ; our image range, for crash_veh
     mov     qword ptr [g_img_lo], rax
     mov     r10d, dword ptr [rax+3Ch]           ; e_lfanew
@@ -575,9 +592,31 @@ ci_wer_dll:
     WINCALL GetProcAddress, rax, addr a_wer_excl
     test    rax, rax
     jz      ci_free_wer
+    mov     qword ptr [rbp-32], rax
+    ; A3-09: exclude actual running image basename (handles renamed portable executables)
+    WINCALL GetModuleFileNameW, 0, addr ci_modbuf, 260
     lea     rcx, [w_vordr_exe]
+    test    eax, eax
+    jz      ci_call_excl
+    cmp     eax, 260
+    jae     ci_call_excl
+    lea     r10, [ci_modbuf]
+    mov     rcx, r10
+ci_base_lp:
+    movzx   edx, word ptr [r10]
+    test    dx, dx
+    jz      ci_call_excl
+    add     r10, 2
+    cmp     dx, 5Ch
+    je      ci_base_set
+    cmp     dx, '/'
+    jne     ci_base_lp
+ci_base_set:
+    mov     rcx, r10
+    jmp     ci_base_lp
+ci_call_excl:
     xor     edx, edx
-    call    rax
+    call    qword ptr [rbp-32]
 ci_free_wer:
     WINCALL FreeLibrary, qword ptr [rbp-24]
 ci_handlers:
@@ -771,6 +810,8 @@ cm_loop:
     cmp     r10, r8
     jb      cm_loop
 cm_done:
+    xor     r11d, r11d                          ; A3-30: scrub last compared byte/XOR residue
+    xor     r9d, r9d
     ; collapse any nonzero to exactly 1 without branching
     neg     eax                         ; CF=1 iff eax was nonzero
     sbb     eax, eax                    ; eax = -1 iff nonzero, else 0

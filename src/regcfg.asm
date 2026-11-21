@@ -890,6 +890,38 @@ cgdh_def:
 cfg_get_dword_hklm endp
 
 ; ===========================================================================
+; cfg_get_dword_hklm_fc(rcx=value name, edx=absent_def, r8d=corrupt_def) -> eax.
+;   A3-02: strictly HKLM-only, distinguishing absent (0 -> absent_def) from
+;   present-but-corrupt (-1 -> corrupt_def) so policies like TpmMinMode fail
+;   closed on wrong-type HKLM values.
+; ===========================================================================
+public cfg_get_dword_hklm_fc
+cfg_get_dword_hklm_fc proc frame
+    FRAME_PROLOG 48
+    mov     dword ptr [rbp-16], edx          ; absent_def
+    mov     dword ptr [rbp-24], r8d          ; corrupt_def
+    mov     rdx, rcx
+    mov     rcx, qword ptr [g_hklm]
+    lea     r8, [g_cfg_dw]
+    call    reg_query_dw
+    cmp     eax, 1
+    je      cgdhf_val
+    cmp     eax, -1
+    je      cgdhf_bad
+    mov     eax, dword ptr [rbp-16]
+    FRAME_EPILOG
+    ret
+cgdhf_bad:
+    mov     eax, dword ptr [rbp-24]
+    FRAME_EPILOG
+    ret
+cgdhf_val:
+    mov     eax, dword ptr [g_cfg_dw]
+    FRAME_EPILOG
+    ret
+cfg_get_dword_hklm_fc endp
+
+; ===========================================================================
 ; cfg_set_dword_hkcu(rcx=value name, edx=value) -> eax = 1/0.
 ; ===========================================================================
 public cfg_set_dword_hkcu
@@ -1162,6 +1194,11 @@ cfg_default_vault proc frame
     call    cfg_od_linked
     test    eax, eax
     jz      cdv_docs
+    ; A3-27: gate candidate against file_path_allowed before CreateDirectoryW
+    mov     rcx, qword ptr [rbp-24]
+    call    file_path_allowed
+    test    eax, eax
+    jz      cdv_docs
     ; dst = "%OneDrive%"; append "\Vordr" + the filename through the shared tail.
     ;
     ; This used to take the append offset from eax, commented "char count" - but eax
@@ -1182,6 +1219,10 @@ cdv_docs:
     WINCALL SHGetFolderPathW, 0, CSIDL_PERSONAL, 0, 0, qword ptr [rbp-24]
     test    eax, eax                         ; S_OK = 0
     jnz     cdv_profile                      ; no Documents -> %USERPROFILE%, never nothing
+    mov     rcx, qword ptr [rbp-24]
+    call    file_path_allowed
+    test    eax, eax
+    jz      cdv_profile
     ; dst = "<Documents>"; append "\Vordr" and create it, mirroring OneDrive
     mov     r11, qword ptr [rbp-24]
     xor     r8d, r8d
@@ -1250,6 +1291,10 @@ cdv_profile:
     call    cfg_profile_dir
     test    eax, eax
     jz      cdv_fail
+    mov     rcx, qword ptr [rbp-24]
+    call    file_path_allowed
+    test    eax, eax
+    jz      cdv_no
     mov     r11, qword ptr [rbp-24]
     xor     r8d, r8d
     jmp     cdv_docs_end                     ; shared subfolder + filename tail

@@ -256,20 +256,19 @@ lo_phave:
     call    log_wapp                            ; append "\Vordr"
     mov     word ptr [rax], 0
     mov     qword ptr [rbp-24], rax
-    ; AUD-26: protect %LOCALAPPDATA%\Vordr with owner+SYSTEM inheritable DACL
+    ; AUD-26 / A3-14: protect %LOCALAPPDATA%\Vordr with owner+SYSTEM inheritable DACL (fail closed)
     mov     ecx, 10000000h                      ; GENERIC_ALL
     mov     edx, 3                              ; OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
     xor     r8d, r8d
     call    gui_build_user_dacl
-    xor     r9d, r9d
     test    eax, eax
-    jz      @F
+    jz      lo_fail
     mov     dword ptr [rbp-88], 24
     lea     rax, [g_tmp_sd]
     mov     qword ptr [rbp-80], rax
     mov     dword ptr [rbp-72], 0
     lea     r9, [rbp-88]
-@@: WINCALL CreateDirectoryW, addr g_logpath, r9 ; ignore result (may exist)
+    WINCALL CreateDirectoryW, addr g_logpath, r9 ; ignore result (may exist)
     mov     rcx, qword ptr [rbp-24]
     lea     rdx, [w_logname]
     call    log_wapp                            ; append "\vordr.log"
@@ -292,14 +291,14 @@ lo_open:
     xor     r8d, r8d
     call    gui_build_user_dacl
     test    eax, eax
-    jz      @F
+    jz      lo_fail                             ; A3-14: never fall back to pSA = NULL
     mov     dword ptr [rbp-88], 24
     lea     rax, [g_tmp_sd]
     mov     qword ptr [rbp-80], rax
     mov     dword ptr [rbp-72], 0
     lea     rax, [rbp-88]
     mov     qword ptr [rbp-160], rax
-@@: WINCALL CreateFileW, qword ptr [rbp-32], FILE_APPEND_DATA, FILE_SHARE_RW, qword ptr [rbp-160], \
+    WINCALL CreateFileW, qword ptr [rbp-32], FILE_APPEND_DATA, FILE_SHARE_RW, qword ptr [rbp-160], \
             OPEN_ALWAYS, <FILE_ATTR_NORMAL or FILE_FLAG_OPEN_RP>, 0
     cmp     rax, INVALID
     je      lo_fail

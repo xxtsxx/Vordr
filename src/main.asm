@@ -173,7 +173,7 @@ msg_usage label byte
     db 13,10
     db "  The command line exposes only non-sensitive diagnostics:",13,10
     db "    vordr selftest             run all known-answer self-tests",13,10
-    db "    vordr bench [-m MIB] [-t N] benchmark the crypto core",13,10
+    db "    vordr katreport            print cryptographic known-answer digests",13,10
     db 13,10
     db "  Every launch runs the self-test gate first and fails closed on mismatch.",13,10
 msg_usage_len equ $ - msg_usage
@@ -469,7 +469,7 @@ ifdef DBG_TRACE
     call    dbg_putc
     mov     al, 'F'
     call    dbg_putc
-    mov     ecx, 12                     ; print 4 nibbles, high to low
+    mov     ecx, 16                     ; A3-30: print all 4 hex nibbles (12, 8, 4, 0)
 ff_hexloop:
     sub     ecx, 4
     mov     eax, r15d
@@ -603,12 +603,17 @@ cg_eval:
     mov     edx, r11d
     call    cpu_eval_features
     mov     dword ptr [g_cpu_features], eax
-    ; sha256.asm uses the SHA-NI instructions unconditionally, so a CPU with
-    ; AES-NI but no SHA-NI (Skylake-class) must be refused here, not #UD later
+    ; sha256.asm / aesgcm.asm / argon2.asm require SSSE3 + AES-NI + PCLMULQDQ + SSE4.1 + SHA-NI
+    test    r10d, 1 SHL 9               ; A3-31: explicit SSSE3 check (pshufb / palignr)
+    jz      cg_missing
     and     eax, CPUF_AESNI or CPUF_PCLMUL or CPUF_SSE41 or CPUF_SHANI
     cmp     eax, CPUF_AESNI or CPUF_PCLMUL or CPUF_SSE41 or CPUF_SHANI
     sete    al
     movzx   eax, al
+    jmp     cg_ret
+cg_missing:
+    xor     eax, eax
+cg_ret:
     add     rsp, 32
     pop     rbx
     ret
@@ -1121,6 +1126,11 @@ password_to_utf8 proc frame
     FRAME_PROLOG 32 + 32 + 16
     ; locals: [rbp-24] = wide ptr
     mov     qword ptr [rbp-24], rcx
+    ; A3-31: pre-zero g_cfg_pass so shorter retries never leave residual tail bytes
+    lea     rcx, [g_cfg_pass]
+    mov     edx, MAX_PASSWORD_BYTES+1
+    call    secure_zero
+    mov     rcx, qword ptr [rbp-24]
 
     ; WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, src, -1,
     ;                     g_cfg_pass, MAX+1, NULL, NULL)

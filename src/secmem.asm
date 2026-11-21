@@ -22,8 +22,11 @@ include macros.inc
 
 extern VirtualAlloc:proc
 extern VirtualFree:proc
+extern VirtualProtect:proc
 extern VirtualLock:proc
 extern VirtualUnlock:proc
+extern AcquireSRWLockExclusive:proc
+extern ReleaseSRWLockExclusive:proc
 extern secure_zero:proc
 extern GetCurrentProcess:proc
 extern SetProcessWorkingSetSizeEx:proc
@@ -121,6 +124,14 @@ externdef g_urlbuf:byte             ; URL launch scratch (gui.asm)
 externdef g_urlbuf2:byte            ; URL scheme-prepended scratch (gui.asm)
 externdef g_times_w:byte            ; Timestamp line scratch (gui.asm)
 externdef g_phdate:byte             ; Password history date scratch (gui.asm)
+externdef g_health_flags:byte       ; Per-entry password health flags (vault.asm)
+externdef g_san_tmp:byte            ; Attachment filename sanitizer scratch (gui.asm)
+externdef g_san_stem:byte           ; Attachment filename stem scratch (gui.asm)
+externdef g_extw:byte               ; Attachment extension scratch (gui.asm)
+externdef g_deleted_ft:byte         ; Soft-deleted timestamp scratch (gui.asm)
+externdef g_tmpfile:byte            ; Opened attachment temp path (gui.asm)
+externdef g_motw_w:byte             ; Opened attachment MOTW path (gui.asm)
+externdef g_motw_io:byte            ; Opened attachment MOTW long path (gui.asm)
 
 ; Sizes of the buffers above, mirrored from the modules that allocate them -
 ; constcheck fails the build if any of these drifts from its original.
@@ -137,10 +148,13 @@ ZI_NBUF      equ 1024
 ZI_PWCAP     equ 1024
 ZE_PWCAP     equ 1024
 ARF_SIZE     equ 68
+HFLG_CAP     equ 8192
+VAULT_BODY_MAX equ 16777216
 
 MEM_COMMIT          equ 1000h
 MEM_RESERVE         equ 2000h
 MEM_RELEASE         equ 8000h
+PAGE_NOACCESS       equ 01h
 PAGE_READWRITE      equ 04h
 ; The working-set MIN is the hard lockable-page quota; it MUST exceed the total
 ; VirtualLock'd bytes.  That is dominated by the decrypted body arenas
@@ -185,7 +199,7 @@ SECREG_CAP          equ 1024
 ; and the lock list had drifted from each other and from the buffers in use).
 ; Adding a buffer that holds plaintext, a password or a key = one row here.
 ; ---------------------------------------------------------------------------
-.data
+.const
 align 8
 sec_regions label qword
     dq  g_cfg_pass,     MAX_PASSWORD_BYTES+1
@@ -265,6 +279,14 @@ sec_regions label qword
     dq  g_urlbuf2,      1040*2
     dq  g_times_w,      128*2
     dq  g_phdate,       40*2
+    dq  g_health_flags, HFLG_CAP
+    dq  g_san_tmp,      260*2
+    dq  g_san_stem,     40*2
+    dq  g_extw,         40*2
+    dq  g_deleted_ft,   20*2
+    dq  g_tmpfile,      MAX_PATH_CHARS*2
+    dq  g_motw_w,       (MAX_PATH_CHARS+32)*2
+    dq  g_motw_io,      (MAX_PATH_CHARS+48)*2
 sec_regions_end label qword
 
 .code
@@ -380,6 +402,8 @@ sec_lock endp
 public sec_ws_grow
 sec_ws_grow proc frame
     FRAME_PROLOG 48
+    ; A3-10: serialize registry/pending reads against worker thread allocations
+    WINCALL AcquireSRWLockExclusive, addr g_secreg_lock
     ; Sum all currently registered dynamic arenas + pending request + statics,
     ; floored at SEC_BODY_RESERVE + SEC_WS_STATICS so large attachment/ZIP
     ; secmem arenas never exhaust the VirtualLock working-set quota.
@@ -415,6 +439,7 @@ swg_sumd:
     jae     @F
     mov     rdx, rcx
 @@: mov     qword ptr [rbp-32], rdx           ; computed max
+    WINCALL ReleaseSRWLockExclusive, addr g_secreg_lock
     WINCALL GetCurrentProcess
     WINCALL SetProcessWorkingSetSizeEx, rax, qword ptr [rbp-24], qword ptr [rbp-32], SEC_WS_FLAGS
     test    eax, eax
@@ -516,13 +541,19 @@ spw_body:
     jz      spw_slots
     mov     rcx, rax
     mov     rdx, qword ptr [g_body_len]
-    call    secure_zero
+    cmp     rdx, VAULT_BODY_MAX                 ; A3-20: clamp length so corrupt len cannot fault
+    jbe     @F
+    mov     rdx, VAULT_BODY_MAX
+@@: call    secure_zero
 spw_slots:
     mov     rcx, qword ptr [g_edit_backup]
     test    rcx, rcx
     jz      spw_history
     mov     rdx, qword ptr [g_edit_backup_len]
-    call    secure_zero
+    cmp     rdx, VAULT_BODY_MAX
+    jbe     @F
+    mov     rdx, VAULT_BODY_MAX
+@@: call    secure_zero
 spw_history:
     mov     rcx, qword ptr [g_edit_history]
     test    rcx, rcx
@@ -534,7 +565,10 @@ spw_a2:
     test    rcx, rcx
     jz      spw_comp
     mov     rdx, qword ptr [g_mb]
-    shl     rdx, 10
+    cmp     rdx, 262144                         ; cap at 256 MiB blocks
+    jbe     @F
+    mov     rdx, 262144
+@@: shl     rdx, 10
     call    secure_zero
 spw_comp:
     mov     rcx, qword ptr [g_comp_bits]        ; AUD-04: wipe off-screen compositor DIB pixels
@@ -545,7 +579,10 @@ spw_comp:
     imul    rax, rdx                            ; 64-bit pixel count
     shl     rax, 2                              ; 64-bit byte count
     jz      spw_done
-    mov     rdx, rax
+    cmp     rax, 04000000h                      ; cap at 64 MiB
+    jbe     @F
+    mov     rax, 04000000h
+@@: mov     rdx, rax
     call    secure_zero
 spw_done:
     FRAME_EPILOG
@@ -554,40 +591,58 @@ secmem_panic_wipe endp
 
 public secmem_alloc
 secmem_alloc proc frame
-    FRAME_PROLOG 48
-    ; locals: [rbp-24] page-rounded len, [rbp-32] base
+    FRAME_PROLOG 80
+    ; locals: [rbp-24] page-rounded len, [rbp-32] base, [rbp-40] oldprot,
+    ;         [rbp-44] lock_ok, [rbp-48] reg_ok
     mov     qword ptr [rbp-32], 0
     test    rcx, rcx
     jz      sa_fail                         ; zero-length: fail closed
     mov     rax, 07FFFFFFFFFF0000h
     cmp     rcx, rax
-    ja      sa_fail                         ; overflow guard before 4 KiB page rounding
+    ja      sa_fail                         ; overflow guard before 4 KiB page rounding + guard page
     add     rcx, 0FFFh
     and     rcx, -1000h                     ; round up to full 4 KiB pages (no unwiped slack)
     mov     qword ptr [rbp-24], rcx
 
-    WINCALL VirtualAlloc, 0, qword ptr [rbp-24], <MEM_RESERVE or MEM_COMMIT>, PAGE_READWRITE
+    ; A3-26: append a trailing 4 KiB PAGE_NOACCESS hardware guard page after every secret arena
+    lea     rdx, [rcx + 1000h]
+    WINCALL VirtualAlloc, 0, rdx, <MEM_RESERVE or MEM_COMMIT>, PAGE_READWRITE
     test    rax, rax
     jz      sa_fail
-    mov     qword ptr [rbp-32], rax         ; remember the base across the lock call
+    mov     qword ptr [rbp-32], rax         ; remember the base across the guard/lock calls
+    mov     rcx, rax
+    add     rcx, qword ptr [rbp-24]
+    WINCALL VirtualProtect, rcx, 1000h, PAGE_NOACCESS, addr rbp-40
+    test    eax, eax
+    jz      sa_protfail
 
     ; keep it resident / out of the pagefile.  RE-ASSERT the hard working-set
-    ; minimum first, accounting for this pending allocation.
-    mov     rcx, qword ptr [rbp-24]
-    mov     qword ptr [g_secreg_pending], rcx
+    ; minimum first, accounting for this pending allocation (SRWLOCK-serialized, A3-10).
+    WINCALL AcquireSRWLockExclusive, addr g_secreg_lock
+    mov     rax, qword ptr [rbp-24]
+    add     qword ptr [g_secreg_pending], rax
+    WINCALL ReleaseSRWLockExclusive, addr g_secreg_lock
     call    sec_ws_grow
-    mov     qword ptr [g_secreg_pending], 0
     mov     rcx, qword ptr [rbp-32]
     mov     rdx, qword ptr [rbp-24]
     call    sec_lock
-    test    eax, eax
-    jz      sa_lockfail
-
+    mov     dword ptr [rbp-44], eax
+    mov     dword ptr [rbp-48], 0
+    WINCALL AcquireSRWLockExclusive, addr g_secreg_lock
+    mov     rax, qword ptr [rbp-24]
+    sub     qword ptr [g_secreg_pending], rax
+    cmp     dword ptr [rbp-44], 0
+    je      sa_rel_lk
     mov     rcx, qword ptr [rbp-32]         ; register {base, page_rounded_len}
     mov     rdx, qword ptr [rbp-24]
     call    secreg_add
-    test    eax, eax
-    jz      sa_regfull
+    mov     dword ptr [rbp-48], eax
+sa_rel_lk:
+    WINCALL ReleaseSRWLockExclusive, addr g_secreg_lock
+    cmp     dword ptr [rbp-44], 0
+    je      sa_lockfail
+    cmp     dword ptr [rbp-48], 0
+    je      sa_regfull
 
     mov     rax, qword ptr [rbp-32]         ; return the (locked) base
     FRAME_EPILOG
@@ -596,6 +651,7 @@ sa_lockfail:
     mov     rcx, qword ptr [rbp-32]
     mov     rdx, qword ptr [rbp-24]
     call    secure_zero
+sa_protfail:
     WINCALL VirtualFree, qword ptr [rbp-32], 0, MEM_RELEASE
     xor     eax, eax
     FRAME_EPILOG
@@ -617,11 +673,13 @@ secmem_free proc frame
     test    rcx, rcx
     jz      sf_done
 
+    ; A3-10: serialize registry lookup, wipe, and removal (panic_wipe remains lock-free)
+    WINCALL AcquireSRWLockExclusive, addr g_secreg_lock
     mov     rcx, qword ptr [rbp-24]
     lea     rdx, [rbp-40]
     call    secreg_find
     test    rax, rax
-    jz      sf_done
+    jz      sf_unlock_done
     ; Wipe BEFORE clearing g_secreg slot, then clear slot BEFORE VirtualFree unmaps (AUD-10)
     mov     qword ptr [rbp-32], rax
     mov     rcx, qword ptr [rbp-24]
@@ -631,10 +689,15 @@ secmem_free proc frame
     mov     qword ptr [r10], 0
     mov     qword ptr [r10+8], 0
     mfence
+    WINCALL ReleaseSRWLockExclusive, addr g_secreg_lock
 
     WINCALL VirtualUnlock, qword ptr [rbp-24], qword ptr [rbp-32]
     WINCALL VirtualFree, qword ptr [rbp-24], 0, MEM_RELEASE
 sf_done:
+    FRAME_EPILOG
+    ret
+sf_unlock_done:
+    WINCALL ReleaseSRWLockExclusive, addr g_secreg_lock
     FRAME_EPILOG
     ret
 secmem_free endp
@@ -644,6 +707,7 @@ secmem_free endp
 ; =============================================================================
 .data?
 align 8
+g_secreg_lock    dq ?                        ; A3-10: SRWLOCK protecting g_secreg / g_secreg_pending
 g_secreg         dq (SECREG_CAP * 2) dup (?) ; live secmem {base, size} pairs
 g_secreg_pending dq ?                        ; in-flight secmem_alloc request size
 ifdef PROBE_IO

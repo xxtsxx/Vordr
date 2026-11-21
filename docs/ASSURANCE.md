@@ -129,9 +129,9 @@ rather than the conventional zero-on-success result.
 | Save integrity and concurrency | `bktest`, `mactest`, `rbtest`, `xctest`, `reload`, `cowrite` |
 | Native exchange and metadata | `sysitemkat`, `vexselkat`, `c9kat`, `vimpkat`, `vattcolkat`, `vaultexportkat`, `vaultexpattkat` |
 | ZIP export and attachment binding | `atgen`, `zitest`, `zexcap`, `zexname`, `zexselkat` (selective export filter, `SHA-256` attachment swap rejection, and missing-member atomic rollback) |
-| Policy, PIN grading, TPM, and private desktop | `polkat` (`HKLM` fail-closed types, `HKLM`-only `AllowUncVault`, `ProfileList` path expansion, PIN/TPM mode clamping), `pinkat` (PIN scalar length, no-class rule, trivial patterns), `healthkat` (`VF_SECRET` + `VF_PIN` grading and domain-separated reuse), `tpmkat` (OAEP v2 context binding, hardware `SmartCardPin`, `S0`/`S1` pre-commit anti-replay, 3-strike revocation), `secdeskkat` |
+| Policy, PIN grading, TPM, and private desktop | `polkat` (`HKLM` fail-closed types, `HKLM`-only `AllowUncVault`, `ProfileList` path expansion, PIN/TPM mode clamping), `pinkat` (PIN scalar length, no-class rule, trivial patterns), `healthkat` (`VF_SECRET` + `VF_PIN` grading and domain-separated reuse), `tpmkat` (OAEP v2 context binding, `S0`/`S1` pre-commit anti-replay, 3-strike revocation), `secdeskkat` |
 | GUI geometry and failed-edit retry | `layoutkat` (with `savefail` and `guardkat` in the same window) |
-| GUI behaviour from outside | `tests/guitest.ps1` (91 checks): input limits, drawn scrollbars, modal dismissal on lock, `WM_COPYDATA` UNC/modal/non-Vordr-sender rejection, default `GetWindowDisplayAffinity` (`0x11`) screen-capture protection, tray clipboard auto-clear, post-lock secret wipes, GDI leaks |
+| GUI behaviour from outside | `tests/guitest.ps1` (91 checks): input limits, drawn scrollbars, modal dismissal on lock, legacy `WM_COPYDATA` rejection (second-instance hand-off uses a kernel-authenticated per-SID named pipe), default `GetWindowDisplayAffinity` (`0x11`) screen-capture protection, tray clipboard auto-clear, post-lock secret wipes, GDI leaks |
 | Vault format, tamper and nonce reuse | `tests/verify_vault.py` |
 | Opening vaults written by a release | `tests/compattest.py` (frozen `tests/fixtures/v023-*.vordr`) |
 | Long-path context restoration | `tests/verify_persistence.py` |

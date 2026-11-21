@@ -72,3 +72,19 @@ ct_memcmp:
 ff_trap:
         brk     #0xF003
         b       ff_trap
+
+        .globl  sstk_overflow_fail
+        .p2align 4
+sstk_overflow_fail:
+        mov     w0, #0xF001
+        b       ff_trap
+
+        .data
+        .p2align 3
+        .globl  g_stack_canary
+g_stack_canary:
+        .quad   0xA5A5A5A55A5A5A5A
+        .p2align 2
+        .globl  g_sstk_tls
+g_sstk_tls:
+        .long   0

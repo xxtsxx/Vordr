@@ -387,12 +387,54 @@ zs_ae_chk:
     ja      zs_unsup
     cmp     word ptr [rax+2], 7
     jb      zs_unsup
+    cmp     word ptr [rax+4], 2                 ; A3-29: require WinZip AE-2 (not AE-1)
+    jne     zs_unsup
     cmp     word ptr [rax+6], 4541h             ; AUD-20: vendor ID must be "AE" (0x4541)
     jne     zs_unsup
     cmp     byte ptr [rax+8], 3                 ; AES-256
     jne     zs_unsup
     cmp     word ptr [rax+9], 0                 ; stored inside AES
     jne     zs_unsup
+    ; A3-29: reject duplicate member names and overlapping data regions (ZIP polyglots)
+    xor     r8d, r8d
+zs_dup_lp:
+    cmp     r8d, dword ptr [rbp-64]
+    jae     zs_dup_ok
+    mov     eax, r8d
+    imul    eax, eax, MEMREC
+    lea     r10, [g_zi_mem]
+    add     r10, rax
+    ; 1) overlap check: [a_start, a_end) vs [b_start, b_end)
+    mov     r9, qword ptr [rbp-88]              ; a_start
+    mov     edx, dword ptr [rbp-72]             ; a_len (zero-ext)
+    add     rdx, r9                             ; a_end
+    mov     r11, qword ptr [r10+16]             ; b_start
+    mov     eax, dword ptr [r10+24]             ; b_len (zero-ext)
+    add     rax, r11                            ; b_end
+    cmp     r9, rax                             ; a_start < b_end?
+    jae     zs_dup_name
+    cmp     r11, rdx                            ; b_start < a_end?
+    jb      zs_empty                            ; overlapping member payloads -> reject
+zs_dup_name:
+    mov     eax, dword ptr [rbp-76]
+    cmp     eax, dword ptr [r10+8]
+    jne     zs_dup_nx
+    mov     r9, qword ptr [r10+0]               ; existing name ptr
+    lea     r11, [rcx+46]                       ; new name ptr
+    xor     edx, edx
+zs_dn_cmp:
+    cmp     edx, eax
+    jae     zs_empty                            ; duplicate member name -> reject
+    mov     al, byte ptr [r9+rdx]
+    cmp     al, byte ptr [r11+rdx]
+    jne     zs_dup_nx
+    mov     eax, dword ptr [rbp-76]
+    inc     edx
+    jmp     zs_dn_cmp
+zs_dup_nx:
+    inc     r8d
+    jmp     zs_dup_lp
+zs_dup_ok:
     ; Record validated member into g_zi_mem[count]
     mov     eax, dword ptr [rbp-64]
     imul    eax, eax, MEMREC
@@ -1421,6 +1463,7 @@ st_term:
     FRAME_EPILOG
     ret
 st_full:
+    mov     dword ptr [g_zi_err], 1             ; A3-29: fail closed on title arena overflow
     mov     rcx, qword ptr [rbp-24]
     cmp     rcx, ZI_MAXENT
     jae     st_ret
@@ -1443,10 +1486,7 @@ zi_stage_title endp
 ;               number of entries actually imported.
 ; =============================================================================
 zi_walk proc frame
-    FRAME_PROLOG 112                            ; grown from 96: [rbp-72]/[rbp-80] are the
-                                                ; forward-progress markers below, and must sit
-                                                ; ABOVE the 32-byte callee shadow (a callee
-                                                ; would clobber a marker inside it).
+    FRAME_PROLOG 128                            ; [rbp-72]/[rbp-80] progress markers, [rbp-84] field idx
     mov     dword ptr [g_zi_count], 0
     mov     dword ptr [g_zi_e], 0
     mov     qword ptr [rbp-72], 0              ; entry-loop progress marker (0 = none yet)
@@ -1467,8 +1507,10 @@ zij_entry:
     movzx   eax, byte ptr [r10]
     cmp     eax, ']'
     je      zij_close
+    cmp     dword ptr [g_zi_e], 0               ; A3-29: strict comma grammar (no leading/missing ',')
+    je      zij_e0
     cmp     eax, ','
-    jne     zij_e0
+    jne     zij_bad
     inc     r10
     mov     qword ptr [g_zi_p], r10
 zij_e0:
@@ -1507,6 +1549,8 @@ zij_titr:
     lea     rdx, [g_zi_sbuf]
     mov     r8d, dword ptr [rbp-52]
     call    zi_stage_title
+    cmp     dword ptr [g_zi_err], 0
+    jne     zij_done
 zij_titdone:
     lea     rcx, [zl_fields]                    ; ,"fields":[
     mov     edx, 11
@@ -1515,6 +1559,7 @@ zij_titdone:
     jz      zij_bad
     mov     dword ptr [g_zi_ap], 0              ; fresh arena for this entry
     mov     dword ptr [rbp-24], 0               ; n (field slot)
+    mov     dword ptr [rbp-84], 0               ; f_idx (strict comma counter)
     mov     qword ptr [rbp-80], 0              ; field-loop progress marker (reset per entry)
 zij_field:
     mov     r10, qword ptr [g_zi_p]
@@ -1526,11 +1571,14 @@ zij_field:
     movzx   eax, byte ptr [r10]
     cmp     eax, ']'
     je      zij_fend
+    cmp     dword ptr [rbp-84], 0               ; A3-29: strict comma grammar inside fields[]
+    je      zij_f0
     cmp     eax, ','
-    jne     zij_f0
+    jne     zij_bad
     inc     r10
     mov     qword ptr [g_zi_p], r10
 zij_f0:
+    inc     dword ptr [rbp-84]
     mov     r10, qword ptr [g_zi_p]
     cmp     r10, qword ptr [g_zi_jend]
     jae     zij_bad
@@ -1737,6 +1785,22 @@ zij_eadv:
     jmp     zij_entry
 zij_close:
     inc     r10
+zij_trail_ws:
+    cmp     r10, qword ptr [g_zi_jend]
+    jae     zij_close_ok
+    movzx   eax, byte ptr [r10]
+    cmp     al, ' '
+    je      zij_ws_nx
+    cmp     al, 9
+    je      zij_ws_nx
+    cmp     al, 10
+    je      zij_ws_nx
+    cmp     al, 13
+    jne     zij_bad                             ; A3-29: reject non-whitespace trailing bytes after ']'
+zij_ws_nx:
+    inc     r10
+    jmp     zij_trail_ws
+zij_close_ok:
     mov     qword ptr [g_zi_p], r10
     jmp     zij_done
 zij_bad:

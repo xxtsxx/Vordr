@@ -21,15 +21,15 @@ cd /d "%~dp0"
 set PYARGS=
 :argloop
 if "%1"=="" goto :doneargs
-if /i "%1"=="release" set PYARGS=%PYARGS% --release
-if /i "%1"=="strict"  set PYARGS=%PYARGS% --strict
-if /i "%1"=="dbg"     set PYARGS=%PYARGS% --dbg
-if /i "%1"=="probeio" set PYARGS=%PYARGS% --probeio
-if /i "%1"=="guishow" set PYARGS=%PYARGS% --guishow
-if /i "%1"=="nohw"    set PYARGS=%PYARGS% --nohw
-if /i "%1"=="clean"   set PYARGS=%PYARGS% --clean
-shift
-goto :argloop
+if /i "%1"=="release" (set PYARGS=%PYARGS% --release& shift & goto :argloop)
+if /i "%1"=="strict"  (set PYARGS=%PYARGS% --strict& shift & goto :argloop)
+if /i "%1"=="dbg"     (set PYARGS=%PYARGS% --dbg& shift & goto :argloop)
+if /i "%1"=="probeio" (set PYARGS=%PYARGS% --probeio& shift & goto :argloop)
+if /i "%1"=="guishow" (set PYARGS=%PYARGS% --guishow& shift & goto :argloop)
+if /i "%1"=="nohw"    (set PYARGS=%PYARGS% --nohw& shift & goto :argloop)
+if /i "%1"=="clean"   (set PYARGS=%PYARGS% --clean& shift & goto :argloop)
+echo build_arm64: unknown argument "%1"
+exit /b 1
 :doneargs
 
 where python >nul 2>nul

@@ -1,34 +1,13 @@
 // =============================================================================
 // src/arm64/loadcfg.S - IMAGE_LOAD_CONFIG_DIRECTORY64 for ARM64
 // -----------------------------------------------------------------------------
-// Provides _load_config_used with DependentLoadFlags = 0x0800
-// (LOAD_LIBRARY_SEARCH_SYSTEM32), SecurityCookie, and ARM64 CFG stubs.
+// Provides read-only _load_config_used with DependentLoadFlags = 0x0800
+// (LOAD_LIBRARY_SEARCH_SYSTEM32).  CFG/GS pointer fields remain zero while
+// GuardFlags = 0 (no dead writable function pointers or indirect-branch stubs;
+// Vordr enforces PAC + per-thread shadow stack + DLPV landing pads directly).
 // =============================================================================
 
-        .text
-        .p2align 2
-guard_check_icall_nop:
-        ret
-
-        .p2align 2
-guard_dispatch_icall_nop:
-        br      x15
-
-        .data
-        .p2align 3
-        .globl  __security_cookie
-__security_cookie:
-        .quad   0x2B992DDFA232
-__guard_check_icall_fptr:
-        .quad   guard_check_icall_nop
-__guard_dispatch_icall_fptr:
-        .quad   guard_dispatch_icall_nop
-
         .section .rdata,"dr"
-        .p2align 2
-gfids_table:
-        .rva    wstart
-
         .p2align 3
         .globl  _load_config_used
 _load_config_used:
@@ -48,13 +27,13 @@ _load_config_used:
         .short  0                           // CSDVersion
         .short  0x0800                      // DependentLoadFlags = LOAD_LIBRARY_SEARCH_SYSTEM32
         .quad   0                           // EditList
-        .quad   __security_cookie           // SecurityCookie
+        .quad   0                           // SecurityCookie (unused: zero CRT / no /GS)
         .quad   0                           // SEHandlerTable
         .quad   0                           // SEHandlerCount
-        .quad   __guard_check_icall_fptr    // GuardCFCheckFunctionPointer
-        .quad   __guard_dispatch_icall_fptr // GuardCFDispatchFunctionPointer
-        .quad   gfids_table                 // GuardCFFunctionTable (VA)
-        .quad   1                           // GuardCFFunctionCount
+        .quad   0                           // GuardCFCheckFunctionPointer
+        .quad   0                           // GuardCFDispatchFunctionPointer
+        .quad   0                           // GuardCFFunctionTable
+        .quad   0                           // GuardCFFunctionCount
         .long   0                           // GuardFlags
         .short  0, 0                        // CodeIntegrity.Flags/Catalog
         .long   0                           // CodeIntegrity.CatalogOffset

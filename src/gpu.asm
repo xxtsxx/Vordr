@@ -889,7 +889,7 @@ ges_have_dc:
     lea     r9, [g_d3d_uav_buf]
     call    qword ptr [r10 + VT_CREATE_BUF]
     test    eax, eax
-    js      ges_fail_free
+    js      ges_dev_lost
 
     ; Create UnorderedAccessView over g_d3d_uav_buf
     mov     dword ptr [rbp-168], 0              ; DXGI_FORMAT_UNKNOWN (structured)
@@ -905,7 +905,7 @@ ges_have_dc:
     lea     r9, [g_d3d_uav]
     call    qword ptr [r10 + VT_CREATE_UAV]
     test    eax, eax
-    js      ges_fail_free
+    js      ges_dev_lost
 
     ; Create Staging Readback Buffer (uint2 = 8 bytes/element)
     mov     eax, dword ptr [rbp-28]
@@ -922,7 +922,7 @@ ges_have_dc:
     lea     r9, [g_d3d_stg_buf]
     call    qword ptr [r10 + VT_CREATE_BUF]
     test    eax, eax
-    js      ges_fail_free
+    js      ges_dev_lost
 
     mov     eax, dword ptr [rbp-16]
     mov     dword ptr [g_gpu_w], eax

@@ -163,8 +163,18 @@ pg_draw:
     xor     edx, edx
     mov     ecx, dword ptr [pw_alpha_n]
     div     ecx                             ; edx = byte mod N -> alphabet index
+    ; A3-19: constant-time linear scan over pw_alpha[0..N-1] (no secret-indexed load)
     lea     r11, [pw_alpha]
-    mov     al, byte ptr [r11+rdx]
+    xor     eax, eax
+    xor     r8d, r8d
+pg_pick:
+    movzx   r9d, byte ptr [r11+r8]
+    cmp     r8d, edx
+    cmove   eax, r9d
+    inc     r8d
+    cmp     r8d, ecx
+    jb      pg_pick
+    xor     r9d, r9d
     mov     r10, qword ptr [rbp-24]
     mov     r11, qword ptr [rbp-48]
     mov     byte ptr [r10+r11], al
@@ -285,8 +295,20 @@ dc_loop:
     call    rand_idx
     cmp     eax, -1
     je      dc_fail
+    ; A3-19: constant-time linear scan over alphabet[0..len-1] (no secret-indexed load)
+    mov     edx, eax
+    mov     ecx, dword ptr [rbp-48]
     mov     r10, qword ptr [rbp-40]
-    movzx   eax, byte ptr [r10+rax]
+    xor     eax, eax
+    xor     r8d, r8d
+dc_pick:
+    movzx   r9d, byte ptr [r10+r8]
+    cmp     r8d, edx
+    cmove   eax, r9d
+    inc     r8d
+    cmp     r8d, ecx
+    jb      dc_pick
+    xor     r9d, r9d
     mov     r11, qword ptr [rbp-24]
     mov     byte ptr [r11], al
     inc     qword ptr [rbp-24]

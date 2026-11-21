@@ -74,46 +74,80 @@ def normalise(path):
     # --- the debug directory, reached through the data directories ---------
     nsections = _u16(b, pe + 6)
     optsize = _u16(b, pe + 20)
+    coff_chars = _u16(b, pe + 22)
     opt = pe + 24
     magic = _u16(b, opt)
-    if magic == 0x20B:            # PE32+
-        ddir = opt + 112
-    elif magic == 0x10B:          # PE32
-        ddir = opt + 96
-    else:
-        raise ValueError("unknown optional header magic 0x%X" % magic)
+    if magic != 0x20B:            # A3-30: require PE32+ only (never accept PE32)
+        raise ValueError("unsupported optional header magic 0x%X (expected PE32+ 0x20B)" % magic)
+    ddir = opt + 112
     nddir = _u32(b, ddir - 4)
     sect = opt + optsize
 
-    # --- PE hardening invariants (AUD-08 / AUD-23) --------------------------
+    # --- PE hardening invariants (AUD-08 / AUD-23 / A3-18 / A3-30) ----------
+    if coff_chars & 0x0001:       # IMAGE_FILE_RELOCS_STRIPPED
+        raise ValueError("PE COFF Characteristics has IMAGE_FILE_RELOCS_STRIPPED (breaks ASLR)")
     dll_chars = _u16(b, opt + 70)
     if (dll_chars & 0x0160) != 0x0160:
         raise ValueError("PE DllCharacteristics 0x%04X missing HIGH_ENTROPY_VA|DYNAMIC_BASE|NX_COMPAT (0x0160)"
                          % dll_chars)
+    roinit_found = False
+    sec_list = []
     for i in range(nsections):
         s = sect + i * 40
-        schars = _u32(b, s + 36)
+        sname = bytes(b[s:s + 8]).rstrip(b"\0").decode("ascii", "replace")
+        vsz, va, rawsz, raw, schars = (
+            _u32(b, s + 8), _u32(b, s + 12), _u32(b, s + 16), _u32(b, s + 20), _u32(b, s + 36)
+        )
+        sec_list.append((sname, va, vsz, raw, rawsz, schars))
         if (schars & 0xA0000000) == 0xA0000000:
-            sname = bytes(b[s:s + 8]).rstrip(b"\0").decode("ascii", "replace")
             raise ValueError("W^X violation: section %r is both writable and executable (0x%08X)"
                              % (sname, schars))
+        if sname == "_ROINIT":
+            if (va & 0xFFF) != 0:
+                raise ValueError("_ROINIT section RVA 0x%X is not 4 KiB-aligned" % va)
+            if schars & 0x20000000:
+                raise ValueError("_ROINIT section must not be executable (0x%08X)" % schars)
+            if (schars & 0x80000000) == 0:
+                raise ValueError("_ROINIT section must be writable before iat_lockdown (0x%08X)" % schars)
+            roinit_found = True
+    if not roinit_found:
+        raise ValueError("missing dedicated _ROINIT section for startup security globals")
     if b"VORDR_NON_RELEASE_BUILD" in b:
         raise ValueError("VORDR_NON_RELEASE_BUILD sentinel found in release PE image")
 
-    def rva_to_off(rva):
-        for i in range(nsections):
-            s = sect + i * 40
-            va, vsz = _u32(b, s + 12), _u32(b, s + 8)
-            raw, rawsz = _u32(b, s + 20), _u32(b, s + 16)
+    def rva_to_sec(rva):
+        for item in sec_list:
+            sname, va, vsz, raw, rawsz, schars = item
             span = min(vsz, rawsz) if vsz else rawsz
             if va <= rva < va + span:
-                return raw + (rva - va)
-        return None
+                return item, raw + (rva - va), span - (rva - va)
+        return None, None, 0
+
+    def rva_to_off(rva):
+        _, off_v, _ = rva_to_sec(rva)
+        return off_v
+
+    # Verify non-empty BASERELOC (dir 5) and IAT (dir 12, read-only section)
+    if nddir <= 12:
+        raise ValueError("PE optional header lacks BASERELOC / IAT data directories")
+    reloc_rva, reloc_sz = _u32(b, ddir + 5 * 8), _u32(b, ddir + 5 * 8 + 4)
+    if reloc_rva == 0 or reloc_sz == 0:
+        raise ValueError("missing or empty IMAGE_DIRECTORY_ENTRY_BASERELOC (breaks ASLR)")
+    iat_rva, iat_sz = _u32(b, ddir + 12 * 8), _u32(b, ddir + 12 * 8 + 4)
+    if iat_rva == 0 or iat_sz == 0:
+        raise ValueError("missing or empty IMAGE_DIRECTORY_ENTRY_IAT")
+    iat_sec, _, iat_rem = rva_to_sec(iat_rva)
+    if iat_sec is None or iat_sz > iat_rem:
+        raise ValueError("IAT directory RVA 0x%X (+0x%X) outside mapped section" % (iat_rva, iat_sz))
+    if iat_sec[5] & 0x80000000:
+        raise ValueError("IAT lies in writable section %r (0x%08X)" % (iat_sec[0], iat_sec[5]))
+
+    # On ARM64 (and x64), verify non-empty EXCEPTION directory (dir 3, .pdata)
+    exc_rva, exc_sz = _u32(b, ddir + 3 * 8), _u32(b, ddir + 3 * 8 + 4)
+    if exc_rva == 0 or exc_sz == 0:
+        raise ValueError("missing or empty IMAGE_DIRECTORY_ENTRY_EXCEPTION (.pdata)")
 
     # --- the EXPORT directory's own TimeDateStamp --------------------------
-    # An exe normally has no exports, but if one ever does: IMAGE_EXPORT_DIRECTORY
-    # carries a timestamp at +4 and the linker writes the build time into it
-    # regardless of /Brepro (Myrkr's shell DLL hit exactly that).
     if nddir > 0:
         exp_rva, exp_size = _u32(b, ddir), _u32(b, ddir + 4)
         if exp_rva and exp_size:
@@ -123,20 +157,17 @@ def normalise(path):
                 changed += 1
 
     # --- the LOAD_CONFIG directory: verify DependentLoadFlags = 0x0800 ------
-    # Without LOAD_LIBRARY_SEARCH_SYSTEM32 (0x0800) in _load_config_used, the PE
-    # loader resolves static import DLLs (wtsapi32.dll, bcrypt.dll, dwmapi.dll,
-    # ...) from the application directory before wstart runs.
-    if nddir <= 10:
-        raise ValueError("PE optional header lacks IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG")
     lcfg_rva, lcfg_size = _u32(b, ddir + 10 * 8), _u32(b, ddir + 10 * 8 + 4)
     if lcfg_rva == 0 or lcfg_size < 0x50:
         raise ValueError("missing or truncated LOAD_CONFIG directory (rva=0x%X, size=0x%X)"
                          % (lcfg_rva, lcfg_size))
     if (lcfg_rva & 7) != 0:
         raise ValueError("LOAD_CONFIG RVA 0x%X is not 8-byte aligned (AUD-23)" % lcfg_rva)
-    lcfg_off = rva_to_off(lcfg_rva)
-    if lcfg_off is None or lcfg_off + 0x50 > len(b):
-        raise ValueError("LOAD_CONFIG RVA 0x%X is outside mapped sections" % lcfg_rva)
+    lcfg_sec, lcfg_off, lcfg_rem = rva_to_sec(lcfg_rva)
+    if lcfg_sec is None or lcfg_size > lcfg_rem or lcfg_off + lcfg_size > len(b):
+        raise ValueError("LOAD_CONFIG RVA 0x%X (+0x%X) is outside mapped section" % (lcfg_rva, lcfg_size))
+    if lcfg_sec[5] & 0x80000000:
+        raise ValueError("LOAD_CONFIG lies in writable section %r (0x%08X)" % (lcfg_sec[0], lcfg_sec[5]))
     if _u32(b, lcfg_off) < 0x50:
         raise ValueError("LOAD_CONFIG.Size 0x%X does not cover DependentLoadFlags"
                          % _u32(b, lcfg_off))
@@ -148,71 +179,48 @@ def normalise(path):
         struct.pack_into("<I", b, lcfg_off + 4, 0)
         changed += 1
 
-    if nddir <= 6:
-        return _save(path, b, changed)
-    dbg_rva = _u32(b, ddir + 6 * 8)
-    dbg_size = _u32(b, ddir + 6 * 8 + 4)
-    if dbg_rva == 0 or dbg_size == 0:
-        return _save(path, b, changed)
-
-    off = rva_to_off(dbg_rva)
-    if off is None:
-        raise ValueError("debug directory RVA 0x%X is in no section" % dbg_rva)
-
-    # IMAGE_DEBUG_DIRECTORY is 28 bytes: TimeDateStamp at +4, SizeOfData at
-    # +16, PointerToRawData at +24.
-    #
-    # The stamps alone are not enough.  Zeroing them took two builds of one
-    # commit from 73 differing bytes to 49, and the rest live in the CodeView
-    # payload - it carries a PDB GUID that the linker regenerates on every
-    # link, so it differs even when the code does not.
-    #
-    # ONLY the CodeView payload (Type 2).  The first version of this cleared
-    # every entry's payload "rather than leaving whichever one changes next",
-    # and that silently turned CET off: hardware shadow-stack compatibility is
-    # advertised by an IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS entry (Type 20)
-    # whose payload IS the flags.  build.cmd's mitigation check caught it -
-    # "CET compatible" simply stopped being printed - which is the whole reason
-    # that check exists.  A build-hygiene fix that disables a mitigation is a
-    # far worse bug than the one it set out to fix.
-    #
-    # Nothing at load time reads the CodeView record.  What is given up is
-    # matching this image to a .pdb, and the .pdb is a local artifact the MSI
-    # does not package, so nothing shipped loses anything.
-    # Every payload EXCEPT that one.  Restricting it to CodeView was not enough
-    # either: /Brepro writes its own IMAGE_DEBUG_TYPE_REPRO record whose payload
-    # is the hash of the linker's inputs, and those inputs are the timestamped
-    # .obj files, so that record varies build to build as well.  Rather than
-    # chase each record type as it turns up, the rule is inverted - clear
-    # everything, preserve the one that means something.
+    # --- the DEBUG directory (A3-18: NEVER bypass CETCOMPAT check on x64!) ---
     EX_DLLCHARACTERISTICS = 20
     cet_ok = False
-    for i in range(dbg_size // 28):
-        e = off + i * 28
-        if e + 28 > len(b):
-            raise ValueError("debug directory runs past the end of the file")
-        if _u32(b, e + 4) != 0:
-            struct.pack_into("<I", b, e + 4, 0)
-            changed += 1
-        if _u32(b, e + 12) == EX_DLLCHARACTERISTICS:
-            cet_sz, cet_ptr = _u32(b, e + 16), _u32(b, e + 24)
-            if cet_ptr and cet_sz >= 4 and cet_ptr + 4 <= len(b):
-                if (_u32(b, cet_ptr) & 0x0001) != 0:
-                    cet_ok = True
-            continue                          # CET lives here - leave it alone
-        raw_sz, raw_rva, raw_ptr = _u32(b, e + 16), _u32(b, e + 20), _u32(b, e + 24)
-        if raw_ptr and raw_sz:
-            if raw_ptr + raw_sz > len(b):
-                raise ValueError("debug payload runs past the end of the file")
-            if b[raw_ptr:raw_ptr + raw_sz] != bytearray(raw_sz):
-                b[raw_ptr:raw_ptr + raw_sz] = bytearray(raw_sz)
+    dbg_rva = _u32(b, ddir + 6 * 8) if nddir > 6 else 0
+    dbg_size = _u32(b, ddir + 6 * 8 + 4) if nddir > 6 else 0
+    if dbg_rva and dbg_size:
+        off = rva_to_off(dbg_rva)
+        if off is None:
+            raise ValueError("debug directory RVA 0x%X is in no section" % dbg_rva)
+        for i in range(dbg_size // 28):
+            e = off + i * 28
+            if e + 28 > len(b):
+                raise ValueError("debug directory runs past the end of the file")
+            if _u32(b, e + 4) != 0:
+                struct.pack_into("<I", b, e + 4, 0)
                 changed += 1
-        if raw_sz != 0 or raw_rva != 0 or raw_ptr != 0:
-            struct.pack_into("<III", b, e + 16, 0, 0, 0)
-            changed += 1
+            if _u32(b, e + 12) == EX_DLLCHARACTERISTICS:
+                cet_sz, cet_rva, cet_ptr = _u32(b, e + 16), _u32(b, e + 20), _u32(b, e + 24)
+                if cet_ptr and cet_sz >= 4 and cet_ptr + 4 <= len(b):
+                    if cet_rva and rva_to_off(cet_rva) != cet_ptr:
+                        raise ValueError("CET debug entry RVA 0x%X disagrees with PointerToRawData 0x%X"
+                                         % (cet_rva, cet_ptr))
+                    if (_u32(b, cet_ptr) & 0x0001) != 0:
+                        cet_ok = True
+                continue
+            raw_sz, raw_rva, raw_ptr = _u32(b, e + 16), _u32(b, e + 20), _u32(b, e + 24)
+            if raw_ptr and raw_sz:
+                if raw_ptr + raw_sz > len(b):
+                    raise ValueError("debug payload runs past the end of the file")
+                if b[raw_ptr:raw_ptr + raw_sz] != bytearray(raw_sz):
+                    b[raw_ptr:raw_ptr + raw_sz] = bytearray(raw_sz)
+                    changed += 1
+            if raw_sz != 0 or raw_rva != 0 or raw_ptr != 0:
+                struct.pack_into("<III", b, e + 16, 0, 0, 0)
+                changed += 1
 
     if machine == 0x8664 and not cet_ok:
         raise ValueError("missing or disabled CETCOMPAT in IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS")
+
+    # Zero OptionalHeader.CheckSum if non-zero after normalisation edits
+    if changed and _u32(b, opt + 64) != 0:
+        struct.pack_into("<I", b, opt + 64, 0)
 
     return _save(path, b, changed)
 

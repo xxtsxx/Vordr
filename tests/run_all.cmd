@@ -381,6 +381,21 @@ if not "%R_BUILD%"=="PASS" (
     set R_INSTALLER=skip
     goto :installer_done
 )
+set HAS_CLANG=0
+where clang >nul 2>&1 && set HAS_CLANG=1
+if exist "C:\Program Files\LLVM\bin\clang.exe" set HAS_CLANG=1
+if "!HAS_CLANG!"=="1" (
+    call .\build_arm64.cmd release > "%WORK%\build_arm64.log" 2>&1
+    if errorlevel 1 (
+        echo   installer: FAIL ^(build_arm64.cmd release^) - see %WORK%\build_arm64.log
+        set R_INSTALLER=FAIL
+        goto :installer_done
+    )
+) else if not exist "bin\vordr-arm64.exe" (
+    echo   installer: SKIP ^(clang/LLVM not found and bin\vordr-arm64.exe absent^)
+    set R_INSTALLER=skip
+    goto :installer_done
+)
 del bin\vordr-*.msi >nul 2>nul
 powershell -ExecutionPolicy Bypass -NoProfile -File tools\make_msi.ps1 > "%WORK%\msi_build.log" 2>&1
 if errorlevel 1 (

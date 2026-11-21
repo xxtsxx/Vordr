@@ -51,6 +51,11 @@ externdef g_wf_created:dword
 extern secmem_panic_wipe:proc           ; wipe every pinned secret (shutdown/logoff)
 extern print_err:proc
 extern cfg_get_dword_hklm:proc
+extern cfg_get_dword_hklm_fc:proc
+extern sec_lock:proc
+extern sha256_init:proc
+extern sha256_update:proc
+extern sha256_final:proc
 externdef g_allow_unc:dword
 externdef g_allow_screencap:dword
 externdef g_vof_buf:qword
@@ -455,7 +460,6 @@ extern AddAccessAllowedAceEx:proc
 extern AddMandatoryAce:proc
 extern SetSecurityDescriptorSacl:proc
 extern SetSecurityDescriptorControl:proc
-extern SendMessageTimeoutW:proc
 extern GetWindowThreadProcessId:proc
 extern OpenProcess:proc
 extern QueryFullProcessImageNameW:proc
@@ -463,6 +467,16 @@ extern GetClipboardOwner:proc
 extern FindFirstFileW:proc
 extern FindNextFileW:proc
 extern FindClose:proc
+extern GetWindowTextW:proc
+extern GetCurrentProcessId:proc
+extern CreateNamedPipeW:proc
+extern ConnectNamedPipe:proc
+extern DisconnectNamedPipe:proc
+extern GetNamedPipeClientProcessId:proc
+extern GetNamedPipeServerProcessId:proc
+extern GetOverlappedResult:proc
+extern CreateEventW:proc
+extern ResetEvent:proc
 
 ; ---- constants ---------------------------------------------------------------
 WM_SETTEXT_                 equ 0Ch
@@ -475,7 +489,6 @@ INHERIT_ACE_FLAGS_          equ 3
 DESKTOP_PRIV_USER_MASK_     equ 00020146h
 DESKTOP_CREATE_ACCESS_      equ 000601FFh
 PROCESS_QUERY_LIMITED_      equ 1000h
-SMTO_SAFE_                  equ 3
 MB_OK               equ 0
 MB_ICONERROR        equ 10h
 MB_ICONINFORMATION  equ 40h
@@ -490,8 +503,22 @@ IDOK                equ 1
 IDCANCEL            equ 2
 
 WM_CLOSE            equ 10h
+WM_QUIT_            equ 12h
 WM_CANCELMODE_      equ 1Fh
 WM_TIMER            equ 113h
+WM_CUT_             equ 300h
+WM_COPY_            equ 301h
+EM_GETSEL_          equ 0B0h
+EM_REPLACESEL_      equ 0C2h
+EM_GETPASSWORDCHAR_ equ 0D2h
+ES_READONLY_        equ 0800h
+SECDESK_POLL_TIMER  equ 77
+PIPE_SRV_OPEN_      equ 400C0001h       ; PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED
+PIPE_SRV_MODE_      equ 0000000Eh       ; PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_REJECT_REMOTE_CLIENTS
+PIPE_CLI_FLAGS_     equ 00110000h       ; SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION
+ERROR_IO_PENDING_   equ 997
+ERROR_PIPE_CONN_    equ 535
+FILE_READ_ATTR_     equ 00000080h
 EM_GETMODIFY_       equ 0B8h
 EM_EMPTYUNDOBUFFER_ equ 0CDh
 EM_GETLIMITTEXT_    equ 0D5h
@@ -588,7 +615,6 @@ GENERIC_READ        equ 80000000h
 FILE_SHARE_RWD      equ 7
 OPEN_EXISTING       equ 3
 FILE_ATTR_NORMAL    equ 80h
-COPYDATA_OPENVAULT  equ 4E504F56h       ; 'VOPN' - our dwData tag; ignore anything else
 ; ghost buttons (frameless glyph controls: theme_drawitem tdi_ghost path)
 GHOST_STYLE_        equ 2               ; GWL_USERDATA style byte
 TME_LEAVE_          equ 2
@@ -1145,6 +1171,9 @@ WSTR ev_save,       <gui-save>
 WSTR ev_export,     <gui-export>
 WSTR ev_import,     <gui-import>
 WSTR g_singleton_name, <VordrSingletonMutex_v1>
+WSTR w_ipc_pfx,        <\\.\pipe\VordrIPC->
+WSTR w_empty_str,      <>
+CSTR a_ipc_dom,        "VordrIPC-v1"
 WSTR g_vault_title,    <Vordr - Vault>
 WSTR g_vault_title_ro, <Vordr - Vault (read-only)>   ; E9: title when opened read-only
 WSTR g_unlock_title,   <Vordr - Unlock vault>
@@ -1914,6 +1943,22 @@ public g_secdesk_hwnd
 g_secdesk_hwnd  dq ?                  ; live password-dialog HWND on the private desktop (0 = none)
 g_secdesk_res   dq ?                  ; DialogBox result marshalled back to the caller
 g_secdesk_orphan dd ?                 ; 1 = the watchdog gave up on a wedged worker
+g_secdesk_busy   dd ?                 ; A3-03: atomic re-entrancy guard for gui_secdesk_show
+g_secdesk_cancel dd ?                 ; A3-10: worker-polled cancellation flag
+g_secdesk_orphans dd ?                ; A3-10: count of live orphaned secdesk workers
+g_comp_locked    dd ?                 ; A3-23: 1 iff g_comp_bits was VirtualLock'd via sec_lock
+align 8
+SD_SLOT_SZ      equ 64
+SD_SLOTS        equ 4
+g_sd_slots      db (SD_SLOT_SZ * SD_SLOTS) dup (?) ; A3-10: per-invocation SECDESK_CTX slots
+g_ipc_pipe      dq ?                  ; A3-11: kernel-authenticated singleton named pipe
+g_ipc_evt       dq ?                  ; A3-11: manual-reset OVERLAPPED event for g_ipc_pipe
+g_ipc_ov        db 32 dup (?)         ; A3-11: OVERLAPPED struct for ConnectNamedPipe
+g_ipc_sha_ctx   db 128 dup (?)        ; A3-11: SHA-256 context for per-SID pipe name
+g_ipc_hash      db 32 dup (?)         ; A3-11: SHA-256 digest for per-SID pipe name
+align 2
+g_ipc_pipe_name dw 64 dup (?)         ; A3-11: \\.\pipe\VordrIPC-<16hex>
+g_ipc_buf       dw MAX_PATH_CHARS dup (?) ; A3-11: named pipe incoming vault path scratch
 align 2
 g_secdesk_name  dw 32 dup (?)         ; "Vordr-Secure-<16 hex>": a fixed, well-known name let any
                                       ;   process open the desktop and wait on it by name
@@ -1934,7 +1979,6 @@ g_openfile_set dd ?                   ; 1 = an import is pending for the open va
 g_imp_preset   dd ?                   ; 1 = gui_import must use g_imppath as-is
 g_ro_badpath   dd ?                   ; 1 = --ro <path> failed validation (refuse fallback)
 align 8
-g_cds          db 24 dup (?)          ; COPYDATASTRUCT {dwData, cbData, pad, lpData}
 g_exedir    dw MAX_PATH_CHARS dup (?)  ; folder holding vordr.exe
 g_initdir   dw MAX_PATH_CHARS dup (?)  ; explicit start folder for the vault picker
 g_nid       db 976 dup (?)           ; NOTIFYICONDATAW (x64 full size)
@@ -2113,7 +2157,8 @@ public g_pwbuf, g_pw2buf, g_secret_w, g_e_totp, g_totp_b32
 public g_conv_w, g_valblob, g_lblblob, g_tilefiles, g_tileblob, g_imgstageref
 public g_readpw, g_phon_w, g_genout, g_genout_w, g_xlpw, g_xlpw2, g_match_w, g_sub_w
 public g_times_w, g_urlbuf, g_urlbuf2, g_cmpbuf, g_phdate, g_imgfn_w, g_rlabel, g_grouptxt
-public g_tmp_sd, g_comp_bits, g_comp_capw, g_comp_caph, g_comp_wbuf
+public g_tmp_sd, g_tmp_acl, g_comp_bits, g_comp_capw, g_comp_caph, g_comp_wbuf
+public g_deleted_ft, g_tmpfile, g_motw_w, g_extw, g_motw_io, g_san_tmp, g_san_stem
 ; ^ every buffer that holds a field value, a password or an AttachRef key: secmem.asm
 ;   pins them at startup and wipes them on a crash (sec_regions)
 g_pwbuf     dw 1024 dup (?)        ; password field (wide; wiped after use)
@@ -2930,10 +2975,48 @@ gsa2_no:
     ret
 gui_shell_arg endp
 
+; gui_pid_is_self(ecx = pid) -> eax = 1 iff pid is running this exact vordr.exe
+;   binary (volume serial + file index match) (VDR2-10 / A3-11).
+gui_pid_is_self proc frame
+    FRAME_PROLOG 96
+    test    ecx, ecx
+    jz      gpis_no
+    mov     dword ptr [rbp-28], ecx
+    WINCALL OpenProcess, PROCESS_QUERY_LIMITED_, 0, dword ptr [rbp-28]
+    test    rax, rax
+    jz      gpis_no
+    mov     qword ptr [rbp-48], rax
+    mov     dword ptr [rbp-36], MAX_PATH_CHARS - 1
+    WINCALL QueryFullProcessImageNameW, qword ptr [rbp-48], 0, addr g_peer_path, addr rbp-36
+    mov     dword ptr [rbp-52], eax
+    WINCALL CloseHandle, qword ptr [rbp-48]
+    cmp     dword ptr [rbp-52], 0
+    je      gpis_no
+    WINCALL GetModuleFileNameW, 0, addr g_self_path, MAX_PATH_CHARS - 1
+    test    eax, eax
+    jz      gpis_no
+    cmp     eax, MAX_PATH_CHARS - 1
+    jae     gpis_no
+    lea     rcx, [g_self_path]
+    lea     rdx, [g_peer_path]
+    call    gui_same_file
+    test    eax, eax
+    jz      gpis_no
+    mov     ecx, dword ptr [rbp-28]
+    mov     dword ptr [g_last_peer_pid], ecx
+    FRAME_EPILOG
+    ret
+gpis_no:
+    mov     dword ptr [g_last_peer_pid], 0
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gui_pid_is_self endp
+
 ; gui_hwnd_is_self(rcx = hwnd) -> eax = 1 iff hwnd is owned by a process running
 ;   this exact vordr.exe binary (volume serial + file index match) (VDR2-10).
 gui_hwnd_is_self proc frame
-    FRAME_PROLOG 96
+    FRAME_PROLOG 64
     test    rcx, rcx
     jz      ghis_no
     mov     qword ptr [rbp-24], rcx
@@ -2941,30 +3024,8 @@ gui_hwnd_is_self proc frame
     WINCALL GetWindowThreadProcessId, qword ptr [rbp-24], addr rbp-28
     test    eax, eax
     jz      ghis_no
-    cmp     dword ptr [rbp-28], 0
-    je      ghis_no
-    WINCALL OpenProcess, PROCESS_QUERY_LIMITED_, 0, dword ptr [rbp-28]
-    test    rax, rax
-    jz      ghis_no
-    mov     qword ptr [rbp-48], rax
-    mov     dword ptr [rbp-36], MAX_PATH_CHARS - 1
-    WINCALL QueryFullProcessImageNameW, qword ptr [rbp-48], 0, addr g_peer_path, addr rbp-36
-    mov     dword ptr [rbp-52], eax
-    WINCALL CloseHandle, qword ptr [rbp-48]
-    cmp     dword ptr [rbp-52], 0
-    je      ghis_no
-    WINCALL GetModuleFileNameW, 0, addr g_self_path, MAX_PATH_CHARS - 1
-    test    eax, eax
-    jz      ghis_no
-    cmp     eax, MAX_PATH_CHARS - 1
-    jae     ghis_no
-    lea     rcx, [g_self_path]
-    lea     rdx, [g_peer_path]
-    call    gui_same_file
-    test    eax, eax
-    jz      ghis_no
     mov     ecx, dword ptr [rbp-28]
-    mov     dword ptr [g_last_peer_pid], ecx
+    call    gui_pid_is_self
     FRAME_EPILOG
     ret
 ghis_no:
@@ -3074,47 +3135,263 @@ gcsm_def:
     ret
 gui_create_singleton_mutex endp
 
-; gui_send_openfile(rcx = target hwnd) -> eax = 1 if delivered to verified Vordr peer.
+; gui_build_ipc_pipe_name() -> eax = 1 ok (g_ipc_pipe_name = \\.\pipe\VordrIPC-<16hex>).
+;   Derives a per-user-SID name from SHA-256("VordrIPC-v1" || TokenUserSID) (A3-11).
+gui_build_ipc_pipe_name proc frame
+    FRAME_PROLOG 80
+    WINCALL GetCurrentProcess
+    WINCALL OpenProcessToken, rax, TOKEN_QUERY_, addr rbp-24
+    test    eax, eax
+    jz      gbip_fail
+    WINCALL GetTokenInformation, qword ptr [rbp-24], 1, addr g_tmp_tokbuf, 128, addr rbp-28
+    mov     dword ptr [rbp-32], eax
+    WINCALL CloseHandle, qword ptr [rbp-24]
+    cmp     dword ptr [rbp-32], 0
+    je      gbip_fail
+    mov     rax, qword ptr [g_tmp_tokbuf]
+    test    rax, rax
+    jz      gbip_fail
+    mov     qword ptr [rbp-40], rax
+    WINCALL GetLengthSid, rax
+    test    eax, eax
+    jz      gbip_fail
+    cmp     eax, 120
+    ja      gbip_fail
+    mov     dword ptr [rbp-44], eax
+    lea     rcx, [g_ipc_sha_ctx]
+    call    sha256_init
+    lea     rcx, [g_ipc_sha_ctx]
+    lea     rdx, [a_ipc_dom]
+    mov     r8d, a_ipc_dom_len
+    call    sha256_update
+    lea     rcx, [g_ipc_sha_ctx]
+    mov     rdx, qword ptr [rbp-40]
+    mov     r8d, dword ptr [rbp-44]
+    call    sha256_update
+    lea     rcx, [g_ipc_sha_ctx]
+    lea     rdx, [g_ipc_hash]
+    call    sha256_final
+    lea     rcx, [g_ipc_pipe_name]
+    lea     rdx, [w_ipc_pfx]
+    lea     r8, [g_ipc_pipe_name + 40*2]
+    call    gui_wstrcpy
+    mov     rcx, qword ptr [g_ipc_hash]
+    mov     rdx, rax
+    call    gui_ft_hex16
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gbip_fail:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gui_build_ipc_pipe_name endp
+
+; gui_ipc_arm() - reset event and post overlapped ConnectNamedPipe on g_ipc_pipe.
+gui_ipc_arm proc frame
+    FRAME_PROLOG 48
+    cmp     qword ptr [g_ipc_pipe], 0
+    je      gia_done
+    WINCALL ResetEvent, qword ptr [g_ipc_evt]
+    lea     rcx, [g_ipc_ov]
+    mov     edx, 32
+    call    secure_zero
+    mov     rax, qword ptr [g_ipc_evt]
+    mov     qword ptr [g_ipc_ov+24], rax
+    WINCALL ConnectNamedPipe, qword ptr [g_ipc_pipe], addr g_ipc_ov
+    test    eax, eax
+    jnz     gia_done
+    WINCALL GetLastError
+    cmp     eax, ERROR_PIPE_CONN_
+    je      gia_done
+    cmp     eax, ERROR_IO_PENDING_
+    je      gia_done
+gia_done:
+    FRAME_EPILOG
+    ret
+gui_ipc_arm endp
+
+; gui_ipc_start() - create kernel-authenticated owner-only named pipe server (A3-11).
+gui_ipc_start proc frame
+    FRAME_PROLOG 128
+    mov     qword ptr [g_ipc_pipe], 0
+    mov     qword ptr [g_ipc_evt], 0
+    call    gui_build_ipc_pipe_name
+    test    eax, eax
+    jz      gis_done
+    mov     ecx, GENERIC_ALL_
+    xor     edx, edx
+    mov     r8d, 1
+    call    gui_build_user_dacl
+    test    eax, eax
+    jz      gis_done
+    WINCALL CreateEventW, 0, 1, 0, 0
+    test    rax, rax
+    jz      gis_done
+    mov     qword ptr [g_ipc_evt], rax
+    mov     qword ptr [rbp-48], 24
+    lea     rax, [g_tmp_sd]
+    mov     qword ptr [rbp-40], rax
+    mov     qword ptr [rbp-32], 0
+    WINCALL CreateNamedPipeW, addr g_ipc_pipe_name, PIPE_SRV_OPEN_, PIPE_SRV_MODE_, \
+            1, 0, MAX_PATH_CHARS*2, 0, addr rbp-48
+    cmp     rax, -1
+    je      gis_fail_evt
+    mov     qword ptr [g_ipc_pipe], rax
+    call    gui_ipc_arm
+    jmp     gis_done
+gis_fail_evt:
+    WINCALL CloseHandle, qword ptr [g_ipc_evt]
+    mov     qword ptr [g_ipc_evt], 0
+gis_done:
+    FRAME_EPILOG
+    ret
+gui_ipc_start endp
+
+; gui_ipc_accept() - handle a connected peer on g_ipc_pipe, authenticating the
+;   kernel-reported client PID via GetNamedPipeClientProcessId + gui_pid_is_self (A3-11).
+gui_ipc_accept proc frame
+    FRAME_PROLOG 96
+    cmp     qword ptr [g_ipc_pipe], 0
+    je      gac_ret
+    mov     dword ptr [rbp-24], 0                 ; ov dummy
+    mov     dword ptr [rbp-28], 0                 ; client PID
+    mov     dword ptr [rbp-32], 0                 ; bytes read
+    mov     dword ptr [rbp-36], 0                 ; read ok flag
+    WINCALL GetOverlappedResult, qword ptr [g_ipc_pipe], addr g_ipc_ov, addr rbp-24, 0
+    test    eax, eax
+    jz      gac_rearm
+    WINCALL GetNamedPipeClientProcessId, qword ptr [g_ipc_pipe], addr rbp-28
+    test    eax, eax
+    jz      gac_rearm
+    WINCALL GetCurrentProcessId
+    cmp     eax, dword ptr [rbp-28]               ; reject self-connect
+    je      gac_rearm
+    mov     ecx, dword ptr [rbp-28]
+    call    gui_pid_is_self                       ; verify exact vordr.exe binary
+    test    eax, eax
+    jz      gac_rearm
+    WINCALL ReadFile, qword ptr [g_ipc_pipe], addr g_ipc_buf, MAX_PATH_CHARS*2, addr rbp-32, 0
+    mov     dword ptr [rbp-36], eax
+gac_rearm:
+    WINCALL DisconnectNamedPipe, qword ptr [g_ipc_pipe]
+    call    gui_ipc_arm
+    cmp     dword ptr [rbp-36], 0
+    je      gac_wipe
+    mov     eax, dword ptr [rbp-32]
+    cmp     eax, 4
+    jb      gac_wipe
+    cmp     eax, MAX_PATH_CHARS*2
+    ja      gac_wipe
+    test    eax, 1
+    jnz     gac_wipe
+    lea     r10, [g_ipc_buf]
+    mov     edx, eax
+    sub     edx, 2
+    cmp     word ptr [r10+rdx], 0
+    jne     gac_wipe
+    ; Refuse hand-offs in read-only mode, on a private desktop, or during any modal dialog.
+    cmp     dword ptr [g_readonly], 0
+    jne     gac_wipe
+    cmp     qword ptr [g_secdesk_hd], 0
+    jne     gac_wipe
+    cmp     dword ptr [g_imp_preset], 0
+    jne     gac_wipe
+    cmp     qword ptr [g_vaulthwnd], 0
+    je      gac_chkshow
+    WINCALL GetWindow, qword ptr [g_vaulthwnd], GW_ENABLEDPOPUP_
+    test    rax, rax
+    jnz     gac_wipe
+    jmp     gac_stash
+gac_chkshow:
+    cmp     dword ptr [g_showing], 0
+    jne     gac_wipe
+gac_stash:
+    lea     rcx, [g_ipc_buf]
+    call    gui_stash_openfile
+    test    eax, eax
+    jz      gac_wipe
+    cmp     qword ptr [g_vaulthwnd], 0
+    je      gac_post_open
+    WINCALL PostMessageW, qword ptr [g_vaulthwnd], WM_VORDR_RAISE, 0, 0
+    WINCALL SetForegroundWindow, qword ptr [g_vaulthwnd]
+    lea     rcx, [g_imppath]
+    lea     rdx, [g_openfile]
+    lea     r8, [g_imppath + (MAX_PATH_CHARS-1)*2]
+    call    gui_wstrcpy
+    mov     dword ptr [g_imp_preset], 1
+    mov     dword ptr [g_openfile_set], 0
+    WINCALL PostMessageW, qword ptr [g_vaulthwnd], WM_COMMAND, IDC_V_MIMPORT, 0
+    jmp     gac_wipe
+gac_post_open:
+    ; A3-11: always hand off asynchronously so gui_open never runs inside IPC delivery
+    cmp     qword ptr [g_trayhwnd], 0
+    je      gac_wipe
+    WINCALL PostMessageW, qword ptr [g_trayhwnd], WM_COMMAND, IDM_OPEN, 0
+gac_wipe:
+    mov     edx, dword ptr [rbp-32]
+    test    edx, edx
+    jz      gac_ret
+    cmp     edx, MAX_PATH_CHARS*2
+    jbe     @F
+    mov     edx, MAX_PATH_CHARS*2
+@@: lea     rcx, [g_ipc_buf]
+    call    secure_zero
+gac_ret:
+    FRAME_EPILOG
+    ret
+gui_ipc_accept endp
+
+; gui_send_openfile(rcx = unused) -> eax = 1 if delivered to verified Vordr peer
+;   over the kernel-authenticated named pipe (A3-11).
 public gui_send_openfile
 gui_send_openfile proc frame
-    FRAME_PROLOG 160                              ; CreateWindowExW takes 12 args (96B spill)
-    mov     qword ptr [rbp-24], rcx
-    call    gui_hwnd_is_self
+    FRAME_PROLOG 112
+    call    gui_build_ipc_pipe_name
     test    eax, eax
     jz      gsof_no
-    call    gui_allow_peer_fg
-    WINCALL CreateWindowExW, 0, addr dbg_static_cls, 0, WS_POPUP, 0, 0, 0, 0, 0, 0, 0, 0
-    test    rax, rax
-    jz      gsof_no
-    mov     qword ptr [rbp-40], rax               ; hSender owned by this vordr.exe process
+    WINCALL CreateFileW, addr g_ipc_pipe_name, GENERIC_WRITE_, 0, 0, OPEN_EXISTING, PIPE_CLI_FLAGS_, 0
+    cmp     rax, -1
+    je      gsof_no
+    mov     qword ptr [rbp-24], rax               ; hPipe
+    mov     dword ptr [rbp-28], 0                 ; server PID
+    WINCALL GetNamedPipeServerProcessId, qword ptr [rbp-24], addr rbp-28
+    test    eax, eax
+    jz      gsof_close_no
+    WINCALL GetCurrentProcessId
+    cmp     eax, dword ptr [rbp-28]
+    je      gsof_close_no
+    mov     ecx, dword ptr [rbp-28]
+    call    gui_pid_is_self
+    test    eax, eax
+    jz      gsof_close_no
+    WINCALL AllowSetForegroundWindow, dword ptr [rbp-28]
     lea     r10, [g_openfile]                     ; byte length incl. the NUL
     xor     r8d, r8d
 gsof_len:
     cmp     word ptr [r10+r8*2], 0
     je      gsof_have
     inc     r8d
-    cmp     r8d, MAX_PATH_CHARS-2               ; gui_stash_openfile's own bound
+    cmp     r8d, MAX_PATH_CHARS-2
     jb      gsof_len
 gsof_have:
     inc     r8d
     add     r8d, r8d                              ; wchars -> bytes
-    lea     r11, [g_cds]
-    mov     qword ptr [r11+0], COPYDATA_OPENVAULT
-    mov     dword ptr [r11+8], r8d
-    lea     rax, [g_openfile]
-    mov     qword ptr [r11+16], rax
-    mov     qword ptr [rbp-32], 0
-    WINCALL SendMessageTimeoutW, qword ptr [rbp-24], WM_COPYDATA, qword ptr [rbp-40], addr g_cds, \
-            SMTO_SAFE_, 2000, addr rbp-32
-    mov     qword ptr [rbp-48], rax
-    WINCALL DestroyWindow, qword ptr [rbp-40]
-    cmp     qword ptr [rbp-48], 0
+    mov     dword ptr [rbp-32], r8d
+    mov     dword ptr [rbp-36], 0
+    WINCALL WriteFile, qword ptr [rbp-24], addr g_openfile, dword ptr [rbp-32], addr rbp-36, 0
+    mov     dword ptr [rbp-40], eax
+    WINCALL CloseHandle, qword ptr [rbp-24]
+    cmp     dword ptr [rbp-40], 0
     je      gsof_no
-    cmp     qword ptr [rbp-32], 0
-    je      gsof_no
+    mov     eax, dword ptr [rbp-36]
+    cmp     eax, dword ptr [rbp-32]
+    jne     gsof_no
     mov     eax, 1
     FRAME_EPILOG
     ret
+gsof_close_no:
+    WINCALL CloseHandle, qword ptr [rbp-24]
 gsof_no:
     xor     eax, eax
     FRAME_EPILOG
@@ -4570,6 +4847,8 @@ unlock_proc proc
     mov     qword ptr [rbp-8], rcx
     cmp     rdx, WM_INITDIALOG
     je      up_init
+    cmp     rdx, WM_TIMER
+    je      up_timer
     cmp     rdx, WM_VORDR_RAISE
     je      up_raise
     cmp     rdx, WM_DESTROY
@@ -4634,13 +4913,19 @@ up_raise:
     mov     rdx, rax
     call    gui_window_raise
     jmp     up_ret
+up_timer:
+    mov     rcx, qword ptr [rbp-8]
+    mov     rdx, r8
+    call    gui_secdesk_poll_timer
+    jmp     up_ret
 up_init:
     mov     rcx, qword ptr [rbp-8]
     mov     qword ptr [g_secdesk_hwnd], rcx
     cmp     qword ptr [g_secdesk_hd], 0
     jne     @F
     mov     qword ptr [g_open_dlg_hwnd], rcx
-@@:
+@@: call    gui_secdesk_arm_poll
+    mov     rcx, qword ptr [rbp-8]
     mov     edx, IDC_U_UNLOCK
     call    theme_attach
     mov     rcx, qword ptr [rbp-8]
@@ -9672,6 +9957,58 @@ row_mk endp
 ;   via WM_PRINTCLIENT + single atomic BitBlt so ClearType, selection highlights,
 ;   wrapping Notes, and password bullets stay crisp and flicker-free over GPU art.
 ; =============================================================================
+; gui_edit_clip_intercept(rcx = hwnd, edx = is_cut) - route Edit WM_COPY / WM_CUT
+;   through gui_copy so Windows clipboard history, cloud sync, and auto-clear apply
+;   identically to Ctrl+C / Ctrl+X / context-menu Copy & Cut (A3-04).
+gui_edit_clip_intercept proc frame
+    FRAME_PROLOG 96
+    mov     qword ptr [rbp-24], rcx               ; hwnd
+    mov     dword ptr [rbp-28], edx               ; is_cut
+    ; Masked password fields never allow clipboard copy/cut
+    WINCALL SendMessageW, qword ptr [rbp-24], EM_GETPASSWORDCHAR_, 0, 0
+    test    eax, eax
+    jnz     geci_done
+    mov     dword ptr [rbp-32], 0                 ; sel start
+    mov     dword ptr [rbp-36], 0                 ; sel end
+    WINCALL SendMessageW, qword ptr [rbp-24], EM_GETSEL_, addr rbp-32, addr rbp-36
+    mov     eax, dword ptr [rbp-32]
+    mov     edx, dword ptr [rbp-36]
+    cmp     eax, edx
+    jae     geci_done                             ; empty selection -> nothing to copy
+    WINCALL GetWindowTextW, qword ptr [rbp-24], addr g_conv_w, CONVW_MAX
+    test    eax, eax
+    jle     geci_wipe
+    cmp     eax, CONVW_MAX - 1
+    jbe     @F
+    mov     eax, CONVW_MAX - 1
+@@: mov     edx, dword ptr [rbp-36]
+    cmp     edx, eax
+    jbe     @F
+    mov     edx, eax
+@@: mov     ecx, dword ptr [rbp-32]
+    cmp     ecx, edx
+    jae     geci_wipe
+    lea     r10, [g_conv_w]
+    mov     word ptr [r10 + rdx*2], 0
+    lea     rdx, [r10 + rcx*2]
+    mov     rcx, qword ptr [rbp-24]
+    call    gui_copy
+    cmp     dword ptr [rbp-28], 0
+    je      geci_wipe
+    WINCALL GetWindowLongPtrW, qword ptr [rbp-24], -16 ; GWL_STYLE
+    test    eax, ES_READONLY_
+    jnz     geci_wipe
+    WINCALL SendMessageW, qword ptr [rbp-24], EM_REPLACESEL_, 1, addr w_empty_str
+    WINCALL InvalidateRect, qword ptr [rbp-24], 0, 0
+geci_wipe:
+    lea     rcx, [g_conv_w]
+    mov     edx, CONVW_MAX*2
+    call    secure_zero
+geci_done:
+    FRAME_EPILOG
+    ret
+gui_edit_clip_intercept endp
+
 glass_edit_subclass proc
     push    rbp
     mov     rbp, rsp
@@ -9684,6 +10021,10 @@ glass_edit_subclass proc
     je      ges_erase
     cmp     edx, WM_PAINT
     je      ges_paint
+    cmp     edx, WM_COPY_
+    je      ges_copy
+    cmp     edx, WM_CUT_
+    je      ges_cut
 
     WINCALL DefSubclassProc, rcx, rdx, r8, r9
     mov     qword ptr [rbp-40], rax              ; save return value
@@ -9741,6 +10082,22 @@ ges_ret_val:
 
 ges_erase:
     mov     eax, 1
+    mov     rsp, rbp
+    pop     rbp
+    ret
+ges_copy:
+    mov     rcx, qword ptr [rbp-8]
+    xor     edx, edx
+    call    gui_edit_clip_intercept
+    xor     eax, eax
+    mov     rsp, rbp
+    pop     rbp
+    ret
+ges_cut:
+    mov     rcx, qword ptr [rbp-8]
+    mov     edx, 1
+    call    gui_edit_clip_intercept
+    xor     eax, eax
     mov     rsp, rbp
     pop     rbp
     ret
@@ -11286,6 +11643,8 @@ lwp_rows:
     call    lbsb_paint
     WINCALL BitBlt, qword ptr [rbp-32], 0, 0, dword ptr [rbp-88], dword ptr [rbp-84], \
             qword ptr [rbp-40], 0, 0, SRCCOPY_
+    ; A3-23: scrub off-screen list/checklist pixels before releasing the bitmap
+    WINCALL PatBlt, qword ptr [rbp-40], 0, 0, dword ptr [rbp-88], dword ptr [rbp-84], PATBLT_BLACK_
     WINCALL SelectObject, qword ptr [rbp-40], qword ptr [rbp-56]
     jmp     lwp_end
 lwp_direct:                                      ; no buffer (GDI exhausted): straight
@@ -13936,13 +14295,23 @@ gsa_dev_lp:
     mov     qword ptr [rbp-56], r10
     jmp     gsa_dev_lp
 gsa_dev_hit:
-    ; prepend '_' in g_san_tmp
+    ; prepend '_' in g_san_tmp (A3-22: when leading spaces were trimmed, r10 > g_san_tmp,
+    ; so write '_' directly at [r10-2] instead of an overlapping backward shift)
     mov     r10, qword ptr [rbp-40]
     mov     ecx, dword ptr [rbp-48]
     cmp     ecx, 254
     jbe     @F
     mov     ecx, 254
 @@: lea     r11, [g_san_tmp]
+    cmp     r10, r11
+    jbe     gsa_shift_go
+    sub     r10, 2
+    mov     word ptr [r10], '_'
+    inc     ecx
+    mov     qword ptr [rbp-40], r10
+    mov     dword ptr [rbp-48], ecx
+    jmp     gsa_emit
+gsa_shift_go:
     mov     edx, ecx
 gsa_shift:
     mov     ax, word ptr [r10+rdx*2]
@@ -14459,12 +14828,38 @@ gtss_file_loop:
     lea     rdx, [g_sweep_subwfd + 44]
     lea     r8, [g_sweep_sub + (TEMP_PATHW-1)*2]
     call    gui_wstrcpy
-    WINCALL SetFileAttributesW, addr g_sweep_sub, FILE_ATTR_NORMAL
+    ; A3-23: open with FILE_FLAG_OPEN_REPARSE_POINT and validate handle BEFORE clearing
+    ; read-only attributes or overwriting, refusing reparse points / hardlinks / non-disk.
     WINCALL CreateFileW, addr g_sweep_sub, GENERIC_WRITE_, FILE_SHARE_RWD, 0, \
             OPEN_EXISTING, 00200080h, 0              ; FILE_FLAG_OPEN_REPARSE_POINT | NORMAL
     cmp     rax, -1
-    je      gtss_file_del
+    jne     gtss_file_open
+    ; If read-only blocked GENERIC_WRITE, validate an attributes-only handle first.
+    WINCALL CreateFileW, addr g_sweep_sub, FILE_READ_ATTR_, FILE_SHARE_RWD, 0, \
+            OPEN_EXISTING, 00200080h, 0
+    cmp     rax, -1
+    je      gtss_file_next
+    mov     qword ptr [rbp-56], rax
+    mov     rcx, rax
+    call    file_validate_handle
+    mov     dword ptr [rbp-72], eax
+    WINCALL CloseHandle, qword ptr [rbp-56]
+    cmp     dword ptr [rbp-72], 0
+    je      gtss_file_next
+    WINCALL SetFileAttributesW, addr g_sweep_sub, FILE_ATTR_NORMAL
+    WINCALL CreateFileW, addr g_sweep_sub, GENERIC_WRITE_, FILE_SHARE_RWD, 0, \
+            OPEN_EXISTING, 00200080h, 0
+    cmp     rax, -1
+    je      gtss_file_next
+gtss_file_open:
     mov     qword ptr [rbp-56], rax                  ; hFile
+    mov     rcx, rax
+    call    file_validate_handle
+    test    eax, eax
+    jnz     gtss_file_valid
+    WINCALL CloseHandle, qword ptr [rbp-56]
+    jmp     gtss_file_next
+gtss_file_valid:
     mov     qword ptr [rbp-64], 0
     WINCALL GetFileSizeEx, qword ptr [rbp-56], addr rbp-64
     test    eax, eax
@@ -17967,9 +18362,9 @@ gui_load_prefs proc frame
     ; C5: audit-log verbosity (HKLM > HKCU > 0/off), so GUI security events are
     ; logged when the operator enables it (0..4; see log.asm LOG_* levels)
     WINCALL cfg_get_dword, addr pref_loglevel, 0, addr g_loglvl_lock
-    cmp     eax, 4                              ; clamp to LOG_DEBUG
+    cmp     eax, 4                              ; A3-02: clamp > 4 to LOG_DEBUG (4), never 0
     jbe     @F
-    xor     eax, eax
+    mov     eax, 4
 @@: mov     dword ptr [g_cfg_loglevel], eax
     ; C4: optional "require Hello/PIN on TPM unlock" (HKLM > HKCU > 0/off)
     WINCALL cfg_get_dword, addr pref_reqhello, 0, addr g_reqhello_lock
@@ -18926,11 +19321,16 @@ gce_grow:
     mov     rcx, qword ptr [g_comp_bits]
     mov     rdx, rax
     call    secure_zero
+    cmp     dword ptr [g_comp_locked], 0
+    je      gce_grow_del
     WINCALL VirtualUnlock, qword ptr [g_comp_bits], qword ptr [rbp-32]
+    mov     dword ptr [g_comp_locked], 0
 gce_grow_del:
     mov     qword ptr [g_comp_bits], 0
     mov     dword ptr [g_comp_capw], 0
     mov     dword ptr [g_comp_caph], 0
+    mov     dword ptr [g_comp_locked], 0
+    mfence
     cmp     qword ptr [g_comp_bmp], 0
     je      gce_mkdib
     WINCALL SelectObject, qword ptr [g_comp_hdc], qword ptr [g_comp_old]
@@ -18976,7 +19376,11 @@ gce_mkdib:
     shl     rax, 2
     test    rax, rax
     jle     @F
-    WINCALL VirtualLock, qword ptr [g_comp_bits], rax
+    ; A3-23: route DIB pinning through sec_lock (grows WS quota + surfaces C3 warning on failure)
+    mov     rcx, qword ptr [g_comp_bits]
+    mov     rdx, rax
+    call    sec_lock
+    mov     dword ptr [g_comp_locked], eax
 @@: mov     eax, 1
     FRAME_EPILOG
     ret
@@ -18986,6 +19390,7 @@ gce_fail:
     mov     qword ptr [g_comp_bits], 0
     mov     dword ptr [g_comp_capw], 0
     mov     dword ptr [g_comp_caph], 0
+    mov     dword ptr [g_comp_locked], 0
     xor     eax, eax
     FRAME_EPILOG
     ret
@@ -18997,20 +19402,31 @@ gui_comp_flush proc frame
     lea     rcx, [g_comp_wbuf]
     mov     edx, 260*2
     call    secure_zero
-    cmp     qword ptr [g_comp_bits], 0
-    je      gcf_del
+    mov     rcx, qword ptr [g_comp_bits]
+    test    rcx, rcx
+    jz      gcf_clear_ptr
+    mov     qword ptr [rbp-32], rcx
     mov     eax, dword ptr [g_comp_capw]
     mov     edx, dword ptr [g_comp_caph]
     imul    rax, rdx
     shl     rax, 2
     test    rax, rax
-    jle     gcf_del
+    jle     gcf_clear_ptr
     mov     qword ptr [rbp-24], rax
-    mov     rcx, qword ptr [g_comp_bits]
+    mov     rcx, qword ptr [rbp-32]
     mov     rdx, rax
     call    secure_zero
-    WINCALL VirtualUnlock, qword ptr [g_comp_bits], qword ptr [rbp-24]
-gcf_del:
+    cmp     dword ptr [g_comp_locked], 0
+    je      gcf_clear_ptr
+    WINCALL VirtualUnlock, qword ptr [rbp-32], qword ptr [rbp-24]
+gcf_clear_ptr:
+    ; A3-20: clear g_comp_bits + dims BEFORE DeleteObject so a fault inside GDI never
+    ; causes secmem_panic_wipe to dereference unmapped DIB memory.
+    mov     qword ptr [g_comp_bits], 0
+    mov     dword ptr [g_comp_capw], 0
+    mov     dword ptr [g_comp_caph], 0
+    mov     dword ptr [g_comp_locked], 0
+    mfence
     cmp     qword ptr [g_comp_bmp], 0
     je      gcf_dc
     cmp     qword ptr [g_comp_hdc], 0
@@ -19024,10 +19440,7 @@ gcf_dc:
     WINCALL DeleteDC, qword ptr [g_comp_hdc]
     mov     qword ptr [g_comp_hdc], 0
 gcf_zero:
-    mov     qword ptr [g_comp_bits], 0
     mov     qword ptr [g_comp_old], 0
-    mov     dword ptr [g_comp_capw], 0
-    mov     dword ptr [g_comp_caph], 0
     mov     dword ptr [g_in_comp], 0
     FRAME_EPILOG
     ret
@@ -21460,13 +21873,9 @@ vp_close:
     call    gui_modal_dim_end
     call    gui_xfade_drop
     mov     dword ptr [g_lock_tries], 0
-    cmp     dword ptr [g_menu_open], 0       ; closing while settings open -> save
-    je      vp_lock_dirty
-    cmp     qword ptr [g_body_ptr], 0
-    je      vp_lock_dirty
-    mov     rcx, qword ptr [rbp-8]
-    call    gui_menu_save
-vp_lock_dirty:
+    ; A3-03: NEVER run gui_menu_save (which re-arms IDLE_TIMER and spawns TPM/PIN modals)
+    ; inside the lock path; discard unsaved Settings edits cleanly and lock immediately.
+    mov     dword ptr [g_menu_open], 0
     mov     dword ptr [g_dirty], 0           ; locking discards unsaved inline edits
 vp_lock_go:
     sub     rsp, 32
@@ -21568,12 +21977,15 @@ gui_load_policy proc frame
     jbe     @F
     mov     eax, 4
 @@: mov     dword ptr [g_cfg_pwminclasses], eax
-    ; PIN minimum length: HKLM > HKCU > default 6, clamped [PIN_MINLEN_MIN..PIN_MINLEN_MAX]
+    ; PIN minimum length: HKLM > HKCU > default 6; A3-17: 0 -> default 6, 1..3 -> 4, >64 -> 64
     lea     rcx, [wv_pinlen]
     mov     edx, PIN_MINLEN_DEF
     lea     r8, [g_pol_pinlen_lock]
     call    cfg_get_dword
-    cmp     eax, PIN_MINLEN_MIN
+    test    eax, eax
+    jnz     @F
+    mov     eax, PIN_MINLEN_DEF
+@@: cmp     eax, PIN_MINLEN_MIN
     jae     @F
     mov     eax, PIN_MINLEN_MIN
 @@: cmp     eax, PIN_MINLEN_MAX
@@ -21601,8 +22013,8 @@ gui_load_policy proc frame
     jbe     @F
     mov     eax, TPM_PIN_TRIES_MAX
 @@: mov     dword ptr [g_tpm_pin_max], eax
-    ; TpmMinMode: strictly HKLM-only floor (0..3; HKCU cannot weaken)
-    WINCALL cfg_get_dword_hklm, addr wv_tpmminmode, 0
+    ; TpmMinMode: strictly HKLM-only floor (0..3; A3-02: corrupt HKLM fails closed to 3)
+    WINCALL cfg_get_dword_hklm_fc, addr wv_tpmminmode, 0, TPM_MODE_HELLO
     cmp     eax, TPM_MODE_HELLO
     jbe     @F
     mov     eax, TPM_MODE_HELLO
@@ -21640,6 +22052,13 @@ gui_load_policy proc frame
     WINCALL cfg_get_dword, addr wv_tpmmode, 0FFFFFFFFh, addr g_tpm_lock
     cmp     eax, 0FFFFFFFFh
     jne     lp_tpm_have
+    ; A3-02: corrupt/sentinel HKLM TpmUnlockMode (g_tpm_lock != 0) fails closed to Off (0),
+    ; NEVER falling through to legacy HKCU TpmUnlock.
+    cmp     dword ptr [g_tpm_lock], 0
+    je      lp_tpm_legacy
+    xor     eax, eax
+    jmp     lp_tpm_store
+lp_tpm_legacy:
     WINCALL cfg_get_dword, addr wv_tpm, 1, addr g_tpm_lock
     test    eax, eax
     jz      lp_tpm_store
@@ -21653,7 +22072,9 @@ gui_load_policy proc frame
 lp_tpm_have:
     cmp     eax, TPM_MODE_HELLO
     jbe     lp_tpm_check
-    mov     eax, TPM_MODE_ALONE
+    ; A3-02: out-of-range TpmUnlockMode (> 3) fails closed to Off (0), never TPM Alone (1)
+    xor     eax, eax
+    jmp     lp_tpm_store
 lp_tpm_check:
     test    eax, eax
     jz      lp_tpm_store
@@ -21665,16 +22086,19 @@ lp_tpm_check:
     jne     lp_tpm_store
     cmp     dword ptr [g_hello_present], 0
     jne     lp_tpm_store
-    ; Hello unavailable on this account: if HKLM TpmMinMode demands 3, fail closed to Off (0);
-    ; otherwise fall back to TPM + PIN when TpmMinMode == 2, else TPM Alone.
+    ; A3-02: Hello unavailable: if HKLM TpmMinMode == 3 OR HKLM locked TpmUnlockMode == 3,
+    ; fail closed to Off (0); otherwise fall back to TPM + PIN (2) or TPM Alone (1).
     cmp     dword ptr [g_tpm_minmode], TPM_MODE_HELLO
-    jne     @F
-    xor     eax, eax
-    jmp     lp_tpm_store
-@@: mov     eax, TPM_MODE_ALONE
+    je      lp_tpm_fc_off
+    cmp     dword ptr [g_tpm_lock], 0
+    jne     lp_tpm_fc_off
+    mov     eax, TPM_MODE_ALONE
     cmp     dword ptr [g_tpm_minmode], TPM_MODE_PIN
     jne     lp_tpm_store
     mov     eax, TPM_MODE_PIN
+    jmp     lp_tpm_store
+lp_tpm_fc_off:
+    xor     eax, eax
 lp_tpm_store:
     mov     dword ptr [g_tpm_want], eax
 lp_tpm_done:
@@ -22417,6 +22841,8 @@ create_proc proc
     mov     qword ptr [rbp-8], rcx
     cmp     rdx, WM_INITDIALOG
     je      cp_init
+    cmp     rdx, WM_TIMER
+    je      cp_timer
     cmp     rdx, WM_VORDR_RAISE
     je      cp_raise
     cmp     rdx, WM_DESTROY
@@ -22446,6 +22872,11 @@ cp_raise:
     mov     rcx, qword ptr [rbp-8]
     mov     rdx, rax
     call    gui_window_raise
+    jmp     cp_ret
+cp_timer:
+    mov     rcx, qword ptr [rbp-8]
+    mov     rdx, r8
+    call    gui_secdesk_poll_timer
     jmp     cp_ret
 cp_tcolor:
     call    theme_ctlcolor
@@ -22495,6 +22926,8 @@ cp_init:
     jne     @F
     mov     qword ptr [g_open_dlg_hwnd], rax
 @@: mov     rcx, qword ptr [rbp-8]
+    call    gui_secdesk_arm_poll
+    mov     rcx, qword ptr [rbp-8]
     mov     edx, IDOK
     call    theme_attach
     mov     rcx, qword ptr [rbp-8]
@@ -24294,7 +24727,13 @@ gim_vfree:
     mov     qword ptr [rbp-56], 0
     jmp     gim_done
 gim_sel:
-    ; ---- selection screen (all entries pre-checked; import adds them as new) ----
+    ; A3-29: warn before checklist if ZIP import was truncated at MAX_SEL / title arena cap
+    cmp     dword ptr [g_zi_trunc], 0
+    je      @F
+    WINCALL gui_msgbox, qword ptr [rbp-24], addr imp_v_trunc, addr t_imp_trunc, <MB_OK or MB_ICONWARNING>
+    cmp     qword ptr [g_body_ptr], 0
+    je      gim_sel_abort
+@@: ; ---- selection screen (all entries pre-checked; import adds them as new) ----
     mov     dword ptr [g_sel_src], 1
     mov     ecx, dword ptr [rbp-64]             ; staged count
     call    gui_sel_all
@@ -24307,12 +24746,19 @@ gim_sel_abort:
     call    zi_abort                            ; user cancelled the selection
     jmp     gim_done
 gim_commit:
-    call    zi_commit                           ; -> eax = entries imported
+    call    zi_commit                           ; -> eax = entries imported, or -1 on auth/integrity fail
     mov     dword ptr [rbp-64], eax
     test    eax, eax
+    js      gim_commit_fail                     ; A3-05: -1 is failure, NEVER success!
     jnz     gim_ok
     WINCALL gui_msgbox, qword ptr [rbp-24], addr imp_g_none, addr imp_g_title, 030h
     jmp     gim_done
+gim_commit_fail:
+    lea     rcx, [ev_import]
+    mov     edx, EXIT_AUTH
+    call    log_result
+    mov     dword ptr [rbp-64], 0
+    jmp     gim_bad
 gim_ok:
     mov     dword ptr [rbp-64], eax             ; both paths arrive with the count in eax
     mov     rcx, qword ptr [rbp-24]
@@ -24683,6 +25129,10 @@ pgout_subclass proc
     sub     rsp, 224
     cmp     edx, WM_PAINT
     je      pgs_paint
+    cmp     edx, WM_COPY_
+    je      pgs_copy
+    cmp     edx, WM_CUT_
+    je      pgs_copy
     mov     qword ptr [rbp-16], rcx
     mov     dword ptr [rbp-24], edx
     mov     rax, qword ptr [rbp+48]
@@ -24696,6 +25146,18 @@ pgout_subclass proc
     WINCALL HideCaret, qword ptr [rbp-16]
     mov     rax, qword ptr [rbp-32]
 pgs_def_ret:
+    mov     rsp, rbp
+    pop     rbp
+    ret
+pgs_copy:
+    ; A3-04: route Ctrl+C / WM_COPY / WM_CUT on password generator box through gui_copy
+    mov     qword ptr [rbp-16], rcx
+    lea     rdx, [g_genout_w]
+    cmp     word ptr [rdx], 0
+    je      pgs_copy_ret
+    call    gui_copy
+pgs_copy_ret:
+    xor     eax, eax
     mov     rsp, rbp
     pop     rbp
     ret
@@ -25100,6 +25562,8 @@ xlpw_proc proc
     mov     qword ptr [rbp-8], rcx
     cmp     rdx, WM_INITDIALOG
     je      xpp_init
+    cmp     rdx, WM_TIMER
+    je      xpp_timer
     cmp     rdx, WM_VORDR_RAISE
     je      xpp_raise
     cmp     rdx, WM_COMMAND
@@ -25127,6 +25591,11 @@ xpp_raise:
     mov     rcx, qword ptr [rbp-8]
     mov     rdx, rax
     call    gui_window_raise
+    jmp     xpp_ret
+xpp_timer:
+    mov     rcx, qword ptr [rbp-8]
+    mov     rdx, r8
+    call    gui_secdesk_poll_timer
     jmp     xpp_ret
 xpp_destroy:
     mov     dword ptr [g_uline_seg_ctl], 0
@@ -25177,6 +25646,8 @@ xpp_init:
     mov     rax, qword ptr [rbp-8]
     mov     qword ptr [g_secdesk_hwnd], rax
 @@: mov     rcx, qword ptr [rbp-8]
+    call    gui_secdesk_arm_poll
+    mov     rcx, qword ptr [rbp-8]
     mov     edx, IDOK
     call    theme_attach
     mov     rcx, qword ptr [rbp-8]
@@ -25352,6 +25823,8 @@ pwremind_proc proc
     mov     qword ptr [rbp-8], rcx
     cmp     rdx, WM_INITDIALOG
     je      rmp_init
+    cmp     rdx, WM_TIMER
+    je      rmp_timer
     cmp     rdx, WM_VORDR_RAISE
     je      rmp_raise
     cmp     rdx, WM_COMMAND
@@ -25379,6 +25852,11 @@ rmp_raise:
     mov     rcx, qword ptr [rbp-8]
     mov     rdx, rax
     call    gui_window_raise
+    jmp     rmp_ret
+rmp_timer:
+    mov     rcx, qword ptr [rbp-8]
+    mov     rdx, r8
+    call    gui_secdesk_poll_timer
     jmp     rmp_ret
 rmp_destroy:
     mov     rcx, qword ptr [rbp-8]
@@ -25412,6 +25890,8 @@ rmp_init:
     mov     rax, qword ptr [rbp-8]
     mov     qword ptr [g_secdesk_hwnd], rax
 @@: mov     rcx, qword ptr [rbp-8]
+    call    gui_secdesk_arm_poll
+    mov     rcx, qword ptr [rbp-8]
     mov     edx, IDOK
     call    theme_attach
     mov     rcx, qword ptr [rbp-8]
@@ -25550,6 +26030,8 @@ imppw_proc proc
     mov     qword ptr [rbp-8], rcx
     cmp     rdx, WM_INITDIALOG
     je      ipp_init
+    cmp     rdx, WM_TIMER
+    je      ipp_timer
     cmp     rdx, WM_VORDR_RAISE
     je      ipp_raise
     cmp     rdx, WM_COMMAND
@@ -25577,6 +26059,11 @@ ipp_raise:
     mov     rcx, qword ptr [rbp-8]
     mov     rdx, rax
     call    gui_window_raise
+    jmp     ipp_ret
+ipp_timer:
+    mov     rcx, qword ptr [rbp-8]
+    mov     rdx, r8
+    call    gui_secdesk_poll_timer
     jmp     ipp_ret
 ipp_destroy:
     mov     rcx, qword ptr [rbp-8]
@@ -25610,6 +26097,8 @@ ipp_init:
     mov     rax, qword ptr [rbp-8]
     mov     qword ptr [g_secdesk_hwnd], rax
 @@: mov     rcx, qword ptr [rbp-8]
+    call    gui_secdesk_arm_poll
+    mov     rcx, qword ptr [rbp-8]
     mov     edx, IDOK
     call    theme_attach
     mov     rcx, qword ptr [rbp-8]
@@ -25978,10 +26467,17 @@ endif
     call    reg_load_vault                  ; HKLM>HKCU registered path, if any
     mov     dword ptr [rbp-24], eax
     test    eax, eax
-    jz      @F
+    jnz     grv_chk_hklm_ok
+    ; A3-02: if HKLM VaultPath is present-but-invalid (g_vault_lock != 0), fail closed
+    ; instead of falling through to --ro <path> or cfg_default_vault.
+    cmp     dword ptr [g_vault_lock], 0
+    jne     grv_none
+    jmp     grv_chk_ro
+grv_chk_hklm_ok:
     cmp     dword ptr [g_vault_lock], 0     ; valid HKLM vault lock wins over --ro <path>
     jne     grv_havepath
-@@: cmp     word ptr [g_ro_vpath], 0
+grv_chk_ro:
+    cmp     word ptr [g_ro_vpath], 0
     je      grv_chk_reg
     lea     rcx, [g_vpath]
     lea     rdx, [g_ro_vpath]
@@ -26175,6 +26671,8 @@ pinset_proc proc
     mov     qword ptr [rbp-8], rcx
     cmp     rdx, WM_INITDIALOG
     je      psp_init
+    cmp     rdx, WM_TIMER
+    je      psp_timer
     cmp     rdx, WM_VORDR_RAISE
     je      psp_raise
     cmp     rdx, WM_COMMAND
@@ -26202,6 +26700,11 @@ psp_raise:
     mov     rcx, qword ptr [rbp-8]
     mov     rdx, rax
     call    gui_window_raise
+    jmp     psp_ret
+psp_timer:
+    mov     rcx, qword ptr [rbp-8]
+    mov     rdx, r8
+    call    gui_secdesk_poll_timer
     jmp     psp_ret
 psp_destroy:
     mov     dword ptr [g_uline_seg_ctl], 0
@@ -26251,6 +26754,8 @@ psp_init_norm:
     jne     psp_init_go
     mov     qword ptr [g_open_dlg_hwnd], rax
 psp_init_go:
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_secdesk_arm_poll
     mov     rcx, qword ptr [rbp-8]
     mov     edx, IDOK
     call    theme_attach
@@ -26472,6 +26977,8 @@ pinunlock_proc proc
     mov     qword ptr [rbp-8], rcx
     cmp     rdx, WM_INITDIALOG
     je      pup_init
+    cmp     rdx, WM_TIMER
+    je      pup_timer
     cmp     rdx, WM_VORDR_RAISE
     je      pup_raise
     cmp     rdx, WM_COMMAND
@@ -26499,6 +27006,11 @@ pup_raise:
     mov     rcx, qword ptr [rbp-8]
     mov     rdx, rax
     call    gui_window_raise
+    jmp     pup_ret
+pup_timer:
+    mov     rcx, qword ptr [rbp-8]
+    mov     rdx, r8
+    call    gui_secdesk_poll_timer
     jmp     pup_ret
 pup_destroy:
     mov     rcx, qword ptr [rbp-8]
@@ -26538,6 +27050,8 @@ pup_init:
 pup_init_norm:
     mov     qword ptr [g_open_dlg_hwnd], rax
 pup_init_go:
+    mov     rcx, qword ptr [rbp-8]
+    call    gui_secdesk_arm_poll
     mov     rcx, qword ptr [rbp-8]
     mov     edx, IDOK
     call    theme_attach
@@ -26802,41 +27316,129 @@ sds_fail:
     ret
 secdesk_switch endp
 
-; secdesk_thread(rcx = unused) - worker: bind to the private desktop, make it
-;   the visible input desktop, run the dialog, then switch back.  eax = 0.
-secdesk_body proc frame
+; gui_secdesk_arm_poll(rcx = hdlg) - arm worker-local 200ms cancel poll when on a
+;   private desktop so lock/watchdog timeout dismisses the dialog on its own desktop (A3-10).
+gui_secdesk_arm_poll proc frame
     FRAME_PROLOG 48
-    WINCALL SetThreadDesktop, qword ptr [g_secdesk_hd]
+    cmp     qword ptr [g_secdesk_hd], 0
+    je      gsap_done
+    WINCALL SetTimer, rcx, SECDESK_POLL_TIMER, 200, 0
+gsap_done:
+    FRAME_EPILOG
+    ret
+gui_secdesk_arm_poll endp
+
+; gui_secdesk_poll_timer(rcx = hdlg, rdx = timer_id) -> eax = 1 if consumed, 0 otherwise.
+gui_secdesk_poll_timer proc frame
+    FRAME_PROLOG 48
+    cmp     rdx, SECDESK_POLL_TIMER
+    jne     gspt_no
+    mov     qword ptr [rbp-24], rcx
+    cmp     dword ptr [g_secdesk_cancel], 0
+    jne     gspt_end
+    cmp     dword ptr [g_secdesk_orphan], 0
+    je      gspt_yes
+gspt_end:
+    WINCALL KillTimer, qword ptr [rbp-24], SECDESK_POLL_TIMER
+    WINCALL EndDialog, qword ptr [rbp-24], 0
+gspt_yes:
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gspt_no:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gui_secdesk_poll_timer endp
+
+; secdesk_orphans_add(ecx = +1 or -1) - atomically update g_secdesk_orphans using
+;   lock cmpxchg (supported natively by both x64 and the ARM64 translator).
+secdesk_orphans_add proc
+    mov     r10d, ecx
+soa_lp:
+    mov     eax, dword ptr [g_secdesk_orphans]
+    mov     r11d, eax
+    add     r11d, r10d
+    lock cmpxchg dword ptr [g_secdesk_orphans], r11d
+    jne     soa_lp
+    ret
+secdesk_orphans_add endp
+
+; secdesk_body(rcx = SECDESK_CTX slot) - worker: bind to the private desktop, make it
+;   the visible input desktop, run the dialog, then switch back.  eax = 0.
+;   Slot layout (64B): +0 hd, +8 orig, +16 proc(xored), +24 res, +32 dlg, +36 cancel, +40 orphan, +44 live.
+secdesk_body proc frame
+    FRAME_PROLOG 64
+    mov     qword ptr [rbp-24], rcx              ; slot ptr
+    WINCALL SetThreadDesktop, qword ptr [rcx+0]
     test    eax, eax
     jz      sdt_fail                             ; VDR-13: never silently run on current desktop
-    mov     rcx, qword ptr [g_secdesk_hd]
+    mov     r10, qword ptr [rbp-24]
+    mov     rcx, qword ptr [r10+0]
     call    secdesk_switch
     test    eax, eax
     jnz     sdt_run
     ; It could not be made the input desktop.  Unbind (safe: this thread owns no
     ; windows yet) and report -2 so gui_secdesk_show enforces HKLM policy / user consent.
-    WINCALL SetThreadDesktop, qword ptr [g_secdesk_orig]
+    mov     r10, qword ptr [rbp-24]
+    WINCALL SetThreadDesktop, qword ptr [r10+8]
 sdt_fail:
+    mov     r10, qword ptr [rbp-24]
+    mov     qword ptr [r10+24], -2
+    cmp     dword ptr [r10+40], 0
+    jne     sdt_orphan_clean
     mov     qword ptr [g_secdesk_res], -2
     jmp     sdt_done
 sdt_run:
-    mov     r9, qword ptr [g_secdesk_proc]
+    mov     r10, qword ptr [rbp-24]
+    mov     r9, qword ptr [r10+16]
     xor     r9, qword ptr [g_ptr_cookie]
-    WINCALL DialogBoxParamW, qword ptr [g_hinst], dword ptr [g_secdesk_dlg], 0, r9, 0
+    WINCALL DialogBoxParamW, qword ptr [g_hinst], dword ptr [r10+32], 0, r9, 0
     cmp     rax, -1
     jne     @F
     mov     rax, -2                              ; Win32 dialog-creation failure -> gss_fallback
-@@: mov     qword ptr [g_secdesk_res], rax       ; marshal the result back to the caller
-    cmp     dword ptr [g_secdesk_orphan], 0      ; the watchdog already restored the user's
-    jne     sdt_done                             ;   desktop and released these handles
+@@: mov     r10, qword ptr [rbp-24]
+    mov     qword ptr [r10+24], rax
+    cmp     dword ptr [r10+40], 0                ; A3-10: orphaned -> never touch shared globals
+    jne     sdt_orphan_clean
+    mov     qword ptr [g_secdesk_res], rax       ; marshal the result back to the caller
     call    secdesk_restore                      ; checked + retried, never fire-and-forget
+    jmp     sdt_done
+sdt_orphan_clean:
+    ; Close our own private & original desktop handles so abandoning never leaks handles.
+    mov     r10, qword ptr [rbp-24]
+    mov     rcx, qword ptr [r10+8]
+    test    rcx, rcx
+    jz      @F
+    WINCALL SetThreadDesktop, rcx
+@@: mov     r10, qword ptr [rbp-24]
+    mov     rcx, qword ptr [r10+0]
+    test    rcx, rcx
+    jz      @F
+    WINCALL CloseDesktop, rcx
+@@: mov     r10, qword ptr [rbp-24]
+    mov     rcx, qword ptr [r10+8]
+    test    rcx, rcx
+    jz      @F
+    WINCALL CloseDesktop, rcx
+@@: mov     r10, qword ptr [rbp-24]
+    mov     qword ptr [r10+0], 0
+    mov     qword ptr [r10+8], 0
+    mov     dword ptr [r10+44], 0                ; mark slot free
+    mov     ecx, -1
+    call    secdesk_orphans_add
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
 sdt_done:
+    mov     r10, qword ptr [rbp-24]
+    mov     dword ptr [r10+44], 0                ; mark slot free
     xor     eax, eax
     FRAME_EPILOG
     ret
 secdesk_body endp
 
-; secdesk_thread(rcx = unused) - the CreateThread entry.  The worker gets its own
+; secdesk_thread(rcx = SECDESK_CTX slot) - the CreateThread entry.  The worker gets its own
 ;   per-thread shadow stack (sstk_thread_init), so nothing it does - and nothing an
 ;   orphaned worker does after the watchdog has given up on it - touches the main
 ;   thread's.  RAW proc by design: it runs before its shadow stack exists, and
@@ -26845,12 +27447,14 @@ secdesk_thread proc
     push    rbp                                  ; robust raw frame: force 16-byte alignment
     mov     rbp, rsp                             ; regardless of the OS thread-entry rsp
     and     rsp, -16                             ; (a bad assumption here misaligned the crypto
-    sub     rsp, 32                              ;  in secdesk_body -> corruption/faults)
+    sub     rsp, 48                              ;  in secdesk_body -> corruption/faults)
+    mov     qword ptr [rbp-8], rcx               ; save SECDESK_CTX slot
     call    sstk_thread_init                     ; AUD-26: fail closed to fallback gate if OOM
     test    eax, eax
     jz      sdt_nosstk
     call    GetCurrentThreadId                   ; publish before the desktop switch: a fault
     mov     dword ptr [g_secdesk_tid], eax       ;   from here on is on the private desktop
+    mov     rcx, qword ptr [rbp-8]
     call    secdesk_body
     mov     dword ptr [g_secdesk_tid], 0         ; back on the caller's desktop from here
     call    sstk_thread_free                     ; every framed call has returned
@@ -26859,7 +27463,12 @@ secdesk_thread proc
     xor     eax, eax
     ret
 sdt_nosstk:
+    mov     r10, qword ptr [rbp-8]
+    mov     qword ptr [r10+24], -2
+    cmp     dword ptr [r10+40], 0
+    jne     @F
     mov     qword ptr [g_secdesk_res], -2
+@@: mov     dword ptr [r10+44], 0
     mov     rsp, rbp
     pop     rbp
     xor     eax, eax
@@ -26871,7 +27480,20 @@ secdesk_thread endp
 ;   until it closes.  Enforces HKLM SecureUnlock fail-closed or explicit Yes/No consent.
 public gui_secdesk_show
 gui_secdesk_show proc frame
-    FRAME_PROLOG 128                             ; locals -24..-56 clear of 6-arg WINCALL spill
+    FRAME_PROLOG 176                             ; locals -24..-96 clear of 6-arg WINCALL spill
+    ; A3-03: refuse re-entrant gui_secdesk_show
+    mov     dword ptr [rbp-60], ecx
+    mov     qword ptr [rbp-72], rdx
+    xor     eax, eax
+    mov     r10d, 1
+    lock cmpxchg dword ptr [g_secdesk_busy], r10d
+    jne     gss_busy_ret
+    ; A3-10: if an orphaned worker is still alive, refuse to launch another worker or
+    ; reset g_secdesk_orphan (prevents concurrent mutation of g_pwbuf / g_filebuf / g_vkey).
+    cmp     dword ptr [g_secdesk_orphans], 0
+    jne     gss_orphan_refuse
+    mov     ecx, dword ptr [rbp-60]
+    mov     rdx, qword ptr [rbp-72]
     mov     dword ptr [g_secdesk_dlg], ecx
     xor     rdx, qword ptr [g_ptr_cookie]
     mov     qword ptr [g_secdesk_proc], rdx
@@ -26880,26 +27502,33 @@ gui_secdesk_show proc frame
     mov     qword ptr [g_secdesk_orig], 0
     mov     qword ptr [g_secdesk_hwnd], 0
     mov     dword ptr [g_secdesk_orphan], 0
+    mov     dword ptr [g_secdesk_cancel], 0
+    mov     qword ptr [rbp-64], 0                ; selected SECDESK_CTX slot
     xor     eax, eax
     cmp     qword ptr [g_body_ptr], 0
     setne   al
-    mov     dword ptr [rbp-56], eax              ; 1 if vault was unlocked on entry (distinct from qword [rbp-40])
+    mov     dword ptr [rbp-56], eax              ; 1 if vault was unlocked on entry
 ifdef PROBE_IO
     cmp     dword ptr [g_secdesk_force_fail], 0
     jne     gss_fallback
 endif
-    ; Remember the desktop currently receiving input, to restore afterwards.  If this
-    ; fails there is NO handle to switch back to, and both restore paths (secdesk_body
-    ; and gss_cleanup) are guarded on it being non-null - so switching away anyway would
-    ; leave the user on a shell-less desktop with no code able to return them, silently
-    ; and without a crash.  Never switch away from a desktop you cannot get back to.
+    ; Allocate a free SECDESK_CTX slot (per-invocation isolation, A3-10)
+    lea     r10, [g_sd_slots]
+    xor     r8d, r8d
+gss_find_slot:
+    cmp     r8d, SD_SLOTS
+    jae     gss_fallback
+    cmp     dword ptr [r10+44], 0
+    je      gss_got_slot
+    add     r10, SD_SLOT_SZ
+    inc     r8d
+    jmp     gss_find_slot
+gss_got_slot:
+    mov     qword ptr [rbp-64], r10
     WINCALL OpenInputDesktop, 0, 0, DESKTOP_MAXALLOWED
     mov     qword ptr [g_secdesk_orig], rax
     test    rax, rax
     jz      gss_fallback
-    ; create the private desktop the dialog will live on, under a name nobody can
-    ; know in advance.  (Same-user code can still enumerate desktops; this removes
-    ; the trivially pre-arranged hook-up, it is not an access control.)
     lea     rcx, [g_secdesk_name]
     lea     rdx, [secdesk_pfx]
     lea     r8, [g_secdesk_name+30*2]
@@ -26913,27 +27542,49 @@ endif
     mov     rcx, qword ptr [rbp-48]
     mov     rdx, qword ptr [rbp-40]
     call    gui_ft_hex16                         ; 16 hex + NUL
-    WINCALL CreateDesktopW, addr g_secdesk_name, 0, 0, 0, DESKTOP_CREATE_ACCESS_, 0
-    mov     qword ptr [g_secdesk_hd], rax
-    test    rax, rax
-    jz      gss_fallback                         ; no desktop -> fallback gate
-    ; VDR2-12: apply a protected DACL stripping DESKTOP_HOOKCONTROL, DESKTOP_READOBJECTS,
-    ; DESKTOP_WRITEOBJECTS, DESKTOP_JOURNALRECORD, and DESKTOP_JOURNALPLAYBACK for peers.
-    ; Note: SetUserObjectSecurity takes PSECURITY_INFORMATION (pointer to DWORD), NOT by value.
+    ; A3-21: build the protected DACL BEFORE CreateDesktopW and pass SECURITY_ATTRIBUTES
+    ; atomically at object creation so there is zero default-DACL race window.
     mov     ecx, DESKTOP_PRIV_USER_MASK_
     xor     edx, edx
     xor     r8d, r8d
     call    gui_build_user_dacl
     test    eax, eax
     jz      gss_fallback
+    mov     qword ptr [rbp-96], 24               ; SECURITY_ATTRIBUTES.nLength
+    lea     rax, [g_tmp_sd]
+    mov     qword ptr [rbp-88], rax              ; lpSecurityDescriptor
+    mov     qword ptr [rbp-80], 0                ; bInheritHandle = FALSE
+    WINCALL CreateDesktopW, addr g_secdesk_name, 0, 0, 0, DESKTOP_CREATE_ACCESS_, addr rbp-96
+    mov     qword ptr [g_secdesk_hd], rax
+    test    rax, rax
+    jz      gss_fallback                         ; no desktop -> fallback gate
+    ; Belt-and-braces DACL re-assertion
     mov     dword ptr [rbp-52], DACL_SECURITY_INFORMATION_
     WINCALL SetUserObjectSecurity, qword ptr [g_secdesk_hd], addr rbp-52, addr g_tmp_sd
     test    eax, eax
     jz      gss_fallback
-    WINCALL CreateThread, 0, 0, addr secdesk_thread, 0, 0, 0
+    ; Populate per-invocation SECDESK_CTX slot before spawning worker thread
+    mov     r10, qword ptr [rbp-64]
+    mov     rax, qword ptr [g_secdesk_hd]
+    mov     qword ptr [r10+0], rax
+    mov     rax, qword ptr [g_secdesk_orig]
+    mov     qword ptr [r10+8], rax
+    mov     rax, qword ptr [g_secdesk_proc]
+    mov     qword ptr [r10+16], rax
+    mov     qword ptr [r10+24], 0
+    mov     eax, dword ptr [g_secdesk_dlg]
+    mov     dword ptr [r10+32], eax
+    mov     dword ptr [r10+36], 0                ; cancel
+    mov     dword ptr [r10+40], 0                ; orphan
+    mov     dword ptr [r10+44], 1                ; live
+    WINCALL CreateThread, 0, 0, addr secdesk_thread, r10, 0, 0
     mov     qword ptr [rbp-24], rax              ; worker thread handle
     test    rax, rax
-    jz      gss_fallback                         ; no thread -> fallback gate
+    jnz     gss_thr_ok
+    mov     r10, qword ptr [rbp-64]
+    mov     dword ptr [r10+44], 0
+    jmp     gss_fallback                         ; no thread -> fallback gate
+gss_thr_ok:
     ; Bounded wait using GetTickCount wall-clock delta + MsgWaitForMultipleObjects so
     ; WM_WTSSESSION_CHANGE (Win+L) and WM_TIMER (idle lock / clipboard scrub) continue
     ; to fire while the worker owns the secure desktop.
@@ -26965,6 +27616,9 @@ gss_pump_mark:
     je      gss_chk_timeout
     cmp     qword ptr [g_body_ptr], 0            ; vault locked while dialog was up?
     jne     gss_chk_timeout
+    mov     dword ptr [g_secdesk_cancel], 1      ; A3-10: signal worker-local poll timer
+    mov     r10, qword ptr [rbp-64]
+    mov     dword ptr [r10+36], 1
     mov     rcx, qword ptr [g_secdesk_hwnd]
     test    rcx, rcx
     jz      gss_chk_timeout
@@ -26980,8 +27634,14 @@ gss_chk_timeout:
     sub     eax, dword ptr [rbp-32]
     cmp     eax, SECDESK_MAX_MS
     jb      gss_wait
-    ; Wedged.  Flag orphan BEFORE restoring desktop, post IDCANCEL to dismiss the
-    ; dialog (and any nested popup) if it created one, and abandon worker handles safely.
+    ; Wedged.  Flag orphan + cancel BEFORE restoring desktop, increment live orphan count,
+    ; post IDCANCEL, and close our thread handle (worker closes its own desktop handles).
+    mov     ecx, 1
+    call    secdesk_orphans_add
+    mov     r10, qword ptr [rbp-64]
+    mov     dword ptr [r10+36], 1
+    mov     dword ptr [r10+40], 1
+    mov     dword ptr [g_secdesk_cancel], 1
     mov     dword ptr [g_secdesk_orphan], 1
     mov     rcx, qword ptr [g_secdesk_hwnd]
     test    rcx, rcx
@@ -26995,6 +27655,7 @@ gss_chk_timeout:
 @@: WINCALL PostMessageW, qword ptr [g_secdesk_hwnd], WM_COMMAND, IDCANCEL, 0
 gss_to_restore:
     call    secdesk_restore
+    WINCALL CloseHandle, qword ptr [rbp-24]      ; release thread handle (worker cleans own HDESKs)
     mov     qword ptr [g_secdesk_res], 0         ; treat as cancelled
     mov     qword ptr [g_secdesk_hd], 0          ; skip the closes in gss_cleanup
     mov     qword ptr [g_secdesk_orig], 0
@@ -27005,6 +27666,13 @@ gss_worker_done:
     cmp     qword ptr [g_secdesk_res], -2        ; worker could not bind/switch desktop?
     je      gss_fallback
     jmp     gss_cleanup
+gss_orphan_refuse:
+    mov     qword ptr [g_secdesk_res], 0
+    jmp     gss_ret
+gss_busy_ret:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
 gss_fallback:
     ; Release any handles opened before the failure first.
     cmp     qword ptr [g_secdesk_orig], 0
@@ -27066,6 +27734,7 @@ gss_orig:
 gss_ret:
     mov     qword ptr [g_secdesk_hwnd], 0
     mov     rax, qword ptr [g_secdesk_res]
+    mov     dword ptr [g_secdesk_busy], 0        ; A3-03: release re-entrancy guard
     FRAME_EPILOG
     ret
 gui_secdesk_show endp
@@ -27146,7 +27815,13 @@ go_nopreload:
     mov     dword ptr [rbp-40], eax          ; blob's actual enrolled mode
     cmp     eax, dword ptr [g_tpm_minmode]   ; enforce HKLM TpmMinMode floor
     jb      go_askpw
-    cmp     eax, TPM_MODE_ALONE
+    cmp     eax, dword ptr [g_tpm_want]      ; A3-02: never allow weaker blob than configured mode
+    jb      go_askpw
+    cmp     dword ptr [g_tpm_lock], 0        ; A3-02: HKLM-locked TpmUnlockMode requires exact match
+    je      @F
+    cmp     eax, dword ptr [g_tpm_want]
+    jne     go_askpw
+@@: cmp     eax, TPM_MODE_ALONE
     je      go_tpm_alone
     cmp     eax, TPM_MODE_PIN
     je      go_tpm_pin
@@ -27217,6 +27892,8 @@ go_tpm_ok:
     call    gui_pwremind                    ; C9: remind periodically under TPM Unlock
     jmp     go_vault
 go_abort_preload:
+    cmp     dword ptr [g_secdesk_orphans], 0 ; A3-10: never free g_filebuf while an orphaned worker runs
+    jne     go_reset
     xor     ecx, ecx
     call    vault_preload_end
     jmp     go_reset
@@ -27231,6 +27908,8 @@ go_unlock_normal:
     WINCALL DialogBoxParamW, qword ptr [g_hinst], DLG_UNLOCK, qword ptr [rbp-24], addr unlock_proc, 0
 go_unlock_res:
     mov     qword ptr [rbp-32], rax        ; preload claim ends either way: on success the
+    cmp     dword ptr [g_secdesk_orphans], 0
+    jne     go_reset
     xor     ecx, ecx                       ;   image is the live vault's, otherwise nobody
     cmp     qword ptr [rbp-32], 1          ;   owns it and it must be released
     jne     @F
@@ -27885,80 +28564,9 @@ twp_ret_zero:
     xor     eax, eax
     jmp     twp_ret
 twp_copydata:
-    ; A second instance was started on a .vordr and handed us the path.  ANY
-    ; process can send this, so treat it as untrusted input: check the tag, bound
-    ; the length, and re-validate the file itself (gui_stash_openfile reads its
-    ; magic).  Even then all it can do is put us in front of the import prompt -
-    ; the source password still has to be typed and the entries ticked, and the
-    ; path can never become the registered vault.
-    ; VDR-07: refuse hand-offs whenever a modal dialog (Export, Import, Attach,
-    ; Unlock, Create, ...) is already active, so g_imgpath / g_openfile cannot be
-    ; mutated mid-flow.
-    mov     rcx, qword ptr [rbp-24]              ; VDR2-10: sender HWND must belong to vordr.exe
-    call    gui_hwnd_is_self
-    test    eax, eax
-    jz      twp_cd_no
-    cmp     dword ptr [g_readonly], 0
-    jne     twp_cd_no
-    cmp     qword ptr [g_secdesk_hd], 0
-    jne     twp_cd_no
-    cmp     dword ptr [g_imp_preset], 0
-    jne     twp_cd_no
-    cmp     qword ptr [g_vaulthwnd], 0
-    je      twp_cd_chkshow
-    WINCALL GetWindow, qword ptr [g_vaulthwnd], GW_ENABLEDPOPUP_
-    test    rax, rax
-    jnz     twp_cd_no
-    jmp     twp_cd_parse
-twp_cd_chkshow:
-    cmp     dword ptr [g_showing], 0
-    jne     twp_cd_no
-twp_cd_parse:
-    mov     r10, qword ptr [rbp-32]              ; COPYDATASTRUCT*
-    test    r10, r10
-    jz      twp_cd_no
-    cmp     qword ptr [r10+0], COPYDATA_OPENVAULT
-    jne     twp_cd_no
-    mov     eax, dword ptr [r10+8]               ; cbData
-    cmp     eax, 4
-    jb      twp_cd_no
-    cmp     eax, MAX_PATH_CHARS*2                ; a long path is a path (it used to be 1023 chars)
-    ja      twp_cd_no
-    test    eax, 1                               ; wide chars: must be even
-    jnz     twp_cd_no
-    mov     rcx, qword ptr [r10+16]              ; lpData
-    test    rcx, rcx
-    jz      twp_cd_no
-    ; cbData says how many bytes ARRIVED; it does not promise they form a
-    ; terminated string, and everything downstream scans for the NUL -
-    ; GetFileAttributesW, CreateFileW, and the copy in gui_stash_openfile.  A
-    ; sender sending cbData=4 with two non-NUL wide chars would send all three
-    ; reading past the end of the block the OS copied for us: an access
-    ; violation, or a path assembled from whatever lies after it.  Bounding the
-    ; LENGTH without requiring termination inside that length checks the wrong
-    ; half.  Require the last wide char in the block to be the terminator, so
-    ; every NUL scan below is guaranteed to stop inside it.
-    mov     edx, eax                             ; cbData (4..64K, even)
-    sub     edx, 2
-    cmp     word ptr [rcx+rdx], 0
-    jne     twp_cd_no
-    call    gui_stash_openfile
-    test    eax, eax
-    jz      twp_cd_no
-    cmp     qword ptr [g_vaulthwnd], 0           ; vault already open -> import now
-    je      twp_open                             ; otherwise run the usual open flow
-    WINCALL PostMessageW, qword ptr [g_vaulthwnd], WM_VORDR_RAISE, 0, 0
-    WINCALL SetForegroundWindow, qword ptr [g_vaulthwnd]
-    lea     rcx, [g_imppath]                     ; arm private import path BEFORE posting it
-    lea     rdx, [g_openfile]
-    lea     r8, [g_imppath + (MAX_PATH_CHARS-1)*2]       ; last slot the NUL may occupy
-    call    gui_wstrcpy
-    mov     dword ptr [g_imp_preset], 1
-    mov     dword ptr [g_openfile_set], 0
-    WINCALL PostMessageW, qword ptr [g_vaulthwnd], WM_COMMAND, IDC_V_MIMPORT, 0
-    mov     eax, 1
-    jmp     twp_ret
-twp_cd_no:
+    ; A3-11: legacy WM_COPYDATA hand-off removed (sender HWND can be spoofed by any
+    ; same-user process and synchronously re-enters WndProc).  Second-instance .vordr
+    ; hand-offs now use the kernel-authenticated named pipe (gui_ipc_accept).
     xor     eax, eax
     jmp     twp_ret
 twp_measure:
@@ -28452,6 +29060,7 @@ ifdef PROBE_IO
 endif
     mov     rcx, qword ptr [g_trayhwnd]       ; Alt + | summons the vault from anywhere
     call    gui_hotkey_add
+    call    gui_ipc_start                     ; A3-11: kernel-authenticated singleton named pipe
 gm_nohotkey:
     ; The shell double-clicked a .vordr while Vordr was not running.  We start
     ; minimised to the tray, so without this the double-click would look like it
@@ -28471,14 +29080,38 @@ ifdef DBG_SHOW
 endif
     ; ---- message loop (start minimised to the tray) -----------------------
 gm_msg:
+    cmp     qword ptr [g_ipc_evt], 0
+    je      gm_msg_plain
+    WINCALL MsgWaitForMultipleObjects, 1, addr g_ipc_evt, 0, -1, QS_ALLINPUT_
+    test    eax, eax
+    jnz     gm_msg_pump
+    call    gui_ipc_accept
+gm_msg_pump:
+    WINCALL PeekMessageW, addr g_msg, 0, 0, 0, 1
+    test    eax, eax
+    jz      gm_msg
+    cmp     dword ptr [g_msg+8], WM_QUIT_
+    je      gm_quit
+    WINCALL TranslateMessage, addr g_msg
+    WINCALL DispatchMessageW, addr g_msg
+    jmp     gm_msg_pump
+gm_msg_plain:
     WINCALL GetMessageW, addr g_msg, 0, 0, 0
     test    eax, eax
     jle     gm_quit                          ; 0 = WM_QUIT, -1 = error
     WINCALL TranslateMessage, addr g_msg
     WINCALL DispatchMessageW, addr g_msg
-    jmp     gm_msg
+    jmp     gm_msg_plain
 gm_quit:
-    call    gui_clipclear                    ; never leave a copied secret behind
+    cmp     qword ptr [g_ipc_pipe], 0
+    je      @F
+    WINCALL CloseHandle, qword ptr [g_ipc_pipe]
+    mov     qword ptr [g_ipc_pipe], 0
+@@: cmp     qword ptr [g_ipc_evt], 0
+    je      @F
+    WINCALL CloseHandle, qword ptr [g_ipc_evt]
+    mov     qword ptr [g_ipc_evt], 0
+@@: call    gui_clipclear                    ; never leave a copied secret behind
     FRAME_EPILOG
     ret
 gui_main endp
@@ -30005,13 +30638,11 @@ endif
     ; intercept WM_COPYDATA or suppress startup (VDR2-10).
     cmp     dword ptr [g_openfile_set], 0
     je      ws_gui_focuschain
-    WINCALL FindWindowW, addr tray_cls, 0
-    test    rax, rax
-    jz      ws_gui_go                       ; squatted/stale mutex with no tray -> start up
-    mov     rcx, rax
+    ; A3-11: deliver .vordr hand-off over kernel-authenticated named pipe
+    xor     ecx, ecx
     call    gui_send_openfile
     test    eax, eax
-    jz      ws_gui_go                       ; spoofed or hung tray -> start our own instance
+    jz      ws_gui_go                       ; spoofed or hung peer -> start our own instance
     jmp     ws_gui_exit
 ws_gui_focuschain:
     WINCALL FindWindowW, 0, addr g_vault_title

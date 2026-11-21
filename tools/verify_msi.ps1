@@ -461,6 +461,100 @@ if ($frpRc -ne 1) { Bad "FindRelatedProducts failed on this machine (return valu
 if ($found) { Write-Host ("  would replace : {0}" -f $found) }
 else        { Write-Host  "  would replace : nothing currently installed matches" }
 
+# --- 4. MsiLockPermissionsEx SDDL ACLs + CreateFolder sequencing ------------
+Write-Host ""
+$before = $fail
+Write-Host "permissions     : checking MsiLockPermissionsEx & CreateFolder"
+$cfRows = Rows "SELECT ``Directory_``,``Component_`` FROM ``CreateFolder``" 2
+$cfPairs = @($cfRows | ForEach-Object { "$($_[0])/$($_[1])" })
+foreach ($reqCf in @("INSTALLDIR/VordrExe", "INSTALLDIR/VordrExeArm64")) {
+    if ($cfPairs -notcontains $reqCf) { Bad "CreateFolder missing required row $reqCf" }
+}
+if (-not $seqMap.ContainsKey("CreateFolders") -or -not $seqMap.ContainsKey("RemoveFolders")) {
+    Bad "InstallExecuteSequence must contain CreateFolders and RemoveFolders for MsiLockPermissionsEx"
+} elseif ($seqMap["CreateFolders"] -ge $seqMap["InstallFiles"] -or $seqMap["RemoveFolders"] -le $seqMap["RemoveFiles"]) {
+    Bad "CreateFolders/RemoveFolders out of order relative to RemoveFiles/InstallFiles"
+}
+$lpRows = Rows "SELECT ``LockObject``,``Table``,``SDDLText`` FROM ``MsiLockPermissionsEx``" 3
+$lpMap = @{}; foreach ($lr in $lpRows) { $lpMap["$($lr[1]):$($lr[0])"] = $lr[2] }
+foreach ($reqLp in @("CreateFolder:INSTALLDIR", "File:vordr_x64.exe", "File:vordr_arm64.exe")) {
+    if (-not $lpMap.ContainsKey($reqLp)) { Bad "MsiLockPermissionsEx missing row for $reqLp"; continue }
+    $sddl = $lpMap[$reqLp]
+    if (-not $sddl.StartsWith("D:P")) { Bad "MsiLockPermissionsEx $reqLp SDDL '$sddl' is not protected (missing D:P)" }
+    if ($sddl -notmatch 'FA;;;SY\)' -or $sddl -notmatch 'FA;;;BA\)' -or $sddl -notmatch '0x1200a9;;;BU\)') {
+        Bad "MsiLockPermissionsEx $reqLp SDDL '$sddl' lacks expected SY:FA / BA:FA / BU:0x1200a9 ACEs"
+    }
+    try {
+        if ($reqLp.StartsWith("CreateFolder:")) {
+            $sd = New-Object System.Security.AccessControl.DirectorySecurity
+            $sd.SetSecurityDescriptorSddlForm($sddl)
+        } else {
+            $sd = New-Object System.Security.AccessControl.FileSecurity
+            $sd.SetSecurityDescriptorSddlForm($sddl)
+        }
+    } catch {
+        Bad "MsiLockPermissionsEx $reqLp SDDL '$sddl' failed .NET SDDL parse: $($_.Exception.Message)"
+    }
+}
+if ($fail -eq $before) { Write-Host ("  MsiLockPermissionsEx: {0} protected SDDL rule(s) validated - ok" -f $lpRows.Count) }
+
+# --- 5. live LaunchConditions numeric/case-insensitive guard evaluation -----
+Write-Host ""
+$before = $fail
+Write-Host "launch guards   : live LaunchConditions evaluation"
+function Test-Launch([hashtable]$props) {
+    $s = $installer.OpenPackage($Msi, 1)
+    foreach ($k in $props.Keys) { $s.Property($k) = $props[$k] }
+    $rc = $s.DoAction("LaunchConditions")
+    [void][Runtime.InteropServices.Marshal]::ReleaseComObject($s)
+    $rc
+}
+$validCases = @(
+    @{},
+    @{ "VORDR_PWMINLEN" = "1" },
+    @{ "VORDR_PWMINLEN" = "16" },
+    @{ "VORDR_PWMINLEN" = "256" },
+    @{ "VORDR_UISCHEME" = "0" },
+    @{ "VORDR_UISCHEME" = "14" },
+    @{ "VORDR_CLIPSECONDS" = "0" },
+    @{ "VORDR_CLIPSECONDS" = "3600" },
+    @{ "VORDR_IDLELOCKMIN" = "0" },
+    @{ "VORDR_IDLELOCKMIN" = "1440" },
+    @{ "VORDR_PWVERIFYDAYS" = "0" },
+    @{ "VORDR_PWVERIFYDAYS" = "3650" }
+)
+foreach ($vc in $validCases) {
+    $rc = Test-Launch $vc
+    if ($rc -ne 1) {
+        $desc = ($vc.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join " "
+        Bad "LaunchConditions rejected valid property set '$desc' (rc=$rc)"
+    }
+}
+$badCases = @(
+    @{ "VORDR_PWMINLEN" = "X01" },
+    @{ "VORDR_PWMINLEN" = "x01" },
+    @{ "VORDR_PWMINLEN" = "ABC" },
+    @{ "VORDR_PWMINLEN" = "12.5" },
+    @{ "VORDR_PWMINLEN" = "0" },
+    @{ "VORDR_PWMINLEN" = "257" },
+    @{ "VORDR_PWMINLEN" = "-1" },
+    @{ "VORDR_PWMINLEN" = "%TEMP%" },
+    @{ "VORDR_UISCHEME" = "15" },
+    @{ "VORDR_UISCHEME" = "X01" },
+    @{ "VORDR_CLIPSECONDS" = "3601" },
+    @{ "VORDR_CLIPSECONDS" = "12 34" }
+)
+foreach ($bc in $badCases) {
+    $rc = Test-Launch $bc
+    if ($rc -eq 1) {
+        $desc = ($bc.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join " "
+        Bad "LaunchConditions ACCEPTED invalid property set '$desc' (expected rejection)"
+    }
+}
+if ($fail -eq $before) {
+    Write-Host ("  LaunchConditions: {0} valid passed, {1} invalid/coercion cases rejected - ok" -f $validCases.Count, $badCases.Count)
+}
+
 [void][Runtime.InteropServices.Marshal]::ReleaseComObject($db)
 [void][Runtime.InteropServices.Marshal]::ReleaseComObject($installer)
 

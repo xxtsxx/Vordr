@@ -69,10 +69,17 @@ def main():
     args = ap.parse_args()
 
     if args.release:
-        if args.dbg or args.probeio or args.guishow:
-            print("build_arm64: 'release' cannot be combined with dbg/probeio/guishow", file=sys.stderr)
+        if args.dbg or args.probeio or args.guishow or args.nohw:
+            print("build_arm64: 'release' cannot be combined with dbg/probeio/guishow/nohw", file=sys.stderr)
             return 1
         args.strict = True
+
+    # A3-08: run the full 10-checker static lint suite on --strict / --release
+    if args.strict:
+        print("=== [arm64 0/5] static checks (build_fast.py lint --strict) ===")
+        lint = subprocess.run([sys.executable, str(ROOT / "tools" / "build_fast.py"), "lint", "--strict"], cwd=ROOT)
+        if lint.returncode != 0:
+            return 1
 
     clang = find_llvm("clang.exe")
     llvm_lib = find_llvm("llvm-lib.exe")
@@ -129,10 +136,15 @@ def main():
             if s.is_external and s.secnum > 0:
                 symtab[s.name] = "internal"
     # Hand-written globals from aesgcm.S, sha.S, blake2b_argon2.S, platform.S, loadcfg.S
-    for s in ("aes256_expand", "gcm_init", "gcm_aad", "gcm_crypt", "gcm_final",
-              "gcm_seal", "gcm_open", "aes_expand_key", "aes_ecb_block", "aes_ctr_xor",
-              "sha256_compress", "sha1_block", "blake2b_compress", "argon2_compress",
-              "cpu_gate", "rng_fill", "ff_trap", "__security_cookie", "_load_config_used"):
+    hand_syms = [
+        "aes256_expand", "gcm_init", "gcm_aad", "gcm_crypt", "gcm_final",
+        "gcm_seal", "gcm_open", "aes_expand_key", "aes_ecb_block", "aes_ctr_xor",
+        "sha256_compress", "sha1_block", "blake2b_compress", "argon2_compress",
+        "cpu_gate", "rng_fill", "ff_trap", "_load_config_used",
+    ]
+    if args.dbg:
+        hand_syms.append("crash_capture_context")
+    for s in hand_syms:
         symtab[s] = "internal"
     symtab_path = work / "symtab.json"
     symtab_path.write_text(json.dumps(symtab, indent=2, sort_keys=True), encoding="utf-8")
@@ -196,8 +208,18 @@ def main():
         arm_libs = list(ex.map(mk_lib, def_files))
 
     # Compile resource file (VERSIONINFO + dialogs + icons)
+    # A3-08: locate Windows SDK /I include paths if INCLUDE is unset (mirrors build.cmd)
     res_out = work / "vordr.res"
-    rc_cmd = [rc, "/nologo", f"/fo{res_out}", str(ROOT / "vordr.rc")]
+    rc_inc = []
+    if not os.environ.get("INCLUDE"):
+        kits = Path(r"C:\Program Files (x86)\Windows Kits\10\Include")
+        if kits.is_dir():
+            vers = sorted([p for p in kits.iterdir() if p.is_dir()], reverse=True)
+            if vers:
+                for sub in ("um", "shared"):
+                    if (vers[0] / sub).is_dir():
+                        rc_inc += ["/I", str(vers[0] / sub)]
+    rc_cmd = [rc, "/nologo", *rc_inc, f"/fo{res_out}", str(ROOT / "vordr.rc")]
     run_cmd(rc_cmd, cwd=ROOT)
 
     # 5. Link native ARM64 PE

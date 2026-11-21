@@ -2,6 +2,9 @@
 // blake2b_argon2.S - hand-written AArch64 NEON replacements for
 //   blake2b_compress  (src/blake2b.asm, BLAKE2b F, RFC 7693 3.2)
 //   argon2_compress   (src/argon2.asm,  Argon2 compression G, RFC 9106 3.5)
+// =============================================================================
+
+#include "frame.inc"
 // -----------------------------------------------------------------------------
 // Vordr internal ARM64 calling convention (docs/ARM64.md): x64 register meaning
 // on fixed ARM64 registers - rcx=x0, rdx=x1, r8=x2, r9=x3, rax=x8.  Both routines
@@ -273,9 +276,11 @@ argon2_compress:
         .seh_save_fplr_x 16
         mov     x29, sp
         .seh_set_fp
-        sub     sp, sp, #1024
-        .seh_stackalloc 1024
+        sub     sp, sp, #1040
+        .seh_stackalloc 1040
         .seh_endprologue
+        A64_FRAME_GUARD_ENTER .La2_ss_in
+        str     xzr, [x29, #-16]
 
         adrp    x11, vordr_a64_rot24
         add     x11, x11, :lo12:vordr_a64_rot24
@@ -432,9 +437,16 @@ argon2_compress:
         movi    v30.2d, #0
         movi    v31.2d, #0
 
-        add     sp, sp, #1024
+        A64_FRAME_GUARD_EXIT .La2_cok, .La2_ssfail, .La2_ssdone
+        stp     xzr, xzr, [x29, #-16]
+        .seh_startepilogue
+        add     sp, sp, #1040
+        .seh_stackalloc 1040
         ldp     x29, x30, [sp], #16
+        .seh_save_fplr_x 16
         autibsp
+        .seh_pac_sign_lr
+        .seh_endepilogue
         ret
         .seh_endproc
 

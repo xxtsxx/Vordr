@@ -30,8 +30,9 @@ flowchart LR
   AES-256-GCM on the ARMv8 Cryptography Extensions (`AESE`/`AESMC`, `PMULL`
   GHASH), SHA-256 and SHA-1 on the ARMv8 SHA instructions, BLAKE2b and the
   Argon2 compression function on NEON, the CSPRNG mix (`BCryptGenRandom` plus
-  `RNDRRS` where the CPU has `FEAT_RNG`), the CPU feature gate, fail-fast and the
-  crash handler's view of the ARM64 `CONTEXT`.
+  `RNDRRS` when every online processor core advertises `FEAT_RNG`), the CPU
+  feature gate, fail-fast (`ff_trap`), and the debug crash-breadcrumb
+  `crash_capture_context` view of `ARM64_NT_CONTEXT` (`src/arm64/platform.S`).
 - **Same mitigations, ARM64 flavour.** Every framed procedure keeps its stack
   canary and software shadow-stack entry, and additionally signs its return
   address with pointer authentication (`PACIBSP`/`AUTIBSP`; a no-op on CPUs
@@ -100,6 +101,9 @@ with zero custom actions. `AppSearch` + `RegLocator` (`SigHostArch`, `Type = 18`
 reads `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment\PROCESSOR_ARCHITECTURE`
 into `HOST_NATIVE_ARCH` (listed in `SecureCustomProperties`). Two mutually exclusive
 64-bit components (`VordrExe` and `VordrExeArm64`) install the host's native binary
-to `%ProgramFiles%\Vordr\vordr.exe` alongside its Start Menu shortcut.
-`tools\verify_msi.ps1` verifies costing for both `AMD64` and `ARM64` hosts and
-checks both embedded PE payloads in `vordr.cab`.
+to `%ProgramFiles%\Vordr\vordr.exe` alongside its Start Menu shortcut, with
+explicit `MsiLockPermissionsEx` SDDL rules (`SYSTEM`/`Administrators` full
+control, `Users` read/execute) protecting `INSTALLDIR` and both executables.
+`tools\verify_msi.ps1` verifies costing for both `AMD64` and `ARM64` hosts,
+`MsiLockPermissionsEx` ACL rows, live `LaunchConditions` numeric guards, and
+both embedded PE payloads in `vordr.cab`.

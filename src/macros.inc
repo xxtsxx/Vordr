@@ -142,7 +142,7 @@ PIN_BADUTF8         equ 3          ; malformed UTF-8 sequence
 ; --- Configurable TPM Unlock modes & anti-replay envelope ----------------------
 TPM_MODE_OFF        equ 0          ; disabled (always prompt for master password)
 TPM_MODE_ALONE      equ 1          ; silent machine-bound TPM unseal
-TPM_MODE_PIN        equ 2          ; TPM + PIN (pre-commit S0/S1 rotation + HW SmartCardPin)
+TPM_MODE_PIN        equ 2          ; TPM + PIN (Argon2id PIN + pre-commit S0/S1 rotating PCP keys)
 TPM_MODE_HELLO      equ 3          ; TPM + Windows Hello (PCP + Passport KSP dual-key)
 TPM_PIN_TRIES_DEF   equ 3          ; default failed-PIN revocation threshold
 TPM_PIN_TRIES_MAX   equ 20         ; maximum configurable failed-PIN threshold

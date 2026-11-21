@@ -1,6 +1,9 @@
 // =============================================================================
 // src/arm64/aesgcm.S - AES-256-GCM and variable-key AES on the ARMv8
 // Cryptography Extensions (AESE/AESMC, PMULL/PMULL2).
+// =============================================================================
+
+#include "frame.inc"
 // -----------------------------------------------------------------------------
 // Hand-written AArch64 replacement for src/aesgcm.asm.  Every global symbol of
 // the x64 object is provided with the same semantics, return values, length
@@ -450,6 +453,7 @@ gcm_seal:
         sub     sp, sp, #384
         .seh_stackalloc 384
         .seh_endprologue
+        A64_FRAME_GUARD_ENTER .Lgs_ss_in
         // NIST SP 800-38D: P <= 2^36 - 32 bytes so the 32-bit counter never
         // wraps back to J0; A <= 2^61 - 1 bytes.
         ldr     x9, [x0, #RQ_INLEN]
@@ -489,9 +493,15 @@ gcm_seal:
         mov     x8, #0
         b       10f
 9:      mov     x8, #1
-10:     mov     sp, x29
+10:     A64_FRAME_GUARD_EXIT .Lgs_cok, .Lgs_ssfail, .Lgs_ssdone
+        .seh_startepilogue
+        add     sp, sp, #384
+        .seh_stackalloc 384
         ldp     x29, x30, [sp], #16
+        .seh_save_fplr_x 16
         autibsp
+        .seh_pac_sign_lr
+        .seh_endepilogue
         ret
         .seh_endproc
 
@@ -501,7 +511,7 @@ gcm_seal:
 // mismatch a distinct, non-null outp is zeroed (inlen bytes); outp == inp is
 // left untouched.
 // Frame: [sp, sp+32) home, [sp+32, sp+368) context, [sp+368, sp+384) computed
-//        tag, [x29-16] request pointer, [x29-8] result.
+//        tag, [x29-24] result, [x29-16] request pointer, [x29-8] stack canary.
 // =============================================================================
         .globl  gcm_open
         .p2align 4
@@ -513,9 +523,10 @@ gcm_open:
         .seh_save_fplr_x 16
         mov     x29, sp
         .seh_set_fp
-        sub     sp, sp, #400
-        .seh_stackalloc 400
+        sub     sp, sp, #416
+        .seh_stackalloc 416
         .seh_endprologue
+        A64_FRAME_GUARD_ENTER .Lgo_ss_in
         ldr     x9, [x0, #RQ_INLEN]
         mov     x10, #0xFFFFFFFE0
         cmp     x9, x10
@@ -553,7 +564,7 @@ gcm_open:
         ldr     x1, [x9, #RQ_TAG]
         mov     x2, #16
         bl      ct_memcmp
-        str     w8, [x29, #-8]
+        str     w8, [x29, #-24]
         cbnz    w8, 5f
         // Tag verified: decrypt inp -> outp via CTR.
         add     x0, sp, #32
@@ -577,15 +588,23 @@ gcm_open:
         add     x0, sp, #32
         mov     x1, #GCM_CTX_SIZE+16
         bl      secure_zero
+        mov     x10, #0                         // A3-30: scrub address/length residue
+        mov     x3, #0
         ZERO_V  v0, v1, v2, v3, v4, v5
         ZERO_V  v16, v17, v18, v19, v20, v21, v22, v23
         ZERO_V  v24, v25, v26, v27, v28, v29, v30, v31
-        ldr     w8, [x29, #-8]                  // 0 = authentic, 1 = mismatch
+        ldr     w8, [x29, #-24]                 // 0 = authentic, 1 = mismatch
         b       10f
 9:      mov     x8, #1
-10:     mov     sp, x29
+10:     A64_FRAME_GUARD_EXIT .Lgo_cok, .Lgo_ssfail, .Lgo_ssdone
+        .seh_startepilogue
+        add     sp, sp, #416
+        .seh_stackalloc 416
         ldp     x29, x30, [sp], #16
+        .seh_save_fplr_x 16
         autibsp
+        .seh_pac_sign_lr
+        .seh_endepilogue
         ret
         .seh_endproc
 

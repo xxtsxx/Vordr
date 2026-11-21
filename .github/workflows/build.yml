@@ -42,6 +42,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
       # G7.3: third-party action pinned to a commit SHA (tag v1 is mutable).
       - name: MSVC x64 environment
@@ -49,15 +51,19 @@ jobs:
         with:
           arch: x64
 
-      - name: run_all gate (redteam + strict build + selftest + roundtrip)
+      - name: run_all gate (redteam + strict build + selftest + roundtrip + ARM64 + MSI)
         shell: cmd
         run: call tests\run_all.cmd
 
-      # G7.2: also produce the reproducible release build (/Brepro + pinned PDB
-      # path) under strict static gates and print its SHA-256.
-      - name: reproducible release build
+      # G7.2: also produce reproducible release builds (/Brepro + pinned PDB
+      # path) for both x64 and ARM64 under strict static gates and print SHA-256.
+      - name: reproducible release builds (x64 + ARM64)
         shell: cmd
-        run: call build.cmd release strict
+        run: |
+          call build.cmd release strict
+          if errorlevel 1 exit /b 1
+          call build_arm64.cmd release
+          if errorlevel 1 exit /b 1
 
       # External-audit artifact: the raw crypto proof (vordr's katreport output +
       # the independent verifier's per-vector PASS/FAIL table) gated against the
@@ -73,6 +79,15 @@ jobs:
           type crypto-proof\verify_crypto.txt
           exit /b %VCRC%
 
+      - name: build and verify universal MSI
+        shell: cmd
+        run: |
+          del bin\vordr-*.msi >nul 2>nul
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools\make_msi.ps1
+          if errorlevel 1 exit /b 1
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools\verify_msi.ps1
+          if errorlevel 1 exit /b 1
+
       - name: upload crypto proof
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -81,11 +96,15 @@ jobs:
           path: crypto-proof/
           if-no-files-found: ignore
 
-      - name: upload vordr.exe
+      - name: upload release artifacts (x64 + ARM64 + universal MSI)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: vordr-exe
-          path: bin/vordr.exe
+          name: vordr-release
+          path: |
+            bin/vordr.exe
+            bin/vordr-arm64.exe
+            bin/vordr-*.msi
+            bin/SHA256SUMS.txt
 
       # run_all writes its logs to %TEMP%\vordr_runall - on the runner that is
       # C:\Users\runneradmin\AppData\Local\Temp, not runner.temp (D:\a\_temp), so the

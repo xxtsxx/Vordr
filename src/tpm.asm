@@ -75,8 +75,8 @@ externdef g_secdesk_hwnd:qword          ; active secure-desktop dialog HWND (gui
 externdef g_vaulthwnd:qword             ; main vault HWND (gui.asm)
 externdef g_trayhwnd:qword              ; persistent hidden owner HWND (gui.asm)
 
-.data
-; CNG / WebAuthn wide strings (no commas -> WSTR)
+.const
+; A3-24: immutable CNG / WebAuthn strings, constants, and descriptors live in read-only .const
 align 2
 WSTR tpm_prov,        <Microsoft Platform Crypto Provider>
 WSTR tpm_alg,         <RSA>
@@ -130,15 +130,10 @@ wa_wh_aaguid db 08h,98h,70h,58h,0CAh,0DCh,4Bh,81h,0B6h,0E1h,30h,0DEh,50h,0DCh,0B
 tbs_getcap_cmd db 80h,01h, 00h,00h,00h,16h, 00h,00h,01h,7Ah, 00h,00h,00h,06h, 00h,00h,02h,0Eh, 00h,00h,00h,03h
 
 align 4
-public g_tpm_last_err
-g_tpm_last_err dd 0                     ; last nonzero NCrypt / WebAuthN HRESULT
 tpm_keylen     dd 2048                  ; force RSA-2048 (never the provider default)
 tpm_keyusage   dd 1                     ; NCRYPT_ALLOW_DECRYPT_FLAG (decryption ONLY)
 tpm_exppol     dd 0                     ; non-exportable
 wa_bool_true   dd 1
-ifdef PROBE_IO
-g_tpm_mock_mode dd 0                    ; 1 only inside cmd_tpmkat software fallback
-endif
 
 align 8
 g_ui_policy label byte                  ; NCRYPT_UI_POLICY (32 bytes, x64)
@@ -167,6 +162,14 @@ wa_ext_arr label byte                   ; WEBAUTHN_EXTENSION (24 bytes)
     dq  wa_ext_hmac_w                   ; pwszExtensionIdentifier = L"hmac-secret"
     dd  4, 0                            ; cbExtension = sizeof(BOOL)
     dq  wa_bool_true                    ; pvExtension = &TRUE
+
+.data
+align 4
+public g_tpm_last_err
+g_tpm_last_err dd 0                     ; last nonzero NCrypt / WebAuthN HRESULT
+ifdef PROBE_IO
+g_tpm_mock_mode dd 0                    ; 1 only inside cmd_tpmkat software fallback
+endif
 
 .data?
 align 8
@@ -1405,6 +1408,28 @@ wgpa_got:
     jz      wgpa_fail
     cmp     dword ptr [r10+0], 3                ; WEBAUTHN_ASSERTION_VERSION_3+
     jb      wgpa_free_fail
+    ; A3-25: verify authenticatorData flags (UP=0x01 | UV=0x04) and returned Credential.pbId
+    cmp     dword ptr [r10+4], 37               ; cbAuthenticatorData >= 37 (rpIdHash[32] + flags + signCount[4])
+    jb      wgpa_free_fail
+    mov     rax, qword ptr [r10+8]              ; pbAuthenticatorData
+    test    rax, rax
+    jz      wgpa_free_fail
+    movzx   ecx, byte ptr [rax+32]              ; flags byte
+    and     ecx, 05h                            ; UP (bit 0) | UV (bit 2)
+    cmp     ecx, 05h
+    jne     wgpa_free_fail
+    mov     eax, dword ptr [r10+36]             ; Credential.cbId
+    cmp     eax, dword ptr [rbp-20]
+    jne     wgpa_free_fail
+    mov     rcx, qword ptr [r10+40]             ; Credential.pbId
+    test    rcx, rcx
+    jz      wgpa_free_fail
+    mov     rdx, qword ptr [rbp-16]
+    mov     r8d, eax
+    call    ct_memcmp
+    test    eax, eax
+    jnz     wgpa_free_fail
+    mov     r10, qword ptr [rbp-48]             ; reload PWEBAUTHN_ASSERTION after ct_memcmp
     mov     r11, qword ptr [r10+112]            ; pHmacSecret
     test    r11, r11
     jz      wgpa_free_fail
@@ -1433,6 +1458,24 @@ wgpa_cp:
     ret
 
 wgpa_free_fail:
+    mov     r10, qword ptr [rbp-48]
+    cmp     dword ptr [r10+0], 3
+    jb      wgpa_ff_rel
+    mov     r11, qword ptr [r10+112]
+    test    r11, r11
+    jz      wgpa_ff_rel
+    mov     ecx, dword ptr [r11+0]
+    test    ecx, ecx
+    jz      wgpa_ff_rel
+    cmp     ecx, 64
+    ja      wgpa_ff_rel
+    mov     rax, qword ptr [r11+8]
+    test    rax, rax
+    jz      wgpa_ff_rel
+    mov     edx, ecx
+    mov     rcx, rax
+    call    secure_zero
+wgpa_ff_rel:
     mov     rcx, qword ptr [rbp-48]
     mov     rax, qword ptr [wa_fn_freeass]
     xor     rax, qword ptr [g_ptr_cookie]
@@ -2464,14 +2507,27 @@ tcq_try_hw:
     mov     ecx, dword ptr [rbp-468]
     cmp     ecx, 19
     jb      tcq_fallback
+    cmp     ecx, 80                             ; A3-16: cap rsp_len to 80-byte stack buffer
+    ja      tcq_fallback
+    cmp     word ptr [rbp-560], 0180h           ; A3-16: TPM_ST_NO_SESSIONS (0x8001 BE)
+    jne     tcq_fallback
+    mov     eax, dword ptr [rbp-560 + 2]        ; responseSize (BE)
+    bswap   eax
+    cmp     eax, 19
+    jb      tcq_fallback
+    cmp     eax, ecx
+    ja      tcq_fallback
+    mov     ecx, eax                            ; clamp walk to responseSize
     mov     eax, dword ptr [rbp-560 + 6]        ; responseCode (0 = TPM_RC_SUCCESS)
     test    eax, eax
     jnz     tcq_fallback
+    cmp     dword ptr [rbp-560 + 11], 06000000h ; A3-16: TPM_CAP_TPM_PROPERTIES (6 BE)
+    jne     tcq_fallback
     mov     eax, dword ptr [rbp-560 + 15]       ; count (big-endian)
     bswap   eax
-    cmp     eax, 8
+    cmp     eax, 7                              ; floor((80 - 19) / 8) = 7 max pairs
     jbe     @F
-    mov     eax, 8
+    mov     eax, 7
 @@: mov     dword ptr [rbp-60], 0FFFFFFFFh      ; lockout_counter
     mov     dword ptr [rbp-64], 0               ; max_auth_fail
     mov     dword ptr [rbp-112], 0              ; lockout_interval_sec

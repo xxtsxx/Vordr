@@ -2,15 +2,19 @@
 // src/arm64/platform.S - ARM64 platform-specific runtime primitives
 // -----------------------------------------------------------------------------
 // Replaces the x86-specific routines that cannot be mechanically translated:
-//   - cpu_gate        : IsProcessorFeaturePresent(PF_ARM_V8_CRYPTO) + HKLM
-//                       CP 4030 (ID_AA64ISAR0_EL1.RNDR) probe for FEAT_RNG
-//   - rng_fill        : BCryptGenRandom + optional ARMv8.5 RNDRRS XOR mix
-//   - ff_trap         : re-entrancy-safe panic wipe + ARM64 __fastfail (brk #0xF003)
-//   - guard_check_icall_nop / guard_dispatch_icall_nop (ARM64 CFG default stubs)
+//   - cpu_gate              : IsProcessorFeaturePresent(PF_ARM_V8_CRYPTO) +
+//                             all-core HKLM CentralProcessor\*\CP 4030 probe
+//                             for FEAT_RNG (heterogeneous big.LITTLE safe)
+//   - rng_fill              : BCryptGenRandom + optional ARMv8.5 RNDRRS XOR mix
+//   - ff_trap               : re-entrancy-safe panic wipe + register scrub +
+//                             ARM64 __fastfail (brk #0xF003)
+//   - crash_capture_context : DBG_TRACE ARM64_NT_CONTEXT register snapshot
 //
 // Calling convention: Vordr internal ARM64 ABI (docs/ARM64.md).
 //   Args 1-4 in x0-x3, return in x8, preserve x19-x29, sp, v8-v15, never touch x18.
 // =============================================================================
+
+#include "frame.inc"
 
         .equ    CPUF_AESNI,         1
         .equ    CPUF_PCLMUL,        2
@@ -24,15 +28,15 @@
         .equ    BCRYPT_SYS_RNG,     2       // BCRYPT_USE_SYSTEM_PREFERRED_RNG
         .equ    KEY_READ,           0x20019
         .equ    REG_QWORD,          11
+        .equ    ERROR_NO_MORE_ITEMS, 259
 
         .section .rdata,"dr"
         .p2align 1
-w_cpu0_key:
+w_cpu_parent:
         .hword  'H','A','R','D','W','A','R','E','\\'
         .hword  'D','E','S','C','R','I','P','T','I','O','N','\\'
         .hword  'S','y','s','t','e','m','\\'
-        .hword  'C','e','n','t','r','a','l','P','r','o','c','e','s','s','o','r','\\'
-        .hword  '0', 0
+        .hword  'C','e','n','t','r','a','l','P','r','o','c','e','s','s','o','r', 0
         .p2align 1
 w_cp4030:
         .hword  'C','P',' ','4','0','3','0', 0
@@ -42,6 +46,8 @@ w_cp4030:
 // =============================================================================
 // cpu_gate() -> w8 = 1 if ARMv8 Cryptography Extensions present, 0 otherwise.
 // Raw frame (runs before hardening_init).
+// A3-18: enumerates EVERY numeric CentralProcessor\<N> subkey so FEAT_RNG is
+// only advertised when ALL cores (big + little) implement RNDRRS.
 // =============================================================================
         .globl  cpu_gate
         .p2align 2
@@ -55,13 +61,18 @@ cpu_gate:
         .seh_set_fp
         stp     x19, x20, [sp, #-16]!
         .seh_save_regp_x x19, 16
-        sub     sp, sp, #64
-        .seh_stackalloc 64
+        stp     x21, x22, [sp, #-16]!
+        .seh_save_regp_x x21, 16
+        sub     sp, sp, #80
+        .seh_stackalloc 80
         .seh_endprologue
 
-        // [sp+0]:  hKey (8)
-        // [sp+8]:  dwType (4), cbData (4)
-        // [sp+16]: val64 (8)
+        // [sp+0]:     hParent (8)
+        // [sp+8]:     hCore (8)
+        // [sp+16]:    dwType (4), cbData (4)
+        // [sp+24]:    val64 (8)
+        // [sp+32]:    cbName (4)
+        // [sp+40..71]: subkey name buffer (16 UTF-16 chars)
         mov     w19, #0
         mov     w0, #PF_ARM_V8_CRYPTO
         bl      IsProcessorFeaturePresent
@@ -69,47 +80,107 @@ cpu_gate:
 
         mov     w19, #CPUF_ARM64_BASE
 
-        // Probe HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\0\CP 4030
-        // (cached ID_AA64ISAR0_EL1) for FEAT_RNG (bits [63:60] >= 1).
+        // Open HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor
         str     xzr, [sp]
         movn    x0, #0x7FFF, lsl #16
         movk    x0, #0x0002                 // 0xFFFFFFFF80000002 = HKEY_LOCAL_MACHINE
-        adrp    x16, w_cpu0_key
-        add     x1, x16, :lo12:w_cpu0_key
+        adrp    x16, w_cpu_parent
+        add     x1, x16, :lo12:w_cpu_parent
         mov     w2, #0
         movz    w3, #0x0019
         movk    w3, #0x0002, lsl #16        // KEY_READ = 0x20019
-        add     x4, sp, #0                  // &hKey
+        add     x4, sp, #0                  // &hParent
         bl      RegOpenKeyExW
         cbnz    w0, cg_store
 
+        mov     w20, #0                     // enum index
+        mov     w21, #0                     // seen_any numeric core
+        mov     w22, #1                     // all_cores_have_rng
+
+cg_enum_lp:
+        cmp     w20, #256                   // safety cap
+        b.hs    cg_enum_done
+        mov     w11, #16
+        str     w11, [sp, #32]              // cbName = 16 wchars
+        ldr     x0, [sp]                    // hParent
+        mov     w1, w20                     // dwIndex
+        add     x2, sp, #40                 // lpName
+        add     x3, sp, #32                 // lpcchName
+        mov     x4, #0                      // lpReserved
+        mov     x5, #0                      // lpClass
+        mov     x6, #0                      // lpcchClass
+        mov     x7, #0                      // lpftLastWriteTime
+        bl      RegEnumKeyExW
+        cmp     w0, #ERROR_NO_MORE_ITEMS
+        b.eq    cg_enum_done
+        cbz     w0, cg_enum_chk
+        mov     w22, #0                     // unexpected enum error -> fail closed
+        b       cg_enum_done
+
+cg_enum_chk:
+        add     w20, w20, #1
+        // Accept only numeric subkeys ('0'..'9'+)
+        ldr     w11, [sp, #32]
+        cbz     w11, cg_enum_lp
+        add     x12, sp, #40
+        mov     w13, #0
+cg_dig_lp:
+        ldrh    w14, [x12, x13, lsl #1]
+        sub     w14, w14, #'0'
+        cmp     w14, #9
+        b.hi    cg_enum_lp                  // non-numeric metadata subkey -> skip
+        add     w13, w13, #1
+        cmp     w13, w11
+        b.lo    cg_dig_lp
+
+        mov     w21, #1                     // saw at least one numeric core
+        str     xzr, [sp, #8]
+        ldr     x0, [sp]                    // hParent
+        add     x1, sp, #40                 // subkey name ("0", "1", ...)
+        mov     w2, #0
+        movz    w3, #0x0019
+        movk    w3, #0x0002, lsl #16        // KEY_READ
+        add     x4, sp, #8                  // &hCore
+        bl      RegOpenKeyExW
+        cbz     w0, cg_query_core
+        mov     w22, #0
+        b       cg_enum_done
+
+cg_query_core:
         mov     w11, #8
-        str     w11, [sp, #12]              // cbData = 8
-        str     wzr, [sp, #8]               // dwType = 0
-        str     xzr, [sp, #16]              // val64 = 0
-        ldr     x0, [sp]                    // hKey
+        str     w11, [sp, #20]              // cbData = 8
+        str     wzr, [sp, #16]              // dwType = 0
+        str     xzr, [sp, #24]              // val64 = 0
+        ldr     x0, [sp, #8]                // hCore
         adrp    x16, w_cp4030
         add     x1, x16, :lo12:w_cp4030
-        mov     x2, #0                      // lpReserved
-        add     x3, sp, #8                  // &dwType
-        add     x4, sp, #16                 // &val64
-        add     x5, sp, #12                 // &cbData
+        mov     x2, #0
+        add     x3, sp, #16                 // &dwType
+        add     x4, sp, #24                 // &val64
+        add     x5, sp, #20                 // &cbData
         bl      RegQueryValueExW
-        mov     w20, w0
+        mov     w13, w0
+        ldr     x0, [sp, #8]
+        bl      RegCloseKey
+        cbnz    w13, cg_no_rng
+        ldr     w11, [sp, #16]
+        cmp     w11, #REG_QWORD
+        b.ne    cg_no_rng
+        ldr     w11, [sp, #20]
+        cmp     w11, #8
+        b.ne    cg_no_rng
+        ldr     x11, [sp, #24]
+        lsr     x11, x11, #60               // ID_AA64ISAR0_EL1.RNDR [63:60]
+        cbz     x11, cg_no_rng
+        b       cg_enum_lp
 
+cg_no_rng:
+        mov     w22, #0
+cg_enum_done:
         ldr     x0, [sp]
         bl      RegCloseKey
-
-        cbnz    w20, cg_store
-        ldr     w11, [sp, #8]
-        cmp     w11, #REG_QWORD
-        b.ne    cg_store
-        ldr     w11, [sp, #12]
-        cmp     w11, #8
-        b.ne    cg_store
-        ldr     x11, [sp, #16]
-        lsr     x11, x11, #60               // ID_AA64ISAR0_EL1.RNDR [63:60]
-        cbz     x11, cg_store
+        cbz     w21, cg_store
+        cbz     w22, cg_store
         orr     w19, w19, #CPUF_RDSEED
 
 cg_store:
@@ -118,10 +189,18 @@ cg_store:
         cmp     w19, #0
         cset    w8, ne
 
-        add     sp, sp, #64
+        .seh_startepilogue
+        add     sp, sp, #80
+        .seh_stackalloc 80
+        ldp     x21, x22, [sp], #16
+        .seh_save_regp_x x21, 16
         ldp     x19, x20, [sp], #16
+        .seh_save_regp_x x19, 16
         ldp     x29, x30, [sp], #16
+        .seh_save_fplr_x 16
         autibsp
+        .seh_pac_sign_lr
+        .seh_endepilogue
         ret
         .seh_endproc
 
@@ -129,6 +208,7 @@ cg_store:
 // rng_fill(x0 = buf, w1 = len) -> w8 = 1 ok, 0 failure
 // Primary: BCryptGenRandom(NULL, buf, len, BCRYPT_USE_SYSTEM_PREFERRED_RNG).
 // Defense in depth: XOR-mix ARMv8.5 RNDRRS when FEAT_RNG (CPUF_RDSEED) is set.
+// Protected by stack canary [x29, #-8] + software shadow stack (A3-18).
 // =============================================================================
         .globl  rng_fill
         .p2align 2
@@ -140,18 +220,20 @@ rng_fill:
         .seh_save_fplr_x 16
         mov     x29, sp
         .seh_set_fp
-        sub     sp, sp, #64
-        .seh_stackalloc 64
+        sub     sp, sp, #80
+        .seh_stackalloc 80
         .seh_endprologue
+        A64_FRAME_GUARD_ENTER .Lrf_ss_in
 
         // [sp+0..31]:  internal callee home area (for secure_zero)
+        // [x29-8]:     stack canary
         // [x29-16]:    buf
-        // [x29-8]:     len (w)
+        // [x29-24]:    len (w)
         cbz     x0, rf_fail
         cbz     w1, rf_ok
 
         str     x0, [x29, #-16]
-        str     w1, [x29, #-8]
+        str     w1, [x29, #-24]
 
         // Windows ARM64 ABI: BCryptGenRandom(NULL, pbBuffer, cbBuffer, dwFlags)
         mov     w3, #BCRYPT_SYS_RNG
@@ -166,7 +248,7 @@ rng_fill:
         tbz     w11, #5, rf_ok              // bit 5 = CPUF_RDSEED (32)
 
         ldr     x10, [x29, #-16]            // cursor
-        ldr     w11, [x29, #-8]             // remaining bytes
+        ldr     w11, [x29, #-24]            // remaining bytes
 rf_mix_loop:
         cmp     w11, #8
         b.lo    rf_tail
@@ -211,22 +293,92 @@ rf_ok:
 
 rf_wipe_fail:
         ldr     x0, [x29, #-16]
-        ldr     w1, [x29, #-8]
+        ldr     w1, [x29, #-24]
         bl      secure_zero
 rf_fail:
         mov     x9, #0
         mov     x13, #0
         mov     w8, #0
 rf_done:
-        mov     sp, x29
+        A64_FRAME_GUARD_EXIT .Lrf_cok, .Lrf_ssfail, .Lrf_ssdone
+        .seh_startepilogue
+        add     sp, sp, #80
+        .seh_stackalloc 80
         ldp     x29, x30, [sp], #16
+        .seh_save_fplr_x 16
         autibsp
+        .seh_pac_sign_lr
+        .seh_endepilogue
         ret
         .seh_endproc
 
 // =============================================================================
 // ff_trap(w0 = fail code) - central fail-fast handler.  Never returns.
+// A3-18/A3-30: wipes every secret buffer, zeroes v0..v31 & GPRs before fastfail,
+// fixes DBG_TRACE 4-nibble loop (w24=16) and separates #else release path.
 // =============================================================================
+.macro A64_SCRUB_ALL_REGS
+        movi    v0.2d, #0
+        movi    v1.2d, #0
+        movi    v2.2d, #0
+        movi    v3.2d, #0
+        movi    v4.2d, #0
+        movi    v5.2d, #0
+        movi    v6.2d, #0
+        movi    v7.2d, #0
+        movi    v8.2d, #0
+        movi    v9.2d, #0
+        movi    v10.2d, #0
+        movi    v11.2d, #0
+        movi    v12.2d, #0
+        movi    v13.2d, #0
+        movi    v14.2d, #0
+        movi    v15.2d, #0
+        movi    v16.2d, #0
+        movi    v17.2d, #0
+        movi    v18.2d, #0
+        movi    v19.2d, #0
+        movi    v20.2d, #0
+        movi    v21.2d, #0
+        movi    v22.2d, #0
+        movi    v23.2d, #0
+        movi    v24.2d, #0
+        movi    v25.2d, #0
+        movi    v26.2d, #0
+        movi    v27.2d, #0
+        movi    v28.2d, #0
+        movi    v29.2d, #0
+        movi    v30.2d, #0
+        movi    v31.2d, #0
+        mov     x1, #0
+        mov     x2, #0
+        mov     x3, #0
+        mov     x4, #0
+        mov     x5, #0
+        mov     x6, #0
+        mov     x7, #0
+        mov     x8, #0
+        mov     x9, #0
+        mov     x10, #0
+        mov     x11, #0
+        mov     x12, #0
+        mov     x13, #0
+        mov     x14, #0
+        mov     x15, #0
+        mov     x16, #0
+        mov     x17, #0
+        mov     x19, #0
+        mov     x20, #0
+        mov     x21, #0
+        mov     x22, #0
+        mov     x23, #0
+        mov     x24, #0
+        mov     x26, #0
+        mov     x27, #0
+        mov     x28, #0
+        mov     x29, #0
+.endm
+
         .globl  ff_trap
         .p2align 2
 ff_trap:
@@ -245,7 +397,7 @@ ff_trap:
         bl      dbg_putc
         mov     w8, #'F'
         bl      dbg_putc
-        mov     w24, #12                    // print 4 hex nibbles, high to low
+        mov     w24, #16                    // A3-30: print ALL 4 hex nibbles (12,8,4,0)
 ff_hexloop:
         sub     w24, w24, #4
         lsr     w8, w25, w24
@@ -271,15 +423,55 @@ ff_dbg_reent:
         movz    w1, #0x0409
         movk    w1, #0xC000, lsl #16
         bl      TerminateProcess
+        A64_SCRUB_ALL_REGS
         mov     w0, w25
         brk     #0xF003
-#endif
+        b       ff_dbg_reent
+#else
         bl      crash_try_enter
         cbz     w8, ff_rel_reent
         bl      sstk_reset_current
         bl      secmem_panic_wipe
         bl      crash_restore_desktop
 ff_rel_reent:
+        A64_SCRUB_ALL_REGS
         mov     w0, w25
         brk     #0xF003                     // Windows ARM64 __fastfail(w0)
         b       ff_rel_reent
+#endif
+
+#ifdef DBG_TRACE
+// =============================================================================
+// crash_capture_context(x0 = ARM64_NT_CONTEXT*) - DBG_TRACE override (A3-18).
+// Captures native ARM64_NT_CONTEXT registers into g_crash_regs[0..9] in the
+// canonical slot order (rax/x8, rcx/x0, rdx/x1, rbx/x19, rsp/Sp, rbp/Fp,
+// rsi/x20, rdi/x21, rip/Pc, r8/x2).  Leaf; never touches stack.
+// =============================================================================
+        .globl  crash_capture_context
+        .p2align 2
+crash_capture_context:
+        cbz     x0, 1f
+        adrp    x16, g_crash_regs
+        add     x16, x16, :lo12:g_crash_regs
+        ldr     x17, [x0, #0x48]            // X8 (mapped rax)
+        str     x17, [x16, #0]
+        ldr     x17, [x0, #0x08]            // X0 (mapped rcx)
+        str     x17, [x16, #8]
+        ldr     x17, [x0, #0x10]            // X1 (mapped rdx)
+        str     x17, [x16, #16]
+        ldr     x17, [x0, #0xA0]            // X19 (mapped rbx)
+        str     x17, [x16, #24]
+        ldr     x17, [x0, #0x100]           // Sp
+        str     x17, [x16, #32]
+        ldr     x17, [x0, #0xF0]            // Fp (X29)
+        str     x17, [x16, #40]
+        ldr     x17, [x0, #0xA8]            // X20 (mapped rsi)
+        str     x17, [x16, #48]
+        ldr     x17, [x0, #0xB0]            // X21 (mapped rdi)
+        str     x17, [x16, #56]
+        ldr     x17, [x0, #0x108]           // Pc
+        str     x17, [x16, #64]
+        ldr     x17, [x0, #0x18]            // X2 (mapped r8)
+        str     x17, [x16, #72]
+1:      ret
+#endif

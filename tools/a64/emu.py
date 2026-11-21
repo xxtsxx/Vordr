@@ -265,10 +265,20 @@ class Arm64PeEmu:
         hkey = self._r(0)
         sub = self._read_wstr(self._r(1)) or ""
         phk = self._arg(4)
-        if hkey == 0xFFFFFFFF80000002 and sub.upper() == r"HARDWARE\DESCRIPTION\SYSTEM\CENTRALPROCESSOR\0":
+        su = sub.upper()
+        if hkey == 0xFFFFFFFF80000002 and su in (
+            r"HARDWARE\DESCRIPTION\SYSTEM\CENTRALPROCESSOR",
+            r"HARDWARE\DESCRIPTION\SYSTEM\CENTRALPROCESSOR\0",
+        ):
             hk = self.next_hkey
             self.next_hkey += 4
-            self.reg_keys[hk] = sub.upper()
+            self.reg_keys[hk] = "CENTRALPROCESSOR" if su.endswith("CENTRALPROCESSOR") else "CPU:0"
+            self.uc.mem_write(phk, struct.pack("<Q", hk))
+            return 0
+        if self.reg_keys.get(hkey) == "CENTRALPROCESSOR" and su.isdigit():
+            hk = self.next_hkey
+            self.next_hkey += 4
+            self.reg_keys[hk] = f"CPU:{su}"
             self.uc.mem_write(phk, struct.pack("<Q", hk))
             return 0
         return 2  # ERROR_FILE_NOT_FOUND
@@ -279,7 +289,7 @@ class Arm64PeEmu:
         ptype = self._r(3)
         pdata = self._arg(4)
         pcb = self._arg(5)
-        if hk in self.reg_keys and val == "CP 4030":
+        if self.reg_keys.get(hk, "").startswith("CPU:") and val == "CP 4030":
             q = (1 << 60) if self.feat_rng else 0
             if ptype:
                 self.uc.mem_write(ptype, struct.pack("<I", 11))  # REG_QWORD
@@ -886,6 +896,36 @@ class Arm64PeEmu:
     def api_SetNamedSecurityInfoW(self):
         return 0  # ERROR_SUCCESS
 
+    def api_GetSecurityInfo(self):
+        ppdacl = self._arg(5)
+        ppsd = self._arg(7)
+        sd_va = self._vm_alloc(64, UC_PROT_READ | UC_PROT_WRITE)
+        self.local_allocs[sd_va] = 64
+        if ppdacl:
+            self.uc.mem_write(ppdacl, struct.pack("<Q", sd_va + 32))
+        if ppsd:
+            self.uc.mem_write(ppsd, struct.pack("<Q", sd_va))
+        return 0  # ERROR_SUCCESS
+
+    def api_SetSecurityInfo(self):
+        return 0  # ERROR_SUCCESS
+
+    def api_AcquireSRWLockExclusive(self):
+        return 0
+
+    def api_ReleaseSRWLockExclusive(self):
+        return 0
+
+    def api_GetModuleFileNameW(self):
+        buf = self._r(1)
+        cch = self._r(2) & 0xFFFFFFFF
+        name = os.path.abspath(self.pe_path)
+        if cch == 0:
+            return 0
+        out = name[:cch - 1]
+        self.uc.mem_write(buf, (out + "\0").encode("utf-16le"))
+        return len(out)
+
     def api_GetCurrentDirectoryW(self):
         cch = self._r(0) & 0xFFFFFFFF
         buf = self._r(1)
@@ -899,6 +939,18 @@ class Arm64PeEmu:
         return 259  # ERROR_NO_MORE_ITEMS
 
     def api_RegEnumKeyExW(self):
+        hk = self._r(0)
+        idx = self._r(1) & 0xFFFFFFFF
+        lpname = self._r(2)
+        lpcch = self._r(3)
+        if self.reg_keys.get(hk) == "CENTRALPROCESSOR" and idx in (0, 1):
+            nm = str(idx)
+            cap = struct.unpack("<I", self.uc.mem_read(lpcch, 4))[0] if lpcch else 0
+            if cap <= len(nm):
+                return 234  # ERROR_MORE_DATA
+            self.uc.mem_write(lpname, (nm + "\0").encode("utf-16le"))
+            self.uc.mem_write(lpcch, struct.pack("<I", len(nm)))
+            return 0
         return 259  # ERROR_NO_MORE_ITEMS
 
     def api_ExpandEnvironmentStringsW(self):

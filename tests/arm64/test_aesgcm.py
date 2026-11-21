@@ -298,7 +298,7 @@ def open_(t, key, iv, aad, ct, tg, outmode="distinct", tag=""):
     rq = t.req(kp, ivp, ap, len(aad), ip, len(ct), op, tp)
     r = t.call("gcm_open", rq, zero_v=(0, 1, 2, 3, 4, 5), tag=tag)
     sp = t.sp_at_call(1)
-    ctx = sp - 16 - 400 + 32
+    ctx = sp - 16 - 416 + 32
     t.eq(u.read(ctx, CTX + 16), bytes(CTX + 16), "gcm_open%s wipes context + computed tag" % tag)
     out = u.read(op, len(ct)) if op else None
     return r, out, u.read(ip, len(ct))

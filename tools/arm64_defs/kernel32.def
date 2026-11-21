@@ -1,14 +1,19 @@
 LIBRARY KERNEL32.dll
 EXPORTS
+    AcquireSRWLockExclusive
     AddVectoredExceptionHandler
     AttachConsole
     CloseHandle
+    ConnectNamedPipe
     CopyFileW
     CreateDirectoryW
+    CreateEventW
     CreateFileW
     CreateMutexW
+    CreateNamedPipeW
     CreateThread
     DeleteFileW
+    DisconnectNamedPipe
     ExitProcess
     ExpandEnvironmentStringsW
     FileTimeToLocalFileTime
@@ -21,6 +26,7 @@ EXPORTS
     GetCommandLineW
     GetCurrentDirectoryW
     GetCurrentProcess
+    GetCurrentProcessId
     GetCurrentThreadId
     GetDiskFreeSpaceExW
     GetDriveTypeW
@@ -35,6 +41,9 @@ EXPORTS
     GetLocalTime
     GetModuleFileNameW
     GetModuleHandleW
+    GetNamedPipeClientProcessId
+    GetNamedPipeServerProcessId
+    GetOverlappedResult
     GetProcAddress
     GetStdHandle
     GetSystemInfo
@@ -58,8 +67,10 @@ EXPORTS
     QueryPerformanceCounter
     QueryPerformanceFrequency
     ReadFile
+    ReleaseSRWLockExclusive
     RemoveDirectoryW
     ReplaceFileW
+    ResetEvent
     SetConsoleOutputCP
     SetDefaultDllDirectories
     SetEndOfFile

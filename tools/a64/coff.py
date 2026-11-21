@@ -118,7 +118,14 @@ class CoffObject:
                 data = raw[rawptr:rawptr + rawsz]
                 size = rawsz
             s = Section(i + 1, nm, data, chars, size)
-            for r in range(nrel):
+            # A3-31: handle IMAGE_SCN_LNK_NRELOC_OVFL (0x01000000) when nrel == 0xFFFF
+            if (chars & 0x01000000) and nrel == 0xFFFF:
+                real_nrel = struct.unpack_from("<I", raw, relptr)[0]
+                r_start = 1
+            else:
+                real_nrel = nrel
+                r_start = 0
+            for r in range(r_start, real_nrel):
                 ro, si, rt = struct.unpack_from("<IIH", raw, relptr + r * 10)
                 s.relocs.append((ro, REL_AMD64.get(rt, f"T{rt}"), si))
             s.relocs.sort()

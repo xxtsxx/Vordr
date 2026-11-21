@@ -1,5 +1,6 @@
 {
   "api_arity": {
+    "AcquireSRWLockExclusive": 1,
     "AddAccessAllowedAce": 4,
     "AddAccessAllowedAceEx": 5,
     "AddMandatoryAce": 5,
@@ -18,6 +19,7 @@
     "CloseClipboard": 0,
     "CloseDesktop": 1,
     "CloseHandle": 1,
+    "ConnectNamedPipe": 2,
     "CopyFileW": 3,
     "CreateCompatibleBitmap": 3,
     "CreateCompatibleDC": 1,
@@ -25,9 +27,11 @@
     "CreateDesktopW": 6,
     "CreateDialogParamW": 5,
     "CreateDirectoryW": 2,
+    "CreateEventW": 4,
     "CreateFileW": 7,
     "CreateFontW": 14,
     "CreateMutexW": 3,
+    "CreateNamedPipeW": 8,
     "CreatePen": 3,
     "CreatePopupMenu": 0,
     "CreateRoundRectRgn": 6,
@@ -42,6 +46,7 @@
     "DestroyMenu": 1,
     "DestroyWindow": 1,
     "DialogBoxParamW": 5,
+    "DisconnectNamedPipe": 1,
     "DispatchMessageW": 1,
     "DragAcceptFiles": 2,
     "DragFinish": 1,
@@ -81,6 +86,7 @@
     "GetCurrentDirectoryW": 2,
     "GetCurrentObject": 2,
     "GetCurrentProcess": 0,
+    "GetCurrentProcessId": 0,
     "GetCurrentThreadId": 0,
     "GetCursorPos": 1,
     "GetDC": 1,
@@ -111,12 +117,16 @@
     "GetModuleFileNameW": 3,
     "GetModuleHandleW": 1,
     "GetMonitorInfoW": 2,
+    "GetNamedPipeClientProcessId": 2,
+    "GetNamedPipeServerProcessId": 2,
     "GetNamedSecurityInfoW": 8,
     "GetOpenFileNameW": 1,
+    "GetOverlappedResult": 4,
     "GetParent": 1,
     "GetProcAddress": 2,
     "GetSaveFileNameW": 1,
     "GetSecurityDescriptorControl": 3,
+    "GetSecurityInfo": 8,
     "GetStdHandle": 1,
     "GetStockObject": 1,
     "GetSysColor": 1,
@@ -207,8 +217,10 @@
     "RegisterHotKey": 4,
     "ReleaseCapture": 0,
     "ReleaseDC": 2,
+    "ReleaseSRWLockExclusive": 1,
     "RemoveDirectoryW": 1,
     "ReplaceFileW": 6,
+    "ResetEvent": 1,
     "RestoreDC": 2,
     "RoundRect": 7,
     "SHGetFolderPathW": 5,
@@ -243,6 +255,7 @@
     "SetSecurityDescriptorControl": 3,
     "SetSecurityDescriptorDacl": 4,
     "SetSecurityDescriptorSacl": 4,
+    "SetSecurityInfo": 7,
     "SetTextColor": 2,
     "SetThreadDesktop": 1,
     "SetTimer": 4,
@@ -320,12 +333,15 @@
         "blake2b_compress"
       ]
     },
-    "loadcfg": {
+    "hardening": {
       "drop": [],
       "override": [
-        "guard_check_icall_nop",
-        "guard_dispatch_icall_nop"
+        "crash_capture_context"
       ]
+    },
+    "loadcfg": {
+      "drop": [],
+      "override": []
     },
     "main": {
       "drop": [],

@@ -6,6 +6,7 @@ EXPORTS
     GetLengthSid
     GetNamedSecurityInfoW
     GetSecurityDescriptorControl
+    GetSecurityInfo
     GetTokenInformation
     InitializeAcl
     InitializeSecurityDescriptor
@@ -23,3 +24,4 @@ EXPORTS
     SetSecurityDescriptorControl
     SetSecurityDescriptorDacl
     SetSecurityDescriptorSacl
+    SetSecurityInfo

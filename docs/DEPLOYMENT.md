@@ -30,8 +30,8 @@ msiexec /x vordr-0.8.1.msi /qn
 The package replaces related versions from `0.0.0` through its own version, inclusive,
 so a rebuilt package of the same version replaces rather than installs alongside the
 previous package. Downgrades are blocked at install time (`NEWERVERSIONDETECTED`
-`Upgrade` row and `LaunchCondition`), and installer-owned directories/files carry
-explicit `LockPermissions` SDDL rules (`verify_msi.ps1`). Keep `UpgradeCode` stable
+`Upgrade` row and `LaunchCondition`), and installer-owned directories and binaries carry
+explicit `MsiLockPermissionsEx` SDDL rules (`verify_msi.ps1`). Keep `UpgradeCode` stable
 across releases.
 
 **Repeat policy properties on upgrades.** MSI properties are not remembered as
@@ -150,21 +150,26 @@ also clamps direct registry edits:
 | `ClipSeconds` | 3600 | 0 is valid: never auto-clear |
 | `IdleLockMin` | 1440 | 0 is valid: no idle lock |
 | `PwVerifyDays` | 3650 | 0 is valid: no reminder |
-| `LogLevel` | **0** — off, not 4 | 0 is valid: off |
+| `LogLevel` | **4** — clamped to `LOG_DEBUG` | 0 is valid: off |
 | `ui_scheme` | **8** — the default (`Gruvbox`); `0..13` palettes, `14` follow Windows | — |
 | `ui_backdrop` | **0** — the default (`Cut planes`); `0..6` GPU styles, `7` flat | — |
 | `ui_anim` | **0** — follow Windows | 0 is valid: follow Windows |
-| `TpmUnlockMode` / `TpmMinMode` | **0** — off / no floor | 0 is valid: off |
+| `TpmUnlockMode` | **0** — off (corrupt `HKLM` also fails closed to `0`) | 0 is valid: off |
+| `TpmMinMode` | **3** — Hello floor (corrupt `HKLM` also fails closed to `3`) | 0 is valid: no floor |
 | `TpmPinMaxAttempts` | 20 | **3** — the default, not 1 |
 | `PinMinLen` | 32 | **6** when 0; 4 when 1–3 |
 | the 0/1 values | any non-zero reads as 1 | — |
 
-`TpmUnlockMode = 2` (`TPM + PIN`) enforces hardware TPM `SmartCardPin` plus pre-commit
-`S0`/`S1` state-key rotation so `HKCU` registry snapshots cannot replay failed attempts,
-and `TpmUnlockMode = 3` (`TPM + Hello`) requires both the Platform Crypto Provider TPM
-key and the user's Windows Hello NGC decryption key (`tpmkat`); treat all TPM modes as
-local hardware-bound convenience paths rather than replacements for a strong master
-password. When `SecureUnlock=1` is
+`TpmUnlockMode = 2` (`TPM + PIN`) combines an Argon2id-stretched user PIN with dual-slot
+(`S0`/`S1`) pre-commit rotating TPM 2.0 Platform Crypto Provider state keys so `HKCU`
+registry snapshots cannot replay failed attempts and failed PINs do not trip OS-wide TPM
+dictionary-attack lockout counters. Because Mode 2 relies on Vordr's pre-commit state-key
+rotation rather than an OS-enforced TPM `SmartCardPin`, use `TpmUnlockMode = 3` (`TPM +
+Hello`, requiring both the Platform Crypto Provider TPM key and the user's Windows Hello
+FIDO2 PRF assertion via `webauthn.dll`, `tpmkat`) or master-password-only (`TpmUnlockMode = 0`)
+when defending against arbitrary same-user CNG callers; treat all TPM modes as local
+hardware-bound convenience paths rather than replacements for a strong master password.
+When `SecureUnlock=1` is
 enforced via `HKLM`, Vordr **fails closed** if private-desktop creation fails and refuses
 normal-desktop fallback (`secdeskkat`); when `SecureUnlock=1` comes from `HKCU` or the
 default, Vordr warns and requires explicit user confirmation before opening a prompt on

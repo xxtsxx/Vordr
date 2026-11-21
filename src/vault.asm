@@ -96,10 +96,13 @@ extern reg_ctr_get:proc
 ifdef PROBE_IO
 extern reg_ctr_del:proc
 endif
-extern GetNamedSecurityInfoW:proc
+extern GetSecurityInfo:proc
 extern GetSecurityDescriptorControl:proc
-extern SetNamedSecurityInfoW:proc
+extern SetSecurityInfo:proc
 extern LocalFree:proc
+extern zi_abort:proc
+externdef g_wf_inherit_acl:dword
+externdef g_vault_lock:dword
 
 externdef g_cfg_in:qword
 externdef g_argv:qword
@@ -284,6 +287,7 @@ align 8
 HFLG_CAP    equ 8192
 public g_health_flags
 g_health_flags db HFLG_CAP dup (?)      ; per-entry health mask (1=weak, 2=reused, 4=old)
+g_foreign_body dq ?                     ; A3-13: active foreign import body (freed on vault_lock)
 g_eidx      dq ?                        ; vault_index_begin: one entry pointer per entry
 g_eidx_body dq ?                        ;   built from this body,
 g_eidx_blen dq ?                        ;   of this length
@@ -1310,20 +1314,21 @@ vk_derive_tpm_hello proc frame
     add     rax, rcx
     mov     qword ptr [rbp-32], rax             ; tail = vkey_iv[12] || vkey_ct[32] || vkey_tag[16]
 
-    ; 1) Silent machine-bound PCP unseal -> g_tpm_sec[0..31]
+    ; 1) A3-25: Live Windows Hello unseal FIRST (Face / Fingerprint / Hello PIN) -> g_tpm_sec[32..63]
+    ;    so tpm_secret is never decrypted in RAM during the up-to-60s Hello prompt.
+    lea     rcx, [g_tpm_blob + 276]
+    mov     edx, dword ptr [rbp-24]
+    lea     r8, [g_tpm_sec + 32]
+    call    tpm_hello_unseal
+    cmp     eax, 1
+    jne     vdth_fail
+
+    ; 2) Silent machine-bound PCP unseal -> g_tpm_sec[0..31]
     lea     rcx, [g_tpm_kn]
     lea     rdx, [g_tpm_blob + 20]
     mov     r8d, 256
     lea     r9, [g_tpm_sec]
     call    tpm_unseal
-    cmp     eax, 1
-    jne     vdth_fail
-
-    ; 2) Live Windows Hello unseal (Face / Fingerprint / Hello PIN) -> g_tpm_sec[32..63]
-    lea     rcx, [g_tpm_blob + 276]
-    mov     edx, dword ptr [rbp-24]
-    lea     r8, [g_tpm_sec + 32]
-    call    tpm_hello_unseal
     cmp     eax, 1
     jne     vdth_fail
 
@@ -1431,14 +1436,19 @@ vault_tpm_remember proc frame
     mov     r8d, 272
     call    reg_tpm_set
     test    eax, eax
-    jz      vtr_fail
+    jz      vtr_reg_fail
     call    tpm_del_slots_silent
     mov     ecx, dword ptr [rbp-16]
     call    tpm_del_stashed_hello
+    call    tpm_wipe_scratch
     mov     eax, 1
     FRAME_EPILOG
     ret
+vtr_reg_fail:
+    lea     rcx, [g_tpm_kn]                     ; A3-31: don't orphan newly created PCP key
+    call    tpm_delete
 vtr_fail:
+    call    tpm_wipe_scratch
     xor     eax, eax
     FRAME_EPILOG
     ret
@@ -1806,37 +1816,62 @@ vmb_suf:
 vault_mkbak endp
 
 ; ===========================================================================
-; vault_copy_dacl(rcx = src_wpath, rdx = dst_wpath) - best-effort copy of the
-;   source file's DACL (including SE_DACL_PROTECTED when set) onto dst_wpath so
-;   MoveFileExW fallbacks and .bak1..3 backups never widen explicit vault ACLs.
+; vault_copy_dacl(rcx = src_wpath, rdx = dst_wpath) - best-effort handle-based
+;   copy of the source file's DACL (including SE_DACL_PROTECTED when set) onto
+;   dst_wpath using FILE_FLAG_OPEN_REPARSE_POINT + file_validate_handle so
+;   planted symlinks are never followed (A3-15).
 ; ===========================================================================
 vault_copy_dacl proc frame
-    FRAME_PROLOG 128
-    ; [rbp-24]=src [rbp-32]=dst [rbp-40]=pDacl [rbp-48]=pSD [rbp-56]=ctrl [rbp-60]=rev
+    FRAME_PROLOG 160
+    ; [rbp-24]=src [rbp-32]=dst [rbp-40]=pDacl [rbp-48]=pSD [rbp-56]=ctrl/rev
+    ; [rbp-64]=hSrc [rbp-72]=hDst
     mov     qword ptr [rbp-24], rcx
     mov     qword ptr [rbp-32], rdx
     mov     qword ptr [rbp-40], 0
     mov     qword ptr [rbp-48], 0
-    WINCALL GetNamedSecurityInfoW, rcx, 1, 4, 0, 0, addr rbp-40, 0, addr rbp-48
+    mov     qword ptr [rbp-64], -1
+    mov     qword ptr [rbp-72], -1
+    WINCALL CreateFileW, rcx, 20000h, 7, 0, 3, FILE_FLAG_OPEN_RP, 0    ; READ_CONTROL, OPEN_EXISTING
+    cmp     rax, -1
+    je      vcd_done
+    mov     qword ptr [rbp-64], rax
+    mov     rcx, rax
+    call    file_validate_handle
     test    eax, eax
-    jnz     vcd_done
+    jz      vcd_close_src
+    WINCALL GetSecurityInfo, qword ptr [rbp-64], 1, 4, 0, 0, addr rbp-40, 0, addr rbp-48
+    test    eax, eax
+    jnz     vcd_close_src
     cmp     qword ptr [rbp-40], 0
     je      vcd_free
     mov     word ptr [rbp-56], 0
-    mov     dword ptr [rbp-60], 0
-    WINCALL GetSecurityDescriptorControl, qword ptr [rbp-48], addr rbp-56, addr rbp-60
+    mov     dword ptr [rbp-52], 0
+    WINCALL GetSecurityDescriptorControl, qword ptr [rbp-48], addr rbp-56, addr rbp-52
     mov     r8d, 4                              ; DACL_SECURITY_INFORMATION
     test    eax, eax
-    jz      vcd_set
+    jz      vcd_open_dst
     test    word ptr [rbp-56], 1000h            ; SE_DACL_PROTECTED
-    jz      vcd_set
+    jz      vcd_open_dst
     mov     r8d, 80000004h                      ; DACL | PROTECTED_DACL_SECURITY_INFORMATION
-vcd_set:
-    WINCALL SetNamedSecurityInfoW, qword ptr [rbp-32], 1, r8d, 0, 0, qword ptr [rbp-40], 0
+vcd_open_dst:
+    mov     dword ptr [rbp-52], r8d             ; save security info mask
+    WINCALL CreateFileW, qword ptr [rbp-32], 40000h, 7, 0, 3, FILE_FLAG_OPEN_RP, 0 ; WRITE_DAC
+    cmp     rax, -1
+    je      vcd_free
+    mov     qword ptr [rbp-72], rax
+    mov     rcx, rax
+    call    file_validate_handle
+    test    eax, eax
+    jz      vcd_close_dst
+    WINCALL SetSecurityInfo, qword ptr [rbp-72], 1, dword ptr [rbp-52], 0, 0, qword ptr [rbp-40], 0
+vcd_close_dst:
+    WINCALL CloseHandle, qword ptr [rbp-72]
 vcd_free:
     cmp     qword ptr [rbp-48], 0
-    je      vcd_done
+    je      vcd_close_src
     WINCALL LocalFree, qword ptr [rbp-48]
+vcd_close_src:
+    WINCALL CloseHandle, qword ptr [rbp-64]
 vcd_done:
     FRAME_EPILOG
     ret
@@ -2014,6 +2049,8 @@ vault_rotate_backups proc frame
     jne     vrb_copy
     cmp     qword ptr [g_filebuf], 0
     je      vrb_copy
+    mov     eax, dword ptr [g_vault_lock]
+    mov     dword ptr [g_wf_inherit_acl], eax   ; A3-14: inherit parent ACL ONLY on HKLM-locked vault
     mov     dword ptr [g_wf_disp], 1            ; CREATE_NEW + FILE_FLAG_OPEN_RP via write_file
     lea     rcx, [g_bak_a]
     mov     rdx, qword ptr [g_filebuf]
@@ -2023,6 +2060,14 @@ vault_rotate_backups proc frame
     jz      vrb_dacl
     jmp     vrb_done
 vrb_copy:
+    mov     rcx, qword ptr [rbp-48]
+    call    bak_not_reparse
+    test    eax, eax
+    jz      vrb_done
+    lea     rcx, [g_bak_a]
+    call    bak_not_reparse
+    test    eax, eax
+    jz      vrb_done
     WINCALL CopyFileW, qword ptr [rbp-48], addr g_bak_a, 1
     test    eax, eax
     jz      vrb_done
@@ -2041,30 +2086,73 @@ vault_commit_backups proc frame
     cmp     dword ptr [g_bak_staged], 0
     je      vcb_done
     mov     dword ptr [g_bak_staged], 0
-    lea     rcx, [g_bak_a]                      ; delete oldest (bak3)
+    ; A3-15: re-verify bak0..3 are not reparse points after file_rename's retry window
+    lea     rcx, [g_bak_a]                      ; check + delete oldest (bak3)
     mov     dl, '0' + BAK_GENS
     call    vault_mkbak
+    test    eax, eax
+    jz      vcb_done
+    lea     rcx, [g_bak_a]
+    call    bak_not_reparse
+    test    eax, eax
+    jz      vcb_done
     WINCALL DeleteFileW, addr g_bak_a
     lea     rcx, [g_bak_a]                      ; bak2 -> bak3
     mov     dl, '0' + BAK_GENS - 1
     call    vault_mkbak
+    test    eax, eax
+    jz      vcb_done
     lea     rcx, [g_bak_b]
     mov     dl, '0' + BAK_GENS
     call    vault_mkbak
+    test    eax, eax
+    jz      vcb_done
+    lea     rcx, [g_bak_a]
+    call    bak_not_reparse
+    test    eax, eax
+    jz      vcb_done
+    lea     rcx, [g_bak_b]
+    call    bak_not_reparse
+    test    eax, eax
+    jz      vcb_done
     WINCALL MoveFileExW, addr g_bak_a, addr g_bak_b, MOVEFILE_REPLACE_EXISTING
     lea     rcx, [g_bak_a]                      ; bak1 -> bak2
     mov     dl, '1'
     call    vault_mkbak
+    test    eax, eax
+    jz      vcb_done
     lea     rcx, [g_bak_b]
     mov     dl, '2'
     call    vault_mkbak
+    test    eax, eax
+    jz      vcb_done
+    lea     rcx, [g_bak_a]
+    call    bak_not_reparse
+    test    eax, eax
+    jz      vcb_done
+    lea     rcx, [g_bak_b]
+    call    bak_not_reparse
+    test    eax, eax
+    jz      vcb_done
     WINCALL MoveFileExW, addr g_bak_a, addr g_bak_b, MOVEFILE_REPLACE_EXISTING
     lea     rcx, [g_bak_a]                      ; staged bak0 -> bak1
     mov     dl, '0'
     call    vault_mkbak
+    test    eax, eax
+    jz      vcb_done
     lea     rcx, [g_bak_b]
     mov     dl, '1'
     call    vault_mkbak
+    test    eax, eax
+    jz      vcb_done
+    lea     rcx, [g_bak_a]
+    call    bak_not_reparse
+    test    eax, eax
+    jz      vcb_done
+    lea     rcx, [g_bak_b]
+    call    bak_not_reparse
+    test    eax, eax
+    jz      vcb_done
     WINCALL MoveFileExW, addr g_bak_a, addr g_bak_b, MOVEFILE_REPLACE_EXISTING
 vcb_done:
     FRAME_EPILOG
@@ -2279,6 +2367,11 @@ vsw_pdone:
     mov     dword ptr [rbp-48], 0                ; attempt count
 vsw_wtry:
     WINCALL DeleteFileW, addr g_tmppath
+    xor     eax, eax
+    cmp     dword ptr [g_seal_noadopt], 0       ; A3-14: exports ALWAYS get owner+SYSTEM DACL
+    jne     @F
+    mov     eax, dword ptr [g_vault_lock]       ; HKLM-locked vault inherits folder ACL
+@@: mov     dword ptr [g_wf_inherit_acl], eax
     mov     dword ptr [g_wf_disp], 1             ; CREATE_NEW (one-shot; re-armed per try)
     lea     rcx, [g_tmppath]
     mov     rdx, qword ptr [g_outbuf]
@@ -2659,14 +2752,15 @@ vu_oom:
     mov     eax, EXIT_OOM
     jmp     vu_cleanall
 vu_cleanall:
-    ; free secmem body if allocated
+    ; free secmem body if allocated (A3-20: null BEFORE free)
     mov     qword ptr [rbp-24], rax
-    mov     rcx, qword ptr [g_body_ptr]
-    test    rcx, rcx
+    xor     eax, eax
+    xchg    qword ptr [g_body_ptr], rax
+    test    rax, rax
     jz      vu_cleanfile2
+    mov     rcx, rax
     mov     rdx, VAULT_BODY_MAX
     call    secmem_free
-    mov     qword ptr [g_body_ptr], 0
 vu_cleanfile2:
     mov     eax, dword ptr [rbp-24]
 vu_cleanfile:
@@ -2816,10 +2910,21 @@ vl_editbk:
     xor     eax, eax
     xchg    qword ptr [g_edit_backup], rax      ; AUD-02: free any parked edit-transaction body
     test    rax, rax
-    jz      vl_key
+    jz      vl_foreign
     mov     rcx, rax
     mov     rdx, VAULT_BODY_MAX
     call    secmem_free
+vl_foreign:
+    ; A3-13: wipe + free any staged foreign vault body or ZIP import arenas on lock
+    xor     eax, eax
+    xchg    qword ptr [g_foreign_body], rax
+    test    rax, rax
+    jz      vl_zi
+    mov     rcx, rax
+    mov     rdx, VAULT_BODY_MAX
+    call    secmem_free
+vl_zi:
+    call    zi_abort
 vl_key:
     call    attach_reset                        ; free pending attachment plaintext
     mov     rcx, qword ptr [g_filebuf]           ; free the resident file image
@@ -3475,9 +3580,10 @@ find_field_in endp
 ; ===========================================================================
 public vault_body_validate
 vault_body_validate proc frame
-    FRAME_PROLOG 80
+    FRAME_PROLOG 96
     ; [rbp-24]=body ptr  [rbp-32]=body_len  [rbp-40]=offset
     ; [rbp-48]=entries remaining  [rbp-56]=fields remaining  [rbp-64]=att section total
+    ; [rbp-68]=field_idx  [rbp-72]=cur_entry_is_sys  [rbp-76]=seen_sys_entry (A3-31)
     mov     r10, qword ptr [g_body_ptr]
     test    r10, r10
     jz      vbv_bad
@@ -3490,6 +3596,7 @@ vault_body_validate proc frame
     mov     dword ptr [rbp-48], eax
     mov     qword ptr [rbp-40], 4               ; first entry begins after the count
     mov     qword ptr [rbp-64], 0               ; cumulative attachment section bytes
+    mov     dword ptr [rbp-76], 0               ; seen_sys_entry = 0
 vbv_entry:
     mov     eax, dword ptr [rbp-48]
     test    eax, eax
@@ -3501,6 +3608,8 @@ vbv_entry:
     mov     r10, qword ptr [rbp-24]
     mov     eax, dword ptr [r10+rcx+32]         ; field_count
     mov     dword ptr [rbp-56], eax
+    mov     dword ptr [rbp-68], 0               ; field_idx = 0
+    mov     dword ptr [rbp-72], 0               ; cur_entry_is_sys = 0
     add     rcx, 36
     mov     qword ptr [rbp-40], rcx             ; -> first field
 vbv_field:
@@ -3546,13 +3655,25 @@ vbv_kind:
     cmp     eax, VF_PWHIST
     je      vbv_pwhist
     cmp     eax, VF_SYSTEM
-    je      vbv_sys_unlbl
+    je      vbv_sys_mark
     cmp     eax, VF_SYS_PWVERIFY
-    je      vbv_sys_unlbl
+    je      vbv_sys_pwv
     jmp     vbv_fadv
-vbv_sys_unlbl:
+vbv_sys_mark:
     test    r9d, VF_LABELED
     jnz     vbv_bad
+    cmp     dword ptr [rbp-68], 0               ; A3-31: VF_SYSTEM must be field[0]
+    jne     vbv_bad
+    cmp     dword ptr [rbp-76], 0               ; ...and at most one per vault
+    jne     vbv_bad
+    mov     dword ptr [rbp-76], 1
+    mov     dword ptr [rbp-72], 1
+    jmp     vbv_fadv
+vbv_sys_pwv:
+    test    r9d, VF_LABELED
+    jnz     vbv_bad
+    cmp     dword ptr [rbp-72], 0               ; A3-31: VF_SYS_PWVERIFY only inside VF_SYSTEM entry
+    je      vbv_bad
     jmp     vbv_fadv
 vbv_atref:
     cmp     r11, ARF_SIZE
@@ -3608,6 +3729,7 @@ vbv_fadv:
     add     rcx, 6
     add     rcx, r8
     mov     qword ptr [rbp-40], rcx
+    inc     dword ptr [rbp-68]                  ; field_idx++
     dec     dword ptr [rbp-56]
     jmp     vbv_field
 vbv_entrynext:
@@ -6624,6 +6746,12 @@ ecf_loop:
     je      ecf_adv                           ; attachment field -> drop (don't copy)
     cmp     ecx, VF_FILE
     je      ecf_adv
+    cmp     ecx, VF_SYSTEM                    ; A3-31: never copy system/deleted markers
+    je      ecf_adv
+    cmp     ecx, VF_SYS_PWVERIFY
+    je      ecf_adv
+    cmp     ecx, VF_DELETED
+    je      ecf_adv
     cmp     ecx, VF_PWHIST
     jne     ecf_do_cp
     test    eax, VF_LABELED                   ; defensive: drop malformed history blobs
@@ -6696,20 +6824,63 @@ ffbi_none:
 fed_find_by_id endp
 
 ; entry_copy_full(rcx = src entry ptr, rdx = dst ptr) -> eax = bytes written.
-;   Verbatim entry copy INCLUDING attachment fields - the 68-byte AttachRef (with the
-;   attachment's own key/nonce/id) travels, so the blob can be carried into the new
-;   file.  Same signature as entry_copy_filtered.
+;   A3-12: export-safe copy INCLUDING attachment fields (68-byte AttachRefs
+;   travel), while stripping VF_PWHIST (old overwritten passwords per
+;   docs/formats.md), VF_SYSTEM, VF_SYS_PWVERIFY, and VF_DELETED and patching
+;   the destination field_count.  Same signature as entry_copy_filtered.
 entry_copy_full proc frame
-    FRAME_PROLOG 64
-    mov     qword ptr [rbp-24], rdx           ; dst
-    mov     qword ptr [rbp-32], rcx           ; src
-    call    vault_entry_len                   ; rcx = src -> rax = len
-    mov     dword ptr [rbp-40], eax
-    mov     rcx, qword ptr [rbp-24]
-    mov     rdx, qword ptr [rbp-32]
-    mov     r8d, dword ptr [rbp-40]
-    call    copy_bytes
-    mov     eax, dword ptr [rbp-40]
+    FRAME_PROLOG 48
+    mov     qword ptr [rbp-32], rdx           ; dst base
+    xor     r8d, r8d                          ; header: 36 bytes src->dst
+ecfl_hc:
+    mov     al, byte ptr [rcx+r8]
+    mov     byte ptr [rdx+r8], al
+    inc     r8d
+    cmp     r8d, 36
+    jb      ecfl_hc
+    mov     r10, rcx                          ; src field cursor
+    mov     r9d, dword ptr [r10+32]           ; src field_count
+    add     r10, 36
+    mov     r11, rdx                          ; dst field cursor
+    add     r11, 36
+    mov     dword ptr [rbp-24], 0             ; kept field count
+ecfl_loop:
+    test    r9d, r9d
+    jz      ecfl_done
+    movzx   eax, word ptr [r10]               ; field type
+    mov     ecx, eax
+    and     ecx, VF_KINDMASK                  ; base kind
+    mov     r8d, dword ptr [r10+2]            ; field value len
+    add     r8d, 6                            ; + {u16 type, u32 len} header
+    cmp     ecx, VF_PWHIST                    ; A3-12: never leak password history on export
+    je      ecfl_adv
+    cmp     ecx, VF_SYSTEM                    ; defensive: strip system / deleted markers
+    je      ecfl_adv
+    cmp     ecx, VF_SYS_PWVERIFY
+    je      ecfl_adv
+    cmp     ecx, VF_DELETED
+    je      ecfl_adv
+    xor     ecx, ecx                          ; copy r8d bytes r10 -> r11
+ecfl_cp:
+    cmp     ecx, r8d
+    jae     ecfl_cpd
+    mov     al, byte ptr [r10+rcx]
+    mov     byte ptr [r11+rcx], al
+    inc     ecx
+    jmp     ecfl_cp
+ecfl_cpd:
+    add     r11, r8
+    inc     dword ptr [rbp-24]
+ecfl_adv:
+    add     r10, r8
+    dec     r9d
+    jmp     ecfl_loop
+ecfl_done:
+    mov     r10, qword ptr [rbp-32]           ; patch dst field_count
+    mov     eax, dword ptr [rbp-24]
+    mov     dword ptr [r10+32], eax
+    mov     rax, r11
+    sub     rax, qword ptr [rbp-32]           ; bytes written
     FRAME_EPILOG
     ret
 entry_copy_full endp
@@ -6784,14 +6955,13 @@ fx_adv:
     inc     dword ptr [rbp-64]
     jmp     fx_loop
 fx_built:
-    mov     rcx, qword ptr [g_body_ptr]       ; free the old (source) body; its attachment
-    test    rcx, rcx                          ; image/index (g_filebuf/g_attidx) stay live for
-    jz      fx_hdr                            ; the carry seal below
+    xor     eax, eax                          ; A3-20: null g_body_ptr BEFORE secmem_free
+    xchg    qword ptr [g_body_ptr], rax
+    test    rax, rax
+    jz      fx_hdr
+    mov     rcx, rax
     mov     rdx, VAULT_BODY_MAX
     call    secmem_free
-    mov     qword ptr [g_body_ptr], 0         ; freed - null it now so a later fx_oom (RNG/KDF
-                                              ; failure) can't leave g_body_ptr dangling at
-                                              ; released pages (UAF / panic-wipe writes freed mem)
 fx_hdr:
     mov     dword ptr [g_hdr+0], VAULT_MAGIC  ; fresh header
     mov     dword ptr [g_hdr+4], VAULT_VERSION
@@ -7214,6 +7384,7 @@ vof_call_unlock:
     mov     rax, qword ptr [g_body_ptr]         ; hand the body to the caller
     mov     r10, qword ptr [rbp-48]
     mov     qword ptr [r10], rax
+    mov     qword ptr [g_foreign_body], rax     ; A3-13: track for immediate wipe on vault_lock
     mov     rcx, qword ptr [g_filebuf]          ; the foreign image itself is not wanted
     test    rcx, rcx
     jz      vof_restore
@@ -7305,10 +7476,15 @@ public vault_free_foreign
 vault_free_foreign proc frame
     FRAME_PROLOG 32
     test    rcx, rcx
-    jz      vff_done
+    jz      vff_zi
+    cmp     rcx, qword ptr [g_foreign_body]
+    jne     vff_free
+    mov     qword ptr [g_foreign_body], 0
+vff_free:
     mov     rdx, VAULT_BODY_MAX
     call    secmem_free
-vff_done:
+vff_zi:
+    call    zi_abort                            ; A3-13: always wipe 1 MiB g_zi_tbuf & staging arrays
     FRAME_EPILOG
     ret
 vault_free_foreign endp
