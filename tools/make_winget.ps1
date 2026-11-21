@@ -135,6 +135,9 @@ Installers:
 - Architecture: x64
   InstallerUrl: $Url
   InstallerSha256: $sha
+- Architecture: arm64
+  InstallerUrl: $Url
+  InstallerSha256: $sha
 ManifestType: installer
 ManifestVersion: $ManifestVer
 "@ | ForEach-Object { Write-Manifest (Join-Path $dir "$PackageId.installer.yaml") $_ }
@@ -153,7 +156,7 @@ PackageName: Vordr
 PackageUrl: $RepoUrl
 License: MIT
 LicenseUrl: $RepoUrl/blob/master/LICENSE.txt
-ShortDescription: A hardened offline password manager written entirely in x64 assembly.
+ShortDescription: A hardened offline password manager written entirely in x64 and ARM64 assembly.
 Description: |-
   Vordr is a single Windows executable with no installer runtime, no C runtime,
   no .NET and no third-party code. The vault is a local encrypted file; nothing

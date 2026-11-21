@@ -7,6 +7,17 @@ in [docs/RELEASES.md](docs/RELEASES.md).
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-11-21
+
+First public `1.0.0` release, consolidating the native ARM64 port, DirectCompute glass UI and compositor, PIN secret type, strengthened TPM unlock modes, and Pass 1–9 security audit remediations (`0.2.4`–`0.8.2`) with a polished interactive universal MSI installer and refreshed documentation.
+
+### Added in 1.0.0
+
+- **Interactive universal MSI setup wizard (`tools/make_msi.ps1`, `tools/verify_msi.ps1`).** Pure declarative Windows Installer 5.0 wizard (zero custom actions, zero third-party tools) featuring custom Vordr-styled graphics (`BmpSide`, `BmpTop`, `vordr.ico` Add/Remove icon, and 16×16 supersampled padlock icons), four guided screens (Welcome, Installation Folder & integration options, master-detail Settings & Policy editor, and Ready to Install), a modeless progress dialog, and maintenance/uninstall handling.
+- **Start with Windows installer option (`VORDR_AUTOSTART=1`).** Opt-in checkbox on the Installation Folder screen and secure public MSI property writing `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run\Vordr = "[INSTALLDIR]vordr.exe"` (starting minimized to the notification area, cleanly removed on uninstall).
+- **User-overridable `HKCU` defaults alongside `HKLM` policy locks (`VORDR_USER_*` + top-right `Lock` toggle).** All 16 settings in the MSI wizard are directly editable: editing any of the 14 `HKCU`-capable settings without ticking the top-right `Lock` checkbox seeds a `Permanent` `HKCU\SOFTWARE\Vordr` user default (changeable inside Vordr Settings and preserved across uninstall), while ticking `Lock` enforces and locks the value in `HKLM\SOFTWARE\Vordr`. `AllowUncVault` and `AllowScreenCapture` remain strictly `HKLM`-only. Silent `/qn` installs continue to write zero policy or preference rows unless explicitly supplied.
+- **Documentation visual refresh and post-quantum section (`README.md`, `logo/vordr.svg`, `docs/screenshots/*.png`, `docs/DEPLOYMENT.md`).** Added the Vordr vector shield logo, synthetic-vault screenshots, a plain-language post-quantum resistance section covering AES-256-GCM, Argon2id/BLAKE2b, SHA-256, and RSA-2048/FIDO2 TPM/Hello unlock wrappers, and full alignment across all 20 documentation files.
+
 ## [0.8.2] - 2026-11-21
 
 ### Added in 0.8.2

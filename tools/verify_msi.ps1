@@ -21,7 +21,7 @@
          no elevation is needed.
 
     Usage:  powershell -ExecutionPolicy Bypass -File tools\verify_msi.ps1 `
-                       [-Msi bin\vordr-0.8.2.msi]
+                       [-Msi bin\vordr-1.0.0.msi]
     Exit code 0 = all checks passed.
 #>
 [CmdletBinding()]
@@ -81,18 +81,20 @@ $secure = if ($scp.Count) { $scp[0][0] -split ";" } else { @() }
 $byName = @{}; foreach ($c in $comp) { $byName[$c[0]] = $c }
 $inFeature = @{}; foreach ($f in $fc) { $inFeature[$f[1]] = $true }
 
-# Policy rows and file-association rows are checked differently, so split them
-# by the component they belong to rather than guessing from the key.
+# Policy rows (HKLM enforced), HKCU user-default rows, autostart, and file-assoc
+# rows are checked differently, so split them by component name.
 $polRows   = @($reg | Where-Object { $_[5] -like "Pol*" })
+$defRows   = @($reg | Where-Object { $_[5] -like "Def*" })
+$autoRows  = @($reg | Where-Object { $_[5] -eq "VordrAutoStart" })
 $assocRows = @($reg | Where-Object { $_[5] -eq "FileAssoc" })
-$other     = @($reg | Where-Object { $_[5] -notlike "Pol*" -and $_[5] -ne "FileAssoc" })
+$other     = @($reg | Where-Object { $_[5] -notlike "Pol*" -and $_[5] -notlike "Def*" -and $_[5] -ne "VordrAutoStart" -and $_[5] -ne "FileAssoc" })
 foreach ($r in $other) { Bad "$($r[0]) belongs to $($r[5]), which this script knows nothing about - add a rule for it rather than leaving it unchecked" }
 
-function CommonChecks($r) {
+function CommonChecks($r, [int]$expectRoot = 2) {
     $rk, $root, $key, $name, $value, $cname = $r
     $c = $byName[$cname]
     if (-not $c) { Bad "$rk names component $cname, which does not exist"; return $null }
-    if ([int]$root -ne 2)               { Bad "$rk writes to root $root, not HKLM (2)" }
+    if ([int]$root -ne $expectRoot)      { Bad "$rk writes to root $root, expected $expectRoot" }
     # 256 = write to the 64-bit view.  Without it, an x64 package silently
     # redirects into WOW6432Node, where the 64-bit vordr.exe never looks: the
     # install succeeds and the entry simply has no effect.
@@ -101,32 +103,57 @@ function CommonChecks($r) {
     if (-not $inFeature[$cname])        { Bad "$cname is in no feature, so it is never installed" }
     if ([string]::IsNullOrEmpty($c[3])) { Bad "$cname has no condition" }
     else {
-        $prop = ($c[3] -replace '^NOT\s+', '')
-        if ($prop -cne $prop.ToUpper()) { Bad "$cname's condition '$($c[3])' is not a public (uppercase) property" }
-        if ($secure -notcontains $prop) { Bad "$prop is missing from SecureCustomProperties - dropped before the elevated half of the install" }
+        foreach ($m in [regex]::Matches($c[3], '\bVORDR_[A-Z0-9_]+\b')) {
+            $prop = $m.Value
+            if ($prop -cne $prop.ToUpper()) { Bad "$cname's property '$prop' is not uppercase" }
+            if ($secure -notcontains $prop) { Bad "$prop is missing from SecureCustomProperties - dropped before the elevated half of the install" }
+        }
     }
     $c
 }
 
-Write-Host ("policy values   : {0}" -f $polRows.Count)
-if ($polRows.Count -ne 16) { Bad "expected 16 policy Registry rows, found $($polRows.Count)" }
+Write-Host ("policy values   : {0} HKLM enforced + {1} HKCU user-default" -f $polRows.Count, $defRows.Count)
+if ($polRows.Count -ne 16) { Bad "expected 16 HKLM policy Registry rows, found $($polRows.Count)" }
+if ($defRows.Count -ne 14) { Bad "expected 14 HKCU user-default Registry rows, found $($defRows.Count)" }
 $polNames = @($polRows | ForEach-Object { $_[3] })
+$defNames = @($defRows | ForEach-Object { $_[3] })
 foreach ($reqPol in @("AllowUncVault", "AllowScreenCapture")) {
     if ($polNames -notcontains $reqPol) { Bad "policy row '$reqPol' is missing from Registry table" }
+    if ($defNames -contains $reqPol)    { Bad "HKLM-only security policy '$reqPol' must NOT have an HKCU Def* row" }
 }
 foreach ($r in $polRows) {
     Write-Host ("  HKLM\{0}\{1} = {2}   [{3}]" -f $r[2], $r[3], $r[4], $r[5])
-    $c = CommonChecks $r
+    $c = CommonChecks $r 2
     if (-not $c) { continue }
+    if ([int]$c[2] -band 16)                 { Bad "$($r[5]) is marked Permanent - uninstall/upgrade could not remove HKLM lock" }
     if ($r[4] -notmatch '^#\[[A-Z0-9_]+\]$') { Bad "$($r[0]) value '$($r[4])' is not '#[PROPERTY]' - it would not be a REG_DWORD driven by a property" }
     if ($c[3] -match '^NOT\s')               { Bad "$($r[5]) is conditioned on the ABSENCE of its property - it would be written when nobody asked" }
+}
+foreach ($r in $defRows) {
+    $c = CommonChecks $r 1
+    if (-not $c) { continue }
+    if (-not ([int]$c[2] -band 16))          { Bad "$($r[5]) lacks Permanent (0x10) - uninstalling Vordr would delete user's HKCU preference $($r[3])" }
+    if ($r[4] -notmatch '^#\[VORDR_USER_[A-Z0-9_]+\]$') { Bad "$($r[0]) value '$($r[4])' is not '#[VORDR_USER_*]'" }
+    if ($c[3] -notmatch '^VORDR_USER_[A-Z0-9_]+ AND NOT VORDR_[A-Z0-9_]+$') { Bad "$($r[5]) condition '$($c[3])' must gate on VORDR_USER_* AND NOT VORDR_*" }
+}
+
+Write-Host ""
+Write-Host ("autostart       : {0} row" -f $autoRows.Count)
+if ($autoRows.Count -ne 1) { Bad "expected 1 VordrAutoStart row, found $($autoRows.Count)" }
+else {
+    $ar = $autoRows[0]
+    Write-Host ("  HKLM\{0}\{1} = {2}   [{3}]" -f $ar[2], $ar[3], $ar[4], $ar[5])
+    $ac = CommonChecks $ar 2
+    if ($ar[2] -ne "SOFTWARE\Microsoft\Windows\CurrentVersion\Run") { Bad "autostart writes to unexpected key '$($ar[2])'" }
+    if ($ar[3] -ne "Vordr") { Bad "autostart value name is '$($ar[3])', expected 'Vordr'" }
+    if ($ar[4] -ne '"[INSTALLDIR]vordr.exe"') { Bad "autostart value '$($ar[4])' must be quoted `"[INSTALLDIR]vordr.exe`"" }
 }
 
 Write-Host ""
 Write-Host ("file assoc      : {0} rows" -f $assocRows.Count)
 foreach ($r in $assocRows) {
     Write-Host ("  HKLM\{0}  {1} = {2}" -f $r[2], $(if ($r[3]) { $r[3] } else { "(default)" }), $r[4])
-    $null = CommonChecks $r
+    $null = CommonChecks $r 2
     if ($r[2] -notlike "SOFTWARE\Classes\*") { Bad "$($r[0]) writes outside SOFTWARE\Classes" }
 }
 if ($assocRows.Count) {
@@ -176,10 +203,16 @@ Write-Host "costing with no properties set:"
 foreach ($r in $polRows) {
     if ($none[$r[5]] -eq $LOCAL) { Bad "$($r[5]) installs with no property set - $($r[3]) would be written, and its PRESENCE locks the setting against the user" }
 }
+foreach ($r in $defRows) {
+    if ($none[$r[5]] -eq $LOCAL) { Bad "$($r[5]) installs with no property set - HKCU $($r[3]) would be written unexpectedly" }
+}
+if ($none["VordrAutoStart"] -eq $LOCAL) {
+    Bad "VordrAutoStart installs by default without VORDR_AUTOSTART=1"
+}
 if ($assocRows.Count -and $none["FileAssoc"] -ne $LOCAL) {
     Bad "the file association is not registered by default - a plain install would leave .vordr unopenable"
 }
-if ($fail -eq $before) { Write-Host "  no policy value written; the association registered - ok" }
+if ($fail -eq $before) { Write-Host "  no HKLM/HKCU settings or autostart written; .vordr association registered - ok" }
 
 $before = $fail
 Write-Host ""
@@ -191,8 +224,32 @@ foreach ($r in $polRows) {
     foreach ($o in $polRows) {
         if ($o[5] -ne $r[5] -and $one[$o[5]] -eq $LOCAL) { Bad "$prop=1 also writes $($o[3]) - properties are not independent" }
     }
+    foreach ($d in $defRows) {
+        if ($one[$d[5]] -eq $LOCAL) { Bad "$prop=1 also writes HKCU $($d[5])" }
+    }
 }
-if ($fail -eq $before) { Write-Host ("  each of the {0} properties writes exactly its own value - ok" -f $polRows.Count) }
+foreach ($r in $defRows) {
+    $uprop = ($byName[$r[5]][3] -split '\s+')[0]
+    $one   = Cost @{ $uprop = "1" }
+    if ($one[$r[5]] -ne $LOCAL) { Bad "$uprop=1 does not install HKCU $($r[5])" }
+    foreach ($o in $defRows) {
+        if ($o[5] -ne $r[5] -and $one[$o[5]] -eq $LOCAL) { Bad "$uprop=1 also writes HKCU $($o[3])" }
+    }
+    foreach ($p in $polRows) {
+        if ($one[$p[5]] -eq $LOCAL) { Bad "$uprop=1 also writes HKLM $($p[5])" }
+    }
+}
+# Precedence check: when both VORDR_PWMINLEN and VORDR_USER_PWMINLEN are set, HKLM wins and HKCU skips
+$both = Cost @{ "VORDR_PWMINLEN" = "16"; "VORDR_USER_PWMINLEN" = "24" }
+if ($both["PolPwMinLen"] -ne $LOCAL -or $both["DefPwMinLen"] -eq $LOCAL) {
+    Bad "when both VORDR_PWMINLEN and VORDR_USER_PWMINLEN are set, only PolPwMinLen must install"
+}
+# Autostart check: VORDR_AUTOSTART=1 enables, VORDR_AUTOSTART=0 skips
+$asOn  = Cost @{ "VORDR_AUTOSTART" = "1" }
+$asOff = Cost @{ "VORDR_AUTOSTART" = "0" }
+if ($asOn["VordrAutoStart"] -ne $LOCAL)  { Bad "VORDR_AUTOSTART=1 did not install VordrAutoStart" }
+if ($asOff["VordrAutoStart"] -eq $LOCAL) { Bad "VORDR_AUTOSTART=0 unexpectedly installed VordrAutoStart" }
+if ($fail -eq $before) { Write-Host ("  {0} HKLM + {1} HKCU + HKLM-wins precedence + autostart costing - ok" -f $polRows.Count, $defRows.Count) }
 
 if ($assocRows.Count) {
     $before = $fail
@@ -530,7 +587,10 @@ $validCases = @(
     @{ "VORDR_IDLELOCKMIN" = "0" },
     @{ "VORDR_IDLELOCKMIN" = "1440" },
     @{ "VORDR_PWVERIFYDAYS" = "0" },
-    @{ "VORDR_PWVERIFYDAYS" = "3650" }
+    @{ "VORDR_PWVERIFYDAYS" = "3650" },
+    @{ "VORDR_USER_PWMINLEN" = "24" },
+    @{ "VORDR_AUTOSTART" = "0" },
+    @{ "VORDR_AUTOSTART" = "1" }
 )
 foreach ($vc in $validCases) {
     $rc = Test-Launch $vc
@@ -555,7 +615,11 @@ $badCases = @(
     @{ "VORDR_PWMINLEN" = "2147483648" },
     @{ "VORDR_PWMINLEN" = [string][char]0xFF11 + [string][char]0xFF16 },
     @{ "VORDR_CLIPSECONDS" = "3601" },
-    @{ "VORDR_CLIPSECONDS" = "12 34" }
+    @{ "VORDR_CLIPSECONDS" = "12 34" },
+    @{ "VORDR_USER_PWMINLEN" = "0" },
+    @{ "VORDR_USER_PWMINLEN" = "257" },
+    @{ "VORDR_USER_PWMINLEN" = "X01" },
+    @{ "VORDR_AUTOSTART" = "2" }
 )
 foreach ($bc in $badCases) {
     $rc = Test-Launch $bc
@@ -566,6 +630,193 @@ foreach ($bc in $badCases) {
 }
 if ($fail -eq $before) {
     Write-Host ("  LaunchConditions: {0} valid passed, {1} invalid/coercion cases rejected - ok" -f $validCases.Count, $badCases.Count)
+}
+
+# --- 6. interactive UI wizard, tristate policy wiring & zero custom actions --
+Write-Host ""
+$before = $fail
+Write-Host "ui wizard       : checking dialogs, graphics, tristate policies & invariants"
+if ($secure -notcontains "INSTALLDIR") {
+    Bad "INSTALLDIR is missing from SecureCustomProperties - custom folder choices would be dropped on elevation"
+}
+$allProps = Rows "SELECT ``Property``,``Value`` FROM ``Property``" 2
+$propMap  = @{}; foreach ($pr in $allProps) { $propMap[$pr[0]] = $pr[1] }
+foreach ($reqProp in @("DefaultUIFont", "ErrorDialog", "ARPPRODUCTICON")) {
+    if (-not $propMap.ContainsKey($reqProp) -or [string]::IsNullOrEmpty($propMap[$reqProp])) {
+        Bad "Property table missing required UI property '$reqProp'"
+    }
+}
+foreach ($r in $polRows) {
+    $pName = $byName[$r[5]][3]
+    if ($propMap.ContainsKey($pName)) {
+        Bad "Property table pre-sets '$pName=$($propMap[$pName])' - silent /qn installs would unexpectedly lock $($r[3])"
+    }
+}
+foreach ($r in $defRows) {
+    $upName = ($byName[$r[5]][3] -split '\s+')[0]
+    if ($propMap.ContainsKey($upName)) {
+        Bad "Property table pre-sets '$upName=$($propMap[$upName])' - silent /qn installs would unexpectedly write HKCU $($r[3])"
+    }
+}
+if ($propMap.ContainsKey("VORDR_AUTOSTART")) {
+    Bad "Property table pre-sets VORDR_AUTOSTART - silent /qn installs would unexpectedly enable Windows startup"
+}
+$tables = Rows "SELECT ``Name`` FROM ``_Tables``" 1
+$tNames = @($tables | ForEach-Object { $_[0] })
+if ($tNames -contains "CustomAction") {
+    Bad "CustomAction table exists - Vordr's MSI must stay zero-custom-action"
+}
+
+$dlgRows  = Rows "SELECT ``Dialog``,``Width``,``Height``,``Control_First``,``Control_Default``,``Control_Cancel``,``Attributes`` FROM ``Dialog``" 7
+$dlgMap   = @{}; foreach ($d in $dlgRows) { $dlgMap[$d[0]] = $d }
+$reqDlgs  = @("WelcomeDlg","InstallDirDlg","BrowseDlg","PolicyDlg","VerifyReadyDlg","ProgressDlg","ExitDlg","UserExitDlg","FatalErrorDlg","MaintenanceDlg","CancelDlg","ErrorDlg")
+foreach ($rd in $reqDlgs) {
+    if (-not $dlgMap.ContainsKey($rd)) { Bad "Dialog table missing required dialog '$rd'" }
+}
+# ProgressDlg MUST be modeless (Visible=1, Modal=2 CLEAR) or InstallUISequence hangs before ExecuteAction!
+if ($dlgMap.ContainsKey("ProgressDlg")) {
+    $progAttr = [int]$dlgMap["ProgressDlg"][6]
+    if (($progAttr -band 3) -ne 1) {
+        Bad "ProgressDlg Attributes=$progAttr must set Visible(1) and clear Modal(2) or install hangs at 'Preparing installation...'"
+    }
+}
+if (-not $uiMap.ContainsKey("ProgressDlg") -or -not $uiMap.ContainsKey("ExecuteAction") -or $uiMap["ProgressDlg"] -ge $uiMap["ExecuteAction"]) {
+    Bad "InstallUISequence must run modeless ProgressDlg before ExecuteAction"
+}
+
+$ctrlRows = Rows "SELECT ``Dialog_``,``Control``,``Type``,``X``,``Y``,``Width``,``Height``,``Attributes``,``Property``,``Text``,``Control_Next`` FROM ``Control``" 11
+$ctrlsByDlg = @{}
+foreach ($ct in $ctrlRows) {
+    if (-not $ctrlsByDlg.ContainsKey($ct[0])) { $ctrlsByDlg[$ct[0]] = @{} }
+    $ctrlsByDlg[$ct[0]][$ct[1]] = $ct
+}
+
+$binRows = Rows "SELECT ``Name`` FROM ``Binary``" 1
+$binSet  = @($binRows | ForEach-Object { $_[0] })
+$icoRows = Rows "SELECT ``Name`` FROM ``Icon``" 1
+$icoSet  = @($icoRows | ForEach-Object { $_[0] })
+foreach ($reqBin in @("BmpSide", "BmpTop", "IcoLockOpen", "IcoLockShut")) {
+    if ($binSet -notcontains $reqBin) { Bad "Binary table missing artwork/icon '$reqBin'" }
+}
+if ($propMap.ContainsKey("ARPPRODUCTICON") -and ($icoSet -notcontains $propMap["ARPPRODUCTICON"])) {
+    Bad "ARPPRODUCTICON '$($propMap['ARPPRODUCTICON'])' is missing from Icon table"
+}
+$scRows = Rows "SELECT ``Shortcut``,``Icon_`` FROM ``Shortcut``" 2
+foreach ($sc in $scRows) {
+    if (-not [string]::IsNullOrEmpty($sc[1]) -and ($icoSet -notcontains $sc[1])) {
+        Bad "Shortcut $($sc[0]) references missing Icon '$($sc[1])'"
+    }
+}
+
+foreach ($d in $dlgRows) {
+    $dn = $d[0]; $dw = [int]$d[1]; $dh = [int]$d[2]
+    $cmap = if ($ctrlsByDlg.ContainsKey($dn)) { $ctrlsByDlg[$dn] } else { @{} }
+    foreach ($ref in @($d[3], $d[4], $d[5])) {
+        if (-not [string]::IsNullOrEmpty($ref) -and (-not $cmap.ContainsKey($ref))) {
+            Bad "Dialog $dn references missing control '$ref'"
+        }
+    }
+    foreach ($ct in $cmap.Values) {
+        if (-not [string]::IsNullOrEmpty($ct[10]) -and (-not $cmap.ContainsKey($ct[10]))) {
+            Bad "Control $dn.$($ct[1]) Control_Next references missing control '$($ct[10])'"
+        }
+        $cx = [int]$ct[3]; $cy = [int]$ct[4]; $cw = [int]$ct[5]; $ch = [int]$ct[6]
+        if ($cx -lt 0 -or $cy -lt 0 -or ($cx + $cw) -gt $dw -or ($cy + $ch) -gt $dh) {
+            Bad "Control $dn.$($ct[1]) rect ($cx,$cy,${cw}x${ch}) exceeds dialog $dn (${dw}x${dh})"
+        }
+        if (($ct[2] -eq "Bitmap" -or $ct[2] -eq "Icon") -and ($binSet -notcontains $ct[9])) {
+            Bad "$($ct[2]) control $dn.$($ct[1]) references missing Binary row '$($ct[9])'"
+        }
+    }
+}
+
+# BrowseDlg indirect controls must carry bit 0x8 (Indirect) to dereference _BrowseProperty
+if ($ctrlsByDlg.ContainsKey("BrowseDlg")) {
+    foreach ($bc in @("Combo", "List", "PathEdit")) {
+        $bctrl = $ctrlsByDlg["BrowseDlg"][$bc]
+        if (-not $bctrl) { Bad "BrowseDlg missing control '$bc'" }
+        elseif (-not ([int]$bctrl[7] -band 8)) { Bad "BrowseDlg.$bc lacks Indirect attribute (0x8) for _BrowseProperty (causes MSI Error 1314)" }
+    }
+}
+
+# Verify ControlEvent dialog targets and PolicyDlg master-detail ListBox + enforce/value controls
+$ceRows = Rows "SELECT ``Dialog_``,``Control_``,``Event``,``Argument``,``Condition`` FROM ``ControlEvent``" 5
+foreach ($ce in $ceRows) {
+    if (($ce[2] -eq "NewDialog" -or $ce[2] -eq "SpawnDialog") -and (-not $dlgMap.ContainsKey($ce[3]))) {
+        Bad "ControlEvent $($ce[0]).$($ce[1]) $($ce[2]) targets missing dialog '$($ce[3])'"
+    }
+}
+$lbRows = Rows "SELECT ``Property``,``Order``,``Value``,``Text`` FROM ``ListBox`` WHERE ``Property``='UI_SEL_POL'" 4
+if ($lbRows.Count -ne $polRows.Count) {
+    Bad "PolicyDlg ListBox has $($lbRows.Count) row(s), expected $($polRows.Count)"
+}
+$polListCtrl = if ($ctrlsByDlg.ContainsKey("PolicyDlg")) { $ctrlsByDlg["PolicyDlg"]["PolList"] } else { $null }
+if (-not $polListCtrl -or $polListCtrl[2] -ne "ListBox") {
+    Bad "PolicyDlg missing ListBox control 'PolList'"
+} elseif (-not ([int]$polListCtrl[7] -band 0x10000)) {
+    Bad "PolicyDlg.PolList lacks Sorted-by-Order attribute (0x10000)"
+}
+$cbRows = Rows "SELECT ``Property``,``Value`` FROM ``CheckBox``" 2
+$cbSet  = @($cbRows | ForEach-Object { $_[0] })
+if ($cbSet -notcontains "UI_AUTOSTART" -or -not $ctrlsByDlg["InstallDirDlg"].ContainsKey("AutoStartChk")) {
+    Bad "InstallDirDlg missing Start-with-Windows checkbox 'AutoStartChk' (UI_AUTOSTART)"
+}
+for ($pi = 0; $pi -lt $polRows.Count; $pi++) {
+    if ($cbSet -notcontains "UL_$pi") { Bad "CheckBox table missing top-right lock toggle 'UL_$pi'" }
+    if (-not $ctrlsByDlg["PolicyDlg"].ContainsKey("PLck$pi")) { Bad "PolicyDlg missing top-right Lock CheckBox 'PLck$pi'" }
+    if (-not $ctrlsByDlg["PolicyDlg"].ContainsKey("PIcO$pi") -or -not $ctrlsByDlg["PolicyDlg"].ContainsKey("PIcL$pi")) {
+        Bad "PolicyDlg missing open/closed padlock Icon controls for setting #$pi"
+    }
+    if (-not $ctrlsByDlg["PolicyDlg"].ContainsKey("PVal$pi")) { Bad "PolicyDlg missing value editor 'PVal$pi'" }
+}
+$polGroups = @($ctrlRows | Where-Object { $_[0] -eq "PolicyDlg" -and $_[2] -eq "RadioButtonGroup" })
+$rbRows = Rows "SELECT ``Property``,``Order``,``Value`` FROM ``RadioButton``" 3
+$rbByProp = @{}
+foreach ($rb in $rbRows) {
+    if (-not $rbByProp.ContainsKey($rb[0])) { $rbByProp[$rb[0]] = @() }
+    $rbByProp[$rb[0]] += $rb[2]
+}
+foreach ($pg in $polGroups) {
+    $pAttr = [int]$pg[7]
+    if (-not ($pAttr -band 0x20000)) { Bad "PolicyDlg.$($pg[1]) lacks PushLike attribute (0x20000)" }
+    if ($pAttr -band 0xC0000)        { Bad "PolicyDlg.$($pg[1]) sets Bitmap/Icon attribute (0x40000/0x80000) on text radio group" }
+    $vals = if ($rbByProp.ContainsKey($pg[8])) { $rbByProp[$pg[8]] } else { @() }
+    if ($vals.Count -ne 2 -or ($vals -notcontains "0") -or ($vals -notcontains "1")) {
+        Bad "PolicyDlg.$($pg[1]) ($($pg[8])) RadioButton values '$($vals -join ',')' do not match boolean 0/1"
+    }
+}
+# Validate PolicyDlg.Next numeric Enable/Disable ControlCondition live via Session.EvaluateCondition
+$ccNext = Rows "SELECT ``Action``,``Condition`` FROM ``ControlCondition`` WHERE ``Dialog_``='PolicyDlg' AND ``Control_``='Next'" 2
+$enCond = ($ccNext | Where-Object { $_[0] -eq "Enable" }  | Select-Object -First 1)
+$diCond = ($ccNext | Where-Object { $_[0] -eq "Disable" } | Select-Object -First 1)
+if (-not $enCond -or -not $diCond) {
+    Bad "PolicyDlg.Next missing Enable/Disable numeric validation ControlConditions"
+} else {
+    function Eval-UiCond([hashtable]$pSet, [string]$expr) {
+        $s = $installer.OpenPackage($Msi, 1)
+        foreach ($k in $pSet.Keys) { $s.Property($k) = $pSet[$k] }
+        $ev = $s.EvaluateCondition($expr)
+        [void][Runtime.InteropServices.Marshal]::ReleaseComObject($s)
+        $ev # 1 = True, 0 = False
+    }
+    if ((Eval-UiCond @{} $enCond[1]) -ne 1)                 { Bad "PolicyDlg.Next Enable condition false by default" }
+    if ((Eval-UiCond @{ "UV_0"="24" } $enCond[1]) -ne 1)    { Bad "PolicyDlg.Next rejected valid unlocked PwMinLen=24" }
+    if ((Eval-UiCond @{ "UV_0"="0" }  $diCond[1]) -ne 1)    { Bad "PolicyDlg.Next accepted invalid PwMinLen=0" }
+    if ((Eval-UiCond @{ "UV_0"="999" } $diCond[1]) -ne 1)   { Bad "PolicyDlg.Next accepted invalid PwMinLen=999" }
+    if ((Eval-UiCond @{ "UV_0"="" }   $diCond[1]) -ne 1)    { Bad "PolicyDlg.Next accepted empty PwMinLen" }
+    if ((Eval-UiCond @{ "UV_5"="0" }  $enCond[1]) -ne 1)    { Bad "PolicyDlg.Next rejected valid ClipSeconds=0" }
+    if ((Eval-UiCond @{ "UV_5"="3601" } $diCond[1]) -ne 1)  { Bad "PolicyDlg.Next accepted invalid ClipSeconds=3601" }
+}
+$polNextHklm = @($ceRows | Where-Object { $_[0] -eq "PolicyDlg" -and $_[1] -eq "Next" -and $_[2] -match '^\[(VORDR_(?!USER_)[A-Z0-9_]+)\]$' -and $_[3] -match '^\[UV_\d+\]$' })
+$polNextHkcu = @($ceRows | Where-Object { $_[0] -eq "PolicyDlg" -and $_[1] -eq "Next" -and $_[2] -match '^\[(VORDR_USER_[A-Z0-9_]+)\]$' -and $_[3] -match '^\[UV_\d+\]$' })
+if ($polNextHklm.Count -ne $polRows.Count) {
+    Bad "PolicyDlg.Next maps $($polNextHklm.Count) HKLM VORDR_* properties, expected $($polRows.Count)"
+}
+if ($polNextHkcu.Count -ne $defRows.Count) {
+    Bad "PolicyDlg.Next maps $($polNextHkcu.Count) HKCU VORDR_USER_* properties, expected $($defRows.Count)"
+}
+if ($fail -eq $before) {
+    Write-Host ("  UI wizard       : {0} dialogs (modeless ProgressDlg), autostart option, {1}-setting ListBox + Lock/HKCU editor, padlock icons, zero CustomActions - ok" -f $dlgRows.Count, $lbRows.Count)
 }
 
 [void][Runtime.InteropServices.Marshal]::ReleaseComObject($db)

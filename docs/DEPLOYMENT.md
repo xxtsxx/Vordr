@@ -7,24 +7,31 @@ A portable installation does not require machine policy.
 
 ## Installation and upgrades
 
-The universal MSI installs for all users in `%ProgramFiles%\Vordr`. It carries
-both the native x64 (`vordr.exe`) and native ARM64 (`vordr-arm64.exe`) binaries
-and automatically installs the host's native executable as `%ProgramFiles%\Vordr\vordr.exe`
-with zero custom actions (using `AppSearch` + `RegLocator` against
+The universal MSI installs for all users in `%ProgramFiles%\Vordr` (customizable via
+the interactive folder picker or `INSTALLDIR=`). It carries both the native x64
+(`vordr.exe`) and native ARM64 (`vordr-arm64.exe`) binaries and automatically installs
+the host's native executable as `[INSTALLDIR]vordr.exe` with zero custom actions (using
+`AppSearch` + `RegLocator` against
 `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment\PROCESSOR_ARCHITECTURE`
-into `HOST_NATIVE_ARCH`, see [Windows on ARM](ARM64.md#universal-msi-deployment)). It
-can register an all-users Start Menu shortcut, the `.vordr` file association, and only
-the policy values explicitly supplied at installation. Installation requires elevation;
-the application manifest uses `asInvoker`, so running Vordr does not itself
-request elevation.
+into `HOST_NATIVE_ARCH`, see [Windows on ARM](ARM64.md#universal-msi-deployment)).
+Running the MSI interactively presents a four-step setup wizard (Welcome, Installation
+Folder with `.vordr` association and optional Start with Windows toggle, optional
+Settings & Policy list where edited values seed user-overridable `HKCU` defaults and the
+top-right `Lock` checkbox enforces them in `HKLM`, and Ready to Install), while silent
+`/qn` deployments remain completely non-interactive and write only the properties
+supplied on the command line. It can register an all-users Start Menu shortcut, the
+`.vordr` file association, optional Windows startup (`VORDR_AUTOSTART=1`), and only the
+settings explicitly selected or supplied at installation. Installation requires elevation;
+the application manifest uses `asInvoker`, so running Vordr does not itself request
+elevation.
 
 Run these Command Prompt examples in an elevated shell, replacing the filename
 with the package being deployed:
 
 ```bat
-msiexec /i vordr-0.8.2.msi /qn
-msiexec /i vordr-0.8.2.msi /qn VORDR_SECUREUNLOCK=1 VORDR_PWMINLEN=16
-msiexec /x vordr-0.8.2.msi /qn
+msiexec /i vordr-1.0.0.msi /qn
+msiexec /i vordr-1.0.0.msi /qn VORDR_SECUREUNLOCK=1 VORDR_PWMINLEN=16
+msiexec /x vordr-1.0.0.msi /qn
 ```
 
 The package replaces related versions from `0.0.0` through its own version, inclusive,
@@ -136,8 +143,17 @@ or disable screen-capture exclusion (`polkat`). When `AllowUncVault` is `0`
 `CreateFileW` and rejects junctions or mapped drives whose resolved handle path
 (`GetFinalPathNameByHandleW`) points to UNC storage.
 
-`VORDR_NOASSOC` is a seventeenth property, not a policy value. Set it to any
-nonempty value to skip the `.vordr` association; omit it to register the association.
+For the 14 settings that Vordr also reads from `HKCU\SOFTWARE\Vordr` (all except the
+`HKLM`-only `AllowUncVault` and `AllowScreenCapture`), parallel `VORDR_USER_<NAME>`
+properties (for example `VORDR_USER_PWMINLEN=24`) seed unlocked user defaults in the
+installing user's `HKCU\SOFTWARE\Vordr` hive. Those components carry the MSI `Permanent`
+flag so users can override them in Vordr Settings and uninstalling Vordr leaves `HKCU`
+untouched. If both `VORDR_<NAME>` and `VORDR_USER_<NAME>` are supplied, the locked
+`HKLM` value takes precedence.
+
+Two integration properties are not policy values:
+- `VORDR_NOASSOC`: set to any nonempty value to skip the `.vordr` file association; omit it to register the association.
+- `VORDR_AUTOSTART`: set to `1` to register `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run\Vordr` (`"[INSTALLDIR]vordr.exe"`, starting minimized to the notification area); omit or set `0` to leave startup manual.
 
 `make_msi.ps1` emits `LaunchCondition` guards that reject non-numeric or out-of-range
 public policy properties at install time (`verify_msi.ps1`), and verifies that both
@@ -183,7 +199,7 @@ timeouts, session locking, and download-only attachments. Omitted settings
 remain user-configurable.
 
 ```bat
-msiexec /i vordr-0.8.2.msi /qn ^
+msiexec /i vordr-1.0.0.msi /qn ^
   VORDR_PWMINLEN=16 VORDR_PWMINCLASSES=4 ^
   VORDR_SECUREUNLOCK=1 VORDR_CLIPSECONDS=10 VORDR_IDLELOCKMIN=5 ^
   VORDR_LOCKONWINLOCK=1 VORDR_NOPREVIEW=1 VORDR_LOGLEVEL=2
@@ -288,7 +304,7 @@ the Explorer session rather than assuming the registry write failed.
 From the repository root:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\verify_msi.ps1 -Msi bin\vordr-0.8.2.msi
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\verify_msi.ps1 -Msi bin\vordr-1.0.0.msi
 ```
 
 The verifier reads MSI tables and evaluates component costing without installing.
