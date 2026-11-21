@@ -29,9 +29,9 @@ policy is in [SECURITY.md](../SECURITY.md); an old hash does not imply support.
 | v0.2.1 | `1ba8413` | `01baa66ff49e1869dc6b68b4c4528c5cb534282b54f98745222e0f628898e664` | — |
 | v0.2.2 | `4482251` | `eaa45139c4941e6516c17ebf880c5fb78dee0bd0c5db88024e99b51833ad914d` | — |
 | v0.2.3 | `378c28e` | `197e5ef014c8be0093ed7a0e7960358cdeb2b118c4dbb5680a949dcf55c2d343` | — |
-| v1.0.0 | `b9249f3` | `8241198fb48d592302ffb20f8b9df3766bc4d396913e18e641003986c2456526` | `ccf95b48cc5f4a324af5805c83f0868dc080f78e440ff4f001d48e2df26f7e6b` |
+| v1.0.0 | `d8aaf5f` | `8241198fb48d592302ffb20f8b9df3766bc4d396913e18e641003986c2456526` | `ccf95b48cc5f4a324af5805c83f0868dc080f78e440ff4f001d48e2df26f7e6b` |
 
-`v1.0.0` (`b9249f3`) build metadata:
+`v1.0.0` (`d8aaf5f`) build metadata:
 - Toolchain: MSVC `ml64` / `link` `14.44.35230.0`, Windows SDK `10.0.28000.0`, LLVM `clang` `23.1.5` (`build.cmd release strict` and `build_arm64.cmd release`, verified byte-reproducible via `tools\verify_repro.ps1` and a second clean checkout).
 - Universal MSI (`vordr-1.0.0.msi`, `647,168` bytes): SHA-256 `53bc66a111180c2912dc2d9c46869f9b62d595ccef80f5477a64a57c9621d803`, `ProductCode` `{94A9DB29-A12F-434E-A73F-1CB8C9D6EE33}`, `UpgradeCode` `{6A1D0C7E-9E2F-4F1B-9C2A-7E5B0D3A8F41}`.
 
