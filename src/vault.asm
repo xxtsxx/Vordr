@@ -2808,9 +2808,9 @@ vault_unlock endp
 public vault_preload
 vault_preload proc frame
     FRAME_PROLOG 160
+    cmp     qword ptr [g_filebuf], 0            ; A4-12: check resident image BEFORE clearing
+    jne     vpl_skip                            ;   g_preloaded (keeps orphan worker state intact)
     mov     dword ptr [g_preloaded], 0
-    cmp     qword ptr [g_filebuf], 0
-    jne     vpl_skip
     cmp     qword ptr [g_cfg_in], 0
     je      vpl_skip
     ; Pre-validate 80-byte header + size cap before committing a full-file allocation
@@ -9603,10 +9603,20 @@ vpc_pw_ready:
     jnz     vpc_restore
     mov     dword ptr [rbp-48], 1
 vpc_restore:
-    lea     rcx, [g_vkey]                       ; the live key comes back either way
+    ; A6-03: defense-in-depth - if vault was locked while vault_pw_check ran, scrub g_vkey
+    ; instead of copying the parked master key back into g_vkey.
+    cmp     qword ptr [g_body_ptr], 0
+    jne     vpc_rest_copy
+    lea     rcx, [g_vkey]
+    mov     edx, 32
+    call    secure_zero
+    jmp     vpc_rest_wipe
+vpc_rest_copy:
+    lea     rcx, [g_vkey]                       ; the live key comes back while vault is open
     lea     rdx, [g_xs_vkey]
     mov     r8d, 32
     call    copy_bytes
+vpc_rest_wipe:
     lea     rcx, [g_xs_vkey]
     mov     edx, 32
     call    secure_zero

@@ -3,6 +3,7 @@ EXPORTS
     AcquireSRWLockExclusive
     AddVectoredExceptionHandler
     AttachConsole
+    CancelIo
     CloseHandle
     ConnectNamedPipe
     CopyFileW
@@ -75,7 +76,9 @@ EXPORTS
     SetDefaultDllDirectories
     SetEndOfFile
     SetErrorMode
+    SetEvent
     SetFileAttributesW
+    SetFileInformationByHandle
     SetFilePointerEx
     SetProcessMitigationPolicy
     SetProcessWorkingSetSizeEx

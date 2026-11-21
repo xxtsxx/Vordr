@@ -350,7 +350,13 @@ set /a T_CRYPTODIFF=!T1!-!T0!
 
 rem --- restore a clean RELEASE binary in bin\ (roundtrip left a PROBE_IO build,
 rem     which exposes the path-taking verbs - never leave that as the artifact) --
-if "%R_BUILD%"=="PASS" call .\build.cmd release strict > "%WORK%\build_restore.log" 2>&1
+if "%R_BUILD%"=="PASS" (
+    call .\build.cmd release strict > "%WORK%\build_restore.log" 2>&1
+    if errorlevel 1 (
+        echo   restore release build FAILED - see %WORK%\build_restore.log
+        set R_BUILD=FAIL
+    )
+)
 
 
 rem --- 6. installer -----------------------------------------------------------
@@ -391,8 +397,8 @@ if "!HAS_CLANG!"=="1" (
         set R_INSTALLER=FAIL
         goto :installer_done
     )
-) else if not exist "bin\vordr-arm64.exe" (
-    echo   installer: SKIP ^(clang/LLVM not found and bin\vordr-arm64.exe absent^)
+) else (
+    echo   installer: SKIP ^(clang/LLVM not found - refusing to wrap stale ARM64 binary^)
     set R_INSTALLER=skip
     goto :installer_done
 )

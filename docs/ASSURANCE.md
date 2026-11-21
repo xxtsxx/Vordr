@@ -59,7 +59,7 @@ flowchart LR
 | Installer | Release-PE validation (`make_msi.ps1`), MSI tables, 16 policy rows, numeric `LaunchCondition` guards, SDDL permissions, downgrade prevention (`NEWERVERSIONDETECTED`), and component costing checked (`verify_msi.ps1`) | Does not install, upgrade, or uninstall the program |
 
 `--quick` skips fault injection. `build.cmd release strict` requires Python and
-fails closed when Python is missing; missing `makecab` can skip the installer
+fails closed when Python is missing; missing `makecab` or `clang`/LLVM can skip the installer
 stage in `run_all.cmd`. A release review must explicitly inspect any skipped stage.
 
 ## Cryptographic checks
@@ -110,7 +110,7 @@ not expose a command-line option for reading an edited report file.
 | `wstrcheck.py` | Bounded string-copy calls missing their `r8`/`r8d` bound across the full preceding instruction window, or direct `g_cfg_in` assignments bypassing `cfg_in_set` |
 | `aligncheck.py` | Misaligned wide-string declarations (sizes written as names or expressions are resolved, not guessed) |
 | `check_docs.py` | Broken relative links/anchors, duplicate heading slugs, unclosed fences, and control characters in documentation |
-| `pe_normalise.py` | Missing or misconfigured PE `IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG` `DependentLoadFlags == 0x0800` (`LOAD_LIBRARY_SEARCH_SYSTEM32`) and non-deterministic COFF/export/debug/Rich timestamps |
+| `pe_normalise.py` | Release PE hardening (`PE32+`, non-stripped relocations, `BASERELOC`, read-only `IAT`/`LOAD_CONFIG` with `DependentLoadFlags == 0x0800`, `.pdata`, 4 KiB-isolated `_ROINIT`, `W^X`, `/CETCOMPAT` bit) and zeroing COFF/export/load-config/debug timestamps |
 
 These are source-pattern checks, not a complete compiler or program proof.
 A refactor can reduce what a checker recognizes without introducing a reported

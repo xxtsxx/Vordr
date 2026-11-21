@@ -572,10 +572,11 @@ read_file_head80 endp
 ; =============================================================================
 public write_file
 write_file proc frame
-    FRAME_PROLOG 176
+    FRAME_PROLOG 192
     mov     dword ptr [g_wf_created], 0
     ; [rbp-24]=buf [rbp-32]=size [rbp-40]=handle [rbp-48]=cursor [rbp-56]=remaining
     ; [rbp-64]=disp/nw [rbp-72]=wpath [rbp-104..-81]=SECURITY_ATTRIBUTES [rbp-112]=pSA
+    ; [rbp-116]=inherit_acl
     mov     qword ptr [rbp-24], rdx           ; stash the buffer and size first - they
     mov     qword ptr [rbp-32], r8            ;   are in path_longify's argument
                                               ;   registers
@@ -586,6 +587,9 @@ write_file proc frame
 
     mov     r10d, dword ptr [g_wf_disp]          ; C7: one-shot disposition (0 = default)
     mov     dword ptr [g_wf_disp], 0             ;     auto-reset so it applies once
+    mov     eax, dword ptr [g_wf_inherit_acl]    ; A4-09: consume one-shot ACL flag BEFORE
+    mov     dword ptr [g_wf_inherit_acl], 0      ;   file_path_allowed so denials cannot leak it
+    mov     dword ptr [rbp-116], eax
     test    r10d, r10d
     jnz     @F
     mov     r10d, CREATE_ALWAYS
@@ -598,11 +602,9 @@ write_file proc frame
     ; AUD-25 / A3-14: apply explicit owner+SYSTEM DACL on personal vaults, .bak0,
     ; and ALL exports.  Only HKLM-locked shared vault saves (g_wf_inherit_acl=1)
     ; inherit parent folder ACL; DACL build failure fails closed (never pSA=NULL).
-    mov     eax, dword ptr [g_wf_inherit_acl]
-    mov     dword ptr [g_wf_inherit_acl], 0
     mov     qword ptr [rbp-112], 0
     mov     edx, GENERIC_WRITE
-    test    eax, eax
+    cmp     dword ptr [rbp-116], 0
     jnz     wf_open
     mov     ecx, 10000000h                      ; GENERIC_ALL
     xor     edx, edx
@@ -634,6 +636,16 @@ wf_open:
     cmp     dword ptr [rbp-64], CREATE_ALWAYS
     jne     wf_write
     WINCALL SetSecurityInfo, qword ptr [rbp-40], 1, 80000004h, 0, 0, addr g_tmp_acl, 0
+    test    eax, eax
+    jz      wf_write
+    cmp     eax, 1                              ; A4-13: tolerate non-ACL volumes (FAT32/exFAT)
+    je      wf_write
+    cmp     eax, 50                             ; ERROR_NOT_SUPPORTED
+    je      wf_write
+    mov     dword ptr [g_io_err], eax           ; fail closed before writing secrets
+    WINCALL CloseHandle, qword ptr [rbp-40]
+    mov     eax, EXIT_IO
+    jmp     wf_done
 wf_write:
 
     mov     rax, qword ptr [rbp-24]
@@ -748,19 +760,24 @@ file_rename proc frame
     mov     rcx, qword ptr [rbp-24]
     call    file_path_allowed
     test    eax, eax
-    jz      frn_io
+    jz      frn_denied
     mov     rcx, qword ptr [rbp-32]
     call    file_path_allowed
     test    eax, eax
-    jz      frn_io
+    jz      frn_denied
     mov     dword ptr [rbp-40], 0               ; attempt count
 frn_try:
-    ; A3-15: re-check reparse points on EVERY retry attempt (not only once before Sleep)
+    ; A3-15 / A4-18: re-check reparse points on BOTH source and target on EVERY retry
+    WINCALL GetFileAttributesW, qword ptr [rbp-24]
+    cmp     eax, -1
+    je      frn_denied
+    test    eax, 400h                           ; refuse renaming from a planted reparse source
+    jnz     frn_denied
     WINCALL GetFileAttributesW, qword ptr [rbp-32]
     cmp     eax, -1
     je      frn_attr_ok
     test    eax, 400h                           ; refuse replacing a symlink / reparse target
-    jnz     frn_io
+    jnz     frn_denied
 frn_attr_ok:
     ; Prefer ReplaceFileW(to, from, NULL, REPLACEFILE_WRITE_THROUGH, 0, 0) so an
     ; existing target's DACLs, owner, encryption attributes, and creation metadata
@@ -817,6 +834,8 @@ frn_retry:
     jae     frn_io
     WINCALL Sleep, 1000
     jmp     frn_try
+frn_denied:
+    mov     dword ptr [g_io_err], 5
 frn_io:
     mov     eax, EXIT_IO
     FRAME_EPILOG
@@ -948,6 +967,7 @@ pl_len:
     inc     r8d
     cmp     r8d, MAX_PATH_CHARS
     jb      pl_len
+    jmp     pl_asis                           ; A4-15 / A5-10: >= MAX_PATH_CHARS -> never read past cap or truncate
 pl_have:
     test    r8d, r8d
     jz      pl_asis                           ; A3-28: empty path -> no OOB read at [r10+2]

@@ -79,18 +79,25 @@ def normalise(path):
     magic = _u16(b, opt)
     if magic != 0x20B:            # A3-30: require PE32+ only (never accept PE32)
         raise ValueError("unsupported optional header magic 0x%X (expected PE32+ 0x20B)" % magic)
+    if optsize < 112 + 13 * 8:    # A4-17: OptionalHeader must cover DataDirectory[0..12]
+        raise ValueError("OptionalHeader too small (%d bytes) for 13 data directories" % optsize)
+    sec_align = _u32(b, opt + 32)
+    if sec_align < 0x1000:
+        raise ValueError("SectionAlignment 0x%X < 0x1000 (cannot isolate _ROINIT page)" % sec_align)
     ddir = opt + 112
     nddir = _u32(b, ddir - 4)
     sect = opt + optsize
+    if sect + nsections * 40 > len(b):
+        raise ValueError("section header table runs past EOF")
 
-    # --- PE hardening invariants (AUD-08 / AUD-23 / A3-18 / A3-30) ----------
+    # --- PE hardening invariants (AUD-08 / AUD-23 / A3-18 / A3-30 / A4-17) --
     if coff_chars & 0x0001:       # IMAGE_FILE_RELOCS_STRIPPED
         raise ValueError("PE COFF Characteristics has IMAGE_FILE_RELOCS_STRIPPED (breaks ASLR)")
     dll_chars = _u16(b, opt + 70)
     if (dll_chars & 0x0160) != 0x0160:
         raise ValueError("PE DllCharacteristics 0x%04X missing HIGH_ENTROPY_VA|DYNAMIC_BASE|NX_COMPAT (0x0160)"
                          % dll_chars)
-    roinit_found = False
+    roinit_sec = None
     sec_list = []
     for i in range(nsections):
         s = sect + i * 40
@@ -98,20 +105,34 @@ def normalise(path):
         vsz, va, rawsz, raw, schars = (
             _u32(b, s + 8), _u32(b, s + 12), _u32(b, s + 16), _u32(b, s + 20), _u32(b, s + 36)
         )
+        if raw + rawsz > len(b):
+            raise ValueError("section %r raw data (0x%X+0x%X) runs past EOF" % (sname, raw, rawsz))
         sec_list.append((sname, va, vsz, raw, rawsz, schars))
         if (schars & 0xA0000000) == 0xA0000000:
             raise ValueError("W^X violation: section %r is both writable and executable (0x%08X)"
                              % (sname, schars))
         if sname == "_ROINIT":
+            if roinit_sec is not None:
+                raise ValueError("duplicate _ROINIT section")
+            if vsz == 0:
+                raise ValueError("_ROINIT section VirtualSize is 0")
             if (va & 0xFFF) != 0:
                 raise ValueError("_ROINIT section RVA 0x%X is not 4 KiB-aligned" % va)
             if schars & 0x20000000:
                 raise ValueError("_ROINIT section must not be executable (0x%08X)" % schars)
             if (schars & 0x80000000) == 0:
                 raise ValueError("_ROINIT section must be writable before iat_lockdown (0x%08X)" % schars)
-            roinit_found = True
-    if not roinit_found:
+            roinit_sec = (va, (va + vsz + 0xFFF) & ~0xFFF)
+    if roinit_sec is None:
         raise ValueError("missing dedicated _ROINIT section for startup security globals")
+    ro_lo, ro_hi = roinit_sec
+    for sname, va, vsz, _, rawsz, _ in sec_list:
+        if sname == "_ROINIT":
+            continue
+        o_end = va + max(vsz, rawsz, 1)
+        if va < ro_hi and o_end > ro_lo:
+            raise ValueError("section %r (0x%X..0x%X) overlaps _ROINIT page span (0x%X..0x%X)"
+                             % (sname, va, o_end, ro_lo, ro_hi))
     if b"VORDR_NON_RELEASE_BUILD" in b:
         raise ValueError("VORDR_NON_RELEASE_BUILD sentinel found in release PE image")
 
@@ -185,9 +206,9 @@ def normalise(path):
     dbg_rva = _u32(b, ddir + 6 * 8) if nddir > 6 else 0
     dbg_size = _u32(b, ddir + 6 * 8 + 4) if nddir > 6 else 0
     if dbg_rva and dbg_size:
-        off = rva_to_off(dbg_rva)
-        if off is None:
-            raise ValueError("debug directory RVA 0x%X is in no section" % dbg_rva)
+        _, off, dbg_rem = rva_to_sec(dbg_rva)
+        if off is None or dbg_size > dbg_rem or off + dbg_size > len(b):
+            raise ValueError("debug directory RVA 0x%X (+0x%X) outside mapped section" % (dbg_rva, dbg_size))
         for i in range(dbg_size // 28):
             e = off + i * 28
             if e + 28 > len(b):
@@ -197,10 +218,14 @@ def normalise(path):
                 changed += 1
             if _u32(b, e + 12) == EX_DLLCHARACTERISTICS:
                 cet_sz, cet_rva, cet_ptr = _u32(b, e + 16), _u32(b, e + 20), _u32(b, e + 24)
-                if cet_ptr and cet_sz >= 4 and cet_ptr + 4 <= len(b):
-                    if cet_rva and rva_to_off(cet_rva) != cet_ptr:
+                # A4-17: require mapped non-zero RVA & PointerToRawData in a read-only section
+                if cet_rva and cet_ptr and cet_sz >= 4 and cet_ptr + 4 <= len(b):
+                    cet_sec, cet_off, cet_rem = rva_to_sec(cet_rva)
+                    if cet_sec is None or cet_off != cet_ptr or cet_rem < 4:
                         raise ValueError("CET debug entry RVA 0x%X disagrees with PointerToRawData 0x%X"
                                          % (cet_rva, cet_ptr))
+                    if cet_sec[5] & 0x80000000:
+                        raise ValueError("CET debug entry lies in writable section %r" % cet_sec[0])
                     if (_u32(b, cet_ptr) & 0x0001) != 0:
                         cet_ok = True
                 continue

@@ -174,11 +174,10 @@ if "%REPRO%"=="1" (
     echo === release normalisation + SHA-256 ^(bin\SHA256SUMS.txt^) ===
     python tools\pe_normalise.py bin\vordr.exe
     if errorlevel 1 goto :failed
-    rem findstr /v ":" drops certutil's "SHA256 hash of ..." and "CertUtil: ..."
-    rem lines.  The obvious /r "^[0-9a-f]" does NOT: findstr's bracket ranges match
-    rem case-insensitively, so "CertUtil:" got through it.
-    echo vordr.exe> bin\SHA256SUMS.txt
-    certutil -hashfile bin\vordr.exe SHA256 | findstr /v ":" | findstr /r /v "^$" >> bin\SHA256SUMS.txt
+    rem Merge vordr.exe SHA-256 into bin\SHA256SUMS.txt while preserving any existing
+    rem vordr-arm64.exe entry (mirrors tools\a64\build_arm64.py, A4-24; avoid '!' for delayedexpansion).
+    python -c "import hashlib, pathlib; p = pathlib.Path('bin/SHA256SUMS.txt'); lines = [l.strip() for l in p.read_text(encoding='utf-8').splitlines() if l.strip()] if p.exists() else []; keep = {lines[i]: lines[i+1] for i in range(0, len(lines)-1, 2) if lines[i] not in ('vordr.exe',)}; h = hashlib.sha256(pathlib.Path('bin/vordr.exe').read_bytes()).hexdigest(); out = ['vordr.exe', h]; [out.extend([k, keep[k]]) for k in sorted(keep)]; p.write_text('\n'.join(out) + '\n', encoding='utf-8')"
+    if errorlevel 1 goto :failed
     type bin\SHA256SUMS.txt
     echo     ^(recorded in bin\SHA256SUMS.txt; tools\verify_repro.ps1 proves it reproduces^)
 )

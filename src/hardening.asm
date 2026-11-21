@@ -146,7 +146,7 @@ endif
 
 .data?
 align 2
-ci_modbuf       dw 264 dup (?)          ; A3-09: GetModuleFileNameW basename for WerAddExcludedApplication
+ci_modbuf       dw MAX_PATH_CHARS dup (?) ; A3-09 / A4-22: GetModuleFileNameW basename (longPathAware)
 
 .code
 
@@ -593,19 +593,19 @@ ci_wer_dll:
     test    rax, rax
     jz      ci_free_wer
     mov     qword ptr [rbp-32], rax
-    ; A3-09: exclude actual running image basename (handles renamed portable executables)
-    WINCALL GetModuleFileNameW, 0, addr ci_modbuf, 260
+    ; A3-09 / A4-22: exclude actual running image basename (handles renamed & long-path executables)
+    WINCALL GetModuleFileNameW, 0, addr ci_modbuf, MAX_PATH_CHARS
     lea     rcx, [w_vordr_exe]
     test    eax, eax
     jz      ci_call_excl
-    cmp     eax, 260
+    cmp     eax, MAX_PATH_CHARS
     jae     ci_call_excl
     lea     r10, [ci_modbuf]
     mov     rcx, r10
 ci_base_lp:
     movzx   edx, word ptr [r10]
     test    dx, dx
-    jz      ci_call_excl
+    jz      ci_base_chk
     add     r10, 2
     cmp     dx, 5Ch
     je      ci_base_set
@@ -614,6 +614,10 @@ ci_base_lp:
 ci_base_set:
     mov     rcx, r10
     jmp     ci_base_lp
+ci_base_chk:
+    cmp     word ptr [rcx], 0
+    jne     ci_call_excl
+    lea     rcx, [w_vordr_exe]
 ci_call_excl:
     xor     edx, edx
     call    qword ptr [rbp-32]

@@ -33,9 +33,10 @@
     finds in HKLM).  An installer that helpfully wrote every default would hand
     the admin a machine where the user can change nothing.
 
-    Values are not validated here - they cannot be, they arrive at install time,
-    not build time.  Vordr clamps every one of them on read (gui_load_policy), so
-    a typo degrades to the clamp rather than to undefined behaviour.
+    LaunchCondition rows validate every public policy property at install time
+    (rejecting out-of-range, signed, or non-decimal values that could coerce
+    #[PROP] away from REG_DWORD), and Vordr also clamps every value on read
+    (gui_load_policy) as defense-in-depth for direct registry edits.
 
     CAVEAT, and it is a real one: MSI does not remember properties.  An upgrade
     that does not repeat them installs without those components, and the old
@@ -161,7 +162,13 @@ function Assert-ReleasePe([string]$Path, [uint16]$ExpectMachine, [bool]$RequireC
         }
         $si++
     }
+    if ($peBytes.Length -lt 0x100 -or [BitConverter]::ToUInt16($peBytes, 0) -ne 0x5A4D) {
+        throw "$Path is not a valid MZ/PE executable."
+    }
     $peOff    = [BitConverter]::ToInt32($peBytes, 0x3C)
+    if ($peOff -lt 0x40 -or ($peOff + 24 + 216) -gt $peBytes.Length -or [BitConverter]::ToUInt32($peBytes, $peOff) -ne 0x00004550) {
+        throw "$Path has an invalid PE header offset or signature."
+    }
     $machine  = [BitConverter]::ToUInt16($peBytes, $peOff + 4)
     if ($machine -ne $ExpectMachine) {
         throw ("{0} has PE Machine 0x{1:X4}, expected 0x{2:X4}" -f $Path, $machine, $ExpectMachine)
@@ -170,13 +177,16 @@ function Assert-ReleasePe([string]$Path, [uint16]$ExpectMachine, [bool]$RequireC
     if ($coffTs -ne 0) {
         throw "$Path has non-zero COFF TimeDateStamp (0x$($coffTs.ToString('X8'))) - not a normalised release binary."
     }
-    $fileChar = [BitConverter]::ToUInt16($peBytes, $peOff + 18)
+    $fileChar = [BitConverter]::ToUInt16($peBytes, $peOff + 22)
     if ($fileChar -band 0x0001) {
         throw "$Path has IMAGE_FILE_RELOCS_STRIPPED set - ASLR relocations missing."
     }
     $nSect    = [BitConverter]::ToUInt16($peBytes, $peOff + 6)
     $optSize  = [BitConverter]::ToUInt16($peBytes, $peOff + 20)
     $optOff   = $peOff + 24
+    if ($optSize -lt 216 -or ($optOff + $optSize + $nSect * 40) -gt $peBytes.Length) {
+        throw "$Path has truncated OptionalHeader or section table."
+    }
     $optMagic = [BitConverter]::ToUInt16($peBytes, $optOff)
     if ($optMagic -ne 0x020B) {
         throw ("{0} OptionalHeader Magic 0x{1:X4} != 0x020B (PE32+)" -f $Path, $optMagic)
@@ -186,6 +196,10 @@ function Assert-ReleasePe([string]$Path, [uint16]$ExpectMachine, [bool]$RequireC
         throw ("{0} DllCharacteristics 0x{1:X4} lacks HIGH_ENTROPY_VA|DYNAMIC_BASE|NX_COMPAT" -f $Path, $dllChar)
     }
     $ddOff    = $optOff + 112                  # PE32+ DataDirectory[0]
+    $nDdir    = [BitConverter]::ToUInt32($peBytes, $ddOff - 4)
+    if ($nDdir -le 12) {
+        throw "$Path OptionalHeader has only $nDdir DataDirectories (expected > 12)."
+    }
     $sectOff  = $optOff + $optSize
     $sects    = @()
     for ($si = 0; $si -lt $nSect; $si++) {
@@ -195,7 +209,10 @@ function Assert-ReleasePe([string]$Path, [uint16]$ExpectMachine, [bool]$RequireC
         $raw = [BitConverter]::ToUInt32($peBytes, $s + 20)
         $rsz = [BitConverter]::ToUInt32($peBytes, $s + 16)
         $ch  = [BitConverter]::ToUInt32($peBytes, $s + 36)
-        if (($ch -band 0xA0000000) -eq 0xA0000000) {
+        if (([int64]$raw + [int64]$rsz) -gt $peBytes.Length) {
+            throw ("{0} section #{1} raw range runs past EOF" -f $Path, $si)
+        }
+        if (($ch -band 0xA0000000L) -eq 0xA0000000L) {
             throw ("{0} section #{1} is both WRITABLE and EXECUTABLE (0x{2:X8})" -f $Path, $si, $ch)
         }
         $span = if ($vsz -gt 0 -and $vsz -lt $rsz) { $vsz } else { $rsz }
@@ -205,20 +222,23 @@ function Assert-ReleasePe([string]$Path, [uint16]$ExpectMachine, [bool]$RequireC
         param([uint32]$rva)
         foreach ($sc in $sects) {
             if ($rva -ge $sc.Va -and $rva -lt ($sc.Va + $sc.Span)) {
-                return @{ Off = [int]($sc.Raw + ($rva - $sc.Va)); Ch = $sc.Ch }
+                $delta = [int64]($rva - $sc.Va)
+                return @{ Off = [int]($sc.Raw + $delta); Ch = $sc.Ch; Rem = [int64]($sc.Span - $delta) }
             }
         }
         return $null
     }
-    # LOAD_CONFIG (DataDirectory[10]): must reside in a read-only section with DependentLoadFlags == 0x0800
+    # LOAD_CONFIG (DataDirectory[10]): must be 8-byte aligned, full-span, read-only, DependentLoadFlags == 0x0800
     $lcRva = [BitConverter]::ToUInt32($peBytes, $ddOff + 10 * 8)
     $lcSz  = [BitConverter]::ToUInt32($peBytes, $ddOff + 10 * 8 + 4)
-    if ($lcRva -eq 0 -or $lcSz -lt 0x50) {
-        throw ("{0} missing or truncated LOAD_CONFIG directory (rva=0x{1:X}, size={2})" -f $Path, $lcRva, $lcSz)
+    if ($lcRva -eq 0 -or $lcSz -lt 0x50 -or (($lcRva -band 7) -ne 0)) {
+        throw ("{0} missing, truncated, or misaligned LOAD_CONFIG directory (rva=0x{1:X}, size={2})" -f $Path, $lcRva, $lcSz)
     }
     $lcLoc = & $resolveRva $lcRva
-    if ($null -eq $lcLoc) { throw "$Path LOAD_CONFIG RVA does not map to any PE section." }
-    if ($lcLoc.Ch -band 0x80000000) { throw "$Path LOAD_CONFIG resides in a writable section." }
+    if ($null -eq $lcLoc -or $lcLoc.Rem -lt $lcSz -or ($lcLoc.Off + $lcSz) -gt $peBytes.Length) {
+        throw "$Path LOAD_CONFIG RVA does not map to a valid PE section span."
+    }
+    if (($lcLoc.Ch -band 0x80000000L) -ne 0) { throw "$Path LOAD_CONFIG resides in a writable section." }
     $lcStructSz = [BitConverter]::ToUInt32($peBytes, $lcLoc.Off)
     $depFlags   = [BitConverter]::ToUInt16($peBytes, $lcLoc.Off + 0x4E)
     if ($lcStructSz -lt 0x50 -or $depFlags -ne 0x0800) {
@@ -229,17 +249,20 @@ function Assert-ReleasePe([string]$Path, [uint16]$ExpectMachine, [bool]$RequireC
     $hasCet  = $false
     if ($dbgRva -ne 0 -and $dbgSz -ge 28) {
         $dbgLoc = & $resolveRva $dbgRva
-        if ($null -ne $dbgLoc) {
-            for ($di = 0; $di -lt [int]($dbgSz / 28); $di++) {
+        if ($null -ne $dbgLoc -and $dbgLoc.Rem -ge $dbgSz -and ($dbgLoc.Off + $dbgSz) -le $peBytes.Length) {
+            $dbgCount = [int][Math]::Floor($dbgSz / 28)
+            for ($di = 0; $di -lt $dbgCount; $di++) {
                 $de    = $dbgLoc.Off + $di * 28
                 $dtype = [BitConverter]::ToUInt32($peBytes, $de + 12)
                 if ($dtype -eq 20) {
                     $dsz   = [BitConverter]::ToUInt32($peBytes, $de + 16)
                     $drva  = [BitConverter]::ToUInt32($peBytes, $de + 20)
                     $dptr  = [BitConverter]::ToUInt32($peBytes, $de + 24)
-                    if ($dsz -ge 4 -and ($dptr + 4) -le $peBytes.Length) {
-                        $cetLoc = if ($drva -ne 0) { & $resolveRva $drva } else { $null }
-                        if (($drva -eq 0 -or ($null -ne $cetLoc -and $cetLoc.Off -eq $dptr)) -and
+                    # A4-17: require mapped non-zero RVA & PointerToRawData in a read-only section
+                    if ($drva -ne 0 -and $dptr -ne 0 -and $dsz -ge 4 -and ($dptr + 4) -le $peBytes.Length) {
+                        $cetLoc = & $resolveRva $drva
+                        if ($null -ne $cetLoc -and $cetLoc.Off -eq $dptr -and $cetLoc.Rem -ge 4 -and
+                            (($cetLoc.Ch -band 0x80000000L) -eq 0) -and
                             (([BitConverter]::ToUInt32($peBytes, $dptr) -band 0x0001) -eq 0x0001)) {
                             $hasCet = $true
                         }
@@ -353,9 +376,11 @@ try {
     # component conditions so an administrative unpack would overwrite one with the other.
     Exec "CREATE TABLE ``AdvtExecuteSequence`` (``Action`` CHAR(72) NOT NULL, ``Condition`` CHAR(255), ``Sequence`` SHORT PRIMARY KEY ``Action``)"
     Exec "CREATE TABLE ``Upgrade`` (``UpgradeCode`` CHAR(38) NOT NULL, ``VersionMin`` CHAR(20), ``VersionMax`` CHAR(20), ``Language`` CHAR(255), ``Attributes`` LONG NOT NULL, ``Remove`` CHAR(255), ``ActionProperty`` CHAR(72) NOT NULL PRIMARY KEY ``UpgradeCode``, ``VersionMin``, ``VersionMax``, ``Language``, ``Attributes``)"
-    Exec "CREATE TABLE ``LaunchCondition`` (``Condition`` CHAR(0) NOT NULL, ``Description`` CHAR(255) NOT NULL PRIMARY KEY ``Condition``)"
+    Exec "CREATE TABLE ``LaunchCondition`` (``Condition`` CHAR(255) NOT NULL, ``Description`` CHAR(255) NOT NULL PRIMARY KEY ``Condition``)"
     Exec "CREATE TABLE ``CreateFolder`` (``Directory_`` CHAR(72) NOT NULL, ``Component_`` CHAR(72) NOT NULL PRIMARY KEY ``Directory_``, ``Component_``)"
-    Exec "CREATE TABLE ``MsiLockPermissionsEx`` (``LockObject`` CHAR(72) NOT NULL, ``Table`` CHAR(32) NOT NULL, ``SDDLText`` CHAR(255) NOT NULL PRIMARY KEY ``LockObject``, ``Table``)"
+    # Windows Installer 5.0 requires all 5 columns (MsiLockPermissionsEx PK, LockObject, Table, SDDLText, Condition);
+    # omitting Condition fails real msiexec /i installs with MSI Error 2235 (A4-01).
+    Exec "CREATE TABLE ``MsiLockPermissionsEx`` (``MsiLockPermissionsEx`` CHAR(72) NOT NULL, ``LockObject`` CHAR(72) NOT NULL, ``Table`` CHAR(32) NOT NULL, ``SDDLText`` CHAR(0) NOT NULL, ``Condition`` CHAR(255) PRIMARY KEY ``MsiLockPermissionsEx``)"
     Exec "CREATE TABLE ``Shortcut`` (``Shortcut`` CHAR(72) NOT NULL, ``Directory_`` CHAR(72) NOT NULL, ``Name`` CHAR(128) NOT NULL, ``Component_`` CHAR(72) NOT NULL, ``Target`` CHAR(72) NOT NULL, ``Arguments`` CHAR(255), ``Description`` CHAR(255), ``Hotkey`` SHORT, ``Icon_`` CHAR(72), ``IconIndex`` SHORT, ``ShowCmd`` SHORT, ``WkDir`` CHAR(72) PRIMARY KEY ``Shortcut``)"
     Exec "CREATE TABLE ``Registry`` (``Registry`` CHAR(72) NOT NULL, ``Root`` SHORT NOT NULL, ``Key`` CHAR(255) NOT NULL, ``Name`` CHAR(255), ``Value`` CHAR(0), ``Component_`` CHAR(72) NOT NULL PRIMARY KEY ``Registry``)"
     Exec "CREATE TABLE ``AppSearch`` (``Property`` CHAR(72) NOT NULL, ``Signature_`` CHAR(72) NOT NULL PRIMARY KEY ``Property``, ``Signature_``)"
@@ -426,9 +451,9 @@ try {
     $fileSddl = "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)"
     Exec "INSERT INTO ``CreateFolder`` (``Directory_``,``Component_``) VALUES ('INSTALLDIR','VordrExe')"
     Exec "INSERT INTO ``CreateFolder`` (``Directory_``,``Component_``) VALUES ('INSTALLDIR','VordrExeArm64')"
-    Exec "INSERT INTO ``MsiLockPermissionsEx`` (``LockObject``,``Table``,``SDDLText``) VALUES ('INSTALLDIR','CreateFolder','$dirSddl')"
-    Exec "INSERT INTO ``MsiLockPermissionsEx`` (``LockObject``,``Table``,``SDDLText``) VALUES ('vordr_x64.exe','File','$fileSddl')"
-    Exec "INSERT INTO ``MsiLockPermissionsEx`` (``LockObject``,``Table``,``SDDLText``) VALUES ('vordr_arm64.exe','File','$fileSddl')"
+    Exec "INSERT INTO ``MsiLockPermissionsEx`` (``MsiLockPermissionsEx``,``LockObject``,``Table``,``SDDLText``) VALUES ('LockInstallDir','INSTALLDIR','CreateFolder','$dirSddl')"
+    Exec "INSERT INTO ``MsiLockPermissionsEx`` (``MsiLockPermissionsEx``,``LockObject``,``Table``,``SDDLText``) VALUES ('LockVordrX64','vordr_x64.exe','File','$fileSddl')"
+    Exec "INSERT INTO ``MsiLockPermissionsEx`` (``MsiLockPermissionsEx``,``LockObject``,``Table``,``SDDLText``) VALUES ('LockVordrArm64','vordr_arm64.exe','File','$fileSddl')"
     Exec "INSERT INTO ``Feature`` (``Feature``,``Feature_Parent``,``Title``,``Description``,``Display``,``Level``,``Directory_``,``Attributes``) VALUES ('Main','','Vordr','Vordr password manager',1,1,'INSTALLDIR',0)"
     Exec "INSERT INTO ``FeatureComponents`` (``Feature_``,``Component_``) VALUES ('Main','VordrExe')"
     Exec "INSERT INTO ``FeatureComponents`` (``Feature_``,``Component_``) VALUES ('Main','VordrExeArm64')"
@@ -453,18 +478,19 @@ try {
         } elseif ($p.Range -match '^(\d+)-(\d+)$') {
             $lo = [int]$Matches[1]; $hi = [int]$Matches[2]
             if ($defVal -lt $lo -or $defVal -gt $hi) { throw ("policy {0} Default {1} outside {2}" -f $p.Prop, $defVal, $p.Range) }
-            if (($hi - $lo) -le 16) {
+            if (($hi - $lo) -le 5) {
                 $terms = @("NOT $($p.Prop)") + ($lo..$hi | ForEach-Object { "($($p.Prop) = `"$_`")" })
                 $condList += ($terms -join " OR ")
             } else {
                 # Reject signs, whitespace, punctuation, and ASCII letters case-insensitively (~><)
                 # so #[PROP] can never coerce into REG_BINARY (#x/#X) or REG_EXPAND_SZ (#%), and
-                # enforce numeric range bounds [lo, hi].
+                # enforce numeric range bounds [lo, hi].  Chunk by 4 chars so every LaunchCondition
+                # row stays strictly <= 255 chars (MSI standard S255 / ICE03 compliance, A4-23).
                 $condList += ("(NOT {0}) OR (({0} >= {1}) AND ({0} <= {2}))" -f $p.Prop, $lo, $hi)
                 $badChars = @('-','+',' ',"`t",'#','%','.',',','$','/','\',':',';','=','!','@','^','&','*','(',')','[',']','{','}','|','?','<','>','~','`','_',"'") +
                             @('a','b','c','d','e','f','g','h','i','j','k','l','m','n','o','p','q','r','s','t','u','v','w','x','y','z')
-                for ($ci = 0; $ci -lt $badChars.Count; $ci += 8) {
-                    $end = [Math]::Min($ci + 7, $badChars.Count - 1)
+                for ($ci = 0; $ci -lt $badChars.Count; $ci += 4) {
+                    $end = [Math]::Min($ci + 3, $badChars.Count - 1)
                     $chunk = $badChars[$ci..$end] | ForEach-Object { "(NOT ({0} ~>< `"{1}`"))" -f $p.Prop, $_ }
                     $condList += ("(NOT {0}) OR ({1})" -f $p.Prop, ($chunk -join " AND "))
                 }
@@ -473,6 +499,9 @@ try {
             throw ("policy {0} has unrecognised Range '{1}'" -f $p.Prop, $p.Range)
         }
         foreach ($cond in $condList) {
+            if ($cond.Length -gt 255) {
+                throw ("LaunchCondition row for {0} exceeds 255 chars ({1}): {2}" -f $p.Prop, $cond.Length, $cond)
+            }
             ExecParams "INSERT INTO ``LaunchCondition`` (``Condition``,``Description``) VALUES (?,?)" @($cond, $desc)
         }
 

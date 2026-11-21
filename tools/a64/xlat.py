@@ -1020,8 +1020,11 @@ class Translator:
         reads = flag_reader(mn)
         writes = mn in FLAG_WRITERS or mn == "call"
         if mn in ("shl", "sal", "shr", "sar", "rol", "ror"):
-            # shift by cl with count 0 leaves flags; treat as write anyway
-            writes = True
+            # A5-11: variable shifts (cl==0) and imm-0 shifts preserve prior flags, so
+            # only non-zero immediate shifts may kill an earlier flag producer in liveness.
+            cnt = ins.ops[1] if len(ins.ops) > 1 else Op("imm", imm=1, size=1)
+            bits = 64 if ins.ops[0].size == 8 else 32
+            writes = (cnt.k == "imm" and (cnt.imm & (bits - 1)) != 0)
         return reads, writes
 
     def flag_analysis(self, order, insns, succ, preds):
@@ -2271,13 +2274,14 @@ class Translator:
                 self.e(f"{armop}v w16, {a}, w17")
             if live:
                 if cnt.k != "imm":
+                    # A4-08: non-flag-setting test for (cl & 31) == 0 so prior NZCV survive
                     skip_f = self.newlab()
-                    self.e("tst w0, #31")
-                    self.e(f"b.eq {skip_f}")
+                    self.e("and w17, w0, #31")
+                    self.e(f"cbz w17, {skip_f}")
                     self.e(f"lsl w17, w16, #{self.small_shift(sz)}")
                     self.e("tst w17, w17")
                     self.lab(skip_f)
-                else:
+                elif n:
                     self.e(f"lsl w17, w16, #{self.small_shift(sz)}")
                     self.e("tst w17, w17")
             self.wr(d, "x16")
@@ -2294,6 +2298,9 @@ class Translator:
             else:
                 self.e(f"{armop} {dv}, {dv}, #{n}")
         else:
+            # A5-11: capture (cl & (bits - 1)) BEFORE shifting in case dv is x0/w0 (rcx/ecx)
+            if live:
+                self.e(f"and w15, w0, #{bits - 1}")
             if armop == "rol":
                 self.e("neg w17, w0")
                 self.e(f"ror {dv}, {dv}, {w}17")
@@ -2301,9 +2308,9 @@ class Translator:
                 self.e(f"{armop} {dv}, {dv}, {w}0")
         if live:
             if cnt.k != "imm":
+                # A4-08 / A5-11: non-flag-setting test for (cl & (bits - 1)) == 0
                 skip_f = self.newlab()
-                self.e(f"tst w0, #{bits - 1}")
-                self.e(f"b.eq {skip_f}")
+                self.e(f"cbz w15, {skip_f}")
                 self.e(f"tst {dv}, {dv}")
                 self.lab(skip_f)
             else:
@@ -2473,10 +2480,12 @@ class Translator:
                     pi.ops[1].k == "reg" and pi.ops[1].fam == "rdx" and pi.ops[0].size >= 4:
                 return True
             if pi.mn == "mov" and pi.ops[0].k == "reg" and pi.ops[0].fam == "rdx" and \
-                    pi.ops[1].k == "imm" and pi.ops[1].imm == 0 and pi.ops[0].size >= 4:
+                    pi.ops[1].k == "imm" and pi.ops[1].imm == 0 and pi.ops[1].sym is None and \
+                    pi.ops[0].size >= 4:
                 return True
             if any(o.k == "reg" and o.fam == "rdx" for o in pi.ops[:1]) or \
-                    pi.mn in ("call", "cqo", "cdq", "mul", "imul", "div", "idiv"):
+                    (pi.mn == "xchg" and any(o.k == "reg" and o.fam == "rdx" for o in pi.ops)) or \
+                    pi.mn in ("call", "cqo", "cdq", "mul", "imul", "div", "idiv", "rdtsc"):
                 return False
             cur = prev
             steps += 1
@@ -2559,9 +2568,12 @@ class Translator:
         sz = s.size
         v = self.rd(s, sz)
         if sz == 8:
-            idx = self.order.index(ins.off)
-            prev = self.insns[self.order[idx - 1]] if idx else None
-            if not prev or prev.mn != "cqo":
+            # A4-21: verify CFG single-predecessor fallthrough from cqo (no branch skipping cqo)
+            ps = self.preds.get(ins.off, [])
+            if len(ps) != 1:
+                raise XlatError("128/64-bit idiv without single-predecessor cqo")
+            prev = self.insns[ps[0]]
+            if ps[0] + prev.size != ins.off or prev.mn != "cqo":
                 raise XlatError("128/64-bit idiv without cqo")
             l_nz, l_ok = self.newlab(), self.newlab()
             self.e(f"cbnz {v}, {l_nz}")
@@ -2657,12 +2669,12 @@ class Translator:
         self.e(f"b.ne {l2}")
         self.e(f"stlxr w15, {rv}, [{t}]")
         self.e(f"cbnz w15, {l1}")
-        self.e("dmb ish")                           # A3-18: full barrier matching x64 LOCK
         self.e(f"b {l3}")
         self.lab(l2)
         self.e("clrex")
         self.e(f"mov {w}8, {w}17")
         self.lab(l3)
+        self.e("dmb ish")                           # A3-18 / A4-21: full LOCK barrier on success & fail
 
     def i_stosb(self, ins):
         self.rep_string(ins, "stos", 1)

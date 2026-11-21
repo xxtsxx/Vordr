@@ -14,7 +14,7 @@
 .equ    A64_TEB_TLS_HI,      0x1000
 .equ    A64_TEB_TLS_LO,      0x480
 .equ    A64_SSTK_HDR,        16
-.equ    A64_SSTK_CAPACITY,   256
+.equ    A64_SSTK_CAPACITY,   4096           // A4-16: match src/macros.inc SSTK_CAPACITY (4096)
 
 .macro A64_FRAME_GUARD_ENTER lbl_skip
         adrp    x16, g_stack_canary
@@ -31,7 +31,9 @@
         cbz     x16, \lbl_skip
         ldr     x17, [x16]
         cmp     x17, #A64_SSTK_CAPACITY
-        b.hs    sstk_overflow_fail
+        b.lo    .Lfg_ok_\@                  // A4-16: avoid +/-1 MiB BRANCH19 external jump
+        b       sstk_overflow_fail          // +/-128 MiB BRANCH26
+.Lfg_ok_\@:
         add     x15, x16, #A64_SSTK_HDR
         ldr     x14, [x29, #8]
         str     x14, [x15, x17, lsl #3]

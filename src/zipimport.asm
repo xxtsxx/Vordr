@@ -404,13 +404,13 @@ zs_dup_lp:
     imul    eax, eax, MEMREC
     lea     r10, [g_zi_mem]
     add     r10, rax
-    ; 1) overlap check: [a_start, a_end) vs [b_start, b_end)
+    ; 1) overlap check: [a_start, a_end) vs [b_start, b_end) including 28-byte AE-2 framing (A4-14)
     mov     r9, qword ptr [rbp-88]              ; a_start
-    mov     edx, dword ptr [rbp-72]             ; a_len (zero-ext)
-    add     rdx, r9                             ; a_end
+    mov     edx, dword ptr [rbp-72]             ; a_usize (zero-ext)
+    lea     rdx, [r9 + rdx + 28]                ; a_end = a_start + a_csize
     mov     r11, qword ptr [r10+16]             ; b_start
-    mov     eax, dword ptr [r10+24]             ; b_len (zero-ext)
-    add     rax, r11                            ; b_end
+    mov     eax, dword ptr [r10+24]             ; b_usize (zero-ext)
+    lea     rax, [r11 + rax + 28]               ; b_end = b_start + b_csize
     cmp     r9, rax                             ; a_start < b_end?
     jae     zs_dup_name
     cmp     r11, rdx                            ; b_start < a_end?

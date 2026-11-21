@@ -1661,6 +1661,16 @@ ths_cpcred:
     mov     rdx, qword ptr [r11+8]              ; pbFirst
     test    rdx, rdx
     jz      ths_need_assert
+    ; A4-19: enforce UP|UV (0x05) on authenticatorData before trusting inline MakeCredential PRF
+    cmp     dword ptr [r10+16], 37              ; cbAuthenticatorData >= 37
+    jb      ths_free_fail
+    mov     rax, qword ptr [r10+24]             ; pbAuthenticatorData
+    test    rax, rax
+    jz      ths_free_fail
+    movzx   ecx, byte ptr [rax+32]
+    and     ecx, 05h
+    cmp     ecx, 05h
+    jne     ths_free_fail
     lea     r8, [g_tpm_prf32]
     xor     ecx, ecx
 ths_cpprf:
@@ -1680,6 +1690,23 @@ ths_cpprf:
     jmp     ths_have_prf
 
 ths_need_assert:
+    ; A4-19: scrub any inline pbFirst before freeing attestation on fallback path
+    mov     r10, qword ptr [rbp-48]
+    cmp     dword ptr [r10+0], 7
+    jb      ths_na_free
+    mov     r11, qword ptr [r10+144]
+    test    r11, r11
+    jz      ths_na_free
+    mov     edx, dword ptr [r11+0]
+    test    edx, edx
+    jz      ths_na_free
+    cmp     edx, 64
+    ja      ths_na_free
+    mov     rcx, qword ptr [r11+8]
+    test    rcx, rcx
+    jz      ths_na_free
+    call    secure_zero
+ths_na_free:
     ; Free attestation, then evaluate PRF via WebAuthNAuthenticatorGetAssertion
     mov     rcx, qword ptr [rbp-48]
     mov     rax, qword ptr [wa_fn_freeatt]
@@ -1748,6 +1775,39 @@ ths_cptag:
     ret
 
 ths_free_fail:
+    ; A4-19: scrub any inline pbFirst before freeing attestation on error exit
+    mov     r10, qword ptr [rbp-48]
+    test    r10, r10
+    jz      ths_fail
+    cmp     dword ptr [r10+0], 7
+    jb      ths_ff_free
+    mov     r11, qword ptr [r10+144]
+    test    r11, r11
+    jz      ths_ff_free
+    mov     edx, dword ptr [r11+0]
+    test    edx, edx
+    jz      ths_ff_free
+    cmp     edx, 64
+    ja      ths_ff_free
+    mov     rcx, qword ptr [r11+8]
+    test    rcx, rcx
+    jz      ths_ff_free
+    call    secure_zero
+ths_ff_free:
+    ; A5-09: delete newly created resident Windows Hello credential so error exit never orphans it
+    cmp     qword ptr [wa_fn_delcred], 0
+    je      ths_ff_att
+    mov     r10, qword ptr [rbp-48]
+    mov     ecx, dword ptr [r10+80]             ; cbCredentialId
+    test    ecx, ecx
+    jz      ths_ff_att
+    mov     rdx, qword ptr [r10+88]             ; pbCredentialId
+    test    rdx, rdx
+    jz      ths_ff_att
+    mov     rax, qword ptr [wa_fn_delcred]
+    xor     rax, qword ptr [g_ptr_cookie]
+    call    rax
+ths_ff_att:
     mov     rcx, qword ptr [rbp-48]
     mov     rax, qword ptr [wa_fn_freeatt]
     xor     rax, qword ptr [g_ptr_cookie]

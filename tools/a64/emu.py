@@ -255,6 +255,12 @@ class Arm64PeEmu:
         ret = fn()
         if ret is not None:
             self._w(0, ret)
+        # A4-07: poison volatile caller-saved x1..x17 after every Win32 API return
+        # to catch ARM64 ABI volatile-register preservation bugs in emulation.
+        if not self.terminated:
+            tag = self.api_calls & 0xFF
+            for ri in range(1, 18):
+                self._w(ri, 0xDEADBEEF00000000 | (ri << 8) | tag)
 
     # ---- Win32 implementations ---------------------------------------------
     def api_IsProcessorFeaturePresent(self):
@@ -919,7 +925,7 @@ class Arm64PeEmu:
     def api_GetModuleFileNameW(self):
         buf = self._r(1)
         cch = self._r(2) & 0xFFFFFFFF
-        name = os.path.abspath(self.pe_path)
+        name = os.path.abspath(self.exe_path)
         if cch == 0:
             return 0
         out = name[:cch - 1]

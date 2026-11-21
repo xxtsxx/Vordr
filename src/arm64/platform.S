@@ -98,8 +98,8 @@ cpu_gate:
         mov     w22, #1                     // all_cores_have_rng
 
 cg_enum_lp:
-        cmp     w20, #256                   // safety cap
-        b.hs    cg_enum_done
+        cmp     w20, #256                   // safety cap (A4-20: fail closed if >256 subkeys)
+        b.hs    cg_no_rng
         mov     w11, #16
         str     w11, [sp, #32]              // cbName = 16 wchars
         ldr     x0, [sp]                    // hParent
@@ -159,10 +159,11 @@ cg_query_core:
         add     x4, sp, #24                 // &val64
         add     x5, sp, #20                 // &cbData
         bl      RegQueryValueExW
-        mov     w13, w0
+        str     w0, [sp, #36]               // A4-07: spill across RegCloseKey (w13 is volatile!)
         ldr     x0, [sp, #8]
         bl      RegCloseKey
-        cbnz    w13, cg_no_rng
+        ldr     w11, [sp, #36]
+        cbnz    w11, cg_no_rng
         ldr     w11, [sp, #16]
         cmp     w11, #REG_QWORD
         b.ne    cg_no_rng

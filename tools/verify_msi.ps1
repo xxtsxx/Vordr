@@ -21,7 +21,7 @@
          no elevation is needed.
 
     Usage:  powershell -ExecutionPolicy Bypass -File tools\verify_msi.ps1 `
-                       [-Msi bin\vordr-0.8.1.msi]
+                       [-Msi bin\vordr-0.8.2.msi]
     Exit code 0 = all checks passed.
 #>
 [CmdletBinding()]
@@ -475,10 +475,16 @@ if (-not $seqMap.ContainsKey("CreateFolders") -or -not $seqMap.ContainsKey("Remo
 } elseif ($seqMap["CreateFolders"] -ge $seqMap["InstallFiles"] -or $seqMap["RemoveFolders"] -le $seqMap["RemoveFiles"]) {
     Bad "CreateFolders/RemoveFolders out of order relative to RemoveFiles/InstallFiles"
 }
-$lpRows = Rows "SELECT ``LockObject``,``Table``,``SDDLText`` FROM ``MsiLockPermissionsEx``" 3
-$lpMap = @{}; foreach ($lr in $lpRows) { $lpMap["$($lr[1]):$($lr[0])"] = $lr[2] }
+# A4-01: verify all 5 Windows Installer 5.0 MsiLockPermissionsEx columns AND execute
+# msi.dll's exact runtime filtered query (catches MSI Error 2235 schema drift).
+$lpRows = Rows "SELECT ``MsiLockPermissionsEx``,``LockObject``,``Table``,``SDDLText``,``Condition`` FROM ``MsiLockPermissionsEx``" 5
+$lpMap = @{}; foreach ($lr in $lpRows) { $lpMap["$($lr[2]):$($lr[1])"] = $lr[3] }
 foreach ($reqLp in @("CreateFolder:INSTALLDIR", "File:vordr_x64.exe", "File:vordr_arm64.exe")) {
     if (-not $lpMap.ContainsKey($reqLp)) { Bad "MsiLockPermissionsEx missing row for $reqLp"; continue }
+    $parts = $reqLp -split ":", 2
+    $qRows = Rows ("SELECT ``LockObject``,``Table``,``SDDLText``,``Condition`` FROM ``MsiLockPermissionsEx`` WHERE ``Table``='{0}' AND ``LockObject``='{1}' ORDER BY ``Condition``" -f $parts[0], $parts[1]) 4
+    if ($qRows.Count -ne 1) { Bad "msi.dll runtime query for $reqLp returned $($qRows.Count) row(s), expected 1" }
+    elseif (-not [string]::IsNullOrEmpty($qRows[0][3])) { Bad "MsiLockPermissionsEx $reqLp has unexpected Condition '$($qRows[0][3])'" }
     $sddl = $lpMap[$reqLp]
     if (-not $sddl.StartsWith("D:P")) { Bad "MsiLockPermissionsEx $reqLp SDDL '$sddl' is not protected (missing D:P)" }
     if ($sddl -notmatch 'FA;;;SY\)' -or $sddl -notmatch 'FA;;;BA\)' -or $sddl -notmatch '0x1200a9;;;BU\)') {
@@ -496,12 +502,15 @@ foreach ($reqLp in @("CreateFolder:INSTALLDIR", "File:vordr_x64.exe", "File:vord
         Bad "MsiLockPermissionsEx $reqLp SDDL '$sddl' failed .NET SDDL parse: $($_.Exception.Message)"
     }
 }
-if ($fail -eq $before) { Write-Host ("  MsiLockPermissionsEx: {0} protected SDDL rule(s) validated - ok" -f $lpRows.Count) }
+if ($fail -eq $before) { Write-Host ("  MsiLockPermissionsEx: {0} protected SDDL rule(s) + 5-col msi.dll SQL validated - ok" -f $lpRows.Count) }
 
 # --- 5. live LaunchConditions numeric/case-insensitive guard evaluation -----
 Write-Host ""
 $before = $fail
 Write-Host "launch guards   : live LaunchConditions evaluation"
+foreach ($lcr in $lcRows) {
+    if ($lcr[0].Length -gt 255) { Bad "LaunchCondition exceeds standard S255 (ICE03): length $($lcr[0].Length)" }
+}
 function Test-Launch([hashtable]$props) {
     $s = $installer.OpenPackage($Msi, 1)
     foreach ($k in $props.Keys) { $s.Property($k) = $props[$k] }
@@ -541,6 +550,10 @@ $badCases = @(
     @{ "VORDR_PWMINLEN" = "%TEMP%" },
     @{ "VORDR_UISCHEME" = "15" },
     @{ "VORDR_UISCHEME" = "X01" },
+    @{ "VORDR_UISCHEME" = "-0" },
+    @{ "VORDR_PWMINLEN" = '1"6' },
+    @{ "VORDR_PWMINLEN" = "2147483648" },
+    @{ "VORDR_PWMINLEN" = [string][char]0xFF11 + [string][char]0xFF16 },
     @{ "VORDR_CLIPSECONDS" = "3601" },
     @{ "VORDR_CLIPSECONDS" = "12 34" }
 )
