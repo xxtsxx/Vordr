@@ -23,12 +23,17 @@ and transfer. Do not compare an MSI's hash with the executable hash.
 These are historical release records, retained unchanged. The supported-version
 policy is in [SECURITY.md](../SECURITY.md); an old hash does not imply support.
 
-| Version | Commit | SHA-256 of `vordr.exe` |
-|---|---|---|
-| v0.2.0 | `48cc1df` | `811b5cd6f56845daf747bc8e4d18f89f35a7bb815463611a1f090009a8279faa` |
-| v0.2.1 | `1ba8413` | `01baa66ff49e1869dc6b68b4c4528c5cb534282b54f98745222e0f628898e664` |
-| v0.2.2 | `4482251` | `eaa45139c4941e6516c17ebf880c5fb78dee0bd0c5db88024e99b51833ad914d` |
-| v0.2.3 | `378c28e` | `197e5ef014c8be0093ed7a0e7960358cdeb2b118c4dbb5680a949dcf55c2d343` |
+| Version | Commit | SHA-256 of `vordr.exe` (x64) | SHA-256 of `vordr-arm64.exe` (ARM64) |
+|---|---|---|---|
+| v0.2.0 | `48cc1df` | `811b5cd6f56845daf747bc8e4d18f89f35a7bb815463611a1f090009a8279faa` | — |
+| v0.2.1 | `1ba8413` | `01baa66ff49e1869dc6b68b4c4528c5cb534282b54f98745222e0f628898e664` | — |
+| v0.2.2 | `4482251` | `eaa45139c4941e6516c17ebf880c5fb78dee0bd0c5db88024e99b51833ad914d` | — |
+| v0.2.3 | `378c28e` | `197e5ef014c8be0093ed7a0e7960358cdeb2b118c4dbb5680a949dcf55c2d343` | — |
+| v1.0.0 | `e29a92a` | `3a130e4d3a4fca1fd32554ee8f3f1fa6be0706bc9990feed4987404ceee8231c` | `0f1d906513d506ae889b25bed17e175f79c1ce41d0261f3d176d7365aec65db2` |
+
+`v1.0.0` (`e29a92a`) build metadata:
+- Toolchain: MSVC `ml64` / `link` `14.44.35230.0`, Windows SDK `10.0.28000.0`, LLVM `clang` `23.1.5` (`build.cmd release strict` and `build_arm64.cmd release`, verified byte-reproducible via `tools\verify_repro.ps1`).
+- Universal MSI (`vordr-1.0.0.msi`, `647,168` bytes): SHA-256 `ffab80c7f2459f36a641faefa6f6bbc233b9887b20291b6e354db613243100d2`, `ProductCode` `{C5666814-4683-4953-8184-87F43E4EA699}`, `UpgradeCode` `{6A1D0C7E-9E2F-4F1B-9C2A-7E5B0D3A8F41}`.
 
 A row may have been added after the tag it describes. Rebuild the tag, not
 the current `master` branch, when checking a published hash.
