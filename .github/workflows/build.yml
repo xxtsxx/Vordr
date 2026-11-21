@@ -16,11 +16,12 @@
 #      absent.  Added because two upgrade faults reached a live install while
 #      these checks existed but were manual.
 #
-# windows-latest ships VS (ml64/link/rc) and Python; ilammy/msvc-dev-cmd puts
-# the x64 toolchain on PATH the same way a "x64 Native Tools" prompt does.
-# build.cmd's hardcoded SDK paths are a local-machine convenience - when they
-# don't exist on the runner, rc/link fall back to the INCLUDE/LIB environment
-# that msvc-dev-cmd sets, so the build works on both.
+# windows-latest ships VS (ml64/link/rc), LLVM (clang/llvm-lib), and Python;
+# Microsoft's built-in vswhere.exe + vcvarsall.bat puts the x64 toolchain on
+# PATH the same way an "x64 Native Tools" prompt does, without third-party JS
+# actions.  build.cmd's hardcoded SDK paths are a local-machine convenience -
+# when they don't exist on the runner, rc/link fall back to the INCLUDE/LIB
+# environment that vcvarsall sets, so the build works on both.
 
 name: build
 
@@ -41,15 +42,51 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (node24)
         with:
           persist-credentials: false
 
-      # G7.3: third-party action pinned to a commit SHA (tag v1 is mutable).
+      # Native MSVC x64 developer environment via Microsoft's built-in vswhere +
+      # vcvarsall.bat (zero third-party actions, zero Node.js dependency).
       - name: MSVC x64 environment
-        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
-        with:
-          arch: x64
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -products * -prerelease -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsPath) { throw "Visual Studio with VC x64 tools not found" }
+          $vcvars = Join-Path $vsPath "VC\Auxiliary\Build\vcvarsall.bat"
+          if (-not (Test-Path $vcvars)) { throw "vcvarsall.bat not found at $vcvars" }
+          $before = @{}
+          [Environment]::GetEnvironmentVariables().GetEnumerator() | ForEach-Object {
+            $before[$_.Key.ToUpperInvariant()] = [string]$_.Value
+          }
+          $env:_VCVARS = $vcvars
+          $out = & cmd.exe /d /c 'call "%_VCVARS%" x64 >nul && set'
+          $rc = $LASTEXITCODE
+          Remove-Item Env:_VCVARS -ErrorAction SilentlyContinue
+          if ($rc -ne 0) { throw "vcvarsall.bat failed (exit $rc)" }
+          foreach ($line in $out) {
+            $eq = $line.IndexOf('=')
+            if ($eq -le 0) { continue }
+            $k = $line.Substring(0, $eq)
+            $v = $line.Substring($eq + 1)
+            $ku = $k.ToUpperInvariant()
+            if ($ku -eq 'PROMPT' -or $ku -eq '_VCVARS') { continue }
+            if ($ku -eq 'PATH') {
+              $oldEntries = @(($before['PATH'] -split ';') | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\').ToLowerInvariant() })
+              $oldSet = [Collections.Generic.HashSet[string]]::new([string[]]$oldEntries)
+              $newDirs = @($v -split ';' | Where-Object { $_ -and -not $oldSet.Contains($_.TrimEnd('\').ToLowerInvariant()) })
+              # GITHUB_PATH prepends each line sequentially, so reverse to keep vcvarsall precedence.
+              [array]::Reverse($newDirs)
+              if ($newDirs.Count -gt 0) { $newDirs | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append }
+            } elseif (-not $before.ContainsKey($ku) -or $before[$ku] -ne $v) {
+              "$k=$v" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            }
+          }
+
+      - name: Install ARM64 translator dependency (capstone)
+        shell: cmd
+        run: python -m pip install --disable-pip-version-check --no-input capstone==5.0.7
 
       - name: run_all gate (redteam + strict build + selftest + roundtrip + ARM64 + MSI)
         shell: cmd
@@ -90,14 +127,14 @@ jobs:
 
       - name: upload crypto proof
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2 (node24)
         with:
           name: crypto-proof
           path: crypto-proof/
           if-no-files-found: ignore
 
       - name: upload release artifacts (x64 + ARM64 + universal MSI)
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2 (node24)
         with:
           name: vordr-release
           path: |
@@ -116,7 +153,7 @@ jobs:
 
       - name: upload stage logs on failure
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2 (node24)
         with:
           name: runall-logs
           path: runall-logs/

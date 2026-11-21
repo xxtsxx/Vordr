@@ -24,10 +24,13 @@ def main():
     try:
         deep = root / ("a" * 90) / ("b" * 90) / ("c" * 60)
         (owned_root / deep.relative_to(root)).mkdir(parents=True)
-        # VDR-15: cwd stays below MAX_PATH so a non-longPathAware Python can spawn
-        # the child, while the relative filename resolves past 260 chars inside
-        # Vordr's dynamic GetFullPathNameW retry path in path_longify.
-        rel_cwd = root / ("a" * 90) / ("b" * 90)
+        # VDR-15: cwd stays below MAX_PATH on any runner/username length so a
+        # non-longPathAware Python can spawn the child, while the relative
+        # filename resolves past 260 chars inside Vordr's dynamic
+        # GetFullPathNameW retry path in path_longify.
+        seg = max(16, min(80, (215 - len(str(root))) // 2))
+        rel_cwd = root / ("d" * seg) / ("e" * seg)
+        (owned_root / rel_cwd.relative_to(root)).mkdir(parents=True)
         rel_name = ("r" * 90) + ".vordr"
         assert len(str(rel_cwd)) < 245
         assert len(str(rel_cwd / rel_name)) > 275

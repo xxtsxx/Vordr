@@ -291,6 +291,7 @@ if not errorlevel 1 (
     python tests\verify_persistence.py --exe bin\vordr.exe > "%WORK%\persistence.log" 2>&1
     if errorlevel 1 (
         echo   persistence regressions: FAIL - see %WORK%\persistence.log
+        powershell -NoProfile -Command "Get-Content -LiteralPath '%WORK%\persistence.log' -Tail 20"
         set RT=FAIL
     ) else (
         echo   persistence regressions: PASS
@@ -394,6 +395,7 @@ if "!HAS_CLANG!"=="1" (
     call .\build_arm64.cmd release > "%WORK%\build_arm64.log" 2>&1
     if errorlevel 1 (
         echo   installer: FAIL ^(build_arm64.cmd release^) - see %WORK%\build_arm64.log
+        powershell -NoProfile -Command "Get-Content -LiteralPath '%WORK%\build_arm64.log' -Tail 20"
         set R_INSTALLER=FAIL
         goto :installer_done
     )
@@ -406,6 +408,7 @@ del bin\vordr-*.msi >nul 2>nul
 powershell -ExecutionPolicy Bypass -NoProfile -File tools\make_msi.ps1 > "%WORK%\msi_build.log" 2>&1
 if errorlevel 1 (
     echo   installer: FAIL ^(make_msi.ps1^) - see %WORK%\msi_build.log
+    powershell -NoProfile -Command "Get-Content -LiteralPath '%WORK%\msi_build.log' -Tail 20"
     set R_INSTALLER=FAIL
     goto :installer_done
 )
