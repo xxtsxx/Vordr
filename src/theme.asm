@@ -2873,8 +2873,8 @@ theme_toggle_labeled endp
 
 ; =============================================================================
 ; theme_progressbar(rcx=lpdis, edx=num, r8d=denom) -> 1 - draw an anti-aliased
-;   TOTP countdown indicator (#3): radial ring (when height >= 12) + smooth
-;   rounded pill bar, interpolating color accent -> amber (<25%) -> coral (<10%).
+;   TOTP countdown bar: smooth rounded pill bar centred vertically,
+;   interpolating color accent -> amber (<25%) -> coral (<10%).
 ; =============================================================================
 public theme_progressbar
 theme_progressbar proc frame
@@ -2958,31 +2958,18 @@ tpb_col_done:
 
     mov     eax, dword ptr [rbp-44]
     sub     eax, dword ptr [rbp-52]           ; h = B - T
-    mov     dword ptr [rbp-72], eax
-    mov     ecx, dword ptr [rbp-56]           ; barL = L
-    cmp     eax, 12
-    jl      tpb_bar_only
-
-    ; Draw 4x AA circular countdown ring on the left (size = h, thickness = 3px)
-    WINCALL theme_aa_arc, qword ptr [rbp-32], dword ptr [rbp-56], dword ptr [rbp-52], \
-            dword ptr [rbp-72], 3, 0, 1024, dword ptr [g_col_frame]
-    cmp     dword ptr [rbp-64], 0
-    jle     @F
-    WINCALL theme_aa_arc, qword ptr [rbp-32], dword ptr [rbp-56], dword ptr [rbp-52], \
-            dword ptr [rbp-72], 3, 0, dword ptr [rbp-64], dword ptr [rbp-68]
-@@: mov     ecx, dword ptr [rbp-56]
-    add     ecx, dword ptr [rbp-72]
-    add     ecx, 7                            ; barL = L + ringSize + 7
-    mov     eax, dword ptr [rbp-72]
+    mov     ecx, dword ptr [rbp-56]           ; barL = L (full width, bar only)
+    cmp     eax, 6
+    jl      tpb_bar_full
     sar     eax, 1
     add     eax, dword ptr [rbp-52]
     sub     eax, 2
-    mov     dword ptr [rbp-76], eax           ; barT = midY - 2
+    mov     dword ptr [rbp-76], eax           ; barT = midY - 2 (4px centred pill)
     add     eax, 4
     mov     dword ptr [rbp-80], eax           ; barB = midY + 2
     jmp     tpb_draw_bar
 
-tpb_bar_only:
+tpb_bar_full:
     mov     eax, dword ptr [rbp-52]
     mov     dword ptr [rbp-76], eax
     mov     eax, dword ptr [rbp-44]

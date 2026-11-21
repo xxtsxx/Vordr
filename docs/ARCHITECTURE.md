@@ -238,7 +238,7 @@ must not be described as Windows CFG.
 | `totp.asm`, `pwgen.asm` | One-time codes, password/PIN generation, grading, and policy |
 | `tpm.asm`, `regcfg.asm` | TPM 2.0 PCP & `webauthn.dll` Hello wrapping, TBS cooldown diagnostics, registry precedence, paths, rollback history |
 | `zipexport.asm`, `zipimport.asm` | WinZip AE-2 and JSON interoperability with per-attachment `SHA-256` verification |
-| `theme.asm` | 14 color schemes + Follow Windows, perceived-luminance contrast, SSE2 SDF rounded rects, glass cards & sidebar, drop shadows, pill toggles, radial TOTP progress |
+| `theme.asm` | 14 color schemes + Follow Windows, perceived-luminance contrast, SSE2 SDF rounded rects, glass cards & sidebar, drop shadows, pill toggles, TOTP countdown bar |
 | `anim.asm` | Animation clock: eased value slots driven by one timer while active, honoring Windows' "Animation effects" setting |
 | `gpu.asm`, `gpu_backdrops.inc` | Direct3D 11 DirectCompute (`cs_5_0`) procedural backdrops (7 styles via `d3d11.dll` with WARP fallback + SSE2 360° Rodrigues hue cycling, plus flat mode) cached in a 32-bit DIB |
 | `fileio.asm`, `console.asm`, `log.asm` | Hardened file access (`file_path_allowed` / `file_validate_handle`), diagnostic output, logging |
