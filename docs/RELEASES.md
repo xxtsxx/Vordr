@@ -40,21 +40,14 @@ the current `master` branch, when checking a published hash.
 
 ## WinGet publication
 
-Vordr **0.2.3** was approved, merged, and published to the WinGet community source
-on **2026-09-14** through
-[PR #411202](https://github.com/microsoft/winget-pkgs/pull/411202).
-All ten validation stages passed, and publication was confirmed by querying
-`ThomasSmistad.Vordr` through WinGet. This is a historical publication record,
-not a claim that 0.2.3 will always be the latest version.
+Published records in the WinGet community source (`ThomasSmistad.Vordr`, referencing each existing GitHub release MSI unchanged — these are **MSI hashes**, not the executable hashes above):
 
-The listing uses the existing GitHub release MSI, with SHA-256:
+| Version | Published | PR | Architectures | SHA-256 of GitHub release MSI |
+|---|---|---|---|---|
+| 0.2.3 | 2026-09-14 | [PR #411202](https://github.com/microsoft/winget-pkgs/pull/411202) | x64 | `683202773f1307952f7c9d6705c1cc09c082bdd28570625aa5ba1a2640d894e6` |
+| 1.0.0 | 2026-11-21 | [PR #485844](https://github.com/microsoft/winget-pkgs/pull/485844) | x64, arm64 (universal MSI) | `53bc66a111180c2912dc2d9c46869f9b62d595ccef80f5477a64a57c9621d803` |
 
-```text
-683202773f1307952f7c9d6705c1cc09c082bdd28570625aa5ba1a2640d894e6
-```
-
-This is the **MSI hash**, not the executable hash in the table above.
-Publication did not rebuild or change the release. Query the live listing with:
+Both submissions passed WinGet automated validation and moderator approval, and publication was confirmed by querying `ThomasSmistad.Vordr` through WinGet. These are historical publication records, not a claim that any listed version will always be the latest. Query the live listing with:
 
 ```powershell
 winget show --id ThomasSmistad.Vordr --exact --source winget
