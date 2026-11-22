@@ -30,6 +30,11 @@ policy is in [SECURITY.md](../SECURITY.md); an old hash does not imply support.
 | v0.2.2 | `4482251` | `eaa45139c4941e6516c17ebf880c5fb78dee0bd0c5db88024e99b51833ad914d` | — |
 | v0.2.3 | `378c28e` | `197e5ef014c8be0093ed7a0e7960358cdeb2b118c4dbb5680a949dcf55c2d343` | — |
 | v1.0.0 | `d8aaf5f` | `8241198fb48d592302ffb20f8b9df3766bc4d396913e18e641003986c2456526` | `ccf95b48cc5f4a324af5805c83f0868dc080f78e440ff4f001d48e2df26f7e6b` |
+| v1.1.1 | `935c7e1` | `d87e0eada337960f673c743cf15bd8ab47a7bb44af58cc185f7030ad3855d08a` | `19cb59442b8597ab443269e3ab78c31f459d74ae4742f2fb732d0c36b188b3e3` |
+
+`v1.1.1` (`935c7e1`) build metadata:
+- Toolchain: MSVC `ml64` / `link` `14.44.35230.0`, Windows SDK `10.0.28000.0`, LLVM `clang` `23.1.5` (`build.cmd release strict` and `build_arm64.cmd release`, verified byte-reproducible via `tools\verify_repro.ps1`).
+- Universal MSI (`vordr-1.1.1.msi`, `684,032` bytes): SHA-256 `c90c979e36a46ba35b25d814672be0fd4a70ef53700f5776d718b40c8c5e65f3`, `ProductCode` `{E960C61F-BF96-4EB4-88EA-403A8CFB345F}`, `UpgradeCode` `{6A1D0C7E-9E2F-4F1B-9C2A-7E5B0D3A8F41}`.
 
 `v1.0.0` (`d8aaf5f`) build metadata:
 - Toolchain: MSVC `ml64` / `link` `14.44.35230.0`, Windows SDK `10.0.28000.0`, LLVM `clang` `23.1.5` (`build.cmd release strict` and `build_arm64.cmd release`, verified byte-reproducible via `tools\verify_repro.ps1` and a second clean checkout).
@@ -47,7 +52,7 @@ Published records in the WinGet community source (`ThomasSmistad.Vordr`, referen
 | 0.2.3 | 2026-09-14 | [PR #411202](https://github.com/microsoft/winget-pkgs/pull/411202) | x64 | `683202773f1307952f7c9d6705c1cc09c082bdd28570625aa5ba1a2640d894e6` |
 | 1.0.0 | 2026-11-21 | [PR #485844](https://github.com/microsoft/winget-pkgs/pull/485844) | x64, arm64 (universal MSI) | `53bc66a111180c2912dc2d9c46869f9b62d595ccef80f5477a64a57c9621d803` |
 
-Both submissions passed WinGet automated validation and moderator approval, and publication was confirmed by querying `ThomasSmistad.Vordr` through WinGet. These are historical publication records, not a claim that any listed version will always be the latest. Query the live listing with:
+Both published submissions above passed WinGet automated validation and moderator approval, and publication was confirmed by querying `ThomasSmistad.Vordr` through WinGet. Version `1.1.1` has been submitted in [PR #486713](https://github.com/microsoft/winget-pkgs/pull/486713) and is pending automated validation, merge, and publication. These are historical publication records, not a claim that any listed version will always be the latest. Query the live listing with:
 
 ```powershell
 winget show --id ThomasSmistad.Vordr --exact --source winget
