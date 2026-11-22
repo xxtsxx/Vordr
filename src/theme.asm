@@ -52,7 +52,6 @@ extern RedrawWindow:proc
 extern SendMessageW:proc
 extern EnumChildWindows:proc
 extern SetWindowTheme:proc
-extern SetLayeredWindowAttributes:proc
 extern GetWindowRect:proc
 extern ScreenToClient:proc
 extern GetFocus:proc
@@ -82,15 +81,12 @@ WM_CTLCOLORLISTBOX  equ 134h
 WM_CTLCOLORSTATIC   equ 138h
 DM_SETDEFID         equ 401h
 GWL_STYLE           equ -16
-GWL_EXSTYLE         equ -20
 GWL_USERDATA        equ -21                  ; 1 = Fluent accent (primary) button
 WS_CLIPCHILDREN     equ 02000000h
-WS_EX_LAYERED       equ 00080000h
-LWA_ALPHA           equ 2
-WIN_ALPHA           equ 255                  ; 100% (fully opaque)
 DWMWA_DARK          equ 20
 DWMWA_CORNER        equ 33                   ; DWMWA_WINDOW_CORNER_PREFERENCE
 DWMWCP_ROUND        equ 2                    ; rounded corners (Fluent)
+DWMWA_BORDER_COLOR  equ 34                   ; 1px DWM outer border colour (Win11)
 DWMWA_CAPTION_COLOR equ 35                   ; title-bar fill (Win11; older: E_INVALIDARG, ignored)
 DWMWA_TEXT_COLOR    equ 36                   ; title-bar text
 NULL_BRUSH          equ 5
@@ -137,40 +133,32 @@ g_col_onacc dd 00101010h                  ; BT.709 auto-contrasted text on accen
 g_col_spec  dd 00585858h                  ; 1px top-lit specular border highlight (#13)
 SCHEME_DW   equ 15
 TINT_W      equ 6                         ; accent share of the neutrals, /256
-SCHEME_COUNT equ 14
+SCHEME_COUNT equ 9
 schemes label dword
     ; bg,panel,frame,btn,btnsel,text,textdim,border,accent,accsel,focus,dark,side,filebadge,accent2
+    ; ---- Light palettes (0..2) ----
     dd 00F3F3F3h,00FFFFFFh,00D2D2D2h,00FFFFFFh,00E6E6E6h,00202020h,00707070h,00D2D2D2h,00C26A00h,00A05800h,00C26A00h,00000000h,00FFFFFFh,00E8DCC8h,00C26A00h  ; 0: Light
     dd 00D8ECF4h,00E0F3FBh,00A8C8D8h,00E0F3FBh,00C0DFEAh,002A3B4Bh,00556A7Ah,00A8C8D8h,001D65B5h,00144E90h,001D65B5h,00000000h,00C4D2D6h,00CCDCE4h,001D65B5h  ; 1: Sepia
-    dd 0040342Eh,0052423Bh,006A564Ch,0052423Bh,005E4C43h,00F4EFECh,00E9DED8h,006A564Ch,00D0C088h,00B0A06Fh,00D0C088h,00000001h,004F4039h,00786858h,00D0C088h  ; 2: Nord
-    dd 001A1410h,00282018h,00403420h,00282018h,00201810h,00FFF0E0h,00C0B0A0h,00403420h,00E0C040h,00B09020h,00E0C040h,00000001h,00170F0Fh,00504028h,00E0C040h  ; 3: Midnight
-    dd 008D3140h,00A03A48h,00C46978h,00A03A48h,00B04050h,00D67F8Bh,00C46978h,00C46978h,00FFA0B0h,00D06070h,00FFA0B0h,00000001h,00802C37h,00B04858h,00FFA0B0h  ; 4: Commodore
-    dd 002E0A19h,00461026h,00B03A6Ah,00461026h,005A1A34h,00FFE4F0h,00D89AB8h,00B03A6Ah,00F755A8h,00D03880h,00F755A8h,00000001h,00240714h,0050162Eh,00FFA0D8h  ; 5: Amethyst
-    dd 001A2006h,0028320Ah,005E7A1Ah,0028320Ah,003A4612h,00F4FFE0h,00BCD090h,005E7A1Ah,0098E010h,0078B00Ah,0098E010h,00000001h,000F1804h,0034400Eh,00D0FF60h  ; 6: Emerald
-    dd 00220E06h,0038180Ah,008A3A1Ah,0038180Ah,004E2210h,00FFEAE0h,00E0B09Ah,008A3A1Ah,00FF6A2Eh,00D04818h,00FF6A2Eh,00000001h,001A0A04h,00341208h,00FFB08Ah  ; 7: Sapphire
-    dd 00282828h,002F3032h,00454950h,002F3032h,0036383Ch,00B2DBEBh,008499A8h,00454950h,001980FEh,001060D0h,001980FEh,00000001h,001F2022h,0034363Ah,0026BBB8h  ; 8: Gruvbox
-    dd 002E1E1Eh,00443231h,005A4745h,00443231h,00523D3Bh,00F4D6CDh,00DEC2BAh,005A4745h,00F7A6CBh,00D684B0h,00F7A6CBh,00000001h,00251818h,005A4745h,0087B3FAh  ; 9: Catppuccin
-    dd 00261B1Ah,003B2824h,00684841h,003B2824h,004E3630h,00F5CAC0h,00CEA59Ah,00684841h,00F7A27Ah,00D2825Ah,00F7A27Ah,00000001h,001E1615h,00523A34h,00FFCF7Dh  ; 10: Tokyo Night
-    dd 00241719h,002E1D1Fh,00523D40h,002E1D1Fh,003E282Bh,00F4DEE0h,00AA8C90h,00523D40h,00BABCEBh,009698C8h,00BABCEBh,00000001h,001C1214h,00463235h,0077C1F6h  ; 11: Rose Pine
-    dd 00E3F6FDh,00F0FBFFh,00A1A193h,00F0FBFFh,00D5E8EEh,00423607h,00756E58h,00B8B8AAh,00D28B26h,00AD701Ch,00D28B26h,00000000h,00D5E8EEh,00C8DFD8h,0098A12Ah  ; 12: Solarized
-    dd 00000000h,00121010h,00443E3Eh,00161414h,00262222h,00FFFFFFh,00C4C0C0h,004A4444h,00FFE500h,00CCB600h,00FFE500h,00000001h,00080808h,002A2828h,00A3FF00h  ; 13: OLED Black
+    dd 00E3F6FDh,00F0FBFFh,00A1A193h,00F0FBFFh,00D5E8EEh,00423607h,00756E58h,00B8B8AAh,00D28B26h,00AD701Ch,00D28B26h,00000000h,00D5E8EEh,00C8DFD8h,0098A12Ah  ; 2: Solarized
+    ; ---- Dark palettes (3..8) ----
+    dd 0040342Eh,0052423Bh,006A564Ch,0052423Bh,005E4C43h,00F4EFECh,00E9DED8h,006A564Ch,00D0C088h,00B0A06Fh,00D0C088h,00000001h,004F4039h,00786858h,00D0C088h  ; 3: Nord
+    dd 001A1410h,00282018h,00403420h,00282018h,00201810h,00FFF0E0h,00C0B0A0h,00403420h,00E0C040h,00B09020h,00E0C040h,00000001h,00170F0Fh,00504028h,00E0C040h  ; 4: Midnight
+    dd 00220E06h,0038180Ah,008A3A1Ah,0038180Ah,004E2210h,00FFEAE0h,00E0B09Ah,008A3A1Ah,00FF6A2Eh,00D04818h,00FF6A2Eh,00000001h,001A0A04h,00341208h,00FFB08Ah  ; 5: Sapphire
+    dd 00282828h,002F3032h,00454950h,002F3032h,0036383Ch,00B2DBEBh,008499A8h,00454950h,001980FEh,001060D0h,001980FEh,00000001h,001F2022h,0034363Ah,0026BBB8h  ; 6: Gruvbox
+    dd 002E1E1Eh,00443231h,005A4745h,00443231h,00523D3Bh,00F4D6CDh,00DEC2BAh,005A4745h,00F7A6CBh,00D684B0h,00F7A6CBh,00000001h,00251818h,005A4745h,0087B3FAh  ; 7: Catppuccin
+    dd 00000000h,00121010h,00443E3Eh,00161414h,00262222h,00FFFFFFh,00C4C0C0h,004A4444h,00FFE500h,00CCB600h,00FFE500h,00000001h,00080808h,002A2828h,00A3FF00h  ; 8: OLED Black
 ; scheme_traits[scheme] = radius(byte0) | accent-mode(byte1: 0 solid/1 rainbow/2 two-tone) |
 ;   flags(byte2: bit0 scanlines)
 scheme_traits label dword
     dd 00000008h  ; 0: Light
     dd 00000008h  ; 1: Sepia
-    dd 00000008h  ; 2: Nord
-    dd 00000008h  ; 3: Midnight
-    dd 00000000h  ; 4: Commodore
-    dd 00000208h  ; 5: Amethyst
-    dd 00000208h  ; 6: Emerald
-    dd 00000208h  ; 7: Sapphire
-    dd 00000006h  ; 8: Gruvbox
-    dd 00000208h  ; 9: Catppuccin
-    dd 00000208h  ; 10: Tokyo Night
-    dd 00000208h  ; 11: Rose Pine
-    dd 00000208h  ; 12: Solarized
-    dd 00000208h  ; 13: OLED Black
+    dd 00000208h  ; 2: Solarized
+    dd 00000008h  ; 3: Nord
+    dd 00000008h  ; 4: Midnight
+    dd 00000208h  ; 5: Sapphire
+    dd 00000006h  ; 6: Gruvbox
+    dd 00000208h  ; 7: Catppuccin
+    dd 00000208h  ; 8: OLED Black
 public g_br_frame, g_br_panel, g_br_bg, g_br_side
 g_br_bg     dq 0
 g_br_side   dq 0                            ; sidebar (list + search) fill
@@ -574,6 +562,9 @@ theme_dwm_apply proc frame
     WINCALL DwmSetWindowAttribute, qword ptr [rbp-24], DWMWA_DARK, addr rbp-40, 4
     mov     dword ptr [rbp-40], DWMWCP_ROUND    ; Fluent rounded window corners
     WINCALL DwmSetWindowAttribute, qword ptr [rbp-24], DWMWA_CORNER, addr rbp-40, 4
+    mov     eax, dword ptr [g_col_border]       ; 1px Win11 DWM border matches active scheme
+    mov     dword ptr [rbp-40], eax
+    WINCALL DwmSetWindowAttribute, qword ptr [rbp-24], DWMWA_BORDER_COLOR, addr rbp-40, 4
     mov     eax, dword ptr [g_col_bg]           ; caption painted like the window bg
     mov     dword ptr [rbp-40], eax
     WINCALL DwmSetWindowAttribute, qword ptr [rbp-24], DWMWA_CAPTION_COLOR, addr rbp-40, 4
@@ -598,11 +589,6 @@ theme_attach proc frame
     WINCALL GetWindowLongPtrW, qword ptr [rbp-24], GWL_STYLE
     or      rax, WS_CLIPCHILDREN            ; clip children so the frame ring isn't overpainted
     WINCALL SetWindowLongPtrW, qword ptr [rbp-24], GWL_STYLE, rax
-    ; WS_EX_LAYERED at full (100%) alpha — opaque window
-    WINCALL GetWindowLongPtrW, qword ptr [rbp-24], GWL_EXSTYLE
-    or      rax, WS_EX_LAYERED
-    WINCALL SetWindowLongPtrW, qword ptr [rbp-24], GWL_EXSTYLE, rax
-    WINCALL SetLayeredWindowAttributes, qword ptr [rbp-24], 0, WIN_ALPHA, LWA_ALPHA
     ; dark scrollbars/borders on the standard controls (listbox, multiline edits)
     WINCALL EnumChildWindows, qword ptr [rbp-24], addr theme_dark_cb, 0
     cmp     dword ptr [rbp-32], 0

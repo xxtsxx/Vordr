@@ -7,6 +7,25 @@ in [docs/RELEASES.md](docs/RELEASES.md).
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-23
+
+### Added in 1.1.0
+
+- **Expanded secret icon picker with full-color `Segoe UI Emoji`, dual Tile/Icon colors, and animated palettes (`vordr.rc`, `src/gui.asm`, `src/gpu.asm`, `src/arm64/platform.S`, `docs/formats.md`).** Replaced the 30-glyph picker with 144 icons across three tabs (`Icons`, `Emoji`, `Nature & Fun`), rendering all 96 emojis in full color via lazy System32 Direct2D/DirectWrite (`D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT` + AAPCS64 `dwrite_create_fmt` wrapper, with automatic GDI fallback). Added independent **Tile** (background) and **Icon** (accent) color selection across 24 curated solid swatches, Win32 `ChooseColorW` custom RGB picker, **Auto** mode (full-color emoji / BT.709 auto-contrast), and 8 live-animated gradient/shimmer palettes (`Gold`, `Rainbow`, `Neon`, `Aurora`, `Ember`, `Ocean`, `Holographic`, `Emerald Chrome`) that shimmer smoothly in the sidebar and detail header even in `Flat` backdrop mode. Extended `VF_ICON` backward-compatibly (`12`/`16`/`24` hex).
+- **Ten new DirectCompute procedural backdrops (`tools/backdrops.hlsl`, `src/gpu_backdrops.inc`, `src/gpu.asm`, `src/gui.asm`).** Expanded the backdrop catalog to 16 GPU procedural styles (`0..15`) plus `Flat` (`16`), adding *Intaglio print*, *Leaf* (side-faded), *Shadow*, *Tattoo*, *Nebula* (side-faded), *Mariusgenser* (vertically flipped with calm top), *Matrix*, *Tron*, *Event horizon* (zoomed-in lower-right black hole dome and photon arc), and *Spiderweb*, and retiring *Optical arcs*.
+- **Home status frosted glass card (`src/gui.asm`).** Wrapped the Home overview's vault path, health verdict, and launch KAT summary inside a bottom-aligned frosted glass pane flush with the sidebar card.
+
+### Changed in 1.1.0
+
+- **Streamlined, sequentially grouped color schemes (`src/theme.asm`, `src/gui.asm`).** Removed *Rose Pine*, *Tokyo Night*, *Amethyst*, *Emerald*, and *Commodore*, grouping the 9 palettes cleanly into 3 light (*Light*, *Sepia*, *Solarized*) followed by 6 dark (*Nord*, *Midnight*, *Sapphire*, *Gruvbox* default, *Catppuccin*, *OLED Black*) plus *Follow Windows*.
+- **Start with Windows enabled by default in the MSI (`tools/make_msi.ps1`, `tools/verify_msi.ps1`, `docs/DEPLOYMENT.md`).** Interactive and silent MSI installs now default `VORDR_AUTOSTART=1` (opt-out via unchecking in the wizard or passing `VORDR_AUTOSTART=0`).
+- **Refreshed documentation screenshots (`README.md`, `docs/screenshots/*.png`).** Updated the showcase to four synthetic-vault screens: *Gruvbox / Cut planes* (revealed password), *Sepia / Intaglio print* (Main screen), *Solarized / Tattoo* (Settings), and *Midnight / Corner mosaic* (centered Password generator).
+
+### Fixed in 1.1.0
+
+- **200% Windows DPI scaling font-size flicker (`src/gui.asm`, `src/secmem.asm`).** Switched the atomic window compositor (`gui_present_composite`) from a cached 32-bit DIBSection to an ephemeral per-frame DDB compatible with `GetWindowDC(hdlg)` (scrubbed with `PatBlt(BLACKNESS)` before release) so Windows GDI Scaling renders text at consistent native physical DPI on hover and focus transitions.
+- **White window-frame border glitches on all edges (`vordr.rc`, `src/gui.asm`, `src/theme.asm`).** Switched `DLG_VAULT` to `WS_OVERLAPPED | WS_CAPTION | WS_THICKFRAME`, removed obsolete `WS_EX_LAYERED` (`alpha=255`), and simplified `vault_nc_subclass` to canonical `WM_NCCALCSIZE` handling with `DWMWA_BORDER_COLOR`, eliminating white border flashes on open, move, resize, maximize, and restore.
+
 ## [1.0.0] - 2026-11-21
 
 First public `1.0.0` release, consolidating the native ARM64 port, DirectCompute glass UI and compositor, PIN secret type, strengthened TPM unlock modes, and Pass 1–9 security audit remediations (`0.2.4`–`0.8.2`) with a polished interactive universal MSI installer and refreshed documentation.

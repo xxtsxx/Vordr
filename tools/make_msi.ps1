@@ -104,7 +104,7 @@ $Policies = @(
     @{ Prop="VORDR_ALLOWUNCVAULT";       Value="AllowUncVault";       Comp="PolAllowUnc";     Guid="{C4829E51-3D74-4A8B-9162-5E1B0F47A3C9}"; HklmOnly=$true; Range="0/1";     Default="0";   Doc="allow opening vault files over UNC/network shares (HKLM-only)" }
     @{ Prop="VORDR_ALLOWSCREENCAPTURE";  Value="AllowScreenCapture";  Comp="PolAllowCap";     Guid="{6D3A14B8-79E2-4F55-8A1C-34B8E92D71F0}"; HklmOnly=$true; Range="0/1";     Default="0";   Doc="allow screen capture of Vordr windows (0 = WDA_EXCLUDEFROMCAPTURE)" }
     @{ Prop="VORDR_LOGLEVEL";            UserProp="VORDR_USER_LOGLEVEL";        Value="LogLevel";            Comp="PolLogLevel";     UserComp="DefLogLevel";     Guid="{A3BD3F2C-326F-4749-A57E-A78D1EC4AC0E}"; UserGuid="{D60A48DC-17EB-495D-9AF6-2B47D8E90A0D}"; Range="0-4";     Default="0";   Doc="audit-log verbosity, 0 = off" }
-    @{ Prop="VORDR_UISCHEME";            UserProp="VORDR_USER_UISCHEME";        Value="ui_scheme";           Comp="PolUiScheme";     UserComp="DefUiScheme";     Guid="{9B70EE1D-7B67-44A0-8C02-06B7BD8F982F}"; UserGuid="{E71B59ED-28FC-4A6E-AB07-3C58E9FA1B0E}"; Range="0-14";    Default="8";   Doc="colour scheme (8 = Gruvbox default, 14 = Follow Windows)" }
+    @{ Prop="VORDR_UISCHEME";            UserProp="VORDR_USER_UISCHEME";        Value="ui_scheme";           Comp="PolUiScheme";     UserComp="DefUiScheme";     Guid="{9B70EE1D-7B67-44A0-8C02-06B7BD8F982F}"; UserGuid="{E71B59ED-28FC-4A6E-AB07-3C58E9FA1B0E}"; Range="0-9";     Default="6";   Doc="colour scheme (6 = Gruvbox default, 9 = Follow Windows)" }
 )
 # NOT exposed via MSI property: HKLM "vault".  Administrators who configure a
 # per-machine vault path via Group Policy can use safe per-user prefixes
@@ -122,10 +122,10 @@ $AssocGuid     = "{4B1E86D2-95AF-4C33-9F0E-2A6D74C1B5E8}"
 $AssocProp     = "VORDR_NOASSOC"            # set to anything to skip the registration
 $ProgId        = "Vordr.Vault"
 $ClassesKey    = "SOFTWARE\Classes"
-# --- optional start-with-Windows (HKLM Run, minimized to notification area) --
+# --- Start with Windows (HKLM Run, minimized to notification area; on by default) --
 $AutoStartComp = "VordrAutoStart"
 $AutoStartGuid = "{3D9A6F21-7E4B-4C80-B2D1-9F4C6A3E8B15}"
-$AutoStartProp = "VORDR_AUTOSTART"          # set to 1 to register HKLM\...\Run\Vordr
+$AutoStartProp = "VORDR_AUTOSTART"          # 1 by default; set to 0 to skip HKLM\...\Run\Vordr
 $RunKey        = "SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
 
 function Resolve-Full([string]$p) {
@@ -439,11 +439,10 @@ try {
         "AllowScreenCapture" = @{ Title="Allow screen capture";       Kind="bool" }
         "LogLevel"           = @{ Title="Audit log verbosity";        Kind="enum"; Items=@(@("0","0 — Off (default)"),@("1","1 — Errors"),@("2","2 — Warnings"),@("3","3 — Info"),@("4","4 — Debug")) }
         "ui_scheme"          = @{ Title="Colour scheme";              Kind="enum"; Items=@(
-            @("0","0 — Light"),@("1","1 — Sepia"),@("2","2 — Nord"),@("3","3 — Midnight"),
-            @("4","4 — Commodore"),@("5","5 — Amethyst"),@("6","6 — Emerald"),@("7","7 — Sapphire"),
-            @("8","8 — Gruvbox (default)"),@("9","9 — Catppuccin"),@("10","10 — Tokyo Night"),
-            @("11","11 — Rose Pine"),@("12","12 — Solarized"),@("13","13 — OLED Black"),
-            @("14","14 — Follow Windows")) }
+            @("0","0 — Light"),@("1","1 — Sepia"),@("2","2 — Solarized"),
+            @("3","3 — Nord"),@("4","4 — Midnight"),@("5","5 — Sapphire"),
+            @("6","6 — Gruvbox (default)"),@("7","7 — Catppuccin"),@("8","8 — OLED Black"),
+            @("9","9 — Follow Windows")) }
     }
 
     $productCode = "{" + [guid]::NewGuid().ToString().ToUpper() + "}"
@@ -473,6 +472,8 @@ try {
         "ErrorDialog"        = "ErrorDlg"
         "_BrowseProperty"    = "INSTALLDIR"
         "UI_ASSOC"           = "1"
+        "UI_AUTOSTART"       = "1"
+        "VORDR_AUTOSTART"    = "1"
         "UI_LOCKED"          = "1"
         "UI_SEL_POL"         = $Policies[0].Value
         # Public properties reach the elevated half of a per-machine install only
@@ -593,12 +594,12 @@ try {
     }
     Write-Host ("  policy values  : {0} HKLM enforced + {1} HKCU user-default properties" -f $Policies.Count, $hkcuCount)
 
-    # --- optional Start with Windows (HKLM\...\Run, minimized to tray) -------
-    Add-PolicyLaunchGuards $AutoStartProp "0/1" 0
+    # --- Start with Windows (HKLM\...\Run, minimized to tray; on by default) -
+    Add-PolicyLaunchGuards $AutoStartProp "0/1" 1
     Exec ("INSERT INTO ``Component`` (``Component``,``ComponentId``,``Directory_``,``Attributes``,``Condition``,``KeyPath``) VALUES ('{0}','{1}','INSTALLDIR',260,'{2} = `"1`"','RegAutoStart')" -f $AutoStartComp, $AutoStartGuid, $AutoStartProp)
     Exec ("INSERT INTO ``FeatureComponents`` (``Feature_``,``Component_``) VALUES ('Main','{0}')" -f $AutoStartComp)
     Exec ("INSERT INTO ``Registry`` (``Registry``,``Root``,``Key``,``Name``,``Value``,``Component_``) VALUES ('RegAutoStart',2,'{0}','Vordr','`"[INSTALLDIR]vordr.exe`"','{1}')" -f $RunKey, $AutoStartComp)
-    Write-Host ("  autostart      : HKLM\{0}\Vordr (opt-in with {1}=1)" -f $RunKey, $AutoStartProp)
+    Write-Host ("  autostart      : HKLM\{0}\Vordr (enabled by default; {1}=0 skips)" -f $RunKey, $AutoStartProp)
 
     # --- .vordr association ---------------------------------------------------
     # On by default, because a file type nobody can open is not much of a file
@@ -1207,7 +1208,7 @@ try {
     Add-Evt "InstallDirDlg" "Next"   "[VORDR_NOASSOC]"   "{}"         "UI_ASSOC = `"1`""         2
     Add-Evt "InstallDirDlg" "Next"   "[VORDR_NOASSOC]"   "1"          "NOT (UI_ASSOC = `"1`")"   3
     Add-Evt "InstallDirDlg" "Next"   "[VORDR_AUTOSTART]" "1"          "UI_AUTOSTART = `"1`""     4
-    Add-Evt "InstallDirDlg" "Next"   "[VORDR_AUTOSTART]" "{}"         "NOT (UI_AUTOSTART = `"1`")" 5
+    Add-Evt "InstallDirDlg" "Next"   "[VORDR_AUTOSTART]" "0"          "NOT (UI_AUTOSTART = `"1`")" 5
     Add-Evt "InstallDirDlg" "Next"   "NewDialog"         "PolicyDlg"  "1" 6
     Add-Evt "InstallDirDlg" "Cancel" "SpawnDialog"       "CancelDlg"  "1" 1
 

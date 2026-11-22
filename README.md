@@ -27,11 +27,11 @@ Most password managers ask you to create an online account, pay a recurring subs
 <br>
 
 <p align="center">
-  <img src="docs/screenshots/vault-entry.png" alt="Vordr main vault window showing glass entry cards, syntax-colored password, and live 2FA countdown bar" width="820">
+  <img src="docs/screenshots/vault-entry.png" alt="Vordr entry view in Gruvbox palette with Cut planes backdrop showing glass entry cards, revealed syntax-colored password, custom and emoji icons, and live 2FA countdown bar" width="820">
 </p>
 
 <p align="center">
-  <em>Gruvbox palette (default) with Cut planes backdrop — glass entry cards, syntax-colored passwords, and live two-factor codes (synthetic demo vault).</em>
+  <em>Gruvbox palette (default) with Cut planes backdrop — glass entry cards, revealed syntax-colored password, custom &amp; emoji icons, and live two-factor codes (synthetic demo vault).</em>
 </p>
 
 <br>
@@ -81,20 +81,26 @@ See the [update guide](docs/USER_GUIDE.md#updates) for portable copies and manag
 | **Strong password & PIN generator** | Create random passwords, multi-word passphrases, pronounceable strings, non-trivial PINs, or hex keys in one click. |
 | **Automatic tidy-up** | Clears copied secrets from the clipboard after 20 seconds, hides Vordr windows from ordinary screenshots and screen-sharing by default, locks automatically when you step away or lock Windows, and can prompt for your master password on an isolated Windows desktop. |
 | **Configurable hardware shortcut** | On PCs with a TPM chip, keep TPM unlock off, unlock silently on that PC, pair the TPM with a Vordr PIN (which automatically revokes the shortcut after repeated wrong tries), or pair the TPM with Windows Hello (face, fingerprint, or Hello PIN)—with a gentle 30-day reminder so your master password stays fresh. |
-| **Clean, adaptable look** | Choose from 14 color palettes (or Follow Windows light/dark mode) and subtle procedural backdrops—or flat surfaces—with flicker-free rendering. |
+| **Clean, adaptable look** | Choose from 9 color palettes (3 light, 6 dark, or Follow Windows light/dark mode), 16 subtle procedural backdrops (or flat surfaces), and 144 secret icons (including full-color Segoe UI Emoji) with custom or live-animated tile and icon colors—all rendered cleanly offline without flicker. |
 | **Easy import, export & IT policy** | Share selected entries as a separate `.vordr` file or an encrypted `.zip` archive; organizations can roll out one universal x64/ARM64 MSI and lock settings through Windows Registry policy. |
 
 ---
 
 ## Screenshots
 
-Choose from **14 color palettes** (plus *Follow Windows* light/dark switching) and **7 procedural backdrops** (plus *Flat*), all rendered cleanly offline without flicker:
+Choose from **9 color palettes** (3 light, 6 dark, plus *Follow Windows* light/dark switching) and **16 procedural backdrops** (plus *Flat*), all rendered cleanly offline without flicker:
 
-| Emerald · Low-poly neon | Midnight · Corner mosaic |
+| Sepia · Intaglio print (Main screen) | Solarized · Tattoo (Settings) |
 | :---: | :---: |
-| ![Vordr in Emerald palette with Low-poly neon backdrop](docs/screenshots/theme-neon.png) | ![Vordr in Midnight palette with Corner mosaic backdrop](docs/screenshots/theme-mosaic.png) |
-| **OLED Black · Crystal rim (Edit mode)** | **Solarized · Guardian sigil (Settings)** |
-| ![Vordr edit mode in OLED Black palette with Crystal rim backdrop showing field controls and inline password generator](docs/screenshots/edit-entry.png) | ![Vordr Settings screen in Solarized palette with Guardian sigil backdrop](docs/screenshots/settings.png) |
+| ![Vordr main screen in Sepia palette with Intaglio print backdrop showing Vault Health overview and bottom glass status pane](docs/screenshots/home-overview.png) | ![Vordr Settings screen in Solarized palette with Tattoo backdrop](docs/screenshots/settings.png) |
+
+<p align="center">
+  <img src="docs/screenshots/pwgen-dialog.png" alt="Vordr centered password generator over Midnight palette with Corner mosaic backdrop" width="660">
+</p>
+
+<p align="center">
+  <em>Midnight · Corner mosaic — centered password generator with syntax-colored output and live entropy meter.</em>
+</p>
 
 ---
 

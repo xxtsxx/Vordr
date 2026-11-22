@@ -122,23 +122,29 @@ the selection slides between entries, an entry cross-fades into the next one,
 focus underlines expand from center, toggle pills slide, and rows and buttons
 fade their highlight in and out (an administrator can override this with the
 `ui_anim` policy value: `0` follow Windows, `1` always, `2` never).
-**Settings > Color scheme** cycles through fourteen color palettes (*Light*,
-*Sepia*, *Nord*, *Midnight*, *Commodore*, *Amethyst*, *Emerald*, *Sapphire*,
-*Gruvbox*, *Catppuccin*, *Tokyo Night*, *Rose Pine*, *Solarized*, *OLED Black*)
-plus *Follow Windows* (`ui_scheme`: `0..13` for the palettes, `8` default, `14`
-to switch automatically between your last-chosen light and dark palettes when
-Windows toggles Light/Dark mode). **Settings > Backdrop** cycles the main window
-surface across seven static GPU-computed procedural styles (*Cut planes*,
-*Low-poly neon*, *Corner mosaic*, *Optical arcs*, *Crystal rim*, *Guardian
-sigil*, *Cipher rings*) plus *Flat* (enforceable via `ui_backdrop`: `0..6` for
-the procedural styles, `7` for flat). Each backdrop is rendered once into a
-cached bitmap when the window size, color scheme, or backdrop choice changes,
-using zero GPU or CPU during normal interaction. On the Home overview, a
-circular health ring summarizes vault password hygiene and clicking the *Weak*,
+**Settings > Color scheme** cycles sequentially through three light palettes (*Light*,
+*Sepia*, *Solarized*) and six dark palettes (*Nord*, *Midnight*, *Sapphire*,
+*Gruvbox*, *Catppuccin*, *OLED Black*), plus *Follow Windows*
+(`ui_scheme`: `0..8` for the palettes, `6` default, `9` to switch automatically
+between your last-chosen light and dark palettes when Windows toggles Light/Dark mode).
+**Settings > Backdrop** cycles the main window surface across sixteen static
+GPU-computed procedural styles (*Cut planes*, *Low-poly neon*, *Corner mosaic*,
+*Crystal rim*, *Guardian sigil*, *Cipher rings*, *Intaglio print*, *Leaf*,
+*Shadow*, *Tattoo*, *Nebula*, *Mariusgenser*, *Matrix*, *Tron*, *Event horizon*,
+*Spiderweb*) plus *Flat* (enforceable via `ui_backdrop`: `0..15` for the
+procedural styles, `16` for flat). Each backdrop is rendered once
+into a cached bitmap when the window size, color scheme, or backdrop choice
+changes, using zero GPU or CPU during normal interaction. On the Home overview, a
+circular health ring summarizes vault password hygiene, clicking the *Weak*,
 *Reused*, or *Ageing* stat cards filters the entry list directly (click
-*Secrets* or the active card again to show all entries). Each entry's tile shows
-a softened gradient monogram of its title unless the title names a known service
-or you picked an icon for it.
+*Secrets* or the active card again to show all entries), and a bottom-aligned
+frosted glass status pane shows the vault path, health summary, and launch
+known-answer test verification. Each entry's tile shows a softened gradient
+monogram of its title unless the title names a known service or you pick an
+icon in edit mode—choosing from 144 Fluent icons and full-color *Segoe UI Emoji*
+across three tabs, with independent **Tile** (background) and **Icon** (accent)
+color selection across 24 solid swatches, a custom color picker, Auto mode, and
+8 live-animated palettes.
 
 ## Locking, screen capture, and the clipboard
 

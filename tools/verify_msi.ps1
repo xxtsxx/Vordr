@@ -21,7 +21,7 @@
          no elevation is needed.
 
     Usage:  powershell -ExecutionPolicy Bypass -File tools\verify_msi.ps1 `
-                       [-Msi bin\vordr-1.0.0.msi]
+                       [-Msi bin\vordr-1.1.0.msi]
     Exit code 0 = all checks passed.
 #>
 [CmdletBinding()]
@@ -206,13 +206,13 @@ foreach ($r in $polRows) {
 foreach ($r in $defRows) {
     if ($none[$r[5]] -eq $LOCAL) { Bad "$($r[5]) installs with no property set - HKCU $($r[3]) would be written unexpectedly" }
 }
-if ($none["VordrAutoStart"] -eq $LOCAL) {
-    Bad "VordrAutoStart installs by default without VORDR_AUTOSTART=1"
+if ($none["VordrAutoStart"] -ne $LOCAL) {
+    Bad "VordrAutoStart does not install by default - Start with Windows should be enabled unless VORDR_AUTOSTART=0"
 }
 if ($assocRows.Count -and $none["FileAssoc"] -ne $LOCAL) {
     Bad "the file association is not registered by default - a plain install would leave .vordr unopenable"
 }
-if ($fail -eq $before) { Write-Host "  no HKLM/HKCU settings or autostart written; .vordr association registered - ok" }
+if ($fail -eq $before) { Write-Host "  no HKLM/HKCU policy settings written; .vordr association + Start with Windows enabled by default - ok" }
 
 $before = $fail
 Write-Host ""
@@ -581,7 +581,7 @@ $validCases = @(
     @{ "VORDR_PWMINLEN" = "16" },
     @{ "VORDR_PWMINLEN" = "256" },
     @{ "VORDR_UISCHEME" = "0" },
-    @{ "VORDR_UISCHEME" = "14" },
+    @{ "VORDR_UISCHEME" = "9" },
     @{ "VORDR_CLIPSECONDS" = "0" },
     @{ "VORDR_CLIPSECONDS" = "3600" },
     @{ "VORDR_IDLELOCKMIN" = "0" },
@@ -608,7 +608,7 @@ $badCases = @(
     @{ "VORDR_PWMINLEN" = "257" },
     @{ "VORDR_PWMINLEN" = "-1" },
     @{ "VORDR_PWMINLEN" = "%TEMP%" },
-    @{ "VORDR_UISCHEME" = "15" },
+    @{ "VORDR_UISCHEME" = "10" },
     @{ "VORDR_UISCHEME" = "X01" },
     @{ "VORDR_UISCHEME" = "-0" },
     @{ "VORDR_PWMINLEN" = '1"6' },
@@ -658,8 +658,8 @@ foreach ($r in $defRows) {
         Bad "Property table pre-sets '$upName=$($propMap[$upName])' - silent /qn installs would unexpectedly write HKCU $($r[3])"
     }
 }
-if ($propMap.ContainsKey("VORDR_AUTOSTART")) {
-    Bad "Property table pre-sets VORDR_AUTOSTART - silent /qn installs would unexpectedly enable Windows startup"
+if (-not $propMap.ContainsKey("VORDR_AUTOSTART") -or $propMap["VORDR_AUTOSTART"] -ne "1") {
+    Bad "Property table must default VORDR_AUTOSTART=1 so Start with Windows is enabled by default"
 }
 $tables = Rows "SELECT ``Name`` FROM ``_Tables``" 1
 $tNames = @($tables | ForEach-Object { $_[0] })

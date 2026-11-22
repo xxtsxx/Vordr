@@ -109,8 +109,9 @@ VF_TEXT             equ 8          ; generic single-line text (custom fields)
 VF_IMAGE            equ 9          ; raw encoded image bytes (PNG/JPEG/BMP)
 VF_FILE             equ 10         ; generic file attachment (any bytes + filename)
 VF_FAV              equ 11         ; reserved marker: entry is a favorite (value "1")
-VF_ICON             equ 12         ; reserved: custom icon override, value = 12 hex
-                                   ;   chars "GGGGCCCCCCCC" (glyph codepoint + COLORREF)
+VF_ICON             equ 12         ; reserved: custom icon override, value = 12/16/24 hex
+                                   ;   ("GGGGCCCCCCCC" BMP, "GGGGGGGGCCCCCCCC" emoji, or
+                                   ;   "GGGGGGGGCCCCCCCCFFFFFFFF" + icon/accent fg colour)
 VF_PWHIST           equ 13         ; reserved: one overwritten password + when it was
                                    ;   changed; value = 16 hex FILETIME + old password
 VF_DELETED          equ 14         ; reserved: entry is in the trash; value = 16 hex
@@ -734,7 +735,7 @@ ANIM_DONUT          equ 10              ; Home Vault-Health donut sweep 0..1024
 ANIM_FAVPOP         equ 11              ; header Favorite star pop 0..1024
 ANIM_COPY           equ 12              ; copy checkmark + countdown pill 0..1024
 
-BACKDROP_COUNT      equ 8               ; 0..6 GPU procedural styles, 7 = Flat
-BACKDROP_FLAT       equ 7
+BACKDROP_COUNT      equ 17              ; 0..15 GPU procedural styles, 16 = Flat
+BACKDROP_FLAT       equ 16
 externdef anim_set:near, anim_get:near, anim_active:near
 externdef g_anim_on:dword, g_anim_tmr:dword

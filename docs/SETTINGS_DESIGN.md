@@ -46,8 +46,8 @@ control ID, kind, value global, registry name, policy-lock flag, clamp, and flag
 - TPM enrollment and mode switches (`Off`, `TPM only`, `TPM + PIN`, `TPM + Hello`)
   remain explicit: wrapping, rotating, or deleting PCP/Hello keys is a side effect,
   not just writing a preference.
-- Color scheme (`IDC_V_MTHEME`, 14 palettes + Follow Windows) and backdrop
-  (`IDC_V_MBKD`, 7 GPU procedural styles + Flat) use compact single-button cycling
+- Color scheme (`IDC_V_MTHEME`, 9 palettes + Follow Windows) and backdrop
+  (`IDC_V_MBKD`, 16 GPU procedural styles + Flat) use compact single-button cycling
   selectors rendered through the unified off-screen compositor (`gui_present_composite`).
 
 The idle timer is re-armed after settings are stored. A changed timeout must

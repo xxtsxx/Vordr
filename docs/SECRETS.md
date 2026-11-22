@@ -69,7 +69,7 @@ code buffers (`g_totp_code6`, `g_totp_code_w`, `g_totp_disp_w`).
 | `g_conv`, `g_convlabel` | vault | UTF-8 field/label scratch | Vault lock and vault-window close |
 | Active vault body (`g_body_ptr`) & foreign import body (`g_foreign_body`) | vault via secmem | Decrypted records, including history and attachment references (plus temporary foreign-import bodies) | `secmem_free` (atomic null-before-free on `g_body_ptr`) |
 | Edit transaction bodies | gui via secmem | Original body and working copy | Success releases original; failure restores original and releases working copy |
-| Off-screen compositor DIB (`g_comp_bits`) | gui via `sec_lock` | Rendered 32-bit window frame (may hold revealed fields during paint) | `gui_comp_flush` zeroes, `VirtualUnlock`s, and clears pointer + `mfence` before `DeleteObject`; also wiped directly in `secmem_panic_wipe` (capped at 64 MiB) |
+| Off-screen compositor bitmap (`gui_present_composite`) | gui (ephemeral window-compatible DDB) | Rendered window frame during a single atomic blit (GDI-scaled at native monitor DPI) | Scrubbed immediately after `BitBlt` with `PatBlt(PATBLT_BLACK_)` and destroyed before returning; never retained between frames |
 
 History buffer sizes use `MAX_PWHIST`, `PWHIST_ENTRY`, `MAX_PWORIG`,
 `PWORIG_STRIDE`, and `PWHBLOB_ENTRY`. Keep their allocation, lock, and wipe

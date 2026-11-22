@@ -16,6 +16,7 @@
     "CallWindowProcW": 5,
     "CancelIo": 1,
     "CharUpperBuffW": 2,
+    "ChooseColorW": 1,
     "ClientToScreen": 2,
     "CloseClipboard": 0,
     "CloseDesktop": 1,
@@ -334,6 +335,12 @@
       "drop": [],
       "override": [
         "blake2b_compress"
+      ]
+    },
+    "gpu": {
+      "drop": [],
+      "override": [
+        "dwrite_create_fmt"
       ]
     },
     "hardening": {

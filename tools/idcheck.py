@@ -90,6 +90,7 @@ def parse_asm(path, all_equs=None):
 RESERVED_RANGES = [
     ("IDC_IG_BASE",  "GLYPHPAL_N"),
     ("IDC_IC_BASE",  "GLYPHCOL_N"),
+    ("IDC_IA_BASE",  "GLYPHANIM_N"),
     ("IDC_DYN_BASE", None),
 ]
 

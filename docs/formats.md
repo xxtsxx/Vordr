@@ -104,7 +104,7 @@ when rewriting metadata.
 | 8 | `VF_TEXT` | Generic single-line text |
 | 9, 10 | `VF_IMAGE`, `VF_FILE` | Attachment reference |
 | 11 | `VF_FAV` | Favorite marker, text `1` |
-| 12 | `VF_ICON` | 12 hex characters: glyph and COLORREF (`GGGGCCCCCCCC`) |
+| 12 | `VF_ICON` | 12 hex (`GGGGCCCCCCCC`) for a BMP glyph, 16 hex (`GGGGGGGGCCCCCCCC`) for a supplementary Unicode scalar (e.g. emoji), or 24 hex (`GGGGGGGGCCCCCCCCFFFFFFFF`) adding an explicit icon/accent color (`00000000` auto, `02BBGGRR` solid RGB, or `01000001`–`01000008` animated palette) alongside the 32-bit tile background color (`00BBGGRR` solid RGB or `01000001`–`01000008` animated palette) |
 | 13 | `VF_PWHIST` | Raw field-history event |
 | 14 | `VF_DELETED` | Trash timestamp, 16 hexadecimal FILETIME characters |
 | 15 | `VF_GROUP` | Section-heading text |

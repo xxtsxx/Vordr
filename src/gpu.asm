@@ -1,19 +1,28 @@
 ; =============================================================================
 ; gpu.asm - Zero-dependency Direct3D 11 DirectCompute procedural backdrops
 ; -----------------------------------------------------------------------------
-; Computes 7 procedural GPU backdrop styles + Flat fallback via System32\d3d11.dll
+; Computes 16 procedural GPU backdrop styles + Flat fallback via System32\d3d11.dll
 ; (hardware GPU adapter first, automatic D3D11 WARP SIMD fallback on headless
 ; or GPU-less machines) using offline-compiled HLSL cs_5_0 DXBC bytecode
 ; (src/gpu_backdrops.inc, generated from tools/backdrops.hlsl):
 ;
-;   0 : Cut planes     (layered shadowed diagonal folds + under-fold glow)
-;   1 : Low-poly neon  (matte Delaunay relief + continuous neon zig-zag seams)
-;   2 : Corner mosaic  (anti-aliased equilateral triangle corner dissolve)
-;   3 : Optical arcs   (Apollonian circle-inversion refractive light caustics)
-;   4 : Crystal rim    (anisotropic crystalline shards + dual-tone rim edges)
-;   5 : Guardian sigil (emissive faceted Vordr sentinel crest + horizon bounce)
-;   6 : Cipher rings   (golden-angle concentric cipher-wheel bead arcs)
-;   7 : Flat           (solid g_col_bg fill, GPU bypassed)
+;   0 : Cut planes      (layered shadowed diagonal folds + under-fold glow)
+;   1 : Low-poly neon   (matte Delaunay relief + continuous neon zig-zag seams)
+;   2 : Corner mosaic   (anti-aliased equilateral triangle corner dissolve)
+;   3 : Crystal rim     (anisotropic crystalline shards + dual-tone rim edges)
+;   4 : Guardian sigil  (emissive faceted Vordr sentinel crest + horizon bounce)
+;   5 : Cipher rings    (golden-angle concentric cipher-wheel bead arcs)
+;   6 : Intaglio print  (banknote guilloche rosettes + copperplate crosshatch)
+;   7 : Leaf            (subtle botanical leaf veins fading softly from side)
+;   8 : Shadow          (architectural louver chiaroscuro light & cast shadows)
+;   9 : Tattoo          (Nordic knotwork & fine-line ornamental filigree margins)
+;  10 : Nebula          (subtle cosmic emission clouds & starlight fading from side)
+;  11 : Mariusgenser    (flipped Norwegian Fair Isle knit — calm top, yoke base)
+;  12 : Matrix          (subtle cascading digital rain glyphs along outer edges)
+;  13 : Tron            (receding perspective light-grid floor & horizon glow)
+;  14 : Event horizon   (zoomed-in lower-right black hole dome & photon ring)
+;  15 : Spiderweb       (ultra-delicate gossamer corner cobweb & tiny dewdrops)
+;  16 : Flat            (solid g_col_bg fill, GPU bypassed)
 ;
 ; Painting & performance contract:
 ;   - GPU dispatches ONLY when dimensions, vault salt seed, active color scheme,
@@ -62,6 +71,7 @@ public gpu_init, gpu_active, gpu_paint_bg, gpu_fill_child_bg, gpu_sample_child_b
 public gpu_fill_glass_child, gpu_sample_glass_child
 public gpu_fill_side_glass_child, gpu_sample_side_glass_child
 public gpu_is_surface_hwnd, gpu_set_vault_seed, gpu_ensure_surface
+public gpu_draw_emoji, dwrite_create_fmt
 ifdef PROBE_IO
 public cmd_gpukat
 endif
@@ -101,28 +111,58 @@ VT_CTX_CS_UAV       equ 220h            ; ID3D11DeviceContext::CSSetUAV [68]
 VT_CTX_CS_SHD       equ 228h            ; ID3D11DeviceContext::CSSetShd [69]
 VT_CTX_CS_CB        equ 238h            ; ID3D11DeviceContext::CSSetCB  [71]
 
+; Direct2D + DirectWrite COM vtable offsets (for full-color Segoe UI Emoji)
+VT_D2D_CREATERDCT   equ 080h            ; ID2D1Factory::CreateDCRenderTarget [16]
+VT_D2D_CREATEBR     equ 040h            ; ID2D1RenderTarget::CreateSolidColorBrush [8]
+VT_D2D_DRAWTEXT     equ 0D8h            ; ID2D1RenderTarget::DrawText [27]
+VT_D2D_BEGINDRAW    equ 180h            ; ID2D1RenderTarget::BeginDraw [48]
+VT_D2D_ENDDRAW      equ 188h            ; ID2D1RenderTarget::EndDraw [49]
+VT_D2D_BINDDC       equ 1C8h            ; ID2D1DCRenderTarget::BindDC [57]
+VT_D2D_SETCOL       equ 040h            ; ID2D1SolidColorBrush::SetColor [8]
+VT_DW_CREATETFMT    equ 078h            ; IDWriteFactory::CreateTextFormat [15]
+VT_DW_SETTALIGN     equ 018h            ; IDWriteTextFormat::SetTextAlignment [3]
+VT_DW_SETPALIGN     equ 020h            ; IDWriteTextFormat::SetParagraphAlignment [4]
+
 GPU_SEED_DEF0       equ 564F5244h       ; "VORD"
 GPU_SEED_DEF1       equ 424B4450h       ; "BKDP"
 
 .const
 WSTR w_d3d11_dll, <d3d11.dll>
+WSTR w_d2d1_dll, <d2d1.dll>
+WSTR w_dwrite_dll, <dwrite.dll>
+WSTR w_emoji_fam, <Segoe UI Emoji>
+even
+w_empty_loc       dw 0
 a_d3d11_create    db "D3D11CreateDevice", 0
+a_d2d1_create     db "D2D1CreateFactory", 0
+a_dw_create       db "DWriteCreateFactory", 0
 gpu_seed_dom      db "vordr-backdrop-v1", 0     ; 18 bytes domain prefix
 gpu_seed_dom_len  equ $ - gpu_seed_dom
 align 4
 d3d_fls           dd 0B100h, 0B000h             ; FL_11_1, FL_11_0
+iid_d2d1_fac      dd 06152247h
+                  dw 06f50h, 0465ah
+                  db 092h, 045h, 011h, 08bh, 0fdh, 03bh, 060h, 007h
+iid_dw_fac        dd 0b859ee5ah
+                  dw 0d838h, 04b5bh
+                  db 0a2h, 0e8h, 01ah, 0dch, 07dh, 093h, 0dbh, 048h
+f_inv255          dd 3B808081h                  ; 1.0f / 255.0f
+f_one             dd 3F800000h                  ; 1.0f
+f_96              dd 42C00000h                  ; 96.0f
+f_emoji_sm        dd 41980000h                  ; 19.0f (sidebar <= 34px tiles)
+f_emoji_lg        dd 41B00000h                  ; 22.0f (header / preview / picker cells)
 
 include gpu_backdrops.inc
 
 ifdef PROBE_IO
-CSTR gpk_ok_hw,   "gpukat: PASS (D3D11 hardware cs_5_0 7 backdrop modes + cache + vault seed + flat toggle)", 13, 10
-CSTR gpk_ok_warp, "gpukat: PASS (D3D11 WARP cs_5_0 7 backdrop modes + cache + vault seed + flat toggle)", 13, 10
+CSTR gpk_ok_hw,   "gpukat: PASS (D3D11 hardware cs_5_0 16 backdrop modes + cache + vault seed + flat toggle)", 13, 10
+CSTR gpk_ok_warp, "gpukat: PASS (D3D11 WARP cs_5_0 16 backdrop modes + cache + vault seed + flat toggle)", 13, 10
 CSTR gpk_bad,     "gpukat: FAIL", 13, 10
 endif
 
 .data
 align 8
-g_backdrop_pref   dd 0                  ; 0..6 = GPU styles, 7 = Flat
+g_backdrop_pref   dd 0                  ; 0..15 = GPU styles, 16 = Flat
 g_backdrop_lock   dd 0                  ; 1 = locked by HKLM policy
 g_gpu_backend     dd 0                  ; 0 = uninit, 1 = HW GPU, 2 = WARP, -1 = unavail
 g_gpu_force_warp  dd 0                  ; AUD-24: set to 1 after HW TDR/device-removed
@@ -152,13 +192,23 @@ g_gpu_oldbmp      dq 0
 g_gpu_bits        dq 0
 g_gpu_base_bits   dq 0                  ; cached static (matte BGRA8, w1|w2) basis (8B/px)
 
+; Direct2D + DirectWrite lazy emoji renderer state
+g_emoji_state     dd 0                  ; 0 = uninit, 1 = ready, -1 = unavailable
+align 8
+g_d2d_fac         dq 0
+g_dw_fac          dq 0
+g_d2d_rt          dq 0
+g_d2d_br          dq 0
+g_dw_fmt_sm       dq 0
+g_dw_fmt_lg       dq 0
+
 .data?
 align 8
 g_gpu_last_key    dd 10 dup (?)         ; 40-byte render-state fingerprint
 ifdef PROBE_IO
 g_gpu_kat_salt    db 32 dup (?)
 align 4
-g_gpu_kat_sig     dd 16 dup (?)         ; per-mode pixel checksums in gpukat
+g_gpu_kat_sig     dd 32 dup (?)         ; per-mode pixel checksums in gpukat
 endif
 
 .code
@@ -1466,7 +1516,7 @@ gpu_sample_side_glass_child proc frame
 gpu_sample_side_glass_child endp
 
 ; =============================================================================
-; cmd_gpukat - Deterministic D3D11 DirectCompute KAT across all 7 GPU modes.
+; cmd_gpukat - Deterministic D3D11 DirectCompute KAT across all 23 GPU modes.
 ; =============================================================================
 ifdef PROBE_IO
 LANDING_PAD
@@ -1641,5 +1691,253 @@ gpk_fail:
     ret
 cmd_gpukat endp
 endif ; PROBE_IO
+
+; =============================================================================
+; Full-color Segoe UI Emoji renderer via System32 Direct2D + DirectWrite
+; (D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT).  Zero startup cost: DLLs load
+; lazily on first emoji paint via LOAD_LIBRARY_SEARCH_SYSTEM32.
+; =============================================================================
+
+; dwrite_create_fmt(rcx=pDw, rdx=familyW, r8d=sizeF32Bits, r9=ppFmt) -> eax=HRESULT
+;   Isolated so ARM64 overrides it cleanly in src/arm64/platform.S (fontSize -> s0).
+dwrite_create_fmt proc frame
+    FRAME_PROLOG 112
+    mov     dword ptr [rsp+32], 0               ; DWRITE_FONT_STYLE_NORMAL
+    mov     dword ptr [rsp+40], 5               ; DWRITE_FONT_STRETCH_NORMAL
+    mov     dword ptr [rsp+48], r8d             ; FLOAT fontSize (IEEE-754 bits)
+    lea     rax, [w_empty_loc]
+    mov     qword ptr [rsp+56], rax             ; localeName = L""
+    mov     qword ptr [rsp+64], r9              ; textFormat**
+    xor     r8d, r8d                            ; fontCollection = NULL
+    mov     r9d, 400                            ; DWRITE_FONT_WEIGHT_NORMAL
+    mov     r10, qword ptr [rcx]
+    call    qword ptr [r10 + VT_DW_CREATETFMT]
+    FRAME_EPILOG
+    ret
+dwrite_create_fmt endp
+
+; gpu_emoji_init() -> eax = 1 if D2D/DirectWrite emoji pipeline is ready, 0 else.
+gpu_emoji_init proc frame
+    FRAME_PROLOG 128
+    mov     eax, dword ptr [g_emoji_state]
+    test    eax, eax
+    jz      gei_do
+    cmp     eax, 1
+    sete    al
+    movzx   eax, al
+    FRAME_EPILOG
+    ret
+gei_do:
+    mov     dword ptr [g_emoji_state], -1       ; fail closed unless every step succeeds
+    WINCALL LoadLibraryExW, addr w_d2d1_dll, 0, LOAD_LIB_SYS32
+    test    rax, rax
+    jz      gei_fail
+    WINCALL GetProcAddress, rax, addr a_d2d1_create
+    test    rax, rax
+    jz      gei_fail
+    mov     qword ptr [rbp-24], rax             ; fn D2D1CreateFactory
+    WINCALL LoadLibraryExW, addr w_dwrite_dll, 0, LOAD_LIB_SYS32
+    test    rax, rax
+    jz      gei_fail
+    WINCALL GetProcAddress, rax, addr a_dw_create
+    test    rax, rax
+    jz      gei_fail
+    mov     qword ptr [rbp-32], rax             ; fn DWriteCreateFactory
+    ; D2D1CreateFactory(SINGLE_THREADED=0, &IID_ID2D1Factory, NULL, &g_d2d_fac)
+    xor     ecx, ecx
+    lea     rdx, [iid_d2d1_fac]
+    xor     r8d, r8d
+    lea     r9, [g_d2d_fac]
+    call    qword ptr [rbp-24]
+    test    eax, eax
+    js      gei_fail
+    ; DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED=0, &IID_IDWriteFactory, &g_dw_fac)
+    xor     ecx, ecx
+    lea     rdx, [iid_dw_fac]
+    lea     r8, [g_dw_fac]
+    call    qword ptr [rbp-32]
+    test    eax, eax
+    js      gei_fail
+    ; D2D1_RENDER_TARGET_PROPERTIES (28B @ [rbp-64..-37]): BGRA8_UNORM + PREMULTIPLIED @ 96 DPI
+    mov     dword ptr [rbp-64], 0               ; type = DEFAULT
+    mov     dword ptr [rbp-60], 87              ; DXGI_FORMAT_B8G8R8A8_UNORM
+    mov     dword ptr [rbp-56], 1               ; D2D1_ALPHA_MODE_PREMULTIPLIED
+    mov     eax, dword ptr [f_96]
+    mov     dword ptr [rbp-52], eax             ; dpiX = 96.0f
+    mov     dword ptr [rbp-48], eax             ; dpiY = 96.0f
+    mov     dword ptr [rbp-44], 0               ; usage = NONE
+    mov     dword ptr [rbp-40], 0               ; minLevel = DEFAULT
+    mov     rcx, qword ptr [g_d2d_fac]
+    mov     r10, qword ptr [rcx]
+    lea     rdx, [rbp-64]
+    lea     r8, [g_d2d_rt]
+    call    qword ptr [r10 + VT_D2D_CREATERDCT]
+    test    eax, eax
+    js      gei_fail
+    ; Create centered small (19px) & large (22px) Segoe UI Emoji text formats
+    mov     rcx, qword ptr [g_dw_fac]
+    lea     rdx, [w_emoji_fam]
+    mov     r8d, dword ptr [f_emoji_sm]
+    lea     r9, [g_dw_fmt_sm]
+    call    dwrite_create_fmt
+    test    eax, eax
+    js      gei_fail
+    mov     rcx, qword ptr [g_dw_fmt_sm]
+    mov     r10, qword ptr [rcx]
+    mov     edx, 2                              ; DWRITE_TEXT_ALIGNMENT_CENTER
+    call    qword ptr [r10 + VT_DW_SETTALIGN]
+    mov     rcx, qword ptr [g_dw_fmt_sm]
+    mov     r10, qword ptr [rcx]
+    mov     edx, 2                              ; DWRITE_PARAGRAPH_ALIGNMENT_CENTER
+    call    qword ptr [r10 + VT_DW_SETPALIGN]
+    mov     rcx, qword ptr [g_dw_fac]
+    lea     rdx, [w_emoji_fam]
+    mov     r8d, dword ptr [f_emoji_lg]
+    lea     r9, [g_dw_fmt_lg]
+    call    dwrite_create_fmt
+    test    eax, eax
+    js      gei_fail
+    mov     rcx, qword ptr [g_dw_fmt_lg]
+    mov     r10, qword ptr [rcx]
+    mov     edx, 2
+    call    qword ptr [r10 + VT_DW_SETTALIGN]
+    mov     rcx, qword ptr [g_dw_fmt_lg]
+    mov     r10, qword ptr [rcx]
+    mov     edx, 2
+    call    qword ptr [r10 + VT_DW_SETPALIGN]
+    ; Create reusable solid color brush (updated via SetColor per draw)
+    mov     eax, dword ptr [f_one]
+    mov     dword ptr [rbp-80], eax
+    mov     dword ptr [rbp-76], eax
+    mov     dword ptr [rbp-72], eax
+    mov     dword ptr [rbp-68], eax
+    mov     rcx, qword ptr [g_d2d_rt]
+    mov     r10, qword ptr [rcx]
+    lea     rdx, [rbp-80]
+    xor     r8d, r8d
+    lea     r9, [g_d2d_br]
+    call    qword ptr [r10 + VT_D2D_CREATEBR]
+    test    eax, eax
+    js      gei_fail
+    mov     dword ptr [g_emoji_state], 1
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gei_fail:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gpu_emoji_init endp
+
+; gpu_draw_emoji(rcx=hdc, rdx=pRect, r8=pTextW, r9d=textLen,
+;                [rbp+48]=fgColorRef, [rbp+56]=useColorFont) -> eax = 1 ok, 0 fallback.
+;   Draws Segoe UI Emoji via Direct2D/DirectWrite directly onto hdc (works on both
+;   32-bit premultiplied ARGB DIBs and standard window/DDB DCs, preserving alpha).
+gpu_draw_emoji proc frame
+    FRAME_PROLOG 208
+    mov     qword ptr [rbp-24], rcx             ; hdc
+    mov     qword ptr [rbp-32], rdx             ; pRect
+    mov     qword ptr [rbp-40], r8              ; pTextW
+    mov     dword ptr [rbp-44], r9d             ; textLen
+    call    gpu_emoji_init
+    test    eax, eax
+    jz      gde_fail
+    mov     r10, qword ptr [rbp-32]
+    mov     eax, dword ptr [r10+8]
+    sub     eax, dword ptr [r10+0]              ; w = R - L
+    jle     gde_fail
+    mov     dword ptr [rbp-48], eax
+    mov     ecx, dword ptr [r10+12]
+    sub     ecx, dword ptr [r10+4]              ; h = B - T
+    jle     gde_fail
+    mov     dword ptr [rbp-52], ecx
+    ; Choose sm (19px) for <= 34px tiles, lg (22px) for larger tiles & picker cells
+    cmp     eax, ecx
+    jle     @F
+    mov     eax, ecx
+@@: mov     rcx, qword ptr [g_dw_fmt_lg]
+    cmp     eax, 34
+    jg      @F
+    mov     rcx, qword ptr [g_dw_fmt_sm]
+@@: mov     qword ptr [rbp-64], rcx             ; pFmt
+    ; Convert fgColorRef (00BBGGRR) to D2D1_COLOR_F {r, g, b, 1.0f} @ [rbp-80..-65]
+    mov     eax, dword ptr [rbp+48]
+    movss   xmm1, dword ptr [f_inv255]
+    movzx   ecx, al                             ; R
+    cvtsi2ss xmm0, ecx
+    mulss   xmm0, xmm1
+    movss   dword ptr [rbp-80], xmm0
+    mov     ecx, eax
+    shr     ecx, 8
+    movzx   ecx, cl                             ; G
+    cvtsi2ss xmm0, ecx
+    mulss   xmm0, xmm1
+    movss   dword ptr [rbp-76], xmm0
+    shr     eax, 16
+    movzx   ecx, al                             ; B
+    cvtsi2ss xmm0, ecx
+    mulss   xmm0, xmm1
+    movss   dword ptr [rbp-72], xmm0
+    mov     eax, dword ptr [f_one]
+    mov     dword ptr [rbp-68], eax             ; a = 1.0f
+    mov     rcx, qword ptr [g_d2d_br]
+    mov     r10, qword ptr [rcx]
+    lea     rdx, [rbp-80]
+    call    qword ptr [r10 + VT_D2D_SETCOL]
+    ; BindDC(g_d2d_rt, hdc, pRect)
+    mov     rcx, qword ptr [g_d2d_rt]
+    mov     r10, qword ptr [rcx]
+    mov     rdx, qword ptr [rbp-24]
+    mov     r8, qword ptr [rbp-32]
+    call    qword ptr [r10 + VT_D2D_BINDDC]
+    test    eax, eax
+    js      gde_fail
+    ; BeginDraw(g_d2d_rt)
+    mov     rcx, qword ptr [g_d2d_rt]
+    mov     r10, qword ptr [rcx]
+    call    qword ptr [r10 + VT_D2D_BEGINDRAW]
+    ; Build D2D1_RECT_F {0.0f, 0.0f, float(w), float(h)} @ [rbp-96..-81]
+    mov     dword ptr [rbp-96], 0
+    mov     dword ptr [rbp-92], 0
+    cvtsi2ss xmm0, dword ptr [rbp-48]
+    movss   dword ptr [rbp-88], xmm0
+    cvtsi2ss xmm0, dword ptr [rbp-52]
+    movss   dword ptr [rbp-84], xmm0
+    ; Compute D2D1_DRAW_TEXT_OPTIONS before the straight-line 8-arg COM call block
+    xor     eax, eax
+    cmp     dword ptr [rbp+56], 0
+    je      @F
+    mov     eax, 4                              ; D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT
+@@: mov     dword ptr [rbp-56], eax
+    ; DrawText(pRT, pTextW, textLen, pFmt, &rectF, pBr, opts, DWRITE_MEASURING_MODE_NATURAL=0)
+    mov     rcx, qword ptr [g_d2d_rt]
+    mov     rdx, qword ptr [rbp-40]
+    mov     r8d, dword ptr [rbp-44]
+    mov     r9, qword ptr [rbp-64]
+    lea     rax, [rbp-96]
+    mov     qword ptr [rsp+32], rax
+    mov     rax, qword ptr [g_d2d_br]
+    mov     qword ptr [rsp+40], rax
+    mov     eax, dword ptr [rbp-56]
+    mov     qword ptr [rsp+48], rax
+    mov     qword ptr [rsp+56], 0
+    mov     r10, qword ptr [rcx]
+    call    qword ptr [r10 + VT_D2D_DRAWTEXT]
+    ; EndDraw(g_d2d_rt, &tag1, &tag2)
+    mov     rcx, qword ptr [g_d2d_rt]
+    mov     r10, qword ptr [rcx]
+    lea     rdx, [rbp-104]
+    lea     r8, [rbp-112]
+    call    qword ptr [r10 + VT_D2D_ENDDRAW]
+    test    eax, eax
+    js      gde_fail
+    mov     eax, 1
+    FRAME_EPILOG
+    ret
+gde_fail:
+    xor     eax, eax
+    FRAME_EPILOG
+    ret
+gpu_draw_emoji endp
 
 end

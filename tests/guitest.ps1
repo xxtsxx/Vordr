@@ -674,34 +674,39 @@ public static bool IsTopmost(IntPtr hwnd) {
         Check ((& $G 'g_anim_on') -eq $won) ("with no override, animation follows Windows' Animation effects switch (Windows {0}, Vordr {1})" -f $won, (& $G 'g_anim_on'))
         $setw = [IntPtr](& $G 'g_settings_hwnd')
         $akey = Join-Path (Join-Path 'HKCU:\Software\VordrGuiTest' $name) 'SOFTWARE\Vordr'
-        # Settings > Backdrop: cycles through all 7 static GPU procedural styles + Flat (0..7)
+        # Settings > Backdrop: cycles through all 16 static GPU procedural styles + Flat (0..16)
         $bbtn = if ($setw -ne [IntPtr]::Zero) { Get-VordrControl -Window $setw -Id 289 } else { [IntPtr]::Zero }
         $bkBackend = & $G 'g_gpu_backend'
         Check ($bbtn -ne [IntPtr]::Zero -and (Get-VordrText $bbtn) -eq 'Cut planes' -and ($bkBackend -eq 1 -or $bkBackend -eq 2)) ("Backdrop starts at 'Cut planes' with D3D11 backend={0}" -f $bkBackend)
-        $bkModes = @('Low-poly neon', 'Corner mosaic', 'Optical arcs', 'Crystal rim', 'Guardian sigil', 'Cipher rings', 'Flat', 'Cut planes')
+        $bkModes = @(
+            'Low-poly neon', 'Corner mosaic', 'Crystal rim', 'Guardian sigil', 'Cipher rings',
+            'Intaglio print', 'Leaf', 'Shadow', 'Tattoo', 'Nebula', 'Mariusgenser',
+            'Matrix', 'Tron', 'Event horizon', 'Spiderweb',
+            'Flat', 'Cut planes'
+        )
         for ($bi = 0; $bi -lt $bkModes.Count; $bi++) {
-            $wantPref = ($bi + 1) % 8
+            $wantPref = ($bi + 1) % 17
             Send-VordrCommand -Window $vb -Id 289 -Sync                                # IDC_V_MBKD
             $bkSaved = (Get-ItemProperty -Path $akey -Name ui_backdrop -ErrorAction SilentlyContinue).ui_backdrop
             Check ((& $G 'g_backdrop_pref') -eq $wantPref -and (Get-VordrText $bbtn) -eq $bkModes[$bi] -and $bkSaved -eq $wantPref) ("Backdrop -> '{0}' (ui_backdrop={1})" -f $bkModes[$bi], $bkSaved)
         }
-        # Settings > Color scheme: cycles through all 14 palettes + Follow Windows (0..14) via button only
+        # Settings > Color scheme: cycles through all 9 palettes (Light 0..2, Dark 3..8) + Follow Windows (9)
         $tbtn = if ($setw -ne [IntPtr]::Zero) { Get-VordrControl -Window $setw -Id 240 } else { [IntPtr]::Zero }
         Check ($tbtn -ne [IntPtr]::Zero -and (Get-VordrText $tbtn) -eq 'Gruvbox') 'Color scheme button exists (default Gruvbox)'
-        $thModes = @('Catppuccin', 'Tokyo Night', 'Rose Pine', 'Solarized', 'OLED Black', 'Follow Windows', 'Light', 'Sepia', 'Nord', 'Midnight', 'Commodore', 'Amethyst', 'Emerald', 'Sapphire', 'Gruvbox')
+        $thModes = @('Catppuccin', 'OLED Black', 'Follow Windows', 'Light', 'Sepia', 'Solarized', 'Nord', 'Midnight', 'Sapphire', 'Gruvbox')
         $persKey = Join-Path (Join-Path 'HKCU:\Software\VordrGuiTest' $name) 'Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
         [void](New-Item -Path $persKey -Force)
         Set-ItemProperty -Path $persKey -Name AppsUseLightTheme -Value 1 -Type DWord
         for ($ti = 0; $ti -lt $thModes.Count; $ti++) {
-            $wantTh = (8 + $ti + 1) % 15
+            $wantTh = (6 + $ti + 1) % 10
             Send-VordrCommand -Window $vb -Id 240 -Sync                                # IDC_V_MTHEME
             $thSaved = (Get-ItemProperty -Path $akey -Name ui_scheme -ErrorAction SilentlyContinue).ui_scheme
             Check ((& $G 'g_scheme_pref') -eq $wantTh -and (Get-VordrText $tbtn) -eq $thModes[$ti] -and $thSaved -eq $wantTh) ("Theme -> '{0}' (ui_scheme={1})" -f $thModes[$ti], $thSaved)
-            if ($wantTh -eq 14) {
-                Check ((& $G 'g_scheme') -eq 12) 'Follow Windows resolves to paired light palette (Solarized=12) when AppsUseLightTheme=1'
+            if ($wantTh -eq 9) {
+                Check ((& $G 'g_scheme') -eq 2) 'Follow Windows resolves to paired light palette (Solarized=2) when AppsUseLightTheme=1'
                 Set-ItemProperty -Path $persKey -Name AppsUseLightTheme -Value 0 -Type DWord
                 [void](Send-VordrMessage -Hwnd $vb -Msg 0x001A -W ([IntPtr]0) -L ([IntPtr]0))
-                Check ((& $G 'g_scheme') -eq 13) 'Follow Windows live-switches to paired dark palette (OLED Black=13) on WM_SETTINGCHANGE'
+                Check ((& $G 'g_scheme') -eq 8) 'Follow Windows live-switches to paired dark palette (OLED Black=8) on WM_SETTINGCHANGE'
             }
         }
         # Interactive Home Vault Health stat card filtering (g_health_filter toggles on Weak tile click)

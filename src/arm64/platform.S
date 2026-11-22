@@ -40,6 +40,9 @@ w_cpu_parent:
         .p2align 1
 w_cp4030:
         .hword  'C','P',' ','4','0','3','0', 0
+        .p2align 1
+w_dw_empty:
+        .hword  0
 
         .text
 
@@ -476,3 +479,41 @@ crash_capture_context:
         str     x17, [x16, #72]
 1:      ret
 #endif
+
+// =============================================================================
+// dwrite_create_fmt(x0=pDw, x1=familyW, w2=sizeF32Bits, x3=ppFmt) -> w8=HRESULT
+// Native AAPCS64 wrapper for IDWriteFactory::CreateTextFormat (vtbl[15] = +120),
+// placing FLOAT fontSize into s0 as required by Windows ARM64 ABI and returning
+// the HRESULT in Vordr's internal return register x8.
+// =============================================================================
+        .globl  dwrite_create_fmt
+        .p2align 2
+        .seh_proc dwrite_create_fmt
+dwrite_create_fmt:
+        pacibsp
+        .seh_pac_sign_lr
+        stp     x29, x30, [sp, #-16]!
+        .seh_save_fplr_x 16
+        mov     x29, sp
+        .seh_set_fp
+        .seh_endprologue
+        fmov    s0, w2                      // FLOAT fontSize -> s0
+        mov     x7, x3                      // IDWriteTextFormat** -> x7
+        adrp    x6, w_dw_empty              // localeName = L"" -> x6
+        add     x6, x6, :lo12:w_dw_empty
+        mov     x2, #0                      // fontCollection = NULL
+        mov     w3, #400                    // DWRITE_FONT_WEIGHT_NORMAL
+        mov     w4, #0                      // DWRITE_FONT_STYLE_NORMAL
+        mov     w5, #5                      // DWRITE_FONT_STRETCH_NORMAL
+        ldr     x16, [x0]
+        ldr     x16, [x16, #120]            // IDWriteFactory::CreateTextFormat [15]
+        blr     x16
+        mov     x8, x0                      // return HRESULT in Vordr internal rax (x8)
+        .seh_startepilogue
+        ldp     x29, x30, [sp], #16
+        .seh_save_fplr_x 16
+        autibsp
+        .seh_pac_sign_lr
+        .seh_endepilogue
+        ret
+        .seh_endproc

@@ -113,9 +113,6 @@ externdef g_zi_sha_act:byte         ; ZIP import actual SHA-256 (zipimport.asm)
 externdef g_zj_sha:byte             ; ZIP export attachment SHA-256 (zipexport.asm)
 externdef g_zj_shahex:byte          ; ZIP export attachment SHA-256 hex (zipexport.asm)
 externdef g_comp_wbuf:byte          ; Off-screen compositor text scratch (gui.asm)
-externdef g_comp_bits:qword         ; Off-screen compositor DIB pixels (gui.asm)
-externdef g_comp_capw:dword         ; Off-screen compositor width (gui.asm)
-externdef g_comp_caph:dword         ; Off-screen compositor height (gui.asm)
 externdef g_rlabel:byte             ; Detail row label scratch (gui.asm)
 externdef g_grouptxt:byte           ; Group heading scratch (gui.asm)
 externdef g_cmpbuf:byte             ; Sort comparison title scratch (gui.asm)
@@ -563,26 +560,12 @@ spw_history:
 spw_a2:
     mov     rcx, qword ptr [g_arena]            ; active Argon2id arena, if mid-KDF
     test    rcx, rcx
-    jz      spw_comp
+    jz      spw_done
     mov     rdx, qword ptr [g_mb]
     cmp     rdx, 262144                         ; cap at 256 MiB blocks
     jbe     @F
     mov     rdx, 262144
 @@: shl     rdx, 10
-    call    secure_zero
-spw_comp:
-    mov     rcx, qword ptr [g_comp_bits]        ; AUD-04: wipe off-screen compositor DIB pixels
-    test    rcx, rcx
-    jz      spw_done
-    mov     eax, dword ptr [g_comp_capw]
-    mov     edx, dword ptr [g_comp_caph]
-    imul    rax, rdx                            ; 64-bit pixel count
-    shl     rax, 2                              ; 64-bit byte count
-    jz      spw_done
-    cmp     rax, 04000000h                      ; cap at 64 MiB
-    jbe     @F
-    mov     rax, 04000000h
-@@: mov     rdx, rax
     call    secure_zero
 spw_done:
     FRAME_EPILOG

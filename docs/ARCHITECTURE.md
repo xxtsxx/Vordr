@@ -166,7 +166,7 @@ trade-off rather than an equivalent backup format; see the
 | Untrusted file contents | Length/cost caps, reparse/ADS/UNC handle validation (`file_validate_handle`), and authentication before record use | Parsers and crypto remain security-critical code |
 | Concurrent saves | Advisory lock and changed-image check | Sync clients and non-cooperating writers need not honor the lock |
 | Older intact vault | Counter compared with local HKCU history | No trusted global monotonic counter |
-| Unlocked process memory | 85 static `VirtualLock` buffers (`.const`), guard-paged `SRWLOCK`-serialized `secmem` arenas, pinned compositor DIB (`g_comp_bits`), IME-detached edit scrubbing, `_ROINIT` lockdown | Not all scratch is locked; no hostile-OS guarantee |
+| Unlocked process memory | 85 static `VirtualLock` buffers (`.const`), guard-paged `SRWLOCK`-serialized `secmem` arenas, ephemeral per-frame compositor DDBs scrubbed with `PatBlt(BLACKNESS)`, IME-detached edit scrubbing, `_ROINIT` lockdown | Not all scratch is locked; no hostile-OS guarantee |
 | Screen & password entry | Default `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` (`AllowScreenCapture`, `HKLM`-only) and atomically DACL-protected private desktop (`SecureUnlock`, 3-state CAS orphan teardown) | Policy-locked `SecureUnlock` refuses fallback; privileged/kernel observation or physical cameras remain possible |
 | Convenience unlock | TPM wrapping; non-exportable RSA-2048 minimum + inner context digest; Mode 2 pre-commit slot rotation; Mode 3 `webauthn.dll` FIDO2 `PRF` (`UP\|UV`) | An alternative unlock route, not a second factor; runtime UI prompt depends on platform provider |
 | Clipboard and previews | Fail-closed exclusion markers, `WM_COPY`/`WM_CUT` interception, tray-timed clear, 8-extension allowlist, inheritable owner+`SYSTEM` temp ACLs, handle-only stale sweep rejecting hardlinks/junctions | Other applications may copy or retain active plaintext |
@@ -231,16 +231,16 @@ must not be described as Windows CFG.
 | `main.asm`, `gui.asm` | CPU/startup gates, CLI dispatch, windows, dialogs, full-window off-screen compositor (`gui_present_composite`), named-pipe IPC, Secure Desktop, tray |
 | `macros.inc` | Shared constants, structures, and calling/hardening macros |
 | `hardening.asm`, `loadcfg.asm` | Runtime checks, `_ROINIT`, guard-paged heap, exception/WER handling, PE load configuration |
-| `secmem.asm` | 85-entry `.const` `sec_regions`, `VirtualLock` arenas with `PAGE_NOACCESS` guards and `SRWLOCK` registry, panic wipes (including `g_comp_bits`) |
+| `secmem.asm` | 85-entry `.const` `sec_regions`, `VirtualLock` arenas with `PAGE_NOACCESS` guards and `SRWLOCK` registry, panic wipes |
 | `random.asm` | OS RNG (`BCryptGenRandom`) and optional `RDSEED` mixing |
 | `sha256.asm`, `sha1.asm`, `aesgcm.asm`, `blake2b.asm`, `argon2.asm` | x64 cryptographic primitives (AES-NI, PCLMULQDQ, SHA-NI, SSE2/AVX2) |
 | `vault.asm` | Container parsing/writing, records, attachments, native import/export, `VF_SYSTEM` scoping |
 | `totp.asm`, `pwgen.asm` | One-time codes, password/PIN generation, grading, and policy |
 | `tpm.asm`, `regcfg.asm` | TPM 2.0 PCP & `webauthn.dll` Hello wrapping, TBS cooldown diagnostics, registry precedence, paths, rollback history |
 | `zipexport.asm`, `zipimport.asm` | WinZip AE-2 and JSON interoperability with per-attachment `SHA-256` verification |
-| `theme.asm` | 14 color schemes + Follow Windows, perceived-luminance contrast, SSE2 SDF rounded rects, glass cards & sidebar, drop shadows, pill toggles, TOTP countdown bar |
+| `theme.asm` | 9 color schemes (3 light, 6 dark) + Follow Windows, perceived-luminance contrast, SSE2 SDF rounded rects, glass cards & sidebar, drop shadows, pill toggles, TOTP countdown bar |
 | `anim.asm` | Animation clock: eased value slots driven by one timer while active, honoring Windows' "Animation effects" setting |
-| `gpu.asm`, `gpu_backdrops.inc` | Direct3D 11 DirectCompute (`cs_5_0`) procedural backdrops (7 styles via `d3d11.dll` with WARP fallback + SSE2 360° Rodrigues hue cycling, plus flat mode) cached in a 32-bit DIB |
+| `gpu.asm`, `gpu_backdrops.inc` | Direct3D 11 DirectCompute (`cs_5_0`) procedural backdrops (16 styles via `d3d11.dll` with WARP fallback + SSE2 360° Rodrigues hue cycling, plus flat mode) cached in a 32-bit DIB, and lazy Direct2D/DirectWrite (`d2d1.dll`/`dwrite.dll`) full-color *Segoe UI Emoji* rendering |
 | `fileio.asm`, `console.asm`, `log.asm` | Hardened file access (`file_path_allowed` / `file_validate_handle`), diagnostic output, logging |
 | `selftest.asm`, `redteam.asm`, `bench.asm` | 23 startup KAT suites, `katreport`, `dbg`-only fault injection, benchmarks |
 | `src/arm64/*.S`, `src/arm64/frame.inc`, `tools/a64/xlat.py` | Hand-written ARMv8 Crypto/NEON/RNG/CPU-gate/load-config modules (`aesgcm.S`, `sha.S`, `blake2b_argon2.S`, `platform.S`, `loadcfg.S`) and deterministic COFF-to-AArch64 translator for the remaining 24 modules ([ARM64.md](ARM64.md)) |
