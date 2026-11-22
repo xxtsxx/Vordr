@@ -80,7 +80,11 @@ extraction (`msiexec /a`) alone does not exercise installation or upgrade logic.
 
 - [ ] Create an annotated version tag pointing to the reviewed, built commit.
 - [ ] Add its executable hash and commit to [RELEASES.md](RELEASES.md).
-- [ ] Publish the exact tested executable and, if offered, the exact tested MSI.
+- [ ] When GitHub Immutable Releases is enabled, create the GitHub Release as a
+  **draft** (`draft: true`), upload all exact tested release assets (`vordr.exe`,
+  `vordr-arm64.exe`, `vordr-X.Y.Z.msi`, `SHA256SUMS.txt`), confirm every asset is
+  attached, and only then publish (`draft: false`) so the immutable release seals
+  with all artifacts intact.
 - [ ] State supported Windows/CPU requirements and changes from the previous release.
 - [ ] Label known affected/superseded versions without deleting or moving their tags.
 - [ ] Download the published files and compare them with the tested bytes.

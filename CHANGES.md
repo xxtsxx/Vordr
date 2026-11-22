@@ -7,6 +7,12 @@ in [docs/RELEASES.md](docs/RELEASES.md).
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-11-23
+
+### Changed in 1.1.1
+
+- **Release republish for GitHub Immutable Releases (`vordr.rc`, `docs/DEPLOYMENT.md`, `docs/RELEASE_CHECKLIST.md`, `tools/verify_msi.ps1`).** Publishes the complete `1.1.0` feature and visual-polish release as `v1.1.1` with all reproducible x64/ARM64 executables and the universal MSI attached via draft-first immutable-release publishing (superseding the empty `v1.1.0` tag created before asset upload), and documents the draft-first immutable-release step in `docs/RELEASE_CHECKLIST.md`.
+
 ## [1.1.0] - 2026-11-23
 
 ### Added in 1.1.0
