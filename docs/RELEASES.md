@@ -51,8 +51,9 @@ Published records in the WinGet community source (`ThomasSmistad.Vordr`, referen
 |---|---|---|---|---|
 | 0.2.3 | 2026-09-14 | [PR #411202](https://github.com/microsoft/winget-pkgs/pull/411202) | x64 | `683202773f1307952f7c9d6705c1cc09c082bdd28570625aa5ba1a2640d894e6` |
 | 1.0.0 | 2026-11-21 | [PR #485844](https://github.com/microsoft/winget-pkgs/pull/485844) | x64, arm64 (universal MSI) | `53bc66a111180c2912dc2d9c46869f9b62d595ccef80f5477a64a57c9621d803` |
+| 1.1.1 | 2026-11-23 | [PR #486713](https://github.com/microsoft/winget-pkgs/pull/486713) | x64, arm64 (universal MSI) | `c90c979e36a46ba35b25d814672be0fd4a70ef53700f5776d718b40c8c5e65f3` |
 
-Both published submissions above passed WinGet automated validation and moderator approval, and publication was confirmed by querying `ThomasSmistad.Vordr` through WinGet. Version `1.1.1` has been submitted in [PR #486713](https://github.com/microsoft/winget-pkgs/pull/486713) and is pending automated validation, merge, and publication. These are historical publication records, not a claim that any listed version will always be the latest. Query the live listing with:
+All published submissions above passed WinGet automated validation and moderator approval, and publication was confirmed by querying `ThomasSmistad.Vordr` through WinGet. These are historical publication records, not a claim that any listed version will always be the latest. Query the live listing with:
 
 ```powershell
 winget show --id ThomasSmistad.Vordr --exact --source winget
